@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+/apps/desktop/gen
+node_modules
