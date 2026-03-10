@@ -1,0 +1,29 @@
+# cargo-deny: licences, advisories, bans and sources. Runs in CI's static job.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Everything here can be distributed inside a GPL-3.0 program.
+allow = [
+  "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "MIT", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "MPL-2.0", "BSL-1.0", "CDLA-Permissive-2.0",
+  "GPL-3.0-or-later",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Layering (ARCHITECTURE.md §2): only the desktop app may use Tauri.
+deny = [{ name = "tauri", wrappers = ["ferrocast-desktop"] }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
