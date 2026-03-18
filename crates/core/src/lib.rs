@@ -11,3 +11,4 @@ pub mod money;
 pub mod sample;
 pub mod dedupe;
 pub mod template;
+pub mod alert;
