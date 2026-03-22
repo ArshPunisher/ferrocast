@@ -432,11 +432,14 @@ impl EventKind {
     }
 
     /// Kinds an alert box can show. Chat, moderation and health events never alert.
+    ///
+    /// A gifted subscription is one recipient of a gift batch: the batch alerts once
+    /// ("Goblin gifted 50 subs"), so the 50 per-recipient events never alert on their own.
     pub fn is_alertable(&self) -> bool {
         match self {
+            EventKind::Subscription { gifted_by, .. } => gifted_by.is_none(),
             EventKind::Follow { .. }
             | EventKind::Raid { .. }
-            | EventKind::Subscription { .. }
             | EventKind::GiftBatch { .. }
             | EventKind::PlatformGift { .. }
             | EventKind::PaidMessage { .. }
@@ -545,6 +548,18 @@ mod tests {
         };
         assert!(!chat.is_alertable());
         assert!(!EventKind::Connector(ConnectorStatus::Connected).is_alertable());
+    }
+
+    #[test]
+    fn gifted_recipients_do_not_alert_on_their_own() {
+        let gifted = EventKind::Subscription {
+            actor: Actor::named(Platform::Twitch, "lucky"),
+            tier: Tier::Tier1,
+            months: 1,
+            message: None,
+            gifted_by: Some(Actor::named(Platform::Twitch, "goblin")),
+        };
+        assert!(!gifted.is_alertable());
     }
 
     #[test]
