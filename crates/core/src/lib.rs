@@ -6,10 +6,11 @@
 
 mod macros;
 
+pub mod alert;
+pub mod dedupe;
 pub mod event;
 pub mod money;
-pub mod sample;
-pub mod dedupe;
-pub mod template;
-pub mod alert;
 pub mod queue;
+pub mod sample;
+pub mod template;
+pub mod goal;
