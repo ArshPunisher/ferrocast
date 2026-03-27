@@ -15,3 +15,4 @@ pub mod sample;
 pub mod template;
 pub mod goal;
 pub mod filter;
+pub mod command;
