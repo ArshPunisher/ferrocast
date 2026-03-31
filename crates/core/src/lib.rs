@@ -17,3 +17,4 @@ pub mod goal;
 pub mod filter;
 pub mod command;
 pub mod moderation;
+pub mod tts;
