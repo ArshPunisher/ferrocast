@@ -7,14 +7,15 @@
 mod macros;
 
 pub mod alert;
+pub mod command;
 pub mod dedupe;
 pub mod event;
+pub mod filter;
+pub mod goal;
+pub mod moderation;
 pub mod money;
+pub mod overlay;
 pub mod queue;
 pub mod sample;
 pub mod template;
-pub mod goal;
-pub mod filter;
-pub mod command;
-pub mod moderation;
 pub mod tts;
