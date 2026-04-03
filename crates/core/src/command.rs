@@ -478,3 +478,102 @@ mod tests {
         assert!(!Access::Mods.allows(Roles::VIP));
     }
 }
+
+/// A message the bot posts on a schedule, only while live and only after enough chat
+/// happened since the last post (so it never talks to an empty room).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timer {
+    pub id: String,
+    pub name: String,
+    pub message: String,
+    pub every_min: u32,
+    pub min_chat_lines: u32,
+    #[serde(default)]
+    pub platforms: Vec<Platform>,
+    pub enabled: bool,
+}
+
+impl Timer {
+    pub fn validate(&self) -> Result<(), CommandError> {
+        if self.message.trim().is_empty() {
+            return Err(CommandError::EmptyResponse);
+        }
+        Template::parse(&self.message)?;
+        Ok(())
+    }
+
+    /// Whether the timer should post now. `every_min` below 5 is treated as 5: a faster
+    /// timer is spam whatever the settings say.
+    pub fn due(
+        &self,
+        last_post: Option<Millis>,
+        lines_since: u32,
+        live: bool,
+        now: Millis,
+    ) -> bool {
+        if !self.enabled || !live || lines_since < self.min_chat_lines {
+            return false;
+        }
+        let every_s = i64::from(self.every_min.max(5)) * 60;
+        last_post.is_none_or(|last| now.seconds_since(last) >= every_s)
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+
+    fn timer() -> Timer {
+        Timer {
+            id: "t".into(),
+            name: "socials".into(),
+            message: "Follow on {platform}".into(),
+            every_min: 10,
+            min_chat_lines: 5,
+            platforms: vec![],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn posts_only_live_with_chat_and_after_the_interval() {
+        let t = timer();
+        assert!(!t.due(None, 10, false, Millis(0)), "offline");
+        assert!(!t.due(None, 2, true, Millis(0)), "quiet chat");
+        assert!(t.due(None, 10, true, Millis(0)));
+        assert!(!t.due(Some(Millis(0)), 10, true, Millis(599_000)));
+        assert!(t.due(Some(Millis(0)), 10, true, Millis(600_000)));
+    }
+
+    #[test]
+    fn floor_of_five_minutes() {
+        let t = Timer {
+            every_min: 0,
+            min_chat_lines: 0,
+            ..timer()
+        };
+        assert!(!t.due(Some(Millis(0)), 0, true, Millis(60_000)));
+        assert!(t.due(Some(Millis(0)), 0, true, Millis(300_000)));
+    }
+
+    #[test]
+    fn validation() {
+        assert!(timer().validate().is_ok());
+        assert!(
+            Timer {
+                message: " ".into(),
+                ..timer()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Timer {
+                message: "{bad".into(),
+                ..timer()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
