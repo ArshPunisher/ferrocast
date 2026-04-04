@@ -293,6 +293,9 @@ pub struct RenderedAlert {
     pub css: String,
     /// Text for TTS if the variation wants it; the TTS policy decides if it's read.
     pub tts_text: Option<String>,
+    /// Media id of the synthesised speech, once the engine made it.
+    #[serde(default)]
+    pub tts_audio: Option<String>,
     pub test: bool,
 }
 
@@ -316,6 +319,7 @@ pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) ->
         platform: event.platform,
         title: fill(&v.title),
         tts_text: (v.tts && !body.trim().is_empty()).then(|| body.clone()),
+        tts_audio: None,
         body,
         image: v.image.clone(),
         sound: v.sound.clone(),

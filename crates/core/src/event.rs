@@ -39,6 +39,12 @@ pub enum Platform {
     Ferrocast,
 }
 
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 impl Platform {
     /// The platforms viewers chat on. Tips and internal events are not chat platforms.
     pub const CHAT: [Platform; 3] = [Platform::Twitch, Platform::Youtube, Platform::Kick];
