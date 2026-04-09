@@ -1,0 +1,19 @@
+[package]
+name = "ferrocast-connector"
+description = "The interface every platform adapter implements."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferrocast-core.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+tokio.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

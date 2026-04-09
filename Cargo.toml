@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 ferrocast-core = { path = "crates/core" }
+ferrocast-connector = { path = "crates/connector" }
 ferrocast-store = { path = "crates/store" }
 ferrocast-twitch = { path = "crates/twitch" }
 ferrocast-youtube = { path = "crates/youtube" }
