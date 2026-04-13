@@ -65,6 +65,26 @@ pub fn recent(
     limit: u32,
     kinds: &[String],
 ) -> Result<Vec<(i64, Event)>> {
+    page(store, before, limit, kinds, false)
+}
+
+/// Like [`recent`] but without messages moderation removed: what overlays may show.
+pub fn recent_visible(
+    store: &Store,
+    before: Option<i64>,
+    limit: u32,
+    kinds: &[String],
+) -> Result<Vec<(i64, Event)>> {
+    page(store, before, limit, kinds, true)
+}
+
+fn page(
+    store: &Store,
+    before: Option<i64>,
+    limit: u32,
+    kinds: &[String],
+    visible_only: bool,
+) -> Result<Vec<(i64, Event)>> {
     let limit = i64::from(limit.clamp(1, 500));
     store.read(|c| {
         let kinds_json = serde_json::to_string(kinds)?;
@@ -72,9 +92,10 @@ pub fn recent(
             "SELECT seq, id, platform, source_id, origin, occurred_at, received_at, data FROM events
              WHERE (?1 IS NULL OR seq < ?1)
                AND (json_array_length(?2) = 0 OR kind IN (SELECT value FROM json_each(?2)))
+               AND (?4 = 0 OR hidden = 0)
              ORDER BY seq DESC LIMIT ?3",
         )?;
-        let rows = st.query_map(params![before, kinds_json, limit], |r| {
+        let rows = st.query_map(params![before, kinds_json, limit, visible_only], |r| {
             let seq: i64 = r.get(0)?;
             let platform: String = r.get(2)?;
             let origin: String = r.get(4)?;
@@ -109,6 +130,33 @@ pub fn get(store: &Store, id: &str) -> Result<Option<Event>> {
         .into_iter()
         .next()
         .map(|(_, e)| e))
+}
+
+/// Marks a message hidden (filtered, deleted by a mod, from a banned account) so it never
+/// returns in overlay snapshots, even after a restart. Returns whether a row changed.
+pub fn hide(store: &Store, platform: Platform, source_id: &str) -> Result<bool> {
+    store.write(|tx| {
+        Ok(tx.execute(
+            "UPDATE events SET hidden = 1 WHERE platform = ?1 AND source_id = ?2 AND hidden = 0",
+            params![platform_key(platform), source_id],
+        )? > 0)
+    })
+}
+
+/// Hides a person's chat since `since_ms` (they were banned or their messages cleared).
+pub fn hide_user_chat(
+    store: &Store,
+    platform: Platform,
+    actor_id: &str,
+    since_ms: i64,
+) -> Result<usize> {
+    store.write(|tx| {
+        Ok(tx.execute(
+            "UPDATE events SET hidden = 1
+             WHERE platform = ?1 AND actor_id = ?2 AND kind = 'chat_message' AND received_at >= ?3 AND hidden = 0",
+            params![platform_key(platform), actor_id, since_ms],
+        )?)
+    })
 }
 
 /// Finds the event a refund refers to.
@@ -291,6 +339,33 @@ mod tests {
         assert_eq!(
             by_source(&s, Platform::Kick, "f1").unwrap().as_deref(),
             Some("follow")
+        );
+    }
+
+    #[test]
+    fn hidden_messages_stay_out_of_visible_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let mut a = chat("a", Some("m1"), "spam");
+        if let EventKind::ChatMessage { actor, .. } = &mut a.kind {
+            actor.id = Some("troll".into());
+        }
+        insert(&s, &a).unwrap();
+        insert(&s, &chat("b", Some("m2"), "nice")).unwrap();
+        insert(&s, &chat("c", Some("m3"), "also fine")).unwrap();
+        assert!(hide(&s, Platform::Twitch, "m3").unwrap());
+        assert!(!hide(&s, Platform::Twitch, "m3").unwrap(), "already hidden");
+        assert_eq!(hide_user_chat(&s, Platform::Twitch, "troll", 0).unwrap(), 1);
+        let visible: Vec<_> = recent_visible(&s, None, 50, &[])
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e.id)
+            .collect();
+        assert_eq!(visible, vec!["b"]);
+        assert_eq!(
+            recent(&s, None, 50, &[]).unwrap().len(),
+            3,
+            "the mod log keeps everything"
         );
     }
 
