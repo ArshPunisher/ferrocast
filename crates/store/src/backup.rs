@@ -85,21 +85,31 @@ pub fn apply_scheduled_restore(dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     };
     let id = id.trim().to_string();
-    std::fs::remove_file(&marker)?;
     if !list(dir)?.iter().any(|b| b.id == id) {
+        std::fs::remove_file(&marker)?;
         return Ok(None);
     }
     let db = dir.join("ferrocast.db");
+    // Take the chosen backup out first: the safety snapshot below rotates old backups, and
+    // the one being restored may be the oldest.
+    let tmp = dir.join("ferrocast.db.restoring");
+    std::fs::copy(dir.join("backups").join(format!("{id}.db")), &tmp)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
     if db.exists() {
-        let keep = dir
-            .join("backups")
-            .join(format!("{}-replaced.db", crate::now_ms()));
-        std::fs::copy(&db, keep)?;
+        // Keep the current data first, through SQLite so the WAL's newest pages are
+        // included (a plain file copy would miss everything since the last checkpoint).
+        let conn = Connection::open(&db).map_err(|e| StoreError::Backup(e.to_string()))?;
+        snapshot(&conn, dir, "replaced")?;
+        drop(conn);
     }
+    // Rename the flushed copy over the database: a crash mid-way leaves either the old or
+    // the new database, never half of one (R-34).
     for ext in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(dir.join(format!("ferrocast.db{ext}")));
     }
-    std::fs::copy(dir.join("backups").join(format!("{id}.db")), &db)?;
+    std::fs::rename(&tmp, &db)?;
+    // Only now is the restore done; a crash earlier retries it on the next start.
+    std::fs::remove_file(&marker)?;
     Ok(Some(id))
 }
 
@@ -140,11 +150,28 @@ mod tests {
         drop(s);
         schedule_restore(dir.path(), &target).unwrap();
         assert_eq!(apply_scheduled_restore(dir.path()).unwrap(), Some(target));
+        assert!(!dir.path().join("restore-on-start").exists());
         let s = Store::open(dir.path()).unwrap();
         let v: i64 = s
             .read(|c| Ok(c.query_row("SELECT value FROM counters", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(v, 3);
+        // The safety copy of the replaced database has the newest value, WAL included.
+        let replaced = list(dir.path())
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id.ends_with("-replaced"))
+            .unwrap();
+        let c = Connection::open(
+            dir.path()
+                .join("backups")
+                .join(format!("{}.db", replaced.id)),
+        )
+        .unwrap();
+        let kept: i64 = c
+            .query_row("SELECT value FROM counters", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 99);
     }
 
     #[test]
