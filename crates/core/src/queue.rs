@@ -218,6 +218,22 @@ impl AlertQueue {
         before != self.waiting.len()
     }
 
+    /// Removes the speech from waiting alerts for `event_id` (a mod deleted the message,
+    /// so it must not be read aloud). Returns how many alerts changed.
+    pub fn strip_tts(&mut self, event_id: &str) -> usize {
+        let mut n = 0;
+        for w in self
+            .waiting
+            .iter_mut()
+            .filter(|w| w.alert.event_id == event_id)
+        {
+            if w.alert.tts_text.take().is_some() | w.alert.tts_audio.take().is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -421,6 +437,24 @@ mod tests {
         assert!(shown(&acts).is_empty(), "paused: nothing new starts");
         assert_eq!(shown(&q.resume(Millis(200))), vec!["b"]);
         assert_eq!(q.next_wake(), Some(Millis(200 + 5_000 + 1_000)));
+    }
+
+    #[test]
+    fn strip_tts_only_touches_that_event() {
+        let mut q = q();
+        q.pause();
+        let mut a = alert("a", 1_000);
+        a.event_id = "e1".into();
+        a.tts_text = Some("read me".into());
+        let mut b = alert("b", 1_000);
+        b.event_id = "e2".into();
+        b.tts_text = Some("keep me".into());
+        q.enqueue(a, 0, Millis(0));
+        q.enqueue(b, 0, Millis(0));
+        assert_eq!(q.strip_tts("e1"), 1);
+        assert_eq!(q.strip_tts("e1"), 0);
+        let texts: Vec<_> = q.waiting().map(|w| w.alert.tts_text.clone()).collect();
+        assert_eq!(texts, vec![None, Some("keep me".into())]);
     }
 
     #[test]
