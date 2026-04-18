@@ -86,12 +86,25 @@ impl Engine {
         let o = self
             .db(move |s| repo::overlays::regenerate_token(s, &oid))
             .await?;
+        // Pages still open on the old URL must stop at once.
+        self.revoke(&o.id);
         Ok(self.overlay_view(&o))
     }
 
     pub async fn delete_overlay(&self, id: &str) -> Result<(), EngineError> {
         let oid = id.to_string();
-        self.db(move |s| repo::overlays::delete(s, &oid)).await
+        self.db(move |s| repo::overlays::delete(s, &oid)).await?;
+        self.revoke(id);
+        Ok(())
+    }
+
+    fn revoke(&self, overlay_id: &str) {
+        self.send_overlay(OverlayFrame::new(
+            Audience::Overlay(overlay_id.to_string()),
+            self.next_seq(),
+            "revoked",
+            &json!({}),
+        ));
     }
 
     pub async fn overlay_by_token(&self, token: &str) -> Result<Option<Overlay>, EngineError> {
@@ -102,13 +115,30 @@ impl Engine {
     /// The first frame for an overlay page: layout plus current state, so nothing is blank.
     pub async fn overlay_snapshot(&self, o: &Overlay) -> Result<Value, EngineError> {
         let events = if o.wants_alerts() || o.widgets.iter().any(|w| w.kind == WidgetKind::Events) {
-            self.events(None, 25, ALERTABLE.iter().map(|s| s.to_string()).collect())
+            let kinds: Vec<String> = ALERTABLE.iter().map(|s| s.to_string()).collect();
+            let mut list = self
+                .db(move |s| repo::events::recent_visible(s, None, 40, &kinds))
                 .await?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect::<Vec<_>>();
+            // Same rule as the live path: only live events that could alert (a pending or
+            // refunded tip, or a backfilled follow, never shows on stream).
+            list.retain(|e| {
+                e.origin == ferrocast_core::event::Origin::Live && e.kind.is_alertable()
+            });
+            list.truncate(25);
+            list
         } else {
             Vec::new()
         };
         let chat: Vec<_> = if o.wants_chat() {
-            let mut c = self.events(None, 50, vec!["chat_message".into()]).await?;
+            let mut c: Vec<_> = self
+                .db(|s| repo::events::recent_visible(s, None, 50, &["chat_message".to_string()]))
+                .await?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect();
             c.retain(|e| {
                 !e.source_id
                     .as_deref()

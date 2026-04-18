@@ -63,6 +63,8 @@ struct Inner {
     connectors: RwLock<HashMap<Platform, Arc<dyn Connector>>>,
     queue: tokio::sync::Mutex<AlertQueue>,
     queue_changed: Notify,
+    /// One settings save at a time, so two quick saves can't land in the wrong order.
+    config: tokio::sync::Mutex<()>,
     dedupe: Mutex<Deduper>,
     cooldowns: Mutex<Cooldowns>,
     hidden: Mutex<Hidden>,
@@ -106,6 +108,7 @@ impl Engine {
                 connectors: RwLock::new(HashMap::new()),
                 queue: tokio::sync::Mutex::new(queue),
                 queue_changed: Notify::new(),
+                config: tokio::sync::Mutex::new(()),
                 dedupe: Mutex::new(Deduper::default()),
                 cooldowns: Mutex::new(Cooldowns::default()),
                 hidden: Mutex::new((HashSet::new(), VecDeque::new())),
@@ -116,6 +119,7 @@ impl Engine {
                 base_url: RwLock::new("http://127.0.0.1:47820".into()),
             }),
         };
+        tokio::spawn(prune(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
@@ -184,6 +188,11 @@ impl Engine {
         st.viewers.remove(&platform);
     }
 
+    /// Held while saving any setting (see `Inner::config`).
+    pub(crate) async fn config_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.config.lock().await
+    }
+
     pub(crate) fn connector(&self, platform: Platform) -> Option<Arc<dyn Connector>> {
         self.inner
             .connectors
@@ -245,7 +254,41 @@ impl Engine {
         let _ = self.inner.overlay_tx.send(frame);
     }
 
+    /// Hides a message from overlays now (memory) and for good (the log), so a reload or a
+    /// restart never brings moderated chat back on stream.
     pub(crate) fn hide_message(&self, platform: Platform, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.remember_hidden(platform, id);
+        let engine = self.clone();
+        let sid = id.to_string();
+        tokio::spawn(async move {
+            if let Err(err) = engine
+                .db(move |s| repo::events::hide(s, platform, &sid))
+                .await
+            {
+                tracing::error!(%err, "couldn't mark a message hidden");
+            }
+        });
+    }
+
+    /// Hides a person's recent chat (banned or messages cleared).
+    pub(crate) fn hide_user(&self, platform: Platform, actor_id: &str) {
+        let engine = self.clone();
+        let aid = actor_id.to_string();
+        let since = now().0 - 24 * 3_600_000;
+        tokio::spawn(async move {
+            if let Err(err) = engine
+                .db(move |s| repo::events::hide_user_chat(s, platform, &aid, since))
+                .await
+            {
+                tracing::error!(%err, "couldn't hide a user's messages");
+            }
+        });
+    }
+
+    fn remember_hidden(&self, platform: Platform, id: &str) {
         let mut h = self.inner.hidden.lock().unwrap_or_else(|p| p.into_inner());
         let key = (platform, id.to_string());
         if h.0.insert(key.clone()) {
@@ -273,11 +316,25 @@ impl Engine {
     }
 
     pub async fn save_settings(&self, s: EngineSettings) -> Result<EngineSettings, EngineError> {
+        let _one_at_a_time = self.inner.config.lock().await;
         let saved = s.clone();
         self.db(move |st| repo::settings::set(st, "engine", &saved))
             .await?;
         self.state_mut().settings = s.clone();
         Ok(s)
+    }
+}
+
+/// Deletes old chat from the log at start and every six hours (alerts and tips are kept).
+async fn prune(engine: Engine) {
+    loop {
+        let days = engine.settings().keep_chat_days.max(1);
+        match engine.db(move |s| repo::events::prune_chat(s, days)).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old chat"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "couldn't prune old chat"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
     }
 }
 

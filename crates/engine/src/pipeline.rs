@@ -36,6 +36,16 @@ impl Engine {
             e.occurred_at = at;
         }
 
+        // A payment arrives once per status change with the same id. Only the captured
+        // event keeps the bare id (goals and refunds refer to it); other statuses get their
+        // own key, so "pending" never blocks the later "captured" as a duplicate.
+        if let EventKind::Tip { status, .. } = &e.kind
+            && *status != ferrocast_core::event::PaymentStatus::Captured
+            && let Some(id) = &e.source_id
+        {
+            e.source_id = Some(format!("{id}#{}", tip_status_key(*status)));
+        }
+
         if e.origin != Origin::Test {
             let first = self
                 .inner
@@ -109,14 +119,26 @@ impl Engine {
                 self.hide_message(e.platform, message_id);
                 let id = message_id.clone();
                 let p = e.platform;
-                let _ = self
+                let deleted_event = self
                     .db(move |s| {
-                        if let Some(ev) = repo::events::by_source(s, p, &id)? {
-                            repo::events::drop_pending_tts_for_event(s, &ev)?;
+                        let ev = repo::events::by_source(s, p, &id)?;
+                        if let Some(ev) = &ev {
+                            repo::events::drop_pending_tts_for_event(s, ev)?;
                         }
-                        Ok(())
+                        Ok(ev)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                // A queued alert for this message must not read it aloud either.
+                if let Some(ev) = deleted_event {
+                    self.queue_op(move |q, _| {
+                        q.strip_tts(&ev);
+                        vec![]
                     })
                     .await;
+                    self.push_tts_pending().await;
+                }
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
                     e.seq,
@@ -125,6 +147,9 @@ impl Engine {
                 ));
             }
             EventKind::UserMessagesCleared { target } | EventKind::Ban { target, .. } => {
+                if let Some(uid) = &target.id {
+                    self.hide_user(e.platform, uid);
+                }
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
                     e.seq,
@@ -458,5 +483,15 @@ impl Engine {
         if let Ok(list) = self.db(repo::events::pending_tts).await {
             self.send_live(LiveFrame::new("tts_pending", &list));
         }
+    }
+}
+
+fn tip_status_key(s: ferrocast_core::event::PaymentStatus) -> &'static str {
+    use ferrocast_core::event::PaymentStatus;
+    match s {
+        PaymentStatus::Pending => "pending",
+        PaymentStatus::Captured => "captured",
+        PaymentStatus::Refunded => "refunded",
+        PaymentStatus::Disputed => "disputed",
     }
 }

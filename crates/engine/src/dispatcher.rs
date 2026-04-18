@@ -76,15 +76,25 @@ impl Engine {
         &self,
         op: impl FnOnce(&mut AlertQueue, ferrocast_core::event::Millis) -> Vec<Action>,
     ) -> QueueView {
-        let (actions, snapshot, v) = {
+        let (actions, changed, v) = {
             let mut q = self.inner.queue.lock().await;
             let before = q.clone();
             let actions = op(&mut q, now());
-            // Persist only real changes: an idle tick every 30 s shouldn't rewrite the row.
-            let snapshot = (*q != before).then(|| q.clone());
-            (actions, snapshot, view(&q))
+            let changed = *q != before;
+            // Save while still holding the queue, so saves land in the order the changes
+            // happened and an older state can never overwrite a newer one (R-31). An idle
+            // tick changes nothing and writes nothing.
+            if changed {
+                let snapshot = q.clone();
+                if let Err(err) = self
+                    .db(move |s| repo::rules::save_queue(s, &snapshot))
+                    .await
+                {
+                    tracing::error!(%err, "couldn't save the alert queue");
+                }
+            }
+            (actions, changed, view(&q))
         };
-        let changed = snapshot.is_some();
         for a in actions {
             match a {
                 Action::Show { alert } => {
@@ -118,13 +128,6 @@ impl Engine {
                     ));
                 }
             }
-        }
-        if let Some(snapshot) = snapshot
-            && let Err(err) = self
-                .db(move |s| repo::rules::save_queue(s, &snapshot))
-                .await
-        {
-            tracing::error!(%err, "couldn't save the alert queue");
         }
         if changed {
             self.send_live(LiveFrame::new("queue", &v));

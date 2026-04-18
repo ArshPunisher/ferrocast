@@ -314,9 +314,8 @@ async fn tips_alert_only_when_captured_and_refunds_take_goals_back() {
             },
         )
     };
-    let mut pending = tip(PaymentStatus::Pending);
-    pending.source_id = Some("pay_9-pending".into());
-    e.ingest(pending).await;
+    // The provider sends the same payment id twice: pending, then captured.
+    e.ingest(tip(PaymentStatus::Pending)).await;
     assert!(e.queue().await.playing.is_none());
     assert_eq!(e.goals()[0].current, 0);
     e.ingest(tip(PaymentStatus::Captured)).await;
@@ -437,4 +436,135 @@ async fn backfill_goes_to_the_feed_with_a_reason() {
     assert!(!why.alerted);
     assert!(why.reasons[0].contains("reconnect"));
     assert!(e.queue().await.playing.is_none());
+}
+
+#[tokio::test]
+async fn moderated_chat_stays_hidden_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = Engine::start(dir.path()).await.unwrap();
+        e.register_connector(FakePlatform::new(Platform::Twitch));
+        let mut f = e.filter();
+        f.terms.push(BlockedTerm {
+            term: "badword".into(),
+            action: FAction::Delete,
+        });
+        e.save_filter(f).await.unwrap();
+        e.ingest(chat(Platform::Twitch, "bad-1", "troll", "badword"))
+            .await;
+        e.ingest(chat(Platform::Twitch, "raid-1", "raider", "spam spam"))
+            .await;
+        let mut target = Actor::named(Platform::Twitch, "raider");
+        target.id = Some("raider-id".into());
+        e.ingest(Event::live(
+            Platform::Twitch,
+            Some("ban-1".into()),
+            Millis(0),
+            EventKind::Ban {
+                target,
+                reason: None,
+                until: None,
+            },
+        ))
+        .await;
+        e.ingest(chat(Platform::Twitch, "ok-1", "fan", "hello"))
+            .await;
+        let store = e.store();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let s = store.clone();
+            let visible = tokio::task::spawn_blocking(move || {
+                ferrocast_store::repo::events::recent_visible(
+                    &s,
+                    None,
+                    50,
+                    &["chat_message".to_string()],
+                )
+                .unwrap()
+                .len()
+            })
+            .await
+            .unwrap();
+            if visible == 1 || tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let e = Engine::start(dir.path()).await.unwrap();
+    let o = e
+        .create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly)
+        .await
+        .unwrap();
+    let snap = e
+        .overlay_snapshot(&e.overlay(&o.id).await.unwrap())
+        .await
+        .unwrap();
+    let ids: Vec<_> = snap["state"]["chat"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["source_id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![Value::from("ok-1")],
+        "filtered and banned chat never comes back"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_message_is_not_read_aloud_by_a_queued_alert() {
+    let (e, _d) = engine().await;
+    let mut tts = e.tts_policy();
+    tts.enabled = true;
+    e.save_tts(tts).await.unwrap();
+    e.queue_pause().await;
+    let sc = |id: &str| {
+        Event::live(
+            Platform::Youtube,
+            Some(id.into()),
+            Millis(0),
+            EventKind::PaidMessage {
+                actor: Actor::named(Platform::Youtube, "Ravi"),
+                money: Money::new(50_000, "INR"),
+                content: Some(Content::plain("read this out")),
+                sticker_url: None,
+            },
+        )
+    };
+    e.ingest(sc("sc-1")).await;
+    let q = e.queue().await;
+    assert!(q.waiting[0].alert.tts_text.is_some());
+    e.ingest(Event::live(
+        Platform::Youtube,
+        Some("del-1".into()),
+        Millis(0),
+        EventKind::MessageDeleted {
+            message_id: "sc-1".into(),
+        },
+    ))
+    .await;
+    assert!(e.queue().await.waiting[0].alert.tts_text.is_none());
+}
+
+#[tokio::test]
+async fn only_alerts_can_be_replayed() {
+    let (e, _d) = engine().await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("on".into()),
+        Millis(0),
+        EventKind::StreamOnline { title: None },
+    ))
+    .await;
+    let ev = e.events(None, 5, vec![]).await.unwrap();
+    assert!(matches!(
+        e.replay(&ev[0].id).await,
+        Err(EngineError::Invalid(_))
+    ));
+    assert!(matches!(
+        e.replay("missing").await,
+        Err(EngineError::NotFound(_))
+    ));
 }

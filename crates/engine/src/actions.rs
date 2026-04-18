@@ -84,6 +84,13 @@ impl Engine {
             .db(move |s| repo::events::get(s, &id))
             .await?
             .ok_or(EngineError::NotFound("event"))?;
+        // Only alerts can be replayed: replaying "stream started" or a ban would re-run
+        // their side effects.
+        if !e.kind.is_alertable() {
+            return Err(EngineError::Invalid(
+                "Only events that showed an alert can be replayed.".into(),
+            ));
+        }
         e.origin = Origin::Replay;
         // A replay is a new event; keeping the platform id would make it a duplicate.
         e.source_id = None;
@@ -221,22 +228,26 @@ impl Engine {
                 }),
             }
         }
-        let list = {
-            let mut st = self.state_mut();
-            st.bans.add(entry);
-            st.bans.clone()
-        };
-        self.db(move |s| repo::bot::save_ban_list(s, &list)).await?;
+        let _one_at_a_time = self.config_lock().await;
+        let mut list = self.state().bans.clone();
+        list.add(entry);
+        let saved = list.clone();
+        self.db(move |s| repo::bot::save_ban_list(s, &saved))
+            .await?;
+        self.state_mut().bans = list;
         Ok(out)
     }
 
     pub async fn unban(&self, platform: Platform, user_id: &str) -> Result<(), EngineError> {
-        let list = {
-            let mut st = self.state_mut();
-            st.bans.remove(platform, user_id);
-            st.bans.clone()
-        };
-        self.db(move |s| repo::bot::save_ban_list(s, &list)).await?;
+        {
+            let _one_at_a_time = self.config_lock().await;
+            let mut list = self.state().bans.clone();
+            list.remove(platform, user_id);
+            let saved = list.clone();
+            self.db(move |s| repo::bot::save_ban_list(s, &saved))
+                .await?;
+            self.state_mut().bans = list;
+        }
         if let Some(c) = self.connector(platform) {
             c.unban(user_id).await?;
         }
@@ -295,6 +306,7 @@ impl Engine {
     }
 
     pub async fn save_panic(&self, cfg: PanicConfig) -> Result<PanicConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let saved = cfg.clone();
         self.db(move |s| repo::settings::set(s, "panic", &saved))
             .await?;
@@ -307,6 +319,7 @@ impl Engine {
     }
 
     pub async fn save_filter(&self, cfg: FilterConfig) -> Result<FilterConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         if cfg.terms.len() > 2_000 || cfg.terms.iter().any(|t| t.term.chars().count() > 100) {
             return Err(EngineError::Invalid(
                 "Up to 2,000 blocked terms of up to 100 characters each.".into(),
@@ -324,6 +337,7 @@ impl Engine {
     }
 
     pub async fn save_tts(&self, p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         if p.max_chars == 0 || p.max_chars > 500 {
             return Err(EngineError::Invalid(
                 "TTS can read 1 to 500 characters.".into(),
@@ -360,6 +374,7 @@ impl Engine {
     }
 
     pub async fn save_rule(&self, rule: AlertRule) -> Result<AlertRule, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         rule.validate()
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let saved = rule.clone();
@@ -370,6 +385,7 @@ impl Engine {
     }
 
     pub async fn delete_rule(&self, id: &str) -> Result<(), EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let rid = id.to_string();
         self.db(move |s| repo::rules::delete(s, &rid)).await?;
         let rules = self.db(repo::rules::list).await?;
@@ -382,6 +398,7 @@ impl Engine {
     }
 
     pub async fn save_goal(&self, goal: Goal) -> Result<Goal, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let saved = goal.clone();
         self.db(move |s| repo::goals::save(s, &saved)).await?;
         let goals = self.db(repo::goals::list).await?;
@@ -391,6 +408,7 @@ impl Engine {
     }
 
     pub async fn delete_goal(&self, id: &str) -> Result<(), EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let gid = id.to_string();
         self.db(move |s| repo::goals::delete(s, &gid)).await?;
         let goals = self.db(repo::goals::list).await?;
@@ -400,6 +418,7 @@ impl Engine {
     }
 
     pub async fn adjust_goal(&self, id: &str, delta: i64) -> Result<Goal, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let gid = id.to_string();
         let g = self
             .db(move |s| repo::goals::adjust(s, &gid, delta))
@@ -419,6 +438,7 @@ impl Engine {
     }
 
     pub async fn save_command(&self, cmd: Command) -> Result<Command, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let saved = cmd.clone();
         self.db(move |s| repo::bot::save_command(s, &saved)).await?;
         let all = self.db(repo::bot::commands).await?;
@@ -427,6 +447,7 @@ impl Engine {
     }
 
     pub async fn delete_command(&self, id: &str) -> Result<(), EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let cid = id.to_string();
         self.db(move |s| repo::bot::delete_command(s, &cid)).await?;
         let all = self.db(repo::bot::commands).await?;
@@ -439,6 +460,7 @@ impl Engine {
     }
 
     pub async fn save_timer(&self, t: Timer) -> Result<Timer, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let saved = t.clone();
         self.db(move |s| repo::bot::save_timer(s, &saved)).await?;
         let all = self.db(repo::bot::timers).await?;
@@ -447,6 +469,7 @@ impl Engine {
     }
 
     pub async fn delete_timer(&self, id: &str) -> Result<(), EngineError> {
+        let _one_at_a_time = self.config_lock().await;
         let tid = id.to_string();
         self.db(move |s| repo::bot::delete_timer(s, &tid)).await?;
         let all = self.db(repo::bot::timers).await?;
