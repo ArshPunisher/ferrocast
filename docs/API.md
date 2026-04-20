@@ -173,6 +173,10 @@ GET/PUT `/api/v1/settings`; POST `/api/v1/export` → a `.ferropack` download; P
 - `queue Queue`
 - `tts_pending [...]`
 - `notice { level: "info" | "warn" | "error", message, action?: { label, href } }`
+- `goals Goal[]` (after any goal change)
+- `held { event_id, reason }` (the chat filter held a message for a mod)
+- `panic { on, plan }`
+- `resync { missed }`: the socket fell behind; refetch status, queue and events
 
 The client sends nothing but pings.
 
@@ -192,7 +196,15 @@ Server → overlay frames `{ v: 1, seq, type, data }`:
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |
 | `clear_chat` | `{ platform: Platform \| null }` |
+| `tts` | `{ id, text }`: a mod approved a held TTS message; speak it |
+| `revoked` | `{}`: this URL was regenerated or the overlay deleted; the server closes the socket next |
 
 Overlay → server frames: `hello { since_seq }`, `ack { alert_id, phase: "started" | "finished" | "failed" }`, `visibility { visible }`. Anything else is ignored and logged. **An overlay can never create events** (R-36).
 
 Test mode: `/o/<token>/?test` asks the server for sample events on a loop, for previews in the editor.
+
+Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/`, so build it with Vite `base: "./"` (assets resolve to `/o/<token>/assets/…`). The dashboard is served under `/app/` (Vite `base: "/app/"`); unknown paths without a file extension fall back to `index.html`. Dashboard `<img>`/`<audio>` previews may pass the session as `?session=` on `GET /api/v1/media/{id}`.
+
+## 7. Not in this build yet
+
+`POST /accounts/{platform}/connect` and `POST /overlays/{id}/add-to-obs` answer 422 with a clear message until the platform and OBS adapters land.

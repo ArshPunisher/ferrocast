@@ -7,8 +7,30 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [dependencies]
+ferrocast-core.workspace = true
+ferrocast-connector.workspace = true
+ferrocast-engine.workspace = true
+ferrocast-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+axum = { version = "0.8", features = ["ws", "multipart"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path", "mime-guess"] }
+mime_guess = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4"
+subtle = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true
