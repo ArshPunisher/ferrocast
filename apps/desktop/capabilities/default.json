@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The dashboard talks to the engine over HTTP only; the window gets no IPC permissions.",
+  "windows": [],
+  "permissions": []
+}
