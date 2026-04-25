@@ -1,0 +1,19 @@
+[package]
+name = "ferrocast-headless"
+description = "Ferrocast's engine and local server without a window, for servers and spare PCs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferrocast-engine.workspace = true
+ferrocast-server.workspace = true
+tokio.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[lints]
+workspace = true
