@@ -18,6 +18,7 @@ ferrocast-twitch = { path = "crates/twitch" }
 ferrocast-youtube = { path = "crates/youtube" }
 ferrocast-kick = { path = "crates/kick" }
 ferrocast-obs = { path = "crates/obs" }
+ferrocast-secrets = { path = "crates/secrets" }
 ferrocast-engine = { path = "crates/engine" }
 ferrocast-server = { path = "crates/server" }
 ferrocast-testkit = { path = "crates/testkit" }
@@ -37,6 +38,13 @@ unwrap_used = "deny"
 expect_used = "warn"
 dbg_macro = "deny"
 todo = "warn"
+
+# Line tables are enough for backtraces; full debug info made target/ 7 GB.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 lto = "thin"
