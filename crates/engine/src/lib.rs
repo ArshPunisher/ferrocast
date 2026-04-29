@@ -10,6 +10,7 @@
 mod actions;
 mod dispatcher;
 mod error;
+mod obs;
 mod pipeline;
 mod snapshot;
 mod timers;
@@ -32,6 +33,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
+pub use obs::{ObsView, PasswordChange};
 use state::{ConnectorView, EngineSettings, State};
 
 /// Current wall-clock time. Only the engine reads the clock; `core` gets time passed in.
@@ -73,12 +75,22 @@ struct Inner {
     live_tx: broadcast::Sender<LiveFrame>,
     overlay_tx: broadcast::Sender<OverlayFrame>,
     base_url: RwLock<String>,
+    secrets: Arc<dyn ferrocast_secrets::Secrets>,
 }
 
 impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_secrets(data_dir, Arc::from(ferrocast_secrets::best_available())).await
+    }
+
+    /// Like [`Engine::start`] with a chosen secret store (tests use memory, never the
+    /// developer's real keychain).
+    pub async fn start_with_secrets(
+        data_dir: &Path,
+        secrets: Arc<dyn ferrocast_secrets::Secrets>,
+    ) -> Result<Engine, EngineError> {
         let dir = data_dir.to_path_buf();
         let store = tokio::task::spawn_blocking(move || -> Result<Store, StoreError> {
             if let Some(id) = ferrocast_store::backup::apply_scheduled_restore(&dir)? {
@@ -117,6 +129,7 @@ impl Engine {
                 live_tx,
                 overlay_tx,
                 base_url: RwLock::new("http://127.0.0.1:47820".into()),
+                secrets,
             }),
         };
         tokio::spawn(prune(engine.clone()));

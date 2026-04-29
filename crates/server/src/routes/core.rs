@@ -164,9 +164,54 @@ pub async fn add_to_obs(
     State(app): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    app.engine.overlay(&id).await?;
-    Err(ApiError::unavailable("OBS isn't connected.")
-        .hint("Connect OBS in Settings → OBS, or copy the URL and add a Browser Source."))
+    let added = app.engine.add_to_obs(&id).await.map_err(|e| {
+        let api = ApiError::from(e);
+        if api.code == "unavailable" {
+            api.hint("Or copy the overlay URL and add a Browser Source in OBS yourself.")
+        } else {
+            api
+        }
+    })?;
+    Ok(Json(json!(added)))
+}
+
+pub async fn obs(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.obs().await?)))
+}
+
+#[derive(Deserialize)]
+pub struct ObsBody {
+    host: String,
+    port: u16,
+    /// Absent keeps the saved password; `null` clears it; a string replaces it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    password: Option<Option<String>>,
+}
+
+fn deserialize_some<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+pub async fn save_obs(
+    State(app): State<AppState>,
+    Body(b): Body<ObsBody>,
+) -> ApiResult<Json<Value>> {
+    use ferrocast_engine::PasswordChange;
+    let change = match b.password {
+        None => PasswordChange::Keep,
+        Some(None) => PasswordChange::Clear,
+        Some(Some(p)) if p.chars().count() > 256 => {
+            return Err(ApiError::invalid("That password is too long."));
+        }
+        Some(Some(p)) => PasswordChange::Set(p),
+    };
+    let cfg = ferrocast_obs::ObsConfig {
+        host: b.host,
+        port: b.port,
+    };
+    Ok(Json(json!(app.engine.save_obs(cfg, change).await?)))
 }
 
 pub async fn rules(State(app): State<AppState>) -> Json<Value> {

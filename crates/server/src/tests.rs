@@ -46,7 +46,12 @@ impl Running {
 
 async fn start() -> Running {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::start(dir.path()).await.unwrap();
+    let engine = Engine::start_with_secrets(
+        dir.path(),
+        std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()),
+    )
+    .await
+    .unwrap();
     let server = serve(
         engine,
         ServeOptions {

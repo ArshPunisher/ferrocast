@@ -99,6 +99,8 @@ pub(crate) fn api() -> Router<AppState> {
             get(crate::assets::dashboard_media).delete(media::remove),
         )
         .route("/live", get(crate::ws::live))
+        // OBS
+        .route("/obs", get(core::obs).put(core::save_obs))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
         .route("/backups", get(core::backups).post(core::backup_now))

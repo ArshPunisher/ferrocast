@@ -87,9 +87,16 @@ impl Connector for FakePlatform {
     }
 }
 
+fn mem() -> Arc<dyn ferrocast_secrets::Secrets> {
+    Arc::new(ferrocast_secrets::MemorySecrets::default())
+}
+
 async fn engine() -> (Engine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    (Engine::start(dir.path()).await.unwrap(), dir)
+    (
+        Engine::start_with_secrets(dir.path(), mem()).await.unwrap(),
+        dir,
+    )
 }
 
 fn chat(p: Platform, id: &str, user: &str, text: &str) -> Event {
@@ -356,7 +363,7 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
 async fn the_queue_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let e = Engine::start(dir.path()).await.unwrap();
+        let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
         e.queue_pause().await;
         e.test("tip", None).await.unwrap();
         e.test("raid", None).await.unwrap();
@@ -366,7 +373,7 @@ async fn the_queue_survives_a_restart() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    let e = Engine::start(dir.path()).await.unwrap();
+    let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
     let q = e.queue().await;
     assert!(q.paused);
     assert_eq!(q.waiting.len(), 2);
@@ -442,7 +449,7 @@ async fn backfill_goes_to_the_feed_with_a_reason() {
 async fn moderated_chat_stays_hidden_after_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let e = Engine::start(dir.path()).await.unwrap();
+        let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
         e.register_connector(FakePlatform::new(Platform::Twitch));
         let mut f = e.filter();
         f.terms.push(BlockedTerm {
@@ -491,7 +498,7 @@ async fn moderated_chat_stays_hidden_after_a_restart() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    let e = Engine::start(dir.path()).await.unwrap();
+    let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
     let o = e
         .create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly)
         .await
