@@ -40,23 +40,16 @@ impl From<ObsError> for EngineError {
 
 impl Engine {
     async fn obs_config(&self) -> Result<ObsConfig, EngineError> {
-        self.db(|s| repo::settings::get_or_default::<ObsConfig>(s, "obs"))
-            .await
+        self.db(|s| repo::settings::get_or_default::<ObsConfig>(s, "obs")).await
     }
 
     fn obs_password(&self) -> Result<Option<String>, EngineError> {
-        self.inner
-            .secrets
-            .get(PASSWORD_KEY)
-            .map_err(|e| EngineError::Unavailable(e.to_string()))
+        self.inner.secrets.get(PASSWORD_KEY).map_err(|e| EngineError::Unavailable(e.to_string()))
     }
 
     fn set_obs_state(&self, state: &str, detail: Option<String>) {
         let mut st = self.state_mut();
-        let v = st
-            .connectors
-            .entry("obs".into())
-            .or_insert_with(ConnectorView::off);
+        let v = st.connectors.entry("obs".into()).or_insert_with(ConnectorView::off);
         v.state = state.into();
         v.detail = detail;
         v.last_event_at = Some(crate::now().0);
@@ -88,30 +81,18 @@ impl Engine {
         Ok(view)
     }
 
-    pub async fn save_obs(
-        &self,
-        cfg: ObsConfig,
-        password: PasswordChange,
-    ) -> Result<ObsView, EngineError> {
+    pub async fn save_obs(&self, cfg: ObsConfig, password: PasswordChange) -> Result<ObsView, EngineError> {
         let host = cfg.host.trim();
         if host.is_empty() || host.len() > 253 || host.contains(['/', ' ', '@']) {
-            return Err(EngineError::Invalid(
-                "Enter OBS's address, like 127.0.0.1 or my-pc.local.".into(),
-            ));
+            return Err(EngineError::Invalid("Enter OBS's address, like 127.0.0.1 or my-pc.local.".into()));
         }
         if cfg.port == 0 {
-            return Err(EngineError::Invalid(
-                "The port must be 1 to 65535 (OBS uses 4455).".into(),
-            ));
+            return Err(EngineError::Invalid("The port must be 1 to 65535 (OBS uses 4455).".into()));
         }
         {
             let _one_at_a_time = self.config_lock().await;
-            let saved = ObsConfig {
-                host: host.to_string(),
-                port: cfg.port,
-            };
-            self.db(move |s| repo::settings::set(s, "obs", &saved))
-                .await?;
+            let saved = ObsConfig { host: host.to_string(), port: cfg.port };
+            self.db(move |s| repo::settings::set(s, "obs", &saved)).await?;
             let r = match password {
                 PasswordChange::Keep => Ok(()),
                 PasswordChange::Clear => self.inner.secrets.delete(PASSWORD_KEY),

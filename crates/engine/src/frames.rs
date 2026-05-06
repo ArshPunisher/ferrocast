@@ -31,11 +31,7 @@ pub struct OverlayFrame {
 impl OverlayFrame {
     pub fn new(audience: Audience, seq: u64, kind: &str, data: &impl Serialize) -> Self {
         let text = envelope(Some(seq), kind, data);
-        OverlayFrame {
-            audience,
-            seq,
-            text,
-        }
+        OverlayFrame { audience, seq, text }
     }
 }
 
@@ -47,9 +43,7 @@ pub struct LiveFrame {
 
 impl LiveFrame {
     pub fn new(kind: &str, data: &impl Serialize) -> Self {
-        LiveFrame {
-            text: envelope(None, kind, data),
-        }
+        LiveFrame { text: envelope(None, kind, data) }
     }
 }
 
@@ -95,10 +89,7 @@ mod tests {
     fn envelope_shape() {
         let t = envelope(Some(7), "alert_hide", &json!({ "alert_id": "a" }));
         let v: Value = serde_json::from_str(&t).unwrap();
-        assert_eq!(
-            v,
-            json!({ "v": 1, "seq": 7, "type": "alert_hide", "data": { "alert_id": "a" } })
-        );
+        assert_eq!(v, json!({ "v": 1, "seq": 7, "type": "alert_hide", "data": { "alert_id": "a" } }));
         let t = envelope(None, "notice", &"x");
         assert!(!t.contains("seq"));
     }

@@ -19,8 +19,7 @@ pub(crate) async fn run(engine: Engine) {
     loop {
         let wake = engine.inner.queue.lock().await.next_wake();
         let sleep = match wake {
-            Some(at) => Duration::from_millis(u64::try_from((at.0 - now().0).max(0)).unwrap_or(0))
-                .min(MAX_IDLE),
+            Some(at) => Duration::from_millis(u64::try_from((at.0 - now().0).max(0)).unwrap_or(0)).min(MAX_IDLE),
             None => MAX_IDLE,
         };
         tokio::select! {
@@ -55,17 +54,10 @@ pub struct WaitingView {
 fn view(q: &AlertQueue) -> QueueView {
     QueueView {
         paused: q.is_paused(),
-        playing: q.playing().map(|p| PlayingView {
-            alert: p.alert.clone(),
-            started_at: p.started_at.0,
-        }),
+        playing: q.playing().map(|p| PlayingView { alert: p.alert.clone(), started_at: p.started_at.0 }),
         waiting: q
             .waiting()
-            .map(|w| WaitingView {
-                alert: w.alert.clone(),
-                priority: w.priority,
-                enqueued_at: w.enqueued_at.0,
-            })
+            .map(|w| WaitingView { alert: w.alert.clone(), priority: w.priority, enqueued_at: w.enqueued_at.0 })
             .collect(),
     }
 }
@@ -86,10 +78,7 @@ impl Engine {
             // tick changes nothing and writes nothing.
             if changed {
                 let snapshot = q.clone();
-                if let Err(err) = self
-                    .db(move |s| repo::rules::save_queue(s, &snapshot))
-                    .await
-                {
+                if let Err(err) = self.db(move |s| repo::rules::save_queue(s, &snapshot)).await {
                     tracing::error!(%err, "couldn't save the alert queue");
                 }
             }
@@ -98,12 +87,7 @@ impl Engine {
         for a in actions {
             match a {
                 Action::Show { alert } => {
-                    self.send_overlay(OverlayFrame::new(
-                        Audience::Alerts,
-                        self.next_seq(),
-                        "alert",
-                        &alert,
-                    ));
+                    self.send_overlay(OverlayFrame::new(Audience::Alerts, self.next_seq(), "alert", &alert));
                 }
                 Action::Hide { alert_id } => {
                     self.send_overlay(OverlayFrame::new(
@@ -136,8 +120,7 @@ impl Engine {
     }
 
     pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32) {
-        self.queue_op(move |q, t| q.enqueue(alert, priority, t))
-            .await;
+        self.queue_op(move |q, t| q.enqueue(alert, priority, t)).await;
         self.inner.queue_changed.notify_one();
     }
 

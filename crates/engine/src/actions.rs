@@ -71,25 +71,18 @@ impl Engine {
             Some(p) => sample::sample(kind, p, at),
             None => sample::any_sample(kind, at),
         }
-        .ok_or_else(|| {
-            EngineError::Invalid(format!("There's no test for \"{kind}\" on that platform."))
-        })?;
+        .ok_or_else(|| EngineError::Invalid(format!("There's no test for \"{kind}\" on that platform.")))?;
         self.submit(event).await
     }
 
     /// Replays a logged event as a new alert.
     pub async fn replay(&self, event_id: &str) -> Result<(), EngineError> {
         let id = event_id.to_string();
-        let mut e = self
-            .db(move |s| repo::events::get(s, &id))
-            .await?
-            .ok_or(EngineError::NotFound("event"))?;
+        let mut e = self.db(move |s| repo::events::get(s, &id)).await?.ok_or(EngineError::NotFound("event"))?;
         // Only alerts can be replayed: replaying "stream started" or a ban would re-run
         // their side effects.
         if !e.kind.is_alertable() {
-            return Err(EngineError::Invalid(
-                "Only events that showed an alert can be replayed.".into(),
-            ));
+            return Err(EngineError::Invalid("Only events that showed an alert can be replayed.".into()));
         }
         e.origin = Origin::Replay;
         // A replay is a new event; keeping the platform id would make it a duplicate.
@@ -113,24 +106,14 @@ impl Engine {
         if text.is_empty() {
             return Err(EngineError::Invalid("The message is empty.".into()));
         }
-        let targets: Vec<Platform> = if platforms.is_empty() {
-            Platform::CHAT.to_vec()
-        } else {
-            platforms.to_vec()
-        };
+        let targets: Vec<Platform> = if platforms.is_empty() { Platform::CHAT.to_vec() } else { platforms.to_vec() };
         let mut out = Outcome::default();
         for p in targets {
             let Some(c) = self.connector(p) else {
-                out.failed.push(Failure {
-                    platform: p,
-                    reason: format!("{p} isn't connected"),
-                });
+                out.failed.push(Failure { platform: p, reason: format!("{p} isn't connected") });
                 continue;
             };
-            let reply = reply_to
-                .as_ref()
-                .filter(|(rp, _)| *rp == p)
-                .map(|(_, id)| id.as_str());
+            let reply = reply_to.as_ref().filter(|(rp, _)| *rp == p).map(|(_, id)| id.as_str());
             let mut result = Ok(());
             for chunk in split_chat(&text, max_chat_chars(p)) {
                 result = c.send_chat(&chunk, reply).await;
@@ -140,23 +123,14 @@ impl Engine {
             }
             match result {
                 Ok(()) => out.ok.push(p),
-                Err(e) => out.failed.push(Failure {
-                    platform: p,
-                    reason: e.to_string(),
-                }),
+                Err(e) => out.failed.push(Failure { platform: p, reason: e.to_string() }),
             }
         }
         Ok(out)
     }
 
-    pub async fn delete_message(
-        &self,
-        platform: Platform,
-        message_id: &str,
-    ) -> Result<(), EngineError> {
-        let c = self
-            .connector(platform)
-            .ok_or(ConnectorError::NotConnected(platform))?;
+    pub async fn delete_message(&self, platform: Platform, message_id: &str) -> Result<(), EngineError> {
+        let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
         c.delete_message(message_id).await?;
         self.hide_message(platform, message_id);
         Ok(())
@@ -170,13 +144,9 @@ impl Engine {
         reason: Option<&str>,
     ) -> Result<(), EngineError> {
         if !(1..=1_209_600).contains(&seconds) {
-            return Err(EngineError::Invalid(
-                "Timeouts are 1 second to 14 days.".into(),
-            ));
+            return Err(EngineError::Invalid("Timeouts are 1 second to 14 days.".into()));
         }
-        let c = self
-            .connector(platform)
-            .ok_or(ConnectorError::NotConnected(platform))?;
+        let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
         Ok(c.timeout(user_id, seconds, reason).await?)
     }
 
@@ -203,8 +173,7 @@ impl Engine {
             let (p, uid) = (platform, user_id.to_string());
             if let Ok(card) = self.db(move |s| repo::viewers::card(s, p, &uid)).await {
                 for id in card.identities {
-                    let ip: Platform =
-                        serde_json::from_value(json!(id.platform)).unwrap_or(platform);
+                    let ip: Platform = serde_json::from_value(json!(id.platform)).unwrap_or(platform);
                     if ip != platform {
                         entry.linked.push((ip, id.user_id));
                     }
@@ -217,23 +186,16 @@ impl Engine {
             match self.connector(p) {
                 Some(c) => match c.ban(&uid, reason.as_deref()).await {
                     Ok(()) => out.ok.push(p),
-                    Err(e) => out.failed.push(Failure {
-                        platform: p,
-                        reason: e.to_string(),
-                    }),
+                    Err(e) => out.failed.push(Failure { platform: p, reason: e.to_string() }),
                 },
-                None => out.failed.push(Failure {
-                    platform: p,
-                    reason: format!("{p} isn't connected"),
-                }),
+                None => out.failed.push(Failure { platform: p, reason: format!("{p} isn't connected") }),
             }
         }
         let _one_at_a_time = self.config_lock().await;
         let mut list = self.state().bans.clone();
         list.add(entry);
         let saved = list.clone();
-        self.db(move |s| repo::bot::save_ban_list(s, &saved))
-            .await?;
+        self.db(move |s| repo::bot::save_ban_list(s, &saved)).await?;
         self.state_mut().bans = list;
         Ok(out)
     }
@@ -244,8 +206,7 @@ impl Engine {
             let mut list = self.state().bans.clone();
             list.remove(platform, user_id);
             let saved = list.clone();
-            self.db(move |s| repo::bot::save_ban_list(s, &saved))
-                .await?;
+            self.db(move |s| repo::bot::save_ban_list(s, &saved)).await?;
             self.state_mut().bans = list;
         }
         if let Some(c) = self.connector(platform) {
@@ -262,11 +223,7 @@ impl Engine {
     pub async fn panic(&self, on: bool) -> Result<PanicPlan, EngineError> {
         let (cfg, connected) = {
             let st = self.state();
-            let connected: Vec<_> = self
-                .connectors()
-                .iter()
-                .map(|c| (c.platform(), c.capabilities()))
-                .collect();
+            let connected: Vec<_> = self.connectors().iter().map(|c| (c.platform(), c.capabilities())).collect();
             (st.panic.clone(), connected)
         };
         let plan = plan_panic(&cfg, &connected, on);
@@ -308,8 +265,7 @@ impl Engine {
     pub async fn save_panic(&self, cfg: PanicConfig) -> Result<PanicConfig, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         let saved = cfg.clone();
-        self.db(move |s| repo::settings::set(s, "panic", &saved))
-            .await?;
+        self.db(move |s| repo::settings::set(s, "panic", &saved)).await?;
         self.state_mut().panic = cfg.clone();
         Ok(cfg)
     }
@@ -321,13 +277,10 @@ impl Engine {
     pub async fn save_filter(&self, cfg: FilterConfig) -> Result<FilterConfig, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         if cfg.terms.len() > 2_000 || cfg.terms.iter().any(|t| t.term.chars().count() > 100) {
-            return Err(EngineError::Invalid(
-                "Up to 2,000 blocked terms of up to 100 characters each.".into(),
-            ));
+            return Err(EngineError::Invalid("Up to 2,000 blocked terms of up to 100 characters each.".into()));
         }
         let saved = cfg.clone();
-        self.db(move |s| repo::settings::set(s, "filter", &saved))
-            .await?;
+        self.db(move |s| repo::settings::set(s, "filter", &saved)).await?;
         self.state_mut().filter = cfg.clone();
         Ok(cfg)
     }
@@ -339,13 +292,10 @@ impl Engine {
     pub async fn save_tts(&self, p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         if p.max_chars == 0 || p.max_chars > 500 {
-            return Err(EngineError::Invalid(
-                "TTS can read 1 to 500 characters.".into(),
-            ));
+            return Err(EngineError::Invalid("TTS can read 1 to 500 characters.".into()));
         }
         let saved = p.clone();
-        self.db(move |s| repo::settings::set(s, "tts", &saved))
-            .await?;
+        self.db(move |s| repo::settings::set(s, "tts", &saved)).await?;
         self.state_mut().tts = p.clone();
         Ok(p)
     }
@@ -375,8 +325,7 @@ impl Engine {
 
     pub async fn save_rule(&self, rule: AlertRule) -> Result<AlertRule, EngineError> {
         let _one_at_a_time = self.config_lock().await;
-        rule.validate()
-            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        rule.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
         let saved = rule.clone();
         self.db(move |s| repo::rules::save(s, &saved)).await?;
         let rules = self.db(repo::rules::list).await?;
@@ -420,9 +369,7 @@ impl Engine {
     pub async fn adjust_goal(&self, id: &str, delta: i64) -> Result<Goal, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         let gid = id.to_string();
-        let g = self
-            .db(move |s| repo::goals::adjust(s, &gid, delta))
-            .await?;
+        let g = self.db(move |s| repo::goals::adjust(s, &gid, delta)).await?;
         {
             let mut st = self.state_mut();
             if let Some(slot) = st.goals.iter_mut().find(|x| x.id == g.id) {
@@ -491,12 +438,7 @@ impl Engine {
     }
 
     /// Recent logged events as the dashboard sees them.
-    pub async fn events(
-        &self,
-        before: Option<i64>,
-        limit: u32,
-        kinds: Vec<String>,
-    ) -> Result<Vec<Event>, EngineError> {
+    pub async fn events(&self, before: Option<i64>, limit: u32, kinds: Vec<String>) -> Result<Vec<Event>, EngineError> {
         Ok(self
             .db(move |s| repo::events::recent(s, before, limit, &kinds))
             .await?

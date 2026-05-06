@@ -21,15 +21,7 @@ pub struct OverlayView {
     pub updated_at: i64,
 }
 
-const ALERTABLE: [&str; 7] = [
-    "follow",
-    "subscription",
-    "gift_batch",
-    "platform_gift",
-    "paid_message",
-    "tip",
-    "raid",
-];
+const ALERTABLE: [&str; 7] = ["follow", "subscription", "gift_batch", "platform_gift", "paid_message", "tip", "raid"];
 
 impl Engine {
     pub fn overlay_view(&self, o: &Overlay) -> OverlayView {
@@ -54,22 +46,15 @@ impl Engine {
         self.db(move |s| repo::overlays::get(s, &oid)).await
     }
 
-    pub async fn create_overlay(
-        &self,
-        name: &str,
-        preset: Preset,
-    ) -> Result<OverlayView, EngineError> {
+    pub async fn create_overlay(&self, name: &str, preset: Preset) -> Result<OverlayView, EngineError> {
         let n = name.to_string();
-        let o = self
-            .db(move |s| repo::overlays::create(s, &n, preset))
-            .await?;
+        let o = self.db(move |s| repo::overlays::create(s, &n, preset)).await?;
         Ok(self.overlay_view(&o))
     }
 
     /// Saves an edited overlay and pushes the new layout to its open pages.
     pub async fn update_overlay(&self, o: Overlay) -> Result<OverlayView, EngineError> {
-        o.validate()
-            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        o.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
         self.send_overlay(OverlayFrame::new(
@@ -83,9 +68,7 @@ impl Engine {
 
     pub async fn regenerate_overlay_url(&self, id: &str) -> Result<OverlayView, EngineError> {
         let oid = id.to_string();
-        let o = self
-            .db(move |s| repo::overlays::regenerate_token(s, &oid))
-            .await?;
+        let o = self.db(move |s| repo::overlays::regenerate_token(s, &oid)).await?;
         // Pages still open on the old URL must stop at once.
         self.revoke(&o.id);
         Ok(self.overlay_view(&o))
@@ -124,9 +107,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             // Same rule as the live path: only live events that could alert (a pending or
             // refunded tip, or a backfilled follow, never shows on stream).
-            list.retain(|e| {
-                e.origin == ferrocast_core::event::Origin::Live && e.kind.is_alertable()
-            });
+            list.retain(|e| e.origin == ferrocast_core::event::Origin::Live && e.kind.is_alertable());
             list.truncate(25);
             list
         } else {
@@ -139,11 +120,7 @@ impl Engine {
                 .into_iter()
                 .map(|(_, e)| e)
                 .collect();
-            c.retain(|e| {
-                !e.source_id
-                    .as_deref()
-                    .is_some_and(|id| self.is_hidden(e.platform, id))
-            });
+            c.retain(|e| !e.source_id.as_deref().is_some_and(|id| self.is_hidden(e.platform, id)));
             c.reverse();
             c
         } else {
@@ -153,27 +130,18 @@ impl Engine {
         events.reverse();
         let (goals, viewers, labels) = {
             let st = self.state();
-            let viewers: serde_json::Map<String, Value> = st
-                .viewers
-                .iter()
-                .map(|(p, c)| (platform_key(*p).to_string(), json!(c)))
-                .collect();
+            let viewers: serde_json::Map<String, Value> =
+                st.viewers.iter().map(|(p, c)| (platform_key(*p).to_string(), json!(c))).collect();
             let labels: serde_json::Map<String, Value> = o
                 .widgets
                 .iter()
                 .filter(|w| w.kind == WidgetKind::Label)
                 .map(|w| {
                     let source = w.config.get("source").and_then(Value::as_str).unwrap_or("");
-                    let tpl = w
-                        .config
-                        .get("template")
-                        .and_then(Value::as_str)
-                        .unwrap_or("{value}");
+                    let tpl = w.config.get("template").and_then(Value::as_str).unwrap_or("{value}");
                     let mut vars = Vars::new();
                     vars.insert("value".into(), st.session.label(source));
-                    let text = Template::parse(tpl)
-                        .map(|t| t.render(&vars))
-                        .unwrap_or_default();
+                    let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
                     (w.id.clone(), json!(text))
                 })
                 .collect();

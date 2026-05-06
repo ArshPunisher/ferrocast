@@ -47,12 +47,7 @@ impl Engine {
         }
 
         if e.origin != Origin::Test {
-            let first = self
-                .inner
-                .dedupe
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .first_time(&e, at);
+            let first = self.inner.dedupe.lock().unwrap_or_else(|p| p.into_inner()).first_time(&e, at);
             if !first {
                 tracing::debug!(platform = %e.platform, source = ?e.source_id, "duplicate dropped");
                 return;
@@ -65,10 +60,7 @@ impl Engine {
                 let key = platform_key(e.platform).to_string();
                 let view = {
                     let mut st = self.state_mut();
-                    let v = st
-                        .connectors
-                        .entry(key.clone())
-                        .or_insert_with(crate::state::ConnectorView::off);
+                    let v = st.connectors.entry(key.clone()).or_insert_with(crate::state::ConnectorView::off);
                     v.apply(status);
                     v.last_event_at = Some(at.0);
                     st.connectors.clone()
@@ -85,12 +77,7 @@ impl Engine {
                         .map(|(p, c)| (platform_key(*p).to_string(), *c))
                         .collect::<std::collections::HashMap<_, _>>()
                 };
-                self.send_overlay(OverlayFrame::new(
-                    Audience::All,
-                    e.seq,
-                    "state",
-                    &json!({ "viewers": viewers }),
-                ));
+                self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
                 return;
             }
             _ => {}
@@ -103,11 +90,7 @@ impl Engine {
                 Ok(None) => return, // the platform delivered this one before (a restart ago)
                 Err(err) => tracing::error!(%err, "couldn't log an event; continuing"),
             }
-            if let Some(view) = self
-                .state_mut()
-                .connectors
-                .get_mut(platform_key(e.platform))
-            {
+            if let Some(view) = self.state_mut().connectors.get_mut(platform_key(e.platform)) {
                 view.last_event_at = Some(at.0);
             }
         }
@@ -162,19 +145,13 @@ impl Engine {
                 let anyone_live = st.live.values().any(|l| *l);
                 st.live.insert(e.platform, true);
                 if !anyone_live {
-                    st.session = crate::state::Session {
-                        started_at: Some(at),
-                        ..Default::default()
-                    };
+                    st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
                 }
             }
             EventKind::StreamOffline => {
                 self.state_mut().live.insert(e.platform, false);
             }
-            EventKind::Reversal {
-                original_source_id,
-                reason,
-            } => {
+            EventKind::Reversal { original_source_id, reason } => {
                 self.reverse(e.platform, original_source_id, *reason).await;
             }
             _ => {}
@@ -215,16 +192,9 @@ impl Engine {
         let (on_sight, verdict, bot_on) = {
             let st = self.state();
             let on_sight = st.settings.auto_ban_on_sight && st.bans.on_sight(actor).is_some();
-            let emotes = content
-                .fragments
-                .iter()
-                .filter(|f| matches!(f, ferrocast_core::event::Fragment::Emote { .. }))
-                .count();
-            (
-                on_sight,
-                filter::check(&st.filter, actor, &content.text, emotes),
-                st.settings.bot_enabled,
-            )
+            let emotes =
+                content.fragments.iter().filter(|f| matches!(f, ferrocast_core::event::Fragment::Emote { .. })).count();
+            (on_sight, filter::check(&st.filter, actor, &content.text, emotes), st.settings.bot_enabled)
         };
 
         let user_id = actor.id.clone();
@@ -242,10 +212,7 @@ impl Engine {
             Action::Allow => {}
             Action::Hold => {
                 self.hide_message(e.platform, &message_id);
-                self.send_live(LiveFrame::new(
-                    "held",
-                    &json!({ "event_id": e.id, "reason": verdict.reason }),
-                ));
+                self.send_live(LiveFrame::new("held", &json!({ "event_id": e.id, "reason": verdict.reason })));
                 return false;
             }
             Action::Delete | Action::Timeout { .. } | Action::Ban => {
@@ -253,17 +220,13 @@ impl Engine {
                 let reason = verdict.reason.clone();
                 let mid = message_id.clone();
                 match verdict.action {
-                    Action::Delete if !mid.is_empty() => {
-                        self.spawn_action(e.platform, "delete a message", move |c| {
-                            Box::pin(async move { c.delete_message(&mid).await })
-                        })
-                    }
+                    Action::Delete if !mid.is_empty() => self.spawn_action(e.platform, "delete a message", move |c| {
+                        Box::pin(async move { c.delete_message(&mid).await })
+                    }),
                     Action::Timeout { seconds } => {
                         if let Some(uid) = user_id {
                             self.spawn_action(e.platform, "time someone out", move |c| {
-                                Box::pin(
-                                    async move { c.timeout(&uid, seconds, Some(&reason)).await },
-                                )
+                                Box::pin(async move { c.timeout(&uid, seconds, Some(&reason)).await })
                             });
                         }
                     }
@@ -297,20 +260,8 @@ impl Engine {
         }
         let result = {
             let commands = self.state().commands.clone();
-            let mut cd = self
-                .inner
-                .cooldowns
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            command::run(
-                &commands,
-                &mut cd,
-                e.platform,
-                actor,
-                &content.text,
-                &extra,
-                now(),
-            )
+            let mut cd = self.inner.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+            command::run(&commands, &mut cd, e.platform, actor, &content.text, &extra, now())
         };
         match result {
             Ok(reply) if !reply.is_empty() => {
@@ -334,27 +285,15 @@ impl Engine {
 
         let (rules, test_alerts, tts_decision, paused_tts) = {
             let st = self.state();
-            (
-                st.rules.clone(),
-                st.settings.test_alerts,
-                tts::decide(&st.tts, &st.filter, e),
-                st.tts_paused,
-            )
+            (st.rules.clone(), st.settings.test_alerts, tts::decide(&st.tts, &st.filter, e), st.tts_paused)
         };
-        let decision = if paused_tts {
-            Decision::Skip {
-                reason: "panic mode paused TTS".into(),
-            }
-        } else {
-            tts_decision
-        };
+        let decision =
+            if paused_tts { Decision::Skip { reason: "panic mode paused TTS".into() } } else { tts_decision };
 
         let mut alerted = false;
         if !e.may_alert() {
             reasons.push(match (&e.kind, e.origin) {
-                (EventKind::Tip { .. }, _) => {
-                    "The payment isn't confirmed yet, so it didn't alert.".into()
-                }
+                (EventKind::Tip { .. }, _) => "The payment isn't confirmed yet, so it didn't alert.".into(),
                 (_, Origin::Backfill) => {
                     "It arrived after a reconnect, so it went to the feed without an alert.".into()
                 }
@@ -369,11 +308,7 @@ impl Engine {
             } else {
                 alert.tts_text = None;
             }
-            let priority = if e.origin == Origin::Test {
-                0
-            } else {
-                variation.priority
-            };
+            let priority = if e.origin == Origin::Test { 0 } else { variation.priority };
             self.enqueue_alert(alert, priority).await;
             alerted = true;
         } else {
@@ -394,8 +329,7 @@ impl Engine {
             self.push_tts_pending().await;
             reasons.push("The message is waiting for TTS approval.".into());
         }
-        self.state_mut()
-            .remember_why(&e.id, Why { alerted, reasons });
+        self.state_mut().remember_why(&e.id, Why { alerted, reasons });
     }
 
     async fn count_goals(&self, e: &Event) {
@@ -408,10 +342,7 @@ impl Engine {
                 continue;
             }
             let (gid, p, src) = (g.id.clone(), e.platform, source.clone());
-            match self
-                .db(move |s| repo::goals::contribute(s, &gid, p, &src, amount))
-                .await
-            {
+            match self.db(move |s| repo::goals::contribute(s, &gid, p, &src, amount)).await {
                 Ok(Some(updated)) => {
                     let mut st = self.state_mut();
                     if let Some(slot) = st.goals.iter_mut().find(|x| x.id == updated.id) {
@@ -428,17 +359,9 @@ impl Engine {
         }
     }
 
-    async fn reverse(
-        &self,
-        platform: Platform,
-        source_id: &str,
-        reason: ferrocast_core::event::ReversalReason,
-    ) {
+    async fn reverse(&self, platform: Platform, source_id: &str, reason: ferrocast_core::event::ReversalReason) {
         let src = source_id.to_string();
-        match self
-            .db(move |s| repo::goals::reverse(s, platform, &src))
-            .await
-        {
+        match self.db(move |s| repo::goals::reverse(s, platform, &src)).await {
             Ok(changed) if !changed.is_empty() => {
                 {
                     let mut st = self.state_mut();
@@ -470,12 +393,7 @@ impl Engine {
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {
         let goals = self.state().goals.clone();
-        self.send_overlay(OverlayFrame::new(
-            Audience::All,
-            seq,
-            "state",
-            &json!({ "goals": goals }),
-        ));
+        self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "goals": goals })));
         self.send_live(LiveFrame::new("goals", &goals));
     }
 

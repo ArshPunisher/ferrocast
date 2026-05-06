@@ -29,12 +29,7 @@ pub struct EngineSettings {
 
 impl Default for EngineSettings {
     fn default() -> Self {
-        EngineSettings {
-            keep_chat_days: 30,
-            test_alerts: true,
-            bot_enabled: true,
-            auto_ban_on_sight: true,
-        }
+        EngineSettings { keep_chat_days: 30, test_alerts: true, bot_enabled: true, auto_ban_on_sight: true }
     }
 }
 
@@ -77,29 +72,18 @@ pub struct AccountView {
 
 impl ConnectorView {
     pub fn off() -> Self {
-        ConnectorView {
-            state: "off".into(),
-            account: None,
-            detail: None,
-            last_event_at: None,
-        }
+        ConnectorView { state: "off".into(), account: None, detail: None, last_event_at: None }
     }
 
     pub fn apply(&mut self, status: &ConnectorStatus) {
         let (state, detail) = match status {
             ConnectorStatus::Connected => ("connected", None),
-            ConnectorStatus::Reconnecting { attempt } => {
-                ("reconnecting", Some(format!("Attempt {attempt}")))
-            }
+            ConnectorStatus::Reconnecting { attempt } => ("reconnecting", Some(format!("Attempt {attempt}"))),
             ConnectorStatus::Disconnected { reason } => ("disconnected", Some(reason.clone())),
-            ConnectorStatus::SignInNeeded => (
-                "sign_in_needed",
-                Some("Sign in again to keep events coming.".into()),
-            ),
-            ConnectorStatus::ScopesMissing { scopes } => (
-                "scopes_missing",
-                Some(format!("Needs permission: {}", scopes.join(", "))),
-            ),
+            ConnectorStatus::SignInNeeded => ("sign_in_needed", Some("Sign in again to keep events coming.".into())),
+            ConnectorStatus::ScopesMissing { scopes } => {
+                ("scopes_missing", Some(format!("Needs permission: {}", scopes.join(", "))))
+            }
         };
         self.state = state.into();
         self.detail = detail;
@@ -124,11 +108,7 @@ impl State {
     }
 
     pub fn why(&self, event_id: &str) -> Option<&Why> {
-        self.why
-            .iter()
-            .rev()
-            .find(|(id, _)| id == event_id)
-            .map(|(_, w)| w)
+        self.why.iter().rev().find(|(id, _)| id == event_id).map(|(_, w)| w)
     }
 }
 
@@ -153,11 +133,7 @@ impl Session {
                 self.follows += 1;
                 self.latest_follower = Some(actor.display_name.clone());
             }
-            EventKind::Subscription {
-                actor,
-                gifted_by: None,
-                ..
-            } => {
+            EventKind::Subscription { actor, gifted_by: None, .. } => {
                 self.subs += 1;
                 self.latest_sub = Some(actor.display_name.clone());
             }
@@ -189,16 +165,8 @@ impl Session {
         match source {
             "latest_follower" => self.latest_follower.clone().unwrap_or_default(),
             "latest_sub" => self.latest_sub.clone().unwrap_or_default(),
-            "latest_tip" => self
-                .latest_tip
-                .as_ref()
-                .map(|(n, m)| format!("{n} {}", m.display()))
-                .unwrap_or_default(),
-            "top_tip_session" => self
-                .top_tip
-                .as_ref()
-                .map(|(n, m)| format!("{n} {}", m.display()))
-                .unwrap_or_default(),
+            "latest_tip" => self.latest_tip.as_ref().map(|(n, m)| format!("{n} {}", m.display())).unwrap_or_default(),
+            "top_tip_session" => self.top_tip.as_ref().map(|(n, m)| format!("{n} {}", m.display())).unwrap_or_default(),
             "session_follows" => self.follows.to_string(),
             "session_subs" => self.subs.to_string(),
             _ => String::new(),
@@ -230,13 +198,7 @@ mod tests {
     fn why_is_bounded() {
         let mut st = State::default();
         for i in 0..(WHY_KEEP + 10) {
-            st.remember_why(
-                &i.to_string(),
-                Why {
-                    alerted: true,
-                    reasons: vec![],
-                },
-            );
+            st.remember_why(&i.to_string(), Why { alerted: true, reasons: vec![] });
         }
         assert_eq!(st.why.len(), WHY_KEEP);
         assert!(st.why("0").is_none());

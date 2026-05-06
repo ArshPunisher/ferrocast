@@ -21,12 +21,7 @@ pub async fn status(State(app): State<AppState>) -> Json<Value> {
     let mut v = app.engine.status();
     v["version"] = json!(env!("CARGO_PKG_VERSION"));
     v["port"] = json!(app.guard.port);
-    let overlays = app
-        .engine
-        .overlays()
-        .await
-        .map(|o| !o.is_empty())
-        .unwrap_or(false);
+    let overlays = app.engine.overlays().await.map(|o| !o.is_empty()).unwrap_or(false);
     v["setup_done"] = json!(overlays);
     Json(v)
 }
@@ -65,29 +60,13 @@ pub async fn accounts(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(out)))
 }
 
-pub async fn connect(
-    State(_app): State<AppState>,
-    Path(p): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn connect(State(app): State<AppState>, Path(p): Path<String>) -> ApiResult<Json<Value>> {
     let p = platform(&p)?;
-    Err(ApiError::unavailable(format!(
-        "Signing in to {p} isn't available in this build yet."
-    )))
+    Ok(Json(json!(app.engine.connect_account(p).await?)))
 }
 
-pub async fn disconnect(
-    State(app): State<AppState>,
-    Path(p): Path<String>,
-) -> ApiResult<StatusCode> {
-    let p = platform(&p)?;
-    let key = serde_json::to_value(p)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
-    app.engine
-        .db(move |s| repo::settings::remove_account(s, &key))
-        .await?;
-    app.engine.unregister_connector(p);
+pub async fn disconnect(State(app): State<AppState>, Path(p): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.disconnect_account(platform(&p)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -102,21 +81,12 @@ pub struct NewOverlay {
     preset: Option<Preset>,
 }
 
-pub async fn create_overlay(
-    State(app): State<AppState>,
-    Body(b): Body<NewOverlay>,
-) -> ApiResult<impl IntoResponse> {
-    let o = app
-        .engine
-        .create_overlay(&b.name, b.preset.unwrap_or(Preset::Starter))
-        .await?;
+pub async fn create_overlay(State(app): State<AppState>, Body(b): Body<NewOverlay>) -> ApiResult<impl IntoResponse> {
+    let o = app.engine.create_overlay(&b.name, b.preset.unwrap_or(Preset::Starter)).await?;
     Ok((StatusCode::CREATED, Json(json!(o))))
 }
 
-pub async fn overlay(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn overlay(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let o = app.engine.overlay(&id).await?;
     Ok(Json(json!(app.engine.overlay_view(&o))))
 }
@@ -135,35 +105,20 @@ pub async fn update_overlay(
     Body(b): Body<OverlayEdit>,
 ) -> ApiResult<Json<Value>> {
     let current = app.engine.overlay(&id).await?;
-    let edited = Overlay {
-        name: b.name,
-        width: b.width,
-        height: b.height,
-        widgets: b.widgets,
-        ..current
-    };
+    let edited = Overlay { name: b.name, width: b.width, height: b.height, widgets: b.widgets, ..current };
     Ok(Json(json!(app.engine.update_overlay(edited).await?)))
 }
 
-pub async fn delete_overlay(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<StatusCode> {
+pub async fn delete_overlay(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     app.engine.delete_overlay(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn regenerate_url(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn regenerate_url(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.regenerate_overlay_url(&id).await?)))
 }
 
-pub async fn add_to_obs(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn add_to_obs(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let added = app.engine.add_to_obs(&id).await.map_err(|e| {
         let api = ApiError::from(e);
         if api.code == "unavailable" {
@@ -188,16 +143,11 @@ pub struct ObsBody {
     password: Option<Option<String>>,
 }
 
-fn deserialize_some<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<Option<String>>, D::Error> {
+fn deserialize_some<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(d).map(Some)
 }
 
-pub async fn save_obs(
-    State(app): State<AppState>,
-    Body(b): Body<ObsBody>,
-) -> ApiResult<Json<Value>> {
+pub async fn save_obs(State(app): State<AppState>, Body(b): Body<ObsBody>) -> ApiResult<Json<Value>> {
     use ferrocast_engine::PasswordChange;
     let change = match b.password {
         None => PasswordChange::Keep,
@@ -207,10 +157,7 @@ pub async fn save_obs(
         }
         Some(Some(p)) => PasswordChange::Set(p),
     };
-    let cfg = ferrocast_obs::ObsConfig {
-        host: b.host,
-        port: b.port,
-    };
+    let cfg = ferrocast_obs::ObsConfig { host: b.host, port: b.port };
     Ok(Json(json!(app.engine.save_obs(cfg, change).await?)))
 }
 
@@ -218,24 +165,14 @@ pub async fn rules(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.rules()))
 }
 
-pub async fn create_rule(
-    State(app): State<AppState>,
-    Body(mut r): Body<AlertRule>,
-) -> ApiResult<impl IntoResponse> {
+pub async fn create_rule(State(app): State<AppState>, Body(mut r): Body<AlertRule>) -> ApiResult<impl IntoResponse> {
     if r.id.trim().is_empty() {
         r.id = ferrocast_store::new_id();
     }
     if app.engine.rules().iter().any(|x| x.id == r.id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "conflict",
-            "A rule with that id already exists.",
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, "conflict", "A rule with that id already exists."));
     }
-    Ok((
-        StatusCode::CREATED,
-        Json(json!(app.engine.save_rule(r).await?)),
-    ))
+    Ok((StatusCode::CREATED, Json(json!(app.engine.save_rule(r).await?))))
 }
 
 pub async fn update_rule(
@@ -250,10 +187,7 @@ pub async fn update_rule(
     Ok(Json(json!(app.engine.save_rule(r).await?)))
 }
 
-pub async fn delete_rule(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<StatusCode> {
+pub async fn delete_rule(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     app.engine.delete_rule(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -265,10 +199,7 @@ pub struct TestBody {
     platform: Option<String>,
 }
 
-pub async fn test(
-    State(app): State<AppState>,
-    Body(b): Body<TestBody>,
-) -> ApiResult<impl IntoResponse> {
+pub async fn test(State(app): State<AppState>, Body(b): Body<TestBody>) -> ApiResult<impl IntoResponse> {
     let p = b.platform.as_deref().map(platform).transpose()?;
     app.engine.test(&b.kind, p).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true }))))
@@ -294,10 +225,7 @@ pub async fn queue_clear(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.queue_clear().await))
 }
 
-pub async fn queue_remove(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn queue_remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.queue_remove(&id).await?)))
 }
 
@@ -308,42 +236,25 @@ pub struct EventsQuery {
     kinds: Option<String>,
 }
 
-pub async fn events(
-    State(app): State<AppState>,
-    Query(q): Query<EventsQuery>,
-) -> ApiResult<Json<Value>> {
+pub async fn events(State(app): State<AppState>, Query(q): Query<EventsQuery>) -> ApiResult<Json<Value>> {
     let kinds: Vec<String> = q
         .kinds
-        .map(|k| {
-            k.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .take(20)
-                .collect()
-        })
+        .map(|k| k.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(20).collect())
         .unwrap_or_default();
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let events = app.engine.events(q.before, limit, kinds).await?;
-    let next = if events.len() as u32 == limit {
-        events.last().map(|e| e.seq)
-    } else {
-        None
-    };
+    let next = if events.len() as u32 == limit { events.last().map(|e| e.seq) } else { None };
     Ok(Json(json!({ "events": events, "next_before": next })))
 }
 
-pub async fn replay(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<impl IntoResponse> {
+pub async fn replay(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<impl IntoResponse> {
     app.engine.replay(&id).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true }))))
 }
 
 pub async fn why(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let w = app.engine.why(&id).ok_or_else(|| {
-        ApiError::not_found("event")
-            .hint("Ferrocast remembers why for the last 500 events of this session.")
+        ApiError::not_found("event").hint("Ferrocast remembers why for the last 500 events of this session.")
     })?;
     Ok(Json(json!(w)))
 }
@@ -352,24 +263,14 @@ pub async fn goals(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.goals()))
 }
 
-pub async fn create_goal(
-    State(app): State<AppState>,
-    Body(mut g): Body<Goal>,
-) -> ApiResult<impl IntoResponse> {
+pub async fn create_goal(State(app): State<AppState>, Body(mut g): Body<Goal>) -> ApiResult<impl IntoResponse> {
     if g.id.trim().is_empty() {
         g.id = ferrocast_store::new_id();
     }
     if app.engine.goals().iter().any(|x| x.id == g.id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "conflict",
-            "A goal with that id already exists.",
-        ));
+        return Err(ApiError::new(StatusCode::CONFLICT, "conflict", "A goal with that id already exists."));
     }
-    Ok((
-        StatusCode::CREATED,
-        Json(json!(app.engine.save_goal(g).await?)),
-    ))
+    Ok((StatusCode::CREATED, Json(json!(app.engine.save_goal(g).await?))))
 }
 
 pub async fn update_goal(
@@ -386,10 +287,7 @@ pub async fn update_goal(
     Ok(Json(json!(app.engine.save_goal(g).await?)))
 }
 
-pub async fn delete_goal(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<StatusCode> {
+pub async fn delete_goal(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     app.engine.delete_goal(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -414,10 +312,7 @@ pub async fn settings(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.settings()))
 }
 
-pub async fn save_settings(
-    State(app): State<AppState>,
-    Body(s): Body<EngineSettings>,
-) -> ApiResult<Json<Value>> {
+pub async fn save_settings(State(app): State<AppState>, Body(s): Body<EngineSettings>) -> ApiResult<Json<Value>> {
     if !(1..=3650).contains(&s.keep_chat_days) {
         return Err(ApiError::invalid("Keep chat for 1 to 3650 days."));
     }
@@ -437,15 +332,8 @@ pub async fn backup_now(State(app): State<AppState>) -> ApiResult<impl IntoRespo
     Ok((StatusCode::CREATED, Json(json!(list))))
 }
 
-pub async fn restore_backup(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
+pub async fn restore_backup(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let dir = app.engine.store().dir().to_path_buf();
-    app.engine
-        .db(move |_| backup::schedule_restore(&dir, &id))
-        .await?;
-    Ok(Json(
-        json!({ "restart_needed": true, "message": "Restart Ferrocast to finish restoring." }),
-    ))
+    app.engine.db(move |_| backup::schedule_restore(&dir, &id)).await?;
+    Ok(Json(json!({ "restart_needed": true, "message": "Restart Ferrocast to finish restoring." })))
 }

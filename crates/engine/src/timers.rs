@@ -25,23 +25,14 @@ pub(crate) async fn run(engine: Engine) {
 pub(crate) fn tick(engine: &Engine, last: &mut LastPost, t: Millis) -> Vec<(String, Platform)> {
     let (timers, live, lines, bot_on) = {
         let st = engine.state();
-        (
-            st.timers.clone(),
-            st.live.clone(),
-            st.session.chat_lines.clone(),
-            st.settings.bot_enabled,
-        )
+        (st.timers.clone(), st.live.clone(), st.session.chat_lines.clone(), st.settings.bot_enabled)
     };
     let mut posted = Vec::new();
     if !bot_on {
         return posted;
     }
     for timer in timers {
-        let targets = if timer.platforms.is_empty() {
-            Platform::CHAT.to_vec()
-        } else {
-            timer.platforms.clone()
-        };
+        let targets = if timer.platforms.is_empty() { Platform::CHAT.to_vec() } else { timer.platforms.clone() };
         for p in targets {
             let is_live = live.get(&p).copied().unwrap_or(false);
             let now_lines = lines.get(&p).copied().unwrap_or(0);
@@ -53,9 +44,7 @@ pub(crate) fn tick(engine: &Engine, last: &mut LastPost, t: Millis) -> Vec<(Stri
             }
             let mut vars = Vars::new();
             vars.insert("platform".into(), p.label().into());
-            let text = Template::parse(&timer.message)
-                .map(|tpl| tpl.render(&vars))
-                .unwrap_or_default();
+            let text = Template::parse(&timer.message).map(|tpl| tpl.render(&vars)).unwrap_or_default();
             let msg = ferrocast_core::command::safe_reply(&text);
             if msg.is_empty() {
                 continue;

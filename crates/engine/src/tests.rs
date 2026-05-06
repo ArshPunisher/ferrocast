@@ -25,10 +25,7 @@ struct FakePlatform {
 
 impl FakePlatform {
     fn new(p: Platform) -> Arc<Self> {
-        Arc::new(FakePlatform {
-            platform: Some(p),
-            ..Default::default()
-        })
+        Arc::new(FakePlatform { platform: Some(p), ..Default::default() })
     }
     fn log(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
@@ -52,30 +49,18 @@ impl Connector for FakePlatform {
             can_delete: true,
         }
     }
-    async fn send_chat(
-        &self,
-        text: &str,
-        reply_to: Option<&str>,
-    ) -> ferrocast_connector::Result<()> {
+    async fn send_chat(&self, text: &str, reply_to: Option<&str>) -> ferrocast_connector::Result<()> {
         self.push(format!("say {text} reply={}", reply_to.unwrap_or("-")))
     }
     async fn delete_message(&self, id: &str) -> ferrocast_connector::Result<()> {
         self.push(format!("delete {id}"))
     }
-    async fn timeout(
-        &self,
-        user: &str,
-        s: u32,
-        _r: Option<&str>,
-    ) -> ferrocast_connector::Result<()> {
+    async fn timeout(&self, user: &str, s: u32, _r: Option<&str>) -> ferrocast_connector::Result<()> {
         self.push(format!("timeout {user} {s}"))
     }
     async fn ban(&self, user: &str, _r: Option<&str>) -> ferrocast_connector::Result<()> {
         if self.fail_bans {
-            return Err(ConnectorError::Refused {
-                platform: self.platform(),
-                message: "no".into(),
-            });
+            return Err(ConnectorError::Refused { platform: self.platform(), message: "no".into() });
         }
         self.push(format!("ban {user}"))
     }
@@ -93,10 +78,7 @@ fn mem() -> Arc<dyn ferrocast_secrets::Secrets> {
 
 async fn engine() -> (Engine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    (
-        Engine::start_with_secrets(dir.path(), mem()).await.unwrap(),
-        dir,
-    )
+    (Engine::start_with_secrets(dir.path(), mem()).await.unwrap(), dir)
 }
 
 fn chat(p: Platform, id: &str, user: &str, text: &str) -> Event {
@@ -106,12 +88,7 @@ fn chat(p: Platform, id: &str, user: &str, text: &str) -> Event {
         p,
         Some(id.into()),
         Millis(0),
-        EventKind::ChatMessage {
-            actor: a,
-            content: Content::plain(text),
-            reply_to: None,
-            is_action: false,
-        },
+        EventKind::ChatMessage { actor: a, content: Content::plain(text), reply_to: None, is_action: false },
     )
 }
 
@@ -126,16 +103,10 @@ async fn eventually(mut f: impl FnMut() -> bool) {
     panic!("condition never became true");
 }
 
-async fn next_overlay_frame(
-    rx: &mut tokio::sync::broadcast::Receiver<frames::OverlayFrame>,
-    kind: &str,
-) -> Value {
+async fn next_overlay_frame(rx: &mut tokio::sync::broadcast::Receiver<frames::OverlayFrame>, kind: &str) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let f = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("timed out")
-            .expect("closed");
+        let f = tokio::time::timeout_at(deadline, rx.recv()).await.expect("timed out").expect("closed");
         let v: Value = serde_json::from_str(&f.text).unwrap();
         if v["type"] == kind {
             return v;
@@ -186,34 +157,18 @@ async fn the_filter_deletes_hides_and_tells_the_platform() {
     let tw = FakePlatform::new(Platform::Twitch);
     e.register_connector(tw.clone());
     let mut f = e.filter();
-    f.terms.push(BlockedTerm {
-        term: "badword".into(),
-        action: FAction::Delete,
-    });
+    f.terms.push(BlockedTerm { term: "badword".into(), action: FAction::Delete });
     e.save_filter(f).await.unwrap();
     let mut rx = e.subscribe_overlays();
-    e.ingest(chat(Platform::Twitch, "m-bad", "troll", "b.a.d.w.o.r.d"))
-        .await;
-    e.ingest(chat(Platform::Twitch, "m-ok", "fan", "great stream"))
-        .await;
+    e.ingest(chat(Platform::Twitch, "m-bad", "troll", "b.a.d.w.o.r.d")).await;
+    e.ingest(chat(Platform::Twitch, "m-ok", "fan", "great stream")).await;
     let shown = next_overlay_frame(&mut rx, "event").await;
-    assert_eq!(
-        shown["data"]["source_id"], "m-ok",
-        "the filtered message never reached overlays"
-    );
+    assert_eq!(shown["data"]["source_id"], "m-ok", "the filtered message never reached overlays");
     eventually(|| tw.log().contains(&"delete m-bad".to_string())).await;
-    let o = e
-        .create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly)
-        .await
-        .unwrap();
+    let o = e.create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly).await.unwrap();
     let ov = e.overlay(&o.id).await.unwrap();
     let snap = e.overlay_snapshot(&ov).await.unwrap();
-    let ids: Vec<_> = snap["state"]["chat"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["source_id"].clone())
-        .collect();
+    let ids: Vec<_> = snap["state"]["chat"].as_array().unwrap().iter().map(|c| c["source_id"].clone()).collect();
     assert_eq!(ids, vec![Value::from("m-ok")]);
 }
 
@@ -235,59 +190,34 @@ async fn commands_reply_on_the_source_platform() {
     })
     .await
     .unwrap();
-    e.ingest(chat(Platform::Kick, "k1", "Sam", "!discord"))
-        .await;
-    eventually(|| {
-        kick.log()
-            .contains(&"say Join us, Sam! reply=k1".to_string())
-    })
-    .await;
+    e.ingest(chat(Platform::Kick, "k1", "Sam", "!discord")).await;
+    eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
 }
 
 #[tokio::test]
 async fn ban_everywhere_uses_linked_accounts_and_reports_failures() {
     let (e, _d) = engine().await;
     let tw = FakePlatform::new(Platform::Twitch);
-    let kick = Arc::new(FakePlatform {
-        platform: Some(Platform::Kick),
-        fail_bans: true,
-        ..Default::default()
-    });
+    let kick = Arc::new(FakePlatform { platform: Some(Platform::Kick), fail_bans: true, ..Default::default() });
     e.register_connector(tw.clone());
     e.register_connector(kick.clone());
     e.ingest(chat(Platform::Twitch, "t1", "raider", "hi")).await;
     e.ingest(chat(Platform::Kick, "k1", "raider_k", "hi")).await;
     let store = e.store();
     tokio::task::spawn_blocking(move || {
-        ferrocast_store::repo::viewers::link(
-            &store,
-            Platform::Kick,
-            "raider_k-id",
-            Platform::Twitch,
-            "raider-id",
-        )
+        ferrocast_store::repo::viewers::link(&store, Platform::Kick, "raider_k-id", Platform::Twitch, "raider-id")
     })
     .await
     .unwrap()
     .unwrap();
-    let out = e
-        .ban(
-            Platform::Twitch,
-            "raider-id",
-            "raider",
-            Some("hate raid".into()),
-            true,
-        )
-        .await
-        .unwrap();
+    let out = e.ban(Platform::Twitch, "raider-id", "raider", Some("hate raid".into()), true).await.unwrap();
     assert_eq!(out.ok, vec![Platform::Twitch]);
     assert_eq!(out.failed.len(), 1);
     assert_eq!(out.failed[0].platform, Platform::Kick);
     assert!(tw.log().contains(&"ban raider-id".to_string()));
     assert_eq!(e.bans().entries.len(), 1);
     // The banned account chats again on Twitch: banned on sight and hidden.
-    e.ingest(chat(Platform::Twitch, "t2", "raider", "back"))
-        .await;
+    e.ingest(chat(Platform::Twitch, "t2", "raider", "back")).await;
     eventually(|| tw.log().iter().filter(|l| *l == "ban raider-id").count() == 2).await;
 }
 
@@ -332,10 +262,7 @@ async fn tips_alert_only_when_captured_and_refunds_take_goals_back() {
         Platform::Tips,
         Some("refund_1".into()),
         Millis(0),
-        EventKind::Reversal {
-            original_source_id: "pay_9".into(),
-            reason: ReversalReason::Chargeback,
-        },
+        EventKind::Reversal { original_source_id: "pay_9".into(), reason: ReversalReason::Chargeback },
     ))
     .await;
     assert_eq!(e.goals()[0].current, 0);
@@ -349,11 +276,7 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
     let plan = e.panic(true).await.unwrap();
     assert_eq!(plan.platforms.len(), 1);
     assert!(e.queue().await.paused);
-    assert!(
-        tw.log()
-            .iter()
-            .any(|l| l.starts_with("mode FollowersOnly true"))
-    );
+    assert!(tw.log().iter().any(|l| l.starts_with("mode FollowersOnly true")));
     e.panic(false).await.unwrap();
     assert!(!e.queue().await.paused);
     assert!(tw.log().iter().any(|l| l.starts_with("mode Slow false")));
@@ -396,33 +319,15 @@ async fn timers_post_only_while_live_and_after_chat() {
     .await
     .unwrap();
     let mut last = Default::default();
-    assert!(
-        timers::tick(&e, &mut last, Millis(0)).is_empty(),
-        "not live"
-    );
-    e.ingest(Event::live(
-        Platform::Twitch,
-        Some("on".into()),
-        Millis(0),
-        EventKind::StreamOnline { title: None },
-    ))
-    .await;
-    assert!(
-        timers::tick(&e, &mut last, Millis(0)).is_empty(),
-        "no chat yet"
-    );
+    assert!(timers::tick(&e, &mut last, Millis(0)).is_empty(), "not live");
+    e.ingest(Event::live(Platform::Twitch, Some("on".into()), Millis(0), EventKind::StreamOnline { title: None }))
+        .await;
+    assert!(timers::tick(&e, &mut last, Millis(0)).is_empty(), "no chat yet");
     e.ingest(chat(Platform::Twitch, "c1", "a", "hi")).await;
     e.ingest(chat(Platform::Twitch, "c2", "b", "hey")).await;
     assert_eq!(timers::tick(&e, &mut last, Millis(0)).len(), 1);
-    assert!(
-        timers::tick(&e, &mut last, Millis(60_000)).is_empty(),
-        "too soon"
-    );
-    eventually(|| {
-        tw.log()
-            .contains(&"say Follow on Twitch reply=-".to_string())
-    })
-    .await;
+    assert!(timers::tick(&e, &mut last, Millis(60_000)).is_empty(), "too soon");
+    eventually(|| tw.log().contains(&"say Follow on Twitch reply=-".to_string())).await;
 }
 
 #[tokio::test]
@@ -432,9 +337,7 @@ async fn backfill_goes_to_the_feed_with_a_reason() {
         Platform::Twitch,
         Some("f-old".into()),
         Millis(0),
-        EventKind::Follow {
-            actor: Actor::named(Platform::Twitch, "late"),
-        },
+        EventKind::Follow { actor: Actor::named(Platform::Twitch, "late") },
     );
     ev.origin = Origin::Backfill;
     e.ingest(ev).await;
@@ -452,43 +355,28 @@ async fn moderated_chat_stays_hidden_after_a_restart() {
         let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
         e.register_connector(FakePlatform::new(Platform::Twitch));
         let mut f = e.filter();
-        f.terms.push(BlockedTerm {
-            term: "badword".into(),
-            action: FAction::Delete,
-        });
+        f.terms.push(BlockedTerm { term: "badword".into(), action: FAction::Delete });
         e.save_filter(f).await.unwrap();
-        e.ingest(chat(Platform::Twitch, "bad-1", "troll", "badword"))
-            .await;
-        e.ingest(chat(Platform::Twitch, "raid-1", "raider", "spam spam"))
-            .await;
+        e.ingest(chat(Platform::Twitch, "bad-1", "troll", "badword")).await;
+        e.ingest(chat(Platform::Twitch, "raid-1", "raider", "spam spam")).await;
         let mut target = Actor::named(Platform::Twitch, "raider");
         target.id = Some("raider-id".into());
         e.ingest(Event::live(
             Platform::Twitch,
             Some("ban-1".into()),
             Millis(0),
-            EventKind::Ban {
-                target,
-                reason: None,
-                until: None,
-            },
+            EventKind::Ban { target, reason: None, until: None },
         ))
         .await;
-        e.ingest(chat(Platform::Twitch, "ok-1", "fan", "hello"))
-            .await;
+        e.ingest(chat(Platform::Twitch, "ok-1", "fan", "hello")).await;
         let store = e.store();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let s = store.clone();
             let visible = tokio::task::spawn_blocking(move || {
-                ferrocast_store::repo::events::recent_visible(
-                    &s,
-                    None,
-                    50,
-                    &["chat_message".to_string()],
-                )
-                .unwrap()
-                .len()
+                ferrocast_store::repo::events::recent_visible(&s, None, 50, &["chat_message".to_string()])
+                    .unwrap()
+                    .len()
             })
             .await
             .unwrap();
@@ -499,25 +387,10 @@ async fn moderated_chat_stays_hidden_after_a_restart() {
         }
     }
     let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
-    let o = e
-        .create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly)
-        .await
-        .unwrap();
-    let snap = e
-        .overlay_snapshot(&e.overlay(&o.id).await.unwrap())
-        .await
-        .unwrap();
-    let ids: Vec<_> = snap["state"]["chat"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["source_id"].clone())
-        .collect();
-    assert_eq!(
-        ids,
-        vec![Value::from("ok-1")],
-        "filtered and banned chat never comes back"
-    );
+    let o = e.create_overlay("Main", ferrocast_core::overlay::Preset::ChatOnly).await.unwrap();
+    let snap = e.overlay_snapshot(&e.overlay(&o.id).await.unwrap()).await.unwrap();
+    let ids: Vec<_> = snap["state"]["chat"].as_array().unwrap().iter().map(|c| c["source_id"].clone()).collect();
+    assert_eq!(ids, vec![Value::from("ok-1")], "filtered and banned chat never comes back");
 }
 
 #[tokio::test]
@@ -547,9 +420,7 @@ async fn a_deleted_message_is_not_read_aloud_by_a_queued_alert() {
         Platform::Youtube,
         Some("del-1".into()),
         Millis(0),
-        EventKind::MessageDeleted {
-            message_id: "sc-1".into(),
-        },
+        EventKind::MessageDeleted { message_id: "sc-1".into() },
     ))
     .await;
     assert!(e.queue().await.waiting[0].alert.tts_text.is_none());
@@ -558,20 +429,79 @@ async fn a_deleted_message_is_not_read_aloud_by_a_queued_alert() {
 #[tokio::test]
 async fn only_alerts_can_be_replayed() {
     let (e, _d) = engine().await;
-    e.ingest(Event::live(
-        Platform::Twitch,
-        Some("on".into()),
-        Millis(0),
-        EventKind::StreamOnline { title: None },
-    ))
-    .await;
+    e.ingest(Event::live(Platform::Twitch, Some("on".into()), Millis(0), EventKind::StreamOnline { title: None }))
+        .await;
     let ev = e.events(None, 5, vec![]).await.unwrap();
-    assert!(matches!(
-        e.replay(&ev[0].id).await,
-        Err(EngineError::Invalid(_))
-    ));
-    assert!(matches!(
-        e.replay("missing").await,
-        Err(EngineError::NotFound(_))
-    ));
+    assert!(matches!(e.replay(&ev[0].id).await, Err(EngineError::Invalid(_))));
+    assert!(matches!(e.replay("missing").await, Err(EngineError::NotFound(_))));
+}
+
+#[tokio::test]
+async fn connecting_twitch_signs_in_runs_eventsub_and_answers_commands() {
+    use ferrocast_testkit::twitch::{fake, notification, push};
+    let (st, (id, api, eventsub)) = fake().await;
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = mem();
+    let apps = PlatformApps {
+        twitch_client_id: Some("client".into()),
+        twitch_endpoints: ferrocast_twitch::Endpoints { id, api, eventsub },
+    };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps.clone()).await.unwrap();
+    let ConnectFlow::DeviceCode { user_code, .. } = e.connect_account(Platform::Twitch).await.unwrap();
+    assert_eq!(user_code, "ABCD-EFGH");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while st.lock().unwrap().sessions == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(secrets.get("twitch-tokens").unwrap().is_some(), "tokens went to the keychain");
+    while st.lock().unwrap().subs.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    e.save_command(Command {
+        id: "hi".into(),
+        name: "!hi".into(),
+        aliases: vec![],
+        response: "hey {user}".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    push(
+        &st,
+        "session-1",
+        notification(
+            "channel.chat.message",
+            "d1",
+            serde_json::json!({
+        "broadcaster_user_id": "111", "chatter_user_id": "5", "chatter_user_login": "viewer", "chatter_user_name": "Viewer",
+        "message_id": "chat-1", "message": { "text": "!hi", "fragments": [{ "type": "text", "text": "!hi" }] }, "badges": [] }),
+        ),
+    );
+    while st.lock().unwrap().chats.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(st.lock().unwrap().chats[0]["message"], "hey Viewer");
+    assert_eq!(st.lock().unwrap().chats[0]["reply_parent_message_id"], "chat-1");
+    assert_eq!(e.events(None, 10, vec!["chat_message".into()]).await.unwrap().len(), 1);
+    // A restart picks the account up again by itself.
+    drop(e);
+    let e2 = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    while st.lock().unwrap().sessions < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(st.lock().unwrap().sessions >= 2, "resumed on start");
+    e2.disconnect_account(Platform::Twitch).await.unwrap();
+    assert!(secrets.get("twitch-tokens").unwrap().is_none(), "signing out forgets the tokens");
+}
+
+#[tokio::test]
+async fn connecting_without_a_twitch_app_says_so() {
+    let (e, _d) = engine().await;
+    assert!(
+        matches!(e.connect_account(Platform::Twitch).await, Err(EngineError::Unavailable(m)) if m.contains("no Twitch app"))
+    );
 }

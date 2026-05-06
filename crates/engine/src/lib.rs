@@ -7,6 +7,7 @@
 //! Startup is staged (R-30): the store loads, state is built, and only then does the
 //! pipeline start reading. Adapters may connect earlier; their events wait in the channel.
 
+mod accounts;
 mod actions;
 mod dispatcher;
 mod error;
@@ -31,6 +32,7 @@ use ferrocast_core::queue::AlertQueue;
 use ferrocast_store::{Store, StoreError, repo};
 use tokio::sync::{Notify, broadcast, mpsc};
 
+pub use accounts::{ConnectFlow, PlatformApps};
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
 pub use obs::{ObsView, PasswordChange};
@@ -76,13 +78,15 @@ struct Inner {
     overlay_tx: broadcast::Sender<OverlayFrame>,
     base_url: RwLock<String>,
     secrets: Arc<dyn ferrocast_secrets::Secrets>,
+    apps: accounts::PlatformApps,
+    adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
 }
 
 impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
-        Self::start_with_secrets(data_dir, Arc::from(ferrocast_secrets::best_available())).await
+        Self::start_with(data_dir, Arc::from(ferrocast_secrets::best_available()), PlatformApps::from_env()).await
     }
 
     /// Like [`Engine::start`] with a chosen secret store (tests use memory, never the
@@ -90,6 +94,15 @@ impl Engine {
     pub async fn start_with_secrets(
         data_dir: &Path,
         secrets: Arc<dyn ferrocast_secrets::Secrets>,
+    ) -> Result<Engine, EngineError> {
+        Self::start_with(data_dir, secrets, PlatformApps::default()).await
+    }
+
+    /// Full control over secrets and platform apps (tests point the apps at fakes).
+    pub async fn start_with(
+        data_dir: &Path,
+        secrets: Arc<dyn ferrocast_secrets::Secrets>,
+        apps: PlatformApps,
     ) -> Result<Engine, EngineError> {
         let dir = data_dir.to_path_buf();
         let store = tokio::task::spawn_blocking(move || -> Result<Store, StoreError> {
@@ -130,12 +143,15 @@ impl Engine {
                 overlay_tx,
                 base_url: RwLock::new("http://127.0.0.1:47820".into()),
                 secrets,
+                apps,
+                adapters: Mutex::new(HashMap::new()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        engine.resume_accounts().await;
         Ok(engine)
     }
 
@@ -146,11 +162,7 @@ impl Engine {
 
     /// Submits an event (used by the API for tests and by in-process sources).
     pub async fn submit(&self, event: Event) -> Result<(), EngineError> {
-        self.inner
-            .sink
-            .send(event)
-            .await
-            .map_err(|_| EngineError::Unavailable("the engine is shutting down".into()))
+        self.inner.sink.send(event).await.map_err(|_| EngineError::Unavailable("the engine is shutting down".into()))
     }
 
     pub fn subscribe_live(&self) -> broadcast::Receiver<LiveFrame> {
@@ -163,40 +175,23 @@ impl Engine {
 
     /// The URL the overlays are served from, set by the server once it knows its port.
     pub fn set_base_url(&self, url: &str) {
-        *self
-            .inner
-            .base_url
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = url.trim_end_matches('/').to_string();
+        *self.inner.base_url.write().unwrap_or_else(|p| p.into_inner()) = url.trim_end_matches('/').to_string();
     }
 
     pub fn base_url(&self) -> String {
-        self.inner
-            .base_url
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.inner.base_url.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Registers a connected platform. Replaces any previous connector for it.
     pub fn register_connector(&self, c: Arc<dyn Connector>) {
         let platform = c.platform();
-        self.inner
-            .connectors
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(platform, c);
+        self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).insert(platform, c);
     }
 
     pub fn unregister_connector(&self, platform: Platform) {
-        self.inner
-            .connectors
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&platform);
+        self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
         let mut st = self.state_mut();
-        st.connectors
-            .insert(platform_key(platform).into(), ConnectorView::off());
+        st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
         st.live.remove(&platform);
         st.viewers.remove(&platform);
     }
@@ -207,22 +202,11 @@ impl Engine {
     }
 
     pub(crate) fn connector(&self, platform: Platform) -> Option<Arc<dyn Connector>> {
-        self.inner
-            .connectors
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&platform)
-            .cloned()
+        self.inner.connectors.read().unwrap_or_else(|p| p.into_inner()).get(&platform).cloned()
     }
 
     pub(crate) fn connectors(&self) -> Vec<Arc<dyn Connector>> {
-        self.inner
-            .connectors
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .cloned()
-            .collect()
+        self.inner.connectors.read().unwrap_or_else(|p| p.into_inner()).values().cloned().collect()
     }
 
     /// Runs a store call on the blocking pool.
@@ -277,10 +261,7 @@ impl Engine {
         let engine = self.clone();
         let sid = id.to_string();
         tokio::spawn(async move {
-            if let Err(err) = engine
-                .db(move |s| repo::events::hide(s, platform, &sid))
-                .await
-            {
+            if let Err(err) = engine.db(move |s| repo::events::hide(s, platform, &sid)).await {
                 tracing::error!(%err, "couldn't mark a message hidden");
             }
         });
@@ -292,10 +273,7 @@ impl Engine {
         let aid = actor_id.to_string();
         let since = now().0 - 24 * 3_600_000;
         tokio::spawn(async move {
-            if let Err(err) = engine
-                .db(move |s| repo::events::hide_user_chat(s, platform, &aid, since))
-                .await
-            {
+            if let Err(err) = engine.db(move |s| repo::events::hide_user_chat(s, platform, &aid, since)).await {
                 tracing::error!(%err, "couldn't hide a user's messages");
             }
         });
@@ -315,12 +293,7 @@ impl Engine {
     }
 
     pub(crate) fn is_hidden(&self, platform: Platform, id: &str) -> bool {
-        self.inner
-            .hidden
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .0
-            .contains(&(platform, id.to_string()))
+        self.inner.hidden.lock().unwrap_or_else(|p| p.into_inner()).0.contains(&(platform, id.to_string()))
     }
 
     /// Engine settings as saved.
@@ -331,8 +304,7 @@ impl Engine {
     pub async fn save_settings(&self, s: EngineSettings) -> Result<EngineSettings, EngineError> {
         let _one_at_a_time = self.inner.config.lock().await;
         let saved = s.clone();
-        self.db(move |st| repo::settings::set(st, "engine", &saved))
-            .await?;
+        self.db(move |st| repo::settings::set(st, "engine", &saved)).await?;
         self.state_mut().settings = s.clone();
         Ok(s)
     }
