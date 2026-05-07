@@ -13,9 +13,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Milliseconds since the Unix epoch. A plain integer keeps `core` free of clocks and
 /// time-zone crates; adapters convert platform timestamps at the edge.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(transparent)]
 pub struct Millis(pub i64);
 
@@ -136,10 +134,7 @@ impl Actor {
 
     /// Someone who chose not to be named.
     pub fn anonymous(platform: Platform) -> Self {
-        Actor {
-            anonymous: true,
-            ..Actor::named(platform, "Anonymous")
-        }
+        Actor { anonymous: true, ..Actor::named(platform, "Anonymous") }
     }
 }
 
@@ -162,34 +157,17 @@ pub struct Content {
 impl Content {
     /// Plain text with no emotes or mentions.
     pub fn plain(text: &str) -> Self {
-        Content {
-            text: text.to_string(),
-            fragments: vec![Fragment::Text {
-                text: text.to_string(),
-            }],
-        }
+        Content { text: text.to_string(), fragments: vec![Fragment::Text { text: text.to_string() }] }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Fragment {
-    Text {
-        text: String,
-    },
-    Emote {
-        provider: EmoteProvider,
-        id: String,
-        name: String,
-        url: String,
-        zero_width: bool,
-    },
-    Mention {
-        login: String,
-    },
-    Link {
-        url: String,
-    },
+    Text { text: String },
+    Emote { provider: EmoteProvider, id: String, name: String, url: String, zero_width: bool },
+    Mention { login: String },
+    Link { url: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,9 +408,9 @@ impl EventKind {
             | EventKind::RewardRedemption { actor, .. } => Some(actor),
             EventKind::GiftBatch { gifter, .. } => Some(gifter),
             EventKind::Raid { from, .. } => Some(from),
-            EventKind::UserMessagesCleared { target }
-            | EventKind::Ban { target, .. }
-            | EventKind::Unban { target } => Some(target),
+            EventKind::UserMessagesCleared { target } | EventKind::Ban { target, .. } | EventKind::Unban { target } => {
+                Some(target)
+            }
             _ => None,
         }
     }
@@ -478,12 +456,7 @@ pub struct Event {
 
 impl Event {
     /// A new live event; `id` and `seq` are filled in by the bus.
-    pub fn live(
-        platform: Platform,
-        source_id: Option<String>,
-        at: Millis,
-        kind: EventKind,
-    ) -> Self {
+    pub fn live(platform: Platform, source_id: Option<String>, at: Millis, kind: EventKind) -> Self {
         Event {
             id: String::new(),
             seq: 0,
@@ -500,8 +473,7 @@ impl Event {
 
     /// Whether the alert pipeline should consider this event at all.
     pub fn may_alert(&self) -> bool {
-        matches!(self.origin, Origin::Live | Origin::Replay | Origin::Test)
-            && self.kind.is_alertable()
+        matches!(self.origin, Origin::Live | Origin::Replay | Origin::Test) && self.kind.is_alertable()
     }
 }
 
@@ -535,9 +507,7 @@ mod tests {
             Platform::Twitch,
             Some("m1".into()),
             Millis(0),
-            EventKind::Follow {
-                actor: Actor::named(Platform::Twitch, "a"),
-            },
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "a") },
         );
         assert!(e.may_alert());
         e.origin = Origin::Backfill;

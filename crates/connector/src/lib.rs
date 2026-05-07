@@ -22,15 +22,9 @@ pub enum ConnectorError {
     #[error("{0} isn't connected")]
     NotConnected(Platform),
     #[error("{platform} doesn't let apps {what}")]
-    NotSupported {
-        platform: Platform,
-        what: &'static str,
-    },
+    NotSupported { platform: Platform, what: &'static str },
     #[error("{platform} asked us to slow down; try again in {} s", retry_after.as_secs())]
-    RateLimited {
-        platform: Platform,
-        retry_after: Duration,
-    },
+    RateLimited { platform: Platform, retry_after: Duration },
     #[error("{0} needs you to sign in again")]
     SignInNeeded(Platform),
     #[error("{platform} is missing permission: {scope}")]
@@ -44,10 +38,7 @@ pub enum ConnectorError {
 impl ConnectorError {
     /// Whether retrying later might work (the dashboard offers "Try again" for these).
     pub fn is_temporary(&self) -> bool {
-        matches!(
-            self,
-            ConnectorError::RateLimited { .. } | ConnectorError::Network { .. }
-        )
+        matches!(self, ConnectorError::RateLimited { .. } | ConnectorError::Network { .. })
     }
 }
 
@@ -98,11 +89,7 @@ pub fn split_chat(text: &str, max: usize) -> Vec<String> {
             word = word.chars().skip(max).collect();
             out.push(head);
         }
-        let need = if cur.is_empty() {
-            word.chars().count()
-        } else {
-            cur.chars().count() + 1 + word.chars().count()
-        };
+        let need = if cur.is_empty() { word.chars().count() } else { cur.chars().count() + 1 + word.chars().count() };
         if need > max {
             out.push(std::mem::take(&mut cur));
         }
@@ -127,22 +114,12 @@ mod tests {
         assert_eq!(split_chat("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(split_chat("  ", 10), Vec::<String>::new());
         let long = "नमस्ते ".repeat(100);
-        assert!(
-            split_chat(&long, 200)
-                .iter()
-                .all(|c| c.chars().count() <= 200)
-        );
+        assert!(split_chat(&long, 200).iter().all(|c| c.chars().count() <= 200));
     }
 
     #[test]
     fn temporary_errors() {
-        assert!(
-            ConnectorError::Network {
-                platform: Platform::Kick,
-                message: "x".into()
-            }
-            .is_temporary()
-        );
+        assert!(ConnectorError::Network { platform: Platform::Kick, message: "x".into() }.is_temporary());
         assert!(!ConnectorError::SignInNeeded(Platform::Twitch).is_temporary());
     }
 }

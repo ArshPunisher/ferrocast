@@ -51,19 +51,14 @@ impl Sessions {
     /// Constant-time check so response timing doesn't leak how much of a token matched.
     pub fn valid(&self, token: &str) -> bool {
         let tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
-        tokens
-            .iter()
-            .any(|t| t.as_bytes().ct_eq(token.as_bytes()).into())
+        tokens.iter().any(|t| t.as_bytes().ct_eq(token.as_bytes()).into())
     }
 
     /// A fresh one-time pairing code.
     pub fn new_code(&self) -> String {
         let mut bytes = [0u8; 10];
         fill(&mut bytes);
-        let code: String = bytes
-            .iter()
-            .map(|b| CODE_ALPHABET[usize::from(*b) % CODE_ALPHABET.len()] as char)
-            .collect();
+        let code: String = bytes.iter().map(|b| CODE_ALPHABET[usize::from(*b) % CODE_ALPHABET.len()] as char).collect();
         let mut codes = self.codes.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         codes.retain(|_, at| now.duration_since(*at) < PAIR_TTL);
@@ -76,10 +71,7 @@ impl Sessions {
         let now = Instant::now();
         {
             let mut f = self.failures.lock().unwrap_or_else(|p| p.into_inner());
-            while f
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
-            {
+            while f.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60)) {
                 f.pop_front();
             }
             if f.len() >= MAX_PAIR_FAILURES {
@@ -95,10 +87,7 @@ impl Sessions {
             }
         };
         if !ok {
-            self.failures
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push_back(now);
+            self.failures.lock().unwrap_or_else(|p| p.into_inner()).push_back(now);
             return Err(ApiError::new(
                 axum::http::StatusCode::UNAUTHORIZED,
                 "bad_code",
@@ -107,10 +96,7 @@ impl Sessions {
             .hint("Make a new link in the app: Settings → Open in browser."));
         }
         let token = random_hex(32);
-        self.tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(token.clone());
+        self.tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(token.clone());
         Ok(token)
     }
 }
@@ -156,12 +142,7 @@ impl Guard {
 
 /// The bearer token from `Authorization`, if any.
 pub fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
+    headers.get(AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ").map(str::trim)
 }
 
 fn fill(buf: &mut [u8]) {
@@ -206,30 +187,17 @@ mod tests {
         let s = Sessions::new();
         let good = s.new_code();
         for _ in 0..MAX_PAIR_FAILURES {
-            assert_eq!(
-                s.pair("WRONGWRONG").unwrap_err().status,
-                axum::http::StatusCode::UNAUTHORIZED
-            );
+            assert_eq!(s.pair("WRONGWRONG").unwrap_err().status, axum::http::StatusCode::UNAUTHORIZED);
         }
-        assert_eq!(
-            s.pair(&good).unwrap_err().status,
-            axum::http::StatusCode::TOO_MANY_REQUESTS
-        );
+        assert_eq!(s.pair(&good).unwrap_err().status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
     fn host_and_origin_rules() {
-        let g = Guard {
-            port: 47820,
-            lan: false,
-            dev_origins: vec!["http://localhost:5173".into()],
-        };
+        let g = Guard { port: 47820, lan: false, dev_origins: vec!["http://localhost:5173".into()] };
         assert!(g.host_ok(&headers(&[(HOST, "127.0.0.1:47820")])));
         assert!(g.host_ok(&headers(&[(HOST, "localhost:47820")])));
-        assert!(
-            !g.host_ok(&headers(&[(HOST, "evil.example:47820")])),
-            "DNS rebinding"
-        );
+        assert!(!g.host_ok(&headers(&[(HOST, "evil.example:47820")])), "DNS rebinding");
         assert!(!g.host_ok(&HeaderMap::new()));
         assert!(g.origin_ok(&HeaderMap::new()));
         assert!(g.origin_ok(&headers(&[(ORIGIN, "http://127.0.0.1:47820")])));
@@ -241,10 +209,7 @@ mod tests {
 
     #[test]
     fn bearer_parsing() {
-        assert_eq!(
-            bearer(&headers(&[(AUTHORIZATION, "Bearer abc")])),
-            Some("abc")
-        );
+        assert_eq!(bearer(&headers(&[(AUTHORIZATION, "Bearer abc")])), Some("abc"));
         assert_eq!(bearer(&headers(&[(AUTHORIZATION, "Basic abc")])), None);
         assert_eq!(bearer(&HeaderMap::new()), None);
     }

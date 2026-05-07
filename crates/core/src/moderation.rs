@@ -74,32 +74,12 @@ pub struct PanicPlan {
 }
 
 /// Plans panic mode `on` (or off, which reverses every mode the config would turn on).
-pub fn plan_panic(
-    cfg: &PanicConfig,
-    connected: &[(Platform, Capabilities)],
-    on: bool,
-) -> PanicPlan {
+pub fn plan_panic(cfg: &PanicConfig, connected: &[(Platform, Capabilities)], on: bool) -> PanicPlan {
     let wanted: Vec<ModeChange> = [
-        cfg.followers_only_minutes.map(|m| ModeChange {
-            mode: ChatMode::FollowersOnly,
-            enabled: on,
-            value: Some(m),
-        }),
-        cfg.emote_only.then_some(ModeChange {
-            mode: ChatMode::EmoteOnly,
-            enabled: on,
-            value: None,
-        }),
-        cfg.subscribers_only.then_some(ModeChange {
-            mode: ChatMode::SubscribersOnly,
-            enabled: on,
-            value: None,
-        }),
-        cfg.slow_seconds.map(|s| ModeChange {
-            mode: ChatMode::Slow,
-            enabled: on,
-            value: Some(s),
-        }),
+        cfg.followers_only_minutes.map(|m| ModeChange { mode: ChatMode::FollowersOnly, enabled: on, value: Some(m) }),
+        cfg.emote_only.then_some(ModeChange { mode: ChatMode::EmoteOnly, enabled: on, value: None }),
+        cfg.subscribers_only.then_some(ModeChange { mode: ChatMode::SubscribersOnly, enabled: on, value: None }),
+        cfg.slow_seconds.map(|s| ModeChange { mode: ChatMode::Slow, enabled: on, value: Some(s) }),
     ]
     .into_iter()
     .flatten()
@@ -107,8 +87,7 @@ pub fn plan_panic(
     let platforms = connected
         .iter()
         .map(|(platform, caps)| {
-            let (changes, unsupported): (Vec<_>, Vec<_>) =
-                wanted.iter().partition(|c| caps.modes.contains(&c.mode));
+            let (changes, unsupported): (Vec<_>, Vec<_>) = wanted.iter().partition(|c| caps.modes.contains(&c.mode));
             PlatformPlan {
                 platform: *platform,
                 changes,
@@ -162,8 +141,7 @@ impl BanList {
 
     pub fn remove(&mut self, platform: Platform, user_id: &str) -> bool {
         let before = self.entries.len();
-        self.entries
-            .retain(|e| !(e.platform == platform && e.user_id.as_deref() == Some(user_id)));
+        self.entries.retain(|e| !(e.platform == platform && e.user_id.as_deref() == Some(user_id)));
         before != self.entries.len()
     }
 
@@ -177,10 +155,7 @@ impl BanList {
             if e.platform == actor.platform {
                 return id.is_some() && e.user_id.as_deref() == id;
             }
-            if e.linked
-                .iter()
-                .any(|(p, uid)| *p == actor.platform && Some(uid.as_str()) == id)
-            {
+            if e.linked.iter().any(|(p, uid)| *p == actor.platform && Some(uid.as_str()) == id) {
                 return true;
             }
             self.match_names && !name.is_empty() && fold(&e.login) == name
@@ -193,12 +168,7 @@ mod tests {
     use super::*;
 
     fn caps(modes: &[ChatMode]) -> Capabilities {
-        Capabilities {
-            modes: modes.to_vec(),
-            can_ban: true,
-            can_timeout: true,
-            can_delete: true,
-        }
+        Capabilities { modes: modes.to_vec(), can_ban: true, can_timeout: true, can_delete: true }
     }
 
     #[test]
@@ -207,12 +177,7 @@ mod tests {
         let connected = vec![
             (
                 Platform::Twitch,
-                caps(&[
-                    ChatMode::FollowersOnly,
-                    ChatMode::Slow,
-                    ChatMode::EmoteOnly,
-                    ChatMode::SubscribersOnly,
-                ]),
+                caps(&[ChatMode::FollowersOnly, ChatMode::Slow, ChatMode::EmoteOnly, ChatMode::SubscribersOnly]),
             ),
             (Platform::Youtube, caps(&[])),
         ];
@@ -220,27 +185,16 @@ mod tests {
         assert_eq!(plan.platforms[0].changes.len(), 2);
         assert!(plan.platforms[0].unsupported.is_empty());
         assert!(plan.platforms[1].changes.is_empty());
-        assert_eq!(
-            plan.platforms[1].unsupported,
-            vec![ChatMode::FollowersOnly, ChatMode::Slow]
-        );
+        assert_eq!(plan.platforms[1].unsupported, vec![ChatMode::FollowersOnly, ChatMode::Slow]);
         assert!(plan.pause_alerts && plan.pause_tts);
     }
 
     #[test]
     fn turning_panic_off_reverses_and_unpauses() {
-        let plan = plan_panic(
-            &PanicConfig::default(),
-            &[(Platform::Kick, caps(&[ChatMode::Slow]))],
-            false,
-        );
+        let plan = plan_panic(&PanicConfig::default(), &[(Platform::Kick, caps(&[ChatMode::Slow]))], false);
         assert_eq!(
             plan.platforms[0].changes,
-            vec![ModeChange {
-                mode: ChatMode::Slow,
-                enabled: false,
-                value: Some(10)
-            }]
+            vec![ModeChange { mode: ChatMode::Slow, enabled: false, value: Some(10) }]
         );
         assert!(!plan.pause_alerts && !plan.pause_tts && plan.hold_new_accounts_days.is_none());
     }
@@ -268,31 +222,12 @@ mod tests {
         let mut e = entry(Platform::Twitch, "t1", "Raider99");
         e.linked.push((Platform::Kick, "k7".into()));
         list.add(e);
-        assert!(
-            list.on_sight(&actor(Platform::Twitch, "t1", "renamed"))
-                .is_some(),
-            "same id, new name"
-        );
-        assert!(
-            list.on_sight(&actor(Platform::Twitch, "t2", "raider99"))
-                .is_none(),
-            "same name, other id"
-        );
-        assert!(
-            list.on_sight(&actor(Platform::Kick, "k7", "x")).is_some(),
-            "linked account"
-        );
-        assert!(
-            list.on_sight(&actor(Platform::Youtube, "y", "raider99"))
-                .is_none(),
-            "names off by default"
-        );
+        assert!(list.on_sight(&actor(Platform::Twitch, "t1", "renamed")).is_some(), "same id, new name");
+        assert!(list.on_sight(&actor(Platform::Twitch, "t2", "raider99")).is_none(), "same name, other id");
+        assert!(list.on_sight(&actor(Platform::Kick, "k7", "x")).is_some(), "linked account");
+        assert!(list.on_sight(&actor(Platform::Youtube, "y", "raider99")).is_none(), "names off by default");
         list.match_names = true;
-        assert!(
-            list.on_sight(&actor(Platform::Youtube, "y", "rаider99"))
-                .is_some(),
-            "folded name with a Cyrillic а"
-        );
+        assert!(list.on_sight(&actor(Platform::Youtube, "y", "rаider99")).is_some(), "folded name with a Cyrillic а");
     }
 
     #[test]

@@ -17,10 +17,7 @@ pub struct Money {
 
 impl Money {
     pub fn new(minor: i64, currency: &str) -> Self {
-        Money {
-            minor,
-            currency: currency.to_ascii_uppercase(),
-        }
+        Money { minor, currency: currency.to_ascii_uppercase() }
     }
 
     /// Builds money from a decimal string such as `"12.50"`, as payment providers send it.
@@ -46,15 +43,9 @@ impl Money {
             return Err(MoneyError::BadAmount(amount.to_string()));
         }
         let scale = 10i64.pow(digits);
-        let whole: i64 = whole
-            .parse()
-            .map_err(|_| MoneyError::BadAmount(amount.to_string()))?;
-        let mut frac_val: i64 = if frac.is_empty() {
-            0
-        } else {
-            frac.parse()
-                .map_err(|_| MoneyError::BadAmount(amount.to_string()))?
-        };
+        let whole: i64 = whole.parse().map_err(|_| MoneyError::BadAmount(amount.to_string()))?;
+        let mut frac_val: i64 =
+            if frac.is_empty() { 0 } else { frac.parse().map_err(|_| MoneyError::BadAmount(amount.to_string()))? };
         for _ in frac.len()..digits as usize {
             frac_val *= 10;
         }
@@ -107,8 +98,8 @@ pub enum MoneyError {
 /// Number of minor-unit digits (ISO 4217). Most currencies use 2.
 pub fn exponent(currency: &str) -> u32 {
     match currency {
-        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "XAF" | "XOF" | "PYG" | "RWF" | "KMF"
-        | "GNF" | "VUV" | "XPF" | "DJF" | "BIF" => 0,
+        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "UGX" | "XAF" | "XOF" | "PYG" | "RWF" | "KMF" | "GNF" | "VUV"
+        | "XPF" | "DJF" | "BIF" => 0,
         "BHD" | "KWD" | "OMR" | "JOD" | "TND" | "IQD" | "LYD" => 3,
         _ => 2,
     }
@@ -205,58 +196,22 @@ mod tests {
 
     #[test]
     fn parses_provider_amounts_exactly() {
-        assert_eq!(
-            Money::parse_decimal("12.50", "usd").unwrap(),
-            Money::new(1250, "USD")
-        );
-        assert_eq!(
-            Money::parse_decimal("500", "INR").unwrap(),
-            Money::new(50_000, "INR")
-        );
-        assert_eq!(
-            Money::parse_decimal("0.1", "EUR").unwrap(),
-            Money::new(10, "EUR")
-        );
-        assert_eq!(
-            Money::parse_decimal("1000", "JPY").unwrap(),
-            Money::new(1000, "JPY")
-        );
-        assert_eq!(
-            Money::parse_decimal("1.234", "KWD").unwrap(),
-            Money::new(1234, "KWD")
-        );
+        assert_eq!(Money::parse_decimal("12.50", "usd").unwrap(), Money::new(1250, "USD"));
+        assert_eq!(Money::parse_decimal("500", "INR").unwrap(), Money::new(50_000, "INR"));
+        assert_eq!(Money::parse_decimal("0.1", "EUR").unwrap(), Money::new(10, "EUR"));
+        assert_eq!(Money::parse_decimal("1000", "JPY").unwrap(), Money::new(1000, "JPY"));
+        assert_eq!(Money::parse_decimal("1.234", "KWD").unwrap(), Money::new(1234, "KWD"));
     }
 
     #[test]
     fn rejects_hostile_amounts() {
-        for bad in [
-            "",
-            "-5",
-            "1e3",
-            "12.345",
-            "1,000",
-            "12.",
-            ".5",
-            "NaN",
-            "inf",
-            "  ",
-            "１２",
-            "99999999999999999999",
-        ] {
-            assert!(
-                Money::parse_decimal(bad, "USD").is_err(),
-                "{bad:?} should fail"
-            );
+        for bad in ["", "-5", "1e3", "12.345", "1,000", "12.", ".5", "NaN", "inf", "  ", "１２", "99999999999999999999"]
+        {
+            assert!(Money::parse_decimal(bad, "USD").is_err(), "{bad:?} should fail");
         }
-        assert!(
-            Money::parse_decimal("1.5", "JPY").is_err(),
-            "JPY has no minor units"
-        );
+        assert!(Money::parse_decimal("1.5", "JPY").is_err(), "JPY has no minor units");
         for cur in ["", "US", "USDT", "us1", "₹"] {
-            assert!(
-                Money::parse_decimal("1", cur).is_err(),
-                "{cur:?} should fail"
-            );
+            assert!(Money::parse_decimal("1", cur).is_err(), "{cur:?} should fail");
         }
     }
 
@@ -272,29 +227,8 @@ mod tests {
 
     #[test]
     fn platform_value_labels() {
-        assert_eq!(
-            PlatformValue {
-                unit: ValueUnit::Bits,
-                amount: 1
-            }
-            .display(),
-            "1 bit"
-        );
-        assert_eq!(
-            PlatformValue {
-                unit: ValueUnit::Bits,
-                amount: 1500
-            }
-            .display(),
-            "1,500 bits"
-        );
-        assert_eq!(
-            PlatformValue {
-                unit: ValueUnit::Kicks,
-                amount: 100
-            }
-            .display(),
-            "100 KICKs"
-        );
+        assert_eq!(PlatformValue { unit: ValueUnit::Bits, amount: 1 }.display(), "1 bit");
+        assert_eq!(PlatformValue { unit: ValueUnit::Bits, amount: 1500 }.display(), "1,500 bits");
+        assert_eq!(PlatformValue { unit: ValueUnit::Kicks, amount: 100 }.display(), "100 KICKs");
     }
 }

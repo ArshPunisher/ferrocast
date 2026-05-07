@@ -8,10 +8,7 @@ use crate::error::{Result, StoreError};
 use crate::{Store, now_ms};
 
 fn pkey(p: Platform) -> String {
-    serde_json::to_value(p)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
+    serde_json::to_value(p).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +36,7 @@ pub fn touch(store: &Store, actor: &Actor, chatted: bool) -> Result<Option<i64>>
         return Ok(None);
     };
     let now = now_ms();
-    let login = actor
-        .login
-        .clone()
-        .unwrap_or_else(|| actor.display_name.clone());
+    let login = actor.login.clone().unwrap_or_else(|| actor.display_name.clone());
     store.write(|tx| {
         let existing: Option<i64> = tx
             .query_row(
@@ -85,10 +79,7 @@ pub fn card(store: &Store, platform: Platform, user_id: &str) -> Result<ViewerCa
             )
             .optional()?
             .ok_or(StoreError::NotFound("viewer"))?;
-        let note: String =
-            c.query_row("SELECT note FROM viewers WHERE id = ?1", [viewer_id], |r| {
-                r.get(0)
-            })?;
+        let note: String = c.query_row("SELECT note FROM viewers WHERE id = ?1", [viewer_id], |r| r.get(0))?;
         let mut st = c.prepare(
             "SELECT platform, user_id, login, display_name, first_seen, last_seen, messages
              FROM viewer_identities WHERE viewer_id = ?1 ORDER BY first_seen",
@@ -106,39 +97,24 @@ pub fn card(store: &Store, platform: Platform, user_id: &str) -> Result<ViewerCa
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ViewerCard {
-            viewer_id,
-            note,
-            identities,
-        })
+        Ok(ViewerCard { viewer_id, note, identities })
     })
 }
 
 pub fn set_note(store: &Store, platform: Platform, user_id: &str, note: &str) -> Result<()> {
     if note.chars().count() > 2_000 {
-        return Err(StoreError::Conflict(
-            "notes can be up to 2,000 characters".into(),
-        ));
+        return Err(StoreError::Conflict("notes can be up to 2,000 characters".into()));
     }
     let v = card(store, platform, user_id)?.viewer_id;
     store.write(|tx| {
-        tx.execute(
-            "UPDATE viewers SET note = ?2 WHERE id = ?1",
-            params![v, note],
-        )?;
+        tx.execute("UPDATE viewers SET note = ?2 WHERE id = ?1", params![v, note])?;
         Ok(())
     })
 }
 
 /// Links `(platform, user_id)` to the viewer that owns `(to_platform, to_user_id)`, so the
 /// two accounts share a note and a ban. The old viewer row is dropped if it's now empty.
-pub fn link(
-    store: &Store,
-    platform: Platform,
-    user_id: &str,
-    to_platform: Platform,
-    to_user_id: &str,
-) -> Result<()> {
+pub fn link(store: &Store, platform: Platform, user_id: &str, to_platform: Platform, to_user_id: &str) -> Result<()> {
     let from = card(store, platform, user_id)?.viewer_id;
     let to = card(store, to_platform, to_user_id)?.viewer_id;
     if from == to {
@@ -171,21 +147,13 @@ mod tests {
     fn touch_counts_messages_and_tracks_renames() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let v = touch(&s, &actor(Platform::Twitch, "1", "Old"), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            touch(&s, &actor(Platform::Twitch, "1", "New"), true).unwrap(),
-            Some(v)
-        );
+        let v = touch(&s, &actor(Platform::Twitch, "1", "Old"), true).unwrap().unwrap();
+        assert_eq!(touch(&s, &actor(Platform::Twitch, "1", "New"), true).unwrap(), Some(v));
         touch(&s, &actor(Platform::Twitch, "1", "New"), false).unwrap();
         let c = card(&s, Platform::Twitch, "1").unwrap();
         assert_eq!(c.identities[0].display_name, "New");
         assert_eq!(c.identities[0].messages, 2);
-        assert_eq!(
-            touch(&s, &Actor::anonymous(Platform::Tips), false).unwrap(),
-            None
-        );
+        assert_eq!(touch(&s, &Actor::anonymous(Platform::Tips), false).unwrap(), None);
     }
 
     #[test]
@@ -199,14 +167,9 @@ mod tests {
         let c = card(&s, Platform::Kick, "k").unwrap();
         assert_eq!(c.note, "regular, plays support");
         assert_eq!(c.identities.len(), 2);
-        let n: i64 = s
-            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM viewers", [], |r| r.get(0))?))
-            .unwrap();
+        let n: i64 = s.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM viewers", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 1, "the empty viewer row is removed");
         assert!(set_note(&s, Platform::Twitch, "t", &"x".repeat(2_001)).is_err());
-        assert!(matches!(
-            card(&s, Platform::Youtube, "nobody"),
-            Err(StoreError::NotFound(_))
-        ));
+        assert!(matches!(card(&s, Platform::Youtube, "nobody"), Err(StoreError::NotFound(_))));
     }
 }

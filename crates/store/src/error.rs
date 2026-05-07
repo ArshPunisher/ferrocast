@@ -4,9 +4,7 @@
 pub enum StoreError {
     #[error("the database couldn't be opened: {0}")]
     Open(String),
-    #[error(
-        "the database is newer (version {found}) than this app (version {supported}); update Ferrocast"
-    )]
+    #[error("the database is newer (version {found}) than this app (version {supported}); update Ferrocast")]
     TooNew { found: i64, supported: i64 },
     #[error("couldn't back up the database before updating it: {0}")]
     Backup(String),

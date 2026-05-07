@@ -31,14 +31,8 @@ fn data_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     // Debug builds never touch the installed app's data.
-    let name = if cfg!(debug_assertions) {
-        "Ferrocast-dev"
-    } else {
-        "Ferrocast"
-    };
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(name)
+    let name = if cfg!(debug_assertions) { "Ferrocast-dev" } else { "Ferrocast" };
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join(name)
 }
 
 fn init_tracing() {
@@ -106,18 +100,14 @@ fn main() {
     };
     app.run(|_app, event| {
         // The last window closing must not quit a tray app; only "Quit" does (exit code set).
-        if let RunEvent::ExitRequested {
-            api, code: None, ..
-        } = event
-        {
+        if let RunEvent::ExitRequested { api, code: None, .. } = event {
             api.prevent_exit();
         }
     });
 }
 
 fn shortcut_of(s: &str) -> Shortcut {
-    s.parse()
-        .unwrap_or_else(|_| Shortcut::new(None, tauri_plugin_global_shortcut::Code::F24))
+    s.parse().unwrap_or_else(|_| Shortcut::new(None, tauri_plugin_global_shortcut::Code::F24))
 }
 
 async fn start(dir: &std::path::Path) -> Result<Running, String> {
@@ -125,11 +115,7 @@ async fn start(dir: &std::path::Path) -> Result<Running, String> {
     let server = ferrocast_server::serve(engine.clone(), ferrocast_server::ServeOptions::default())
         .await
         .map_err(|e| format!("The local server couldn't start: {e}"))?;
-    Ok(Running {
-        engine,
-        base: server.base_url(),
-        token: server.sessions.desktop_token().to_string(),
-    })
+    Ok(Running { engine, base: server.base_url(), token: server.sessions.desktop_token().to_string() })
 }
 
 /// Shows the main window, creating it if it was never opened.
@@ -148,9 +134,7 @@ fn show_window(app: &AppHandle) {
     };
     let api = serde_json::to_string(&running.base).unwrap_or_default();
     let token = serde_json::to_string(&running.token).unwrap_or_default();
-    let script = format!(
-        "window.__FERROCAST__ = Object.freeze({{ api: {api}, token: {token}, desktop: true }});"
-    );
+    let script = format!("window.__FERROCAST__ = Object.freeze({{ api: {api}, token: {token}, desktop: true }});");
     let origin = running.base.clone();
     let opener = app.clone();
     let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
@@ -185,10 +169,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit)
         .build()?;
-    let mut tray = TrayIconBuilder::with_id("main")
-        .tooltip("Ferrocast")
-        .menu(&menu)
-        .show_menu_on_left_click(true);
+    let mut tray = TrayIconBuilder::with_id("main").tooltip("Ferrocast").menu(&menu).show_menu_on_left_click(true);
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
@@ -242,8 +223,6 @@ fn show_startup_error(app: &AppHandle, message: &str) {
     let _ = WebviewWindowBuilder::new(app, "error", WebviewUrl::App("index.html".into()))
         .title("Ferrocast")
         .inner_size(520.0, 220.0)
-        .initialization_script(format!(
-            "window.addEventListener('DOMContentLoaded', () => {{ {html} }});"
-        ))
+        .initialization_script(format!("window.addEventListener('DOMContentLoaded', () => {{ {html} }});"))
         .build();
 }

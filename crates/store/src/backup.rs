@@ -23,17 +23,12 @@ pub struct BackupInfo {
 pub fn snapshot(conn: &Connection, dir: &Path, label: &str) -> Result<PathBuf> {
     let backups = dir.join("backups");
     std::fs::create_dir_all(&backups).map_err(|e| StoreError::Backup(e.to_string()))?;
-    let safe: String = label
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(40)
-        .collect();
+    let safe: String = label.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(40).collect();
     let name = format!("{}-{safe}.db", crate::now_ms());
     let tmp = backups.join(format!("{name}.partial"));
     let path = backups.join(&name);
     let _ = std::fs::remove_file(&tmp);
-    conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
-        .map_err(|e| StoreError::Backup(e.to_string()))?;
+    conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()]).map_err(|e| StoreError::Backup(e.to_string()))?;
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::Backup(e.to_string()))?;
     rotate(&backups)?;
     Ok(path)
@@ -52,16 +47,8 @@ pub fn list(dir: &Path) -> Result<Vec<BackupInfo>> {
         let Some(id) = name.strip_suffix(".db") else {
             continue;
         };
-        let created_at = id
-            .split('-')
-            .next()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(0);
-        out.push(BackupInfo {
-            id: id.to_string(),
-            bytes: entry.metadata()?.len(),
-            created_at,
-        });
+        let created_at = id.split('-').next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        out.push(BackupInfo { id: id.to_string(), bytes: entry.metadata()?.len(), created_at });
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
     Ok(out)
@@ -134,8 +121,7 @@ mod tests {
     fn snapshots_rotate_and_restore() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        s.write(|tx| Ok(tx.execute("INSERT INTO counters(name, value) VALUES ('deaths', 3)", [])?))
-            .unwrap();
+        s.write(|tx| Ok(tx.execute("INSERT INTO counters(name, value) VALUES ('deaths', 3)", [])?)).unwrap();
         let first = s.snapshot("manual").unwrap();
         assert!(first.exists());
         for i in 0..12 {
@@ -145,32 +131,18 @@ mod tests {
         let all = list(dir.path()).unwrap();
         assert_eq!(all.len(), KEEP);
         let target = all.last().unwrap().id.clone();
-        s.write(|tx| Ok(tx.execute("UPDATE counters SET value = 99", [])?))
-            .unwrap();
+        s.write(|tx| Ok(tx.execute("UPDATE counters SET value = 99", [])?)).unwrap();
         drop(s);
         schedule_restore(dir.path(), &target).unwrap();
         assert_eq!(apply_scheduled_restore(dir.path()).unwrap(), Some(target));
         assert!(!dir.path().join("restore-on-start").exists());
         let s = Store::open(dir.path()).unwrap();
-        let v: i64 = s
-            .read(|c| Ok(c.query_row("SELECT value FROM counters", [], |r| r.get(0))?))
-            .unwrap();
+        let v: i64 = s.read(|c| Ok(c.query_row("SELECT value FROM counters", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, 3);
         // The safety copy of the replaced database has the newest value, WAL included.
-        let replaced = list(dir.path())
-            .unwrap()
-            .into_iter()
-            .find(|b| b.id.ends_with("-replaced"))
-            .unwrap();
-        let c = Connection::open(
-            dir.path()
-                .join("backups")
-                .join(format!("{}.db", replaced.id)),
-        )
-        .unwrap();
-        let kept: i64 = c
-            .query_row("SELECT value FROM counters", [], |r| r.get(0))
-            .unwrap();
+        let replaced = list(dir.path()).unwrap().into_iter().find(|b| b.id.ends_with("-replaced")).unwrap();
+        let c = Connection::open(dir.path().join("backups").join(format!("{}.db", replaced.id))).unwrap();
+        let kept: i64 = c.query_row("SELECT value FROM counters", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, 99);
     }
 

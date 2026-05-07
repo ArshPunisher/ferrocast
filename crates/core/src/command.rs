@@ -25,9 +25,7 @@ impl Access {
         let mod_or_up = is(Roles::BROADCASTER) || is(Roles::MODERATOR);
         match self {
             Access::Everyone => true,
-            Access::Subs => {
-                mod_or_up || is(Roles::VIP) || is(Roles::SUBSCRIBER) || is(Roles::MEMBER)
-            }
+            Access::Subs => mod_or_up || is(Roles::VIP) || is(Roles::SUBSCRIBER) || is(Roles::MEMBER),
             Access::Vips => mod_or_up || is(Roles::VIP),
             Access::Mods => mod_or_up,
         }
@@ -80,10 +78,7 @@ impl Command {
         Template::parse(&self.response)?;
         for other in others.iter().filter(|o| o.id != self.id) {
             for mine in std::iter::once(&self.name).chain(&self.aliases) {
-                if std::iter::once(&other.name)
-                    .chain(&other.aliases)
-                    .any(|t| t.eq_ignore_ascii_case(mine))
-                {
+                if std::iter::once(&other.name).chain(&other.aliases).any(|t| t.eq_ignore_ascii_case(mine)) {
                     return Err(CommandError::Taken(mine.clone()));
                 }
             }
@@ -92,18 +87,13 @@ impl Command {
     }
 
     fn answers_to(&self, word: &str) -> bool {
-        self.name.eq_ignore_ascii_case(word)
-            || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(word))
+        self.name.eq_ignore_ascii_case(word) || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(word))
     }
 }
 
 fn valid_name(n: &str) -> bool {
     let rest = n.strip_prefix('!').unwrap_or("");
-    !rest.is_empty()
-        && rest.len() <= 32
-        && rest
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    !rest.is_empty() && rest.len() <= 32 && rest.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 /// A parsed `!command args` message.
@@ -124,10 +114,7 @@ pub fn parse(text: &str) -> Option<Invocation<'_>> {
     if word.len() < 2 {
         return None;
     }
-    Some(Invocation {
-        word,
-        args: parts.take(20).collect(),
-    })
+    Some(Invocation { word, args: parts.take(20).collect() })
 }
 
 /// Remembers when commands last ran.
@@ -160,10 +147,7 @@ pub fn run(
     now: Millis,
 ) -> Result<String, Skip> {
     let inv = parse(text).ok_or(Skip::NotACommand)?;
-    let cmd = commands
-        .iter()
-        .find(|c| c.answers_to(inv.word))
-        .ok_or(Skip::Unknown)?;
+    let cmd = commands.iter().find(|c| c.answers_to(inv.word)).ok_or(Skip::Unknown)?;
     if !cmd.enabled {
         return Err(Skip::Disabled);
     }
@@ -175,13 +159,7 @@ pub fn run(
     }
     // Mods skip cooldowns: they use commands to help, not to spam.
     let is_mod = Access::Mods.allows(actor.roles);
-    let user_key = (
-        cmd.id.clone(),
-        actor
-            .id
-            .clone()
-            .unwrap_or_else(|| actor.display_name.clone()),
-    );
+    let user_key = (cmd.id.clone(), actor.id.clone().unwrap_or_else(|| actor.display_name.clone()));
     if !is_mod {
         if let Some(&last) = cooldowns.global.get(&cmd.id) {
             let left = i64::from(cmd.cooldown_s) - now.seconds_since(last);
@@ -207,15 +185,9 @@ pub fn run(
     for (i, a) in inv.args.iter().enumerate().take(9) {
         vars.insert(format!("arg{}", i + 1), (*a).to_string());
     }
-    let target = inv
-        .args
-        .first()
-        .map(|a| a.trim_start_matches('@'))
-        .unwrap_or(&actor.display_name);
+    let target = inv.args.first().map(|a| a.trim_start_matches('@')).unwrap_or(&actor.display_name);
     vars.insert("target".into(), target.to_string());
-    let reply = Template::parse(&cmd.response)
-        .map(|t| t.render(&vars))
-        .unwrap_or_default();
+    let reply = Template::parse(&cmd.response).map(|t| t.render(&vars)).unwrap_or_default();
     Ok(safe_reply(&reply))
 }
 
@@ -223,10 +195,7 @@ pub fn run(
 /// some chats treat as a moderation command. A viewer passing "/ban mod" as an argument
 /// must not get the bot to run it.
 pub fn safe_reply(text: &str) -> String {
-    let one_line: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let one_line: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let mut trimmed = one_line.trim().to_string();
     while trimmed.starts_with('/') || trimmed.starts_with('.') {
         trimmed.remove(0);
@@ -263,15 +232,7 @@ mod tests {
     fn runs_with_args_and_target() {
         let cmds = vec![cmd("!so", "Go follow {target} on {platform}! ({args})")];
         let mut cd = Cooldowns::default();
-        let out = run(
-            &cmds,
-            &mut cd,
-            Platform::Twitch,
-            &viewer("a"),
-            "!SO @Friend extra",
-            &Vars::new(),
-            Millis(0),
-        );
+        let out = run(&cmds, &mut cd, Platform::Twitch, &viewer("a"), "!SO @Friend extra", &Vars::new(), Millis(0));
         assert_eq!(out.unwrap(), "Go follow Friend on Twitch! (@Friend extra)");
     }
 
@@ -280,52 +241,14 @@ mod tests {
         let cmds = vec![cmd("!d", "x")];
         let mut cd = Cooldowns::default();
         let p = Platform::Twitch;
-        assert!(
-            run(
-                &cmds,
-                &mut cd,
-                p,
-                &viewer("a"),
-                "!d",
-                &Vars::new(),
-                Millis(0)
-            )
-            .is_ok()
-        );
+        assert!(run(&cmds, &mut cd, p, &viewer("a"), "!d", &Vars::new(), Millis(0)).is_ok());
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                p,
-                &viewer("b"),
-                "!d",
-                &Vars::new(),
-                Millis(4_000)
-            ),
+            run(&cmds, &mut cd, p, &viewer("b"), "!d", &Vars::new(), Millis(4_000)),
             Err(Skip::Cooldown { seconds_left: 6 })
         );
-        assert!(
-            run(
-                &cmds,
-                &mut cd,
-                p,
-                &viewer("b"),
-                "!d",
-                &Vars::new(),
-                Millis(11_000)
-            )
-            .is_ok()
-        );
+        assert!(run(&cmds, &mut cd, p, &viewer("b"), "!d", &Vars::new(), Millis(11_000)).is_ok());
         assert!(matches!(
-            run(
-                &cmds,
-                &mut cd,
-                p,
-                &viewer("a"),
-                "!d",
-                &Vars::new(),
-                Millis(22_000)
-            ),
+            run(&cmds, &mut cd, p, &viewer("a"), "!d", &Vars::new(), Millis(22_000)),
             Err(Skip::Cooldown { .. })
         ));
         let mut m = viewer("m");
@@ -343,75 +266,27 @@ mod tests {
         let cmds = vec![c, off];
         let mut cd = Cooldowns::default();
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Twitch,
-                &viewer("a"),
-                "!mods",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Twitch, &viewer("a"), "!mods", &Vars::new(), Millis(0)),
             Err(Skip::WrongPlatform)
         );
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Kick,
-                &viewer("a"),
-                "!mods",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Kick, &viewer("a"), "!mods", &Vars::new(), Millis(0)),
             Err(Skip::NotAllowed)
         );
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Kick,
-                &viewer("a"),
-                "!off",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Kick, &viewer("a"), "!off", &Vars::new(), Millis(0)),
             Err(Skip::Disabled)
         );
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Kick,
-                &viewer("a"),
-                "!nope",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Kick, &viewer("a"), "!nope", &Vars::new(), Millis(0)),
             Err(Skip::Unknown)
         );
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Kick,
-                &viewer("a"),
-                "hello !mods",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Kick, &viewer("a"), "hello !mods", &Vars::new(), Millis(0)),
             Err(Skip::NotACommand)
         );
         assert_eq!(
-            run(
-                &cmds,
-                &mut cd,
-                Platform::Kick,
-                &viewer("a"),
-                "!",
-                &Vars::new(),
-                Millis(0)
-            ),
+            run(&cmds, &mut cd, Platform::Kick, &viewer("a"), "!", &Vars::new(), Millis(0)),
             Err(Skip::NotACommand)
         );
     }
@@ -420,53 +295,24 @@ mod tests {
     fn viewers_cannot_inject_chat_commands() {
         let cmds = vec![cmd("!echo", "{args}")];
         let mut cd = Cooldowns::default();
-        let out = run(
-            &cmds,
-            &mut cd,
-            Platform::Twitch,
-            &viewer("a"),
-            "!echo /ban streamer",
-            &Vars::new(),
-            Millis(0),
-        );
+        let out = run(&cmds, &mut cd, Platform::Twitch, &viewer("a"), "!echo /ban streamer", &Vars::new(), Millis(0));
         assert_eq!(out.unwrap(), "ban streamer");
-        assert_eq!(
-            safe_reply(". /timeout x\nsecond line"),
-            "timeout x second line"
-        );
-        assert_eq!(
-            safe_reply(&"x".repeat(900)).chars().count(),
-            MAX_REPLY_CHARS
-        );
+        assert_eq!(safe_reply(". /timeout x\nsecond line"), "timeout x second line");
+        assert_eq!(safe_reply(&"x".repeat(900)).chars().count(), MAX_REPLY_CHARS);
     }
 
     #[test]
     fn validation() {
         let a = cmd("!discord", "join {user}");
         assert!(a.validate(&[]).is_ok());
-        assert_eq!(
-            cmd("discord", "x").validate(&[]),
-            Err(CommandError::BadName)
-        );
-        assert_eq!(
-            cmd("!dis cord", "x").validate(&[]),
-            Err(CommandError::BadName)
-        );
+        assert_eq!(cmd("discord", "x").validate(&[]), Err(CommandError::BadName));
+        assert_eq!(cmd("!dis cord", "x").validate(&[]), Err(CommandError::BadName));
         assert_eq!(cmd("!", "x").validate(&[]), Err(CommandError::BadName));
-        assert_eq!(
-            cmd("!x", "  ").validate(&[]),
-            Err(CommandError::EmptyResponse)
-        );
-        assert!(matches!(
-            cmd("!x", "{oops").validate(&[]),
-            Err(CommandError::Template(_))
-        ));
+        assert_eq!(cmd("!x", "  ").validate(&[]), Err(CommandError::EmptyResponse));
+        assert!(matches!(cmd("!x", "{oops").validate(&[]), Err(CommandError::Template(_))));
         let mut b = cmd("!dc", "x");
         b.aliases = vec!["!Discord".into()];
-        assert_eq!(
-            b.validate(&[a]),
-            Err(CommandError::Taken("!Discord".into()))
-        );
+        assert_eq!(b.validate(&[a]), Err(CommandError::Taken("!Discord".into())));
     }
 
     #[test]
@@ -504,13 +350,7 @@ impl Timer {
 
     /// Whether the timer should post now. `every_min` below 5 is treated as 5: a faster
     /// timer is spam whatever the settings say.
-    pub fn due(
-        &self,
-        last_post: Option<Millis>,
-        lines_since: u32,
-        live: bool,
-        now: Millis,
-    ) -> bool {
+    pub fn due(&self, last_post: Option<Millis>, lines_since: u32, live: bool, now: Millis) -> bool {
         if !self.enabled || !live || lines_since < self.min_chat_lines {
             return false;
         }
@@ -547,11 +387,7 @@ mod timer_tests {
 
     #[test]
     fn floor_of_five_minutes() {
-        let t = Timer {
-            every_min: 0,
-            min_chat_lines: 0,
-            ..timer()
-        };
+        let t = Timer { every_min: 0, min_chat_lines: 0, ..timer() };
         assert!(!t.due(Some(Millis(0)), 0, true, Millis(60_000)));
         assert!(t.due(Some(Millis(0)), 0, true, Millis(300_000)));
     }
@@ -559,21 +395,7 @@ mod timer_tests {
     #[test]
     fn validation() {
         assert!(timer().validate().is_ok());
-        assert!(
-            Timer {
-                message: " ".into(),
-                ..timer()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            Timer {
-                message: "{bad".into(),
-                ..timer()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(Timer { message: " ".into(), ..timer() }.validate().is_err());
+        assert!(Timer { message: "{bad".into(), ..timer() }.validate().is_err());
     }
 }

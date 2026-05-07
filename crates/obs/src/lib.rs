@@ -23,22 +23,15 @@ pub struct ObsConfig {
 
 impl Default for ObsConfig {
     fn default() -> Self {
-        ObsConfig {
-            host: "127.0.0.1".into(),
-            port: 4455,
-        }
+        ObsConfig { host: "127.0.0.1".into(), port: 4455 }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ObsError {
-    #[error(
-        "OBS isn't running, or its WebSocket server is off (Tools → WebSocket Server Settings)."
-    )]
+    #[error("OBS isn't running, or its WebSocket server is off (Tools → WebSocket Server Settings).")]
     NotReachable,
-    #[error(
-        "OBS refused the password. Copy it from Tools → WebSocket Server Settings → Show Connect Info."
-    )]
+    #[error("OBS refused the password. Copy it from Tools → WebSocket Server Settings → Show Connect Info.")]
     WrongPassword,
     #[error("OBS answered with an error: {0}")]
     Refused(String),
@@ -88,11 +81,7 @@ pub async fn connect(cfg: &ObsConfig, password: Option<&str>) -> Result<Client, 
 
 pub async fn status(client: &Client) -> Result<ObsStatus, ObsError> {
     let v = client.general().version().await.map_err(map_err)?;
-    let scene = client
-        .scenes()
-        .current_program_scene()
-        .await
-        .map_err(map_err)?;
+    let scene = client.scenes().current_program_scene().await.map_err(map_err)?;
     Ok(ObsStatus {
         obs_version: v.obs_studio_version.to_string(),
         websocket_version: v.obs_web_socket_version.to_string(),
@@ -102,11 +91,7 @@ pub async fn status(client: &Client) -> Result<ObsStatus, ObsError> {
 
 /// The browser-source name for an overlay. Kept stable so adding twice updates in place.
 pub fn source_name(overlay_name: &str) -> String {
-    let clean: String = overlay_name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(60)
-        .collect();
+    let clean: String = overlay_name.chars().filter(|c| !c.is_control()).take(60).collect();
     format!("Ferrocast: {}", clean.trim())
 }
 
@@ -119,23 +104,14 @@ pub async fn add_browser_source(
     width: u32,
     height: u32,
 ) -> Result<Added, ObsError> {
-    let scene = client
-        .scenes()
-        .current_program_scene()
-        .await
-        .map_err(map_err)?
-        .id;
+    let scene = client.scenes().current_program_scene().await.map_err(map_err)?.id;
     let scene_id = SceneId::Uuid(scene.uuid);
     // Keep the source running when hidden so a queued alert isn't lost on a scene switch;
     // audio stays with OBS's defaults.
-    let settings = json!({ "url": url, "width": width, "height": height, "shutdown": false, "restart_when_active": false });
-    let existing = client
-        .inputs()
-        .list(Some("browser_source"))
-        .await
-        .map_err(map_err)?
-        .into_iter()
-        .find(|i| i.id.name == name);
+    let settings =
+        json!({ "url": url, "width": width, "height": height, "shutdown": false, "restart_when_active": false });
+    let existing =
+        client.inputs().list(Some("browser_source")).await.map_err(map_err)?.into_iter().find(|i| i.id.name == name);
     match existing {
         Some(input) => {
             client
@@ -147,15 +123,8 @@ pub async fn add_browser_source(
                 })
                 .await
                 .map_err(map_err)?;
-            let in_scene = client
-                .scene_items()
-                .id(Id {
-                    scene: scene_id,
-                    source: name,
-                    search_offset: None,
-                })
-                .await
-                .is_ok();
+            let in_scene =
+                client.scene_items().id(Id { scene: scene_id, source: name, search_offset: None }).await.is_ok();
             if !in_scene {
                 client
                     .scene_items()
@@ -167,11 +136,7 @@ pub async fn add_browser_source(
                     .await
                     .map_err(map_err)?;
             }
-            Ok(Added {
-                scene: scene.name,
-                source: name.to_string(),
-                created: false,
-            })
+            Ok(Added { scene: scene.name, source: name.to_string(), created: false })
         }
         None => {
             client
@@ -185,11 +150,7 @@ pub async fn add_browser_source(
                 })
                 .await
                 .map_err(map_err)?;
-            Ok(Added {
-                scene: scene.name,
-                source: name.to_string(),
-                created: true,
-            })
+            Ok(Added { scene: scene.name, source: name.to_string(), created: true })
         }
     }
 }

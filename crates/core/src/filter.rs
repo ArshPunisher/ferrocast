@@ -83,15 +83,8 @@ impl Default for FilterConfig {
             terms: Vec::new(),
             links: LinkRule {
                 enabled: true,
-                allowed_roles: Roles::BROADCASTER
-                    .union(Roles::MODERATOR)
-                    .union(Roles::VIP)
-                    .union(Roles::SUBSCRIBER),
-                allowed_domains: vec![
-                    "clips.twitch.tv".into(),
-                    "youtube.com".into(),
-                    "youtu.be".into(),
-                ],
+                allowed_roles: Roles::BROADCASTER.union(Roles::MODERATOR).union(Roles::VIP).union(Roles::SUBSCRIBER),
+                allowed_domains: vec!["clips.twitch.tv".into(), "youtube.com".into(), "youtu.be".into()],
                 hold_first_time: true,
                 action: Action::Delete,
             },
@@ -116,17 +109,10 @@ pub struct Verdict {
 
 impl Verdict {
     fn allow() -> Self {
-        Verdict {
-            action: Action::Allow,
-            reason: String::new(),
-        }
+        Verdict { action: Action::Allow, reason: String::new() }
     }
     fn worse(self, other: Verdict) -> Verdict {
-        if other.action.severity() > self.action.severity() {
-            other
-        } else {
-            self
-        }
+        if other.action.severity() > self.action.severity() { other } else { self }
     }
 }
 
@@ -140,36 +126,22 @@ pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Ve
     for t in &cfg.terms {
         let needle = fold(&t.term);
         if !needle.is_empty() && contains_term(&folded, &needle) {
-            v = v.worse(Verdict {
-                action: t.action,
-                reason: format!("blocked term \"{}\"", t.term),
-            });
+            v = v.worse(Verdict { action: t.action, reason: format!("blocked term \"{}\"", t.term) });
         }
     }
     if cfg.links.enabled && has_link(text) {
         let role_ok = actor.roles.0 & cfg.links.allowed_roles.0 != 0;
-        let domain_ok = links(text)
-            .iter()
-            .all(|d| domain_allowed(d, &cfg.links.allowed_domains));
+        let domain_ok = links(text).iter().all(|d| domain_allowed(d, &cfg.links.allowed_domains));
         if actor.roles.contains(Roles::FIRST_TIME) && cfg.links.hold_first_time && !domain_ok {
-            v = v.worse(Verdict {
-                action: Action::Hold,
-                reason: "first message has a link".into(),
-            });
+            v = v.worse(Verdict { action: Action::Hold, reason: "first message has a link".into() });
         }
         // Independent of the hold above so the stronger action wins: a first-time
         // non-subscriber's scam link is deleted, not merely held.
         if !role_ok && !domain_ok {
-            v = v.worse(Verdict {
-                action: cfg.links.action,
-                reason: "link not allowed".into(),
-            });
+            v = v.worse(Verdict { action: cfg.links.action, reason: "link not allowed".into() });
         }
     }
-    let spam = |reason: String| Verdict {
-        action: cfg.spam_action,
-        reason,
-    };
+    let spam = |reason: String| Verdict { action: cfg.spam_action, reason };
     if cfg.max_length > 0 && text.chars().count() > cfg.max_length {
         v = v.worse(spam(format!("longer than {} characters", cfg.max_length)));
     }
@@ -180,9 +152,7 @@ pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Ve
             v = v.worse(spam("too many capitals".into()));
         }
     }
-    if cfg.max_symbols > 0
-        && longest_run(text, |c| !c.is_alphanumeric() && !c.is_whitespace()) > cfg.max_symbols
-    {
+    if cfg.max_symbols > 0 && longest_run(text, |c| !c.is_alphanumeric() && !c.is_whitespace()) > cfg.max_symbols {
         v = v.worse(spam("too many symbols".into()));
     }
     if cfg.max_emotes > 0 && emotes > cfg.max_emotes {
@@ -197,17 +167,10 @@ pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Ve
 /// Folds text for matching (see module docs). Output is lowercase ASCII-ish words
 /// separated by single spaces.
 pub fn fold(text: &str) -> String {
-    let mapped: String = text
-        .nfkc()
-        .flat_map(char::to_lowercase)
-        .filter(|c| !is_invisible(*c))
-        .map(lookalike)
-        .collect();
+    let mapped: String =
+        text.nfkc().flat_map(char::to_lowercase).filter(|c| !is_invisible(*c)).map(lookalike).collect();
     // Collapse "b.a.d" / "b a d" / "b-a-d": separators between single characters.
-    let tokens: Vec<&str> = mapped
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let tokens: Vec<&str> = mapped.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
     let mut words: Vec<String> = Vec::new();
     let mut run = String::new();
     for t in tokens {
@@ -223,11 +186,7 @@ pub fn fold(text: &str) -> String {
     if !run.is_empty() {
         words.push(run);
     }
-    words
-        .iter()
-        .map(|w| squeeze(w))
-        .collect::<Vec<_>>()
-        .join(" ")
+    words.iter().map(|w| squeeze(w)).collect::<Vec<_>>().join(" ")
 }
 
 /// Whole-word match for single words, substring match inside words for longer terms so
@@ -296,16 +255,10 @@ fn has_link(text: &str) -> bool {
 
 /// Domains of anything that looks like a link, including "example . com" and "hxxp" tricks.
 pub(crate) fn links(text: &str) -> Vec<String> {
-    let lower = text
-        .to_lowercase()
-        .replace(" . ", ".")
-        .replace("[.]", ".")
-        .replace("(.)", ".")
-        .replace(" dot ", ".");
+    let lower = text.to_lowercase().replace(" . ", ".").replace("[.]", ".").replace("(.)", ".").replace(" dot ", ".");
     let mut out = Vec::new();
     for raw in lower.split_whitespace() {
-        let w =
-            raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != ':');
+        let w = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != ':');
         let w = w
             .strip_prefix("https://")
             .or_else(|| w.strip_prefix("http://"))
@@ -316,8 +269,7 @@ pub(crate) fn links(text: &str) -> Vec<String> {
         let host = host.strip_prefix("www.").unwrap_or(host);
         let parts: Vec<&str> = host.split('.').collect();
         let tld_ok = parts.last().is_some_and(|t| is_tld(t));
-        if parts.len() >= 2 && tld_ok && parts.iter().all(|p| !p.is_empty()) && !host.contains("..")
-        {
+        if parts.len() >= 2 && tld_ok && parts.iter().all(|p| !p.is_empty()) && !host.contains("..") {
             out.push(host.to_string());
         }
     }
@@ -328,21 +280,19 @@ pub(crate) fn links(text: &str) -> Vec<String> {
 /// made "Mr.Bean" and "great.stream" look like links.
 fn is_tld(t: &str) -> bool {
     const GENERIC: [&str; 38] = [
-        "com", "net", "org", "dev", "app", "xyz", "info", "biz", "live", "link", "site", "online",
-        "store", "shop", "club", "top", "vip", "fun", "pro", "art", "blog", "chat", "click",
-        "cloud", "games", "icu", "lol", "monster", "rest", "sbs", "space", "tech", "today",
-        "website", "win", "zip", "gay", "ink",
+        "com", "net", "org", "dev", "app", "xyz", "info", "biz", "live", "link", "site", "online", "store", "shop",
+        "club", "top", "vip", "fun", "pro", "art", "blog", "chat", "click", "cloud", "games", "icu", "lol", "monster",
+        "rest", "sbs", "space", "tech", "today", "website", "win", "zip", "gay", "ink",
     ];
     // Country codes that show up in chat links; "wp" or "gg.ez" style banter isn't a link.
     const COUNTRY: [&str; 120] = [
-        "ac", "ae", "ag", "ai", "al", "am", "ar", "at", "au", "az", "ba", "bd", "be", "bg", "bh",
-        "br", "by", "bz", "ca", "cc", "cf", "ch", "cl", "cn", "co", "cx", "cz", "de", "dk", "ee",
-        "eg", "es", "fi", "fm", "fo", "fr", "ga", "ge", "gg", "gl", "gq", "gr", "gy", "hk", "hr",
-        "hu", "id", "ie", "il", "im", "in", "io", "ir", "is", "it", "jo", "jp", "ke", "kr", "kw",
-        "kz", "la", "lb", "lc", "li", "lk", "lt", "lu", "lv", "ly", "ma", "md", "me", "mk", "ml",
-        "mn", "ms", "mu", "mx", "my", "ng", "nl", "no", "np", "nu", "nz", "om", "pe", "ph", "pk",
-        "pl", "pt", "pw", "qa", "ro", "rs", "ru", "sa", "sc", "se", "sg", "sh", "si", "sk", "so",
-        "su", "th", "tk", "to", "tr", "tv", "tw", "ua", "uk", "us", "uz", "vg", "vn", "ws", "za",
+        "ac", "ae", "ag", "ai", "al", "am", "ar", "at", "au", "az", "ba", "bd", "be", "bg", "bh", "br", "by", "bz",
+        "ca", "cc", "cf", "ch", "cl", "cn", "co", "cx", "cz", "de", "dk", "ee", "eg", "es", "fi", "fm", "fo", "fr",
+        "ga", "ge", "gg", "gl", "gq", "gr", "gy", "hk", "hr", "hu", "id", "ie", "il", "im", "in", "io", "ir", "is",
+        "it", "jo", "jp", "ke", "kr", "kw", "kz", "la", "lb", "lc", "li", "lk", "lt", "lu", "lv", "ly", "ma", "md",
+        "me", "mk", "ml", "mn", "ms", "mu", "mx", "my", "ng", "nl", "no", "np", "nu", "nz", "om", "pe", "ph", "pk",
+        "pl", "pt", "pw", "qa", "ro", "rs", "ru", "sa", "sc", "se", "sg", "sh", "si", "sk", "so", "su", "th", "tk",
+        "to", "tr", "tv", "tw", "ua", "uk", "us", "uz", "vg", "vn", "ws", "za",
     ];
     GENERIC.contains(&t) || COUNTRY.contains(&t)
 }
@@ -388,10 +338,7 @@ mod tests {
 
     fn cfg_with(term: &str) -> FilterConfig {
         FilterConfig {
-            terms: vec![BlockedTerm {
-                term: term.into(),
-                action: Action::Timeout { seconds: 600 },
-            }],
+            terms: vec![BlockedTerm { term: term.into(), action: Action::Timeout { seconds: 600 } }],
             ..FilterConfig::default()
         }
     }
@@ -413,21 +360,14 @@ mod tests {
             "b̷a̷d̷w̷o̷r̷d̷",
             "xxbadwordxx",
         ] {
-            assert_eq!(
-                check(&cfg, &viewer(), evasion, 0).action,
-                Action::Timeout { seconds: 600 },
-                "{evasion:?}"
-            );
+            assert_eq!(check(&cfg, &viewer(), evasion, 0).action, Action::Timeout { seconds: 600 }, "{evasion:?}");
         }
     }
 
     #[test]
     fn short_terms_match_whole_words_only() {
         let cfg = cfg_with("ass");
-        assert_eq!(
-            check(&cfg, &viewer(), "first class assistant", 0).action,
-            Action::Allow
-        );
+        assert_eq!(check(&cfg, &viewer(), "first class assistant", 0).action, Action::Allow);
         assert_ne!(check(&cfg, &viewer(), "you a s s", 0).action, Action::Allow);
     }
 
@@ -442,36 +382,12 @@ mod tests {
     #[test]
     fn links_by_role_domain_and_first_time() {
         let cfg = FilterConfig::default();
-        assert_eq!(
-            check(&cfg, &viewer(), "buy followers at cheap-viewz.com", 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "cheap-viewz . com", 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "hxxps://scam.ru/x", 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(
-                &cfg,
-                &viewer(),
-                "watch https://www.youtube.com/watch?v=1",
-                0
-            )
-            .action,
-            Action::Allow
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "clip https://clips.twitch.tv/abc", 0).action,
-            Action::Allow
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "evil-youtube.com.attacker.net", 0).action,
-            Action::Delete
-        );
+        assert_eq!(check(&cfg, &viewer(), "buy followers at cheap-viewz.com", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "cheap-viewz . com", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "hxxps://scam.ru/x", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "watch https://www.youtube.com/watch?v=1", 0).action, Action::Allow);
+        assert_eq!(check(&cfg, &viewer(), "clip https://clips.twitch.tv/abc", 0).action, Action::Allow);
+        assert_eq!(check(&cfg, &viewer(), "evil-youtube.com.attacker.net", 0).action, Action::Delete);
         let mut sub = viewer();
         sub.roles = Roles::SUBSCRIBER;
         assert_eq!(check(&cfg, &sub, "my site.dev", 0).action, Action::Allow);
@@ -488,82 +404,31 @@ mod tests {
             Action::Hold,
             "a first-time sub's link waits for a mod"
         );
-        assert_eq!(
-            check(&cfg, &viewer(), "version 1.2 is out... ok.", 0).action,
-            Action::Allow,
-            "not a link"
-        );
-        for normal in [
-            "Mr.Bean is funny",
-            "that was great.stream on",
-            "gg.wp",
-            "e.g. this",
-            "U.S.A. vs IN",
-        ] {
-            assert_eq!(
-                check(&cfg, &viewer(), normal, 0).action,
-                Action::Allow,
-                "{normal:?} isn't a link"
-            );
+        assert_eq!(check(&cfg, &viewer(), "version 1.2 is out... ok.", 0).action, Action::Allow, "not a link");
+        for normal in ["Mr.Bean is funny", "that was great.stream on", "gg.wp", "e.g. this", "U.S.A. vs IN"] {
+            assert_eq!(check(&cfg, &viewer(), normal, 0).action, Action::Allow, "{normal:?} isn't a link");
         }
-        for spam in [
-            "cheap.xyz",
-            "bit.ly/abc",
-            "free-followers.gg",
-            "discord.gg/scam",
-        ] {
-            assert_eq!(
-                check(&cfg, &viewer(), spam, 0).action,
-                Action::Delete,
-                "{spam:?} is a link"
-            );
+        for spam in ["cheap.xyz", "bit.ly/abc", "free-followers.gg", "discord.gg/scam"] {
+            assert_eq!(check(&cfg, &viewer(), spam, 0).action, Action::Delete, "{spam:?} is a link");
         }
     }
 
     #[test]
     fn spam_rules() {
-        let cfg = FilterConfig {
-            max_symbols: 5,
-            max_emotes: 3,
-            max_repeat: 10,
-            ..FilterConfig::default()
-        };
-        assert_eq!(
-            check(&cfg, &viewer(), "THIS IS ALL CAPS SHOUTING", 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "OK", 0).action,
-            Action::Allow,
-            "short caps are fine"
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "lol !!!!!!!!", 0).action,
-            Action::Delete
-        );
+        let cfg = FilterConfig { max_symbols: 5, max_emotes: 3, max_repeat: 10, ..FilterConfig::default() };
+        assert_eq!(check(&cfg, &viewer(), "THIS IS ALL CAPS SHOUTING", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "OK", 0).action, Action::Allow, "short caps are fine");
+        assert_eq!(check(&cfg, &viewer(), "lol !!!!!!!!", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), "hi", 4).action, Action::Delete);
-        assert_eq!(
-            check(&cfg, &viewer(), "nooooooooooooooo", 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), &"a ".repeat(400), 0).action,
-            Action::Delete
-        );
-        assert_eq!(
-            check(&cfg, &viewer(), "नमस्ते दोस्तों, कैसे हो", 0).action,
-            Action::Allow,
-            "Devanagari isn't 'symbols'"
-        );
+        assert_eq!(check(&cfg, &viewer(), "nooooooooooooooo", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), &"a ".repeat(400), 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "नमस्ते दोस्तों, कैसे हो", 0).action, Action::Allow, "Devanagari isn't 'symbols'");
     }
 
     #[test]
     fn worst_action_wins_and_disabled_allows() {
         let mut cfg = cfg_with("badword");
-        cfg.terms.push(BlockedTerm {
-            term: "nuke".into(),
-            action: Action::Ban,
-        });
+        cfg.terms.push(BlockedTerm { term: "nuke".into(), action: Action::Ban });
         let v = check(&cfg, &viewer(), "nuke badword", 0);
         assert_eq!(v.action, Action::Ban);
         assert!(v.reason.contains("nuke"));

@@ -8,14 +8,8 @@ use crate::{Store, now_ms};
 
 /// Reads a setting; `None` when it was never saved.
 pub fn get<T: DeserializeOwned>(store: &Store, key: &str) -> Result<Option<T>> {
-    let raw: Option<String> = store.read(|c| {
-        Ok(
-            c.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()?,
-        )
-    })?;
+    let raw: Option<String> = store
+        .read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?))?;
     match raw {
         Some(s) => Ok(Some(serde_json::from_str(&s)?)),
         None => Ok(None),
@@ -103,16 +97,10 @@ mod tests {
     fn typed_settings_round_trip_and_default() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        assert_eq!(
-            get_or_default::<Prefs>(&s, "prefs").unwrap(),
-            Prefs::default()
-        );
+        assert_eq!(get_or_default::<Prefs>(&s, "prefs").unwrap(), Prefs::default());
         set(&s, "prefs", &Prefs { volume: 40 }).unwrap();
         set(&s, "prefs", &Prefs { volume: 60 }).unwrap();
-        assert_eq!(
-            get::<Prefs>(&s, "prefs").unwrap(),
-            Some(Prefs { volume: 60 })
-        );
+        assert_eq!(get::<Prefs>(&s, "prefs").unwrap(), Some(Prefs { volume: 60 }));
     }
 
     #[test]

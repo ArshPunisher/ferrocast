@@ -23,22 +23,13 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Overlay> {
 pub fn list(store: &Store) -> Result<Vec<Overlay>> {
     store.read(|c| {
         let mut st = c.prepare(&format!("SELECT {COLS} FROM overlays ORDER BY created_at"))?;
-        Ok(st
-            .query_map([], row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?)
     })
 }
 
 pub fn get(store: &Store, id: &str) -> Result<Overlay> {
     store
-        .read(|c| {
-            Ok(c.query_row(
-                &format!("SELECT {COLS} FROM overlays WHERE id = ?1"),
-                [id],
-                row,
-            )
-            .optional()?)
-        })?
+        .read(|c| Ok(c.query_row(&format!("SELECT {COLS} FROM overlays WHERE id = ?1"), [id], row).optional()?))?
         .ok_or(StoreError::NotFound("overlay"))
 }
 
@@ -47,14 +38,8 @@ pub fn by_token(store: &Store, token: &str) -> Result<Option<Overlay>> {
     if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(None);
     }
-    store.read(|c| {
-        Ok(c.query_row(
-            &format!("SELECT {COLS} FROM overlays WHERE token = ?1"),
-            [token],
-            row,
-        )
-        .optional()?)
-    })
+    store
+        .read(|c| Ok(c.query_row(&format!("SELECT {COLS} FROM overlays WHERE token = ?1"), [token], row).optional()?))
 }
 
 /// Creates an overlay from a preset with a fresh token.
@@ -68,22 +53,13 @@ pub fn create(store: &Store, name: &str, preset: Preset) -> Result<Overlay> {
         widgets: preset_widgets(preset),
         updated_at: now_ms(),
     };
-    o.validate()
-        .map_err(|e| StoreError::Conflict(e.to_string()))?;
+    o.validate().map_err(|e| StoreError::Conflict(e.to_string()))?;
     let widgets = serde_json::to_string(&o.widgets)?;
     store.write(|tx| {
         tx.execute(
             "INSERT INTO overlays(id, name, token, width, height, widgets, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![
-                o.id,
-                o.name,
-                o.token,
-                o.width,
-                o.height,
-                widgets,
-                o.updated_at
-            ],
+            params![o.id, o.name, o.token, o.width, o.height, widgets, o.updated_at],
         )?;
         Ok(())
     })?;
@@ -92,8 +68,7 @@ pub fn create(store: &Store, name: &str, preset: Preset) -> Result<Overlay> {
 
 /// Saves name, size and widgets. The token can't be changed here, only regenerated.
 pub fn update(store: &Store, o: &Overlay) -> Result<Overlay> {
-    o.validate()
-        .map_err(|e| StoreError::Conflict(e.to_string()))?;
+    o.validate().map_err(|e| StoreError::Conflict(e.to_string()))?;
     let widgets = serde_json::to_string(&o.widgets)?;
     let n = store.write(|tx| {
         Ok(tx.execute(
@@ -122,11 +97,7 @@ pub fn regenerate_token(store: &Store, id: &str) -> Result<Overlay> {
 
 pub fn delete(store: &Store, id: &str) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM overlays WHERE id = ?1", [id])?))?;
-    if n == 0 {
-        Err(StoreError::NotFound("overlay"))
-    } else {
-        Ok(())
-    }
+    if n == 0 { Err(StoreError::NotFound("overlay")) } else { Ok(()) }
 }
 
 #[cfg(test)]
@@ -148,10 +119,7 @@ mod tests {
         assert_eq!(saved.token, o.token, "update can't set the token");
         let fresh = regenerate_token(&s, &o.id).unwrap();
         assert_ne!(fresh.token, o.token);
-        assert!(
-            by_token(&s, &o.token).unwrap().is_none(),
-            "old URL stops working"
-        );
+        assert!(by_token(&s, &o.token).unwrap().is_none(), "old URL stops working");
         delete(&s, &o.id).unwrap();
         assert!(matches!(get(&s, &o.id), Err(StoreError::NotFound(_))));
         assert!(matches!(delete(&s, &o.id), Err(StoreError::NotFound(_))));
@@ -171,13 +139,7 @@ mod tests {
     fn junk_tokens_never_hit_the_database() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        for t in [
-            "",
-            "' OR 1=1 --",
-            "../../x",
-            &"a".repeat(32 * 100),
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-        ] {
+        for t in ["", "' OR 1=1 --", "../../x", &"a".repeat(32 * 100), "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
             assert!(by_token(&s, t).unwrap().is_none());
         }
     }

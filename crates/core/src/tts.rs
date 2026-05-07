@@ -30,11 +30,7 @@ impl Default for TtsPolicy {
         TtsPolicy {
             enabled: false,
             voice: None,
-            min_amounts: vec![
-                Money::new(10_000, "INR"),
-                Money::new(200, "USD"),
-                Money::new(200, "EUR"),
-            ],
+            min_amounts: vec![Money::new(10_000, "INR"), Money::new(200, "USD"), Money::new(200, "EUR")],
             min_platform_value: 200,
             max_chars: 200,
             read_names: true,
@@ -58,31 +54,13 @@ pub fn decide(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event) -> D
         return skip("TTS is off");
     }
     let (actor, message, paid_ok) = match &event.kind {
-        EventKind::Tip {
-            actor,
-            money,
-            message,
-            ..
-        } => (actor, message.clone(), meets(&policy.min_amounts, money)),
-        EventKind::PaidMessage {
-            actor,
-            money,
-            content,
-            ..
-        } => (
-            actor,
-            content.as_ref().map(|c| c.text.clone()),
-            meets(&policy.min_amounts, money),
-        ),
-        EventKind::PlatformGift {
-            actor,
-            value,
-            message,
-        } => (
-            actor,
-            message.as_ref().map(|c| c.text.clone()),
-            value.amount >= policy.min_platform_value,
-        ),
+        EventKind::Tip { actor, money, message, .. } => (actor, message.clone(), meets(&policy.min_amounts, money)),
+        EventKind::PaidMessage { actor, money, content, .. } => {
+            (actor, content.as_ref().map(|c| c.text.clone()), meets(&policy.min_amounts, money))
+        }
+        EventKind::PlatformGift { actor, value, message } => {
+            (actor, message.as_ref().map(|c| c.text.clone()), value.amount >= policy.min_platform_value)
+        }
         EventKind::RewardRedemption { actor, input, .. } => (actor, input.clone(), true),
         _ => return skip("this event type isn't read aloud"),
     };
@@ -94,9 +72,7 @@ pub fn decide(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event) -> D
     };
     let verdict = filter::check(filter_cfg, actor, &message, 0);
     if verdict.action != filter::Action::Allow {
-        return Decision::Hold {
-            text: clean(&message, policy.max_chars),
-        };
+        return Decision::Hold { text: clean(&message, policy.max_chars) };
     }
     let body = clean(&message, policy.max_chars);
     if body.is_empty() {
@@ -107,16 +83,11 @@ pub fn decide(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event) -> D
     } else {
         body
     };
-    if policy.hold_for_approval {
-        Decision::Hold { text }
-    } else {
-        Decision::Speak { text }
-    }
+    if policy.hold_for_approval { Decision::Hold { text } } else { Decision::Speak { text } }
 }
 
 fn meets(mins: &[Money], money: &Money) -> bool {
-    mins.iter()
-        .any(|m| m.currency.eq_ignore_ascii_case(&money.currency) && money.minor >= m.minor)
+    mins.iter().any(|m| m.currency.eq_ignore_ascii_case(&money.currency) && money.minor >= m.minor)
 }
 
 /// Removes links, emails, long digit runs (phones, addresses, card numbers), repeated
@@ -127,11 +98,7 @@ pub fn clean(text: &str, max_chars: usize) -> String {
         .filter(|w| !looks_like_link(w) && !w.contains('@'))
         .map(|w| {
             let digits = w.chars().filter(char::is_ascii_digit).count();
-            if digits >= 5 {
-                "number".to_string()
-            } else {
-                squeeze_runs(w, 3)
-            }
+            if digits >= 5 { "number".to_string() } else { squeeze_runs(w, 3) }
         })
         .filter(|w| w.chars().any(char::is_alphanumeric))
         .collect();
@@ -189,20 +156,13 @@ mod tests {
     }
 
     fn on() -> TtsPolicy {
-        TtsPolicy {
-            enabled: true,
-            ..TtsPolicy::default()
-        }
+        TtsPolicy { enabled: true, ..TtsPolicy::default() }
     }
 
     #[test]
     fn off_by_default() {
         assert!(matches!(
-            decide(
-                &TtsPolicy::default(),
-                &FilterConfig::default(),
-                &tip(50_000, "INR", "hi")
-            ),
+            decide(&TtsPolicy::default(), &FilterConfig::default(), &tip(50_000, "INR", "hi")),
             Decision::Skip { .. }
         ));
     }
@@ -212,29 +172,15 @@ mod tests {
         let f = FilterConfig::default();
         assert_eq!(
             decide(&on(), &f, &tip(50_000, "INR", "great run")),
-            Decision::Speak {
-                text: "Asha says: great run".into()
-            }
+            Decision::Speak { text: "Asha says: great run".into() }
         );
-        assert!(matches!(
-            decide(&on(), &f, &tip(5_000, "INR", "hi")),
-            Decision::Skip { .. }
-        ));
-        assert!(
-            matches!(
-                decide(&on(), &f, &tip(1_000_000, "JPY", "hi")),
-                Decision::Skip { .. }
-            ),
-            "JPY not listed"
-        );
+        assert!(matches!(decide(&on(), &f, &tip(5_000, "INR", "hi")), Decision::Skip { .. }));
+        assert!(matches!(decide(&on(), &f, &tip(1_000_000, "JPY", "hi")), Decision::Skip { .. }), "JPY not listed");
     }
 
     #[test]
     fn strips_doxxing_and_links() {
-        let out = clean(
-            "call me 9876543210 or visit evil.com / https://x.y at 221B Baker st, mail a@b.co",
-            200,
-        );
+        let out = clean("call me 9876543210 or visit evil.com / https://x.y at 221B Baker st, mail a@b.co", 200);
         assert_eq!(out, "call me number or visit at 221B Baker st, mail");
         assert_eq!(clean("hiiiiiiiiii !!!!!!", 200), "hiii");
         assert_eq!(clean("one two three four", 9), "one two");
@@ -243,38 +189,20 @@ mod tests {
     #[test]
     fn filtered_messages_are_held_not_spoken() {
         let mut f = FilterConfig::default();
-        f.terms.push(filter::BlockedTerm {
-            term: "badword".into(),
-            action: filter::Action::Delete,
-        });
-        assert!(matches!(
-            decide(&on(), &f, &tip(50_000, "INR", "b4dw0rd lol")),
-            Decision::Hold { .. }
-        ));
+        f.terms.push(filter::BlockedTerm { term: "badword".into(), action: filter::Action::Delete });
+        assert!(matches!(decide(&on(), &f, &tip(50_000, "INR", "b4dw0rd lol")), Decision::Hold { .. }));
     }
 
     #[test]
     fn approval_mode_holds_everything() {
-        let p = TtsPolicy {
-            hold_for_approval: true,
-            ..on()
-        };
-        assert!(matches!(
-            decide(&p, &FilterConfig::default(), &tip(50_000, "INR", "hi")),
-            Decision::Hold { .. }
-        ));
+        let p = TtsPolicy { hold_for_approval: true, ..on() };
+        assert!(matches!(decide(&p, &FilterConfig::default(), &tip(50_000, "INR", "hi")), Decision::Hold { .. }));
     }
 
     #[test]
     fn empty_or_unreadable_messages_are_skipped() {
         let f = FilterConfig::default();
-        assert!(matches!(
-            decide(&on(), &f, &tip(50_000, "INR", "   ")),
-            Decision::Skip { .. }
-        ));
-        assert!(matches!(
-            decide(&on(), &f, &tip(50_000, "INR", "!!!! ???")),
-            Decision::Skip { .. }
-        ));
+        assert!(matches!(decide(&on(), &f, &tip(50_000, "INR", "   ")), Decision::Skip { .. }));
+        assert!(matches!(decide(&on(), &f, &tip(50_000, "INR", "!!!! ???")), Decision::Skip { .. }));
     }
 }

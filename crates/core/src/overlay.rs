@@ -90,9 +90,7 @@ impl Overlay {
             if !fits {
                 return Err(OverlayError::Geometry(w.id.clone()));
             }
-            let size = serde_json::to_string(&w.config)
-                .map(|s| s.len())
-                .unwrap_or(usize::MAX);
+            let size = serde_json::to_string(&w.config).map(|s| s.len()).unwrap_or(usize::MAX);
             if !w.config.is_object() || size > MAX_CONFIG_BYTES {
                 return Err(OverlayError::Config(w.id.clone()));
             }
@@ -155,13 +153,7 @@ pub fn preset_widgets(preset: Preset) -> Vec<Widget> {
     match preset {
         Preset::Starter => vec![alerts, chat, events],
         Preset::AlertsOnly => vec![alerts],
-        Preset::ChatOnly => vec![Widget {
-            x: 40,
-            y: 40,
-            w: 520,
-            h: 1000,
-            ..chat
-        }],
+        Preset::ChatOnly => vec![Widget { x: 40, y: 40, w: 520, h: 1000, ..chat }],
         Preset::Blank => vec![],
     }
 }
@@ -184,12 +176,7 @@ mod tests {
 
     #[test]
     fn presets_are_valid() {
-        for p in [
-            Preset::Starter,
-            Preset::AlertsOnly,
-            Preset::ChatOnly,
-            Preset::Blank,
-        ] {
+        for p in [Preset::Starter, Preset::AlertsOnly, Preset::ChatOnly, Preset::Blank] {
             overlay(preset_widgets(p)).validate().unwrap();
         }
         assert!(overlay(preset_widgets(Preset::Starter)).wants_chat());
@@ -202,10 +189,7 @@ mod tests {
         o.widgets[0].x = 1800;
         assert!(matches!(o.validate(), Err(OverlayError::Geometry(_))));
         o.widgets[0].x = i32::MAX;
-        assert!(
-            matches!(o.validate(), Err(OverlayError::Geometry(_))),
-            "no overflow"
-        );
+        assert!(matches!(o.validate(), Err(OverlayError::Geometry(_))), "no overflow");
         let mut o = overlay(preset_widgets(Preset::AlertsOnly));
         o.widgets[0].w = 0;
         assert!(matches!(o.validate(), Err(OverlayError::Geometry(_))));
@@ -226,19 +210,8 @@ mod tests {
         o.widgets.push(o.widgets[0].clone());
         assert!(matches!(o.validate(), Err(OverlayError::DuplicateId(_))));
         let many: Vec<Widget> = (0..41)
-            .map(|i| Widget {
-                id: i.to_string(),
-                kind: WidgetKind::Label,
-                x: 0,
-                y: 0,
-                w: 10,
-                h: 10,
-                config: json!({}),
-            })
+            .map(|i| Widget { id: i.to_string(), kind: WidgetKind::Label, x: 0, y: 0, w: 10, h: 10, config: json!({}) })
             .collect();
-        assert!(matches!(
-            overlay(many).validate(),
-            Err(OverlayError::TooManyWidgets(_))
-        ));
+        assert!(matches!(overlay(many).validate(), Err(OverlayError::TooManyWidgets(_))));
     }
 }

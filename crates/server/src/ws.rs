@@ -35,17 +35,12 @@ pub struct LiveQuery {
 }
 
 /// `GET /api/v1/live?session=…`
-pub async fn live(
-    State(app): State<AppState>,
-    Query(q): Query<LiveQuery>,
-    ws: WebSocketUpgrade,
-) -> Response {
+pub async fn live(State(app): State<AppState>, Query(q): Query<LiveQuery>, ws: WebSocketUpgrade) -> Response {
     let ok = q.session.as_deref().is_some_and(|t| app.sessions.valid(t));
     if !ok {
         return ApiError::unauthorized().into_response();
     }
-    ws.max_message_size(MAX_INBOUND)
-        .on_upgrade(move |socket| live_loop(app, socket))
+    ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| live_loop(app, socket))
 }
 
 async fn live_loop(app: AppState, socket: WebSocket) {
@@ -57,11 +52,7 @@ async fn live_loop(app: AppState, socket: WebSocket) {
         LiveFrame::new("queue", &app.engine.queue().await),
     ];
     for f in hello {
-        if tx
-            .send(Message::Text(Utf8Bytes::from(f.text.as_ref())))
-            .await
-            .is_err()
-        {
+        if tx.send(Message::Text(Utf8Bytes::from(f.text.as_ref()))).await.is_err() {
             return;
         }
     }
@@ -89,15 +80,9 @@ async fn live_loop(app: AppState, socket: WebSocket) {
     }
 }
 
-async fn overlay_ws(
-    State(app): State<AppState>,
-    Path(token): Path<String>,
-    ws: WebSocketUpgrade,
-) -> Response {
+async fn overlay_ws(State(app): State<AppState>, Path(token): Path<String>, ws: WebSocketUpgrade) -> Response {
     match app.engine.overlay_by_token(&token).await {
-        Ok(Some(o)) => ws
-            .max_message_size(MAX_INBOUND)
-            .on_upgrade(move |socket| overlay_loop(app, o, socket)),
+        Ok(Some(o)) => ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| overlay_loop(app, o, socket)),
         Ok(None) => ApiError::not_found("overlay").into_response(),
         Err(e) => ApiError::from(e).into_response(),
     }
@@ -123,10 +108,7 @@ fn wants(o: &Overlay, a: &Audience) -> bool {
     match a {
         Audience::All => true,
         Audience::Chat => o.wants_chat(),
-        Audience::Alerts => o
-            .widgets
-            .iter()
-            .any(|w| matches!(w.kind, WidgetKind::Alerts | WidgetKind::Events)),
+        Audience::Alerts => o.widgets.iter().any(|w| matches!(w.kind, WidgetKind::Alerts | WidgetKind::Events)),
         Audience::Overlay(id) => *id == o.id,
     }
 }
@@ -144,9 +126,7 @@ async fn send_snapshot(
         }
     };
     let text = envelope(Some(app.engine.current_seq()), "snapshot", &snap);
-    tx.send(Message::Text(Utf8Bytes::from(text.as_ref())))
-        .await
-        .is_ok()
+    tx.send(Message::Text(Utf8Bytes::from(text.as_ref()))).await.is_ok()
 }
 
 async fn overlay_loop(app: AppState, mut overlay: Overlay, socket: WebSocket) {

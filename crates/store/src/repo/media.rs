@@ -113,20 +113,13 @@ pub fn save(store: &Store, name: &str, data: &[u8]) -> std::result::Result<Media
     let m = Media {
         id,
         kind,
-        name: if clean_name.trim().is_empty() {
-            "file".into()
-        } else {
-            clean_name
-        },
+        name: if clean_name.trim().is_empty() { "file".into() } else { clean_name },
         mime: mime.into(),
         bytes: data.len() as u64,
         created_at: now_ms(),
     };
     let kind_s = serde_json::to_value(m.kind).map_err(StoreError::from)?;
-    let digest: String = Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let digest: String = Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect();
     store
         .write(|tx| {
             tx.execute(
@@ -166,23 +159,15 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Media> {
 
 pub fn list(store: &Store) -> Result<Vec<Media>> {
     store.read(|c| {
-        let mut st = c.prepare(
-            "SELECT id, kind, name, mime, bytes, created_at FROM media ORDER BY created_at DESC",
-        )?;
-        Ok(st
-            .query_map([], row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut st = c.prepare("SELECT id, kind, name, mime, bytes, created_at FROM media ORDER BY created_at DESC")?;
+        Ok(st.query_map([], row)?.collect::<rusqlite::Result<Vec<_>>>()?)
     })
 }
 
 pub fn get(store: &Store, id: &str) -> Result<Option<(Media, PathBuf)>> {
     let m = store.read(|c| {
-        Ok(c.query_row(
-            "SELECT id, kind, name, mime, bytes, created_at FROM media WHERE id = ?1",
-            [id],
-            row,
-        )
-        .optional()?)
+        Ok(c.query_row("SELECT id, kind, name, mime, bytes, created_at FROM media WHERE id = ?1", [id], row)
+            .optional()?)
     })?;
     Ok(m.map(|m| {
         let path = media_dir(store).join(&m.id);
@@ -209,10 +194,7 @@ mod tests {
     fn sniffs_by_content_not_name() {
         assert_eq!(sniff(PNG).map(|s| s.0), Some(MediaKind::Image));
         assert_eq!(sniff(b"ID3\x04\0").map(|s| s.1), Some("audio/mpeg"));
-        assert_eq!(
-            sniff(b"RIFF\0\0\0\0WAVEfmt ").map(|s| s.1),
-            Some("audio/wav")
-        );
+        assert_eq!(sniff(b"RIFF\0\0\0\0WAVEfmt ").map(|s| s.1), Some("audio/wav"));
         assert_eq!(sniff(b"\0\0\0\x20ftypisom").map(|s| s.1), Some("video/mp4"));
         assert_eq!(sniff(b"<svg onload=alert(1)>"), None);
         assert_eq!(sniff(b"MZ\x90\0"), None, "executables");
@@ -226,11 +208,7 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let m = save(&s, "../../etc/passwd.png", PNG).unwrap();
         let (_, path) = get(&s, &m.id).unwrap().unwrap();
-        assert_eq!(
-            path.parent().unwrap(),
-            dir.path().join("media"),
-            "stored by id, not by name"
-        );
+        assert_eq!(path.parent().unwrap(), dir.path().join("media"), "stored by id, not by name");
         assert_eq!(std::fs::read(&path).unwrap(), PNG);
         assert_eq!(list(&s).unwrap().len(), 1);
         delete(&s, &m.id).unwrap();
@@ -242,19 +220,10 @@ mod tests {
     fn refuses_empty_wrong_type_and_oversized() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        assert!(matches!(
-            save(&s, "a", b""),
-            Err(SaveError::Upload(UploadError::Empty))
-        ));
-        assert!(matches!(
-            save(&s, "a.png", b"<svg/>"),
-            Err(SaveError::Upload(UploadError::UnsupportedType))
-        ));
+        assert!(matches!(save(&s, "a", b""), Err(SaveError::Upload(UploadError::Empty))));
+        assert!(matches!(save(&s, "a.png", b"<svg/>"), Err(SaveError::Upload(UploadError::UnsupportedType))));
         let mut big = b"ID3".to_vec();
         big.resize(6 * 1024 * 1024, 0);
-        assert!(matches!(
-            save(&s, "a.mp3", &big),
-            Err(SaveError::Upload(UploadError::TooBig(_)))
-        ));
+        assert!(matches!(save(&s, "a.mp3", &big), Err(SaveError::Upload(UploadError::TooBig(_)))));
     }
 }

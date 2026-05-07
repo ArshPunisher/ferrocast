@@ -39,11 +39,7 @@ pub struct Goal {
 impl Goal {
     /// 0.0 to 1.0 for the progress bar (can exceed 1.0 when the goal is beaten).
     pub fn progress(&self) -> f64 {
-        if self.target <= 0 {
-            1.0
-        } else {
-            self.current.max(0) as f64 / self.target as f64
-        }
+        if self.target <= 0 { 1.0 } else { self.current.max(0) as f64 / self.target as f64 }
     }
 
     pub fn is_active(&self, now: Millis) -> bool {
@@ -60,23 +56,13 @@ pub fn contribution(goal: &Goal, event: &Event) -> i64 {
     }
     match (goal.kind, &event.kind) {
         (GoalKind::Follows, EventKind::Follow { .. }) => 1,
-        (
-            GoalKind::Subs,
-            EventKind::Subscription {
-                gifted_by: None, ..
-            },
-        ) => 1,
+        (GoalKind::Subs, EventKind::Subscription { gifted_by: None, .. }) => 1,
         (GoalKind::Subs, EventKind::GiftBatch { count, .. }) => i64::from(*count),
-        (GoalKind::Bits, EventKind::PlatformGift { value, .. })
-            if value.unit == ValueUnit::Bits =>
-        {
+        (GoalKind::Bits, EventKind::PlatformGift { value, .. }) if value.unit == ValueUnit::Bits => {
             i64::try_from(value.amount).unwrap_or(i64::MAX)
         }
         (GoalKind::Tips, EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. })
-            if goal
-                .currency
-                .as_deref()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&money.currency)) =>
+            if goal.currency.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&money.currency)) =>
         {
             // Tip events only alert once captured; the same rule keeps pending money out.
             if let EventKind::Tip { status, .. } = &event.kind
@@ -132,11 +118,8 @@ mod tests {
     #[test]
     fn subs_count_batches_not_recipients() {
         let g = goal(GoalKind::Subs, None);
-        let batch = live(EventKind::GiftBatch {
-            gifter: Actor::named(Platform::Twitch, "g"),
-            tier: Tier::Tier1,
-            count: 5,
-        });
+        let batch =
+            live(EventKind::GiftBatch { gifter: Actor::named(Platform::Twitch, "g"), tier: Tier::Tier1, count: 5 });
         let recipient = live(EventKind::Subscription {
             actor: Actor::named(Platform::Twitch, "r"),
             tier: Tier::Tier1,
@@ -151,33 +134,16 @@ mod tests {
     #[test]
     fn tips_only_count_captured_money_in_the_goal_currency() {
         let g = goal(GoalKind::Tips, Some("INR"));
-        assert_eq!(
-            contribution(&g, &tip(50_000, "INR", PaymentStatus::Captured)),
-            50_000
-        );
-        assert_eq!(
-            contribution(&g, &tip(50_000, "INR", PaymentStatus::Pending)),
-            0
-        );
-        assert_eq!(
-            contribution(&g, &tip(500, "USD", PaymentStatus::Captured)),
-            0
-        );
-        assert_eq!(
-            contribution(
-                &goal(GoalKind::Tips, None),
-                &tip(1, "INR", PaymentStatus::Captured)
-            ),
-            0
-        );
+        assert_eq!(contribution(&g, &tip(50_000, "INR", PaymentStatus::Captured)), 50_000);
+        assert_eq!(contribution(&g, &tip(50_000, "INR", PaymentStatus::Pending)), 0);
+        assert_eq!(contribution(&g, &tip(500, "USD", PaymentStatus::Captured)), 0);
+        assert_eq!(contribution(&goal(GoalKind::Tips, None), &tip(1, "INR", PaymentStatus::Captured)), 0);
     }
 
     #[test]
     fn tests_backfill_and_out_of_window_events_never_count() {
         let g = goal(GoalKind::Follows, None);
-        let mut e = live(EventKind::Follow {
-            actor: Actor::named(Platform::Twitch, "f"),
-        });
+        let mut e = live(EventKind::Follow { actor: Actor::named(Platform::Twitch, "f") });
         assert_eq!(contribution(&g, &e), 1);
         e.origin = Origin::Test;
         assert_eq!(contribution(&g, &e), 0);
@@ -193,18 +159,12 @@ mod tests {
         let g = goal(GoalKind::Bits, None);
         let bits = live(EventKind::PlatformGift {
             actor: Actor::named(Platform::Twitch, "b"),
-            value: PlatformValue {
-                unit: ValueUnit::Bits,
-                amount: 500,
-            },
+            value: PlatformValue { unit: ValueUnit::Bits, amount: 500 },
             message: None,
         });
         let kicks = live(EventKind::PlatformGift {
             actor: Actor::named(Platform::Kick, "k"),
-            value: PlatformValue {
-                unit: ValueUnit::Kicks,
-                amount: 500,
-            },
+            value: PlatformValue { unit: ValueUnit::Kicks, amount: 500 },
             message: None,
         });
         assert_eq!(contribution(&g, &bits), 500);

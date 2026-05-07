@@ -11,17 +11,14 @@ use crate::{Store, now_ms};
 pub fn commands(store: &Store) -> Result<Vec<Command>> {
     store.read(|c| {
         let mut st = c.prepare("SELECT command FROM commands ORDER BY rowid")?;
-        Ok(st
-            .query_map([], |r| super::from_json(0, r.get(0)?))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(st.query_map([], |r| super::from_json(0, r.get(0)?))?.collect::<rusqlite::Result<Vec<_>>>()?)
     })
 }
 
 /// Validates against the other commands (names and aliases must be unique) and saves.
 pub fn save_command(store: &Store, cmd: &Command) -> Result<()> {
     let others = commands(store)?;
-    cmd.validate(&others)
-        .map_err(|e| StoreError::Conflict(e.to_string()))?;
+    cmd.validate(&others).map_err(|e| StoreError::Conflict(e.to_string()))?;
     let json = serde_json::to_string(cmd)?;
     store.write(|tx| {
         tx.execute(
@@ -34,25 +31,18 @@ pub fn save_command(store: &Store, cmd: &Command) -> Result<()> {
 
 pub fn delete_command(store: &Store, id: &str) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM commands WHERE id = ?1", [id])?))?;
-    if n == 0 {
-        Err(StoreError::NotFound("command"))
-    } else {
-        Ok(())
-    }
+    if n == 0 { Err(StoreError::NotFound("command")) } else { Ok(()) }
 }
 
 pub fn timers(store: &Store) -> Result<Vec<Timer>> {
     store.read(|c| {
         let mut st = c.prepare("SELECT timer FROM timers ORDER BY rowid")?;
-        Ok(st
-            .query_map([], |r| super::from_json(0, r.get(0)?))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(st.query_map([], |r| super::from_json(0, r.get(0)?))?.collect::<rusqlite::Result<Vec<_>>>()?)
     })
 }
 
 pub fn save_timer(store: &Store, t: &Timer) -> Result<()> {
-    t.validate()
-        .map_err(|e| StoreError::Conflict(e.to_string()))?;
+    t.validate().map_err(|e| StoreError::Conflict(e.to_string()))?;
     let json = serde_json::to_string(t)?;
     store.write(|tx| {
         tx.execute(
@@ -65,20 +55,14 @@ pub fn save_timer(store: &Store, t: &Timer) -> Result<()> {
 
 pub fn delete_timer(store: &Store, id: &str) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM timers WHERE id = ?1", [id])?))?;
-    if n == 0 {
-        Err(StoreError::NotFound("timer"))
-    } else {
-        Ok(())
-    }
+    if n == 0 { Err(StoreError::NotFound("timer")) } else { Ok(()) }
 }
 
 /// Adds `delta` to a counter (creating it at 0) and returns the new value.
 pub fn bump_counter(store: &Store, name: &str, delta: i64) -> Result<i64> {
     let name = name.trim().to_lowercase();
     if name.is_empty() || name.len() > 40 {
-        return Err(StoreError::Conflict(
-            "counter names are 1 to 40 characters".into(),
-        ));
+        return Err(StoreError::Conflict("counter names are 1 to 40 characters".into()));
     }
     store.write(|tx| {
         tx.execute(
@@ -86,25 +70,14 @@ pub fn bump_counter(store: &Store, name: &str, delta: i64) -> Result<i64> {
              ON CONFLICT(name) DO UPDATE SET value = counters.value + excluded.value",
             params![name, delta],
         )?;
-        Ok(
-            tx.query_row("SELECT value FROM counters WHERE name = ?1", [&name], |r| {
-                r.get(0)
-            })?,
-        )
+        Ok(tx.query_row("SELECT value FROM counters WHERE name = ?1", [&name], |r| r.get(0))?)
     })
 }
 
 pub fn counter(store: &Store, name: &str) -> Result<i64> {
     let name = name.trim().to_lowercase();
     Ok(store
-        .read(|c| {
-            Ok(
-                c.query_row("SELECT value FROM counters WHERE name = ?1", [name], |r| {
-                    r.get(0)
-                })
-                .optional()?,
-            )
-        })?
+        .read(|c| Ok(c.query_row("SELECT value FROM counters WHERE name = ?1", [name], |r| r.get(0)).optional()?))?
         .unwrap_or(0))
 }
 
@@ -119,24 +92,14 @@ pub struct Quote {
 pub fn add_quote(store: &Store, text: &str, added_by: &str) -> Result<Quote> {
     let text = text.trim();
     if text.is_empty() || text.chars().count() > 400 {
-        return Err(StoreError::Conflict(
-            "quotes are 1 to 400 characters".into(),
-        ));
+        return Err(StoreError::Conflict("quotes are 1 to 400 characters".into()));
     }
     let at = now_ms();
     let id = store.write(|tx| {
-        tx.execute(
-            "INSERT INTO quotes(text, added_by, at) VALUES (?1, ?2, ?3)",
-            params![text, added_by, at],
-        )?;
+        tx.execute("INSERT INTO quotes(text, added_by, at) VALUES (?1, ?2, ?3)", params![text, added_by, at])?;
         Ok(tx.last_insert_rowid())
     })?;
-    Ok(Quote {
-        id,
-        text: text.into(),
-        added_by: added_by.into(),
-        at,
-    })
+    Ok(Quote { id, text: text.into(), added_by: added_by.into(), at })
 }
 
 /// A quote by number, or a random one.
@@ -153,11 +116,7 @@ pub fn quote(store: &Store, id: Option<i64>) -> Result<Option<Quote>> {
 
 pub fn delete_quote(store: &Store, id: i64) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM quotes WHERE id = ?1", [id])?))?;
-    if n == 0 {
-        Err(StoreError::NotFound("quote"))
-    } else {
-        Ok(())
-    }
+    if n == 0 { Err(StoreError::NotFound("quote")) } else { Ok(()) }
 }
 
 pub fn ban_list(store: &Store) -> Result<BanList> {
@@ -193,10 +152,7 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         save_command(&s, &cmd("a", "!discord")).unwrap();
         save_command(&s, &cmd("a", "!discord")).unwrap(); // updating itself is fine
-        assert!(matches!(
-            save_command(&s, &cmd("b", "!DISCORD")),
-            Err(StoreError::Conflict(_))
-        ));
+        assert!(matches!(save_command(&s, &cmd("b", "!DISCORD")), Err(StoreError::Conflict(_))));
         assert_eq!(commands(&s).unwrap().len(), 1);
         delete_command(&s, "a").unwrap();
         assert!(delete_command(&s, "a").is_err());

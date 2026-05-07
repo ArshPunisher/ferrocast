@@ -13,8 +13,7 @@ fn usage() -> &'static str {
 
 #[tokio::main]
 async fn main() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let mut dir: Option<PathBuf> = None;
@@ -37,11 +36,7 @@ async fn main() {
     }
     let dir = dir
         .or_else(|| std::env::var_os("FERROCAST_HOME").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("Ferrocast")
-        });
+        .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("Ferrocast"));
 
     let engine = match ferrocast_engine::Engine::start(&dir).await {
         Ok(e) => e,

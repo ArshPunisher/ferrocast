@@ -30,19 +30,11 @@ pub fn key_for(event: &Event) -> DedupeKey {
     h.write(event.kind.name().as_bytes());
     if let Some(actor) = event.kind.actor() {
         h.write(actor.id.as_deref().unwrap_or("").as_bytes());
-        h.write(
-            actor
-                .login
-                .as_deref()
-                .unwrap_or(&actor.display_name)
-                .as_bytes(),
-        );
+        h.write(actor.login.as_deref().unwrap_or(&actor.display_name).as_bytes());
     }
     match &event.kind {
         EventKind::ChatMessage { content, .. } => h.write(content.text.as_bytes()),
-        EventKind::Tip {
-            money, payment_ref, ..
-        } => {
+        EventKind::Tip { money, payment_ref, .. } => {
             h.write(payment_ref.as_bytes());
             h.write(&money.minor.to_le_bytes());
         }
@@ -69,12 +61,7 @@ impl Deduper {
     /// `window_ms` for platform ids (EventSub retries arrive within minutes), and a hard
     /// cap on remembered keys.
     pub fn new(window_ms: i64, capacity: usize) -> Self {
-        Deduper {
-            window_ms,
-            capacity: capacity.max(1),
-            seen: HashMap::new(),
-            order: VecDeque::new(),
-        }
+        Deduper { window_ms, capacity: capacity.max(1), seen: HashMap::new(), order: VecDeque::new() }
     }
 
     /// `true` the first time an event is seen, `false` for a repeat.
@@ -182,10 +169,7 @@ mod tests {
         let mut d = Deduper::default();
         assert!(d.first_time(&chat(Some("m1"), "hi", 0), Millis(0)));
         assert!(!d.first_time(&chat(Some("m1"), "hi", 0), Millis(1_000)));
-        assert!(!d.first_time(
-            &chat(Some("m1"), "different text, same id", 0),
-            Millis(60_000)
-        ));
+        assert!(!d.first_time(&chat(Some("m1"), "different text, same id", 0), Millis(60_000)));
         assert!(d.first_time(&chat(Some("m2"), "hi", 0), Millis(1_000)));
     }
 
@@ -211,26 +195,14 @@ mod tests {
     fn events_without_ids_dedupe_by_content_briefly() {
         let mut d = Deduper::default();
         assert!(d.first_time(&chat(None, "gg", 1_000), Millis(1_000)));
-        assert!(
-            !d.first_time(&chat(None, "gg", 1_000), Millis(1_500)),
-            "double delivery"
-        );
-        assert!(
-            d.first_time(&chat(None, "gg wp", 1_000), Millis(1_500)),
-            "different text"
-        );
-        assert!(
-            d.first_time(&chat(None, "gg", 1_000), Millis(20_000)),
-            "same text later is new"
-        );
+        assert!(!d.first_time(&chat(None, "gg", 1_000), Millis(1_500)), "double delivery");
+        assert!(d.first_time(&chat(None, "gg wp", 1_000), Millis(1_500)), "different text");
+        assert!(d.first_time(&chat(None, "gg", 1_000), Millis(20_000)), "same text later is new");
     }
 
     #[test]
     fn empty_source_id_is_treated_as_missing() {
-        assert!(matches!(
-            key_for(&chat(Some(""), "x", 0)),
-            DedupeKey::Hashed(..)
-        ));
+        assert!(matches!(key_for(&chat(Some(""), "x", 0)), DedupeKey::Hashed(..)));
     }
 
     #[test]

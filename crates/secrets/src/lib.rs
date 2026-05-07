@@ -55,9 +55,7 @@ impl Secrets for Keychain {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        Self::entry(key)?
-            .set_password(value)
-            .map_err(|e| SecretError::Keychain(e.to_string()))
+        Self::entry(key)?.set_password(value).map_err(|e| SecretError::Keychain(e.to_string()))
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretError> {
@@ -85,25 +83,14 @@ impl fmt::Debug for MemorySecrets {
 
 impl Secrets for MemorySecrets {
     fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
-        Ok(self
-            .map
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(key)
-            .cloned())
+        Ok(self.map.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned())
     }
     fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        self.map
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key.to_string(), value.to_string());
+        self.map.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), value.to_string());
         Ok(())
     }
     fn delete(&self, key: &str) -> Result<(), SecretError> {
-        self.map
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(key);
+        self.map.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
         Ok(())
     }
 }
@@ -131,10 +118,7 @@ mod tests {
         let s = MemorySecrets::default();
         assert_eq!(s.get("twitch").unwrap(), None);
         s.set("twitch", "super-secret-token").unwrap();
-        assert_eq!(
-            s.get("twitch").unwrap().as_deref(),
-            Some("super-secret-token")
-        );
+        assert_eq!(s.get("twitch").unwrap().as_deref(), Some("super-secret-token"));
         assert!(!format!("{s:?}").contains("super-secret"));
         s.delete("twitch").unwrap();
         s.delete("twitch").unwrap();

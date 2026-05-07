@@ -20,13 +20,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        ApiError {
-            status,
-            code,
-            message: message.into(),
-            hint: None,
-            retry_after: None,
-        }
+        ApiError { status, code, message: message.into(), hint: None, retry_after: None }
     }
 
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
@@ -39,21 +33,13 @@ impl ApiError {
     }
 
     pub fn not_found(what: &str) -> Self {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            format!("That {what} doesn't exist."),
-        )
-        .hint("Reload the page; it may have been deleted.")
+        ApiError::new(StatusCode::NOT_FOUND, "not_found", format!("That {what} doesn't exist."))
+            .hint("Reload the page; it may have been deleted.")
     }
 
     pub fn unauthorized() -> Self {
-        ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "This dashboard isn't signed in to the app.",
-        )
-        .hint("Open the dashboard from the Ferrocast app, or pair this browser again.")
+        ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "This dashboard isn't signed in to the app.")
+            .hint("Open the dashboard from the Ferrocast app, or pair this browser again.")
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
@@ -65,11 +51,7 @@ impl ApiError {
     }
 
     pub fn too_many(seconds: u64) -> Self {
-        let mut e = ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "Too many tries. Wait a moment.",
-        );
+        let mut e = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many tries. Wait a moment.");
         e.retry_after = Some(seconds);
         e
     }
@@ -77,8 +59,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body =
-            json!({ "error": { "code": self.code, "message": self.message, "hint": self.hint } });
+        let body = json!({ "error": { "code": self.code, "message": self.message, "hint": self.hint } });
         let mut res = (self.status, Json(body)).into_response();
         if let Some(s) = self.retry_after
             && let Ok(v) = HeaderValue::from_str(&s.to_string())
@@ -99,12 +80,8 @@ impl From<EngineError> for ApiError {
             EngineError::Store(s) => s.into(),
             EngineError::Internal(m) => {
                 tracing::error!(error = %m, "internal error");
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "Something went wrong inside Ferrocast.",
-                )
-                .hint("Try again. If it keeps happening, use Report a problem in Settings.")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "Something went wrong inside Ferrocast.")
+                    .hint("Try again. If it keeps happening, use Report a problem in Settings.")
             }
         }
     }
@@ -117,12 +94,8 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, "conflict", m),
             other => {
                 tracing::error!(error = %other, "storage error");
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "storage",
-                    "Ferrocast couldn't read or save its data.",
-                )
-                .hint("Check there's free disk space, then try again.")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "storage", "Ferrocast couldn't read or save its data.")
+                    .hint("Check there's free disk space, then try again.")
             }
         }
     }
@@ -133,11 +106,7 @@ impl From<ConnectorError> for ApiError {
         let message = e.to_string();
         match e {
             ConnectorError::RateLimited { retry_after, .. } => {
-                let mut a = ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "platform_rate_limited",
-                    message,
-                );
+                let mut a = ApiError::new(StatusCode::TOO_MANY_REQUESTS, "platform_rate_limited", message);
                 a.retry_after = Some(retry_after.as_secs().max(1));
                 a
             }
@@ -147,13 +116,9 @@ impl From<ConnectorError> for ApiError {
             ConnectorError::SignInNeeded(_) | ConnectorError::MissingScope { .. } => {
                 ApiError::unavailable(message).hint("Reconnect the account in Settings → Accounts.")
             }
-            ConnectorError::NotSupported { .. } | ConnectorError::Refused { .. } => {
-                ApiError::unavailable(message)
-            }
-            ConnectorError::Network { .. } => {
-                ApiError::new(StatusCode::BAD_GATEWAY, "platform_unreachable", message)
-                    .hint("Check your connection and try again.")
-            }
+            ConnectorError::NotSupported { .. } | ConnectorError::Refused { .. } => ApiError::unavailable(message),
+            ConnectorError::Network { .. } => ApiError::new(StatusCode::BAD_GATEWAY, "platform_unreachable", message)
+                .hint("Check your connection and try again."),
         }
     }
 }

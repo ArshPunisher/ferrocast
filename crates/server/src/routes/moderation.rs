@@ -19,18 +19,8 @@ pub struct ChatQuery {
     limit: Option<u32>,
 }
 
-pub async fn chat(
-    State(app): State<AppState>,
-    Query(q): Query<ChatQuery>,
-) -> ApiResult<Json<Value>> {
-    let mut list = app
-        .engine
-        .events(
-            None,
-            q.limit.unwrap_or(200).clamp(1, 500),
-            vec!["chat_message".into()],
-        )
-        .await?;
+pub async fn chat(State(app): State<AppState>, Query(q): Query<ChatQuery>) -> ApiResult<Json<Value>> {
+    let mut list = app.engine.events(None, q.limit.unwrap_or(200).clamp(1, 500), vec!["chat_message".into()]).await?;
     list.reverse();
     Ok(Json(json!(list)))
 }
@@ -79,13 +69,8 @@ pub struct DeleteBody {
     message_id: String,
 }
 
-pub async fn delete_message(
-    State(app): State<AppState>,
-    Body(b): Body<DeleteBody>,
-) -> ApiResult<StatusCode> {
-    app.engine
-        .delete_message(platform(&b.platform)?, &b.message_id)
-        .await?;
+pub async fn delete_message(State(app): State<AppState>, Body(b): Body<DeleteBody>) -> ApiResult<StatusCode> {
+    app.engine.delete_message(platform(&b.platform)?, &b.message_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -98,18 +83,8 @@ pub struct TimeoutBody {
     reason: Option<String>,
 }
 
-pub async fn timeout(
-    State(app): State<AppState>,
-    Body(b): Body<TimeoutBody>,
-) -> ApiResult<StatusCode> {
-    app.engine
-        .timeout(
-            platform(&b.platform)?,
-            &b.user_id,
-            b.seconds,
-            b.reason.as_deref(),
-        )
-        .await?;
+pub async fn timeout(State(app): State<AppState>, Body(b): Body<TimeoutBody>) -> ApiResult<StatusCode> {
+    app.engine.timeout(platform(&b.platform)?, &b.user_id, b.seconds, b.reason.as_deref()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -134,16 +109,7 @@ pub async fn ban(State(app): State<AppState>, Body(b): Body<BanBody>) -> ApiResu
         return Err(ApiError::invalid("Who to ban is missing (user_id)."));
     }
     let reason = b.reason.map(|r| r.chars().take(500).collect::<String>());
-    let out = app
-        .engine
-        .ban(
-            platform(&b.user.platform)?,
-            &b.user.user_id,
-            &b.user.login,
-            reason,
-            b.everywhere,
-        )
-        .await?;
+    let out = app.engine.ban(platform(&b.user.platform)?, &b.user.user_id, &b.user.login, reason, b.everywhere).await?;
     Ok(Json(json!({ "banned": out.ok, "failed": out.failed })))
 }
 
@@ -172,18 +138,12 @@ pub struct PanicBody {
     on: bool,
 }
 
-pub async fn panic(
-    State(app): State<AppState>,
-    Body(b): Body<PanicBody>,
-) -> ApiResult<Json<Value>> {
+pub async fn panic(State(app): State<AppState>, Body(b): Body<PanicBody>) -> ApiResult<Json<Value>> {
     let plan = app.engine.panic(b.on).await?;
     Ok(Json(json!({ "on": b.on, "plan": plan })))
 }
 
-pub async fn save_panic(
-    State(app): State<AppState>,
-    Body(cfg): Body<PanicConfig>,
-) -> ApiResult<Json<Value>> {
+pub async fn save_panic(State(app): State<AppState>, Body(cfg): Body<PanicConfig>) -> ApiResult<Json<Value>> {
     if cfg.slow_seconds.is_some_and(|s| s == 0 || s > 120) {
         return Err(ApiError::invalid("Slow mode is 1 to 120 seconds."));
     }
@@ -197,22 +157,13 @@ pub async fn filters(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.filter()))
 }
 
-pub async fn save_filters(
-    State(app): State<AppState>,
-    Body(cfg): Body<FilterConfig>,
-) -> ApiResult<Json<Value>> {
+pub async fn save_filters(State(app): State<AppState>, Body(cfg): Body<FilterConfig>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.save_filter(cfg).await?)))
 }
 
-pub async fn viewer(
-    State(app): State<AppState>,
-    Path((p, user)): Path<(String, String)>,
-) -> ApiResult<Json<Value>> {
+pub async fn viewer(State(app): State<AppState>, Path((p, user)): Path<(String, String)>) -> ApiResult<Json<Value>> {
     let p = platform(&p)?;
-    let card = app
-        .engine
-        .db(move |s| repo::viewers::card(s, p, &user))
-        .await?;
+    let card = app.engine.db(move |s| repo::viewers::card(s, p, &user)).await?;
     Ok(Json(json!(card)))
 }
 

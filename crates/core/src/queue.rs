@@ -28,12 +28,7 @@ pub struct QueueTuning {
 
 impl Default for QueueTuning {
     fn default() -> Self {
-        QueueTuning {
-            ack_grace_ms: 5_000,
-            gap_ms: 600,
-            stale_after_ms: 180_000,
-            max_waiting: 200,
-        }
+        QueueTuning { ack_grace_ms: 5_000, gap_ms: 600, stale_after_ms: 180_000, max_waiting: 200 }
     }
 }
 
@@ -85,10 +80,7 @@ pub struct AlertQueue {
 
 impl AlertQueue {
     pub fn new(tuning: QueueTuning) -> Self {
-        AlertQueue {
-            tuning,
-            ..Default::default()
-        }
+        AlertQueue { tuning, ..Default::default() }
     }
 
     /// Adds an alert. Higher priority goes first; equal priority keeps arrival order.
@@ -96,19 +88,8 @@ impl AlertQueue {
         if self.contains(&alert.alert_id) {
             return Vec::new();
         }
-        let pos = self
-            .waiting
-            .iter()
-            .position(|w| w.priority < priority)
-            .unwrap_or(self.waiting.len());
-        self.waiting.insert(
-            pos,
-            Waiting {
-                alert,
-                priority,
-                enqueued_at: now,
-            },
-        );
+        let pos = self.waiting.iter().position(|w| w.priority < priority).unwrap_or(self.waiting.len());
+        self.waiting.insert(pos, Waiting { alert, priority, enqueued_at: now });
         let mut actions = self.enforce_cap();
         actions.extend(self.tick(now));
         actions
@@ -120,9 +101,7 @@ impl AlertQueue {
         if let Some(p) = &self.playing
             && now >= p.deadline
         {
-            actions.push(Action::Hide {
-                alert_id: p.alert.alert_id.clone(),
-            });
+            actions.push(Action::Hide { alert_id: p.alert.alert_id.clone() });
             self.finish(now);
         }
         if self.playing.is_some() || self.paused || now < self.next_at {
@@ -130,10 +109,7 @@ impl AlertQueue {
         }
         let stale: Vec<String> = if self.tuning.stale_after_ms > 0 {
             let cutoff = now.0 - self.tuning.stale_after_ms;
-            let (old, fresh): (Vec<_>, Vec<_>) = self
-                .waiting
-                .drain(..)
-                .partition(|w| w.enqueued_at.0 < cutoff);
+            let (old, fresh): (Vec<_>, Vec<_>) = self.waiting.drain(..).partition(|w| w.enqueued_at.0 < cutoff);
             self.waiting = fresh.into();
             old.into_iter().map(|w| w.alert.alert_id).collect()
         } else {
@@ -143,17 +119,9 @@ impl AlertQueue {
             actions.push(Action::Folded { alert_ids: stale });
         }
         if let Some(next) = self.waiting.pop_front() {
-            let deadline =
-                Millis(now.0 + i64::from(next.alert.duration_ms) + self.tuning.ack_grace_ms);
-            actions.push(Action::Show {
-                alert: Box::new(next.alert.clone()),
-            });
-            self.playing = Some(Playing {
-                alert: next.alert,
-                started_at: now,
-                deadline,
-                acknowledged: false,
-            });
+            let deadline = Millis(now.0 + i64::from(next.alert.duration_ms) + self.tuning.ack_grace_ms);
+            actions.push(Action::Show { alert: Box::new(next.alert.clone()) });
+            self.playing = Some(Playing { alert: next.alert, started_at: now, deadline, acknowledged: false });
         }
         actions
     }
@@ -172,8 +140,7 @@ impl AlertQueue {
                 if !p.acknowledged {
                     p.acknowledged = true;
                     // Restart the clock from when it actually appeared.
-                    p.deadline =
-                        Millis(now.0 + i64::from(p.alert.duration_ms) + self.tuning.ack_grace_ms);
+                    p.deadline = Millis(now.0 + i64::from(p.alert.duration_ms) + self.tuning.ack_grace_ms);
                 }
                 Vec::new()
             }
@@ -189,9 +156,7 @@ impl AlertQueue {
         let Some(p) = &self.playing else {
             return Vec::new();
         };
-        let mut actions = vec![Action::Hide {
-            alert_id: p.alert.alert_id.clone(),
-        }];
+        let mut actions = vec![Action::Hide { alert_id: p.alert.alert_id.clone() }];
         self.finish(now);
         actions.extend(self.tick(now));
         actions
@@ -222,11 +187,7 @@ impl AlertQueue {
     /// so it must not be read aloud). Returns how many alerts changed.
     pub fn strip_tts(&mut self, event_id: &str) -> usize {
         let mut n = 0;
-        for w in self
-            .waiting
-            .iter_mut()
-            .filter(|w| w.alert.event_id == event_id)
-        {
+        for w in self.waiting.iter_mut().filter(|w| w.alert.event_id == event_id) {
             if w.alert.tts_text.take().is_some() | w.alert.tts_audio.take().is_some() {
                 n += 1;
             }
@@ -264,9 +225,7 @@ impl AlertQueue {
     }
 
     fn contains(&self, alert_id: &str) -> bool {
-        self.playing
-            .as_ref()
-            .is_some_and(|p| p.alert.alert_id == alert_id)
+        self.playing.as_ref().is_some_and(|p| p.alert.alert_id == alert_id)
             || self.waiting.iter().any(|w| w.alert.alert_id == alert_id)
     }
 
@@ -286,11 +245,7 @@ impl AlertQueue {
                 folded.push(w.alert.alert_id);
             }
         }
-        if folded.is_empty() {
-            Vec::new()
-        } else {
-            vec![Action::Folded { alert_ids: folded }]
-        }
+        if folded.is_empty() { Vec::new() } else { vec![Action::Folded { alert_ids: folded }] }
     }
 }
 
@@ -320,26 +275,15 @@ mod tests {
     }
 
     fn q() -> AlertQueue {
-        AlertQueue::new(QueueTuning {
-            ack_grace_ms: 1_000,
-            gap_ms: 100,
-            stale_after_ms: 60_000,
-            max_waiting: 10,
-        })
+        AlertQueue::new(QueueTuning { ack_grace_ms: 1_000, gap_ms: 100, stale_after_ms: 60_000, max_waiting: 10 })
     }
 
     #[test]
     fn plays_one_at_a_time_in_order() {
         let mut q = q();
-        assert_eq!(
-            shown(&q.enqueue(alert("a", 2_000), 0, Millis(0))),
-            vec!["a"]
-        );
+        assert_eq!(shown(&q.enqueue(alert("a", 2_000), 0, Millis(0))), vec!["a"]);
         assert!(shown(&q.enqueue(alert("b", 2_000), 0, Millis(10))).is_empty());
-        assert!(
-            shown(&q.ack("a", AckPhase::Finished, Millis(2_000))).is_empty(),
-            "gap first"
-        );
+        assert!(shown(&q.ack("a", AckPhase::Finished, Millis(2_000))).is_empty(), "gap first");
         assert_eq!(shown(&q.tick(Millis(2_100))), vec!["b"]);
     }
 

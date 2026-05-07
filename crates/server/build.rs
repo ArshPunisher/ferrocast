@@ -10,13 +10,10 @@ fn main() {
     let chosen = std::env::var("FERROCAST_WEB_DIST")
         .ok()
         .map(PathBuf::from)
-        .filter(|p| {
-            p.join("dashboard/index.html").exists() && p.join("overlays/index.html").exists()
-        })
+        .filter(|p| p.join("dashboard/index.html").exists() && p.join("overlays/index.html").exists())
         .or_else(|| {
-            (sibling.join("dashboard/index.html").exists()
-                && sibling.join("overlays/index.html").exists())
-            .then_some(sibling)
+            (sibling.join("dashboard/index.html").exists() && sibling.join("overlays/index.html").exists())
+                .then_some(sibling)
         })
         .unwrap_or_else(|| manifest.join("placeholder"));
     let chosen = chosen.canonicalize().unwrap_or(chosen);

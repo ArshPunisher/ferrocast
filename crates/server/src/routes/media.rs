@@ -18,36 +18,26 @@ fn too_large(msg: &str) -> ApiError {
         .hint("Compress the file or pick a shorter one.")
 }
 
-pub async fn upload(
-    State(app): State<AppState>,
-    mut form: Multipart,
-) -> ApiResult<impl IntoResponse> {
+pub async fn upload(State(app): State<AppState>, mut form: Multipart) -> ApiResult<impl IntoResponse> {
     let field = loop {
         match form.next_field().await {
             Ok(Some(f)) if f.name() == Some("file") => break f,
             Ok(Some(_)) => continue,
             Ok(None) => {
-                return Err(ApiError::invalid(
-                    "Attach the file in a form field named \"file\".",
-                ));
+                return Err(ApiError::invalid("Attach the file in a form field named \"file\"."));
             }
             Err(e) => return Err(multipart_error(e)),
         }
     };
     let name = field.file_name().unwrap_or("file").to_string();
     let data = field.bytes().await.map_err(multipart_error)?;
-    let saved = app
-        .engine
-        .db(move |s| Ok(media::save(s, &name, &data)))
-        .await?;
+    let saved = app.engine.db(move |s| Ok(media::save(s, &name, &data))).await?;
     match saved {
         Ok(m) => {
             let url = format!("/api/v1/media/{}", m.id);
             Ok((
                 StatusCode::CREATED,
-                Json(
-                    json!({ "id": m.id, "kind": m.kind, "name": m.name, "bytes": m.bytes, "url": url }),
-                ),
+                Json(json!({ "id": m.id, "kind": m.kind, "name": m.name, "bytes": m.bytes, "url": url })),
             ))
         }
         Err(SaveError::Upload(UploadError::TooBig(msg))) => Err(too_large(msg)),

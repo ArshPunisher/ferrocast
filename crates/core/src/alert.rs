@@ -55,27 +55,20 @@ impl Condition {
                 amount_of(event, currency.as_deref()).is_some_and(|a| a < *value)
             }
             Condition::TierAtLeast { tier } => match &event.kind {
-                EventKind::Subscription { tier: t, .. } | EventKind::GiftBatch { tier: t, .. } => {
-                    t.rank() >= *tier
-                }
+                EventKind::Subscription { tier: t, .. } | EventKind::GiftBatch { tier: t, .. } => t.rank() >= *tier,
                 _ => false,
             },
             Condition::MonthsAtLeast { months } => {
                 matches!(&event.kind, EventKind::Subscription { months: m, .. } if m >= months)
             }
             Condition::PlatformIs { platform } => event.platform == *platform,
-            Condition::IsGifted => matches!(
-                &event.kind,
-                EventKind::Subscription {
-                    gifted_by: Some(_),
-                    ..
-                } | EventKind::GiftBatch { .. }
-            ),
+            Condition::IsGifted => {
+                matches!(&event.kind, EventKind::Subscription { gifted_by: Some(_), .. } | EventKind::GiftBatch { .. })
+            }
             Condition::HasMessage => message_of(event).is_some_and(|m| !m.trim().is_empty()),
             Condition::MessageContains { text } => {
                 let needle = text.to_lowercase();
-                !needle.is_empty()
-                    && message_of(event).is_some_and(|m| m.to_lowercase().contains(&needle))
+                !needle.is_empty() && message_of(event).is_some_and(|m| m.to_lowercase().contains(&needle))
             }
             Condition::All { of } => of.iter().all(|c| c.matches(event)),
             Condition::Any { of } => of.iter().any(|c| c.matches(event)),
@@ -87,9 +80,7 @@ impl Condition {
 pub fn amount_of(event: &Event, currency: Option<&str>) -> Option<f64> {
     let money_ok = |c: &str| currency.is_none_or(|want| want.eq_ignore_ascii_case(c));
     match &event.kind {
-        EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. }
-            if money_ok(&money.currency) =>
-        {
+        EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } if money_ok(&money.currency) => {
             Some(money.major())
         }
         EventKind::PlatformGift { value, .. } if currency.is_none() => Some(value.amount as f64),
@@ -103,18 +94,10 @@ pub fn amount_of(event: &Event, currency: Option<&str>) -> Option<f64> {
 
 fn message_of(event: &Event) -> Option<&str> {
     match &event.kind {
-        EventKind::Subscription {
-            message: Some(m), ..
-        }
-        | EventKind::PlatformGift {
-            message: Some(m), ..
-        }
-        | EventKind::PaidMessage {
-            content: Some(m), ..
-        } => Some(&m.text),
-        EventKind::Tip {
-            message: Some(m), ..
-        } => Some(m),
+        EventKind::Subscription { message: Some(m), .. }
+        | EventKind::PlatformGift { message: Some(m), .. }
+        | EventKind::PaidMessage { content: Some(m), .. } => Some(&m.text),
+        EventKind::Tip { message: Some(m), .. } => Some(m),
         EventKind::RewardRedemption { input: Some(i), .. } => Some(i),
         _ => None,
     }
@@ -202,16 +185,8 @@ pub enum RuleError {
 }
 
 /// Event kinds a rule may target.
-pub const ALERT_KINDS: [&str; 8] = [
-    "follow",
-    "subscription",
-    "gift_batch",
-    "platform_gift",
-    "paid_message",
-    "tip",
-    "raid",
-    "reward_redemption",
-];
+pub const ALERT_KINDS: [&str; 8] =
+    ["follow", "subscription", "gift_batch", "platform_gift", "paid_message", "tip", "raid", "reward_redemption"];
 
 impl AlertRule {
     /// Checks everything the editor should refuse to save.
@@ -219,11 +194,7 @@ impl AlertRule {
         if self.kinds.is_empty() {
             return Err(RuleError::NoKinds);
         }
-        if let Some(bad) = self
-            .kinds
-            .iter()
-            .find(|k| !ALERT_KINDS.contains(&k.as_str()))
-        {
+        if let Some(bad) = self.kinds.iter().find(|k| !ALERT_KINDS.contains(&k.as_str())) {
             return Err(RuleError::UnknownKind(bad.clone()));
         }
         if !self.variations.iter().any(|v| v.condition.is_none()) {
@@ -231,10 +202,7 @@ impl AlertRule {
         }
         for v in &self.variations {
             for src in [&v.title, &v.body] {
-                Template::parse(src).map_err(|source| RuleError::Template {
-                    name: v.name.clone(),
-                    source,
-                })?;
+                Template::parse(src).map_err(|source| RuleError::Template { name: v.name.clone(), source })?;
             }
             if v.volume > 100 {
                 return Err(RuleError::Volume(v.name.clone()));
@@ -268,10 +236,7 @@ pub fn select<'a>(rules: &'a [AlertRule], event: &Event) -> Option<(&'a AlertRul
     if !event.may_alert() {
         return None;
     }
-    rules
-        .iter()
-        .filter(|r| r.applies_to(event))
-        .find_map(|r| r.pick(event).map(|v| (r, v)))
+    rules.iter().filter(|r| r.applies_to(event)).find_map(|r| r.pick(event).map(|v| (r, v)))
 }
 
 /// What the overlay receives: text already rendered, media by id.
@@ -304,11 +269,7 @@ pub struct RenderedAlert {
 /// paid alert.
 pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) -> RenderedAlert {
     let vars: Vars = event_vars(event);
-    let fill = |src: &str| {
-        Template::parse(src)
-            .map(|t| t.render(&vars))
-            .unwrap_or_else(|_| src.to_string())
-    };
+    let fill = |src: &str| Template::parse(src).map(|t| t.render(&vars)).unwrap_or_else(|_| src.to_string());
     let body = fill(&v.body);
     RenderedAlert {
         alert_id: alert_id.into(),
@@ -343,43 +304,13 @@ pub fn default_rules() -> Vec<AlertRule> {
     };
     vec![
         rule("follow", "Follows", "follow", "{name} followed!"),
-        rule(
-            "sub",
-            "Subscriptions",
-            "subscription",
-            "{name} subscribed for {months} months!",
-        ),
-        rule(
-            "gift",
-            "Gifted subs",
-            "gift_batch",
-            "{name} gifted {count} subs!",
-        ),
-        rule(
-            "bits",
-            "Bits and KICKs",
-            "platform_gift",
-            "{name} sent {value}!",
-        ),
-        rule(
-            "superchat",
-            "Super Chats",
-            "paid_message",
-            "{name} sent {amount}!",
-        ),
+        rule("sub", "Subscriptions", "subscription", "{name} subscribed for {months} months!"),
+        rule("gift", "Gifted subs", "gift_batch", "{name} gifted {count} subs!"),
+        rule("bits", "Bits and KICKs", "platform_gift", "{name} sent {value}!"),
+        rule("superchat", "Super Chats", "paid_message", "{name} sent {amount}!"),
         rule("tip", "Tips", "tip", "{name} tipped {amount}!"),
-        rule(
-            "raid",
-            "Raids",
-            "raid",
-            "{name} is raiding with {viewers} viewers!",
-        ),
-        rule(
-            "redeem",
-            "Channel points",
-            "reward_redemption",
-            "{name} redeemed {reward}",
-        ),
+        rule("raid", "Raids", "raid", "{name} is raiding with {viewers} viewers!"),
+        rule("redeem", "Channel points", "reward_redemption", "{name} redeemed {reward}"),
     ]
 }
 
@@ -442,59 +373,19 @@ mod tests {
     #[test]
     fn currency_conditions_never_cross_currencies() {
         let tip = any_sample("tip", Millis(0)).unwrap(); // ₹500
-        assert!(
-            Condition::AmountAtLeast {
-                value: 500.0,
-                currency: Some("INR".into())
-            }
-            .matches(&tip)
-        );
-        assert!(
-            !Condition::AmountAtLeast {
-                value: 5.0,
-                currency: Some("USD".into())
-            }
-            .matches(&tip)
-        );
-        assert!(
-            Condition::AmountBelow {
-                value: 501.0,
-                currency: None
-            }
-            .matches(&tip)
-        );
+        assert!(Condition::AmountAtLeast { value: 500.0, currency: Some("INR".into()) }.matches(&tip));
+        assert!(!Condition::AmountAtLeast { value: 5.0, currency: Some("USD".into()) }.matches(&tip));
+        assert!(Condition::AmountBelow { value: 501.0, currency: None }.matches(&tip));
         let bits = sample("platform_gift", Platform::Twitch, Millis(0)).unwrap();
-        assert!(
-            !Condition::AmountAtLeast {
-                value: 1.0,
-                currency: Some("USD".into())
-            }
-            .matches(&bits)
-        );
-        assert!(
-            Condition::AmountAtLeast {
-                value: 500.0,
-                currency: None
-            }
-            .matches(&bits)
-        );
+        assert!(!Condition::AmountAtLeast { value: 1.0, currency: Some("USD".into()) }.matches(&bits));
+        assert!(Condition::AmountAtLeast { value: 500.0, currency: None }.matches(&bits));
     }
 
     #[test]
     fn empty_needle_never_matches() {
         let tip = any_sample("tip", Millis(0)).unwrap();
-        assert!(
-            !Condition::MessageContains {
-                text: String::new()
-            }
-            .matches(&tip)
-        );
-        assert!(
-            Condition::MessageContains {
-                text: "KEEP".into()
-            }
-            .matches(&tip)
-        );
+        assert!(!Condition::MessageContains { text: String::new() }.matches(&tip));
+        assert!(Condition::MessageContains { text: "KEEP".into() }.matches(&tip));
     }
 
     #[test]
@@ -528,14 +419,9 @@ mod tests {
         }
         for kind in crate::sample::TESTABLE {
             let e = any_sample(kind, Millis(0)).unwrap();
-            let (rule, v) =
-                select(&rules, &e).unwrap_or_else(|| panic!("no default rule for {kind}"));
+            let (rule, v) = select(&rules, &e).unwrap_or_else(|| panic!("no default rule for {kind}"));
             let a = render("a1", rule, v, &e);
-            assert!(
-                !a.title.contains('{'),
-                "unrendered title for {kind}: {}",
-                a.title
-            );
+            assert!(!a.title.contains('{'), "unrendered title for {kind}: {}", a.title);
             assert!(a.test);
         }
     }

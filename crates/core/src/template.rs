@@ -70,10 +70,7 @@ impl Template {
                     i += 2;
                 }
                 '{' => {
-                    let close = chars[i + 1..]
-                        .iter()
-                        .position(|&c| c == '}')
-                        .ok_or(TemplateError::Unclosed(i))?;
+                    let close = chars[i + 1..].iter().position(|&c| c == '}').ok_or(TemplateError::Unclosed(i))?;
                     let inner: String = chars[i + 1..i + 1 + close].iter().collect();
                     if !text.is_empty() {
                         pieces.push(Piece::Text(std::mem::take(&mut text)));
@@ -130,11 +127,7 @@ impl Template {
 fn parse_var(inner: &str) -> Result<Piece, TemplateError> {
     let mut parts = inner.split('|');
     let name = parts.next().unwrap_or("").trim().to_string();
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-    {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
         return Err(TemplateError::BadName(inner.to_string()));
     }
     let mut filters = Vec::new();
@@ -148,11 +141,9 @@ fn parse_var(inner: &str) -> Result<Piece, TemplateError> {
             ("upper", None) => Filter::Upper,
             ("lower", None) => Filter::Lower,
             ("title", None) => Filter::Title,
-            ("truncate", Some(n)) => Filter::Truncate(
-                n.trim()
-                    .parse()
-                    .map_err(|_| TemplateError::BadFilter(raw.to_string()))?,
-            ),
+            ("truncate", Some(n)) => {
+                Filter::Truncate(n.trim().parse().map_err(|_| TemplateError::BadFilter(raw.to_string()))?)
+            }
             ("default", Some(text)) => Filter::Default(text.trim_matches('"').to_string()),
             _ => return Err(TemplateError::BadFilter(raw.to_string())),
         });
@@ -203,22 +194,10 @@ pub fn event_vars(event: &Event) -> Vars {
     v.insert("platform".into(), event.platform.label().into());
     if let Some(actor) = event.kind.actor() {
         v.insert("name".into(), actor.display_name.clone());
-        v.insert(
-            "user".into(),
-            actor
-                .login
-                .clone()
-                .unwrap_or_else(|| actor.display_name.clone()),
-        );
+        v.insert("user".into(), actor.login.clone().unwrap_or_else(|| actor.display_name.clone()));
     }
     match &event.kind {
-        EventKind::Subscription {
-            tier,
-            months,
-            message,
-            gifted_by,
-            ..
-        } => {
+        EventKind::Subscription { tier, months, message, gifted_by, .. } => {
             v.insert("months".into(), months.to_string());
             v.insert("tier".into(), tier_label(tier));
             if let Some(m) = message {
@@ -259,12 +238,7 @@ pub fn event_vars(event: &Event) -> Vars {
             v.insert("viewers".into(), viewers.to_string());
             v.insert("amount".into(), viewers.to_string());
         }
-        EventKind::RewardRedemption {
-            reward,
-            cost,
-            input,
-            ..
-        } => {
+        EventKind::RewardRedemption { reward, cost, input, .. } => {
             v.insert("reward".into(), reward.clone());
             v.insert("cost".into(), cost.to_string());
             if let Some(i) = input {
@@ -292,8 +266,8 @@ fn tier_label(t: &crate::event::Tier) -> String {
 
 /// Every variable name any event can set, for the editor's autocomplete.
 pub const KNOWN_VARS: [&str; 15] = [
-    "name", "user", "platform", "amount", "currency", "message", "months", "tier", "gifter",
-    "count", "value", "unit", "viewers", "reward", "cost",
+    "name", "user", "platform", "amount", "currency", "message", "months", "tier", "gifter", "count", "value", "unit",
+    "viewers", "reward", "cost",
 ];
 
 #[cfg(test)]
@@ -303,20 +277,13 @@ mod tests {
     use crate::sample::any_sample;
 
     fn vars(pairs: &[(&str, &str)]) -> Vars {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     #[test]
     fn renders_variables_and_filters() {
-        let t = Template::parse("{name|upper} gave {amount}! {message|default:\"no message\"}")
-            .unwrap();
-        assert_eq!(
-            t.render(&vars(&[("name", "asha"), ("amount", "₹500")])),
-            "ASHA gave ₹500! no message"
-        );
+        let t = Template::parse("{name|upper} gave {amount}! {message|default:\"no message\"}").unwrap();
+        assert_eq!(t.render(&vars(&[("name", "asha"), ("amount", "₹500")])), "ASHA gave ₹500! no message");
         let t = Template::parse("{name|title}").unwrap();
         assert_eq!(t.render(&vars(&[("name", "pixel panda")])), "Pixel Panda");
     }
@@ -336,51 +303,26 @@ mod tests {
 
     #[test]
     fn rejects_broken_templates() {
-        assert_eq!(
-            Template::parse("hello {name"),
-            Err(TemplateError::Unclosed(6))
-        );
-        assert!(matches!(
-            Template::parse("{}"),
-            Err(TemplateError::BadName(_))
-        ));
-        assert!(matches!(
-            Template::parse("{na me}"),
-            Err(TemplateError::BadName(_))
-        ));
-        assert!(matches!(
-            Template::parse("{name|explode}"),
-            Err(TemplateError::BadFilter(_))
-        ));
-        assert!(matches!(
-            Template::parse("{name|truncate:abc}"),
-            Err(TemplateError::BadFilter(_))
-        ));
-        assert!(matches!(
-            Template::parse(&"a".repeat(MAX_TEMPLATE_CHARS + 1)),
-            Err(TemplateError::TooLong(_))
-        ));
+        assert_eq!(Template::parse("hello {name"), Err(TemplateError::Unclosed(6)));
+        assert!(matches!(Template::parse("{}"), Err(TemplateError::BadName(_))));
+        assert!(matches!(Template::parse("{na me}"), Err(TemplateError::BadName(_))));
+        assert!(matches!(Template::parse("{name|explode}"), Err(TemplateError::BadFilter(_))));
+        assert!(matches!(Template::parse("{name|truncate:abc}"), Err(TemplateError::BadFilter(_))));
+        assert!(matches!(Template::parse(&"a".repeat(MAX_TEMPLATE_CHARS + 1)), Err(TemplateError::TooLong(_))));
     }
 
     #[test]
     fn viewer_text_stays_text() {
         let t = Template::parse("{name}").unwrap();
         let evil = "<img src=x onerror=alert(1)>{message}";
-        assert_eq!(
-            t.render(&vars(&[("name", evil), ("message", "boom")])),
-            evil,
-            "no second expansion"
-        );
+        assert_eq!(t.render(&vars(&[("name", evil), ("message", "boom")])), evil, "no second expansion");
     }
 
     #[test]
     fn output_is_capped() {
         let t = Template::parse("{name}{name}").unwrap();
         let huge = "x".repeat(MAX_OUTPUT_CHARS);
-        assert_eq!(
-            t.render(&vars(&[("name", &huge)])).chars().count(),
-            MAX_OUTPUT_CHARS
-        );
+        assert_eq!(t.render(&vars(&[("name", &huge)])).chars().count(), MAX_OUTPUT_CHARS);
     }
 
     #[test]
@@ -395,22 +337,13 @@ mod tests {
         for kind in crate::sample::TESTABLE {
             let e = any_sample(kind, crate::event::Millis(0)).unwrap();
             let v = event_vars(&e);
-            assert!(
-                v.contains_key("name") && v.contains_key("platform"),
-                "{kind}"
-            );
+            assert!(v.contains_key("name") && v.contains_key("platform"), "{kind}");
             for key in v.keys() {
-                assert!(
-                    KNOWN_VARS.contains(&key.as_str()),
-                    "{key} missing from KNOWN_VARS"
-                );
+                assert!(KNOWN_VARS.contains(&key.as_str()), "{key} missing from KNOWN_VARS");
             }
         }
         let tip = any_sample("tip", crate::event::Millis(0)).unwrap();
-        assert_eq!(
-            event_vars(&tip).get("amount").map(String::as_str),
-            Some("₹500")
-        );
+        assert_eq!(event_vars(&tip).get("amount").map(String::as_str), Some("₹500"));
         assert_eq!(tip.platform, Platform::Tips);
     }
 }

@@ -59,22 +59,12 @@ pub fn insert(store: &Store, e: &Event) -> Result<Option<i64>> {
 
 /// A page of events, newest first. `before` is a log sequence number; `kinds` filters by
 /// kind name. The limit is clamped to 1..=500.
-pub fn recent(
-    store: &Store,
-    before: Option<i64>,
-    limit: u32,
-    kinds: &[String],
-) -> Result<Vec<(i64, Event)>> {
+pub fn recent(store: &Store, before: Option<i64>, limit: u32, kinds: &[String]) -> Result<Vec<(i64, Event)>> {
     page(store, before, limit, kinds, false)
 }
 
 /// Like [`recent`] but without messages moderation removed: what overlays may show.
-pub fn recent_visible(
-    store: &Store,
-    before: Option<i64>,
-    limit: u32,
-    kinds: &[String],
-) -> Result<Vec<(i64, Event)>> {
+pub fn recent_visible(store: &Store, before: Option<i64>, limit: u32, kinds: &[String]) -> Result<Vec<(i64, Event)>> {
     page(store, before, limit, kinds, true)
 }
 
@@ -119,17 +109,10 @@ fn page(
 
 /// Looks an event up by Ferrocast id.
 pub fn get(store: &Store, id: &str) -> Result<Option<Event>> {
-    let seq: Option<i64> = store.read(|c| {
-        Ok(
-            c.query_row("SELECT seq FROM events WHERE id = ?1", [id], |r| r.get(0))
-                .optional()?,
-        )
-    })?;
+    let seq: Option<i64> =
+        store.read(|c| Ok(c.query_row("SELECT seq FROM events WHERE id = ?1", [id], |r| r.get(0)).optional()?))?;
     let Some(seq) = seq else { return Ok(None) };
-    Ok(recent(store, Some(seq + 1), 1, &[])?
-        .into_iter()
-        .next()
-        .map(|(_, e)| e))
+    Ok(recent(store, Some(seq + 1), 1, &[])?.into_iter().next().map(|(_, e)| e))
 }
 
 /// Marks a message hidden (filtered, deleted by a mod, from a banned account) so it never
@@ -144,12 +127,7 @@ pub fn hide(store: &Store, platform: Platform, source_id: &str) -> Result<bool> 
 }
 
 /// Hides a person's chat since `since_ms` (they were banned or their messages cleared).
-pub fn hide_user_chat(
-    store: &Store,
-    platform: Platform,
-    actor_id: &str,
-    since_ms: i64,
-) -> Result<usize> {
+pub fn hide_user_chat(store: &Store, platform: Platform, actor_id: &str, since_ms: i64) -> Result<usize> {
     store.write(|tx| {
         Ok(tx.execute(
             "UPDATE events SET hidden = 1
@@ -191,16 +169,9 @@ pub fn add_pending_tts(store: &Store, p: &PendingTts) -> Result<()> {
 
 pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
     store.read(|c| {
-        let mut st = c.prepare(
-            "SELECT id, event_id, text, created_at FROM tts_pending ORDER BY created_at",
-        )?;
+        let mut st = c.prepare("SELECT id, event_id, text, created_at FROM tts_pending ORDER BY created_at")?;
         let rows = st.query_map([], |r| {
-            Ok(PendingTts {
-                id: r.get(0)?,
-                event_id: r.get(1)?,
-                text: r.get(2)?,
-                created_at: r.get(3)?,
-            })
+            Ok(PendingTts { id: r.get(0)?, event_id: r.get(1)?, text: r.get(2)?, created_at: r.get(3)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     })
@@ -210,18 +181,9 @@ pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
 pub fn take_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
     store.write(|tx| {
         let p = tx
-            .query_row(
-                "SELECT id, event_id, text, created_at FROM tts_pending WHERE id = ?1",
-                [id],
-                |r| {
-                    Ok(PendingTts {
-                        id: r.get(0)?,
-                        event_id: r.get(1)?,
-                        text: r.get(2)?,
-                        created_at: r.get(3)?,
-                    })
-                },
-            )
+            .query_row("SELECT id, event_id, text, created_at FROM tts_pending WHERE id = ?1", [id], |r| {
+                Ok(PendingTts { id: r.get(0)?, event_id: r.get(1)?, text: r.get(2)?, created_at: r.get(3)? })
+            })
             .optional()?;
         tx.execute("DELETE FROM tts_pending WHERE id = ?1", [id])?;
         Ok(p)
@@ -236,12 +198,7 @@ pub fn drop_pending_tts_for_event(store: &Store, event_id: &str) -> Result<usize
 /// Deletes chat older than `days` (alerts and tips are kept for history and taxes).
 pub fn prune_chat(store: &Store, days: u32) -> Result<usize> {
     let cutoff = now_ms() - i64::from(days) * 86_400_000;
-    store.write(|tx| {
-        Ok(tx.execute(
-            "DELETE FROM events WHERE kind = 'chat_message' AND received_at < ?1",
-            [cutoff],
-        )?)
-    })
+    store.write(|tx| Ok(tx.execute("DELETE FROM events WHERE kind = 'chat_message' AND received_at < ?1", [cutoff])?))
 }
 
 #[cfg(test)]
@@ -270,23 +227,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
         assert!(insert(&s, &chat("a", Some("m1"), "hi")).unwrap().is_some());
-        assert!(
-            insert(&s, &chat("b", Some("m1"), "hi again"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(insert(&s, &chat("b", Some("m1"), "hi again")).unwrap().is_none());
         assert!(insert(&s, &chat("c", None, "x")).unwrap().is_some());
         assert!(insert(&s, &chat("d", None, "x")).unwrap().is_some());
-        assert!(
-            insert(&s, &chat("e", Some(""), "empty id counts as none"))
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            insert(&s, &chat("f", Some(""), "empty id counts as none"))
-                .unwrap()
-                .is_some()
-        );
+        assert!(insert(&s, &chat("e", Some(""), "empty id counts as none")).unwrap().is_some());
+        assert!(insert(&s, &chat("f", Some(""), "empty id counts as none")).unwrap().is_some());
     }
 
     #[test]
@@ -310,9 +255,7 @@ mod tests {
             Platform::Kick,
             Some("f1".into()),
             Millis(2),
-            EventKind::Follow {
-                actor: Actor::named(Platform::Kick, "fan"),
-            },
+            EventKind::Follow { actor: Actor::named(Platform::Kick, "fan") },
         );
         f.id = "follow".into();
         insert(&s, &f).unwrap();
@@ -324,22 +267,10 @@ mod tests {
         let follows = recent(&s, None, 50, &["follow".into()]).unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].1.platform, Platform::Kick);
-        assert_eq!(
-            recent(&s, None, 0, &[]).unwrap().len(),
-            1,
-            "limit clamps up to 1"
-        );
-        assert_eq!(
-            recent(&s, None, 100_000, &["nonsense' OR 1=1".into()])
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_eq!(recent(&s, None, 0, &[]).unwrap().len(), 1, "limit clamps up to 1");
+        assert_eq!(recent(&s, None, 100_000, &["nonsense' OR 1=1".into()]).unwrap().len(), 0);
         assert_eq!(get(&s, "follow").unwrap().unwrap().kind.name(), "follow");
-        assert_eq!(
-            by_source(&s, Platform::Kick, "f1").unwrap().as_deref(),
-            Some("follow")
-        );
+        assert_eq!(by_source(&s, Platform::Kick, "f1").unwrap().as_deref(), Some("follow"));
     }
 
     #[test]
@@ -356,38 +287,18 @@ mod tests {
         assert!(hide(&s, Platform::Twitch, "m3").unwrap());
         assert!(!hide(&s, Platform::Twitch, "m3").unwrap(), "already hidden");
         assert_eq!(hide_user_chat(&s, Platform::Twitch, "troll", 0).unwrap(), 1);
-        let visible: Vec<_> = recent_visible(&s, None, 50, &[])
-            .unwrap()
-            .into_iter()
-            .map(|(_, e)| e.id)
-            .collect();
+        let visible: Vec<_> = recent_visible(&s, None, 50, &[]).unwrap().into_iter().map(|(_, e)| e.id).collect();
         assert_eq!(visible, vec!["b"]);
-        assert_eq!(
-            recent(&s, None, 50, &[]).unwrap().len(),
-            3,
-            "the mod log keeps everything"
-        );
+        assert_eq!(recent(&s, None, 50, &[]).unwrap().len(), 3, "the mod log keeps everything");
     }
 
     #[test]
     fn tts_pending_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let p = PendingTts {
-            id: "t1".into(),
-            event_id: "e1".into(),
-            text: "hi".into(),
-            created_at: 1,
-        };
+        let p = PendingTts { id: "t1".into(), event_id: "e1".into(), text: "hi".into(), created_at: 1 };
         add_pending_tts(&s, &p).unwrap();
-        add_pending_tts(
-            &s,
-            &PendingTts {
-                id: "t2".into(),
-                ..p.clone()
-            },
-        )
-        .unwrap();
+        add_pending_tts(&s, &PendingTts { id: "t2".into(), ..p.clone() }).unwrap();
         assert_eq!(pending_tts(&s).unwrap().len(), 2);
         assert_eq!(take_pending_tts(&s, "t1").unwrap(), Some(p));
         assert_eq!(take_pending_tts(&s, "t1").unwrap(), None);

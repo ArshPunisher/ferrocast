@@ -12,9 +12,7 @@ use crate::{Store, now_ms};
 pub fn list(store: &Store) -> Result<Vec<AlertRule>> {
     let rules: Vec<AlertRule> = store.read(|c| {
         let mut st = c.prepare("SELECT rule FROM alert_rules ORDER BY position, id")?;
-        Ok(st
-            .query_map([], |r| super::from_json(0, r.get(0)?))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(st.query_map([], |r| super::from_json(0, r.get(0)?))?.collect::<rusqlite::Result<Vec<_>>>()?)
     })?;
     if !rules.is_empty() || settings_seeded(store)? {
         return Ok(rules);
@@ -33,8 +31,7 @@ fn settings_seeded(store: &Store) -> Result<bool> {
 
 /// Validates then inserts or replaces a rule, keeping its position (new rules go last).
 pub fn save(store: &Store, rule: &AlertRule) -> Result<()> {
-    rule.validate()
-        .map_err(|e| StoreError::Conflict(e.to_string()))?;
+    rule.validate().map_err(|e| StoreError::Conflict(e.to_string()))?;
     let json = serde_json::to_string(rule)?;
     store.write(|tx| {
         let pos: i64 = tx.query_row(
@@ -53,30 +50,17 @@ pub fn save(store: &Store, rule: &AlertRule) -> Result<()> {
 
 pub fn delete(store: &Store, id: &str) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM alert_rules WHERE id = ?1", [id])?))?;
-    if n == 0 {
-        Err(StoreError::NotFound("alert rule"))
-    } else {
-        Ok(())
-    }
+    if n == 0 { Err(StoreError::NotFound("alert rule")) } else { Ok(()) }
 }
 
 pub fn load_queue(store: &Store) -> Result<Option<AlertQueue>> {
-    let raw: Option<String> = store.read(|c| {
-        Ok(
-            c.query_row("SELECT state FROM alert_queue WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .optional()?,
-        )
-    })?;
+    let raw: Option<String> = store
+        .read(|c| Ok(c.query_row("SELECT state FROM alert_queue WHERE id = 1", [], |r| r.get(0)).optional()?))?;
     match raw {
         None => Ok(None),
         Some(s) => serde_json::from_str(&s)
             .map(Some)
-            .map_err(|e| StoreError::Corrupt {
-                what: "alert queue",
-                detail: e.to_string(),
-            }),
+            .map_err(|e| StoreError::Corrupt { what: "alert queue", detail: e.to_string() }),
     }
 }
 
@@ -107,10 +91,7 @@ mod tests {
         for r in &rules {
             delete(&s, &r.id).unwrap();
         }
-        assert!(
-            list(&s).unwrap().is_empty(),
-            "the streamer's choice to have no rules is kept"
-        );
+        assert!(list(&s).unwrap().is_empty(), "the streamer's choice to have no rules is kept");
     }
 
     #[test]
@@ -137,10 +118,7 @@ mod tests {
         let mut r = list(&s).unwrap()[0].clone();
         r.kinds.clear();
         assert!(matches!(save(&s, &r), Err(StoreError::Conflict(_))));
-        assert!(matches!(
-            delete(&s, "missing"),
-            Err(StoreError::NotFound(_))
-        ));
+        assert!(matches!(delete(&s, "missing"), Err(StoreError::NotFound(_))));
     }
 
     #[test]

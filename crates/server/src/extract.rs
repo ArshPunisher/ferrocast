@@ -25,19 +25,14 @@ where
                     "wrong_content_type",
                     "Send JSON with the header Content-Type: application/json.",
                 ),
-                JsonRejection::JsonSyntaxError(_) => {
-                    ApiError::invalid("The request isn't valid JSON.")
-                }
+                JsonRejection::JsonSyntaxError(_) => ApiError::invalid("The request isn't valid JSON."),
                 JsonRejection::JsonDataError(e) => {
                     ApiError::invalid(format!("A field is missing or wrong: {}", e.body_text()))
                 }
                 JsonRejection::BytesRejection(_) => ApiError::new(
                     axum::http::StatusCode::PAYLOAD_TOO_LARGE,
                     "too_large",
-                    format!(
-                        "The request is too big; the limit is {} KB.",
-                        crate::JSON_LIMIT / 1024
-                    ),
+                    format!("The request is too big; the limit is {} KB.", crate::JSON_LIMIT / 1024),
                 ),
                 other => ApiError::invalid(other.body_text()),
             }),

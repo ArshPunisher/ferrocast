@@ -54,20 +54,10 @@ fn file_response<E: Embed>(path: &str, csp: &str) -> Option<Response> {
         h.insert(header::CONTENT_TYPE, v);
     }
     // Vite fingerprints files under assets/, so they can be cached for good; HTML can't.
-    let cache = if path.starts_with("assets/") {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    };
+    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     if path.ends_with(".html")
         && let Ok(v) = HeaderValue::from_str(csp)
     {
@@ -77,8 +67,7 @@ fn file_response<E: Embed>(path: &str, csp: &str) -> Option<Response> {
 }
 
 async fn dashboard_index() -> Response {
-    file_response::<Dashboard>("index.html", DASHBOARD_CSP)
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    file_response::<Dashboard>("index.html", DASHBOARD_CSP).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
 /// Real files are served; any other path without an extension is a client-side route.
@@ -86,10 +75,7 @@ async fn dashboard_file(Path(path): Path<String>) -> Response {
     if let Some(r) = file_response::<Dashboard>(&path, DASHBOARD_CSP) {
         return r;
     }
-    let looks_like_file = path
-        .rsplit('/')
-        .next()
-        .is_some_and(|last| last.contains('.'));
+    let looks_like_file = path.rsplit('/').next().is_some_and(|last| last.contains('.'));
     if looks_like_file {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -97,23 +83,14 @@ async fn dashboard_file(Path(path): Path<String>) -> Response {
 }
 
 async fn overlay_redirect(Path(token): Path<String>) -> Redirect {
-    Redirect::permanent(&format!(
-        "/o/{}/",
-        token
-            .chars()
-            .filter(char::is_ascii_hexdigit)
-            .collect::<String>()
-    ))
+    Redirect::permanent(&format!("/o/{}/", token.chars().filter(char::is_ascii_hexdigit).collect::<String>()))
 }
 
 async fn overlay_index(State(app): State<AppState>, Path(token): Path<String>) -> Response {
     match app.engine.overlay_by_token(&token).await {
         Ok(Some(_)) => file_response::<Overlays>("index.html", OVERLAY_CSP)
             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()),
-        _ => (
-            StatusCode::NOT_FOUND,
-            "This overlay URL doesn't exist anymore. Copy it again from Ferrocast.",
-        )
+        _ => (StatusCode::NOT_FOUND, "This overlay URL doesn't exist anymore. Copy it again from Ferrocast.")
             .into_response(),
     }
 }
@@ -129,16 +106,11 @@ async fn overlay_file(
     if let Some(id) = path.strip_prefix("media/") {
         return media_response(&app, id, &headers).await;
     }
-    file_response::<Overlays>(&path, OVERLAY_CSP)
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    file_response::<Overlays>(&path, OVERLAY_CSP).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
 /// `GET /api/v1/media/{id}` for dashboard previews (auth checked by the API guard).
-pub async fn dashboard_media(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn dashboard_media(State(app): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     media_response(&app, &id, &headers).await
 }
 
@@ -146,10 +118,7 @@ pub async fn dashboard_media(
 /// protocol couldn't, R-41).
 async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Response {
     let mid = id.to_string();
-    let found = app
-        .engine
-        .db(move |s| ferrocast_store::repo::media::get(s, &mid))
-        .await;
+    let found = app.engine.db(move |s| ferrocast_store::repo::media::get(s, &mid)).await;
     let (media, path): (_, PathBuf) = match found {
         Ok(Some(x)) => x,
         Ok(None) => return ApiError::not_found("file").into_response(),
@@ -159,10 +128,7 @@ async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Respon
         return ApiError::not_found("file").into_response();
     };
     let len = media.bytes;
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|r| r.to_str().ok())
-        .and_then(|r| parse_range(r, len));
+    let range = headers.get(header::RANGE).and_then(|r| r.to_str().ok()).and_then(|r| parse_range(r, len));
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, media.mime.as_str())
         .header(header::ACCEPT_RANGES, "bytes")

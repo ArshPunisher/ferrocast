@@ -40,16 +40,8 @@ pub struct ServeOptions {
 
 impl Default for ServeOptions {
     fn default() -> Self {
-        let dev = std::env::var("FERROCAST_DEV_ORIGIN")
-            .ok()
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
-        ServeOptions {
-            port: DEFAULT_PORT,
-            lan: false,
-            dev_origins: dev,
-        }
+        let dev = std::env::var("FERROCAST_DEV_ORIGIN").ok().into_iter().filter(|s| !s.is_empty()).collect();
+        ServeOptions { port: DEFAULT_PORT, lan: false, dev_origins: dev }
     }
 }
 
@@ -76,11 +68,7 @@ impl Server {
 
 /// Binds and starts serving. Tries `opts.port`, then the next 20 ports.
 pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server> {
-    let ip = if opts.lan {
-        Ipv4Addr::UNSPECIFIED
-    } else {
-        Ipv4Addr::LOCALHOST
-    };
+    let ip = if opts.lan { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
     let mut last_err = None;
     let mut listener = None;
     for port in opts.port..opts.port.saturating_add(20) {
@@ -94,20 +82,14 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
     }
     let listener = match listener {
         Some(l) => l,
-        None => TcpListener::bind((ip, 0))
-            .await
-            .map_err(|e| last_err.unwrap_or(e))?,
+        None => TcpListener::bind((ip, 0)).await.map_err(|e| last_err.unwrap_or(e))?,
     };
     let addr = listener.local_addr()?;
     let sessions = Arc::new(Sessions::new());
     let state = AppState {
         engine: engine.clone(),
         sessions: sessions.clone(),
-        guard: auth::Guard {
-            port: addr.port(),
-            lan: opts.lan,
-            dev_origins: opts.dev_origins,
-        },
+        guard: auth::Guard { port: addr.port(), lan: opts.lan, dev_origins: opts.dev_origins },
     };
     engine.set_base_url(&format!("http://127.0.0.1:{}", addr.port()));
     let app = router(state);
@@ -117,24 +99,14 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
         }
     });
     tracing::info!(%addr, "local server listening");
-    Ok(Server {
-        addr,
-        sessions,
-        task,
-    })
+    Ok(Server { addr, sessions, task })
 }
 
 pub(crate) fn router(state: AppState) -> Router {
     let api = routes::api()
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .merge(routes::uploads())
-        .fallback(|| async {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "no_route",
-                "There's no such API route.",
-            )
-        })
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no_route", "There's no such API route.") })
         .layer(middleware::from_fn_with_state(state.clone(), api_guard));
     Router::new()
         .nest("/api/v1", api)
@@ -174,12 +146,9 @@ async fn api_guard(State(app): State<AppState>, req: Request, next: Next) -> Res
     let open = path.ends_with("/session/pair") || path.ends_with("/live");
     if !open {
         // GETs may carry the token as ?session= so <img>/<audio> previews can load media.
-        let query_token = (req.method() == Method::GET)
-            .then(|| query_param(req.uri().query().unwrap_or(""), "session"))
-            .flatten();
-        let token = auth::bearer(req.headers())
-            .map(str::to_string)
-            .or(query_token);
+        let query_token =
+            (req.method() == Method::GET).then(|| query_param(req.uri().query().unwrap_or(""), "session")).flatten();
+        let token = auth::bearer(req.headers()).map(str::to_string).or(query_token);
         let ok = token.is_some_and(|t| app.sessions.valid(&t));
         if !ok {
             let mut res = ApiError::unauthorized().into_response();
@@ -205,14 +174,8 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
     };
     let h = res.headers_mut();
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("authorization, content-type"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, PUT, DELETE"),
-    );
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE"));
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
 }
 
