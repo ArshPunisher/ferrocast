@@ -98,9 +98,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    app.run(|_app, event| {
-        // The last window closing must not quit a tray app; only "Quit" does (exit code set).
-        if let RunEvent::ExitRequested { api, code: None, .. } = event {
+    app.run(|app, event| {
+        // The last window closing must not quit a tray app; only "Quit" does (exit code
+        // set). If startup failed there's no tray to quit from, so closing the error
+        // window really exits.
+        if let RunEvent::ExitRequested { api, code: None, .. } = event
+            && app.try_state::<Running>().is_some()
+        {
             api.prevent_exit();
         }
     });
