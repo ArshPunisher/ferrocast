@@ -42,6 +42,7 @@ async fn main() {
         Ok(e) => e,
         Err(e) => fail(&format!("couldn't start: {e}")),
     };
+    let lan = opts.lan;
     let server = match ferrocast_server::serve(engine, opts).await {
         Ok(s) => s,
         Err(e) => fail(&format!("the local server couldn't start: {e}")),
@@ -51,6 +52,10 @@ async fn main() {
     println!("Data folder: {}", dir.display());
     println!("Open the dashboard (this link works once, for 2 minutes):");
     println!("  {}/app/#pair={code}", server.base_url());
+    if lan {
+        println!("From another device on this network, use this computer's address instead of 127.0.0.1:");
+        println!("  http://<this-computer's-ip>:{}/app/#pair={code}", server.addr.port());
+    }
     if tokio::signal::ctrl_c().await.is_ok() {
         println!("Stopping.");
     }
