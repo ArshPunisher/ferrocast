@@ -97,7 +97,7 @@ type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label
 | POST | `/api/v1/overlays` | `{ name, preset?: "starter" \| "alerts_only" \| "chat_only" \| "blank" }` → `Overlay` |
 | GET / PUT / DELETE | `/api/v1/overlays/{id}` | `Overlay` (PUT replaces name, size, widgets) |
 | POST | `/api/v1/overlays/{id}/regenerate-url` | → `Overlay` (old URL stops working at once) |
-| POST | `/api/v1/overlays/{id}/add-to-obs` | → `{ scene, source }` (422 if OBS isn't connected) |
+| POST | `/api/v1/overlays/{id}/add-to-obs` | → `{ scene, source, created }`: `created` is false when an existing Ferrocast source was updated in place (422 with a hint if OBS can't be reached) |
 
 Widget `config` per kind:
 - `alerts`: `{ theme: string, rule_ids: string[] | null }` (null = all rules)
@@ -207,4 +207,4 @@ Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/
 
 ## 7. Not in this build yet
 
-`POST /accounts/{platform}/connect` and `POST /overlays/{id}/add-to-obs` answer 422 with a clear message until the platform and OBS adapters land.
+`POST /accounts/{platform}/connect` works for Twitch (when the build has a Twitch app) and answers 422 with a message for YouTube and Kick until their adapters land. `POST /overlays/{id}/add-to-obs` works whenever OBS is reachable and answers 422 with a hint otherwise.
