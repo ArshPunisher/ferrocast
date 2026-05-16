@@ -1,0 +1,303 @@
+//! Tests against fakes: Google's token endpoint, the REST API, and a scripted gRPC
+//! `streamList` server.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use base64::Engine as _;
+use ferrocast_core::event::{EventKind, Millis, Origin};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, mpsc};
+use tonic::{Request, Response, Status};
+
+use super::*;
+use crate::proto::live_chat_message_snippet::DisplayedContent;
+use crate::proto::live_chat_message_snippet::type_wrapper::Type;
+use crate::proto::v3_data_live_chat_message_service_server::{
+    V3DataLiveChatMessageService, V3DataLiveChatMessageServiceServer,
+};
+use crate::proto::*;
+
+fn msg(id: &str, ty: Type, content: Option<DisplayedContent>, author: &str) -> LiveChatMessage {
+    LiveChatMessage {
+        kind: None,
+        etag: None,
+        id: Some(id.into()),
+        snippet: Some(LiveChatMessageSnippet {
+            r#type: Some(ty as i32),
+            live_chat_id: Some("chat-1".into()),
+            author_channel_id: Some(author.into()),
+            published_at: None,
+            has_display_content: Some(true),
+            display_message: None,
+            displayed_content: content,
+        }),
+        author_details: Some(LiveChatMessageAuthorDetails {
+            channel_id: Some(author.into()),
+            channel_url: None,
+            display_name: Some(format!("{author} name")),
+            profile_image_url: None,
+            is_verified: Some(false),
+            is_chat_owner: Some(false),
+            is_chat_sponsor: Some(true),
+            is_chat_moderator: Some(false),
+        }),
+    }
+}
+
+fn text(id: &str, t: &str) -> LiveChatMessage {
+    msg(
+        id,
+        Type::TextMessageEvent,
+        Some(DisplayedContent::TextMessageDetails(LiveChatTextMessageDetails { message_text: Some(t.into()) })),
+        "UCviewer",
+    )
+}
+
+fn page(items: Vec<LiveChatMessage>, next: &str, offline: bool) -> LiveChatMessageListResponse {
+    LiveChatMessageListResponse {
+        kind: None,
+        etag: None,
+        offline_at: offline.then(|| "2026-05-01T10:00:00Z".to_string()),
+        page_info: None,
+        next_page_token: Some(next.into()),
+        items,
+        active_poll_item: None,
+    }
+}
+
+#[test]
+fn super_chat_micros_become_exact_minor_units() {
+    assert_eq!(map::micros_to_money(1_750_000, "usd"), ferrocast_core::money::Money::new(175, "USD"));
+    assert_eq!(map::micros_to_money(199_000_000, "INR"), ferrocast_core::money::Money::new(19_900, "INR"));
+    assert_eq!(map::micros_to_money(1_000_000_000, "JPY"), ferrocast_core::money::Money::new(1000, "JPY"));
+    assert_eq!(map::micros_to_money(1_234_000, "KWD"), ferrocast_core::money::Money::new(1234, "KWD"));
+    assert_eq!(
+        map::micros_to_money(u64::MAX, "USD").minor,
+        i64::try_from(u128::from(u64::MAX) * 100 / 1_000_000).unwrap()
+    );
+}
+
+#[test]
+fn maps_every_kind_we_show() {
+    let at = Millis(1);
+    let sc = msg(
+        "sc",
+        Type::SuperChatEvent,
+        Some(DisplayedContent::SuperChatDetails(LiveChatSuperChatDetails {
+            amount_micros: Some(5_000_000),
+            currency: Some("USD".into()),
+            amount_display_string: None,
+            user_comment: Some("gg".into()),
+            tier: Some(2),
+        })),
+        "UCa",
+    );
+    let e = map::map(&sc, at).unwrap();
+    assert!(
+        matches!(&e.kind, EventKind::PaidMessage { money, content: Some(c), .. } if money.minor == 500 && c.text == "gg")
+    );
+    let ms = msg(
+        "ms",
+        Type::MemberMilestoneChatEvent,
+        Some(DisplayedContent::MemberMilestoneChatDetails(LiveChatMemberMilestoneChatDetails {
+            member_level_name: Some("Gold".into()),
+            member_month: Some(12),
+            user_comment: None,
+        })),
+        "UCb",
+    );
+    assert!(matches!(map::map(&ms, at).unwrap().kind, EventKind::Subscription { months: 12, .. }));
+    let gifting = msg(
+        "g",
+        Type::MembershipGiftingEvent,
+        Some(DisplayedContent::MembershipGiftingDetails(LiveChatMembershipGiftingDetails {
+            gift_memberships_count: Some(5),
+            gift_memberships_level_name: None,
+        })),
+        "UCc",
+    );
+    assert!(matches!(map::map(&gifting, at).unwrap().kind, EventKind::GiftBatch { count: 5, .. }));
+    let got = msg(
+        "r",
+        Type::GiftMembershipReceivedEvent,
+        Some(DisplayedContent::GiftMembershipReceivedDetails(LiveChatGiftMembershipReceivedDetails {
+            member_level_name: None,
+            gifter_channel_id: Some("UCc".into()),
+            associated_membership_gifting_message_id: None,
+        })),
+        "UCd",
+    );
+    assert!(!map::map(&got, at).unwrap().kind.is_alertable(), "recipients don't alert one by one");
+    let tomb = msg("deleted-1", Type::Tombstone, None, "UCe");
+    let t = map::map(&tomb, at).unwrap();
+    assert!(matches!(&t.kind, EventKind::MessageDeleted { message_id } if message_id == "deleted-1"));
+    assert_ne!(t.source_id.as_deref(), Some("deleted-1"), "the tombstone gets its own dedupe key");
+    let text_msg = map::map(&text("t1", "hello"), at).unwrap();
+    assert!(
+        matches!(&text_msg.kind, EventKind::ChatMessage { actor, .. } if actor.roles.contains(ferrocast_core::event::Roles::MEMBER))
+    );
+    assert!(map::map(&msg("p", Type::PollEvent, None, "UCf"), at).is_none());
+    let mut bad = text("x", "y");
+    bad.snippet = None;
+    assert!(map::map(&bad, at).is_none(), "a message without a snippet is skipped, not a panic");
+}
+
+// --- fakes -------------------------------------------------------------------
+
+#[derive(Default)]
+struct Script {
+    requests: Vec<Option<String>>,
+}
+
+struct FakeChat {
+    script: Arc<Mutex<Script>>,
+}
+
+#[tonic::async_trait]
+impl V3DataLiveChatMessageService for FakeChat {
+    type StreamListStream = tokio_stream::wrappers::ReceiverStream<Result<LiveChatMessageListResponse, Status>>;
+
+    async fn stream_list(
+        &self,
+        req: Request<LiveChatMessageListRequest>,
+    ) -> Result<Response<Self::StreamListStream>, Status> {
+        if req.metadata().get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer access-0") {
+            return Err(Status::unauthenticated("bad token"));
+        }
+        let token = req.into_inner().page_token;
+        let n = {
+            let mut s = self.script.lock().unwrap();
+            s.requests.push(token);
+            s.requests.len()
+        };
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if n == 1 {
+                let _ = tx.send(Ok(page(vec![text("old-1", "!hi from before")], "p1", false))).await;
+                let _ = tx.send(Ok(page(vec![text("new-1", "fresh")], "p2", false))).await;
+                // then the server ends the stream, as YouTube does from time to time
+            } else {
+                let _ = tx.send(Ok(page(vec![text("new-2", "after the drop")], "p3", false))).await;
+                let _ = tx.send(Ok(page(vec![], "p4", true))).await;
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+async fn fakes() -> (Endpoints, Arc<Mutex<Script>>, Arc<Mutex<Vec<String>>>) {
+    let script = Arc::new(Mutex::new(Script::default()));
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc.local_addr().unwrap();
+    let svc = V3DataLiveChatMessageServiceServer::new(FakeChat { script: script.clone() });
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
+            .await
+    });
+    let forms = Arc::new(Mutex::new(Vec::new()));
+    let f2 = forms.clone();
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(move |body: String| {
+                let f = f2.clone();
+                async move {
+                    f.lock().unwrap().push(body);
+                    axum::Json(json!({ "access_token": "access-0", "refresh_token": "refresh-0", "expires_in": 3600 }))
+                }
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "items": [{ "snippet": { "liveChatId": "chat-1" } }] }))
+            }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: format!("http://{grpc_addr}"),
+    };
+    (ep, script, forms)
+}
+
+fn app() -> AppCredentials {
+    AppCredentials { client_id: "cid".into(), client_secret: "csecret".into() }
+}
+
+#[tokio::test]
+async fn sign_in_checks_state_and_sends_the_pkce_verifier() {
+    let (ep, _s, forms) = fakes().await;
+    let http = http_client();
+    let pending = oauth::begin(&ep, &app()).await.unwrap();
+    let url = url::Url::parse(&pending.url).unwrap();
+    let q = |k: &str| url.query_pairs().find(|(a, _)| a == k).map(|(_, v)| v.into_owned()).unwrap();
+    let (redirect, state, challenge) = (q("redirect_uri"), q("state"), q("code_challenge"));
+    assert_eq!(q("code_challenge_method"), "S256");
+    let browser = tokio::spawn({
+        let http = http.clone();
+        async move {
+            let _ = http.get(format!("{redirect}?code=the-code&state={state}")).send().await;
+        }
+    });
+    let tokens = oauth::finish(&http, &ep, &app(), pending, Duration::from_secs(5)).await.unwrap();
+    browser.await.unwrap();
+    assert_eq!(tokens.refresh_token, "refresh-0");
+    let body = forms.lock().unwrap()[0].clone();
+    let verifier = body.split('&').find_map(|kv| kv.strip_prefix("code_verifier=")).unwrap();
+    let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    assert_eq!(expect, challenge, "the verifier matches the challenge Google saw");
+}
+
+#[tokio::test]
+async fn a_forged_redirect_with_the_wrong_state_is_refused() {
+    let (ep, _s, _f) = fakes().await;
+    let http = http_client();
+    let pending = oauth::begin(&ep, &app()).await.unwrap();
+    let redirect =
+        url::Url::parse(&pending.url).unwrap().query_pairs().find(|(k, _)| k == "redirect_uri").unwrap().1.into_owned();
+    let h = http.clone();
+    tokio::spawn(async move {
+        let _ = h.get(format!("{redirect}?code=evil&state=guessed")).send().await;
+    });
+    let err = oauth::finish(&http, &ep, &app(), pending, Duration::from_secs(5)).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::SignIn(_)));
+}
+
+#[tokio::test]
+async fn the_stream_marks_history_resumes_after_a_drop_and_ends_with_the_chat() {
+    let (ep, script, _f) = fakes().await;
+    let tokens =
+        Tokens { access_token: "access-0".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    let api = Arc::new(Api::new(http_client(), ep, app(), tokens, Arc::new(|_| Ok(()))));
+    let (sink, mut rx) = mpsc::channel(64);
+    let live: stream::LiveChat = Arc::default();
+    tokio::spawn(stream::run(api, sink, Arc::new(Notify::new()), live.clone()));
+    let mut chat = Vec::new();
+    let mut saw_online = false;
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+        match e.kind {
+            EventKind::StreamOnline { .. } => saw_online = true,
+            EventKind::ChatMessage { .. } => chat.push((e.source_id.unwrap(), e.origin)),
+            EventKind::StreamOffline => break,
+            _ => {}
+        }
+    }
+    assert!(saw_online);
+    assert_eq!(
+        chat,
+        vec![("old-1".into(), Origin::Backfill), ("new-1".into(), Origin::Live), ("new-2".into(), Origin::Live)]
+    );
+    let requests = script.lock().unwrap().requests.clone();
+    assert_eq!(requests, vec![None, Some("p2".into())], "resumed from the last page token");
+    assert!(live.read().unwrap().is_none(), "no live chat after it ended");
+}
