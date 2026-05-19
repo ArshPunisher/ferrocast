@@ -15,6 +15,7 @@ ferrocast-store.workspace = true
 ferrocast-obs.workspace = true
 ferrocast-secrets.workspace = true
 ferrocast-twitch.workspace = true
+ferrocast-youtube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

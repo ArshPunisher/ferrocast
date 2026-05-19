@@ -80,6 +80,7 @@ struct Inner {
     secrets: Arc<dyn ferrocast_secrets::Secrets>,
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
+    youtube_wake: Mutex<Option<Arc<Notify>>>,
 }
 
 impl Engine {
@@ -145,6 +146,7 @@ impl Engine {
                 secrets,
                 apps,
                 adapters: Mutex::new(HashMap::new()),
+                youtube_wake: Mutex::new(None),
             }),
         };
         tokio::spawn(prune(engine.clone()));

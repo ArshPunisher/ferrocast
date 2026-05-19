@@ -16,6 +16,9 @@ use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
 const TWITCH_TOKENS: &str = "twitch-tokens";
+const YOUTUBE_TOKENS: &str = "youtube-tokens";
+/// How long the browser sign-in for YouTube may take.
+const YOUTUBE_SIGN_IN: Duration = Duration::from_secs(300);
 
 /// The public client ids of Ferrocast's platform apps. They're public by design (device
 /// code / PKCE flows); release builds bake them in, and `FERROCAST_TWITCH_CLIENT_ID` etc.
@@ -24,6 +27,8 @@ const TWITCH_TOKENS: &str = "twitch-tokens";
 pub struct PlatformApps {
     pub twitch_client_id: Option<String>,
     pub twitch_endpoints: Endpoints,
+    pub youtube: Option<ferrocast_youtube::AppCredentials>,
+    pub youtube_endpoints: ferrocast_youtube::Endpoints,
 }
 
 impl PlatformApps {
@@ -38,6 +43,16 @@ impl PlatformApps {
         PlatformApps {
             twitch_client_id: pick("FERROCAST_TWITCH_CLIENT_ID", option_env!("FERROCAST_TWITCH_CLIENT_ID")),
             twitch_endpoints: Endpoints::default(),
+            youtube: match (
+                pick("FERROCAST_YOUTUBE_CLIENT_ID", option_env!("FERROCAST_YOUTUBE_CLIENT_ID")),
+                pick("FERROCAST_YOUTUBE_CLIENT_SECRET", option_env!("FERROCAST_YOUTUBE_CLIENT_SECRET")),
+            ) {
+                (Some(client_id), Some(client_secret)) => {
+                    Some(ferrocast_youtube::AppCredentials { client_id, client_secret })
+                }
+                _ => None,
+            },
+            youtube_endpoints: ferrocast_youtube::Endpoints::default(),
         }
     }
 }
@@ -46,7 +61,16 @@ impl PlatformApps {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "flow", rename_all = "snake_case")]
 pub enum ConnectFlow {
-    DeviceCode { user_code: String, verification_url: String, expires_at: i64 },
+    DeviceCode {
+        user_code: String,
+        verification_url: String,
+        expires_at: i64,
+    },
+    /// Open this URL in the system browser; the engine is waiting for Google to send the
+    /// streamer back.
+    Browser {
+        url: String,
+    },
 }
 
 impl Engine {
@@ -59,7 +83,8 @@ impl Engine {
     pub async fn connect_account(&self, platform: Platform) -> Result<ConnectFlow, EngineError> {
         match platform {
             Platform::Twitch => self.connect_twitch().await,
-            Platform::Youtube | Platform::Kick => {
+            Platform::Youtube => self.connect_youtube().await,
+            Platform::Kick => {
                 Err(EngineError::Unavailable(format!("Signing in to {platform} isn't available in this build yet.")))
             }
             _ => Err(EngineError::Invalid("That isn't a platform you can sign in to.".into())),
@@ -185,6 +210,26 @@ impl Engine {
             return;
         };
         for a in accounts {
+            if a.platform == "youtube" {
+                let saved = self.inner.secrets.get(YOUTUBE_TOKENS).ok().flatten();
+                match saved.and_then(|j| serde_json::from_str::<ferrocast_youtube::Tokens>(&j).ok()) {
+                    Some(t) => match self.youtube_api(t) {
+                        Ok(api) => self.start_youtube(api, a.clone()),
+                        Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
+                    },
+                    None => {
+                        let _ = self
+                            .submit(Event::live(
+                                Platform::Youtube,
+                                None,
+                                Millis(0),
+                                EventKind::Connector(ConnectorStatus::SignInNeeded),
+                            ))
+                            .await;
+                    }
+                }
+                continue;
+            }
             if a.platform == "twitch" {
                 let saved = self.inner.secrets.get(TWITCH_TOKENS).ok().flatten();
                 match saved.and_then(|j| serde_json::from_str::<Tokens>(&j).ok()) {
@@ -213,12 +258,115 @@ impl Engine {
             h.abort();
         }
         self.unregister_connector(platform);
-        if platform == Platform::Twitch {
-            self.inner.secrets.delete(TWITCH_TOKENS).map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        let key = match platform {
+            Platform::Twitch => Some(TWITCH_TOKENS),
+            Platform::Youtube => {
+                *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                Some(YOUTUBE_TOKENS)
+            }
+            _ => None,
+        };
+        if let Some(k) = key {
+            self.inner.secrets.delete(k).map_err(|e| EngineError::Unavailable(e.to_string()))?;
         }
         let key = crate::platform_key(platform).to_string();
         self.db(move |s| repo::settings::remove_account(s, &key)).await?;
         Ok(())
+    }
+
+    async fn connect_youtube(&self) -> Result<ConnectFlow, EngineError> {
+        let app = self.apps().youtube.clone().ok_or_else(|| {
+            EngineError::Unavailable(
+                "This build of Ferrocast has no YouTube app set up, so it can't sign in to YouTube.".into(),
+            )
+        })?;
+        let ep = self.apps().youtube_endpoints.clone();
+        let pending =
+            ferrocast_youtube::oauth::begin(&ep, &app).await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        let url = pending.url.clone();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let http = ferrocast_youtube::http_client();
+            match ferrocast_youtube::oauth::finish(&http, &ep, &app, pending, YOUTUBE_SIGN_IN).await {
+                Ok(tokens) => {
+                    if let Err(e) = engine.finish_youtube(tokens).await {
+                        engine.notice(NoticeLevel::Error, &format!("YouTube sign-in didn't finish: {e}"));
+                    }
+                }
+                Err(e) => engine.notice(NoticeLevel::Warn, &e.to_string()),
+            }
+        });
+        Ok(ConnectFlow::Browser { url })
+    }
+
+    async fn finish_youtube(&self, tokens: ferrocast_youtube::Tokens) -> Result<(), EngineError> {
+        self.save_secret_json(YOUTUBE_TOKENS, &tokens)?;
+        let api = self.youtube_api(tokens)?;
+        let me = api.me().await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        let account = repo::settings::Account {
+            platform: "youtube".into(),
+            user_id: me.id.clone(),
+            login: me.title.clone(),
+            display_name: me.title.clone(),
+            avatar_url: me.avatar_url.clone(),
+            scopes: ferrocast_youtube::oauth::SCOPES.iter().map(|s| s.to_string()).collect(),
+            connected_at: now().0,
+        };
+        let saved = account.clone();
+        self.db(move |s| repo::settings::save_account(s, &saved)).await?;
+        self.start_youtube(api, account);
+        self.notice(NoticeLevel::Info, "YouTube is connected. Chat shows up whenever you're live there.");
+        Ok(())
+    }
+
+    fn save_secret_json<T: Serialize>(&self, key: &str, value: &T) -> Result<(), EngineError> {
+        let json = serde_json::to_string(value).map_err(|e| EngineError::Internal(e.to_string()))?;
+        self.inner.secrets.set(key, &json).map_err(|e| EngineError::Unavailable(e.to_string()))
+    }
+
+    fn youtube_api(&self, tokens: ferrocast_youtube::Tokens) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
+        let app = self.apps().youtube.clone().ok_or_else(|| EngineError::Unavailable("no YouTube app".into()))?;
+        let secrets = self.inner.secrets.clone();
+        let persist = Arc::new(move |t: &ferrocast_youtube::Tokens| {
+            let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
+            secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())
+        });
+        Ok(Arc::new(ferrocast_youtube::Api::new(
+            ferrocast_youtube::http_client(),
+            self.apps().youtube_endpoints.clone(),
+            app,
+            tokens,
+            persist,
+        )))
+    }
+
+    fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
+        let live: ferrocast_youtube::stream::LiveChat = Arc::default();
+        self.register_connector(Arc::new(ferrocast_youtube::YoutubeConnector { api: api.clone(), live: live.clone() }));
+        {
+            let mut st = self.state_mut();
+            let v = st.connectors.entry("youtube".into()).or_insert_with(crate::state::ConnectorView::off);
+            v.account = Some(crate::state::AccountView {
+                name: account.display_name.clone(),
+                avatar_url: account.avatar_url.clone(),
+            });
+        }
+        let wake = Arc::new(tokio::sync::Notify::new());
+        *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake.clone());
+        let handle = tokio::spawn(ferrocast_youtube::stream::run(api, self.sink(), wake, live));
+        if let Some(old) =
+            self.inner.adapters.lock().unwrap_or_else(|p| p.into_inner()).insert(Platform::Youtube, handle)
+        {
+            old.abort();
+        }
+    }
+
+    /// Another platform went live: ask YouTube to look for a live chat now, instead of
+    /// waiting for its ten-minute check (saves quota and catches multistreams at once).
+    pub(crate) fn wake_youtube(&self) {
+        if let Some(w) = self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            w.notify_one();
+        }
     }
 
     pub(crate) fn notice(&self, level: NoticeLevel, message: &str) {

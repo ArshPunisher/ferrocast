@@ -445,9 +445,12 @@ async fn connecting_twitch_signs_in_runs_eventsub_and_answers_commands() {
     let apps = PlatformApps {
         twitch_client_id: Some("client".into()),
         twitch_endpoints: ferrocast_twitch::Endpoints { id, api, eventsub },
+        ..PlatformApps::default()
     };
     let e = Engine::start_with(dir.path(), secrets.clone(), apps.clone()).await.unwrap();
-    let ConnectFlow::DeviceCode { user_code, .. } = e.connect_account(Platform::Twitch).await.unwrap();
+    let ConnectFlow::DeviceCode { user_code, .. } = e.connect_account(Platform::Twitch).await.unwrap() else {
+        panic!("Twitch uses a device code")
+    };
     assert_eq!(user_code, "ABCD-EFGH");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while st.lock().unwrap().sessions == 0 && tokio::time::Instant::now() < deadline {
@@ -504,4 +507,34 @@ async fn connecting_without_a_twitch_app_says_so() {
     assert!(
         matches!(e.connect_account(Platform::Twitch).await, Err(EngineError::Unavailable(m)) if m.contains("no Twitch app"))
     );
+}
+
+#[tokio::test]
+async fn backfilled_and_shared_chat_never_trigger_the_bot() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    e.save_command(Command {
+        id: "hi".into(),
+        name: "!hi".into(),
+        aliases: vec![],
+        response: "hey".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    let mut old = chat(Platform::Twitch, "h1", "a", "!hi");
+    old.origin = Origin::Backfill;
+    e.ingest(old).await;
+    let mut shared = chat(Platform::Twitch, "s1", "b", "!hi");
+    shared.channel = Some(ChannelRef { platform: Platform::Twitch, id: "777".into(), name: "Partner".into() });
+    e.ingest(shared).await;
+    e.ingest(chat(Platform::Twitch, "l1", "c", "!hi")).await;
+    eventually(|| !tw.log().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(tw.log(), vec!["say hey reply=l1".to_string()]);
 }

@@ -141,6 +141,9 @@ impl Engine {
                 ));
             }
             EventKind::StreamOnline { .. } => {
+                if e.platform != Platform::Youtube {
+                    self.wake_youtube();
+                }
                 let mut st = self.state_mut();
                 let anyone_live = st.live.values().any(|l| *l);
                 st.live.insert(e.platform, true);
@@ -243,7 +246,9 @@ impl Engine {
             }
         }
 
-        if bot_on && content.text.trim_start().starts_with('!') {
+        // Only live chat from this channel gets answers: replayed history and Shared Chat
+        // messages from a partner channel never make the bot speak (R-11).
+        if bot_on && e.origin == Origin::Live && e.channel.is_none() && content.text.trim_start().starts_with('!') {
             self.answer_command(e).await;
         }
         true
