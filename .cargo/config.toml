@@ -1,0 +1,4 @@
+# Incremental caches grew to 4 GB on a nearly full disk; full rebuilds of a changed crate
+# are fast enough here.
+[build]
+incremental = false
