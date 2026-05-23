@@ -9,6 +9,10 @@ ignore = [
   # Build-time macro crate pulled in by gtk-rs 0.18 (Tauri's Linux webview stack). Not a
   # vulnerability; no maintained replacement upstream yet. Revisit when Tauri moves to gtk4.
   { id = "RUSTSEC-2024-0370", reason = "unmaintained, transitive via gtk 0.18 in Tauri on Linux" },
+  # The Marvin attack recovers keys from RSA *decryption* timing. Ferrocast only verifies
+  # Kick's webhook signatures with Kick's public key (relay) and signs in tests; no private
+  # key ever decrypts anything in a shipped binary. Revisit when rsa 0.10 is stable.
+  { id = "RUSTSEC-2023-0071", reason = "signature verification only; no RSA decryption in shipped code" },
 ]
 
 [licenses]

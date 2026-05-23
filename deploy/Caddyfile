@@ -1,0 +1,5 @@
+# Caddy terminates TLS (automatic certificates) and forwards to the relay on loopback.
+ferrocast-relay.clearcraftlabs.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8787
+}
