@@ -13,6 +13,7 @@ mod dispatcher;
 mod error;
 mod obs;
 mod pipeline;
+mod relay;
 mod snapshot;
 mod timers;
 
@@ -81,6 +82,7 @@ struct Inner {
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
+    relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -147,6 +149,7 @@ impl Engine {
                 apps,
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
+                relay_link: Mutex::new(None),
             }),
         };
         tokio::spawn(prune(engine.clone()));

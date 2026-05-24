@@ -538,3 +538,153 @@ async fn backfilled_and_shared_chat_never_trigger_the_bot() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(tw.log(), vec!["say hey reply=l1".to_string()]);
 }
+
+#[tokio::test]
+async fn kick_connects_through_the_relay_and_its_chat_gets_answers() {
+    use base64::Engine as _;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+    use rsa::signature::{SignatureEncoding, Signer};
+
+    let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 1024).unwrap();
+    let pem = key.to_public_key().to_public_key_pem(LineEnding::LF).unwrap();
+    let recorded: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
+    let rec = recorded.clone();
+    let kick_app = axum::Router::new()
+        .route(
+            "/public/v1/public-key",
+            axum::routing::get(move || {
+                let pem = pem.clone();
+                async move { axum::Json(serde_json::json!({ "data": { "public_key": pem } })) }
+            }),
+        )
+        .route(
+            "/oauth/token",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "access_token": "ka", "refresh_token": "kr", "expires_in": 7200 }))
+            }),
+        )
+        .route(
+            "/public/v1/users",
+            axum::routing::get(|| async {
+                axum::Json(
+                    serde_json::json!({ "data": [{ "user_id": 4242, "name": "kicker", "profile_picture": "" }] }),
+                )
+            }),
+        )
+        .fallback(move |uri: axum::http::Uri, body: String| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().unwrap().push((uri.path().to_string(), serde_json::from_str(&body).unwrap_or(Value::Null)));
+                axum::Json(serde_json::json!({ "data": {}, "message": "OK" }))
+            }
+        });
+    let kl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let kick = format!("http://{}", kl.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(kl, kick_app).await });
+
+    let rdir = tempfile::tempdir().unwrap();
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let cfg = ferrocast_relay::Config {
+        public_url: relay.clone(),
+        kick_client_id: Some("cid".into()),
+        kick_client_secret: Some("cs".into()),
+        kick_id_url: kick.clone(),
+        kick_api_url: kick.clone(),
+    };
+    let rapp = ferrocast_relay::router(ferrocast_relay::AppState::new(
+        cfg,
+        ferrocast_relay::Db::open(&rdir.path().join("r.db")).unwrap(),
+    ))
+    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(rl, rapp).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay.clone()), kick_api: kick.clone(), ..PlatformApps::default() };
+    let e = Engine::start_with(dir.path(), mem(), apps).await.unwrap();
+    e.save_command(Command {
+        id: "hi".into(),
+        name: "!hi".into(),
+        aliases: vec![],
+        response: "hey {user}".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+
+    let ConnectFlow::Browser { url } = e.connect_account(Platform::Kick).await.unwrap() else {
+        panic!("Kick uses the browser")
+    };
+    let state = url::Url::parse(&url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
+    // Kick redirects the streamer back to the relay.
+    assert_eq!(reqwest::get(format!("{relay}/v1/kick/callback?code=c&state={state}")).await.unwrap().status(), 200);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !recorded.lock().unwrap().iter().any(|(p, _)| p == "/public/v1/events/subscriptions")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let sub = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, _)| p == "/public/v1/events/subscriptions")
+        .cloned()
+        .expect("subscribed");
+    assert_eq!(sub.1["broadcaster_user_id"], 4242);
+
+    let body = serde_json::json!({
+        "message_id": "kmsg-1", "broadcaster": { "user_id": 4242 },
+        "sender": { "user_id": 77, "username": "viewer", "channel_slug": "viewer" }, "content": "!hi",
+    })
+    .to_string();
+    let ts = {
+        // the relay checks the timestamp; send "now" in RFC 3339
+        let secs = crate::now().0 / 1000;
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    };
+    let sig = SigningKey::<rsa::sha2::Sha256>::new(key).sign(format!("evt-1.{ts}.{body}").as_bytes());
+    let status = reqwest::Client::new()
+        .post(format!("{relay}/v1/kick/webhook"))
+        .header("Kick-Event-Message-Id", "evt-1")
+        .header("Kick-Event-Message-Timestamp", &ts)
+        .header("Kick-Event-Signature", base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()))
+        .header("Kick-Event-Type", "chat.message.sent")
+        .header("Kick-Event-Version", "1")
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    while !recorded.lock().unwrap().iter().any(|(p, _)| p == "/public/v1/chat")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reply = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(p, _)| p == "/public/v1/chat")
+        .cloned()
+        .expect("the bot answered on Kick");
+    assert_eq!(reply.1["content"], "hey viewer");
+    assert_eq!(reply.1["reply_to_message_id"], "kmsg-1");
+}

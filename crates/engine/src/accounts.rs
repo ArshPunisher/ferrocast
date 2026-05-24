@@ -29,6 +29,10 @@ pub struct PlatformApps {
     pub twitch_endpoints: Endpoints,
     pub youtube: Option<ferrocast_youtube::AppCredentials>,
     pub youtube_endpoints: ferrocast_youtube::Endpoints,
+    /// The Ferrocast relay (Kick webhooks and sign-in, later tips).
+    pub relay_url: Option<String>,
+    /// Kick's public API (tests point it at a fake).
+    pub kick_api: String,
 }
 
 impl PlatformApps {
@@ -53,6 +57,9 @@ impl PlatformApps {
                 _ => None,
             },
             youtube_endpoints: ferrocast_youtube::Endpoints::default(),
+            relay_url: pick("FERROCAST_RELAY_URL", option_env!("FERROCAST_RELAY_URL"))
+                .map(|u| u.trim_end_matches('/').to_string()),
+            kick_api: "https://api.kick.com".into(),
         }
     }
 }
@@ -84,9 +91,7 @@ impl Engine {
         match platform {
             Platform::Twitch => self.connect_twitch().await,
             Platform::Youtube => self.connect_youtube().await,
-            Platform::Kick => {
-                Err(EngineError::Unavailable(format!("Signing in to {platform} isn't available in this build yet.")))
-            }
+            Platform::Kick => self.connect_kick().await,
             _ => Err(EngineError::Invalid("That isn't a platform you can sign in to.".into())),
         }
     }
@@ -210,6 +215,10 @@ impl Engine {
             return;
         };
         for a in accounts {
+            if a.platform == "kick" {
+                self.resume_kick(a.clone()).await;
+                continue;
+            }
             if a.platform == "youtube" {
                 let saved = self.inner.secrets.get(YOUTUBE_TOKENS).ok().flatten();
                 match saved.and_then(|j| serde_json::from_str::<ferrocast_youtube::Tokens>(&j).ok()) {
@@ -263,6 +272,10 @@ impl Engine {
             Platform::Youtube => {
                 *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 Some(YOUTUBE_TOKENS)
+            }
+            Platform::Kick => {
+                self.forget_kick()?;
+                None
             }
             _ => None,
         };
