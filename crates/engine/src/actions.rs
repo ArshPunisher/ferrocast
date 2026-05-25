@@ -308,11 +308,12 @@ impl Engine {
             .await?
             .ok_or(EngineError::NotFound("TTS message"))?;
         if approve {
+            let audio = self.speak_to_media(&item.text).await;
             self.send_overlay(crate::frames::OverlayFrame::new(
                 crate::frames::Audience::Alerts,
                 self.next_seq(),
                 "tts",
-                &json!({ "id": item.id, "text": item.text }),
+                &json!({ "id": item.id, "text": item.text, "audio": audio }),
             ));
         }
         self.push_tts_pending().await;

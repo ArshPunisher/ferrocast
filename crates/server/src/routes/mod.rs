@@ -64,6 +64,7 @@ pub(crate) fn api() -> Router<AppState> {
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))
+        .route("/tts/voices", get(bot::tts_voices))
         .route("/tts/{id}/approve", post(bot::tts_approve))
         .route("/tts/{id}/reject", post(bot::tts_reject))
         // media list/delete (upload is in `uploads` with its own size limit)

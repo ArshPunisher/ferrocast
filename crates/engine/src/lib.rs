@@ -15,6 +15,7 @@ mod obs;
 mod pipeline;
 mod relay;
 mod snapshot;
+pub mod speech;
 mod timers;
 
 pub mod frames;

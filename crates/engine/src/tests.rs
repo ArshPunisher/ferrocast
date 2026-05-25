@@ -688,3 +688,42 @@ async fn kick_connects_through_the_relay_and_its_chat_gets_answers() {
     assert_eq!(reply.1["content"], "hey viewer");
     assert_eq!(reply.1["reply_to_message_id"], "kmsg-1");
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_tip_with_tts_gets_real_speech_attached_before_it_plays() {
+    let (e, _d) = engine().await;
+    let mut tts = e.tts_policy();
+    tts.enabled = true;
+    e.save_tts(tts).await.unwrap();
+    e.queue_pause().await;
+    e.ingest(Event::live(
+        Platform::Tips,
+        Some("pay_tts".into()),
+        Millis(0),
+        EventKind::Tip {
+            actor: Actor::named(Platform::Tips, "Asha"),
+            money: Money::new(50_000, "INR"),
+            message: Some("great stream".into()),
+            provider: TipProvider::Razorpay,
+            payment_ref: "pay_tts".into(),
+            status: PaymentStatus::Captured,
+        },
+    ))
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let q = e.queue().await;
+        if let Some(id) = q.waiting.first().and_then(|w| w.alert.tts_audio.clone()) {
+            let store = e.store();
+            let found = tokio::task::spawn_blocking(move || ferrocast_store::repo::media::get(&store, &id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.unwrap().0.mime, "audio/wav");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no speech attached");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

@@ -96,3 +96,7 @@ pub async fn tts_reject(State(app): State<AppState>, Path(id): Path<String>) -> 
     app.engine.decide_tts(&id, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub async fn tts_voices() -> Json<Value> {
+    Json(json!(ferrocast_engine::speech::voices().await))
+}

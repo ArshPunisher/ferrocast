@@ -195,6 +195,18 @@ impl AlertQueue {
         n
     }
 
+    /// Attaches synthesised speech to a waiting alert. `false` if it already started or is
+    /// gone (the overlay then speaks `tts_text` with the browser's voice).
+    pub fn set_tts_audio(&mut self, alert_id: &str, media_id: &str) -> bool {
+        match self.waiting.iter_mut().find(|w| w.alert.alert_id == alert_id) {
+            Some(w) if w.alert.tts_text.is_some() => {
+                w.alert.tts_audio = Some(media_id.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }

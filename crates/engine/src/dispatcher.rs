@@ -120,8 +120,38 @@ impl Engine {
     }
 
     pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32) {
+        let speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
         self.queue_op(move |q, t| q.enqueue(alert, priority, t)).await;
         self.inner.queue_changed.notify_one();
+        if let Some((alert_id, text)) = speak {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                if let Some(media) = engine.speak_to_media(&text).await {
+                    engine
+                        .queue_op(move |q, _| {
+                            q.set_tts_audio(&alert_id, &media);
+                            vec![]
+                        })
+                        .await;
+                }
+            });
+        }
+    }
+
+    /// Synthesises `text` into the media library; `None` if this computer can't (the
+    /// overlay then uses the browser's voice).
+    pub(crate) async fn speak_to_media(&self, text: &str) -> Option<String> {
+        let voice = self.state().tts.voice.clone();
+        let work = self.store().dir().join("tmp");
+        let out = work.join(format!("tts-{}.wav", ferrocast_store::new_id()));
+        if let Err(e) = crate::speech::synthesize(text, voice.as_deref(), &work, &out).await {
+            tracing::warn!(error = %e, "text-to-speech failed; the overlay will use the browser voice");
+            return None;
+        }
+        let bytes = tokio::fs::read(&out).await.ok()?;
+        let _ = tokio::fs::remove_file(&out).await;
+        let saved = self.db(move |s| Ok(repo::media::save(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
+        Some(saved.id)
     }
 
     /// An overlay reports progress on an alert. Only the alert that is playing counts.

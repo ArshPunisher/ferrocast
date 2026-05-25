@@ -62,6 +62,8 @@ type Event = { id: string; seq: number; platform: Platform; channel: { platform:
 type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; variation_id: string; kind: string; platform: Platform;
                        title: string; body: string; image: string | null; sound: string | null; volume: number;
                        duration_ms: number; layout: string; css: string; tts_text: string | null; tts_audio: string | null; test: boolean };
+// tts_audio is a media id of a WAV made with the computer's own voices; it may be null even when tts_text is set
+// (synthesis still running or unavailable): then speak tts_text with speechSynthesis.
 ```
 
 ## 4. Routes
@@ -196,7 +198,7 @@ Server → overlay frames `{ v: 1, seq, type, data }`:
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |
 | `clear_chat` | `{ platform: Platform \| null }` |
-| `tts` | `{ id, text }`: a mod approved a held TTS message; speak it |
+| `tts` | `{ id, text, audio: string \| null }`: a mod approved a held TTS message. Play `/o/<token>/media/<audio>` when present, else speak `text` with the browser's voice |
 | `revoked` | `{}`: this URL was regenerated or the overlay deleted; the server closes the socket next |
 
 Overlay → server frames: `hello { since_seq }`, `ack { alert_id, phase: "started" | "finished" | "failed" }`, `visibility { visible }`. Anything else is ignored and logged. **An overlay can never create events** (R-36).
