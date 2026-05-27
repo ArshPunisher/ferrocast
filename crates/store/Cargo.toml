@@ -18,6 +18,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 getrandom = "0.4"
 ulid = "3"
 sha2 = "0.11"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
