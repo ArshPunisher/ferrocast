@@ -56,6 +56,47 @@ impl Money {
         Ok(Money { minor, currency })
     }
 
+    /// Money from a provider's integer amount in its own minor units (`digits` places), moved
+    /// to this currency's ISO exponent, rounding half up. Providers disagree with ISO for a
+    /// few currencies (Stripe sends ISK in hundredths), so the amount an alert shows never
+    /// depends on that.
+    pub fn from_scaled(amount: i64, digits: u32, currency: &str) -> Result<Self, MoneyError> {
+        let currency = currency.trim().to_ascii_uppercase();
+        if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err(MoneyError::BadCurrency(currency));
+        }
+        let bad = || MoneyError::BadAmount(amount.to_string());
+        if amount < 0 || digits > 6 {
+            return Err(bad());
+        }
+        let want = exponent(&currency);
+        let minor = if digits <= want {
+            amount.checked_mul(10i64.pow(want - digits)).ok_or_else(bad)?
+        } else {
+            let div = 10i64.pow(digits - want);
+            amount / div + i64::from(amount % div * 2 >= div)
+        };
+        Ok(Money { minor, currency })
+    }
+
+    /// Like [`Money::parse_decimal`], but accepts more fraction digits than the currency
+    /// has (rounding half up), for providers that always send two places ("500.00" JPY).
+    pub fn parse_decimal_lenient(amount: &str, currency: &str) -> Result<Self, MoneyError> {
+        let s = amount.trim();
+        let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+        let valid = !whole.is_empty()
+            && whole.len() <= 15
+            && frac.len() <= 6
+            && whole.bytes().all(|b| b.is_ascii_digit())
+            && frac.bytes().all(|b| b.is_ascii_digit())
+            && !(s.contains('.') && frac.is_empty());
+        if !valid {
+            return Err(MoneyError::BadAmount(amount.to_string()));
+        }
+        let joined: i64 = format!("{whole}{frac}").parse().map_err(|_| MoneyError::BadAmount(amount.to_string()))?;
+        Money::from_scaled(joined, u32::try_from(frac.len()).unwrap_or(6), currency)
+    }
+
     /// The amount in major units as a float, for display and conditions only (never sums).
     pub fn major(&self) -> f64 {
         self.minor as f64 / 10f64.powi(exponent(&self.currency) as i32)
@@ -193,6 +234,26 @@ impl PlatformValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_units_become_iso_units() {
+        assert_eq!(Money::from_scaled(50_000, 2, "inr").unwrap(), Money::new(50_000, "INR"));
+        // Stripe sends ISK and UGX in hundredths; ISO has no minor unit for them.
+        assert_eq!(Money::from_scaled(150_000, 2, "ISK").unwrap(), Money::new(1_500, "ISK"));
+        assert_eq!(Money::from_scaled(150_050, 2, "ISK").unwrap(), Money::new(1_501, "ISK"), "half rounds up");
+        assert_eq!(Money::from_scaled(500, 0, "JPY").unwrap(), Money::new(500, "JPY"));
+        assert_eq!(Money::from_scaled(1_234, 3, "KWD").unwrap(), Money::new(1_234, "KWD"));
+        assert_eq!(Money::from_scaled(12, 0, "USD").unwrap(), Money::new(1_200, "USD"));
+        assert!(Money::from_scaled(-1, 2, "USD").is_err());
+        assert!(Money::from_scaled(i64::MAX, 0, "USD").is_err(), "overflow is refused, not wrapped");
+        assert!(Money::from_scaled(1, 2, "dollars").is_err());
+        assert_eq!(Money::parse_decimal_lenient("500.00", "JPY").unwrap(), Money::new(500, "JPY"));
+        assert_eq!(Money::parse_decimal_lenient("5.005", "USD").unwrap(), Money::new(501, "USD"));
+        assert_eq!(Money::parse_decimal_lenient("3", "USD").unwrap(), Money::new(300, "USD"));
+        for bad in ["", "1e3", "-5", "5.", ".5", "1.2.3", "5 USD", "1.0000001", &"9".repeat(16)] {
+            assert!(Money::parse_decimal_lenient(bad, "USD").is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_provider_amounts_exactly() {
