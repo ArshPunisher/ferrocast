@@ -15,13 +15,37 @@ CREATE TABLE IF NOT EXISTS kick_owners (broadcaster_id TEXT PRIMARY KEY, install
 CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY AUTOINCREMENT, install_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS queue_install ON queue(install_id, id);
 CREATE TABLE IF NOT EXISTS seen (message_id TEXT PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS tip_pages (install_id TEXT PRIMARY KEY, handle TEXT NOT NULL UNIQUE, config TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS released_handles (handle TEXT PRIMARY KEY, install_id TEXT NOT NULL, released_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS handle_changes (install_id TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_oauth (state TEXT PRIMARY KEY, install_id TEXT NOT NULL, verifier TEXT NOT NULL, created_at INTEGER NOT NULL);
 ";
 
+/// How a tip page save went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Saved {
+    Yes,
+    Taken,
+    TooManyChanges,
+}
+
+/// Holds a released handle for its install. An install holds only its latest released
+/// name, so renaming can't be used to squat dozens of names.
+fn release(tx: &rusqlite::Transaction<'_>, install: &str, handle: &str, now: i64) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM released_handles WHERE install_id = ?1", [install])?;
+    tx.execute(
+        "INSERT INTO released_handles(handle, install_id, released_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(handle) DO UPDATE SET install_id = excluded.install_id, released_at = excluded.released_at",
+        params![handle, install, now],
+    )?;
+    Ok(())
+}
+
 /// Items waiting for one install, at most. A desktop away for days gets the newest ones.
 pub const MAX_QUEUE: i64 = 5_000;
-/// How long undelivered items are kept.
+/// How long undelivered items are kept. Tips are money, so they wait longer.
 pub const QUEUE_TTL_MS: i64 = 3 * 86_400_000;
+pub const TIP_TTL_MS: i64 = 30 * 86_400_000;
 
 #[derive(Debug)]
 pub struct Db {
@@ -81,7 +105,8 @@ impl Db {
             .optional()
     }
 
-    /// Queues an item, trimming the oldest beyond the cap. Returns its id.
+    /// Queues an item, trimming the oldest beyond the cap. Non-tip items go first: a chat
+    /// flood while the desktop is away must never push out a tip. Returns its id.
     pub fn enqueue(&self, install: &str, kind: &str, payload: &str) -> rusqlite::Result<i64> {
         let c = self.c();
         c.execute(
@@ -89,10 +114,21 @@ impl Db {
             params![install, kind, payload, now_ms()],
         )?;
         let id = c.last_insert_rowid();
-        c.execute(
-            "DELETE FROM queue WHERE install_id = ?1 AND id <= (SELECT id FROM queue WHERE install_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
-            params![install, MAX_QUEUE],
-        )?;
+        let count: i64 = c.query_row("SELECT COUNT(*) FROM queue WHERE install_id = ?1", [install], |r| r.get(0))?;
+        let over = count - MAX_QUEUE;
+        if over > 0 {
+            let gone = c.execute(
+                "DELETE FROM queue WHERE id IN (SELECT id FROM queue WHERE install_id = ?1 AND kind != 'tip' ORDER BY id LIMIT ?2)",
+                params![install, over],
+            )?;
+            let left = over - i64::try_from(gone).unwrap_or(over);
+            if left > 0 {
+                c.execute(
+                    "DELETE FROM queue WHERE id IN (SELECT id FROM queue WHERE install_id = ?1 ORDER BY id LIMIT ?2)",
+                    params![install, left],
+                )?;
+            }
+        }
         Ok(id)
     }
 
@@ -148,12 +184,97 @@ impl Db {
         Ok(row.filter(|(_, _, at)| now_ms() - at < 600_000).map(|(i, v, _)| (i, v)))
     }
 
+    /// Saves a tip page. Refuses a handle another install owns, or released less than
+    /// `hold_ms` ago, and more than `max_changes` new handles a day. All in one transaction,
+    /// so parallel saves can't get past the limit.
+    pub fn set_tip_config(
+        &self,
+        install: &str,
+        handle: &str,
+        json: &str,
+        hold_ms: i64,
+        max_changes: i64,
+    ) -> rusqlite::Result<Saved> {
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let owner: Option<String> =
+            tx.query_row("SELECT install_id FROM tip_pages WHERE handle = ?1", [handle], |r| r.get(0)).optional()?;
+        if owner.as_deref().is_some_and(|o| o != install) {
+            return Ok(Saved::Taken);
+        }
+        let held: Option<(String, i64)> = tx
+            .query_row("SELECT install_id, released_at FROM released_handles WHERE handle = ?1", [handle], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if held.is_some_and(|(o, at)| o != install && now - at < hold_ms) {
+            return Ok(Saved::Taken);
+        }
+        let previous: Option<String> =
+            tx.query_row("SELECT handle FROM tip_pages WHERE install_id = ?1", [install], |r| r.get(0)).optional()?;
+        if previous.as_deref() != Some(handle) {
+            let changes: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM handle_changes WHERE install_id = ?1 AND at > ?2",
+                params![install, now - 86_400_000],
+                |r| r.get(0),
+            )?;
+            if changes >= max_changes {
+                return Ok(Saved::TooManyChanges);
+            }
+            if let Some(p) = &previous {
+                release(&tx, install, p, now)?;
+            }
+            tx.execute("INSERT INTO handle_changes(install_id, at) VALUES (?1, ?2)", params![install, now])?;
+            tx.execute("DELETE FROM released_handles WHERE handle = ?1", [handle])?;
+        }
+        tx.execute(
+            "INSERT INTO tip_pages(install_id, handle, config) VALUES (?1, ?2, ?3)
+             ON CONFLICT(install_id) DO UPDATE SET handle = excluded.handle, config = excluded.config",
+            params![install, handle, json],
+        )?;
+        tx.commit()?;
+        Ok(Saved::Yes)
+    }
+
+    /// Takes a tip page down; its handle stays held for this install.
+    pub fn delete_tip_config(&self, install: &str) -> rusqlite::Result<bool> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let handle: Option<String> =
+            tx.query_row("SELECT handle FROM tip_pages WHERE install_id = ?1", [install], |r| r.get(0)).optional()?;
+        let Some(handle) = handle else { return Ok(false) };
+        release(&tx, install, &handle, now_ms())?;
+        tx.execute("DELETE FROM tip_pages WHERE install_id = ?1", [install])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Forgets a webhook id (its delivery failed, so the provider's retry must get through).
+    pub fn unsee(&self, message_id: &str) -> rusqlite::Result<()> {
+        self.c().execute("DELETE FROM seen WHERE message_id = ?1", [message_id])?;
+        Ok(())
+    }
+
+    pub fn tip_config(&self, install: &str) -> rusqlite::Result<Option<String>> {
+        self.c().query_row("SELECT config FROM tip_pages WHERE install_id = ?1", [install], |r| r.get(0)).optional()
+    }
+
+    pub fn tip_config_by_handle(&self, handle: &str) -> rusqlite::Result<Option<String>> {
+        self.c().query_row("SELECT config FROM tip_pages WHERE handle = ?1", [handle], |r| r.get(0)).optional()
+    }
+
     /// Housekeeping: old queue items, seen ids and abandoned sign-ins.
     pub fn prune(&self) -> rusqlite::Result<()> {
         let now = now_ms();
         let c = self.c();
-        c.execute("DELETE FROM queue WHERE created_at < ?1", [now - QUEUE_TTL_MS])?;
-        c.execute("DELETE FROM seen WHERE at < ?1", [now - 86_400_000])?;
+        c.execute("DELETE FROM queue WHERE kind != 'tip' AND created_at < ?1", [now - QUEUE_TTL_MS])?;
+        c.execute("DELETE FROM queue WHERE created_at < ?1", [now - TIP_TTL_MS])?;
+        // Tip ids are kept as long as tips are (Razorpay notices over 7 days old are refused).
+        c.execute("DELETE FROM seen WHERE message_id NOT LIKE 'tip:%' AND at < ?1", [now - 86_400_000])?;
+        c.execute("DELETE FROM seen WHERE at < ?1", [now - TIP_TTL_MS])?;
+        c.execute("DELETE FROM handle_changes WHERE at < ?1", [now - 86_400_000])?;
+        c.execute("DELETE FROM released_handles WHERE released_at < ?1", [now - crate::tips::HANDLE_HOLD_MS])?;
         c.execute("DELETE FROM pending_oauth WHERE created_at < ?1", [now - 600_000])?;
         Ok(())
     }

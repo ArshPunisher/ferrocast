@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod kick;
+pub mod tips;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -90,7 +91,7 @@ impl AppState {
         self.wakers.lock().unwrap_or_else(|p| p.into_inner()).entry(install.to_string()).or_default().clone()
     }
 
-    fn enqueue(&self, install: &str, kind: &str, payload: &Value) -> Result<(), ApiError> {
+    pub(crate) fn enqueue(&self, install: &str, kind: &str, payload: &Value) -> Result<(), ApiError> {
         self.db.enqueue(install, kind, &payload.to_string()).map_err(ApiError::db)?;
         self.waker(install).notify_one();
         Ok(())
@@ -103,13 +104,18 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    hint: Option<String>,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        ApiError { status, code, message: message.into() }
+    pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        ApiError { status, code, message: message.into(), hint: None }
     }
-    fn db(e: rusqlite::Error) -> Self {
+    pub(crate) fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    pub(crate) fn db(e: rusqlite::Error) -> Self {
         tracing::error!(error = %e, "relay database error");
         ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage", "The relay couldn't save that. Try again shortly.")
     }
@@ -120,13 +126,13 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            axum::Json(json!({ "error": { "code": self.code, "message": self.message, "hint": Value::Null } })),
-        )
+        (self.status, axum::Json(json!({ "error": { "code": self.code, "message": self.message, "hint": self.hint } })))
             .into_response()
     }
 }
+
+/// The largest request body the relay reads.
+pub const BODY_LIMIT: usize = 256 * 1024;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -137,7 +143,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/kick/callback", get(kick_callback))
         .route("/v1/kick/refresh", post(kick_refresh))
         .route("/v1/kick/webhook", post(kick_webhook))
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
+        .route("/v1/tips/config", axum::routing::put(tips::save_config).delete(tips::delete_config))
+        .route("/v1/tips/razorpay/{install}", post(tips::razorpay))
+        .route("/v1/tips/kofi/{install}", post(tips::kofi))
+        .route("/v1/tips/stripe/{install}", post(tips::stripe))
+        .route("/t/{handle}", get(tips::page))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
 
@@ -169,7 +180,7 @@ fn hash(secret: &str) -> String {
 }
 
 /// Checks `Authorization: Bearer <install>.<secret>` and returns the install id.
-fn authed(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+pub(crate) fn authed(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
     let raw = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
