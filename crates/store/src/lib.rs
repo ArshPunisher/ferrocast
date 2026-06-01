@@ -11,7 +11,7 @@ pub mod backup;
 pub mod repo;
 
 pub use db::Store;
-pub use error::StoreError;
+pub use error::{PackError, StoreError};
 
 /// Current time in Unix milliseconds. The store stamps rows itself so callers can't forget.
 pub(crate) fn now_ms() -> i64 {

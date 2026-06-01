@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zip::write::SimpleFileOptions;
 
-use crate::error::{Result, StoreError};
+use crate::error::{PackError, Result, StoreError};
 use crate::{Store, now_ms};
 
 pub const FORMAT: &str = "ferropack";
@@ -36,9 +36,13 @@ const TABLES: &[&str] = &[
     "viewer_identities",
 ];
 
-/// Largest pack we'll read, and largest single entry: a zip bomb stops here.
-const MAX_ENTRY: u64 = 64 * 1024 * 1024;
+/// Largest single entry, all entries together once unpacked, and the number of entries:
+/// a zip bomb stops here.
+pub const MAX_ENTRY: u64 = 64 * 1024 * 1024;
+pub const MAX_UNPACKED: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 20_000;
+/// Largest `.ferropack` file the dashboard may upload.
+pub const MAX_PACK: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -56,8 +60,9 @@ pub struct ImportReport {
     pub backup: String,
 }
 
+/// Writing a pack failed: a disk problem on this computer.
 fn zerr(e: impl std::fmt::Display) -> StoreError {
-    StoreError::Conflict(format!("the pack couldn't be written or read: {e}"))
+    StoreError::Io(std::io::Error::other(format!("the pack couldn't be written: {e}")))
 }
 
 fn table_json(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Value>> {
@@ -92,7 +97,7 @@ fn csv_field(s: &str) -> String {
 /// The tip history as CSV, newest last.
 fn tips_csv(conn: &rusqlite::Connection) -> Result<String> {
     let mut out = String::from("date_utc_ms,provider,payment_id,name,amount,currency,status,message\n");
-    let mut st = conn.prepare("SELECT received_at, data FROM events WHERE kind IN ('tip', 'reversal') ORDER BY seq")?;
+    let mut st = conn.prepare("SELECT occurred_at, data FROM events WHERE kind IN ('tip', 'reversal') ORDER BY seq")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
         let (at, data) = row?;
@@ -191,19 +196,32 @@ pub fn export(store: &Store, out: &Path, app_version: &str) -> Result<Manifest> 
     Ok(manifest)
 }
 
+fn corrupt(e: impl std::fmt::Display) -> StoreError {
+    PackError::Corrupt(e.to_string()).into()
+}
+
+fn too_large(name: &str) -> StoreError {
+    PackError::TooLarge(format!(
+        "\"{name}\" in the pack is over the {} MB limit for one file.",
+        MAX_ENTRY / 1024 / 1024
+    ))
+    .into()
+}
+
 fn read_entry<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result<Option<Vec<u8>>> {
     let mut f = match zip.by_name(name) {
         Ok(f) => f,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err(zerr(e)),
+        Err(e) => return Err(corrupt(e)),
     };
     if f.size() > MAX_ENTRY {
-        return Err(StoreError::Conflict(format!("\"{name}\" in the pack is too large")));
+        return Err(too_large(name));
     }
     let mut buf = Vec::new();
-    f.by_ref().take(MAX_ENTRY + 1).read_to_end(&mut buf)?;
+    // A failed inflate or CRC check is a damaged pack, not a disk problem.
+    f.by_ref().take(MAX_ENTRY + 1).read_to_end(&mut buf).map_err(corrupt)?;
     if buf.len() as u64 > MAX_ENTRY {
-        return Err(StoreError::Conflict(format!("\"{name}\" in the pack is too large")));
+        return Err(too_large(name));
     }
     Ok(Some(buf))
 }
@@ -213,45 +231,78 @@ fn safe_media_name(name: &str) -> Option<&str> {
     (!id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(id)
 }
 
+/// Unpacks every `media/<id>` entry into `staging`; returns the ids.
+fn stage_media<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, staging: &Path) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(corrupt)?;
+        let name = f.name().map_err(corrupt)?.to_string();
+        if !name.starts_with("media/") {
+            continue;
+        }
+        let Some(id) = safe_media_name(&name) else {
+            return Err(PackError::Unsafe(name).into());
+        };
+        if f.size() > MAX_ENTRY {
+            return Err(too_large(&name));
+        }
+        let mut out = std::fs::File::create(staging.join(id))?;
+        let n = std::io::copy(&mut f.by_ref().take(MAX_ENTRY + 1), &mut out).map_err(corrupt)?;
+        if n > MAX_ENTRY {
+            return Err(too_large(&name));
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
 /// Imports a pack, replacing rows with the same keys and keeping everything else.
 pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
     let file = std::fs::File::open(pack)?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|_| StoreError::Conflict("That file isn't a .ferropack.".into()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|_| PackError::NotAPack)?;
     if zip.len() > MAX_ENTRIES {
-        return Err(StoreError::Conflict("The pack has too many files.".into()));
+        return Err(PackError::TooLarge(format!("The pack has more than {MAX_ENTRIES} files.")).into());
     }
-    let manifest: Manifest = serde_json::from_slice(
-        &read_entry(&mut zip, "manifest.json")?
-            .ok_or_else(|| StoreError::Conflict("That file isn't a .ferropack.".into()))?,
-    )
-    .map_err(|_| StoreError::Conflict("The pack's manifest is damaged.".into()))?;
-    if manifest.format != FORMAT || manifest.version > VERSION {
-        return Err(StoreError::Conflict(format!(
-            "This pack was made by a newer Ferrocast (pack version {}). Update Ferrocast, then import it.",
-            manifest.version
-        )));
+    let manifest: Manifest =
+        serde_json::from_slice(&read_entry(&mut zip, "manifest.json")?.ok_or(PackError::NotAPack)?)
+            .map_err(|_| PackError::Corrupt("its manifest can't be read".into()))?;
+    if manifest.format != FORMAT {
+        return Err(PackError::NotAPack.into());
+    }
+    if manifest.version > VERSION {
+        return Err(PackError::TooNew(manifest.version).into());
+    }
+    let mut unpacked: u64 = 0;
+    for i in 0..zip.len() {
+        let f = zip.by_index(i).map_err(corrupt)?;
+        unpacked = unpacked.saturating_add(f.size());
+    }
+    if unpacked > MAX_UNPACKED {
+        return Err(PackError::TooLarge(format!(
+            "The pack unpacks to more than {} GB, the most Ferrocast imports.",
+            MAX_UNPACKED / 1024 / 1024 / 1024
+        ))
+        .into());
     }
     let mut tables = Vec::new();
     for t in TABLES {
         if let Some(bytes) = read_entry(&mut zip, &format!("{t}.json"))? {
-            let rows: Vec<Map<String, Value>> = serde_json::from_slice(&bytes)
-                .map_err(|_| StoreError::Conflict(format!("{t}.json in the pack is damaged.")))?;
+            let rows: Vec<Map<String, Value>> =
+                serde_json::from_slice(&bytes).map_err(|_| PackError::Corrupt(format!("{t}.json can't be read")))?;
             tables.push((*t, rows));
         }
     }
-    let mut media = Vec::new();
-    for i in 0..zip.len() {
-        let name = zip.by_index(i).map_err(zerr)?.name().map_err(zerr)?.to_string();
-        if name.starts_with("media/") {
-            let Some(id) = safe_media_name(&name) else {
-                return Err(StoreError::Conflict(format!("The pack has an unsafe file name: {name}")));
-            };
-            if let Some(bytes) = read_entry(&mut zip, &name)? {
-                media.push((id.to_string(), bytes));
-            }
+    // Media is unpacked to a staging folder one file at a time, never all in memory.
+    let staging = store.dir().join("tmp").join(format!("import-{}", crate::new_id()));
+    std::fs::create_dir_all(&staging)?;
+    let staged = stage_media(&mut zip, &staging);
+    let media = match staged {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
         }
-    }
+    };
     let backup = store.snapshot("before-import")?;
     let mut report = ImportReport { backup: backup.display().to_string(), ..Default::default() };
     store.write(|tx| {
@@ -292,10 +343,12 @@ pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
     })?;
     let dir = store.dir().join("media");
     std::fs::create_dir_all(&dir)?;
-    for (id, bytes) in media {
-        std::fs::write(dir.join(&id), bytes)?;
+    for id in media {
+        std::fs::rename(staging.join(&id), dir.join(&id))
+            .or_else(|_| std::fs::copy(staging.join(&id), dir.join(&id)).map(|_| ()))?;
         report.media_files += 1;
     }
+    let _ = std::fs::remove_dir_all(&staging);
     Ok(report)
 }
 
@@ -373,19 +426,38 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(d.path()).unwrap();
         let m = manifest_bytes(1);
+        let pack_err = |path: &Path| match import(&s, path) {
+            Err(StoreError::Pack(p)) => p,
+            other => panic!("expected a pack error, got {other:?}"),
+        };
         let slip = write_pack(&[("manifest.json", &m), ("media/../../evil", b"x")]);
-        assert!(import(&s, slip.path()).is_err());
+        assert!(matches!(pack_err(slip.path()), PackError::Unsafe(_)));
         assert!(!d.path().parent().unwrap().join("evil").exists());
         let newer = write_pack(&[("manifest.json", &manifest_bytes(99))]);
-        assert!(import(&s, newer.path()).unwrap_err().to_string().contains("newer"));
+        assert_eq!(pack_err(newer.path()), PackError::TooNew(99));
         let not_a_pack = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(not_a_pack.path(), b"hello").unwrap();
-        assert!(import(&s, not_a_pack.path()).is_err());
+        assert_eq!(pack_err(not_a_pack.path()), PackError::NotAPack);
+        let no_manifest = write_pack(&[("overlays.json", b"[]")]);
+        assert_eq!(pack_err(no_manifest.path()), PackError::NotAPack);
+        // A pack cut short (a download that didn't finish) is damaged, not a disk error.
+        let good = write_pack(&[("manifest.json", &m), ("media/abc", &[7u8; 50_000])]);
+        let bytes = std::fs::read(good.path()).unwrap();
+        let cut = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cut.path(), &bytes[..bytes.len() - 200]).unwrap();
+        assert!(matches!(pack_err(cut.path()), PackError::NotAPack | PackError::Corrupt(_)));
+        let mut flipped = bytes.clone();
+        let at = flipped.windows(4).position(|w| w == [7, 7, 7, 7]).unwrap_or(100) + 10;
+        flipped[at] ^= 0xff;
+        let bad_crc = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(bad_crc.path(), &flipped).unwrap();
+        assert!(matches!(pack_err(bad_crc.path()), PackError::Corrupt(_)), "a CRC mismatch is a damaged pack");
+        assert!(!d.path().join("media").join("abc").exists(), "nothing from a damaged pack is kept");
         let injection = br#"[{"key": "x", "value": "1", "updated_at": 0, "x\") ; DROP TABLE overlays; --": 1}]"#;
         let sql = write_pack(&[("manifest.json", &m), ("settings.json", injection)]);
         import(&s, sql.path()).unwrap();
         assert!(repo::overlays::list(&s).is_ok(), "unknown column names are ignored, tables intact");
         let broken = write_pack(&[("manifest.json", &m), ("overlays.json", b"{not json")]);
-        assert!(import(&s, broken.path()).is_err());
+        assert!(matches!(pack_err(broken.path()), PackError::Corrupt(_)));
     }
 }
