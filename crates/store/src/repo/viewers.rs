@@ -27,6 +27,8 @@ pub struct Identity {
     pub first_seen: i64,
     pub last_seen: i64,
     pub messages: i64,
+    #[serde(default)]
+    pub timeouts: i64,
 }
 
 /// Records that `actor` was seen (and chatted, if `chatted`). Returns the viewer id.
@@ -81,7 +83,7 @@ pub fn card(store: &Store, platform: Platform, user_id: &str) -> Result<ViewerCa
             .ok_or(StoreError::NotFound("viewer"))?;
         let note: String = c.query_row("SELECT note FROM viewers WHERE id = ?1", [viewer_id], |r| r.get(0))?;
         let mut st = c.prepare(
-            "SELECT platform, user_id, login, display_name, first_seen, last_seen, messages
+            "SELECT platform, user_id, login, display_name, first_seen, last_seen, messages, timeouts
              FROM viewer_identities WHERE viewer_id = ?1 ORDER BY first_seen",
         )?;
         let identities = st
@@ -94,10 +96,21 @@ pub fn card(store: &Store, platform: Platform, user_id: &str) -> Result<ViewerCa
                     first_seen: r.get(4)?,
                     last_seen: r.get(5)?,
                     messages: r.get(6)?,
+                    timeouts: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ViewerCard { viewer_id, note, identities })
+    })
+}
+
+/// Counts a timeout we gave this person. `false` if we've never seen them.
+pub fn add_timeout(store: &Store, platform: Platform, user_id: &str) -> Result<bool> {
+    store.write(|tx| {
+        Ok(tx.execute(
+            "UPDATE viewer_identities SET timeouts = timeouts + 1 WHERE platform = ?1 AND user_id = ?2",
+            params![pkey(platform), user_id],
+        )? > 0)
     })
 }
 

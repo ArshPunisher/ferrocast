@@ -11,8 +11,11 @@ use crate::error::{Result, StoreError};
 
 /// Migrations in order. The index + 1 is the schema version (`PRAGMA user_version`).
 /// Never edit a released migration; add a new one.
-const MIGRATIONS: &[&str] =
-    &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_moderation_flags.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_moderation_flags.sql"),
+    include_str!("../migrations/0003_held_and_timeouts.sql"),
+];
 
 /// Schema version this build understands.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

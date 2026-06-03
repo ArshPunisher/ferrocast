@@ -137,6 +137,64 @@ pub fn hide_user_chat(store: &Store, platform: Platform, actor_id: &str, since_m
     })
 }
 
+/// Marks a chat message as held for a mod (and hidden until released).
+pub fn hold(store: &Store, event_id: &str) -> Result<bool> {
+    store.write(|tx| Ok(tx.execute("UPDATE events SET held = 1, hidden = 1 WHERE id = ?1", [event_id])? > 0))
+}
+
+/// Takes a held message off the hold list: `release` shows it again, otherwise it stays
+/// hidden. `None` if it isn't held (another mod got there first).
+pub fn take_held(store: &Store, event_id: &str, release: bool) -> Result<Option<Event>> {
+    let taken = store.write(|tx| {
+        Ok(tx.execute(
+            "UPDATE events SET held = 0, hidden = CASE WHEN ?2 THEN 0 ELSE hidden END WHERE id = ?1 AND held = 1",
+            params![event_id, release],
+        )? > 0)
+    })?;
+    if taken { get(store, event_id) } else { Ok(None) }
+}
+
+/// Held messages, oldest first.
+pub fn held(store: &Store, limit: u32) -> Result<Vec<Event>> {
+    store
+        .read(|c| {
+            let mut st = c.prepare("SELECT id FROM events WHERE held = 1 ORDER BY seq LIMIT ?1")?;
+            let ids: Vec<String> =
+                st.query_map([limit], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
+            Ok(ids)
+        })?
+        .iter()
+        .filter_map(|id| get(store, id).transpose())
+        .collect()
+}
+
+/// The newest event of `kind` by this person, for the viewer card.
+pub fn latest_by_actor(store: &Store, platform: Platform, actor_id: &str, kind: &str) -> Result<Option<Event>> {
+    let id: Option<String> = store.read(|c| {
+        Ok(c.query_row(
+            "SELECT id FROM events WHERE platform = ?1 AND actor_id = ?2 AND kind = ?3 ORDER BY seq DESC LIMIT 1",
+            params![platform_key(platform), actor_id, kind],
+            |r| r.get(0),
+        )
+        .optional()?)
+    })?;
+    match id {
+        Some(id) => get(store, &id),
+        None => Ok(None),
+    }
+}
+
+/// When this person first followed, as far as the log knows.
+pub fn first_follow(store: &Store, platform: Platform, actor_id: &str) -> Result<Option<i64>> {
+    store.read(|c| {
+        Ok(c.query_row(
+            "SELECT MIN(occurred_at) FROM events WHERE platform = ?1 AND actor_id = ?2 AND kind = 'follow'",
+            params![platform_key(platform), actor_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?)
+    })
+}
+
 /// Finds the event a refund refers to.
 pub fn by_source(store: &Store, platform: Platform, source_id: &str) -> Result<Option<String>> {
     store.read(|c| {
@@ -290,6 +348,31 @@ mod tests {
         let visible: Vec<_> = recent_visible(&s, None, 50, &[]).unwrap().into_iter().map(|(_, e)| e.id).collect();
         assert_eq!(visible, vec!["b"]);
         assert_eq!(recent(&s, None, 50, &[]).unwrap().len(), 3, "the mod log keeps everything");
+    }
+
+    #[test]
+    fn held_messages_are_released_or_dropped_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let mut a = chat("a", Some("m1"), "check bestviewers.net");
+        if let EventKind::ChatMessage { actor, .. } = &mut a.kind {
+            actor.id = Some("u1".into());
+        }
+        insert(&s, &a).unwrap();
+        insert(&s, &chat("b", Some("m2"), "link two")).unwrap();
+        assert!(hold(&s, "a").unwrap() && hold(&s, "b").unwrap());
+        assert!(!hold(&s, "nope").unwrap());
+        assert_eq!(held(&s, 50).unwrap().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert!(recent_visible(&s, None, 50, &[]).unwrap().is_empty(), "held means hidden");
+        assert_eq!(take_held(&s, "a", true).unwrap().unwrap().id, "a");
+        assert!(take_held(&s, "a", true).unwrap().is_none(), "the second mod gets nothing");
+        assert!(take_held(&s, "b", false).unwrap().is_some());
+        let visible: Vec<_> = recent_visible(&s, None, 50, &[]).unwrap().into_iter().map(|(_, e)| e.id).collect();
+        assert_eq!(visible, ["a"], "released shows again, dropped stays hidden");
+        assert!(held(&s, 50).unwrap().is_empty());
+        assert_eq!(latest_by_actor(&s, Platform::Twitch, "u1", "chat_message").unwrap().unwrap().id, "a");
+        assert!(latest_by_actor(&s, Platform::Kick, "u1", "chat_message").unwrap().is_none());
+        assert_eq!(first_follow(&s, Platform::Twitch, "u1").unwrap(), None);
     }
 
     #[test]
