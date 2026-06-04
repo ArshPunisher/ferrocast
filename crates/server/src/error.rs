@@ -74,8 +74,13 @@ impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         match e {
             EngineError::Invalid(m) => ApiError::invalid(m),
+            EngineError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, "conflict", m),
+            EngineError::TooMany(m) => ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", m),
             EngineError::Unavailable(m) => ApiError::unavailable(m),
             EngineError::NotFound(what) => ApiError::not_found(what),
+            EngineError::Missing { code, message, hint } => {
+                ApiError::new(StatusCode::NOT_FOUND, code, message).hint(hint)
+            }
             EngineError::Connector(c) => c.into(),
             EngineError::Store(s) => s.into(),
             EngineError::Internal(m) => {
@@ -92,6 +97,7 @@ impl From<StoreError> for ApiError {
         match e {
             StoreError::NotFound(what) => ApiError::not_found(what),
             StoreError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, "conflict", m),
+            StoreError::Pack(p) => ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_pack", p.to_string()),
             other => {
                 tracing::error!(error = %other, "storage error");
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "storage", "Ferrocast couldn't read or save its data.")

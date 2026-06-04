@@ -71,6 +71,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/media", get(media::list))
         .route("/media/{id}", get(crate::assets::dashboard_media).delete(media::remove))
         .route("/live", get(crate::ws::live))
+        // tips
+        .route("/tips", get(core::tips).put(core::save_tips))
         // OBS
         .route("/obs", get(core::obs).put(core::save_obs))
         // settings and data
@@ -83,7 +85,11 @@ pub(crate) fn api() -> Router<AppState> {
 pub(crate) fn uploads() -> Router<AppState> {
     Router::new()
         .route("/media", post(media::upload))
+        .route("/export", post(media::export))
         .layer(axum::extract::DefaultBodyLimit::max(media::MAX_UPLOAD + 64 * 1024))
+        .merge(Router::new().route("/import", post(media::import)).layer(axum::extract::DefaultBodyLimit::max(
+            usize::try_from(ferrocast_store::pack::MAX_PACK).unwrap_or(usize::MAX).saturating_add(64 * 1024),
+        )))
 }
 
 /// Parses a platform from a path or body string.

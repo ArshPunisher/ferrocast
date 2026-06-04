@@ -307,6 +307,24 @@ impl Engine {
         self.state().settings.clone()
     }
 
+    /// Re-reads everything from the store (after an import). Live connections stay up.
+    /// Re-reads saved settings (after an import or restore). What's happening right now
+    /// stays: connections, live state, panic mode, the TTS pause and "why" answers.
+    pub async fn reload(&self) -> Result<(), EngineError> {
+        // No config save can land between the read and the swap and be overwritten.
+        let _one_at_a_time = self.inner.config.lock().await;
+        let (fresh, _) = self.db(load_state).await?;
+        let mut st = self.state_mut();
+        let connectors = std::mem::take(&mut st.connectors);
+        let live = std::mem::take(&mut st.live);
+        let viewers = std::mem::take(&mut st.viewers);
+        let session = std::mem::take(&mut st.session);
+        let why = std::mem::take(&mut st.why);
+        let (panic_on, tts_paused) = (st.panic_on, st.tts_paused);
+        *st = State { connectors, live, viewers, session, why, panic_on, tts_paused, ..fresh };
+        Ok(())
+    }
+
     pub async fn save_settings(&self, s: EngineSettings) -> Result<EngineSettings, EngineError> {
         let _one_at_a_time = self.inner.config.lock().await;
         let saved = s.clone();

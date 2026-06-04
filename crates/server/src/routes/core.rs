@@ -337,3 +337,31 @@ pub async fn restore_backup(State(app): State<AppState>, Path(id): Path<String>)
     app.engine.db(move |_| backup::schedule_restore(&dir, &id)).await?;
     Ok(Json(json!({ "restart_needed": true, "message": "Restart Ferrocast to finish restoring." })))
 }
+
+pub async fn save_tips(State(app): State<AppState>, Body(cfg): Body<Value>) -> ApiResult<Json<Value>> {
+    if !cfg.is_object() {
+        return Err(ApiError::invalid("The tip page settings must be an object.")
+            .hint("Send { handle, display_name, message, razorpay?, kofi?, stripe? }."));
+    }
+    let saved = app.engine.save_tips(&cfg).await?;
+    // Keep the relay's cleaned-up copy: normalised names, and secrets only as "has_secret".
+    let mut public = match saved.get("config") {
+        Some(c) if c.is_object() => c.clone(),
+        _ => return Err(ApiError::unavailable("The relay saved the tip page but didn't send it back. Reload Tips.")),
+    };
+    if let Some(obj) = public.as_object_mut() {
+        obj.insert("page_url".into(), saved["page_url"].clone());
+        obj.insert("webhooks".into(), saved["webhooks"].clone());
+    }
+    let stored = public.clone();
+    app.engine.db(move |s| repo::settings::set(s, "tips", &stored)).await?;
+    Ok(Json(public))
+}
+
+pub async fn tips(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    let v: Option<Value> = app.engine.db(|s| repo::settings::get(s, "tips")).await?;
+    Ok(Json(v.unwrap_or_else(|| {
+        json!({ "handle": "", "display_name": "", "message": "", "page_url": null, "webhooks": null,
+                "razorpay": null, "kofi": null, "stripe": null })
+    })))
+}

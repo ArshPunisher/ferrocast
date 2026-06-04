@@ -11,8 +11,17 @@ pub enum EngineError {
     /// Bad input (400).
     #[error("{0}")]
     Invalid(String),
+    /// Clashes with something that exists (409).
+    #[error("{0}")]
+    Conflict(String),
+    /// Too often (429).
+    #[error("{0}")]
+    TooMany(String),
     #[error("{0} not found")]
     NotFound(&'static str),
+    /// Gone or never there, with its own error code (404).
+    #[error("{message}")]
+    Missing { code: &'static str, message: &'static str, hint: &'static str },
     #[error(transparent)]
     Connector(#[from] ConnectorError),
     #[error(transparent)]

@@ -143,6 +143,11 @@ impl Engine {
                     self.notice(NoticeLevel::Error, &format!("Kick sign-in didn't finish: {e}"));
                 }
             }
+            "tip" => {
+                if let Some(e) = tip_event(payload) {
+                    let _ = self.submit(e).await;
+                }
+            }
             other => tracing::debug!(kind = other, "ignored a relay item"),
         }
     }
@@ -266,7 +271,148 @@ impl Engine {
         }
     }
 
+    /// Sends the tip page settings to the relay; returns the page and webhook URLs.
+    pub async fn save_tips(&self, cfg: &Value) -> Result<Value, EngineError> {
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await?;
+        self.ensure_relay_link();
+        let res = self
+            .relay_http()
+            .put(format!("{url}/v1/tips/config"))
+            .bearer_auth(&auth)
+            .json(cfg)
+            .send()
+            .await
+            .map_err(|e| EngineError::Unavailable(format!("Couldn't reach the Ferrocast relay: {e}")))?;
+        let status = res.status().as_u16();
+        let v: Value = res.json().await.unwrap_or(Value::Null);
+        let message = || {
+            v.pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("The relay refused the tip page settings.")
+                .to_string()
+        };
+        match status {
+            200..=299 => Ok(v),
+            409 => Err(EngineError::Conflict(message())),
+            429 => Err(EngineError::TooMany(message())),
+            401 | 403 => Err(EngineError::Unavailable(
+                "The Ferrocast relay doesn't recognise this install. Reconnect Kick or save the tip page again in a minute."
+                    .into(),
+            )),
+            400 | 413 | 415 | 422 => Err(EngineError::Invalid(message())),
+            _ => Err(EngineError::Unavailable(message())),
+        }
+    }
+
     pub(crate) fn forget_kick(&self) -> Result<(), EngineError> {
         self.inner.secrets.delete(KICK_TOKENS).map_err(|e| EngineError::Unavailable(e.to_string()))
+    }
+}
+
+/// A relay `tip` item → a Tip event, or a Reversal for refunds and chargebacks. The source
+/// id is `provider:payment` for both, so goals take back exactly what that payment added.
+pub(crate) fn tip_event(p: &Value) -> Option<ferrocast_core::event::Event> {
+    use ferrocast_core::event::{Actor, Event, EventKind, PaymentStatus, ReversalReason, TipProvider};
+    let provider_key = p["provider"].as_str()?;
+    let provider = match provider_key {
+        "razorpay" => TipProvider::Razorpay,
+        "stripe" => TipProvider::Stripe,
+        "ko_fi" => TipProvider::KoFi,
+        "paypal" => TipProvider::Paypal,
+        _ => return None,
+    };
+    let payment = p["payment_id"].as_str().filter(|s| !s.is_empty())?;
+    let key = format!("{provider_key}:{payment}");
+    // When the relay received it: a tip held while the desktop was off belongs to that day's
+    // goals and tax records, not today's. Never in the future.
+    let at = Millis(p["at"].as_i64().filter(|t| *t > 0).map_or(now().0, |t| t.min(now().0)));
+    let kind = match p["status"].as_str()? {
+        "captured" => {
+            use ferrocast_core::money::Money;
+            let currency = p["currency"].as_str()?;
+            // Razorpay and Stripe send integer minor units with their digit count; Ko-fi sends
+            // a decimal string. Either way core's own currency table decides the exponent.
+            let money = match (p["amount_minor"].as_i64(), p["digits"].as_u64()) {
+                (Some(minor), Some(digits)) => Money::from_scaled(minor, u32::try_from(digits).ok()?, currency).ok()?,
+                _ => Money::parse_decimal_lenient(p["amount"].as_str()?, currency).ok()?,
+            };
+            if money.minor <= 0 {
+                return None;
+            }
+            let name = p["name"].as_str().filter(|n| !n.trim().is_empty()).unwrap_or("Someone");
+            let mut actor = Actor::named(Platform::Tips, name);
+            actor.login = None;
+            EventKind::Tip {
+                actor,
+                money,
+                message: p["message"].as_str().filter(|m| !m.trim().is_empty()).map(String::from),
+                provider,
+                payment_ref: payment.to_string(),
+                status: PaymentStatus::Captured,
+            }
+        }
+        "refunded" => {
+            return Some(Event::live(
+                Platform::Tips,
+                Some(format!("{key}#refund")),
+                at,
+                EventKind::Reversal { original_source_id: key, reason: ReversalReason::Refund },
+            ));
+        }
+        "disputed" => {
+            return Some(Event::live(
+                Platform::Tips,
+                Some(format!("{key}#dispute")),
+                at,
+                EventKind::Reversal { original_source_id: key, reason: ReversalReason::Chargeback },
+            ));
+        }
+        _ => return None,
+    };
+    Some(Event::live(Platform::Tips, Some(key), at, kind))
+}
+
+#[cfg(test)]
+mod tip_tests {
+    use super::tip_event;
+    use ferrocast_core::event::{EventKind, PaymentStatus};
+    use serde_json::json;
+
+    #[test]
+    fn tips_and_reversals_share_a_key() {
+        let tip = tip_event(
+            &json!({ "provider": "razorpay", "status": "captured", "payment_id": "pay_1", "amount": "500.00",
+                                     "currency": "INR", "name": "Asha", "message": "gg" }),
+        )
+        .unwrap();
+        assert_eq!(tip.source_id.as_deref(), Some("razorpay:pay_1"));
+        assert!(
+            matches!(&tip.kind, EventKind::Tip { money, status: PaymentStatus::Captured, .. } if money.minor == 50_000)
+        );
+        let refund =
+            tip_event(&json!({ "provider": "razorpay", "status": "refunded", "payment_id": "pay_1" })).unwrap();
+        assert!(
+            matches!(&refund.kind, EventKind::Reversal { original_source_id, .. } if original_source_id == "razorpay:pay_1")
+        );
+        let isk = tip_event(&json!({ "provider": "stripe", "status": "captured", "payment_id": "pi_1",
+            "amount_minor": 150_000, "digits": 2, "currency": "ISK" }))
+        .unwrap();
+        assert!(matches!(&isk.kind, EventKind::Tip { money, .. } if money.minor == 1_500), "Stripe's ISK hundredths");
+        let jpy = tip_event(&json!({ "provider": "ko_fi", "status": "captured", "payment_id": "k1",
+            "amount": "500.00", "currency": "JPY" }))
+        .unwrap();
+        assert!(matches!(&jpy.kind, EventKind::Tip { money, .. } if money.minor == 500), "Ko-fi's two places on yen");
+        for bad in [
+            json!({ "provider": "stripe", "status": "captured", "payment_id": "x", "amount_minor": -5, "digits": 2, "currency": "USD" }),
+            json!({ "provider": "stripe", "status": "captured", "payment_id": "x", "amount_minor": 5, "digits": 99, "currency": "USD" }),
+            json!({ "provider": "venmo", "status": "captured", "payment_id": "x", "amount": "1", "currency": "USD" }),
+            json!({ "provider": "stripe", "status": "captured", "payment_id": "", "amount": "1", "currency": "USD" }),
+            json!({ "provider": "stripe", "status": "captured", "payment_id": "x", "amount": "-5", "currency": "USD" }),
+            json!({ "provider": "stripe", "status": "captured", "payment_id": "x", "amount": "0", "currency": "USD" }),
+            json!({ "provider": "stripe", "status": "weird", "payment_id": "x" }),
+        ] {
+            assert!(tip_event(&bad).is_none(), "{bad}");
+        }
     }
 }

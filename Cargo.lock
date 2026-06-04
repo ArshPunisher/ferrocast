@@ -1422,6 +1422,7 @@ dependencies = [
  "ferrocast-core",
  "ferrocast-engine",
  "ferrocast-obs",
+ "ferrocast-relay",
  "ferrocast-secrets",
  "ferrocast-store",
  "futures-util",

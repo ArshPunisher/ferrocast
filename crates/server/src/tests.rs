@@ -258,3 +258,132 @@ fn byte_ranges() {
     }
     assert_eq!(parse_range("bytes=0-0", 0), None);
 }
+
+#[tokio::test]
+async fn export_then_import_round_trips_and_bad_files_get_415() {
+    let r = start().await;
+    let o: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let pack = r.client.post(format!("{}/api/v1/export", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(pack.status(), StatusCode::OK);
+    assert!(pack.headers()["content-disposition"].to_str().unwrap().contains(".ferropack"));
+    let bytes = pack.bytes().await.unwrap().to_vec();
+    r.client
+        .delete(format!("{}/api/v1/overlays/{}", r.base, o["id"].as_str().unwrap()))
+        .bearer_auth(&r.token)
+        .send()
+        .await
+        .unwrap();
+    let up = |b: Vec<u8>| {
+        let form =
+            reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(b).file_name("x.ferropack"));
+        r.client.post(format!("{}/api/v1/import", r.base)).bearer_auth(&r.token).multipart(form).send()
+    };
+    let res = up(bytes).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let list: Value = r.get("/api/v1/overlays").await.json().await.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "the deleted overlay came back");
+    let junk = up(b"definitely not a zip".to_vec()).await.unwrap();
+    assert_eq!(error_code(junk).await, (StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_pack".into()));
+}
+
+/// A dashboard, an engine and a real relay, all in-process.
+async fn start_with_relay() -> (Running, tempfile::TempDir) {
+    let rdir = tempfile::tempdir().unwrap();
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let cfg = ferrocast_relay::Config {
+        public_url: relay.clone(),
+        kick_client_id: None,
+        kick_client_secret: None,
+        kick_id_url: relay.clone(),
+        kick_api_url: relay.clone(),
+    };
+    let rapp = ferrocast_relay::router(ferrocast_relay::AppState::new(
+        cfg,
+        ferrocast_relay::Db::open(&rdir.path().join("r.db")).unwrap(),
+    ))
+    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(rl, rapp).await });
+    let dir = tempfile::tempdir().unwrap();
+    let apps = ferrocast_engine::PlatformApps { relay_url: Some(relay), ..Default::default() };
+    let engine = Engine::start_with(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()), apps)
+        .await
+        .unwrap();
+    let server = serve(engine, ServeOptions { port: 0, lan: false, dev_origins: vec![] }).await.unwrap();
+    let r = Running {
+        base: server.base_url(),
+        token: server.sessions.desktop_token().to_string(),
+        client: reqwest::Client::new(),
+        _dir: dir,
+    };
+    (r, rdir)
+}
+
+#[tokio::test]
+async fn the_tip_page_saves_through_the_relay_without_keeping_secrets() {
+    let (r, _relay) = start_with_relay().await;
+    assert_eq!(
+        error_code(r.put("/api/v1/tips", json!([1, 2])).await).await,
+        (StatusCode::BAD_REQUEST, "invalid".into())
+    );
+    let page = json!({ "handle": "  NoVa ", "display_name": "Nova", "message": "",
+        "razorpay": { "page_url": "https://razorpay.me/@nova", "secret": "rzp-secret-1" } });
+    let res = r.put("/api/v1/tips", page.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["handle"], "nova", "the dashboard shows the name the page really has");
+    assert_eq!(v["razorpay"]["has_secret"], true);
+    assert!(v["page_url"].as_str().unwrap().ends_with("/t/nova"));
+    assert!(v["webhooks"]["razorpay"].as_str().is_some());
+    assert!(!v.to_string().contains("rzp-secret-1"));
+    // Editing without re-entering the secret keeps it.
+    let mut edit = page.clone();
+    edit["message"] = json!("thanks!");
+    edit["razorpay"]["secret"] = json!("");
+    let v: Value = r.put("/api/v1/tips", edit).await.json().await.unwrap();
+    assert_eq!(v["razorpay"]["has_secret"], true);
+    assert_eq!(v["message"], "thanks!");
+    let stored: Value = r.get("/api/v1/tips").await.json().await.unwrap();
+    assert!(!stored.to_string().contains("rzp-secret-1"), "secrets never land in the local settings");
+    let mut bad = page.clone();
+    bad["razorpay"]["page_url"] = json!("https://razorpay.me.evil.com/x");
+    assert_eq!(error_code(r.put("/api/v1/tips", bad).await).await.0, StatusCode::BAD_REQUEST);
+    // Three new names a day; the fourth is refused with 429, not a generic error.
+    for name in ["nova-two", "nova-three"] {
+        let mut p = page.clone();
+        p["handle"] = json!(name);
+        assert_eq!(r.put("/api/v1/tips", p).await.status(), StatusCode::OK, "{name}");
+    }
+    let mut p = page.clone();
+    p["handle"] = json!("nova-four");
+    assert_eq!(
+        error_code(r.put("/api/v1/tips", p).await).await,
+        (StatusCode::TOO_MANY_REQUESTS, "rate_limited".into())
+    );
+}
+
+#[tokio::test]
+async fn tips_without_a_relay_say_so() {
+    let r = start().await;
+    let page = json!({ "handle": "nova", "display_name": "Nova",
+        "razorpay": { "page_url": "https://razorpay.me/@nova", "secret": "rzp-secret-1" } });
+    let (status, _) = error_code(r.put("/api/v1/tips", page).await).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let v: Value = r.get("/api/v1/tips").await.json().await.unwrap();
+    assert_eq!(v["page_url"], Value::Null);
+}
+
+#[tokio::test]
+async fn imports_have_their_own_size_limit_and_clear_errors() {
+    let r = start().await;
+    let upload = |bytes: Vec<u8>| {
+        let form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::bytes(bytes).file_name("x.ferropack"));
+        r.client.post(format!("{}/api/v1/import", r.base)).bearer_auth(&r.token).multipart(form).send()
+    };
+    // Bigger than any one media file: the media upload limit must not apply to packs.
+    let res = upload(vec![0u8; 60 * 1024 * 1024]).await.unwrap();
+    assert_eq!(error_code(res).await, (StatusCode::UNSUPPORTED_MEDIA_TYPE, "bad_pack".into()));
+    let res = upload(Vec::new()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}

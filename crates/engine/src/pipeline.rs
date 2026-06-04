@@ -83,6 +83,29 @@ impl Engine {
             _ => {}
         }
 
+        // Providers don't promise order: a refund or chargeback can land before its capture
+        // (the desktop was offline, the relay queued both). Then the tip never happened.
+        if let EventKind::Tip { status: ferrocast_core::event::PaymentStatus::Captured, .. } = &e.kind
+            && e.origin != Origin::Test
+            && let Some(key) = e.source_id.clone()
+        {
+            let reversed = self
+                .db(move |s| {
+                    for suffix in ["refund", "dispute"] {
+                        if repo::events::by_source(s, Platform::Tips, &format!("{key}#{suffix}"))?.is_some() {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })
+                .await
+                .unwrap_or(false);
+            if reversed {
+                tracing::info!(source = ?e.source_id, "a tip arrived after its refund; not alerting");
+                return;
+            }
+        }
+
         if e.origin != Origin::Test {
             let stored = e.clone();
             match self.db(move |s| repo::events::insert(s, &stored)).await {
@@ -366,34 +389,46 @@ impl Engine {
 
     async fn reverse(&self, platform: Platform, source_id: &str, reason: ferrocast_core::event::ReversalReason) {
         let src = source_id.to_string();
-        match self.db(move |s| repo::goals::reverse(s, platform, &src)).await {
-            Ok(changed) if !changed.is_empty() => {
-                {
-                    let mut st = self.state_mut();
-                    for g in changed {
-                        if let Some(slot) = st.goals.iter_mut().find(|x| x.id == g.id) {
-                            *slot = g;
-                        }
+        let result = self
+            .db(move |s| {
+                let known = repo::events::by_source(s, platform, &src)?.is_some();
+                Ok((known, repo::goals::reverse(s, platform, &src)?))
+            })
+            .await;
+        let (known, changed) = match result {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(%err, "couldn't reverse goal contributions");
+                return;
+            }
+        };
+        let goals_changed = !changed.is_empty();
+        if goals_changed {
+            {
+                let mut st = self.state_mut();
+                for g in changed {
+                    if let Some(slot) = st.goals.iter_mut().find(|x| x.id == g.id) {
+                        *slot = g;
                     }
                 }
-                self.broadcast_goals(self.current_seq());
             }
-            Ok(_) => {}
-            Err(err) => tracing::error!(%err, "couldn't reverse goal contributions"),
+            self.broadcast_goals(self.current_seq());
+        }
+        // A refund of something that never alerted (a sale, not a tip) says nothing.
+        if !known {
+            return;
         }
         let what = match reason {
             ferrocast_core::event::ReversalReason::Chargeback => "A chargeback",
             ferrocast_core::event::ReversalReason::Refund => "A refund",
             ferrocast_core::event::ReversalReason::Cancelled => "A cancelled payment",
         };
-        self.send_live(LiveFrame::new(
-            "notice",
-            &Notice {
-                level: NoticeLevel::Warn,
-                message: format!("{what} took a payment back; goals were updated."),
-                action: None,
-            },
-        ));
+        let message = if goals_changed {
+            format!("{what} took a tip back; goals were updated.")
+        } else {
+            format!("{what} took a tip back.")
+        };
+        self.send_live(LiveFrame::new("notice", &Notice { level: NoticeLevel::Warn, message, action: None }));
     }
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {

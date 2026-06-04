@@ -269,12 +269,53 @@ async fn tips_alert_only_when_captured_and_refunds_take_goals_back() {
 }
 
 #[tokio::test]
+async fn a_tip_whose_refund_arrived_first_never_alerts_or_counts() {
+    let (e, _d) = engine().await;
+    e.save_goal(Goal {
+        id: "mic".into(),
+        title: "New mic".into(),
+        kind: GoalKind::Tips,
+        target: 1_000_000,
+        current: 0,
+        currency: Some("INR".into()),
+        starts_at: Millis(0),
+        ends_at: None,
+    })
+    .await
+    .unwrap();
+    // Relay items, in the wrong order: the refund, then the capture, then a replay of it.
+    let refund = serde_json::json!({ "provider": "razorpay", "status": "refunded", "payment_id": "pay_late" });
+    let capture = serde_json::json!({ "provider": "razorpay", "status": "captured", "payment_id": "pay_late",
+        "amount_minor": 50_000, "digits": 2, "currency": "INR", "name": "Asha" });
+    e.ingest(crate::relay::tip_event(&refund).unwrap()).await;
+    e.ingest(crate::relay::tip_event(&capture).unwrap()).await;
+    e.ingest(crate::relay::tip_event(&capture).unwrap()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(e.goals()[0].current, 0);
+    assert!(e.queue().await.playing.is_none(), "no alert for money that was given back");
+    // A normal tip in another currency still counts only in its own currency's goal.
+    let usd = serde_json::json!({ "provider": "stripe", "status": "captured", "payment_id": "pi_2",
+        "amount_minor": 500, "digits": 2, "currency": "USD", "name": "Sam" });
+    e.ingest(crate::relay::tip_event(&usd).unwrap()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(e.queue().await.playing.is_some(), "a normal tip still alerts");
+    assert_eq!(e.goals()[0].current, 0, "dollars never land in a rupee goal");
+}
+
+#[tokio::test]
 async fn panic_mode_switches_modes_and_pauses_alerts() {
     let (e, _d) = engine().await;
     let tw = FakePlatform::new(Platform::Twitch);
     e.register_connector(tw.clone());
-    let plan = e.panic(true).await.unwrap();
-    assert_eq!(plan.platforms.len(), 1);
+    let mut live = e.subscribe_live();
+    let result = e.panic(true).await.unwrap();
+    assert_eq!(result.applied.len(), 1);
+    assert_eq!(result.applied[0].modes, vec!["followers_only".to_string(), "slow".to_string()]);
+    let mut kinds = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        kinds.push(serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string());
+    }
+    assert!(kinds.contains(&"panic".to_string()) && kinds.contains(&"notice".to_string()), "{kinds:?}");
     assert!(e.queue().await.paused);
     assert!(tw.log().iter().any(|l| l.starts_with("mode FollowersOnly true")));
     e.panic(false).await.unwrap();
