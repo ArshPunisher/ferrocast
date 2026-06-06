@@ -93,6 +93,8 @@ pub struct BanUser {
     platform: String,
     user_id: String,
     login: String,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +111,17 @@ pub async fn ban(State(app): State<AppState>, Body(b): Body<BanBody>) -> ApiResu
         return Err(ApiError::invalid("Who to ban is missing (user_id)."));
     }
     let reason = b.reason.map(|r| r.chars().take(500).collect::<String>());
-    let out = app.engine.ban(platform(&b.user.platform)?, &b.user.user_id, &b.user.login, reason, b.everywhere).await?;
+    let out = app
+        .engine
+        .ban(
+            platform(&b.user.platform)?,
+            &b.user.user_id,
+            &b.user.login,
+            b.user.display_name.as_deref(),
+            reason,
+            b.everywhere,
+        )
+        .await?;
     Ok(Json(json!({ "banned": out.ok, "failed": out.failed })))
 }
 
@@ -119,18 +131,42 @@ pub struct UnbanBody {
     user_id: String,
 }
 
+/// Unbans on the platform, and takes them off the shared list when they're on it. Bans
+/// the filter made on its own aren't on the list, so the platform is always asked.
 pub async fn unban(State(app): State<AppState>, Body(b): Body<UnbanBody>) -> ApiResult<StatusCode> {
     app.engine.unban(platform(&b.platform)?, &b.user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The shared ban list, newest first (API-REQUESTS R1).
 pub async fn bans(State(app): State<AppState>) -> Json<Value> {
-    Json(json!(app.engine.bans()))
+    let mut entries = app.engine.bans().entries;
+    entries.sort_by_key(|e| std::cmp::Reverse(e.at.0));
+    let list: Vec<Value> = entries
+        .into_iter()
+        .map(|e| {
+            json!({
+                "platform": e.platform,
+                "user_id": e.user_id.unwrap_or_default(),
+                "display_name": if e.display_name.is_empty() { e.login.clone() } else { e.display_name },
+                "login": e.login,
+                "reason": e.reason,
+                "banned_at": e.at.0,
+                "everywhere": e.everywhere,
+                "by": e.by,
+            })
+        })
+        .collect();
+    Json(json!(list))
 }
 
 pub async fn panic_state(State(app): State<AppState>) -> Json<Value> {
     let (on, config) = app.engine.panic_state();
-    Json(json!({ "on": on, "config": config }))
+    Json(json!({ "on": on, "plan": config }))
+}
+
+pub async fn panic_config(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.panic_state().1))
 }
 
 #[derive(Deserialize)]
@@ -139,17 +175,10 @@ pub struct PanicBody {
 }
 
 pub async fn panic(State(app): State<AppState>, Body(b): Body<PanicBody>) -> ApiResult<Json<Value>> {
-    let plan = app.engine.panic(b.on).await?;
-    Ok(Json(json!({ "on": b.on, "plan": plan })))
+    Ok(Json(json!(app.engine.panic(b.on).await?)))
 }
 
 pub async fn save_panic(State(app): State<AppState>, Body(cfg): Body<PanicConfig>) -> ApiResult<Json<Value>> {
-    if cfg.slow_seconds.is_some_and(|s| s == 0 || s > 120) {
-        return Err(ApiError::invalid("Slow mode is 1 to 120 seconds."));
-    }
-    if cfg.followers_only_minutes.is_some_and(|m| m > 129_600) {
-        return Err(ApiError::invalid("Followers-only can be up to 90 days."));
-    }
     Ok(Json(json!(app.engine.save_panic(cfg).await?)))
 }
 
@@ -161,10 +190,68 @@ pub async fn save_filters(State(app): State<AppState>, Body(cfg): Body<FilterCon
     Ok(Json(json!(app.engine.save_filter(cfg).await?)))
 }
 
+/// Everything the dashboard shows about one person (API-REQUESTS R6).
 pub async fn viewer(State(app): State<AppState>, Path((p, user)): Path<(String, String)>) -> ApiResult<Json<Value>> {
     let p = platform(&p)?;
-    let card = app.engine.db(move |s| repo::viewers::card(s, p, &user)).await?;
-    Ok(Json(json!(card)))
+    let uid = user.clone();
+    let found = app
+        .engine
+        .db(move |s| {
+            let card = repo::viewers::card(s, p, &uid)?;
+            let chat = repo::events::latest_by_actor(s, p, &uid, "chat_message")?;
+            let follow = repo::events::first_follow(s, p, &uid)?;
+            Ok((card, chat, follow))
+        })
+        .await;
+    let (card, chat, follows_since) = match found {
+        Ok(v) => v,
+        Err(ferrocast_engine::EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "viewer_not_found",
+                "Ferrocast hasn't seen this person yet.",
+            )
+            .hint("Viewer cards fill in once someone chats or follows while Ferrocast is running."));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let key = ferrocast_engine::platform_key(p);
+    let me = card.identities.iter().find(|i| i.platform == key && i.user_id == user);
+    let actor = chat.as_ref().and_then(|e| e.kind.actor().cloned());
+    let banned = app.engine.bans().entries.iter().any(|e| e.platform == p && e.user_id.as_deref() == Some(&user));
+    let others: Vec<Value> = card
+        .identities
+        .iter()
+        .filter(|i| !(i.platform == key && i.user_id == user))
+        .map(|i| json!({ "platform": i.platform, "login": i.login }))
+        .collect();
+    Ok(Json(json!({
+        "platform": p,
+        "user_id": user,
+        "login": me.map(|i| i.login.clone()).unwrap_or_default(),
+        "display_name": me.map(|i| i.display_name.clone()).unwrap_or_default(),
+        "avatar_url": actor.as_ref().and_then(|a| a.avatar_url.clone()),
+        "roles": actor.as_ref().map(|a| a.roles.0).unwrap_or(0),
+        "first_seen": me.map(|i| i.first_seen),
+        "messages": me.map(|i| i.messages).unwrap_or(0),
+        "follows_since": follows_since,
+        "note": card.note,
+        "banned": banned,
+        "timeouts": me.map(|i| i.timeouts).unwrap_or(0),
+        "other_identities": others,
+    })))
+}
+
+pub async fn note(State(app): State<AppState>, Path((p, user)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    let p = platform(&p)?;
+    let card = app.engine.db(move |s| repo::viewers::card(s, p, &user)).await;
+    match card {
+        Ok(c) => Ok(Json(json!({ "text": c.note }))),
+        Err(ferrocast_engine::EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => {
+            Ok(Json(json!({ "text": "" })))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -177,13 +264,26 @@ pub async fn save_note(
     Path((p, user)): Path<(String, String)>,
     Body(b): Body<NoteBody>,
 ) -> ApiResult<Json<Value>> {
+    if b.text.chars().count() > 2_000 {
+        return Err(ApiError::invalid("Notes can be up to 2,000 characters."));
+    }
     let p = platform(&p)?;
-    let card = app
-        .engine
-        .db(move |s| {
-            repo::viewers::set_note(s, p, &user, &b.text)?;
-            repo::viewers::card(s, p, &user)
-        })
-        .await?;
-    Ok(Json(json!(card)))
+    let text = b.text.clone();
+    app.engine.db(move |s| repo::viewers::set_note(s, p, &user, &text)).await?;
+    Ok(Json(json!({ "text": b.text })))
+}
+
+/// Messages waiting for a mod (R-48).
+pub async fn held(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.held().await?)))
+}
+
+pub async fn release_held(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.release_held(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn drop_held(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.drop_held(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

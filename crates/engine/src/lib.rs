@@ -285,6 +285,16 @@ impl Engine {
         });
     }
 
+    pub(crate) fn remember_hidden_pub(&self, platform: Platform, id: &str) {
+        if !id.is_empty() {
+            self.remember_hidden(platform, id);
+        }
+    }
+
+    pub(crate) fn forget_hidden(&self, platform: Platform, id: &str) {
+        self.inner.hidden.lock().unwrap_or_else(|p| p.into_inner()).0.remove(&(platform, id.to_string()));
+    }
+
     fn remember_hidden(&self, platform: Platform, id: &str) {
         let mut h = self.inner.hidden.lock().unwrap_or_else(|p| p.into_inner());
         let key = (platform, id.to_string());
@@ -347,7 +357,7 @@ async fn prune(engine: Engine) {
     }
 }
 
-pub(crate) fn platform_key(p: Platform) -> &'static str {
+pub fn platform_key(p: Platform) -> &'static str {
     match p {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",

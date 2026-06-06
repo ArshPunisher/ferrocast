@@ -18,6 +18,14 @@ use crate::frames::{Audience, LiveFrame, Notice, NoticeLevel, OverlayFrame};
 use crate::state::Why;
 use crate::{Engine, now, platform_key};
 
+/// What moderation decided for one chat message.
+enum Moderated {
+    Shown,
+    Hidden,
+    /// Waiting for a mod, with the reason.
+    Held(String),
+}
+
 /// Runs until every sender is gone.
 pub(crate) async fn run(engine: Engine, mut rx: mpsc::Receiver<Event>) {
     while let Some(event) = rx.recv().await {
@@ -119,8 +127,16 @@ impl Engine {
         }
 
         let mut show_in_overlays = true;
+        let mut held: Option<String> = None;
         match &e.kind {
-            EventKind::ChatMessage { .. } => show_in_overlays = self.moderate_and_answer(&e).await,
+            EventKind::ChatMessage { .. } => match self.moderate_and_answer(&e).await {
+                Moderated::Shown => {}
+                Moderated::Hidden => show_in_overlays = false,
+                Moderated::Held(reason) => {
+                    show_in_overlays = false;
+                    held = Some(reason);
+                }
+            },
             EventKind::MessageDeleted { message_id } => {
                 self.hide_message(e.platform, message_id);
                 let id = message_id.clone();
@@ -188,6 +204,10 @@ impl Engine {
         }
 
         self.send_live(LiveFrame::new("event", &e));
+        // The dashboard gets the message first, then the mark that it's held (R-48).
+        if let Some(reason) = held {
+            self.send_live(LiveFrame::new("held", &json!({ "event_id": e.id, "reason": reason })));
+        }
         if show_in_overlays {
             let audience = match e.kind {
                 EventKind::ChatMessage { .. } => Some(Audience::Chat),
@@ -204,9 +224,9 @@ impl Engine {
 
     /// Ban-on-sight, the chat filter, and bot commands. Returns whether the message may
     /// appear in overlays.
-    async fn moderate_and_answer(&self, e: &Event) -> bool {
+    async fn moderate_and_answer(&self, e: &Event) -> Moderated {
         let EventKind::ChatMessage { actor, content, .. } = &e.kind else {
-            return true;
+            return Moderated::Shown;
         };
         let a = actor.clone();
         let _ = self.db(move |s| repo::viewers::touch(s, &a, true)).await;
@@ -220,7 +240,18 @@ impl Engine {
             let on_sight = st.settings.auto_ban_on_sight && st.bans.on_sight(actor).is_some();
             let emotes =
                 content.fragments.iter().filter(|f| matches!(f, ferrocast_core::event::Fragment::Emote { .. })).count();
-            (on_sight, filter::check(&st.filter, actor, &content.text, emotes), st.settings.bot_enabled)
+            let mut verdict = filter::check(&st.filter, actor, &content.text, emotes);
+            // Panic mode can hold everyone chatting here for the first time (R-50).
+            let exempt = actor.roles.0 & st.filter.exempt_roles.0 != 0;
+            if st.panic_on
+                && st.panic.hold_new_accounts
+                && !exempt
+                && actor.roles.contains(ferrocast_core::event::Roles::FIRST_TIME)
+                && verdict.action == Action::Allow
+            {
+                verdict = filter::Verdict { action: Action::Hold, reason: "first message during panic mode".into() };
+            }
+            (on_sight, verdict, st.settings.bot_enabled)
         };
 
         let user_id = actor.id.clone();
@@ -231,15 +262,18 @@ impl Engine {
                 });
             }
             self.hide_message(e.platform, &message_id);
-            return false;
+            return Moderated::Hidden;
         }
 
         match verdict.action {
             Action::Allow => {}
             Action::Hold => {
-                self.hide_message(e.platform, &message_id);
-                self.send_live(LiveFrame::new("held", &json!({ "event_id": e.id, "reason": verdict.reason })));
-                return false;
+                self.remember_hidden_pub(e.platform, &message_id);
+                let id = e.id.clone();
+                if let Err(err) = self.db(move |s| repo::events::hold(s, &id)).await {
+                    tracing::error!(%err, "couldn't hold a message");
+                }
+                return Moderated::Held(verdict.reason);
             }
             Action::Delete | Action::Timeout { .. } | Action::Ban => {
                 self.hide_message(e.platform, &message_id);
@@ -251,6 +285,7 @@ impl Engine {
                     }),
                     Action::Timeout { seconds } => {
                         if let Some(uid) = user_id {
+                            self.count_timeout(e.platform, &uid).await;
                             self.spawn_action(e.platform, "time someone out", move |c| {
                                 Box::pin(async move { c.timeout(&uid, seconds, Some(&reason)).await })
                             });
@@ -265,7 +300,7 @@ impl Engine {
                     }
                     _ => {}
                 }
-                return false;
+                return Moderated::Hidden;
             }
         }
 
@@ -274,7 +309,7 @@ impl Engine {
         if bot_on && e.origin == Origin::Live && e.channel.is_none() && content.text.trim_start().starts_with('!') {
             self.answer_command(e).await;
         }
-        true
+        Moderated::Shown
     }
 
     async fn answer_command(&self, e: &Event) {

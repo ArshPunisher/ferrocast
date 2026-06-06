@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use ferrocast_connector::{Connector, ConnectorError};
 use ferrocast_core::command::{Access, Command, Timer};
 use ferrocast_core::event::*;
-use ferrocast_core::filter::{Action as FAction, BlockedTerm};
 use ferrocast_core::goal::{Goal, GoalKind};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use ferrocast_core::money::Money;
@@ -157,7 +156,7 @@ async fn the_filter_deletes_hides_and_tells_the_platform() {
     let tw = FakePlatform::new(Platform::Twitch);
     e.register_connector(tw.clone());
     let mut f = e.filter();
-    f.terms.push(BlockedTerm { term: "badword".into(), action: FAction::Delete });
+    f.words.list.push("badword".into());
     e.save_filter(f).await.unwrap();
     let mut rx = e.subscribe_overlays();
     e.ingest(chat(Platform::Twitch, "m-bad", "troll", "b.a.d.w.o.r.d")).await;
@@ -170,6 +169,68 @@ async fn the_filter_deletes_hides_and_tells_the_platform() {
     let snap = e.overlay_snapshot(&ov).await.unwrap();
     let ids: Vec<_> = snap["state"]["chat"].as_array().unwrap().iter().map(|c| c["source_id"].clone()).collect();
     assert_eq!(ids, vec![Value::from("m-ok")]);
+}
+
+fn first_time(mut e: Event) -> Event {
+    if let EventKind::ChatMessage { actor, .. } = &mut e.kind {
+        actor.roles = Roles::FIRST_TIME.union(Roles::SUBSCRIBER);
+    }
+    e
+}
+
+#[tokio::test]
+async fn held_messages_wait_then_are_released_or_dropped_once() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let mut live = e.subscribe_live();
+    let mut overlays = e.subscribe_overlays();
+    e.ingest(first_time(chat(Platform::Twitch, "m1", "newbie", "hey check mysite.dev"))).await;
+    e.ingest(first_time(chat(Platform::Twitch, "m2", "other", "and mine at spam.xyz"))).await;
+    // The dashboard sees the message, then the hold mark.
+    let mut kinds = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        kinds.push(serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string());
+    }
+    let pos = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+    assert!(pos("event") < pos("held"), "{kinds:?}");
+    assert!(overlays.try_recv().is_err(), "held chat never reaches overlays");
+    let held = e.held().await.unwrap();
+    assert_eq!(held.len(), 2);
+    e.release_held(&held[0].id).await.unwrap();
+    let shown = next_overlay_frame(&mut overlays, "event").await;
+    assert_eq!(shown["data"]["source_id"], "m1", "a released message shows in chat overlays");
+    assert!(matches!(e.release_held(&held[0].id).await, Err(EngineError::Missing { code: "held_not_found", .. })));
+    e.drop_held(&held[1].id).await.unwrap();
+    eventually(|| tw.log().contains(&"delete m2".to_string())).await;
+    assert!(e.held().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn panic_mode_holds_first_time_chatters() {
+    let (e, _d) = engine().await;
+    e.register_connector(FakePlatform::new(Platform::Twitch));
+    e.ingest(first_time(chat(Platform::Twitch, "a1", "early", "hello!"))).await;
+    assert!(e.held().await.unwrap().is_empty(), "outside panic mode a plain hello is fine");
+    e.panic(true).await.unwrap();
+    e.ingest(first_time(chat(Platform::Twitch, "a2", "raider", "hello!"))).await;
+    e.ingest(chat(Platform::Twitch, "a3", "regular", "hello!")).await;
+    let held: Vec<_> = e.held().await.unwrap().into_iter().map(|e| e.source_id.unwrap_or_default()).collect();
+    assert_eq!(held, ["a2"], "only first-time chatters wait");
+    let mut cfg = e.panic_state().1;
+    cfg.hold_new_accounts = false;
+    e.save_panic(cfg).await.unwrap();
+    e.ingest(first_time(chat(Platform::Twitch, "a4", "raider2", "hello!"))).await;
+    assert_eq!(e.held().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_restore_keeps_panic_mode_on() {
+    let (e, _d) = engine().await;
+    e.register_connector(FakePlatform::new(Platform::Twitch));
+    e.panic(true).await.unwrap();
+    e.reload().await.unwrap();
+    assert!(e.panic_state().0, "importing a pack mid-raid doesn't quietly turn panic off");
 }
 
 #[tokio::test]
@@ -210,7 +271,8 @@ async fn ban_everywhere_uses_linked_accounts_and_reports_failures() {
     .await
     .unwrap()
     .unwrap();
-    let out = e.ban(Platform::Twitch, "raider-id", "raider", Some("hate raid".into()), true).await.unwrap();
+    let out =
+        e.ban(Platform::Twitch, "raider-id", "raider", Some("Raider"), Some("hate raid".into()), true).await.unwrap();
     assert_eq!(out.ok, vec![Platform::Twitch]);
     assert_eq!(out.failed.len(), 1);
     assert_eq!(out.failed[0].platform, Platform::Kick);
@@ -396,7 +458,7 @@ async fn moderated_chat_stays_hidden_after_a_restart() {
         let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
         e.register_connector(FakePlatform::new(Platform::Twitch));
         let mut f = e.filter();
-        f.terms.push(BlockedTerm { term: "badword".into(), action: FAction::Delete });
+        f.words.list.push("badword".into());
         e.save_filter(f).await.unwrap();
         e.ingest(chat(Platform::Twitch, "bad-1", "troll", "badword")).await;
         e.ingest(chat(Platform::Twitch, "raid-1", "raider", "spam spam")).await;

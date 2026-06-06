@@ -12,7 +12,7 @@ use ferrocast_core::command::{Command, Timer};
 use ferrocast_core::event::{Event, Millis, Origin, Platform};
 use ferrocast_core::filter::FilterConfig;
 use ferrocast_core::goal::Goal;
-use ferrocast_core::moderation::{BanEntry, PanicConfig, PanicPlan, plan_panic};
+use ferrocast_core::moderation::{BanEntry, PanicConfig, plan_panic};
 use ferrocast_core::sample;
 use ferrocast_core::tts::TtsPolicy;
 use ferrocast_store::repo;
@@ -147,7 +147,47 @@ impl Engine {
             return Err(EngineError::Invalid("Timeouts are 1 second to 14 days.".into()));
         }
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
-        Ok(c.timeout(user_id, seconds, reason).await?)
+        c.timeout(user_id, seconds, reason).await?;
+        self.count_timeout(platform, user_id).await;
+        Ok(())
+    }
+
+    /// Adds one to the viewer card's timeout count.
+    pub(crate) async fn count_timeout(&self, platform: Platform, user_id: &str) {
+        let uid = user_id.to_string();
+        if let Err(err) = self.db(move |s| repo::viewers::add_timeout(s, platform, &uid)).await {
+            tracing::warn!(%err, "couldn't count a timeout");
+        }
+    }
+
+    /// Messages the filter is holding for a mod, oldest first.
+    pub async fn held(&self) -> Result<Vec<Event>, EngineError> {
+        self.db(|s| repo::events::held(s, 200)).await
+    }
+
+    /// Lets a held message through: it shows in chat overlays as if it had passed (R-48).
+    pub async fn release_held(&self, event_id: &str) -> Result<(), EngineError> {
+        let id = event_id.to_string();
+        let e = self.db(move |s| repo::events::take_held(s, &id, true)).await?.ok_or(HELD_GONE)?;
+        if let Some(sid) = &e.source_id {
+            self.forget_hidden(e.platform, sid);
+        }
+        let mut public = e.clone();
+        public.raw = None;
+        self.send_overlay(crate::frames::OverlayFrame::new(crate::frames::Audience::Chat, e.seq, "event", &public));
+        Ok(())
+    }
+
+    /// Throws a held message away and deletes it on its platform.
+    pub async fn drop_held(&self, event_id: &str) -> Result<(), EngineError> {
+        let id = event_id.to_string();
+        let e = self.db(move |s| repo::events::take_held(s, &id, false)).await?.ok_or(HELD_GONE)?;
+        if let Some(mid) = e.source_id.clone().filter(|m| !m.is_empty()) {
+            self.spawn_action(e.platform, "delete a held message", move |c| {
+                Box::pin(async move { c.delete_message(&mid).await })
+            });
+        }
+        Ok(())
     }
 
     /// Bans on the source platform, adds to the shared list, and with `everywhere` bans
@@ -157,6 +197,7 @@ impl Engine {
         platform: Platform,
         user_id: &str,
         login: &str,
+        display_name: Option<&str>,
         reason: Option<String>,
         everywhere: bool,
     ) -> Result<Outcome, EngineError> {
@@ -168,6 +209,9 @@ impl Engine {
             reason: reason.clone(),
             at: now(),
             linked: Vec::new(),
+            display_name: display_name.unwrap_or(login).to_string(),
+            everywhere,
+            by: None,
         };
         if everywhere {
             let (p, uid) = (platform, user_id.to_string());
@@ -219,29 +263,28 @@ impl Engine {
         self.state().bans.clone()
     }
 
-    /// Turns panic mode on or off on every connected platform (R-50).
-    pub async fn panic(&self, on: bool) -> Result<PanicPlan, EngineError> {
+    /// Turns panic mode on or off on every connected platform (R-50). Returns what was
+    /// actually switched on each platform.
+    pub async fn panic(&self, on: bool) -> Result<PanicResult, EngineError> {
         let (cfg, connected) = {
             let st = self.state();
             let connected: Vec<_> = self.connectors().iter().map(|c| (c.platform(), c.capabilities())).collect();
             (st.panic.clone(), connected)
         };
         let plan = plan_panic(&cfg, &connected, on);
+        let mut applied = Vec::new();
+        let mut failed = Vec::new();
         for pp in &plan.platforms {
+            let mut modes = Vec::new();
             if let Some(c) = self.connector(pp.platform) {
                 for change in &pp.changes {
-                    if let Err(err) = c.set_mode(*change).await {
-                        self.send_live(LiveFrame::new(
-                            "notice",
-                            &Notice {
-                                level: NoticeLevel::Error,
-                                message: format!("Panic mode on {}: {err}", pp.platform),
-                                action: None,
-                            },
-                        ));
+                    match c.set_mode(*change).await {
+                        Ok(()) => modes.push(mode_name(change.mode).to_string()),
+                        Err(err) => failed.push(format!("{} on {}: {err}", mode_label(change.mode), pp.platform)),
                     }
                 }
             }
+            applied.push(AppliedModes { platform: pp.platform, modes });
         }
         {
             let mut st = self.state_mut();
@@ -253,8 +296,20 @@ impl Engine {
         } else if !on && cfg.pause_alerts {
             self.queue_resume().await;
         }
-        self.send_live(LiveFrame::new("panic", &json!({ "on": on, "plan": plan })));
-        Ok(plan)
+        // Every open dashboard shows the same switches and one clear line (R-22).
+        self.send_live(LiveFrame::new("panic", &json!({ "on": on, "plan": cfg })));
+        let message = if on {
+            "Panic mode is on. Chat is locked down and alerts are paused.".to_string()
+        } else {
+            "Panic mode is off. Chat and alerts are back to normal.".to_string()
+        };
+        let (level, message) = if failed.is_empty() {
+            (if on { NoticeLevel::Warn } else { NoticeLevel::Info }, message)
+        } else {
+            (NoticeLevel::Error, format!("{message} Some changes didn't apply: {}.", failed.join("; ")))
+        };
+        self.send_live(LiveFrame::new("notice", &Notice { level, message, action: None }));
+        Ok(PanicResult { on, applied })
     }
 
     pub fn panic_state(&self) -> (bool, PanicConfig) {
@@ -263,6 +318,7 @@ impl Engine {
     }
 
     pub async fn save_panic(&self, cfg: PanicConfig) -> Result<PanicConfig, EngineError> {
+        cfg.validate().map_err(EngineError::Invalid)?;
         let _one_at_a_time = self.config_lock().await;
         let saved = cfg.clone();
         self.db(move |s| repo::settings::set(s, "panic", &saved)).await?;
@@ -276,9 +332,7 @@ impl Engine {
 
     pub async fn save_filter(&self, cfg: FilterConfig) -> Result<FilterConfig, EngineError> {
         let _one_at_a_time = self.config_lock().await;
-        if cfg.terms.len() > 2_000 || cfg.terms.iter().any(|t| t.term.chars().count() > 100) {
-            return Err(EngineError::Invalid("Up to 2,000 blocked terms of up to 100 characters each.".into()));
-        }
+        cfg.validate().map_err(EngineError::Invalid)?;
         let saved = cfg.clone();
         self.db(move |s| repo::settings::set(s, "filter", &saved)).await?;
         self.state_mut().filter = cfg.clone();
@@ -446,5 +500,47 @@ impl Engine {
             .into_iter()
             .map(|(_, e)| e)
             .collect())
+    }
+}
+
+const HELD_GONE: EngineError = EngineError::Missing {
+    code: "held_not_found",
+    message: "That message isn't waiting any more.",
+    hint: "Another mod may have released or dropped it already.",
+};
+
+/// What panic mode switched on one platform.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppliedModes {
+    pub platform: Platform,
+    pub modes: Vec<String>,
+}
+
+/// `POST /mod/panic`'s answer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PanicResult {
+    pub on: bool,
+    pub applied: Vec<AppliedModes>,
+}
+
+fn mode_name(m: ferrocast_core::event::ChatMode) -> &'static str {
+    use ferrocast_core::event::ChatMode::*;
+    match m {
+        FollowersOnly => "followers_only",
+        SubscribersOnly => "subscribers_only",
+        EmoteOnly => "emote_only",
+        Slow => "slow",
+        UniqueChat => "unique_chat",
+    }
+}
+
+fn mode_label(m: ferrocast_core::event::ChatMode) -> &'static str {
+    use ferrocast_core::event::ChatMode::*;
+    match m {
+        FollowersOnly => "followers-only",
+        SubscribersOnly => "subscribers-only",
+        EmoteOnly => "emote-only",
+        Slow => "slow mode",
+        UniqueChat => "unique chat",
     }
 }
