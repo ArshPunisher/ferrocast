@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn filtered_messages_are_held_not_spoken() {
         let mut f = FilterConfig::default();
-        f.terms.push(filter::BlockedTerm { term: "badword".into(), action: filter::Action::Delete });
+        f.words.list.push("badword".into());
         assert!(matches!(decide(&on(), &f, &tip(50_000, "INR", "b4dw0rd lol")), Decision::Hold { .. }));
     }
 

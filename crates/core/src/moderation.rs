@@ -9,32 +9,55 @@ use serde::{Deserialize, Serialize};
 use crate::event::{Actor, ChatMode, Millis, Platform};
 use crate::filter::fold;
 
-/// What the streamer wants when they hit the panic button.
+/// What the streamer wants when they hit the panic button (the dashboard's shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PanicConfig {
-    /// Only accounts that have followed for at least this long may chat. `None` = off.
-    pub followers_only_minutes: Option<u32>,
+    /// Only accounts that have followed for at least `followers_only_minutes` may chat.
+    pub followers_only: bool,
+    pub followers_only_minutes: u32,
     pub emote_only: bool,
-    pub subscribers_only: bool,
-    /// Slow mode delay. `None` = off.
-    pub slow_seconds: Option<u32>,
-    /// Hold messages from accounts younger than this many days in the mod queue.
-    pub hold_new_accounts_days: Option<u32>,
+    /// Slow mode delay; 0 = leave slow mode alone.
+    pub slow_mode_seconds: u32,
+    /// Hold first-time chatters' messages for a mod while panic is on.
+    pub hold_new_accounts: bool,
     pub pause_alerts: bool,
     pub pause_tts: bool,
+    /// The global shortcut, e.g. "Ctrl+Shift+P". Empty = none.
+    #[serde(default)]
+    pub hotkey: String,
+    #[serde(default)]
+    pub subscribers_only: bool,
 }
 
 impl Default for PanicConfig {
     fn default() -> Self {
         PanicConfig {
-            followers_only_minutes: Some(10),
+            followers_only: true,
+            followers_only_minutes: 10,
             emote_only: false,
-            subscribers_only: false,
-            slow_seconds: Some(10),
-            hold_new_accounts_days: Some(7),
+            slow_mode_seconds: 10,
+            hold_new_accounts: true,
             pause_alerts: true,
             pause_tts: true,
+            hotkey: "Ctrl+Shift+P".into(),
+            subscribers_only: false,
         }
+    }
+}
+
+impl PanicConfig {
+    /// Checks limits every platform accepts; messages name the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.slow_mode_seconds > 120 {
+            return Err("slow_mode_seconds: slow mode is 1 to 120 seconds (0 leaves it alone).".into());
+        }
+        if self.followers_only_minutes > 129_600 {
+            return Err("followers_only_minutes: followers-only can be up to 90 days.".into());
+        }
+        if self.hotkey.chars().count() > 40 || self.hotkey.chars().any(char::is_control) {
+            return Err("hotkey: a shortcut like Ctrl+Shift+P, up to 40 characters.".into());
+        }
+        Ok(())
     }
 }
 
@@ -70,16 +93,24 @@ pub struct PanicPlan {
     pub platforms: Vec<PlatformPlan>,
     pub pause_alerts: bool,
     pub pause_tts: bool,
-    pub hold_new_accounts_days: Option<u32>,
+    pub hold_new_accounts: bool,
 }
 
 /// Plans panic mode `on` (or off, which reverses every mode the config would turn on).
 pub fn plan_panic(cfg: &PanicConfig, connected: &[(Platform, Capabilities)], on: bool) -> PanicPlan {
     let wanted: Vec<ModeChange> = [
-        cfg.followers_only_minutes.map(|m| ModeChange { mode: ChatMode::FollowersOnly, enabled: on, value: Some(m) }),
+        cfg.followers_only.then_some(ModeChange {
+            mode: ChatMode::FollowersOnly,
+            enabled: on,
+            value: Some(cfg.followers_only_minutes),
+        }),
         cfg.emote_only.then_some(ModeChange { mode: ChatMode::EmoteOnly, enabled: on, value: None }),
         cfg.subscribers_only.then_some(ModeChange { mode: ChatMode::SubscribersOnly, enabled: on, value: None }),
-        cfg.slow_seconds.map(|s| ModeChange { mode: ChatMode::Slow, enabled: on, value: Some(s) }),
+        (cfg.slow_mode_seconds > 0).then_some(ModeChange {
+            mode: ChatMode::Slow,
+            enabled: on,
+            value: Some(cfg.slow_mode_seconds),
+        }),
     ]
     .into_iter()
     .flatten()
@@ -99,7 +130,7 @@ pub fn plan_panic(cfg: &PanicConfig, connected: &[(Platform, Capabilities)], on:
         platforms,
         pause_alerts: cfg.pause_alerts && on,
         pause_tts: cfg.pause_tts && on,
-        hold_new_accounts_days: if on { cfg.hold_new_accounts_days } else { None },
+        hold_new_accounts: cfg.hold_new_accounts && on,
     }
 }
 
@@ -114,6 +145,14 @@ pub struct BanEntry {
     /// Other accounts of the same person the streamer linked by hand.
     #[serde(default)]
     pub linked: Vec<(Platform, String)>,
+    #[serde(default)]
+    pub display_name: String,
+    /// Banned with "ban everywhere".
+    #[serde(default)]
+    pub everywhere: bool,
+    /// Who banned them: a mod's name, or `None` for the streamer or an automatic rule.
+    #[serde(default)]
+    pub by: Option<String>,
 }
 
 /// The shared ban list across platforms.
@@ -190,13 +229,28 @@ mod tests {
     }
 
     #[test]
+    fn panic_limits_and_the_dashboard_shape() {
+        assert!(PanicConfig::default().validate().is_ok());
+        let c = PanicConfig { slow_mode_seconds: 121, ..PanicConfig::default() };
+        assert!(c.validate().unwrap_err().starts_with("slow_mode_seconds"));
+        let c = PanicConfig { hotkey: "x".repeat(41), ..PanicConfig::default() };
+        assert!(c.validate().is_err());
+        let json = r#"{"followers_only":true,"followers_only_minutes":30,"emote_only":false,"slow_mode_seconds":0,
+            "hold_new_accounts":true,"pause_alerts":true,"pause_tts":true,"hotkey":"Ctrl+Shift+P"}"#;
+        let c: PanicConfig = serde_json::from_str(json).unwrap();
+        let plan = plan_panic(&c, &[(Platform::Twitch, caps(&[ChatMode::FollowersOnly, ChatMode::Slow]))], true);
+        assert_eq!(plan.platforms[0].changes.len(), 1, "slow mode 0 is left alone");
+        assert!(plan.hold_new_accounts);
+    }
+
+    #[test]
     fn turning_panic_off_reverses_and_unpauses() {
         let plan = plan_panic(&PanicConfig::default(), &[(Platform::Kick, caps(&[ChatMode::Slow]))], false);
         assert_eq!(
             plan.platforms[0].changes,
             vec![ModeChange { mode: ChatMode::Slow, enabled: false, value: Some(10) }]
         );
-        assert!(!plan.pause_alerts && !plan.pause_tts && plan.hold_new_accounts_days.is_none());
+        assert!(!plan.pause_alerts && !plan.pause_tts && !plan.hold_new_accounts);
     }
 
     fn actor(p: Platform, id: &str, login: &str) -> Actor {
@@ -213,6 +267,9 @@ mod tests {
             reason: None,
             at: Millis(0),
             linked: vec![],
+            display_name: login.into(),
+            everywhere: false,
+            by: None,
         }
     }
 

@@ -36,66 +36,166 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockedTerm {
-    /// Written plainly; folding is applied to both sides.
-    pub term: String,
-    pub action: Action,
+/// What a filter rule does to a message it catches. Timeouts use
+/// [`FilterConfig::timeout_seconds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    #[default]
+    Delete,
+    Timeout,
+    Ban,
+    Hold,
 }
 
+/// Blocked words and phrases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FilterConfig {
+pub struct WordRule {
     pub enabled: bool,
-    pub terms: Vec<BlockedTerm>,
-    /// Links are allowed for these roles and these domains only.
-    pub links: LinkRule,
-    /// Above this share of capital letters (0–100), once a message has at least
-    /// `caps_min_letters` letters. 0 = off.
-    pub caps_percent: u8,
-    pub caps_min_letters: usize,
-    /// More than this many symbols/emoji in a row. 0 = off.
-    pub max_symbols: usize,
-    /// More than this many emotes in one message. 0 = off.
-    pub max_emotes: usize,
-    /// A character repeated more than this many times in a row. 0 = off.
-    pub max_repeat: usize,
-    pub max_length: usize,
-    /// Action for caps/symbols/emotes/repeat/length problems.
-    pub spam_action: Action,
-    /// Roles the filter never touches.
-    pub exempt: Roles,
+    /// Written plainly; folding is applied to both sides.
+    pub list: Vec<String>,
+    /// Match lookalike and disguised spellings (b4dw0rd, ｂａｄ, b.a.d). Off = plain,
+    /// case-insensitive whole-word matching.
+    pub lookalikes: bool,
+    pub action: RuleAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkRule {
     pub enabled: bool,
-    pub allowed_roles: Roles,
-    pub allowed_domains: Vec<String>,
-    /// First-time chatters posting a link is the classic scam opener.
+    /// Links are fine from these roles…
+    pub allow_roles: Roles,
+    /// …and to these domains (and their subdomains) from anyone.
+    pub allow_domains: Vec<String>,
+    pub action: RuleAction,
+    /// A first-time chatter's link waits for a mod even when their role allows links:
+    /// it is the classic scam opener.
+    #[serde(default = "yes")]
     pub hold_first_time: bool,
-    pub action: Action,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsRule {
+    pub enabled: bool,
+    /// Only messages with at least this many letters are checked.
+    pub min_length: usize,
+    /// Caught at or above this share of capitals (1–100).
+    pub max_percent: u8,
+    pub action: RuleAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmoteRule {
+    pub enabled: bool,
+    /// Caught above this many emotes in one message.
+    pub max: usize,
+    pub action: RuleAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolRule {
+    pub enabled: bool,
+    /// Caught above this share (1–100) of symbols and emoji among non-space characters,
+    /// once a message has at least 8 of them.
+    pub max_percent: u8,
+    pub action: RuleAction,
+}
+
+/// "Buy followers", "I do commissions": the bots that work through every small channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SolicitationRule {
+    pub enabled: bool,
+    pub action: RuleAction,
+}
+
+/// The moderation filters, in the dashboard's shape (API.md §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterConfig {
+    pub words: WordRule,
+    pub links: LinkRule,
+    pub caps: CapsRule,
+    pub emotes: EmoteRule,
+    pub symbols: SymbolRule,
+    pub solicitation: SolicitationRule,
+    /// How long a "timeout" action lasts: 1 second to 14 days.
+    pub timeout_seconds: u32,
+    /// Roles the filters never touch.
+    pub exempt_roles: Roles,
+    /// Longer messages are deleted (0 = no limit). Not on the dashboard yet.
+    #[serde(default = "default_max_length")]
+    pub max_length: usize,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_max_length() -> usize {
+    500
+}
+
+/// The longest timeout every platform accepts (Twitch's limit).
+pub const MAX_TIMEOUT_SECONDS: u32 = 1_209_600;
 
 impl Default for FilterConfig {
     fn default() -> Self {
         FilterConfig {
-            enabled: true,
-            terms: Vec::new(),
+            words: WordRule { enabled: true, list: Vec::new(), lookalikes: true, action: RuleAction::Delete },
             links: LinkRule {
                 enabled: true,
-                allowed_roles: Roles::BROADCASTER.union(Roles::MODERATOR).union(Roles::VIP).union(Roles::SUBSCRIBER),
-                allowed_domains: vec!["clips.twitch.tv".into(), "youtube.com".into(), "youtu.be".into()],
+                allow_roles: Roles::BROADCASTER.union(Roles::MODERATOR).union(Roles::VIP).union(Roles::SUBSCRIBER),
+                allow_domains: vec!["clips.twitch.tv".into(), "youtube.com".into(), "youtu.be".into()],
+                action: RuleAction::Delete,
                 hold_first_time: true,
-                action: Action::Delete,
             },
-            caps_percent: 80,
-            caps_min_letters: 15,
-            max_symbols: 0,
-            max_emotes: 0,
-            max_repeat: 0,
+            caps: CapsRule { enabled: true, min_length: 15, max_percent: 80, action: RuleAction::Delete },
+            emotes: EmoteRule { enabled: false, max: 15, action: RuleAction::Delete },
+            symbols: SymbolRule { enabled: false, max_percent: 50, action: RuleAction::Delete },
+            // Delete, not ban: a false match must cost a viewer one message, never their account.
+            solicitation: SolicitationRule { enabled: true, action: RuleAction::Delete },
+            timeout_seconds: 600,
+            exempt_roles: Roles::BROADCASTER.union(Roles::MODERATOR),
             max_length: 500,
-            spam_action: Action::Delete,
-            exempt: Roles::BROADCASTER.union(Roles::MODERATOR),
+        }
+    }
+}
+
+impl FilterConfig {
+    /// Checks limits; the message names the field so the dashboard can point at it.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_TIMEOUT_SECONDS).contains(&self.timeout_seconds) {
+            return Err("timeout_seconds: must be between 1 second and 14 days.".into());
+        }
+        if self.words.list.len() > 2_000 {
+            return Err("words.list: up to 2,000 words or phrases.".into());
+        }
+        if self.words.list.iter().any(|w| w.chars().count() > 100) {
+            return Err("words.list: each word or phrase can be up to 100 characters.".into());
+        }
+        if self.links.allow_domains.len() > 200 || self.links.allow_domains.iter().any(|d| d.chars().count() > 253) {
+            return Err("links.allow_domains: up to 200 domains of up to 253 characters.".into());
+        }
+        if !(1..=100).contains(&self.caps.max_percent) {
+            return Err("caps.max_percent: must be between 1 and 100.".into());
+        }
+        if self.caps.min_length > 500 {
+            return Err("caps.min_length: must be 500 or less.".into());
+        }
+        if !(1..=100).contains(&self.symbols.max_percent) {
+            return Err("symbols.max_percent: must be between 1 and 100.".into());
+        }
+        if !(1..=500).contains(&self.emotes.max) {
+            return Err("emotes.max: must be between 1 and 500.".into());
+        }
+        Ok(())
+    }
+
+    fn action(&self, a: RuleAction) -> Action {
+        match a {
+            RuleAction::Delete => Action::Delete,
+            RuleAction::Timeout => Action::Timeout { seconds: self.timeout_seconds.clamp(1, MAX_TIMEOUT_SECONDS) },
+            RuleAction::Ban => Action::Ban,
+            RuleAction::Hold => Action::Hold,
         }
     }
 }
@@ -116,52 +216,128 @@ impl Verdict {
     }
 }
 
+/// Phrases the follower-selling and "commission" bots use, folded.
+const SOLICITATION: &[&str] = &[
+    "buy followers",
+    "buy viewers",
+    "buy primes",
+    "cheap followers",
+    "cheap viewers",
+    "followers primes and viewers",
+    "do you need viewers",
+    "need more viewers",
+    "promote your stream",
+    "promote your channel",
+    "grow your stream",
+    "grow your channel",
+    "streamboo",
+    "dogehype",
+    "i do commissions",
+    "open for commissions",
+    "i make emotes",
+    "i can make emotes",
+    "i do emotes",
+    "emotes and overlays",
+    "overlays and emotes",
+    "remove the space",
+];
+
 /// Checks one message. `emotes` is the number of emote fragments.
 pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Verdict {
-    if !cfg.enabled || actor.roles.0 & cfg.exempt.0 != 0 {
+    if actor.roles.0 & cfg.exempt_roles.0 != 0 {
         return Verdict::allow();
     }
     let mut v = Verdict::allow();
     let folded = fold(text);
-    for t in &cfg.terms {
-        let needle = fold(&t.term);
-        if !needle.is_empty() && contains_term(&folded, &needle) {
-            v = v.worse(Verdict { action: t.action, reason: format!("blocked term \"{}\"", t.term) });
+    if cfg.words.enabled {
+        let plain = text.to_lowercase();
+        for term in &cfg.words.list {
+            let hit = if cfg.words.lookalikes {
+                let needle = fold(term);
+                !needle.is_empty() && contains_term(&folded, &needle)
+            } else {
+                let needle = term.trim().to_lowercase();
+                !needle.is_empty() && contains_plain(&plain, &needle)
+            };
+            if hit {
+                v = v.worse(Verdict {
+                    action: cfg.action(cfg.words.action),
+                    reason: format!("blocked term \"{term}\""),
+                });
+            }
+        }
+    }
+    if cfg.solicitation.enabled {
+        // Whole words only: "hi do emotes work" must not read as "i do emotes". A phrase
+        // spelled out letter by letter ("b u y f o l l o w e r s") folds into one word, so
+        // that word may also equal the phrase with its spaces removed.
+        let padded = format!(" {folded} ");
+        let words: Vec<&str> = folded.split(' ').collect();
+        let hit = SOLICITATION.iter().find(|p| {
+            let f = fold(p);
+            padded.contains(&format!(" {f} ")) || words.contains(&f.replace(' ', "").as_str())
+        });
+        if let Some(p) = hit {
+            v = v.worse(Verdict { action: cfg.action(cfg.solicitation.action), reason: format!("selling (\"{p}\")") });
         }
     }
     if cfg.links.enabled && has_link(text) {
-        let role_ok = actor.roles.0 & cfg.links.allowed_roles.0 != 0;
-        let domain_ok = links(text).iter().all(|d| domain_allowed(d, &cfg.links.allowed_domains));
+        let role_ok = actor.roles.0 & cfg.links.allow_roles.0 != 0;
+        let domain_ok = links(text).iter().all(|d| domain_allowed(d, &cfg.links.allow_domains));
         if actor.roles.contains(Roles::FIRST_TIME) && cfg.links.hold_first_time && !domain_ok {
             v = v.worse(Verdict { action: Action::Hold, reason: "first message has a link".into() });
         }
         // Independent of the hold above so the stronger action wins: a first-time
         // non-subscriber's scam link is deleted, not merely held.
         if !role_ok && !domain_ok {
-            v = v.worse(Verdict { action: cfg.links.action, reason: "link not allowed".into() });
+            v = v.worse(Verdict { action: cfg.action(cfg.links.action), reason: "link not allowed".into() });
         }
     }
-    let spam = |reason: String| Verdict { action: cfg.spam_action, reason };
     if cfg.max_length > 0 && text.chars().count() > cfg.max_length {
-        v = v.worse(spam(format!("longer than {} characters", cfg.max_length)));
+        v = v.worse(Verdict { action: Action::Delete, reason: format!("longer than {} characters", cfg.max_length) });
     }
-    let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
-    if cfg.caps_percent > 0 && letters.len() >= cfg.caps_min_letters.max(1) {
-        let caps = letters.iter().filter(|c| c.is_uppercase()).count();
-        if caps * 100 >= letters.len() * usize::from(cfg.caps_percent) {
-            v = v.worse(spam("too many capitals".into()));
+    if cfg.caps.enabled {
+        let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+        if letters.len() >= cfg.caps.min_length.max(1) {
+            let caps = letters.iter().filter(|c| c.is_uppercase()).count();
+            if caps * 100 >= letters.len() * usize::from(cfg.caps.max_percent.max(1)) {
+                v = v.worse(Verdict { action: cfg.action(cfg.caps.action), reason: "too many capitals".into() });
+            }
         }
     }
-    if cfg.max_symbols > 0 && longest_run(text, |c| !c.is_alphanumeric() && !c.is_whitespace()) > cfg.max_symbols {
-        v = v.worse(spam("too many symbols".into()));
+    if cfg.symbols.enabled {
+        let visible: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let symbols = visible.iter().filter(|c| is_symbol(**c)).count();
+        if visible.len() >= 8 && symbols * 100 > visible.len() * usize::from(cfg.symbols.max_percent.max(1)) {
+            v = v.worse(Verdict { action: cfg.action(cfg.symbols.action), reason: "too many symbols".into() });
+        }
     }
-    if cfg.max_emotes > 0 && emotes > cfg.max_emotes {
-        v = v.worse(spam(format!("more than {} emotes", cfg.max_emotes)));
-    }
-    if cfg.max_repeat > 0 && longest_same_char(text) > cfg.max_repeat {
-        v = v.worse(spam("repeated characters".into()));
+    if cfg.emotes.enabled && emotes > cfg.emotes.max {
+        v = v.worse(Verdict {
+            action: cfg.action(cfg.emotes.action),
+            reason: format!("more than {} emotes", cfg.emotes.max),
+        });
     }
     v
+}
+
+/// Punctuation, symbols and emoji, but not letters or marks of any script (Devanagari
+/// vowel signs are marks, not symbols).
+fn is_symbol(c: char) -> bool {
+    !c.is_alphanumeric() && !c.is_whitespace() && !is_combining(c)
+}
+
+fn is_combining(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036f}' | '\u{0900}'..='\u{097f}' | '\u{0980}'..='\u{0dff}' | '\u{200c}' | '\u{200d}' | '\u{fe0f}')
+}
+
+/// Case-insensitive whole-word (or whole-phrase) match without folding.
+fn contains_plain(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(i, m)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + m.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// Folds text for matching (see module docs). Output is lowercase ASCII-ish words
@@ -304,29 +480,6 @@ fn domain_allowed(domain: &str, allowed: &[String]) -> bool {
     })
 }
 
-fn longest_run(text: &str, pred: impl Fn(char) -> bool) -> usize {
-    let (mut best, mut cur) = (0, 0);
-    for c in text.chars() {
-        if pred(c) {
-            cur += 1;
-            best = best.max(cur);
-        } else {
-            cur = 0;
-        }
-    }
-    best
-}
-
-fn longest_same_char(text: &str) -> usize {
-    let (mut best, mut cur, mut last) = (0, 0, None);
-    for c in text.chars() {
-        cur = if Some(c) == last { cur + 1 } else { 1 };
-        last = Some(c);
-        best = best.max(cur);
-    }
-    best
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,10 +490,10 @@ mod tests {
     }
 
     fn cfg_with(term: &str) -> FilterConfig {
-        FilterConfig {
-            terms: vec![BlockedTerm { term: term.into(), action: Action::Timeout { seconds: 600 } }],
-            ..FilterConfig::default()
-        }
+        let mut c = FilterConfig { timeout_seconds: 600, ..FilterConfig::default() };
+        c.words.list = vec![term.into()];
+        c.words.action = RuleAction::Timeout;
+        c
     }
 
     #[test]
@@ -365,6 +518,17 @@ mod tests {
     }
 
     #[test]
+    fn lookalikes_off_matches_plain_words_only() {
+        let mut cfg = cfg_with("badword");
+        cfg.words.lookalikes = false;
+        assert_eq!(check(&cfg, &viewer(), "a BadWord here", 0).action, Action::Timeout { seconds: 600 });
+        assert_eq!(check(&cfg, &viewer(), "b4dw0rd", 0).action, Action::Allow);
+        assert_eq!(check(&cfg, &viewer(), "xxbadwordxx", 0).action, Action::Allow, "whole words");
+        cfg.words.enabled = false;
+        assert_eq!(check(&cfg, &viewer(), "badword", 0).action, Action::Allow);
+    }
+
+    #[test]
     fn short_terms_match_whole_words_only() {
         let cfg = cfg_with("ass");
         assert_eq!(check(&cfg, &viewer(), "first class assistant", 0).action, Action::Allow);
@@ -372,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn mods_and_broadcaster_are_exempt() {
+    fn exempt_roles_are_never_filtered() {
         let cfg = cfg_with("badword");
         let mut m = viewer();
         m.roles = Roles::MODERATOR;
@@ -380,9 +544,38 @@ mod tests {
     }
 
     #[test]
-    fn links_by_role_domain_and_first_time() {
+    fn follower_sellers_and_commission_bots() {
         let cfg = FilterConfig::default();
-        assert_eq!(check(&cfg, &viewer(), "buy followers at cheap-viewz.com", 0).action, Action::Delete);
+        for spam in [
+            "Wanna become famous? Buy followers, primes and viewers on example . com",
+            "Hey! I'm a graphic designer, I make emotes and overlays",
+            "Hey! I'm a graphic designer and i do commissions",
+            "b u y  f o l l o w e r s",
+            "Do you need viewers?",
+            "streamboo .com (remove the space)",
+        ] {
+            assert_eq!(check(&cfg, &viewer(), spam, 0).action, Action::Delete, "{spam:?}");
+        }
+        for fine in [
+            "how do you get followers",
+            "nice emotes!",
+            "I need more coffee",
+            "the designer of this game",
+            "hi do emotes work here",
+            "hi make emotes for the sub tiers?",
+            "you are the best viewers",
+            "I want to become famous",
+            "I'm a graphic designer too",
+        ] {
+            assert_eq!(check(&cfg, &viewer(), fine, 0).action, Action::Allow, "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn links_by_role_domain_and_first_time() {
+        let mut cfg = FilterConfig::default();
+        cfg.solicitation.enabled = false;
+        assert_eq!(check(&cfg, &viewer(), "check cheap-viewz.com", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), "cheap-viewz . com", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), "hxxps://scam.ru/x", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), "watch https://www.youtube.com/watch?v=1", 0).action, Action::Allow);
@@ -411,29 +604,72 @@ mod tests {
         for spam in ["cheap.xyz", "bit.ly/abc", "free-followers.gg", "discord.gg/scam"] {
             assert_eq!(check(&cfg, &viewer(), spam, 0).action, Action::Delete, "{spam:?} is a link");
         }
+        cfg.links.action = RuleAction::Timeout;
+        assert_eq!(check(&cfg, &viewer(), "cheap.xyz", 0).action, Action::Timeout { seconds: 600 });
     }
 
     #[test]
     fn spam_rules() {
-        let cfg = FilterConfig { max_symbols: 5, max_emotes: 3, max_repeat: 10, ..FilterConfig::default() };
+        let mut cfg = FilterConfig::default();
+        cfg.symbols.enabled = true;
+        cfg.emotes.enabled = true;
+        cfg.emotes.max = 3;
         assert_eq!(check(&cfg, &viewer(), "THIS IS ALL CAPS SHOUTING", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), "OK", 0).action, Action::Allow, "short caps are fine");
-        assert_eq!(check(&cfg, &viewer(), "lol !!!!!!!!", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "lol !!!!!!!!!!!!", 0).action, Action::Delete);
+        assert_eq!(check(&cfg, &viewer(), "wow!!", 0).action, Action::Allow, "a little punctuation is fine");
         assert_eq!(check(&cfg, &viewer(), "hi", 4).action, Action::Delete);
-        assert_eq!(check(&cfg, &viewer(), "nooooooooooooooo", 0).action, Action::Delete);
         assert_eq!(check(&cfg, &viewer(), &"a ".repeat(400), 0).action, Action::Delete);
-        assert_eq!(check(&cfg, &viewer(), "नमस्ते दोस्तों, कैसे हो", 0).action, Action::Allow, "Devanagari isn't 'symbols'");
+        assert_eq!(
+            check(&cfg, &viewer(), "नमस्ते दोस्तों, कैसे हो आप सब", 0).action,
+            Action::Allow,
+            "Devanagari isn't 'symbols'"
+        );
+        cfg.caps.enabled = false;
+        assert_eq!(check(&cfg, &viewer(), "THIS IS ALL CAPS SHOUTING", 0).action, Action::Allow);
     }
 
     #[test]
-    fn worst_action_wins_and_disabled_allows() {
+    fn worst_action_wins() {
         let mut cfg = cfg_with("badword");
-        cfg.terms.push(BlockedTerm { term: "nuke".into(), action: Action::Ban });
-        let v = check(&cfg, &viewer(), "nuke badword", 0);
+        cfg.links.action = RuleAction::Ban;
+        let v = check(&cfg, &viewer(), "badword cheap.xyz", 0);
         assert_eq!(v.action, Action::Ban);
-        assert!(v.reason.contains("nuke"));
-        cfg.enabled = false;
-        assert_eq!(check(&cfg, &viewer(), "nuke", 0).action, Action::Allow);
+        assert!(v.reason.contains("link"));
+    }
+
+    #[test]
+    fn limits_name_the_field() {
+        assert!(FilterConfig::default().validate().is_ok());
+        let bad = [
+            FilterConfig { timeout_seconds: 0, ..FilterConfig::default() },
+            FilterConfig { timeout_seconds: MAX_TIMEOUT_SECONDS + 1, ..FilterConfig::default() },
+        ];
+        for b in bad {
+            assert!(b.validate().unwrap_err().starts_with("timeout_seconds"));
+        }
+        let mut c = FilterConfig::default();
+        c.caps.max_percent = 0;
+        assert!(c.validate().unwrap_err().starts_with("caps.max_percent"));
+        let mut c = FilterConfig::default();
+        c.words.list = vec!["x".repeat(101)];
+        assert!(c.validate().unwrap_err().starts_with("words.list"));
+    }
+
+    #[test]
+    fn the_dashboard_shape_round_trips() {
+        let json = r#"{"words":{"enabled":true,"list":["a"],"lookalikes":true,"action":"delete"},
+            "links":{"enabled":true,"allow_roles":14,"allow_domains":["youtu.be"],"action":"delete"},
+            "caps":{"enabled":true,"min_length":12,"max_percent":70,"action":"delete"},
+            "emotes":{"enabled":false,"max":15,"action":"delete"},
+            "symbols":{"enabled":false,"max_percent":50,"action":"timeout"},
+            "solicitation":{"enabled":true,"action":"ban"},"timeout_seconds":600,"exempt_roles":3}"#;
+        let c: FilterConfig = serde_json::from_str(json).unwrap();
+        assert!(c.links.hold_first_time, "fields the dashboard doesn't send keep their defaults");
+        assert_eq!(c.max_length, 500);
+        assert_eq!(c.symbols.action, RuleAction::Timeout);
+        let back = serde_json::to_value(&c).unwrap();
+        assert_eq!(back["links"]["allow_roles"], 14);
     }
 
     #[test]
