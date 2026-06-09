@@ -16,7 +16,8 @@ fn main() {
                 .then_some(sibling)
         })
         .unwrap_or_else(|| manifest.join("placeholder"));
-    let chosen = chosen.canonicalize().unwrap_or(chosen);
+    // Not canonicalised: on Windows that gives a `\\?\` path, and rust-embed's
+    // "/dashboard" join doesn't work on those. The manifest dir is already absolute.
     println!("cargo:rerun-if-changed={}", chosen.display());
     println!("cargo:rustc-env=FERROCAST_WEB_DIR={}", chosen.display());
 }
