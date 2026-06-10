@@ -192,7 +192,7 @@ pub fn export(store: &Store, out: &Path, app_version: &str) -> Result<Manifest> 
     zip.start_file("manifest.json", opts).map_err(zerr)?;
     zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
     zip.finish().map_err(zerr)?.sync_all()?;
-    std::fs::rename(&tmp, out)?;
+    crate::backup::rename_patiently(&tmp, out)?;
     Ok(manifest)
 }
 
@@ -344,7 +344,7 @@ pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
     let dir = store.dir().join("media");
     std::fs::create_dir_all(&dir)?;
     for id in media {
-        std::fs::rename(staging.join(&id), dir.join(&id))
+        crate::backup::rename_patiently(&staging.join(&id), &dir.join(&id))
             .or_else(|_| std::fs::copy(staging.join(&id), dir.join(&id)).map(|_| ()))?;
         report.media_files += 1;
     }

@@ -29,7 +29,7 @@ pub fn snapshot(conn: &Connection, dir: &Path, label: &str) -> Result<PathBuf> {
     let path = backups.join(&name);
     let _ = std::fs::remove_file(&tmp);
     conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()]).map_err(|e| StoreError::Backup(e.to_string()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| StoreError::Backup(e.to_string()))?;
+    rename_patiently(&tmp, &path).map_err(|e| StoreError::Backup(e.to_string()))?;
     rotate(&backups)?;
     Ok(path)
 }
@@ -94,10 +94,26 @@ pub fn apply_scheduled_restore(dir: &Path) -> Result<Option<String>> {
     for ext in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(dir.join(format!("ferrocast.db{ext}")));
     }
-    std::fs::rename(&tmp, &db)?;
+    rename_patiently(&tmp, &db)?;
     // Only now is the restore done; a crash earlier retries it on the next start.
     std::fs::remove_file(&marker)?;
     Ok(Some(id))
+}
+
+/// Renames, retrying for up to about two seconds when the OS says the file is busy: on
+/// Windows an antivirus scan or the search indexer often holds a just-written file.
+pub(crate) fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut wait = std::time::Duration::from_millis(25);
+    for _ in 0..7 {
+        match std::fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            other => return other,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 fn rotate(backups: &Path) -> Result<()> {

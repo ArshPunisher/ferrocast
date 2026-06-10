@@ -108,7 +108,7 @@ pub fn save(store: &Store, name: &str, data: &[u8]) -> std::result::Result<Media
     std::fs::create_dir_all(&dir).map_err(StoreError::from)?;
     let tmp = dir.join(format!("{id}.partial"));
     std::fs::write(&tmp, data).map_err(StoreError::from)?;
-    std::fs::rename(&tmp, dir.join(&id)).map_err(StoreError::from)?;
+    crate::backup::rename_patiently(&tmp, &dir.join(&id)).map_err(StoreError::from)?;
     let clean_name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
     let m = Media {
         id,
