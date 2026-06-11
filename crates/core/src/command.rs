@@ -34,12 +34,16 @@ impl Access {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
+    /// Blank when creating; the engine picks one.
+    #[serde(default)]
     pub id: String,
     /// With the prefix, e.g. "!discord". Matching ignores case.
     pub name: String,
     #[serde(default)]
     pub aliases: Vec<String>,
     pub response: String,
+    /// Who may use it (`roles` in the API: "everyone", "subs", "vips", "mods").
+    #[serde(rename = "roles", alias = "access")]
     pub access: Access,
     pub cooldown_s: u32,
     pub user_cooldown_s: u32,
@@ -329,6 +333,7 @@ mod tests {
 /// happened since the last post (so it never talks to an empty room).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timer {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     pub message: String,
