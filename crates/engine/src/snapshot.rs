@@ -145,7 +145,7 @@ impl Engine {
                     (w.id.clone(), json!(text))
                 })
                 .collect();
-            (st.goals.clone(), viewers, labels)
+            (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers, labels)
         };
         let view = self.overlay_view(o);
         Ok(json!({

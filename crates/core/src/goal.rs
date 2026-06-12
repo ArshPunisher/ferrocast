@@ -81,9 +81,139 @@ pub fn apply(goal: &mut Goal, delta: i64) {
     goal.current = goal.current.saturating_add(delta);
 }
 
+/// A goal as the dashboard and overlays see it: tips goals in major units of their
+/// currency (₹3,450 is `3450`), everything else as plain counts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalView {
+    #[serde(default)]
+    pub id: String,
+    pub title: String,
+    pub kind: GoalKind,
+    pub target: f64,
+    #[serde(default)]
+    pub current: f64,
+    #[serde(default)]
+    pub currency: Option<String>,
+    #[serde(default)]
+    pub starts_at: Millis,
+    #[serde(default)]
+    pub ends_at: Option<Millis>,
+}
+
+impl Goal {
+    /// How many minor units one displayed unit is: 100 for a ₹ goal, 1 for counts.
+    pub fn scale(&self) -> i64 {
+        match (&self.kind, &self.currency) {
+            (GoalKind::Tips, Some(c)) => 10i64.pow(crate::money::exponent(&c.to_ascii_uppercase())),
+            _ => 1,
+        }
+    }
+
+    pub fn view(&self) -> GoalView {
+        let scale = self.scale() as f64;
+        GoalView {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            kind: self.kind,
+            target: self.target as f64 / scale,
+            current: self.current as f64 / scale,
+            currency: self.currency.clone(),
+            starts_at: self.starts_at,
+            ends_at: self.ends_at,
+        }
+    }
+
+    /// A displayed amount (major units for tips) in this goal's stored units, rounded.
+    /// Count goals (follows, subs, bits) take whole numbers only.
+    pub fn to_units(&self, shown: f64) -> Result<i64, String> {
+        if self.kind != GoalKind::Tips && shown.fract() != 0.0 {
+            return Err("This goal counts whole numbers.".into());
+        }
+        let v = (shown * self.scale() as f64).round();
+        if !v.is_finite() || v.abs() > 1e15 {
+            return Err("That amount is too large.".into());
+        }
+        Ok(v as i64)
+    }
+}
+
+impl GoalView {
+    /// Back to a stored goal. `current` comes from the store, never from the dashboard.
+    pub fn into_goal(self) -> Result<Goal, String> {
+        let currency = self.currency.clone().map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty());
+        if self.kind == GoalKind::Tips
+            && !currency.as_deref().is_some_and(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase()))
+        {
+            return Err("A tips goal needs a currency, like INR or USD.".into());
+        }
+        if !self.target.is_finite() || self.target <= 0.0 {
+            return Err("The target must be more than zero.".into());
+        }
+        if self.kind != GoalKind::Tips && self.target.fract() != 0.0 {
+            return Err("The target must be a whole number.".into());
+        }
+        if self.kind != GoalKind::Tips && self.currency.is_some() {
+            return Err("Only tips goals have a currency.".into());
+        }
+        let title = self.title.trim();
+        if title.is_empty() || title.chars().count() > 80 {
+            return Err("A goal needs a title of up to 80 characters.".into());
+        }
+        let mut g = Goal {
+            id: self.id,
+            title: self.title,
+            kind: self.kind,
+            target: 0,
+            current: 0,
+            currency,
+            starts_at: self.starts_at,
+            ends_at: self.ends_at,
+        };
+        g.target = g.to_units(self.target)?;
+        if g.target < 1 {
+            return Err("The target is smaller than the currency's smallest unit.".into());
+        }
+        Ok(g)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tips_goals_show_major_units() {
+        let g = Goal {
+            id: "mic".into(),
+            title: "Mic".into(),
+            kind: GoalKind::Tips,
+            target: 500_000,
+            current: 345_050,
+            currency: Some("INR".into()),
+            starts_at: Millis(0),
+            ends_at: None,
+        };
+        let v = g.view();
+        assert_eq!((v.target, v.current), (5_000.0, 3_450.5));
+        let back = v.clone().into_goal().unwrap();
+        assert_eq!(back.target, 500_000);
+        assert_eq!(back.current, 0, "progress never comes from the dashboard");
+        let yen = Goal { currency: Some("jpy".into()), target: 9_000, ..g.clone() };
+        assert_eq!(yen.view().target, 9_000.0);
+        let follows = Goal { kind: GoalKind::Follows, currency: None, target: 100, ..g.clone() };
+        assert_eq!(follows.view().target, 100.0);
+        assert!(GoalView { currency: None, ..v.clone() }.into_goal().is_err(), "tips need a currency");
+        assert!(GoalView { target: 0.0, ..v.clone() }.into_goal().is_err());
+        assert!(GoalView { target: f64::NAN, ..v.clone() }.into_goal().is_err());
+        assert!(GoalView { target: 1e300, ..v.clone() }.into_goal().is_err());
+        assert!(GoalView { target: 0.001, ..v.clone() }.into_goal().is_err(), "rounds to nothing");
+        let count = GoalView { kind: GoalKind::Follows, currency: None, target: 2.5, ..v.clone() };
+        assert!(count.into_goal().is_err(), "half a follower");
+        assert!(GoalView { kind: GoalKind::Subs, ..v.clone() }.into_goal().is_err(), "a sub goal with a currency");
+        assert!(GoalView { title: "  ".into(), ..v }.into_goal().is_err());
+        assert!(follows.to_units(0.4).is_err());
+        assert_eq!(g.to_units(12.345).unwrap(), 1_235, "rounded to the paisa");
+    }
     use crate::event::{Actor, PaymentStatus, Platform, Tier, TipProvider};
     use crate::money::{Money, PlatformValue};
 

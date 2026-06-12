@@ -37,8 +37,23 @@ pub fn save(store: &Store, goal: &Goal) -> Result<()> {
     if goal.kind == ferrocast_core::goal::GoalKind::Tips && goal.currency.is_none() {
         return Err(StoreError::Conflict("a tips goal needs a currency".into()));
     }
-    let json = serde_json::to_string(goal)?;
     store.write(|tx| {
+        // Progress comes from the stored row, read in the same transaction: a tip counted
+        // while the dashboard edits the title must not be overwritten.
+        let stored: Option<String> =
+            tx.query_row("SELECT goal FROM goals WHERE id = ?1", [&goal.id], |r| r.get(0)).optional()?;
+        let mut goal = goal.clone();
+        if let Some(old) = stored.and_then(|j| serde_json::from_str::<Goal>(&j).ok()) {
+            let unit_changed = old.kind != goal.kind || old.currency != goal.currency;
+            if unit_changed && old.current != 0 {
+                return Err(StoreError::Conflict(
+                    "This goal already has progress, so its kind and currency can't change. Make a new goal instead."
+                        .into(),
+                ));
+            }
+            goal.current = if unit_changed { 0 } else { old.current };
+        }
+        let json = serde_json::to_string(&goal)?;
         tx.execute(
             "INSERT INTO goals(id, goal) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET goal = excluded.goal",
             params![goal.id, json],

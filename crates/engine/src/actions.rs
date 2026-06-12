@@ -406,9 +406,11 @@ impl Engine {
         let saved = goal.clone();
         self.db(move |s| repo::goals::save(s, &saved)).await?;
         let goals = self.db(repo::goals::list).await?;
+        // The stored goal keeps its real progress, whatever `current` was sent.
+        let stored = goals.iter().find(|g| g.id == goal.id).cloned().unwrap_or(goal);
         self.state_mut().goals = goals;
-        self.broadcast_goals(self.current_seq());
-        Ok(goal)
+        self.broadcast_goals(self.next_seq());
+        Ok(stored)
     }
 
     pub async fn delete_goal(&self, id: &str) -> Result<(), EngineError> {
@@ -417,7 +419,7 @@ impl Engine {
         self.db(move |s| repo::goals::delete(s, &gid)).await?;
         let goals = self.db(repo::goals::list).await?;
         self.state_mut().goals = goals;
-        self.broadcast_goals(self.current_seq());
+        self.broadcast_goals(self.next_seq());
         Ok(())
     }
 
@@ -431,7 +433,7 @@ impl Engine {
                 *slot = g.clone();
             }
         }
-        self.broadcast_goals(self.current_seq());
+        self.broadcast_goals(self.next_seq());
         Ok(g)
     }
 

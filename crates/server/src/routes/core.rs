@@ -5,9 +5,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use ferrocast_core::alert::AlertRule;
-use ferrocast_core::goal::Goal;
+use ferrocast_core::goal::{Goal, GoalView};
 use ferrocast_core::overlay::{Overlay, Preset, Widget};
-use ferrocast_engine::state::EngineSettings;
 use ferrocast_store::{backup, repo};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -259,32 +258,39 @@ pub async fn why(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
     Ok(Json(json!(w)))
 }
 
-pub async fn goals(State(app): State<AppState>) -> Json<Value> {
-    Json(json!(app.engine.goals()))
+fn goal_views(goals: &[Goal]) -> Value {
+    json!(goals.iter().map(Goal::view).collect::<Vec<_>>())
 }
 
-pub async fn create_goal(State(app): State<AppState>, Body(mut g): Body<Goal>) -> ApiResult<impl IntoResponse> {
+/// Goals in display units: tips goals in major units of their currency (API-REQUESTS R14).
+pub async fn goals(State(app): State<AppState>) -> Json<Value> {
+    Json(goal_views(&app.engine.goals()))
+}
+
+pub async fn create_goal(State(app): State<AppState>, Body(v): Body<GoalView>) -> ApiResult<impl IntoResponse> {
+    let mut g = v.into_goal().map_err(ApiError::invalid)?;
     if g.id.trim().is_empty() {
         g.id = ferrocast_store::new_id();
     }
     if app.engine.goals().iter().any(|x| x.id == g.id) {
         return Err(ApiError::new(StatusCode::CONFLICT, "conflict", "A goal with that id already exists."));
     }
-    Ok((StatusCode::CREATED, Json(json!(app.engine.save_goal(g).await?))))
+    Ok((StatusCode::CREATED, Json(json!(app.engine.save_goal(g).await?.view()))))
 }
 
 pub async fn update_goal(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    Body(mut g): Body<Goal>,
+    Body(v): Body<GoalView>,
 ) -> ApiResult<Json<Value>> {
     let Some(current) = app.engine.goals().into_iter().find(|x| x.id == id) else {
         return Err(ApiError::not_found("goal"));
     };
+    let mut g = v.into_goal().map_err(ApiError::invalid)?;
     g.id = id;
     // Progress only moves through events and "adjust", never by editing the goal.
     g.current = current.current;
-    Ok(Json(json!(app.engine.save_goal(g).await?)))
+    Ok(Json(json!(app.engine.save_goal(g).await?.view())))
 }
 
 pub async fn delete_goal(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
@@ -294,7 +300,8 @@ pub async fn delete_goal(State(app): State<AppState>, Path(id): Path<String>) ->
 
 #[derive(Deserialize)]
 pub struct Adjust {
-    delta: i64,
+    /// In display units, like the goal itself (₹ for a rupee tips goal).
+    delta: f64,
 }
 
 pub async fn adjust_goal(
@@ -302,21 +309,27 @@ pub async fn adjust_goal(
     Path(id): Path<String>,
     Body(b): Body<Adjust>,
 ) -> ApiResult<Json<Value>> {
-    if b.delta.unsigned_abs() > 1_000_000_000 {
+    let Some(goal) = app.engine.goals().into_iter().find(|x| x.id == id) else {
+        return Err(ApiError::not_found("goal"));
+    };
+    let delta = goal.to_units(b.delta).map_err(ApiError::invalid)?;
+    if delta.unsigned_abs() > 1_000_000_000_000 {
         return Err(ApiError::invalid("That change is too large."));
     }
-    Ok(Json(json!(app.engine.adjust_goal(&id, b.delta).await?)))
+    Ok(Json(json!(app.engine.adjust_goal(&id, delta).await?.view())))
 }
 
 pub async fn settings(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.settings()))
 }
 
-pub async fn save_settings(State(app): State<AppState>, Body(s): Body<EngineSettings>) -> ApiResult<Json<Value>> {
-    if !(1..=3650).contains(&s.keep_chat_days) {
-        return Err(ApiError::invalid("Keep chat for 1 to 3650 days."));
-    }
-    Ok(Json(json!(app.engine.save_settings(s).await?)))
+/// Saves the fields that were sent and keeps the rest, so an older dashboard that doesn't
+/// know a setting can't reset it.
+pub async fn save_settings(State(app): State<AppState>, Body(patch): Body<Value>) -> ApiResult<Json<Value>> {
+    let Some(patch) = patch.as_object() else {
+        return Err(ApiError::invalid("Settings must be an object."));
+    };
+    Ok(Json(json!(app.engine.patch_settings(patch).await?)))
 }
 
 pub async fn backups(State(app): State<AppState>) -> ApiResult<Json<Value>> {

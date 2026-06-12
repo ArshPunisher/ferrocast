@@ -467,15 +467,44 @@ impl Engine {
     }
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {
-        let goals = self.state().goals.clone();
+        let goals: Vec<_> = self.state().goals.iter().map(ferrocast_core::goal::Goal::view).collect();
         self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "goals": goals })));
         self.send_live(LiveFrame::new("goals", &goals));
     }
 
     pub(crate) async fn push_tts_pending(&self) {
-        if let Ok(list) = self.db(repo::events::pending_tts).await {
+        if let Ok(list) = self.tts_pending().await {
             self.send_live(LiveFrame::new("tts_pending", &list));
         }
+    }
+
+    /// Messages waiting for TTS approval, with who sent them and what they paid (R-48).
+    pub async fn tts_pending(&self) -> Result<Vec<serde_json::Value>, crate::EngineError> {
+        let list = self.db(repo::events::pending_tts).await?;
+        Ok(list
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "event_id": p.event_id,
+                    "platform": p.platform.unwrap_or_else(|| "ferrocast".into()),
+                    "name": p.name.unwrap_or_else(|| "Someone".into()),
+                    "text": p.text,
+                    "amount": p.amount,
+                    "received_at": p.created_at,
+                })
+            })
+            .collect())
+    }
+}
+
+fn platform_label(p: Platform) -> &'static str {
+    match p {
+        Platform::Twitch => "Twitch",
+        Platform::Youtube => "YouTube",
+        Platform::Kick => "Kick",
+        Platform::Tips => "Tips",
+        Platform::Ferrocast => "Ferrocast",
     }
 }
 
