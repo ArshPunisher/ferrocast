@@ -415,6 +415,15 @@ impl EventKind {
         }
     }
 
+    /// What was paid, written for people ("₹500", "1,000 bits"), if anything.
+    pub fn amount_display(&self) -> Option<String> {
+        match self {
+            EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } => Some(money.display()),
+            EventKind::PlatformGift { value, .. } => Some(value.display()),
+            _ => None,
+        }
+    }
+
     /// Kinds an alert box can show. Chat, moderation and health events never alert.
     ///
     /// A gifted subscription is one recipient of a gift batch: the batch alerts once

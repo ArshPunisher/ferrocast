@@ -387,6 +387,9 @@ impl Engine {
                 event_id: e.id.clone(),
                 text: text.clone(),
                 created_at: now().0,
+                platform: Some(platform_key(e.platform).to_string()),
+                name: e.kind.actor().map(|a| a.display_name.clone()),
+                amount: e.kind.amount_display(),
             };
             let _ = self.db(move |s| repo::events::add_pending_tts(s, &p)).await;
             self.push_tts_pending().await;

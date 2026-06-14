@@ -213,13 +213,35 @@ pub struct PendingTts {
     pub event_id: String,
     pub text: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// For people: "₹500", "1,000 bits".
+    #[serde(default)]
+    pub amount: Option<String>,
+}
+
+const PENDING_COLS: &str = "id, event_id, text, created_at, platform, name, amount";
+
+fn pending_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingTts> {
+    Ok(PendingTts {
+        id: r.get(0)?,
+        event_id: r.get(1)?,
+        text: r.get(2)?,
+        created_at: r.get(3)?,
+        platform: r.get(4)?,
+        name: r.get(5)?,
+        amount: r.get(6)?,
+    })
 }
 
 pub fn add_pending_tts(store: &Store, p: &PendingTts) -> Result<()> {
     store.write(|tx| {
         tx.execute(
-            "INSERT OR REPLACE INTO tts_pending(id, event_id, text, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![p.id, p.event_id, p.text, p.created_at],
+            "INSERT OR REPLACE INTO tts_pending(id, event_id, text, created_at, platform, name, amount)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![p.id, p.event_id, p.text, p.created_at, p.platform, p.name, p.amount],
         )?;
         Ok(())
     })
@@ -227,10 +249,8 @@ pub fn add_pending_tts(store: &Store, p: &PendingTts) -> Result<()> {
 
 pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
     store.read(|c| {
-        let mut st = c.prepare("SELECT id, event_id, text, created_at FROM tts_pending ORDER BY created_at")?;
-        let rows = st.query_map([], |r| {
-            Ok(PendingTts { id: r.get(0)?, event_id: r.get(1)?, text: r.get(2)?, created_at: r.get(3)? })
-        })?;
+        let mut st = c.prepare(&format!("SELECT {PENDING_COLS} FROM tts_pending ORDER BY created_at LIMIT 500"))?;
+        let rows = st.query_map([], pending_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     })
 }
@@ -239,9 +259,7 @@ pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
 pub fn take_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
     store.write(|tx| {
         let p = tx
-            .query_row("SELECT id, event_id, text, created_at FROM tts_pending WHERE id = ?1", [id], |r| {
-                Ok(PendingTts { id: r.get(0)?, event_id: r.get(1)?, text: r.get(2)?, created_at: r.get(3)? })
-            })
+            .query_row(&format!("SELECT {PENDING_COLS} FROM tts_pending WHERE id = ?1"), [id], pending_row)
             .optional()?;
         tx.execute("DELETE FROM tts_pending WHERE id = ?1", [id])?;
         Ok(p)
@@ -379,7 +397,15 @@ mod tests {
     fn tts_pending_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let p = PendingTts { id: "t1".into(), event_id: "e1".into(), text: "hi".into(), created_at: 1 };
+        let p = PendingTts {
+            id: "t1".into(),
+            event_id: "e1".into(),
+            text: "hi".into(),
+            created_at: 1,
+            platform: Some("twitch".into()),
+            name: Some("Asha".into()),
+            amount: Some("₹500".into()),
+        };
         add_pending_tts(&s, &p).unwrap();
         add_pending_tts(&s, &PendingTts { id: "t2".into(), ..p.clone() }).unwrap();
         assert_eq!(pending_tts(&s).unwrap().len(), 2);

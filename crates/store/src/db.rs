@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_moderation_flags.sql"),
     include_str!("../migrations/0003_held_and_timeouts.sql"),
+    include_str!("../migrations/0004_tts_pending_details.sql"),
 ];
 
 /// Schema version this build understands.
