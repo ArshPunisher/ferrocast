@@ -191,7 +191,10 @@ impl Engine {
                 }
             }
             EventKind::StreamOffline => {
-                self.state_mut().live.insert(e.platform, false);
+                let mut st = self.state_mut();
+                st.live.insert(e.platform, false);
+                // An ended stream's last count must not keep adding to the peak.
+                st.viewers.remove(&e.platform);
             }
             EventKind::Reversal { original_source_id, reason } => {
                 self.reverse(e.platform, original_source_id, *reason).await;
@@ -450,11 +453,21 @@ impl Engine {
                     }
                 }
             }
-            self.broadcast_goals(self.current_seq());
+            self.broadcast_goals(self.next_seq());
         }
         // A refund of something that never alerted (a sale, not a tip) says nothing.
-        if !known {
-            return;
+        let Some(original) = original else { return };
+        // This stream's totals give the money back too, if it was this stream's.
+        if let EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } = &original.kind {
+            let mut st = self.state_mut();
+            let this_stream = st.session.started_at.is_none_or(|start| original.occurred_at >= start);
+            let first_time = st.session.reversed.insert(source_id.to_string());
+            if this_stream
+                && first_time
+                && let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency)
+            {
+                m.minor = m.minor.saturating_sub(money.minor).max(0);
+            }
         }
         let what = match reason {
             ferrocast_core::event::ReversalReason::Chargeback => "A chargeback",

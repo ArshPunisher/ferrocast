@@ -25,11 +25,114 @@ pub struct EngineSettings {
     pub bot_enabled: bool,
     /// Ban accounts on the shared ban list automatically when they chat.
     pub auto_ban_on_sight: bool,
+    /// The dashboard's look: "system", "dark" or "light".
+    pub theme: String,
+    /// "system", "on" or "off".
+    pub reduced_motion: String,
+    /// Lighter overlay effects for slower PCs (R-40).
+    pub low_motion_overlays: bool,
+    /// Let phones and tablets on this network open the dashboard (applies on next start).
+    pub lan_access: bool,
+    /// "stable" or "beta".
+    pub update_channel: String,
+    /// Never install an update while any platform is live (R-60).
+    pub never_update_while_live: bool,
+    pub launch_at_login: bool,
+    pub close_to_tray: bool,
+    /// A BCP 47 tag like "en" or "hi".
+    pub language: String,
+    /// The streamer's main currency (ISO 4217), e.g. for the TTS minimum. Defaults from the
+    /// computer's region.
+    pub currency: String,
 }
 
 impl Default for EngineSettings {
     fn default() -> Self {
-        EngineSettings { keep_chat_days: 30, test_alerts: true, bot_enabled: true, auto_ban_on_sight: true }
+        EngineSettings {
+            keep_chat_days: 30,
+            test_alerts: true,
+            bot_enabled: true,
+            auto_ban_on_sight: true,
+            theme: "system".into(),
+            reduced_motion: "system".into(),
+            low_motion_overlays: false,
+            lan_access: false,
+            update_channel: "stable".into(),
+            never_update_while_live: true,
+            launch_at_login: false,
+            close_to_tray: true,
+            language: "en".into(),
+            currency: currency_for_locale(sys_locale::get_locale().as_deref().unwrap_or("")).into(),
+        }
+    }
+}
+
+/// A sensible main currency from a locale like "en-IN" or "pt_BR.UTF-8".
+pub fn currency_for_locale(locale: &str) -> &'static str {
+    let region = locale
+        .split(['.', '@'])
+        .next()
+        .unwrap_or("")
+        .split(['-', '_'])
+        .skip(1)
+        .find(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_alphabetic()))
+        .map(|p| p.to_ascii_uppercase())
+        .unwrap_or_default();
+    const EURO: [&str; 20] = [
+        "AT", "BE", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "HR", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PT",
+        "SI", "SK",
+    ];
+    if EURO.contains(&region.as_str()) {
+        return "EUR";
+    }
+    match region.as_str() {
+        "IN" => "INR",
+        "GB" => "GBP",
+        "BR" => "BRL",
+        "CA" => "CAD",
+        "AU" => "AUD",
+        "NZ" => "NZD",
+        "JP" => "JPY",
+        "KR" => "KRW",
+        "MX" => "MXN",
+        "ID" => "IDR",
+        "PH" => "PHP",
+        "TR" => "TRY",
+        "PL" => "PLN",
+        "SE" => "SEK",
+        "NO" => "NOK",
+        "DK" => "DKK",
+        "CH" => "CHF",
+        "SG" => "SGD",
+        "AE" => "AED",
+        "ZA" => "ZAR",
+        "PK" => "PKR",
+        "BD" => "BDT",
+        _ => "USD",
+    }
+}
+
+impl EngineSettings {
+    /// Checks every field; the message names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=3650).contains(&self.keep_chat_days) {
+            return Err("keep_chat_days: keep chat for 1 to 3650 days.".into());
+        }
+        let one_of = |field: &str, v: &str, ok: &[&str]| {
+            if ok.contains(&v) { Ok(()) } else { Err(format!("{field}: use one of {}.", ok.join(", "))) }
+        };
+        one_of("theme", &self.theme, &["system", "dark", "light"])?;
+        one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
+        one_of("update_channel", &self.update_channel, &["stable", "beta"])?;
+        if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err("currency: a three-letter code like INR or USD.".into());
+        }
+        let lang_ok = (2..=35).contains(&self.language.len())
+            && self.language.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !lang_ok {
+            return Err("language: a language tag like en or hi-IN.".into());
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +226,18 @@ pub struct Session {
     pub latest_tip: Option<(String, Money)>,
     pub top_tip: Option<(String, Money)>,
     pub chat_lines: HashMap<Platform, u32>,
+    /// Money this stream, one entry per currency (never converted).
+    #[serde(default)]
+    pub tips: Vec<Money>,
+    /// Bits cheered this stream.
+    #[serde(default)]
+    pub bits: u64,
+    /// The most people watching at once, all platforms together.
+    #[serde(default)]
+    pub peak_viewers: u64,
+    /// Payments already taken off `tips` (a refund and a dispute can both arrive).
+    #[serde(skip)]
+    pub reversed: std::collections::HashSet<String>,
 }
 
 impl Session {
@@ -143,6 +258,10 @@ impl Session {
             }
             EventKind::Tip { actor, money, .. } | EventKind::PaidMessage { actor, money, .. } => {
                 if event.kind.is_alertable() {
+                    match self.tips.iter_mut().find(|m| m.currency == money.currency) {
+                        Some(m) => m.minor = m.minor.saturating_add(money.minor),
+                        None => self.tips.push(money.clone()),
+                    }
                     self.latest_tip = Some((actor.display_name.clone(), money.clone()));
                     let beats = match &self.top_tip {
                         Some((_, top)) => top.currency == money.currency && money.minor > top.minor,
@@ -155,6 +274,9 @@ impl Session {
             }
             EventKind::ChatMessage { .. } => {
                 *self.chat_lines.entry(event.platform).or_default() += 1;
+            }
+            EventKind::PlatformGift { value, .. } if value.unit == ferrocast_core::money::ValueUnit::Bits => {
+                self.bits = self.bits.saturating_add(value.amount);
             }
             _ => {}
         }
@@ -203,5 +325,21 @@ mod tests {
         assert_eq!(st.why.len(), WHY_KEEP);
         assert!(st.why("0").is_none());
         assert!(st.why(&(WHY_KEEP + 9).to_string()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::currency_for_locale;
+
+    #[test]
+    fn regions_pick_their_currency() {
+        assert_eq!(currency_for_locale("en-IN"), "INR");
+        assert_eq!(currency_for_locale("hi_IN.UTF-8"), "INR");
+        assert_eq!(currency_for_locale("pt-BR"), "BRL");
+        assert_eq!(currency_for_locale("de_DE@euro"), "EUR");
+        assert_eq!(currency_for_locale("zh-Hans-SG"), "SGD");
+        assert_eq!(currency_for_locale("en"), "USD");
+        assert_eq!(currency_for_locale(""), "USD");
     }
 }

@@ -335,6 +335,37 @@ impl Engine {
         Ok(())
     }
 
+    /// Saves only the settings that were sent, under the config lock so two dashboards
+    /// saving different fields at once both win. Errors name the field.
+    pub async fn patch_settings(
+        &self,
+        patch: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EngineSettings, EngineError> {
+        let _one_at_a_time = self.inner.config.lock().await;
+        let current = serde_json::to_value(self.settings()).map_err(|e| EngineError::Internal(e.to_string()))?;
+        let mut merged = current.clone();
+        for (k, v) in patch {
+            let Some(slot) = merged.get_mut(k) else { continue }; // unknown keys are ignored
+            let mut one = current.clone();
+            one[k.as_str()] = v.clone();
+            if serde_json::from_value::<EngineSettings>(one).is_err() {
+                let want = match &current[k.as_str()] {
+                    serde_json::Value::Bool(_) => "true or false",
+                    serde_json::Value::Number(_) => "a whole number",
+                    _ => "text",
+                };
+                return Err(EngineError::Invalid(format!("{k}: must be {want}.")));
+            }
+            *slot = v.clone();
+        }
+        let s: EngineSettings = serde_json::from_value(merged).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        s.validate().map_err(EngineError::Invalid)?;
+        let saved = s.clone();
+        self.db(move |st| repo::settings::set(st, "engine", &saved)).await?;
+        self.state_mut().settings = s.clone();
+        Ok(s)
+    }
+
     pub async fn save_settings(&self, s: EngineSettings) -> Result<EngineSettings, EngineError> {
         let _one_at_a_time = self.inner.config.lock().await;
         let saved = s.clone();

@@ -481,6 +481,13 @@ impl Engine {
         Ok(())
     }
 
+    /// This stream's numbers and the current viewer counts by platform.
+    pub fn session_view(&self) -> (crate::state::Session, std::collections::HashMap<String, u64>) {
+        let st = self.state();
+        let viewers = st.viewers.iter().map(|(p, c)| (crate::platform_key(*p).to_string(), *c)).collect();
+        (st.session.clone(), viewers)
+    }
+
     /// Status for `GET /status`.
     pub fn status(&self) -> serde_json::Value {
         let st = self.state();

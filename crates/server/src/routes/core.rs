@@ -20,8 +20,7 @@ pub async fn status(State(app): State<AppState>) -> Json<Value> {
     let mut v = app.engine.status();
     v["version"] = json!(env!("CARGO_PKG_VERSION"));
     v["port"] = json!(app.guard.port);
-    let overlays = app.engine.overlays().await.map(|o| !o.is_empty()).unwrap_or(false);
-    v["setup_done"] = json!(overlays);
+    v["setup_done"] = json!(super::app::setup_done(&app).await);
     Json(v)
 }
 
@@ -130,7 +129,15 @@ pub async fn add_to_obs(State(app): State<AppState>, Path(id): Path<String>) -> 
 }
 
 pub async fn obs(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.obs().await?)))
+    Ok(Json(obs_view(&app.engine.obs().await?)))
+}
+
+/// OBS as the dashboard shows it: `version` and `scene` at the top level.
+pub(crate) fn obs_view(o: &ferrocast_engine::ObsView) -> Value {
+    let mut v = json!(o);
+    v["version"] = json!(o.status.as_ref().map(|s| s.obs_version.clone()));
+    v["scene"] = json!(o.status.as_ref().map(|s| s.scene.clone()));
+    v
 }
 
 #[derive(Deserialize)]
@@ -157,7 +164,7 @@ pub async fn save_obs(State(app): State<AppState>, Body(b): Body<ObsBody>) -> Ap
         Some(Some(p)) => PasswordChange::Set(p),
     };
     let cfg = ferrocast_obs::ObsConfig { host: b.host, port: b.port };
-    Ok(Json(json!(app.engine.save_obs(cfg, change).await?)))
+    Ok(Json(obs_view(&app.engine.save_obs(cfg, change).await?)))
 }
 
 pub async fn rules(State(app): State<AppState>) -> Json<Value> {
@@ -369,6 +376,13 @@ pub async fn save_tips(State(app): State<AppState>, Body(cfg): Body<Value>) -> A
     let stored = public.clone();
     app.engine.db(move |s| repo::settings::set(s, "tips", &stored)).await?;
     Ok(Json(public))
+}
+
+/// Takes the tip page down and forgets the local copy.
+pub async fn delete_tips(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.delete_tips().await?;
+    app.engine.db(|s| repo::settings::delete(s, "tips")).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn tips(State(app): State<AppState>) -> ApiResult<Json<Value>> {

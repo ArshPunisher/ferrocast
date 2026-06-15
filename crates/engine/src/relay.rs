@@ -27,7 +27,7 @@ const KICK_TOKENS: &str = "kick-tokens";
 impl Engine {
     fn relay_url(&self) -> Result<String, EngineError> {
         self.apps().relay_url.clone().ok_or_else(|| {
-            EngineError::Unavailable("This build of Ferrocast has no relay set up, so Kick can't connect.".into())
+            EngineError::Unavailable("This build of Ferrocast has no relay set up, so Kick and tips can't work.".into())
         })
     }
 
@@ -302,6 +302,26 @@ impl Engine {
             )),
             400 | 413 | 415 | 422 => Err(EngineError::Invalid(message())),
             _ => Err(EngineError::Unavailable(message())),
+        }
+    }
+
+    /// Takes the tip page down on the relay (its name stays held for this install).
+    pub async fn delete_tips(&self) -> Result<(), EngineError> {
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await?;
+        let res = self
+            .relay_http()
+            .delete(format!("{url}/v1/tips/config"))
+            .bearer_auth(&auth)
+            .send()
+            .await
+            .map_err(|e| EngineError::Unavailable(format!("Couldn't reach the Ferrocast relay: {e}")))?;
+        match res.status().as_u16() {
+            200..=299 => Ok(()),
+            401 | 403 => Err(EngineError::Unavailable(
+                "The Ferrocast relay doesn't recognise this install. Try again in a minute.".into(),
+            )),
+            s => Err(EngineError::Unavailable(format!("The relay couldn't take the tip page down (it answered {s})."))),
         }
     }
 

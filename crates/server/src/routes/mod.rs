@@ -1,5 +1,6 @@
 //! `/api/v1` routes (API.md §4).
 
+mod app;
 mod bot;
 mod core;
 mod media;
@@ -75,11 +76,15 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/media/{id}", get(crate::assets::dashboard_media).delete(media::remove))
         .route("/live", get(crate::ws::live))
         // tips
-        .route("/tips", get(core::tips).put(core::save_tips))
+        .route("/tips", get(core::tips).put(core::save_tips).delete(core::delete_tips))
         // OBS
         .route("/obs", get(core::obs).put(core::save_obs))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
+        .route("/themes", get(app::themes))
+        .route("/stats/session", get(app::session_stats))
+        .route("/updates", get(app::updates))
+        .route("/setup/complete", post(app::setup_complete))
         .route("/backups", get(core::backups).post(core::backup_now))
         .route("/backups/{id}/restore", post(core::restore_backup))
 }

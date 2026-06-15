@@ -34,6 +34,14 @@ pub fn set<T: Serialize>(store: &Store, key: &str, value: &T) -> Result<()> {
     })
 }
 
+/// Removes a setting; the next `get` returns `None`.
+pub fn delete(store: &Store, key: &str) -> Result<()> {
+    store.write(|tx| {
+        tx.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        Ok(())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub platform: String,
