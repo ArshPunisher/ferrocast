@@ -432,11 +432,14 @@ impl Engine {
         let src = source_id.to_string();
         let result = self
             .db(move |s| {
-                let known = repo::events::by_source(s, platform, &src)?.is_some();
-                Ok((known, repo::goals::reverse(s, platform, &src)?))
+                let original = match repo::events::by_source(s, platform, &src)? {
+                    Some(id) => repo::events::get(s, &id)?,
+                    None => None,
+                };
+                Ok((original, repo::goals::reverse(s, platform, &src)?))
             })
             .await;
-        let (known, changed) = match result {
+        let (original, changed) = match result {
             Ok(v) => v,
             Err(err) => {
                 tracing::error!(%err, "couldn't reverse goal contributions");
