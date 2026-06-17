@@ -66,20 +66,45 @@ impl Engine {
         match &e.kind {
             EventKind::Connector(status) => {
                 let key = platform_key(e.platform).to_string();
-                let view = {
+                let (view, before, after) = {
                     let mut st = self.state_mut();
                     let v = st.connectors.entry(key.clone()).or_insert_with(crate::state::ConnectorView::off);
+                    let before = v.state.clone();
                     v.apply(status);
                     v.last_event_at = Some(at.0);
-                    st.connectors.clone()
+                    let after = v.state.clone();
+                    (st.connectors.clone(), before, after)
                 };
                 self.send_live(LiveFrame::new("status", &json!({ "connectors": view })));
+                // One clear banner when a platform needs the streamer, never a stream of
+                // errors (R-22): only on the change into that state.
+                if before != after && matches!(after.as_str(), "sign_in_needed" | "scopes_missing") {
+                    let name = platform_label(e.platform);
+                    let message = if after == "sign_in_needed" {
+                        format!("{name} needs you to sign in again.")
+                    } else {
+                        format!("{name} needs more permissions to keep everything working.")
+                    };
+                    self.send_live(LiveFrame::new(
+                        "notice",
+                        &Notice {
+                            level: NoticeLevel::Warn,
+                            message,
+                            action: Some(crate::frames::NoticeAction {
+                                label: "Reconnect".into(),
+                                href: "#/settings/accounts".into(),
+                            }),
+                        },
+                    ));
+                }
                 return;
             }
             EventKind::ViewerCount { count } => {
                 let viewers = {
                     let mut st = self.state_mut();
                     st.viewers.insert(e.platform, *count);
+                    let total: u64 = st.viewers.values().sum();
+                    st.session.peak_viewers = st.session.peak_viewers.max(total);
                     st.viewers
                         .iter()
                         .map(|(p, c)| (platform_key(*p).to_string(), *c))
@@ -206,10 +231,10 @@ impl Engine {
             self.support_event(&e).await;
         }
 
-        self.send_live(LiveFrame::new("event", &e));
+        self.send_live_event(e.seq, LiveFrame::new("event", &e));
         // The dashboard gets the message first, then the mark that it's held (R-48).
         if let Some(reason) = held {
-            self.send_live(LiveFrame::new("held", &json!({ "event_id": e.id, "reason": reason })));
+            self.send_live_event(e.seq, LiveFrame::new("held", &json!({ "event_id": e.id, "reason": reason })));
         }
         if show_in_overlays {
             let audience = match e.kind {

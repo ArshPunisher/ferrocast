@@ -74,6 +74,8 @@ struct Inner {
     dedupe: Mutex<Deduper>,
     cooldowns: Mutex<Cooldowns>,
     hidden: Mutex<Hidden>,
+    /// The last dashboard `event` frames, so a socket that reconnects can catch up (R11).
+    recent_events: Mutex<Recent>,
     seq: AtomicU64,
     sink: EventSink,
     live_tx: broadcast::Sender<LiveFrame>,
@@ -130,6 +132,9 @@ impl Engine {
         let (sink, rx) = mpsc::channel(SINK_CAPACITY);
         let (live_tx, _) = broadcast::channel(1_024);
         let (overlay_tx, _) = broadcast::channel(1_024);
+        // Seqs start from the clock, so they keep growing across restarts and a dashboard
+        // reconnecting with an old `since` still gets new events.
+        let start_seq = u64::try_from(now().0).unwrap_or(0).saturating_mul(1000);
         let engine = Engine {
             inner: Arc::new(Inner {
                 store,
@@ -141,7 +146,9 @@ impl Engine {
                 dedupe: Mutex::new(Deduper::default()),
                 cooldowns: Mutex::new(Cooldowns::default()),
                 hidden: Mutex::new((HashSet::new(), VecDeque::new())),
-                seq: AtomicU64::new(0),
+                // Anything from before this start is gone: an older `since` gets `resync`.
+                recent_events: Mutex::new(Recent { frames: VecDeque::new(), evicted_up_to: start_seq }),
+                seq: AtomicU64::new(start_seq),
                 sink,
                 live_tx,
                 overlay_tx,
@@ -240,7 +247,9 @@ impl Engine {
         self.inner.state.write().unwrap_or_else(|p| p.into_inner())
     }
 
-    pub(crate) fn next_seq(&self) -> u64 {
+    /// A new frame number. Overlays drop frames at or below the last one they saw, so
+    /// every frame sent after a snapshot needs its own.
+    pub fn next_seq(&self) -> u64 {
         self.inner.seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -251,6 +260,28 @@ impl Engine {
 
     pub(crate) fn send_live(&self, frame: LiveFrame) {
         let _ = self.inner.live_tx.send(frame);
+    }
+
+    /// Sends an `event` (or its `held` mark) and remembers it for sockets that reconnect.
+    pub(crate) fn send_live_event(&self, seq: u64, frame: LiveFrame) {
+        {
+            let mut r = self.inner.recent_events.lock().unwrap_or_else(|p| p.into_inner());
+            r.frames.push_back((seq, frame.clone()));
+            while r.frames.len() > RECENT_EVENTS {
+                if let Some((old, _)) = r.frames.pop_front() {
+                    r.evicted_up_to = r.evicted_up_to.max(old);
+                }
+            }
+        }
+        self.send_live(frame);
+    }
+
+    /// Frames remembered after `since`, oldest first, and whether some after `since` were
+    /// already forgotten (the dashboard should refetch).
+    pub fn events_since(&self, since: u64) -> (Vec<LiveFrame>, bool) {
+        let r = self.inner.recent_events.lock().unwrap_or_else(|p| p.into_inner());
+        let gap = r.evicted_up_to > since;
+        (r.frames.iter().filter(|(seq, _)| *seq > since).map(|(_, f)| f.clone()).collect(), gap)
     }
 
     pub(crate) fn send_overlay(&self, frame: OverlayFrame) {
@@ -386,6 +417,16 @@ async fn prune(engine: Engine) {
         }
         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
     }
+}
+
+/// How many recent `event` frames a reconnecting dashboard can catch up on.
+const RECENT_EVENTS: usize = 500;
+
+/// Recent dashboard frames for replay, and the highest seq already dropped.
+#[derive(Debug, Default)]
+struct Recent {
+    frames: VecDeque<(u64, LiveFrame)>,
+    evicted_up_to: u64,
 }
 
 pub fn platform_key(p: Platform) -> &'static str {

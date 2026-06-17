@@ -75,6 +75,41 @@ impl Engine {
         self.submit(event).await
     }
 
+    /// A sample for an overlay in test mode (API-REQUESTS R12): an event and, when a rule
+    /// covers it, the alert it would show. Nothing touches the real queue, log or goals.
+    pub fn preview(&self, n: u64) -> (Event, Option<ferrocast_core::alert::RenderedAlert>) {
+        const KINDS: [&str; 6] = ["follow", "tip", "chat", "subscription", "raid", "platform_gift"];
+        let at = now();
+        let kind = KINDS[(n as usize) % KINDS.len()];
+        let chat = || {
+            let mut actor = ferrocast_core::event::Actor::named(Platform::Twitch, "PreviewViewer");
+            actor.id = Some("preview".into());
+            Event::live(
+                Platform::Twitch,
+                None,
+                at,
+                ferrocast_core::event::EventKind::ChatMessage {
+                    actor,
+                    content: ferrocast_core::event::Content::plain("This is how chat looks on stream."),
+                    reply_to: None,
+                    is_action: false,
+                },
+            )
+        };
+        let mut e = if kind == "chat" { chat() } else { sample::any_sample(kind, at).unwrap_or_else(chat) };
+        e.id = format!("preview-{n}");
+        e.origin = Origin::Test;
+        e.seq = self.next_seq();
+        e.received_at = at;
+        let rules = self.state().rules.clone();
+        let alert = e
+            .may_alert()
+            .then(|| ferrocast_core::alert::select(&rules, &e))
+            .flatten()
+            .map(|(rule, v)| ferrocast_core::alert::render(&format!("preview-{n}"), rule, v, &e));
+        (e, alert)
+    }
+
     /// Replays a logged event as a new alert.
     pub async fn replay(&self, event_id: &str) -> Result<(), EngineError> {
         let id = event_id.to_string();
