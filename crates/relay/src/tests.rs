@@ -614,6 +614,7 @@ mod tip_tests {
         assert_eq!(gone.status(), 204);
         assert_eq!(http.get(format!("{}/t/nova", r.base)).send().await.unwrap().status(), 404);
         assert_eq!(save(&http, &r, &b, &cfg()).await.status(), 409, "a deleted page's name is held too");
+        assert_eq!(save(&http, &r, &a, &cfg()).await.status(), 200, "putting your own page back isn't a fourth change");
         let bad = http
             .put(format!("{}/v1/tips/config", r.base))
             .bearer_auth(&a)

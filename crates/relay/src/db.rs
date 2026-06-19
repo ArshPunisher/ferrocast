@@ -208,12 +208,14 @@ impl Db {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()?;
-        if held.is_some_and(|(o, at)| o != install && now - at < hold_ms) {
+        if held.as_ref().is_some_and(|(o, at)| o != install && now - at < hold_ms) {
             return Ok(Saved::Taken);
         }
         let previous: Option<String> =
             tx.query_row("SELECT handle FROM tip_pages WHERE install_id = ?1", [install], |r| r.get(0)).optional()?;
-        if previous.as_deref() != Some(handle) {
+        // Putting your own page back up under the name you took down isn't a new name.
+        let reclaiming = previous.is_none() && held.as_ref().is_some_and(|(o, _)| o == install);
+        if previous.as_deref() != Some(handle) && !reclaiming {
             let changes: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM handle_changes WHERE install_id = ?1 AND at > ?2",
                 params![install, now - 86_400_000],
@@ -226,6 +228,8 @@ impl Db {
                 release(&tx, install, p, now)?;
             }
             tx.execute("INSERT INTO handle_changes(install_id, at) VALUES (?1, ?2)", params![install, now])?;
+            tx.execute("DELETE FROM released_handles WHERE handle = ?1", [handle])?;
+        } else if reclaiming {
             tx.execute("DELETE FROM released_handles WHERE handle = ?1", [handle])?;
         }
         tx.execute(
