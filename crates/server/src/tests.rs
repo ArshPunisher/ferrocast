@@ -387,3 +387,304 @@ async fn imports_have_their_own_size_limit_and_clear_errors() {
     let res = upload(Vec::new()).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
+
+async fn next_json(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+) -> Value {
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await.unwrap().unwrap().unwrap();
+        if let Message::Text(t) = msg {
+            return serde_json::from_str(&t).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn app_routes_have_the_dashboard_shapes() {
+    let r = start().await;
+    let themes: Value = r.get("/api/v1/themes").await.json().await.unwrap();
+    let ids: Vec<_> = themes.as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["molten", "daylight", "arcade", "minimal", "sticker"]);
+    let stats: Value = r.get("/api/v1/stats/session").await.json().await.unwrap();
+    for k in ["started_at", "follows", "subs", "tips", "bits", "messages", "peak_viewers", "viewers"] {
+        assert!(stats.get(k).is_some(), "stats.{k}");
+    }
+    let up: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(up["channel"], "stable");
+    assert_eq!(up["blocked_while_live"], false);
+    let status: Value = r.get("/api/v1/status").await.json().await.unwrap();
+    assert_eq!(status["setup_done"], false);
+    assert_eq!(r.post("/api/v1/setup/complete", json!({})).await.status(), StatusCode::NO_CONTENT);
+    let status: Value = r.get("/api/v1/status").await.json().await.unwrap();
+    assert_eq!(status["setup_done"], true);
+}
+
+#[tokio::test]
+async fn settings_save_what_was_sent_and_name_bad_fields() {
+    let r = start().await;
+    let res = r.put("/api/v1/settings", json!({ "theme": "dark", "close_to_tray": false })).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+    assert_eq!((s["theme"].as_str(), s["close_to_tray"].as_bool()), (Some("dark"), Some(false)));
+    assert_eq!(s["keep_chat_days"], 30, "fields that weren't sent are kept");
+    assert_eq!(s["update_channel"], "stable");
+    let bad = r.put("/api/v1/settings", json!({ "theme": "neon" })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let v: Value = bad.json().await.unwrap();
+    assert!(v["error"]["message"].as_str().unwrap().starts_with("theme"), "{v}");
+    assert_eq!(r.put("/api/v1/settings", json!({ "lan_access": "yes" })).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(r.put("/api/v1/settings", json!([1])).await.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn tts_goals_and_commands_speak_the_dashboards_language() {
+    let r = start().await;
+    // The default main currency comes from the computer's region; pin it for the test.
+    r.put("/api/v1/settings", json!({ "currency": "INR" })).await;
+    let t: Value = r.get("/api/v1/tts").await.json().await.unwrap();
+    assert_eq!((t["min_amount"].as_f64(), t["currency"].as_str()), (Some(100.0), Some("INR")));
+    let saved: Value = r
+        .put(
+            "/api/v1/tts",
+            json!({ "enabled": true, "voice": "", "min_amount": 50, "max_chars": 200,
+            "hold_for_approval": true, "read_names": true }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(saved["min_amount"], 50.0);
+    assert_eq!(saved["min_amounts"][0]["minor"], 5_000, "₹50 is 5,000 paise");
+    assert_eq!(saved["min_amounts"].as_array().unwrap().len(), 3, "other currencies keep their minimum");
+    let bad = r.put("/api/v1/tts", json!({ "enabled": true, "min_amount": -1, "max_chars": 200 })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert!(r.get("/api/v1/tts/pending").await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
+
+    let g: Value = r
+        .post("/api/v1/goals", json!({ "title": "Mic", "kind": "tips", "target": 5000, "currency": "INR" }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(g["target"], 5000.0, "tips goals are in rupees, not paise");
+    let id = g["id"].as_str().unwrap();
+    let adj: Value =
+        r.post(&format!("/api/v1/goals/{id}/adjust"), json!({ "delta": 12.5 })).await.json().await.unwrap();
+    assert_eq!(adj["current"], 12.5);
+    assert_eq!(
+        r.post("/api/v1/goals", json!({ "title": "No currency", "kind": "tips", "target": 5 })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let c: Value = r
+        .post(
+            "/api/v1/commands",
+            json!({ "name": "!dc", "aliases": [], "response": "hi", "roles": "mods",
+            "cooldown_s": 5, "user_cooldown_s": 0, "platforms": [], "enabled": true }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(c["roles"], "mods");
+    assert!(!c["id"].as_str().unwrap().is_empty(), "the engine picks an id");
+}
+
+#[tokio::test]
+async fn moderation_routes_have_the_dashboard_shapes() {
+    let r = start().await;
+    assert!(r.get("/api/v1/mod/bans").await.json::<Value>().await.unwrap().is_array());
+    let panic: Value = r.get("/api/v1/mod/panic/config").await.json().await.unwrap();
+    assert_eq!(panic["hotkey"], "Ctrl+Alt+Shift+P");
+    let mut slow = panic.clone();
+    slow["slow_mode_seconds"] = json!(500);
+    let bad: Value = r.put("/api/v1/mod/panic/config", slow).await.json().await.unwrap();
+    assert!(bad["error"]["message"].as_str().unwrap().starts_with("slow_mode_seconds"));
+    let filters: Value = r.get("/api/v1/mod/filters").await.json().await.unwrap();
+    assert_eq!(filters["solicitation"]["action"], "delete");
+    let mut f = filters.clone();
+    f["timeout_seconds"] = json!(0);
+    let bad: Value = r.put("/api/v1/mod/filters", f).await.json().await.unwrap();
+    assert!(bad["error"]["message"].as_str().unwrap().starts_with("timeout_seconds"));
+    assert_eq!(r.put("/api/v1/mod/filters", filters).await.status(), StatusCode::OK, "what we send back is accepted");
+    assert_eq!(
+        error_code(r.post("/api/v1/mod/held/nope/release", json!({})).await).await,
+        (StatusCode::NOT_FOUND, "held_not_found".into())
+    );
+    assert_eq!(
+        error_code(r.get("/api/v1/viewers/twitch/stranger").await).await,
+        (StatusCode::NOT_FOUND, "viewer_not_found".into())
+    );
+    let note: Value = r.get("/api/v1/viewers/twitch/stranger/note").await.json().await.unwrap();
+    assert_eq!(note["text"], "");
+    let panic_on: Value = r.post("/api/v1/mod/panic", json!({ "on": true })).await.json().await.unwrap();
+    assert_eq!(panic_on["on"], true);
+    assert!(panic_on["applied"].is_array());
+}
+
+#[tokio::test]
+async fn overlay_sockets_close_with_4404_and_preview_in_test_mode() {
+    let r = start().await;
+    let ws_base = r.base.replace("http://", "ws://");
+    let (mut gone, _) = tokio_tungstenite::connect_async(format!("{ws_base}/o/not-a-token/ws")).await.unwrap();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), gone.next()).await.unwrap() {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 4404),
+        other => panic!("expected a 4404 close, got {other:?}"),
+    }
+    let o: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let url = o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut test, _) = tokio_tungstenite::connect_async(format!("{url}?test")).await.unwrap();
+    let snap = next_json(&mut test).await;
+    assert_eq!(snap["type"], "snapshot");
+    assert!(snap["data"]["state"]["events"].as_array().unwrap().is_empty(), "no real events in a preview");
+    let sample = next_json(&mut test).await;
+    assert_eq!(sample["type"], "event", "a sample arrives at once");
+    assert!(sample["data"]["id"].as_str().unwrap().starts_with("preview-"));
+    let preview_alert = next_json(&mut test).await;
+    assert_eq!((preview_alert["type"].as_str(), preview_alert["data"]["test"].as_bool()), (Some("alert"), Some(true)));
+    // Overlay pages drop frames at or below the last seq they saw.
+    let seqs = [&snap, &sample, &preview_alert].map(|f| f["seq"].as_u64().unwrap());
+    assert!(seqs[0] < seqs[1] && seqs[1] < seqs[2], "each frame gets its own, growing seq: {seqs:?}");
+    // The real overlay gets a real test alert; the preview socket must not.
+    let (mut real, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(next_json(&mut real).await["type"], "snapshot");
+    r.post("/api/v1/test", json!({ "kind": "raid" })).await;
+    loop {
+        let v = next_json(&mut real).await;
+        if v["type"] == "alert" {
+            break;
+        }
+    }
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), test.next()).await;
+    assert!(quiet.is_err(), "nothing from the real queue reaches a preview: {quiet:?}");
+    // Regenerating the URL tells the page, then closes with 4404.
+    let id = o["id"].as_str().unwrap();
+    r.post(&format!("/api/v1/overlays/{id}/regenerate-url"), json!({})).await;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), real.next()).await.unwrap() {
+            Some(Ok(Message::Text(t))) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "revoked" {
+                    break;
+                }
+            }
+            other => panic!("expected the revoked frame first, got {other:?}"),
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), real.next()).await.unwrap() {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 4404),
+        other => panic!("expected a 4404 close, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_dashboard_that_reconnects_catches_up_on_missed_events() {
+    let r = start().await;
+    let ws_base = r.base.replace("http://", "ws://");
+    let live_url = format!("{ws_base}/api/v1/live?session={}", r.token);
+    let (mut live, _) = tokio_tungstenite::connect_async(&live_url).await.unwrap();
+    let hello = next_json(&mut live).await;
+    let seen = hello["data"]["seq"].as_u64().unwrap();
+    drop(live);
+    for kind in ["follow", "raid"] {
+        r.post("/api/v1/test", json!({ "kind": kind })).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (mut again, _) = tokio_tungstenite::connect_async(format!("{live_url}&since={seen}")).await.unwrap();
+    let mut kinds = Vec::new();
+    for _ in 0..8 {
+        let v = next_json(&mut again).await;
+        if v["type"] == "event" {
+            kinds.push(v["data"]["kind"]["type"].as_str().unwrap_or("").to_string());
+            if kinds.len() == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(kinds, ["follow", "raid"]);
+    // A `since` from before this start (an earlier run's seq) asks for a refetch.
+    let (mut stale, _) = tokio_tungstenite::connect_async(format!("{live_url}&since={}", seen / 2)).await.unwrap();
+    let mut types = Vec::new();
+    for _ in 0..4 {
+        types.push(next_json(&mut stale).await["type"].as_str().unwrap_or("").to_string());
+    }
+    assert!(types.contains(&"resync".to_string()), "{types:?}");
+    // A malformed query is ignored, not a plain-text error page.
+    let (mut odd, _) = tokio_tungstenite::connect_async(format!("{live_url}&since=abc&since=")).await.unwrap();
+    assert_eq!(next_json(&mut odd).await["type"], "hello");
+}
+
+#[tokio::test]
+async fn held_tts_shows_who_and_what_even_for_test_events() {
+    let r = start().await;
+    r.put("/api/v1/tts", json!({ "enabled": true, "min_amount": 0, "hold_for_approval": true })).await;
+    r.post("/api/v1/test", json!({ "kind": "tip" })).await;
+    let mut pending = Value::Null;
+    for _ in 0..100 {
+        pending = r.get("/api/v1/tts/pending").await.json().await.unwrap();
+        if !pending.as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let item = &pending[0];
+    assert_ne!(item["name"], "Someone", "{item}");
+    assert!(item["platform"].is_string());
+    assert!(item["amount"].as_str().is_some_and(|a| !a.is_empty()), "{item}");
+}
+
+#[tokio::test]
+async fn settings_and_goal_errors_say_which_field_and_why() {
+    let r = start().await;
+    let bad: Value = r.put("/api/v1/settings", json!({ "lan_access": "yes" })).await.json().await.unwrap();
+    assert_eq!(bad["error"]["message"], "lan_access: must be true or false.");
+    let bad: Value = r.put("/api/v1/settings", json!({ "currency": "rupees" })).await.json().await.unwrap();
+    assert!(bad["error"]["message"].as_str().unwrap().starts_with("currency"));
+    let saved: Value = r.put("/api/v1/settings", json!({ "currency": "USD" })).await.json().await.unwrap();
+    assert_eq!(saved["currency"], "USD");
+    let t: Value = r.put("/api/v1/tts", json!({ "min_amount": 5 })).await.json().await.unwrap();
+    assert_eq!((t["currency"].as_str(), t["min_amount"].as_f64()), (Some("USD"), Some(5.0)), "the main currency");
+    let usd = t["min_amounts"].as_array().unwrap().iter().filter(|m| m["currency"] == "USD").count();
+    assert_eq!(usd, 1, "one minimum per currency");
+    let bad = r.put("/api/v1/tts", json!({ "min_amounts": [{ "minor": -1, "currency": "INR" }] })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        r.post("/api/v1/goals", json!({ "title": "Half", "kind": "follows", "target": 2.5 })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let g: Value = r
+        .post("/api/v1/goals", json!({ "title": "Mic", "kind": "tips", "target": 50, "currency": "INR" }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = g["id"].as_str().unwrap();
+    r.post(&format!("/api/v1/goals/{id}/adjust"), json!({ "delta": 10 })).await;
+    let mut edit = g.clone();
+    edit["title"] = json!("New mic");
+    edit["current"] = json!(0);
+    let saved: Value = r.put(&format!("/api/v1/goals/{id}"), edit.clone()).await.json().await.unwrap();
+    assert_eq!((saved["title"].as_str(), saved["current"].as_f64()), (Some("New mic"), Some(10.0)), "progress kept");
+    edit["currency"] = json!("JPY");
+    assert_eq!(r.put(&format!("/api/v1/goals/{id}"), edit).await.status(), StatusCode::CONFLICT);
+    let gone = r.client.delete(format!("{}/api/v1/tips", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(gone.status(), StatusCode::UNPROCESSABLE_ENTITY, "no relay in this build");
+}
+
+#[test]
+fn obs_version_is_the_bare_number() {
+    let view = ferrocast_engine::ObsView {
+        state: "connected".into(),
+        host: "127.0.0.1".into(),
+        port: 4455,
+        has_password: false,
+        detail: None,
+        status: Some(ferrocast_obs::ObsStatus {
+            obs_version: "31.1.2".into(),
+            websocket_version: "5.6".into(),
+            scene: "Gameplay".into(),
+        }),
+    };
+    let v = crate::routes::obs_view_for_tests(&view);
+    assert_eq!((v["version"].as_str(), v["scene"].as_str()), (Some("31.1.2"), Some("Gameplay")));
+}

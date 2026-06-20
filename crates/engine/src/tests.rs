@@ -225,6 +225,79 @@ async fn panic_mode_holds_first_time_chatters() {
 }
 
 #[tokio::test]
+async fn a_platform_that_needs_signing_in_shows_one_reconnect_notice() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    let needs = || Event::live(Platform::Kick, None, Millis(0), EventKind::Connector(ConnectorStatus::SignInNeeded));
+    e.ingest(needs()).await;
+    e.ingest(needs()).await;
+    let mut notices = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        let v: Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "notice" {
+            notices.push(v);
+        }
+    }
+    assert_eq!(notices.len(), 1, "one banner, not one per retry");
+    assert_eq!(notices[0]["data"]["action"]["href"], "#/settings/accounts");
+    assert!(notices[0]["data"]["message"].as_str().unwrap().starts_with("Kick"));
+}
+
+#[tokio::test]
+async fn session_numbers_follow_tips_refunds_bits_and_viewers() {
+    let (e, _d) = engine().await;
+    let live = |p: Platform, kind: EventKind| Event::live(p, None, Millis(0), kind);
+    e.ingest(live(Platform::Twitch, EventKind::StreamOnline { title: None })).await;
+    e.ingest(live(Platform::Youtube, EventKind::StreamOnline { title: None })).await;
+    let tip = serde_json::json!({ "provider": "razorpay", "status": "captured", "payment_id": "pay_s",
+        "amount_minor": 50_000, "digits": 2, "currency": "INR", "name": "Asha" });
+    e.ingest(crate::relay::tip_event(&tip).unwrap()).await;
+    let mut bits = ferrocast_core::sample::sample("platform_gift", Platform::Twitch, Millis(0)).unwrap();
+    bits.source_id = Some("cheer-1".into());
+    bits.origin = Origin::Live;
+    e.ingest(bits).await;
+    e.ingest(live(Platform::Twitch, EventKind::ViewerCount { count: 100 })).await;
+    e.ingest(live(Platform::Youtube, EventKind::ViewerCount { count: 50 })).await;
+    let (s, _) = e.session_view();
+    assert_eq!(s.tips, vec![Money::new(50_000, "INR")]);
+    assert_eq!((s.bits, s.peak_viewers), (500, 150));
+    // YouTube ends; its last count no longer adds up.
+    e.ingest(live(Platform::Youtube, EventKind::StreamOffline)).await;
+    e.ingest(live(Platform::Twitch, EventKind::ViewerCount { count: 120 })).await;
+    assert_eq!(e.session_view().0.peak_viewers, 150);
+    let refund = serde_json::json!({ "provider": "razorpay", "status": "refunded", "payment_id": "pay_s" });
+    e.ingest(crate::relay::tip_event(&refund).unwrap()).await;
+    assert_eq!(e.session_view().0.tips, vec![Money::new(0, "INR")], "refunds come off this stream's total");
+    let tip2 = serde_json::json!({ "provider": "razorpay", "status": "captured", "payment_id": "pay_t",
+        "amount_minor": 20_000, "digits": 2, "currency": "INR", "name": "Ravi" });
+    e.ingest(crate::relay::tip_event(&tip2).unwrap()).await;
+    for status in ["refunded", "disputed"] {
+        let r = serde_json::json!({ "provider": "razorpay", "status": status, "payment_id": "pay_t" });
+        e.ingest(crate::relay::tip_event(&r).unwrap()).await;
+    }
+    let tip3 = serde_json::json!({ "provider": "razorpay", "status": "captured", "payment_id": "pay_u",
+        "amount_minor": 30_000, "digits": 2, "currency": "INR", "name": "Meera" });
+    e.ingest(crate::relay::tip_event(&tip3).unwrap()).await;
+    assert_eq!(e.session_view().0.tips, vec![Money::new(30_000, "INR")], "a refund and a dispute take it back once");
+}
+
+#[tokio::test]
+async fn held_marks_are_replayed_with_their_messages() {
+    let (e, _d) = engine().await;
+    e.register_connector(FakePlatform::new(Platform::Twitch));
+    let before = e.current_seq();
+    e.ingest(first_time(chat(Platform::Twitch, "h1", "newbie", "visit spam.xyz"))).await;
+    let (frames, gap) = e.events_since(before);
+    assert!(!gap);
+    let types: Vec<String> = frames
+        .iter()
+        .map(|f| serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(types, ["event", "held"]);
+    assert!(e.current_seq() > 1_000_000_000_000, "seqs start from the clock, so they grow across restarts");
+}
+
+#[tokio::test]
 async fn a_restore_keeps_panic_mode_on() {
     let (e, _d) = engine().await;
     e.register_connector(FakePlatform::new(Platform::Twitch));

@@ -109,3 +109,8 @@ pub(crate) fn platform(s: &str) -> Result<Platform, ApiError> {
         _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube or kick."))),
     }
 }
+
+#[cfg(test)]
+pub(crate) fn obs_view_for_tests(o: &ferrocast_engine::ObsView) -> serde_json::Value {
+    core::obs_view(o)
+}
