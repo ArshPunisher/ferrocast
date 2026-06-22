@@ -3,21 +3,39 @@
 //!
 //! The window is a thin view of `http://127.0.0.1:<port>/app/`; it has no IPC permissions
 //! and talks to the engine over the same HTTP API a browser uses (ARCHITECTURE.md §1).
-//! Closing the window hides it; the engine keeps running in the tray.
+//! Closing the window hides it (unless "close to tray" is off); the engine keeps running in
+//! the tray. Launch at login, the panic hotkey and window size follow the dashboard's
+//! settings, and warnings show as system notifications while the window is hidden.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ferrocast_engine::Engine;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
-const PANIC_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+P";
 const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
+/// Passed by the login item: start in the tray without opening the window.
+const MINIMIZED_ARG: &str = "--minimized";
+/// How often the shell picks up settings changed in the dashboard.
+const SETTINGS_EVERY: Duration = Duration::from_secs(2);
+
+/// Settings the shell applies itself, shared with the window and shortcut handlers.
+#[derive(Default)]
+struct Shell {
+    close_to_tray: AtomicBool,
+    panic_shortcut: Mutex<Option<Shortcut>>,
+}
 
 /// What the running app holds on to.
 struct Running {
@@ -44,16 +62,23 @@ fn init_tracing() {
 fn main() {
     init_tracing();
     let dir = data_dir();
+    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
+        .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if *shortcut == shortcut_of(PANIC_SHORTCUT) {
+                    let is_panic = app.try_state::<Arc<Shell>>().is_some_and(|s| {
+                        s.panic_shortcut.lock().unwrap_or_else(|p| p.into_inner()).as_ref() == Some(shortcut)
+                    });
+                    if is_panic {
                         toggle_panic(app);
                     } else if *shortcut == shortcut_of(SHOW_SHORTCUT) {
                         show_window(app);
@@ -71,23 +96,36 @@ fn main() {
                     return Ok(());
                 }
             };
+            let engine = running.engine.clone();
             app.manage(running);
+            let shell = Arc::new(Shell::default());
+            shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
+            app.manage(shell.clone());
             build_tray(app.handle())?;
-            for s in [PANIC_SHORTCUT, SHOW_SHORTCUT] {
-                if let Err(e) = app.global_shortcut().register(shortcut_of(s)) {
-                    tracing::warn!(shortcut = s, error = %e, "couldn't register a shortcut (another app may use it)");
-                }
+            if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
+                tracing::warn!(error = %e, "couldn't register the show-window shortcut (another app may use it)");
             }
-            show_window(app.handle());
+            tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
+            tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
+            if !minimized {
+                show_window(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
                 && window.label() == "main"
             {
-                // Closing hides: the engine keeps alerts and the bot running from the tray.
-                api.prevent_close();
-                let _ = window.hide();
+                let app = window.app_handle();
+                let _ = app.save_window_state(StateFlags::all());
+                let to_tray = app.try_state::<Arc<Shell>>().is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed));
+                if to_tray {
+                    // Closing hides: the engine keeps alerts and the bot running from the tray.
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    app.exit(0);
+                }
             }
         })
         .build(tauri::generate_context!());
@@ -112,6 +150,82 @@ fn main() {
 
 fn shortcut_of(s: &str) -> Shortcut {
     s.parse().unwrap_or_else(|_| Shortcut::new(None, tauri_plugin_global_shortcut::Code::F24))
+}
+
+/// Applies the settings the shell owns whenever the dashboard changes them: launch at
+/// login, close to tray, and the panic hotkey (PanicConfig.hotkey).
+async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
+    let mut login: Option<bool> = None;
+    let mut hotkey: Option<String> = None;
+    loop {
+        let settings = engine.settings();
+        shell.close_to_tray.store(settings.close_to_tray, Ordering::Relaxed);
+        if login != Some(settings.launch_at_login) {
+            let al = app.autolaunch();
+            let result = if settings.launch_at_login { al.enable() } else { al.disable() };
+            match result {
+                Ok(()) => login = Some(settings.launch_at_login),
+                Err(e) => {
+                    tracing::warn!(error = %e, "couldn't change launch at login");
+                    login = Some(settings.launch_at_login); // don't retry every two seconds
+                }
+            }
+        }
+        let wanted = engine.panic_state().1.hotkey.trim().to_string();
+        if hotkey.as_deref() != Some(wanted.as_str()) {
+            set_panic_hotkey(&app, &shell, &wanted);
+            hotkey = Some(wanted);
+        }
+        tokio::time::sleep(SETTINGS_EVERY).await;
+    }
+}
+
+fn set_panic_hotkey(app: &AppHandle, shell: &Shell, wanted: &str) {
+    let mut slot = shell.panic_shortcut.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(old) = slot.take() {
+        let _ = app.global_shortcut().unregister(old);
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    // Registered exactly as written ("Ctrl" stays Control on a Mac): it's global, and ⌘
+    // combinations belong to the app in front.
+    match wanted.parse::<Shortcut>() {
+        Ok(sc) => match app.global_shortcut().register(sc) {
+            Ok(()) => *slot = Some(sc),
+            Err(e) => {
+                tracing::warn!(hotkey = wanted, error = %e, "couldn't register the panic hotkey (another app may use it)")
+            }
+        },
+        Err(e) => {
+            tracing::warn!(hotkey = wanted, error = %e, "the panic hotkey isn't a shortcut this computer understands")
+        }
+    }
+}
+
+/// Warnings and errors (a platform needs signing in, panic mode, a refund) become system
+/// notifications while the window is hidden, so the streamer sees them mid-game.
+async fn notify_when_hidden(app: AppHandle, engine: Engine) {
+    let mut live = engine.subscribe_live();
+    loop {
+        let frame = match live.recv().await {
+            Ok(f) => f,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&frame.text) else { continue };
+        if v["type"] != "notice" || !matches!(v["data"]["level"].as_str(), Some("warn" | "error")) {
+            continue;
+        }
+        let visible = app.get_webview_window("main").and_then(|w| w.is_visible().ok()).unwrap_or(false);
+        if visible {
+            continue;
+        }
+        let body = v["data"]["message"].as_str().unwrap_or("").chars().take(300).collect::<String>();
+        if let Err(e) = app.notification().builder().title("Ferrocast").body(body).show() {
+            tracing::debug!(error = %e, "couldn't show a notification");
+        }
+    }
 }
 
 async fn start(dir: &std::path::Path) -> Result<Running, String> {

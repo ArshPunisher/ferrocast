@@ -27,6 +27,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-notification = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 

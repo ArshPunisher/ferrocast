@@ -22,7 +22,7 @@ pub struct PanicConfig {
     pub hold_new_accounts: bool,
     pub pause_alerts: bool,
     pub pause_tts: bool,
-    /// The global shortcut, e.g. "Ctrl+Shift+P". Empty = none.
+    /// The global shortcut, e.g. "Ctrl+Alt+Shift+P". Empty = none.
     #[serde(default)]
     pub hotkey: String,
     #[serde(default)]
@@ -39,7 +39,8 @@ impl Default for PanicConfig {
             hold_new_accounts: true,
             pause_alerts: true,
             pause_tts: true,
-            hotkey: "Ctrl+Shift+P".into(),
+            // Global, so it must not steal a common app shortcut (⌘⇧P, Ctrl+Shift+P).
+            hotkey: "Ctrl+Alt+Shift+P".into(),
             subscribers_only: false,
         }
     }
