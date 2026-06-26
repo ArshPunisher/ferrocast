@@ -74,6 +74,10 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | GET | `/api/v1/status` | → `{ version, port, live: { twitch, youtube, kick }, connectors: { twitch: ConnectorState, youtube, kick, obs, relay }, setup_done: boolean }` |
 | POST | `/api/v1/session/pair` | `{ code }` → `{ token }` (no auth needed) |
 | POST | `/api/v1/session/pair-code` | → `{ code, url, expires_at }` (makes an "open in browser" link) |
+| POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
+| GET | `/api/v1/stats/session` | → `{ started_at, follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
+| GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
+| GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta", blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
 
 `ConnectorState = { state: "off" | "connected" | "reconnecting" | "disconnected" | "sign_in_needed" | "scopes_missing", account: { name, avatar_url } | null, detail: string | null, last_event_at: number | null }`
 
@@ -127,6 +131,7 @@ Widget `config` per kind:
 ### Goals
 `Goal = { id, title, kind: "follows" | "subs" | "tips" | "bits" | "custom", target: number, currency: string | null, starts_at, ends_at: number | null, current: number }`
 GET/POST `/api/v1/goals`, PUT/DELETE `/api/v1/goals/{id}`, POST `/api/v1/goals/{id}/adjust { delta }`.
+Tips goals are in **major units** of their currency everywhere (API, `goals` frames, overlay `state`): ₹3,450.50 is `3450.5`; `delta` too. A tips goal needs a `currency`; other goals take whole numbers and no currency (400 otherwise). `current` is never taken from a PUT, and a goal with progress can't change its kind or currency (409).
 
 ### Chat and moderation
 | Method | Path | Body → Response |
@@ -135,23 +140,48 @@ GET/POST `/api/v1/goals`, PUT/DELETE `/api/v1/goals/{id}`, POST `/api/v1/goals/{
 | POST | `/api/v1/chat/send` | `{ text, platforms: Platform[] \| "all", reply_to?: { platform, message_id } }` → `{ sent: Platform[], failed: { platform, reason }[] }` |
 | POST | `/api/v1/mod/delete` | `{ platform, message_id }` → 204 |
 | POST | `/api/v1/mod/timeout` | `{ platform, user_id, seconds, reason? }` → 204 |
-| POST | `/api/v1/mod/ban` | `{ user: { platform, user_id, login }, reason?, everywhere: boolean }` → `{ banned: Platform[], failed: [...] }` |
-| POST | `/api/v1/mod/unban` | `{ platform, user_id }` → 204 |
-| GET | `/api/v1/mod/bans` | → shared ban list |
-| POST | `/api/v1/mod/panic` | `{ on: boolean }` → `{ on, applied: { platform, modes: string[] }[] }` |
-| GET / PUT | `/api/v1/mod/filters` | word list, link rules, caps/emote/symbol limits, actions |
-| GET / PUT | `/api/v1/viewers/{platform}/{user_id}/note` | `{ text }` |
+| POST | `/api/v1/mod/ban` | `{ user: { platform, user_id, login, display_name? }, reason?, everywhere: boolean }` → `{ banned: Platform[], failed: [...] }` |
+| POST | `/api/v1/mod/unban` | `{ platform, user_id }` → 204 (always asks the platform, so bans the filter made can be undone) |
+| GET | `/api/v1/mod/bans` | → `BanEntry[]`, newest first |
+| GET | `/api/v1/mod/panic` | → `{ on, plan: PanicConfig }` |
+| POST | `/api/v1/mod/panic` | `{ on: boolean }` → `{ on, applied: { platform, modes: string[] }[] }`; also sends `panic` and one `notice` frame |
+| GET / PUT | `/api/v1/mod/panic/config` | `PanicConfig` (400 names the field) |
+| GET / PUT | `/api/v1/mod/filters` | `Filters` (400 names the field, e.g. `timeout_seconds: must be between 1 second and 14 days.`) |
+| GET | `/api/v1/mod/held` | → held chat `Event[]`, oldest first |
+| POST | `/api/v1/mod/held/{event_id}/release` · `/drop` | → 204: release shows it in chat overlays; drop deletes it on the platform. 404 `held_not_found` when another mod got there first |
+| GET | `/api/v1/viewers/{platform}/{user_id}` | → `ViewerCard` (404 `viewer_not_found`) |
+| GET / PUT | `/api/v1/viewers/{platform}/{user_id}/note` | `{ text }` (up to 2,000 characters) |
+
+```ts
+type BanEntry = { platform; user_id; login; display_name; reason: string | null; banned_at: number; everywhere: boolean; by: string | null }
+type FilterAction = "delete" | "timeout" | "ban" | "hold"
+type Filters = { words: { enabled; list: string[]; lookalikes: boolean; action }, links: { enabled; allow_roles: number; allow_domains: string[]; action; hold_first_time? },
+                 caps: { enabled; min_length; max_percent; action }, emotes: { enabled; max; action }, symbols: { enabled; max_percent; action },
+                 solicitation: { enabled; action }, timeout_seconds: number, exempt_roles: number, max_length? }
+type PanicConfig = { followers_only; followers_only_minutes; emote_only; slow_mode_seconds /* 0 = leave alone */; hold_new_accounts; pause_alerts; pause_tts; hotkey: string; subscribers_only? }
+type ViewerCard = { platform; user_id; login; display_name; avatar_url: string | null; roles: number; first_seen: number | null; messages: number;
+                    follows_since: number | null; note: string; banned: boolean; timeouts: number; other_identities: { platform, login }[] }
+```
 
 ### Bot
 GET/POST `/api/v1/commands`, PUT/DELETE `/api/v1/commands/{id}`; GET/POST `/api/v1/timers`, PUT/DELETE `/api/v1/timers/{id}`.
-`Command = { id, name: "!discord", aliases: string[], response: string (template), roles: "everyone" | "subs" | "vips" | "mods", cooldown_s: number, user_cooldown_s: number, platforms: Platform[] | [], enabled }`
+`Command = { id, name: "!discord", aliases: string[], response: string (template), roles: "everyone" | "subs" | "vips" | "mods", cooldown_s: number, user_cooldown_s: number, platforms: Platform[] | [], enabled }` (`id` may be blank on POST; the engine picks one)
 `Timer = { id, name, message, every_min: number, min_chat_lines: number, platforms: Platform[] | [], enabled }`
 
 ### TTS
-GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, max_chars, hold_for_approval, read_names }`), GET `/api/v1/tts/voices`, GET `/api/v1/tts/pending`, POST `/api/v1/tts/{id}/approve` · `/reject`.
+GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.
+GET `/api/v1/tts/voices` → `{ id, name, language, pro: false }[]` (the computer's own voices). GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
 
 ### Tips
-GET/PUT `/api/v1/tips` (`{ enabled, display_name, page_url, currency, min_amount, providers: { razorpay?: {...}, kofi?: {...}, stripe?: {...} } }`).
+The streamer uses their own provider pages; the relay verifies each provider's webhook and forwards name, amount and message only.
+
+```ts
+type TipProviderState = { page_url: string; page_id: string | null; test_mode: boolean; has_secret: boolean }
+type TipSettings = { handle; display_name; message; page_url: string | null; webhooks: { razorpay; kofi; stripe } | null;
+                     razorpay: TipProviderState | null; kofi: TipProviderState | null; stripe: TipProviderState | null }
+```
+GET `/api/v1/tips` → `TipSettings` (never secrets). PUT with the same fields; a provider is `null` (off) or `{ page_url, page_id?, test_mode?, secret? }`, where a blank secret keeps the saved one → the normalised `TipSettings`. DELETE → 204 (page down; the name stays held for this install for 30 days).
+Errors: 400 `invalid` (handle 3–30 of `a-z 0-9 - _`, reserved words, links must be https on the provider's own domains, Stripe secrets start `whsec_`, `page_id` must be a `plink_` id), 409 `conflict` (name taken), 429 `rate_limited` (three name changes a day), 422 `unavailable` (no relay in this build or the relay can't be reached).
 
 ### Media
 | Method | Path | Body → Response |
@@ -161,23 +191,24 @@ GET/PUT `/api/v1/tips` (`{ enabled, display_name, page_url, currency, min_amount
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
 ### OBS
-GET `/api/v1/obs` → `{ state, version, scene }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the keychain).
+GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the keychain; absent keeps it, `null` clears it).
 
 ### Settings and data
-GET/PUT `/api/v1/settings`; POST `/api/v1/export` → a `.ferropack` download; POST `/api/v1/import` (multipart, `source: "ferropack" | "streamelements" | "streamlabs"`) → a report of what was imported; GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`.
+GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
+POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`. StreamElements and Streamlabs imports aren't in this build yet.
 
 ## 5. Live socket for the dashboard
 
-`GET /api/v1/live?session=<token>` (WebSocket). Server → client frames `{ v: 1, type, data }`:
+`GET /api/v1/live?session=<token>&since=<seq>` (WebSocket; `since` optional). With `since`, the `event` frames after that seq (the last 500 are kept) are replayed right after `hello`, `status` and `queue`, with their `held` marks; `hello.seq` is then `since` itself, and `resync { missed: 0 }` (0 = count unknown) comes first if some were already forgotten or `since` is from before a restart. Seqs only grow, across restarts too. Drop duplicate event ids. Server → client frames `{ v: 1, type, data }`:
 - `hello { seq }`
 - `event Event` (everything, including chat)
 - `status { connectors }`
 - `queue Queue`
 - `tts_pending [...]`
-- `notice { level: "info" | "warn" | "error", message, action?: { label, href } }`
+- `notice { level: "info" | "warn" | "error", message, action?: { label, href } }` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
 - `goals Goal[]` (after any goal change)
-- `held { event_id, reason }` (the chat filter held a message for a mod)
-- `panic { on, plan }`
+- `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
+- `panic { on, plan: PanicConfig }`
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
 The client sends nothing but pings.
@@ -199,14 +230,16 @@ Server → overlay frames `{ v: 1, seq, type, data }`:
 | `delete_user` | `{ platform, user_id }` |
 | `clear_chat` | `{ platform: Platform \| null }` |
 | `tts` | `{ id, text, audio: string \| null }`: a mod approved a held TTS message. Play `/o/<token>/media/<audio>` when present, else speak `text` with the browser's voice |
-| `revoked` | `{}`: this URL was regenerated or the overlay deleted; the server closes the socket next |
+| `revoked` | `{}`: this URL was regenerated or the overlay deleted; the server closes the socket next with code 4404 |
 
 Overlay → server frames: `hello { since_seq }`, `ack { alert_id, phase: "started" | "finished" | "failed" }`, `visibility { visible }`. Anything else is ignored and logged. **An overlay can never create events** (R-36).
 
-Test mode: `/o/<token>/?test` asks the server for sample events on a loop, for previews in the editor.
+A socket opened with a token the engine doesn't know is closed at once with code **4404**; treat it like `revoked` (clear, stop reconnecting).
+
+Test mode: `/o/<token>/ws?test` gets the snapshot (layout, goals and viewer counts; no real chat, events or names), then a sample `event` (and its `alert` when a rule covers it, ids `preview-<n>`, `test: true`) at once and every 6 s, plus `config`/`revoked` for its overlay. Nothing from the real queue reaches it, and its acks are ignored.
 
 Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/`, so build it with Vite `base: "./"` (assets resolve to `/o/<token>/assets/…`). The dashboard is served under `/app/` (Vite `base: "/app/"`); unknown paths without a file extension fall back to `index.html`. Dashboard `<img>`/`<audio>` previews may pass the session as `?session=` on `GET /api/v1/media/{id}`.
 
 ## 7. Not in this build yet
 
-`POST /accounts/{platform}/connect` works for Twitch (when the build has a Twitch app) and answers 422 with a message for YouTube and Kick until their adapters land. `POST /overlays/{id}/add-to-obs` works whenever OBS is reachable and answers 422 with a hint otherwise.
+`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. StreamElements and Streamlabs imports, and the update feed (`/updates` always has `latest: null`), aren't in this build yet.
