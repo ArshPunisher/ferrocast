@@ -81,7 +81,8 @@ pub fn apply_scheduled_restore(dir: &Path) -> Result<Option<String>> {
     // the one being restored may be the oldest.
     let tmp = dir.join("ferrocast.db.restoring");
     std::fs::copy(dir.join("backups").join(format!("{id}.db")), &tmp)?;
-    std::fs::File::open(&tmp)?.sync_all()?;
+    // Flushing needs a handle opened for writing: on Windows a read-only one is refused.
+    std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
     if db.exists() {
         // Keep the current data first, through SQLite so the WAL's newest pages are
         // included (a plain file copy would miss everything since the last checkpoint).
