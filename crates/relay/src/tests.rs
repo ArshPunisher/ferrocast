@@ -274,6 +274,12 @@ fn client_ip_trusts_forwarding_only_from_the_local_proxy() {
     assert_eq!(client_ip(local, &HeaderMap::new()).to_string(), "127.0.0.1");
     h.insert("x-forwarded-for", "garbage".parse().unwrap());
     assert_eq!(client_ip(local, &h).to_string(), "127.0.0.1");
+    // Behind the Cloudflare Tunnel container (a private address), Cloudflare's header wins.
+    let tunnel: std::net::SocketAddr = "172.18.0.5:41000".parse().unwrap();
+    let mut cf = HeaderMap::new();
+    cf.insert("cf-connecting-ip", "203.0.113.9".parse().unwrap());
+    assert_eq!(client_ip(tunnel, &cf).to_string(), "203.0.113.9");
+    assert_eq!(client_ip(remote, &cf).to_string(), "192.0.2.1", "a public caller can't send it");
 }
 
 mod tip_tests {

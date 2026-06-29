@@ -160,19 +160,34 @@ fn random(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// The caller's address. Behind the local reverse proxy (the peer is loopback) that's the
-/// last `X-Forwarded-For` hop the proxy added; a direct caller can't spoof it.
+/// The caller's address. Behind our own proxy (the peer is loopback, or a private address
+/// such as the Cloudflare Tunnel container next to us) that's `CF-Connecting-IP`, else the
+/// last `X-Forwarded-For` hop the proxy added. A caller from the internet reaches the relay
+/// only through the proxy, so it can't pick its own address.
 pub fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
-    if peer.ip().is_loopback()
-        && let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(|v| v.trim().parse().ok())
+    let header_ip = |name: &str, last: bool| {
+        headers.get(name).and_then(|v| v.to_str().ok()).and_then(|v| {
+            let part = if last { v.rsplit(',').next() } else { v.split(',').next() };
+            part.and_then(|p| p.trim().parse().ok())
+        })
+    };
+    if is_private(peer.ip())
+        && let Some(ip) = header_ip("cf-connecting-ip", false).or_else(|| header_ip("x-forwarded-for", true))
     {
         return ip;
     }
     peer.ip()
+}
+
+fn is_private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback() || v4.is_private())
+        }
+    }
 }
 
 fn hash(secret: &str) -> String {
