@@ -1,0 +1,37 @@
+# Ferrocast relay on the Oracle server (/opt/ferrocast-relay), reached only through its own
+# Cloudflare Tunnel: no port is published on the host.
+#   relay.env    RELAY_PUBLIC_URL, KICK_CLIENT_ID, KICK_CLIENT_SECRET (chmod 600)
+#   tunnel.env   TUNNEL_TOKEN from the Cloudflare dashboard (chmod 600)
+name: ferrocast-relay
+
+services:
+  relay:
+    image: ferrocast-relay:${RELAY_TAG:-latest}
+    container_name: ferrocast-relay
+    restart: unless-stopped
+    env_file: relay.env
+    volumes:
+      - relay-data:/data
+    networks: [ferrocast]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: { memory: 256m }
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.0
+    container_name: ferrocast-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    env_file: tunnel.env
+    depends_on: [relay]
+    networks: [ferrocast]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  relay-data:
+
+networks:
+  ferrocast:

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Builds the relay image, ships it to the server and (re)starts it behind its own
+# Cloudflare Tunnel. Nothing else on the server is touched.
+#
+#   deploy/deploy-relay.sh [ssh-host]        (default host: transformx-server)
+#
+# Secrets come from ../secrets/relay.env next to the repo (never committed):
+#   TUNNEL_TOKEN=...          from Cloudflare → Networking → Tunnels → ferrocast-relay
+#   KICK_CLIENT_ID=...        from kick.com → Settings → Developer (optional until then)
+#   KICK_CLIENT_SECRET=...
+# shellcheck disable=SC2029 # $dir is meant to expand here, before ssh sends the command.
+set -euo pipefail
+
+host="${1:-transformx-server}"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+secrets="$repo/../secrets/relay.env"
+dir=/opt/ferrocast-relay
+
+if [[ ! -f "$secrets" ]]; then
+  echo "Missing $secrets (needs TUNNEL_TOKEN, and KICK_CLIENT_ID/KICK_CLIENT_SECRET once the Kick app exists)." >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$secrets"
+if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
+  echo "TUNNEL_TOKEN is empty in $secrets." >&2
+  exit 1
+fi
+
+echo "Building the relay image..."
+docker build -q -f "$repo/deploy/relay.Dockerfile" -t ferrocast-relay:latest "$repo" >/dev/null
+
+echo "Sending it to $host..."
+docker save ferrocast-relay:latest | gzip | ssh "$host" 'sudo docker load' >/dev/null
+
+echo "Writing the config..."
+# Secrets go straight to their final, root-owned 0600 files through `sudo install` reading
+# stdin: nothing passes through a guessable /tmp path another user could pre-create.
+ssh "$host" "sudo mkdir -p $dir && sudo chmod 755 $dir"
+ssh "$host" "sudo install -m 644 -o root -g root /dev/stdin $dir/docker-compose.yml" < "$repo/deploy/docker-compose.yml"
+{
+  printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
+  printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
+  printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
+  printf 'RUST_LOG=info\n'
+} | ssh "$host" "sudo install -m 600 -o root -g root /dev/stdin $dir/relay.env"
+printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o root -g root /dev/stdin $dir/tunnel.env"
+
+ssh "$host" "set -e
+  cd $dir && sudo docker compose up -d --remove-orphans
+  sleep 5
+  sudo docker ps --filter name=ferrocast --format '{{.Names}}: {{.Status}}'"
+
+echo "Checking it from the internet..."
+for _ in 1 2 3 4 5 6; do
+  if curl -fsS https://ferrocast-relay.clearcraftlabs.com/health 2>/dev/null | grep -q ok; then
+    echo "The relay answers at https://ferrocast-relay.clearcraftlabs.com"
+    exit 0
+  fi
+  sleep 5
+done
+echo "Started, but https://ferrocast-relay.clearcraftlabs.com/health doesn't answer yet. Check the tunnel's public hostname in Cloudflare." >&2
+exit 1
