@@ -1,0 +1,42 @@
+name: Soak
+
+# R-40: a long run under steady load that fails if memory keeps growing or alerts back up.
+# GitHub's hosted runners stop a job at 6 hours, so this runs about 5.3 hours at 5 events
+# a second (more events than a full day at one a second), then waits up to 15 minutes for
+# the alert queue to drain. Weekly, and on demand.
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long to run, in minutes
+        default: "320"
+      rate:
+        description: Events per second
+        default: "5"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: Soak (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build
+        run: cargo build --release --locked -p ferrocast-engine --example soak
+      - name: Soak
+        env:
+          MINUTES: ${{ inputs.minutes || '320' }}
+          RATE: ${{ inputs.rate || '5' }}
+        run: ./target/release/examples/soak --minutes "$MINUTES" --rate "$RATE"
