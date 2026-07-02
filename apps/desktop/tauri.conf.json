@@ -14,8 +14,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "appimage", "deb", "rpm"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "appimage",
+      "deb",
+      "rpm"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "category": "Utility",
     "shortDescription": "Alerts, overlays, chat and moderation for Twitch, YouTube and Kick",
     "longDescription": "Ferrocast runs your stream alerts, OBS overlays, merged chat, chatbot and cross-platform moderation on your own computer. Free and open source.",
@@ -23,8 +36,34 @@
     "copyright": "Copyright 2026 ClearCraft Labs",
     "license": "GPL-3.0-or-later",
     "homepage": "https://ferrocast.clearcraftlabs.com",
-    "macOS": { "signingIdentity": "-", "minimumSystemVersion": "13.3" },
-    "linux": { "appimage": { "bundleMediaFramework": false } },
-    "windows": { "nsis": { "installMode": "currentUser" } }
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "13.3",
+      "dmg": {
+        "background": "dmg/background.tiff",
+        "windowSize": {
+          "width": 660,
+          "height": 448
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 210
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 210
+        }
+      }
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

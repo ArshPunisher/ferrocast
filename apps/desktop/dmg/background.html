@@ -1,0 +1,88 @@
+<!doctype html>
+<!--
+  The macOS install window (DMG) background: 660 × 400 points. Finder draws the app icon at
+  (180, 210) and the Applications folder at (480, 210) on top of it (see tauri.conf.json).
+  Rendered to background.tiff (1× and 2×) by render.sh. Finder labels are dark text, so the
+  background stays light.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: 'Bricolage Grotesque';
+    src: url('../../../../ferrocast-web/dist/dashboard/assets/bricolage-grotesque-latin-wght-normal-DLoelf7F.woff2') format('woff2');
+    font-weight: 200 800;
+  }
+  @font-face {
+    font-family: 'Hanken Grotesk';
+    src: url('../../../../ferrocast-web/dist/dashboard/assets/hanken-grotesk-latin-wght-normal-CaVRRdDk.woff2') format('woff2');
+    font-weight: 100 900;
+  }
+  html, body { margin: 0; }
+  body {
+    width: 660px;
+    height: 400px;
+    overflow: hidden;
+    position: relative;
+    background: #f4f6fb;
+    font-family: 'Hanken Grotesk', system-ui, sans-serif;
+    color: #12151c;
+  }
+  /* Colour fields: cobalt (the brand) on the app side, violet on the way, molten at home. */
+  .field { position: absolute; border-radius: 50%; filter: blur(46px); }
+  .cobalt { width: 340px; height: 340px; left: 10px; top: 60px; background: radial-gradient(circle, #3461f5 0%, rgba(52, 97, 245, 0) 70%); opacity: .8; }
+  .violet { width: 300px; height: 260px; left: 190px; top: 170px; background: radial-gradient(circle, #a855f7 0%, rgba(168, 85, 247, 0) 70%); opacity: .55; }
+  .molten { width: 340px; height: 340px; left: 330px; top: 50px; background: radial-gradient(circle, #ff7a3d 0%, rgba(255, 122, 61, 0) 70%); opacity: .7; }
+  .sun { width: 220px; height: 160px; left: 470px; top: -40px; background: radial-gradient(circle, #ffc93d 0%, rgba(255, 201, 61, 0) 70%); opacity: .5; }
+  /* Where Finder puts the two icons and their names: a glass plate under each. */
+  .plate {
+    position: absolute; top: 128px; width: 168px; height: 184px; border-radius: 36px;
+    background: rgba(255, 255, 255, .62);
+    backdrop-filter: blur(6px);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 18px 40px -18px rgba(28, 40, 90, .35);
+    border: 1px solid rgba(255, 255, 255, .7);
+  }
+  .plate.app { left: 96px; }
+  .plate.apps { left: 396px; }
+  header { position: absolute; left: 0; right: 0; top: 34px; text-align: center; }
+  h1 {
+    margin: 0; font-family: 'Bricolage Grotesque', system-ui, sans-serif; font-weight: 700;
+    font-size: 26px; letter-spacing: -0.02em; line-height: 1.1;
+  }
+  header p { margin: 8px 0 0; font-size: 13.5px; color: #4b5263; }
+  svg.arrow { position: absolute; left: 262px; top: 170px; }
+  footer {
+    position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
+    font-size: 11.5px; color: #4b5263;
+  }
+  footer b { font-weight: 600; color: #22262f; }
+</style>
+</head>
+<body>
+  <div class="field cobalt"></div>
+  <div class="field violet"></div>
+  <div class="field molten"></div>
+  <div class="field sun"></div>
+  <header>
+    <h1>Drag Ferrocast into Applications</h1>
+    <p>Then open it from Applications or Spotlight.</p>
+  </header>
+  <div class="plate app"></div>
+  <div class="plate apps"></div>
+  <svg class="arrow" width="136" height="64" viewBox="0 0 136 64" fill="none" aria-hidden="true">
+    <defs>
+      <linearGradient id="g" x1="0" y1="0" x2="136" y2="0" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#3461f5"/>
+        <stop offset=".55" stop-color="#a855f7"/>
+        <stop offset="1" stop-color="#ff7a3d"/>
+      </linearGradient>
+      <marker id="head" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="4" markerHeight="4" orient="auto">
+        <path d="M1 1 L8 5 L1 9" stroke="#ff7a3d" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      </marker>
+    </defs>
+    <path d="M10 44 C 42 8, 90 6, 118 36" stroke="url(#g)" stroke-width="5" stroke-linecap="round" marker-end="url(#head)"/>
+  </svg>
+  <footer>First time only: if macOS won't open it, go to <b>System Settings › Privacy &amp; Security</b> and press <b>Open Anyway</b>.</footer>
+</body>
+</html>
