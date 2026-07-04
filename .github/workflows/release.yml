@@ -4,9 +4,13 @@ name: Release
 # AppImage) and attaches them to a draft GitHub release (R-62). Nothing is published until
 # the owner reviews the draft. Actions are pinned to commit SHAs.
 #
-# Needs one secret while the frontend repo is private: FERROCAST_WEB_TOKEN, a fine-grained
-# token with read access to ferrocast-web. Signing (Apple notarisation, SignPath) comes
-# later (R-61); until then macOS builds are ad-hoc signed and Windows builds are unsigned.
+# Needs, in this repo's settings:
+#   secrets FERROCAST_WEB_TOKEN (read access to ferrocast-web while it is private) and
+#           FERROCAST_YOUTUBE_CLIENT_SECRET;
+#   variables FERROCAST_TWITCH_CLIENT_ID and FERROCAST_YOUTUBE_CLIENT_ID.
+# macOS builds are ad-hoc signed (no paid Apple account): people install with Homebrew
+# (packaging/homebrew) or open the DMG and press "Open Anyway" once. Windows builds are
+# unsigned until SignPath (R-61).
 
 on:
   push:
@@ -88,6 +92,12 @@ jobs:
         shell: bash
         env:
           FERROCAST_WEB_DIST: ${{ github.workspace }}/ferrocast-web/dist
+          # Public app ids live in repo variables; Google's installed-app secret is a
+          # repo secret (it ships inside the app, but stays out of the repo).
+          FERROCAST_TWITCH_CLIENT_ID: ${{ vars.FERROCAST_TWITCH_CLIENT_ID }}
+          FERROCAST_YOUTUBE_CLIENT_ID: ${{ vars.FERROCAST_YOUTUBE_CLIENT_ID }}
+          FERROCAST_YOUTUBE_CLIENT_SECRET: ${{ secrets.FERROCAST_YOUTUBE_CLIENT_SECRET }}
+          FERROCAST_RELAY_URL: https://ferrocast-relay.clearcraftlabs.com
         working-directory: apps/desktop
         run: cargo tauri build ${{ matrix.args }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -109,10 +119,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
+      - name: Homebrew cask with this release's checksum
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          packaging/homebrew/update-cask.sh "$version" dist/Ferrocast_"${version}"_universal.dmg
+          cp packaging/homebrew/Casks/ferrocast.rb dist/ferrocast.rb
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
