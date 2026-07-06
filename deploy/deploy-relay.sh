@@ -20,8 +20,14 @@ if [[ ! -f "$secrets" ]]; then
   echo "Missing $secrets (needs TUNNEL_TOKEN, and KICK_CLIENT_ID/KICK_CLIENT_SECRET once the Kick app exists)." >&2
   exit 1
 fi
-# shellcheck disable=SC1090
-source "$secrets"
+# Read as plain KEY=value lines, never executed (a pasted command must not run).
+value() { sed -n "s/^$1=//p" "$secrets" | tail -n 1; }
+TUNNEL_TOKEN="$(value TUNNEL_TOKEN)"
+KICK_CLIENT_ID="$(value KICK_CLIENT_ID)"
+KICK_CLIENT_SECRET="$(value KICK_CLIENT_SECRET)"
+# The dashboard's copy button gives a whole command ("docker run ... --token eyJ..."); keep
+# only the token.
+TUNNEL_TOKEN="${TUNNEL_TOKEN##* }"
 if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
   echo "TUNNEL_TOKEN is empty in $secrets." >&2
   exit 1
