@@ -90,6 +90,45 @@ pub fn sniff(head: &[u8]) -> Option<(MediaKind, &'static str)> {
     })
 }
 
+/// The true type, size and digest of a file already on disk, or `None` when it isn't a
+/// type we serve or is over its kind's limit. Imports use it so a pack can't label a file
+/// (say, an HTML page) with a type of its choosing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub kind: MediaKind,
+    pub mime: &'static str,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+pub fn check_file(path: &std::path::Path) -> std::io::Result<Option<Checked>> {
+    let data = std::fs::read(path)?;
+    let Some((kind, mime)) = sniff(&data) else {
+        return Ok(None);
+    };
+    if data.is_empty() || data.len() as u64 > kind.max_bytes() {
+        return Ok(None);
+    }
+    let sha256 = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    Ok(Some(Checked { kind, mime, bytes: data.len() as u64, sha256 }))
+}
+
+/// Every type `sniff` can return: what the server is willing to send as media.
+pub fn servable(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "audio/wav"
+            | "audio/ogg"
+            | "audio/mpeg"
+            | "video/webm"
+            | "video/mp4"
+    )
+}
+
 fn media_dir(store: &Store) -> PathBuf {
     store.dir().join("media")
 }

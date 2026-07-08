@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use zip::write::SimpleFileOptions;
 
 use crate::error::{PackError, Result, StoreError};
-use crate::{Store, now_ms};
+use crate::{Store, now_ms, repo};
 
 pub const FORMAT: &str = "ferropack";
 pub const VERSION: u32 = 1;
@@ -256,6 +256,48 @@ fn stage_media<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, staging: &Path) -> 
     Ok(ids)
 }
 
+/// What import learned about the pack's media by reading the files themselves.
+struct CheckedMedia {
+    /// Pack media rows that describe a real, servable file, with that file's true facts.
+    /// Rows missing here are skipped, so they never replace a library record.
+    verified: std::collections::HashMap<String, repo::media::Checked>,
+    /// Staged files to move into the library: servable, and backed by a verified row.
+    copy: std::collections::HashSet<String>,
+}
+
+fn check_media(
+    store: &Store,
+    staging: &Path,
+    staged: &[String],
+    tables: &[(&str, Vec<Map<String, Value>>)],
+) -> Result<CheckedMedia> {
+    let staged: std::collections::HashSet<&str> = staged.iter().map(String::as_str).collect();
+    let mut verified = std::collections::HashMap::new();
+    let mut copy = std::collections::HashSet::new();
+    let pack_rows = tables.iter().filter(|(t, _)| *t == "media").flat_map(|(_, r)| r);
+    for row in pack_rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if verified.contains_key(id) || safe_media_name(&format!("media/{id}")).is_none() {
+            continue;
+        }
+        // The pack's own file if it brought one, else the one already in the library.
+        let (path, from_pack) =
+            if staged.contains(id) { (staging.join(id), true) } else { (store.dir().join("media").join(id), false) };
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(found) = repo::media::check_file(&path)? {
+            if from_pack {
+                copy.insert(id.to_string());
+            }
+            verified.insert(id.to_string(), found);
+        }
+    }
+    Ok(CheckedMedia { verified, copy })
+}
+
 /// Imports a pack, replacing rows with the same keys and keeping everything else.
 pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
     let file = std::fs::File::open(pack)?;
@@ -292,26 +334,75 @@ pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
             tables.push((*t, rows));
         }
     }
+    keep_device_settings(store, &mut tables);
     // Media is unpacked to a staging folder one file at a time, never all in memory.
     let staging = store.dir().join("tmp").join(format!("import-{}", crate::new_id()));
     std::fs::create_dir_all(&staging)?;
-    let staged = stage_media(&mut zip, &staging);
-    let media = match staged {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
+    let result = import_staged(store, &mut zip, &staging, &tables);
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Settings that belong to this computer, not to the streamer's setup: a pack (perhaps one
+/// someone else shared) must not open the server to the network, start the app at login,
+/// or point the OBS connection, and with it the OBS password, at another machine.
+const DEVICE_ENGINE_FIELDS: &[&str] = &["lan_access", "launch_at_login", "close_to_tray"];
+
+fn keep_device_settings(store: &Store, tables: &mut [(&str, Vec<Map<String, Value>>)]) {
+    let Some((_, rows)) = tables.iter_mut().find(|(t, _)| *t == "settings") else {
+        return;
     };
+    // Unreadable local settings count as none: the device fields then fall back to off.
+    let local_engine: Option<Map<String, Value>> =
+        repo::settings::get::<Map<String, Value>>(store, "engine").ok().flatten();
+    let parse = |row: &Map<String, Value>| -> Option<Map<String, Value>> {
+        serde_json::from_str(row.get("value")?.as_str()?).ok()
+    };
+    rows.retain_mut(|row| match row.get("key").and_then(Value::as_str) {
+        Some("engine") => {
+            let Some(mut engine) = parse(row) else {
+                return false;
+            };
+            for field in DEVICE_ENGINE_FIELDS {
+                match local_engine.as_ref().and_then(|l| l.get(*field)) {
+                    Some(v) => engine.insert((*field).to_string(), v.clone()),
+                    None => engine.remove(*field),
+                };
+            }
+            row.insert("value".into(), Value::String(Value::Object(engine).to_string()));
+            true
+        }
+        Some("obs") => parse(row)
+            .and_then(|o| o.get("host").and_then(Value::as_str).map(str::to_string))
+            .is_some_and(|h| matches!(h.as_str(), "127.0.0.1" | "localhost" | "::1")),
+        _ => true,
+    });
+}
+
+fn import_staged<R: Read + Seek>(
+    store: &Store,
+    zip: &mut zip::ZipArchive<R>,
+    staging: &Path,
+    tables: &[(&str, Vec<Map<String, Value>>)],
+) -> Result<ImportReport> {
+    let media = stage_media(zip, staging)?;
+    // A pack's media rows say what type each file is; never believe them. Check every file
+    // the pack brings (and any local file a row points at) by its content instead.
+    let checked = check_media(store, staging, &media, tables)?;
     let backup = store.snapshot("before-import")?;
     let mut report = ImportReport { backup: backup.display().to_string(), ..Default::default() };
     store.write(|tx| {
-        for (table, rows) in &tables {
+        for (table, rows) in tables {
             let allowed: Vec<String> = {
                 let mut st = tx.prepare(&format!("PRAGMA table_info({table})"))?;
                 st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?
             };
             for row in rows {
+                if *table == "media"
+                    && !row.get("id").and_then(Value::as_str).is_some_and(|id| checked.verified.contains_key(id))
+                {
+                    continue;
+                }
                 // Only real columns, so a crafted pack can't inject SQL through key names.
                 let cols: Vec<&String> = row.keys().filter(|k| allowed.contains(k)).collect();
                 if cols.is_empty() {
@@ -339,23 +430,32 @@ pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
             }
             report.imported.insert((*table).into(), json!(rows.len()));
         }
+        for (id, c) in &checked.verified {
+            let kind = serde_json::to_value(c.kind)?;
+            tx.execute(
+                "UPDATE media SET kind = ?1, mime = ?2, bytes = ?3, sha256 = ?4 WHERE id = ?5",
+                rusqlite::params![kind.as_str().unwrap_or("image"), c.mime, c.bytes as i64, c.sha256, id],
+            )?;
+        }
         Ok(())
     })?;
     let dir = store.dir().join("media");
     std::fs::create_dir_all(&dir)?;
     for id in media {
+        // Only a servable file with a verified row ever replaces anything on disk.
+        if !checked.copy.contains(&id) {
+            continue;
+        }
         crate::backup::rename_patiently(&staging.join(&id), &dir.join(&id))
             .or_else(|_| std::fs::copy(staging.join(&id), dir.join(&id)).map(|_| ()))?;
         report.media_files += 1;
     }
-    let _ = std::fs::remove_dir_all(&staging);
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo;
 
     #[test]
     fn export_then_import_into_a_fresh_install_keeps_everything() {
@@ -459,5 +559,95 @@ mod tests {
         assert!(repo::overlays::list(&s).is_ok(), "unknown column names are ignored, tables intact");
         let broken = write_pack(&[("manifest.json", &m), ("overlays.json", b"{not json")]);
         assert!(matches!(pack_err(broken.path()), PackError::Corrupt(_)));
+    }
+
+    #[test]
+    fn a_pack_cannot_choose_what_type_its_media_is_served_as() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let mine = repo::media::save(&s, "mine.png", png).unwrap();
+        let m = manifest_bytes(1);
+        let row = |id: &str, mime: &str| json!({ "id": id, "kind": "image", "name": "x", "mime": mime, "bytes": 1, "sha256": "", "created_at": 0 });
+        let rows = serde_json::to_vec(&json!([
+            row("page", "text/html"),   // an HTML page dressed as media
+            row("real", "text/html"),   // a real PNG with a lying type
+            row(&mine.id, "text/html"), // relabels a file already in the library
+            row("ghost", "image/png"),  // a row with no file anywhere
+        ]))
+        .unwrap();
+        let page = b"<html><script>fetch('/api/v1/settings')</script>";
+        let pack = write_pack(&[
+            ("manifest.json", &m),
+            ("media.json", &rows),
+            ("media/page", page),
+            ("media/real", png),
+            ("media/stray", page), // no row, not a media type
+        ]);
+        let report = import(&s, pack.path()).unwrap();
+        assert_eq!(report.media_files, 1, "only the real image is unpacked");
+
+        assert!(repo::media::get(&s, "page").unwrap().is_none(), "the page's row is dropped");
+        let dir = d.path().join("media");
+        assert!(!dir.join("page").exists() && !dir.join("stray").exists(), "and its file is never written");
+        let (real, _) = repo::media::get(&s, "real").unwrap().unwrap();
+        assert_eq!(
+            (real.mime.as_str(), real.bytes),
+            ("image/png", png.len() as u64),
+            "type and size come from the file"
+        );
+        let (kept, path) = repo::media::get(&s, &mine.id).unwrap().unwrap();
+        assert_eq!(kept.mime, "image/png", "an existing file keeps its true type");
+        assert_eq!(std::fs::read(path).unwrap(), png);
+        assert!(repo::media::get(&s, "ghost").unwrap().is_none());
+
+        // A pack file that isn't media never overwrites a good file with the same id.
+        assert!(!d.path().join("tmp").read_dir().unwrap().any(|_| true), "staging is cleaned up");
+        let swap = write_pack(&[("manifest.json", &m), (&format!("media/{}", mine.id), page)]);
+        import(&s, swap.path()).unwrap();
+        assert_eq!(std::fs::read(dir.join(&mine.id)).unwrap(), png);
+        // ...nor does a row whose packed file fails the check remove the library's record.
+        let mine_row = serde_json::to_vec(&json!([row(&mine.id, "image/png")])).unwrap();
+        let bad_file =
+            write_pack(&[("manifest.json", &m), ("media.json", &mine_row), (&format!("media/{}", mine.id), page)]);
+        import(&s, bad_file.path()).unwrap();
+        let (still, _) = repo::media::get(&s, &mine.id).unwrap().unwrap();
+        assert_eq!(still.mime, "image/png", "the record is kept");
+        // ...nor does a real image with no row behind it replace a library file silently.
+        let other_png = [png, b"different"].concat();
+        let rowless = write_pack(&[("manifest.json", &m), (&format!("media/{}", mine.id), &other_png)]);
+        import(&s, rowless.path()).unwrap();
+        assert_eq!(std::fs::read(dir.join(&mine.id)).unwrap(), png);
+    }
+
+    #[test]
+    fn a_pack_cannot_change_this_computers_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        repo::settings::set(&s, "engine", &json!({ "theme": "dark", "launch_at_login": true })).unwrap();
+        let setting = |key: &str, value: Value| json!({ "key": key, "value": value.to_string(), "updated_at": 0 });
+        let rows = serde_json::to_vec(&json!([
+            setting("engine", json!({ "theme": "light", "lan_access": true, "launch_at_login": false })),
+            setting("obs", json!({ "host": "203.0.113.9", "port": 4455 })),
+        ]))
+        .unwrap();
+        let pack = write_pack(&[("manifest.json", &manifest_bytes(1)), ("settings.json", &rows)]);
+        import(&s, pack.path()).unwrap();
+        let engine: Map<String, Value> = repo::settings::get(&s, "engine").unwrap().unwrap();
+        assert_eq!(engine["theme"], "light", "the streamer's own choices come across");
+        assert_eq!(engine.get("lan_access"), None, "but never network access");
+        assert_eq!(engine["launch_at_login"], true, "or this computer's start-up choice");
+        assert!(repo::settings::get::<Value>(&s, "obs").unwrap().is_none(), "OBS on another machine is dropped");
+
+        let local = write_pack(&[
+            ("manifest.json", &manifest_bytes(1)),
+            (
+                "settings.json",
+                &serde_json::to_vec(&json!([setting("obs", json!({ "host": "127.0.0.1", "port": 4460 }))])).unwrap(),
+            ),
+        ]);
+        import(&s, local.path()).unwrap();
+        let obs: Value = repo::settings::get(&s, "obs").unwrap().unwrap();
+        assert_eq!(obs["port"], 4460, "OBS on this computer is kept");
     }
 }
