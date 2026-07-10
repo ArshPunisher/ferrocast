@@ -124,16 +124,32 @@ async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Respon
         Ok(None) => return ApiError::not_found("file").into_response(),
         Err(e) => return ApiError::from(e).into_response(),
     };
+    // Media shares the dashboard's origin, so only ever send it as an image, sound or video.
+    if !ferrocast_store::repo::media::servable(&media.mime) {
+        return ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media",
+            "This file isn't an image, sound or video Ferrocast can play.",
+        )
+        .hint("Upload it again from the media library.")
+        .into_response();
+    }
     let Ok(mut file) = tokio::fs::File::open(&path).await else {
         return ApiError::not_found("file").into_response();
     };
-    let len = media.bytes;
+    // The size on disk, not the stored one: a wrong Content-Length breaks the response.
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => return ApiError::not_found("file").into_response(),
+    };
     let range = headers.get(header::RANGE).and_then(|r| r.to_str().ok()).and_then(|r| parse_range(r, len));
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, media.mime.as_str())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CACHE_CONTROL, "private, max-age=3600")
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox")
+        .header(header::REFERRER_POLICY, "no-referrer");
     match range {
         Some((start, end)) => {
             if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {

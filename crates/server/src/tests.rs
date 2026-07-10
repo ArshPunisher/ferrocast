@@ -200,6 +200,8 @@ async fn media_uploads_refuse_bad_files_and_serve_ranges() {
     assert_eq!(part.bytes().await.unwrap().as_ref(), &png[8..16]);
     let with_query = r.client.get(format!("{url}?session={}", r.token)).send().await.unwrap();
     assert_eq!(with_query.status(), StatusCode::OK, "img tags can use ?session=");
+    let csp = with_query.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("");
+    assert!(csp.contains("sandbox"), "media on our origin can never run as a page");
     let bad_range = r.client.get(&url).bearer_auth(&r.token).header("Range", "bytes=99999-").send().await.unwrap();
     assert_eq!(bad_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     let none = up("x", vec![]).await.unwrap();
