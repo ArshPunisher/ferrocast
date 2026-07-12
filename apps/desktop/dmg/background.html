@@ -1,88 +1,106 @@
 <!doctype html>
 <!--
-  The macOS install window (DMG) background: 660 × 400 points. Finder draws the app icon at
-  (180, 210) and the Applications folder at (480, 210) on top of it (see tauri.conf.json).
-  Rendered to background.tiff (1× and 2×) by render.sh. Finder labels are dark text, so the
-  background stays light.
+  The macOS install window (DMG) background: 660 x 400 points. A stream-overlay collage on
+  the left; Finder draws the app icon at (330, 210) and the Applications folder at (550, 210)
+  on the plain sheet to the right (see tauri.conf.json). Finder labels are dark text, so
+  nothing is drawn under the icons. Rendered to background.tiff (1x and 2x) by render.sh.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<title>Ferrocast install window</title>
 <style>
-  @font-face {
-    font-family: 'Bricolage Grotesque';
-    src: url('../../../../ferrocast-web/dist/dashboard/assets/bricolage-grotesque-latin-wght-normal-DLoelf7F.woff2') format('woff2');
-    font-weight: 200 800;
-  }
-  @font-face {
-    font-family: 'Hanken Grotesk';
-    src: url('../../../../ferrocast-web/dist/dashboard/assets/hanken-grotesk-latin-wght-normal-CaVRRdDk.woff2') format('woff2');
-    font-weight: 100 900;
-  }
+  @font-face { font-family: 'Bricolage Grotesque'; src: url('fonts/bricolage.woff2') format('woff2'); font-weight: 200 800; }
+  @font-face { font-family: 'Hanken Grotesk'; src: url('fonts/hanken.woff2') format('woff2'); font-weight: 100 900; }
+  @font-face { font-family: 'JetBrains Mono'; src: url('fonts/jetbrains-mono.woff2') format('woff2'); font-weight: 100 800; }
   html, body { margin: 0; }
   body {
-    width: 660px;
-    height: 400px;
-    overflow: hidden;
-    position: relative;
-    background: #f4f6fb;
+    width: 660px; height: 400px; overflow: hidden; position: relative;
+    background: #f3f2f5; color: #111317;
     font-family: 'Hanken Grotesk', system-ui, sans-serif;
-    color: #12151c;
+    -webkit-font-smoothing: antialiased;
   }
-  /* Colour fields: cobalt (the brand) on the app side, violet on the way, molten at home. */
-  .field { position: absolute; border-radius: 50%; filter: blur(46px); }
-  .cobalt { width: 340px; height: 340px; left: 10px; top: 60px; background: radial-gradient(circle, #3461f5 0%, rgba(52, 97, 245, 0) 70%); opacity: .8; }
-  .violet { width: 300px; height: 260px; left: 190px; top: 170px; background: radial-gradient(circle, #a855f7 0%, rgba(168, 85, 247, 0) 70%); opacity: .55; }
-  .molten { width: 340px; height: 340px; left: 330px; top: 50px; background: radial-gradient(circle, #ff7a3d 0%, rgba(255, 122, 61, 0) 70%); opacity: .7; }
-  .sun { width: 220px; height: 160px; left: 470px; top: -40px; background: radial-gradient(circle, #ffc93d 0%, rgba(255, 201, 61, 0) 70%); opacity: .5; }
-  /* Where Finder puts the two icons and their names: a glass plate under each. */
-  .plate {
-    position: absolute; top: 128px; width: 168px; height: 184px; border-radius: 36px;
-    background: rgba(255, 255, 255, .62);
-    backdrop-filter: blur(6px);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 18px 40px -18px rgba(28, 40, 90, .35);
-    border: 1px solid rgba(255, 255, 255, .7);
+  .panel { position: absolute; left: 0; top: 0; width: 220px; height: 400px; overflow: hidden; background: #5a3ed2; }
+  .sheet { position: absolute; left: 220px; top: 0; width: 440px; height: 400px; }
+  .sheet > * { position: absolute; margin: 0; }
+  .wm { left: 32px; top: 34px; height: 44px; width: auto; }
+  .rule { left: 32px; right: 32px; height: 1px; background: #1113171f; }
+  .r1 { top: 98px; }
+  .r1 i { position: absolute; left: 184px; top: -4px; width: 7px; height: 7px; background: #5a3ed2; transform: rotate(45deg); }
+  .r2 { top: 318px; }
+  .meta {
+    top: 108px; left: 32px; right: 32px; display: flex; justify-content: space-between;
+    font: 500 9.5px/14px 'JetBrains Mono', ui-monospace, monospace; color: #656871; letter-spacing: 0.01em;
   }
-  .plate.app { left: 96px; }
-  .plate.apps { left: 396px; }
-  header { position: absolute; left: 0; right: 0; top: 34px; text-align: center; }
-  h1 {
-    margin: 0; font-family: 'Bricolage Grotesque', system-ui, sans-serif; font-weight: 700;
-    font-size: 26px; letter-spacing: -0.02em; line-height: 1.1;
+  .arrow { left: 190px; top: 203px; }
+  .cta {
+    top: 330px; left: 32px;
+    font: 600 10px/14px 'JetBrains Mono', ui-monospace, monospace; letter-spacing: 0.16em; text-transform: uppercase; color: #111317;
   }
-  header p { margin: 8px 0 0; font-size: 13.5px; color: #4b5263; }
-  svg.arrow { position: absolute; left: 262px; top: 170px; }
-  footer {
-    position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
-    font-size: 11.5px; color: #4b5263;
+  .hint {
+    top: 360px; left: 32px; right: 24px;
+    font: 400 8.5px/12px 'JetBrains Mono', ui-monospace, monospace; color: #656871; white-space: nowrap;
   }
-  footer b { font-weight: 600; color: #22262f; }
+  .hint b { font-weight: 500; color: #2a2d33; }
+
+  .panel { background-color: #5a3ed2; }
+  #ht { position: absolute; inset: 0; }
+  .card { position: absolute; border-radius: 10px; box-shadow: 5px 6px 0 #26136e; }
+  .lbl { font: 600 7.5px/10px 'JetBrains Mono', monospace; letter-spacing: .16em; text-transform: uppercase; }
+  .alert { left: 18px; top: 28px; width: 180px; height: 90px; background: #f3f2f6; color: #111317; transform: rotate(-4deg); padding: 14px 16px; box-sizing: border-box; overflow: hidden; }
+  .alert .lbl { color: #5a3ed2; }
+  .alert .who { font: 700 25px/1 'Bricolage Grotesque', sans-serif; letter-spacing: -0.02em; margin-top: 10px; }
+  .alert .what { font: 500 10.5px/1 'Hanken Grotesk', sans-serif; color: #4b4f58; margin-top: 7px; }
+  .alert .bar { position: absolute; left: 0; bottom: 0; width: 62%; height: 3px; background: #5a3ed2; }
+  .chat { left: 20px; top: 134px; width: 184px; background: #111317; color: #eef0f3; transform: rotate(2.5deg); padding: 11px 13px 9px; box-sizing: border-box; }
+  .chat .lbl { color: #9a95b3; margin-bottom: 6px; }
+  .row { display: grid; grid-template-columns: 28px 1fr; column-gap: 7px; align-items: center; font: 400 9.5px/12px 'Hanken Grotesk', sans-serif; padding: 4px 0; white-space: nowrap; }
+  .row + .row { border-top: 1px solid #ffffff14; }
+  .tag { font: 600 6.5px/11px 'JetBrains Mono', monospace; letter-spacing: .06em; text-align: center; border: 1px solid #ffffff3d; border-radius: 3px; height: 11px; color: #cfcbe0; }
+  .row b { font-weight: 700; color: #fff; margin-right: 5px; }
+  .row.bot .tag { background: #9b86ff; border-color: #9b86ff; color: #111317; }
+  .row.bot { color: #cbbfff; }
+  .tip { left: 14px; top: 290px; width: 146px; height: 82px; background: #f3f2f6; color: #111317; transform: rotate(-2.5deg); padding: 12px 14px; box-sizing: border-box; }
+  .tip .lbl { color: #5a3ed2; }
+  .tip .amt { font: 700 29px/1 'Bricolage Grotesque', sans-serif; letter-spacing: -0.03em; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .tip .from { font: 500 9.5px/1 'Hanken Grotesk', sans-serif; color: #4b4f58; margin-top: 6px; }
+  .live { position: absolute; left: 150px; top: 276px; transform: rotate(7deg); background: #111317; color: #f3f2f6; border-radius: 5px; padding: 5px 8px; font: 700 8px/10px 'JetBrains Mono', monospace; letter-spacing: .18em; box-shadow: 3px 4px 0 #26136e; }
 </style>
 </head>
 <body>
-  <div class="field cobalt"></div>
-  <div class="field violet"></div>
-  <div class="field molten"></div>
-  <div class="field sun"></div>
-  <header>
-    <h1>Drag Ferrocast into Applications</h1>
-    <p>Then open it from Applications or Spotlight.</p>
-  </header>
-  <div class="plate app"></div>
-  <div class="plate apps"></div>
-  <svg class="arrow" width="136" height="64" viewBox="0 0 136 64" fill="none" aria-hidden="true">
-    <defs>
-      <linearGradient id="g" x1="0" y1="0" x2="136" y2="0" gradientUnits="userSpaceOnUse">
-        <stop offset="0" stop-color="#3461f5"/>
-        <stop offset=".55" stop-color="#a855f7"/>
-        <stop offset="1" stop-color="#ff7a3d"/>
-      </linearGradient>
-      <marker id="head" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="4" markerHeight="4" orient="auto">
-        <path d="M1 1 L8 5 L1 9" stroke="#ff7a3d" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </marker>
-    </defs>
-    <path d="M10 44 C 42 8, 90 6, 118 36" stroke="url(#g)" stroke-width="5" stroke-linecap="round" marker-end="url(#head)"/>
-  </svg>
-  <footer>First time only: if macOS won't open it, go to <b>System Settings › Privacy &amp; Security</b> and press <b>Open Anyway</b>.</footer>
+<div class="panel" aria-hidden="true"><svg id="ht" width="220" height="400" viewBox="0 0 220 400"></svg>
+  <div class="card alert"><div class="lbl">New follower</div><div class="who">nightjar_</div><div class="what">just followed on Twitch</div><i class="bar"></i></div>
+  <div class="card chat"><div class="lbl">Chat, 3 platforms</div>
+    <div class="row"><span class="tag">TW</span><span><b>marlo_v</b>that clutch!!</span></div>
+    <div class="row"><span class="tag">YT</span><span><b>Priya K</b>first time here</span></div>
+    <div class="row"><span class="tag">KICK</span><span><b>dusk.rider</b>!uptime</span></div>
+    <div class="row bot"><span class="tag">BOT</span><span><b>ferrobot</b>live for 2h 14m</span></div>
+  </div>
+  <div class="live">LIVE</div>
+  <div class="card tip"><div class="lbl">Tip</div><div class="amt">$5.00</div><div class="from">Tamsin, for the coffee</div></div></div>
+<main class="sheet">
+  <svg class="wm" xmlns="http://www.w3.org/2000/svg" viewBox="-10 17 4309 743"  role="img" aria-label="ferrocast"><defs><mask id="wmmask" maskUnits="userSpaceOnUse" x="-50" y="0" width="4389" height="800"><rect x="-50" width="4389" height="800" fill="#fff"/><circle cx="2144.34" cy="308.7" r="104" fill="#000"/></mask></defs><path transform="translate(0 740) scale(1 -1)" d="M106 0L106 336L23 336L23 442L163 436L163 455Q128 463 105.5 480.5Q83 498 73 523Q63 548 63 576Q63 619 85 650.5Q107 682 147 699.5Q187 717 241 717Q287 717 324.5 705.5Q362 694 385 677L376 547Q352 564 322 575Q292 586 265 586Q235 586 215.5 570Q196 554 196 518Q196 493 206.5 478.5Q217 464 232.5 457.5Q248 451 263 449L383 449L383 336L246 336L246 0Z" fill="#111317"/><path transform="translate(367 740) scale(1 -1)" d="M310 -14Q245 -14 194.5 4Q144 22 109 56Q74 90 55.5 140Q37 190 37 253Q37 315 54.5 367.5Q72 420 106 458.5Q140 497 189 518Q238 539 300 539Q360 539 407 519.5Q454 500 485.5 461Q517 422 531.5 365.5Q546 309 542 236L175 232Q179 165 212 131Q249 91 310 91Q338 91 357.5 98.5Q377 106 389.5 118Q402 130 409.5 145Q417 160 422 175L547 148Q538 111 520.5 81.5Q503 52 474 30.5Q445 9 404.5 -2.5Q364 -14 310 -14ZM179 311L410 314Q409 341 401 361Q387 395 360.5 411Q334 427 302 427Q264 427 235 407Q206 387 190 349Q183 331 179 311Z" fill="#111317"/><path transform="translate(918 740) scale(1 -1)" d="M66 0L66 525L185 525L186 346L205 346Q213 413 232.5 455Q252 497 287 517Q322 537 374 537Q383 537 393.5 536.5Q404 536 418 533L412 380Q397 387 379 390Q361 393 347 393Q308 393 280 375Q252 357 234.5 323.5Q217 290 211 242L211 0Z" fill="#111317"/><path transform="translate(1308 740) scale(1 -1)" d="M66 0L66 525L185 525L186 346L205 346Q213 413 232.5 455Q252 497 287 517Q322 537 374 537Q383 537 393.5 536.5Q404 536 418 533L412 380Q397 387 379 390Q361 393 347 393Q308 393 280 375Q252 357 234.5 323.5Q217 290 211 242L211 0Z" fill="#111317"/><g mask="url(#wmmask)"><path transform="translate(1714 740) scale(1 -1)" d="M304 -14Q225 -14 165 17.5Q105 49 71 110.5Q37 172 37 264Q37 356 71.5 417Q106 478 166.5 508.5Q227 539 304 539Q383 539 443.5 508Q504 477 538.5 415.5Q573 354 573 262Q573 169 537.5 107.5Q502 46 441.5 16Q381 -14 304 -14ZM309 93Q348 93 374.5 111Q401 129 414.5 165.5Q428 202 428 254Q428 309 413.5 347.5Q399 386 371 406.5Q343 427 300 427Q263 427 236 409.5Q209 392 195 355.5Q181 319 181 266Q181 181 215 137Q249 93 309 93Z" fill="#111317"/></g><path transform="translate(2291 740) scale(1 -1)" d="M309 -14Q241 -14 190 6Q139 26 105 62Q71 98 54 147.5Q37 197 37 256Q37 318 54.5 369.5Q72 421 106 459Q140 497 190 518Q240 539 304 539Q368 539 415.5 518Q463 497 492.5 459.5Q522 422 533 371L400 328Q397 359 383.5 381.5Q370 404 347.5 415.5Q325 427 297 427Q268 427 247 415.5Q226 404 211.5 382.5Q197 361 189.5 330.5Q182 300 182 262Q182 208 196.5 170.5Q211 133 239.5 113.5Q268 94 310 94Q350 94 374 109.5Q398 125 409.5 149.5Q421 174 424 200L550 172Q545 133 528.5 99Q512 65 482 40Q452 15 409.5 0.5Q367 -14 309 -14Z" fill="#111317"/><path transform="translate(2827 740) scale(1 -1)" d="M189 -14Q145 -14 111 3.5Q77 21 58 54Q39 87 39 136Q39 179 55.5 208Q72 237 104 255Q136 273 183 285Q230 297 290 306Q322 311 342.5 315.5Q363 320 373 330.5Q383 341 383 361Q383 389 363 409Q343 429 300 429Q271 429 246.5 419Q222 409 204.5 389Q187 369 179 338L52 377Q64 418 86.5 448Q109 478 141 498.5Q173 519 214 529Q255 539 303 539Q380 539 428.5 514.5Q477 490 501 438.5Q525 387 525 306L525 216Q525 181 526.5 145Q528 109 530.5 72.5Q533 36 536 0L409 0Q405 25 401.5 57.5Q398 90 396 123L378 123Q364 85 338 54Q312 23 274.5 4.5Q237 -14 189 -14ZM250 90Q269 90 288.5 97Q308 104 326.5 116.5Q345 129 360.5 148Q376 167 386 191L384 257Q375 253 365 250Q341 242 315.5 238Q290 234 265 229Q240 224 220.5 216Q201 208 189.5 194.5Q178 181 178 157Q178 126 198 108Q218 90 250 90Z" fill="#111317"/><path transform="translate(3382 740) scale(1 -1)" d="M276 -14Q223 -14 180 -4Q137 6 106 25Q75 44 56 70.5Q37 97 31 130L141 175Q145 153 163 134Q181 115 211.5 103.5Q242 92 285 92Q331 92 356 105.5Q381 119 381 144Q381 163 367 174Q353 185 326 193Q299 201 261 208Q224 217 185.5 227Q147 237 114.5 255Q82 273 61.5 302.5Q41 332 41 378Q41 426 67 462Q93 498 143 518.5Q193 539 265 539Q330 539 379 521.5Q428 504 459.5 471.5Q491 439 502 394L385 355Q381 379 365.5 397Q350 415 324.5 424Q299 433 265 433Q222 433 198.5 419Q175 405 175 382Q175 363 190.5 351Q206 339 234 331.5Q262 324 300 316Q340 308 378 297.5Q416 287 446.5 270Q477 253 495 225Q513 197 513 153Q513 101 485 63.5Q457 26 404 6Q351 -14 276 -14Z" fill="#111317"/><path transform="translate(3892 740) scale(1 -1)" d="M261 -12Q173 -12 131.5 34.5Q90 81 90 183L90 412L14 412L16 525L69 525Q100 525 115 534Q130 543 133 567L146 642L228 642L228 525L361 525L361 408L228 408L228 189Q228 153 245 137Q262 121 297 121Q316 121 333.5 125Q351 129 364 138L364 4Q333 -6 307 -9Q281 -12 261 -12Z" fill="#111317"/><circle cx="2144.34" cy="308.7" r="66" fill="#5a3ed2"/></svg>
+  <div class="rule r1"><i></i></div>
+  <p class="meta"><span>macOS 13.3+ · local-first · GPL-3.0</span><span>Twitch / YouTube / Kick</span></p>
+  <svg class="arrow" width="60" height="14" viewBox="0 0 60 14" aria-hidden="true"><path d="M0 3h8v8h-8zM1.5 4.5v5h5v-5z" fill-rule="evenodd" fill="#5a3ed2"/><path d="M12 3h8v8h-8zM13.5 4.5v5h5v-5z" fill-rule="evenodd" fill="#5a3ed2"/><path d="M24 3h8v8h-8zM25.5 4.5v5h5v-5z" fill-rule="evenodd" fill="#5a3ed2"/><rect x="36" y="3" width="8" height="8" fill="#5a3ed2"/><path d="M49 0L60 7L49 14Z" fill="#5a3ed2"/></svg>
+  <div class="rule r2"></div>
+  <p class="cta">Drag onto Applications to install</p>
+  <p class="hint">If macOS blocks it: <b>System Settings › Privacy &amp; Security › Open Anyway</b></p>
+</main>
+<script>
+(function halftoneD3() {
+  const svg = document.getElementById("ht");
+  const step = 5.5, ang = 0.26, ca = Math.cos(ang), sa = Math.sin(ang);
+  let d = "";
+  for (let i = -40; i < 120; i++) for (let j = -40; j < 120; j++) {
+    const x = 20 + i * step * ca - j * step * sa, y = -30 + i * step * sa + j * step * ca;
+    if (x < -4 || x > 224 || y < -4 || y > 404) continue;
+    const t = Math.max(0, Math.min(1, 0.15 + 0.9 * ((y / 400) * 0.75 + (1 - x / 220) * 0.35) - 0.2 + 0.25 * Math.exp(-((x - 200) ** 2 + (y - 20) ** 2) / 2500)));
+    const r = 0.3 + 2.3 * t * t;
+    if (r < 0.4) continue;
+    d += `M${(x + r).toFixed(2)} ${y.toFixed(2)}a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(-2 * r).toFixed(2)} 0a${r.toFixed(2)} ${r.toFixed(2)} 0 1 0 ${(2 * r).toFixed(2)} 0`;
+  }
+  svg.innerHTML = `<path d="${d}" fill="#7a61f0"/>`;
+})();</script>
 </body>
 </html>

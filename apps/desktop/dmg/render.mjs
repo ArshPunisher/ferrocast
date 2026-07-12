@@ -12,7 +12,8 @@ const browser = await chromium.launch()
 for (const scale of [1, 2]) {
   const page = await browser.newPage({ viewport: { width: 660, height: 400 }, deviceScaleFactor: scale })
   await page.goto(pathToFileURL(path.join(here, 'background.html')).href)
-  await page.evaluate(() => document.fonts.ready)
+  // Fonts, then two frames so the script-drawn halftone has painted.
+  await page.evaluate(() => document.fonts.ready.then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))))
   await page.screenshot({ path: path.join(out, `bg${scale}.png`) })
   await page.close()
 }

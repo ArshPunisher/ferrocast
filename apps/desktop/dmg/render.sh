@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Renders background.html to background.tiff (1× and 2× in one file, so Finder stays sharp
-# on Retina screens). Needs ferrocast-web next to this repo, installed and built (fonts).
+# on Retina screens). Needs ferrocast-web next to this repo, installed (for Playwright).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"
