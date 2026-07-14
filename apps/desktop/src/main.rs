@@ -288,6 +288,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&quit)
         .build()?;
     let mut tray = TrayIconBuilder::with_id("main").tooltip("Ferrocast").menu(&menu).show_menu_on_left_click(true);
+    // macOS: a black template image of the mark, so the menu bar tints it for light, dark and
+    // highlighted states. Elsewhere the tray shows the app icon.
+    #[cfg(target_os = "macos")]
+    {
+        tray = tray.icon(tauri::include_image!("icons/tray-template.png")).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
