@@ -264,6 +264,27 @@ fn the_queue_is_capped_and_acks_are_per_install() {
 }
 
 #[test]
+fn unused_installs_are_pruned_but_real_ones_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("r.db")).unwrap();
+    for id in ["flood", "fresh", "used", "kick", "tips"] {
+        db.add_install(id, "h").unwrap();
+    }
+    let old = db::UNUSED_INSTALL_MS + 60_000;
+    for id in ["flood", "used", "kick", "tips"] {
+        db.backdate_install(id, old).unwrap();
+    }
+    db.touch_install("used").unwrap();
+    db.set_kick_owner("42", "kick").unwrap();
+    assert_eq!(db.set_tip_config("tips", "streamer", "{}", 0, 3).unwrap(), db::Saved::Yes);
+    db.prune().unwrap();
+    assert!(db.install_hash("flood").unwrap().is_none(), "signed up a week ago, never connected");
+    for id in ["fresh", "used", "kick", "tips"] {
+        assert!(db.install_hash(id).unwrap().is_some(), "{id} is kept");
+    }
+}
+
+#[test]
 fn client_ip_trusts_forwarding_only_from_the_local_proxy() {
     let mut h = HeaderMap::new();
     h.insert("x-forwarded-for", "203.0.113.9, 198.51.100.7".parse().unwrap());

@@ -73,6 +73,8 @@ pub struct AppState {
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
     signups: Arc<Mutex<HashMap<std::net::IpAddr, (i64, u32)>>>,
+    /// Install registrations from everyone this hour: (hour, count).
+    signups_hour: Arc<Mutex<(i64, u32)>>,
 }
 
 impl AppState {
@@ -84,6 +86,7 @@ impl AppState {
             keys: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
+            signups_hour: Arc::default(),
         }
     }
 
@@ -130,6 +133,9 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+/// New installs accepted per hour across all addresses.
+pub const MAX_SIGNUPS_PER_HOUR: u32 = 2_000;
 
 /// The largest request body the relay reads.
 pub const BODY_LIMIT: usize = 256 * 1024;
@@ -229,6 +235,23 @@ async fn new_install(
                 "rate_limited",
                 "Too many new installs from this address. Wait a minute.",
             ));
+        }
+    }
+    {
+        // Many addresses together can't flood the database either.
+        let mut h = st.signups_hour.lock().unwrap_or_else(|p| p.into_inner());
+        let hour = now_ms() / 3_600_000;
+        if h.0 != hour {
+            *h = (hour, 0);
+        }
+        h.1 += 1;
+        if h.1 > MAX_SIGNUPS_PER_HOUR {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "The relay is taking a lot of new installs right now.",
+            )
+            .hint("Ferrocast retries on its own; nothing to do."));
         }
     }
     let id = random(12);

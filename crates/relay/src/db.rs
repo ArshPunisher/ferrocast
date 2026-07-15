@@ -46,6 +46,8 @@ pub const MAX_QUEUE: i64 = 5_000;
 /// How long undelivered items are kept. Tips are money, so they wait longer.
 pub const QUEUE_TTL_MS: i64 = 3 * 86_400_000;
 pub const TIP_TTL_MS: i64 = 30 * 86_400_000;
+/// An install that never connected after signing up is removed after this long.
+pub const UNUSED_INSTALL_MS: i64 = 7 * 86_400_000;
 
 #[derive(Debug)]
 pub struct Db {
@@ -85,8 +87,18 @@ impl Db {
         self.c().query_row("SELECT secret_hash FROM installs WHERE id = ?1", [id], |r| r.get(0)).optional()
     }
 
+    /// Tests: pretend an install signed up `ago_ms` ago and never connected since.
+    #[cfg(test)]
+    pub(crate) fn backdate_install(&self, id: &str, ago_ms: i64) -> rusqlite::Result<()> {
+        let at = now_ms() - ago_ms;
+        self.c().execute("UPDATE installs SET created_at = ?2, last_seen = ?2 WHERE id = ?1", params![id, at])?;
+        Ok(())
+    }
+
     pub fn touch_install(&self, id: &str) -> rusqlite::Result<()> {
-        self.c().execute("UPDATE installs SET last_seen = ?2 WHERE id = ?1", params![id, now_ms()])?;
+        // Always after created_at, so "never connected" (equal stamps) can't match a used install.
+        self.c()
+            .execute("UPDATE installs SET last_seen = MAX(?2, created_at + 1) WHERE id = ?1", params![id, now_ms()])?;
         Ok(())
     }
 
@@ -280,6 +292,15 @@ impl Db {
         c.execute("DELETE FROM handle_changes WHERE at < ?1", [now - 86_400_000])?;
         c.execute("DELETE FROM released_handles WHERE released_at < ?1", [now - crate::tips::HANDLE_HOLD_MS])?;
         c.execute("DELETE FROM pending_oauth WHERE created_at < ?1", [now - 600_000])?;
+        // Installs registered but never used again (a scripted sign-up flood, or an app that
+        // was installed and removed) go after a week; anything with a tip page or a Kick
+        // channel stays.
+        c.execute(
+            "DELETE FROM installs WHERE last_seen = created_at AND created_at < ?1
+               AND id NOT IN (SELECT install_id FROM tip_pages)
+               AND id NOT IN (SELECT install_id FROM kick_owners)",
+            [now - UNUSED_INSTALL_MS],
+        )?;
         Ok(())
     }
 }
