@@ -21,7 +21,7 @@ use crate::frames::NoticeLevel;
 use crate::state::{AccountView, ConnectorView};
 use crate::{Engine, EngineError, now};
 
-const INSTALL: &str = "relay-install";
+pub(crate) const INSTALL: &str = "relay-install";
 const KICK_TOKENS: &str = "kick-tokens";
 
 impl Engine {
@@ -101,10 +101,23 @@ impl Engine {
         let mut req = ws_url.into_client_request().map_err(|e| e.to_string())?;
         req.headers_mut()
             .insert("authorization", format!("Bearer {auth}").parse().map_err(|_| "bad install id".to_string())?);
-        let (ws, _) = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(req))
+        let connected = tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(req))
             .await
-            .map_err(|_| "timed out connecting to the relay".to_string())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| "timed out connecting to the relay".to_string())?;
+        let (ws, _) = match connected {
+            Ok(c) => c,
+            // The relay no longer knows this install (it removes ones that never connected
+            // after a week): forget it, so the next attempt registers a fresh one.
+            Err(tokio_tungstenite::tungstenite::Error::Http(res)) if res.status().as_u16() == 401 => {
+                return match self.inner.secrets.delete(INSTALL) {
+                    Ok(()) => Err("the relay didn't recognise this install; registering again".into()),
+                    Err(e) => {
+                        Err(format!("the relay didn't recognise this install, and it couldn't be forgotten: {e}"))
+                    }
+                };
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         self.set_relay_state("connected", None);
         let (mut tx, mut rx) = ws.split();
         loop {

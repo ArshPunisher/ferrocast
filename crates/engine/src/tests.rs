@@ -903,3 +903,40 @@ async fn a_tip_with_tts_gets_real_speech_attached_before_it_plays() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+#[tokio::test]
+async fn a_forgotten_relay_install_registers_again() {
+    let rdir = tempfile::tempdir().unwrap();
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let cfg = ferrocast_relay::Config {
+        public_url: relay.clone(),
+        kick_client_id: None,
+        kick_client_secret: None,
+        kick_id_url: relay.clone(),
+        kick_api_url: relay.clone(),
+    };
+    let rapp = ferrocast_relay::router(ferrocast_relay::AppState::new(
+        cfg,
+        ferrocast_relay::Db::open(&rdir.path().join("r.db")).unwrap(),
+    ))
+    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(rl, rapp).await });
+
+    let secrets = mem();
+    // An install the relay has since removed (or never had).
+    secrets.set(relay::INSTALL, "gone.gone").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay), ..PlatformApps::default() };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    e.ensure_relay_link();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let now = secrets.get(relay::INSTALL).unwrap();
+        if now.as_deref().is_some_and(|a| a != "gone.gone") {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the install was never replaced");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
