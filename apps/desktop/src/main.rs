@@ -230,7 +230,9 @@ async fn notify_when_hidden(app: AppHandle, engine: Engine) {
 
 async fn start(dir: &std::path::Path) -> Result<Running, String> {
     let engine = Engine::start(dir).await.map_err(|e| e.to_string())?;
-    let server = ferrocast_server::serve(engine.clone(), ferrocast_server::ServeOptions::default())
+    // LAN access is read once here: changing it takes effect the next time Ferrocast starts.
+    let opts = ferrocast_server::ServeOptions { lan: engine.settings().lan_access, ..Default::default() };
+    let server = ferrocast_server::serve(engine.clone(), opts)
         .await
         .map_err(|e| format!("The local server couldn't start: {e}"))?;
     Ok(Running { engine, base: server.base_url(), token: server.sessions.desktop_token().to_string() })

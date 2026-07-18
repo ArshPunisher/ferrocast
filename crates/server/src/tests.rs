@@ -690,3 +690,27 @@ fn obs_version_is_the_bare_number() {
     let v = crate::routes::obs_view_for_tests(&view);
     assert_eq!((v["version"].as_str(), v["scene"].as_str()), (Some("31.1.2"), Some("Gameplay")));
 }
+
+#[tokio::test]
+async fn lan_pairing_links_point_at_this_computer_on_the_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let server = serve(engine, ServeOptions { port: 0, lan: true, dev_origins: vec![] }).await.unwrap();
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/v1/session/pair-code", server.base_url()))
+        .bearer_auth(server.sessions.desktop_token())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    let v: Value = res.json().await.unwrap();
+    let url = v["url"].as_str().unwrap();
+    assert!(url.contains(&format!(":{}/app/#pair=", server.addr.port())), "{url}");
+    // On a machine with a network, the phone gets a reachable address, not its own loopback.
+    if let Some(ip) = super::routes::lan_ip() {
+        assert!(url.starts_with(&format!("http://{ip}:")), "{url}");
+    }
+}

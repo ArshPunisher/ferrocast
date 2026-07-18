@@ -3,6 +3,8 @@
 mod app;
 mod bot;
 mod core;
+#[cfg(test)]
+pub(crate) use core::lan_ip;
 mod media;
 mod moderation;
 

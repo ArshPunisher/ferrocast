@@ -37,9 +37,26 @@ pub async fn pair(State(app): State<AppState>, Body(b): Body<PairBody>) -> ApiRe
 pub async fn pair_code(State(app): State<AppState>) -> Json<Value> {
     let code = app.sessions.new_code();
     let expires_at = now_ms() + crate::auth::PAIR_TTL.as_millis() as i64;
-    Json(
-        json!({ "code": code, "url": format!("{}/app/#pair={code}", app.engine.base_url()), "expires_at": expires_at }),
-    )
+    Json(json!({ "code": code, "url": format!("{}/app/#pair={code}", pair_base(&app)), "expires_at": expires_at }))
+}
+
+/// Where another device should open the dashboard: this computer's address on the local
+/// network when LAN access is on (127.0.0.1 would mean the phone itself), else loopback.
+fn pair_base(app: &AppState) -> String {
+    let base = app.engine.base_url();
+    if !app.guard.lan {
+        return base;
+    }
+    lan_ip().map(|ip| format!("http://{ip}:{}", app.guard.port)).unwrap_or(base)
+}
+
+/// The address the OS would use to reach the internet. A UDP "connect" picks the route
+/// without sending anything.
+pub(crate) fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
 fn now_ms() -> i64 {
