@@ -90,7 +90,8 @@ impl Command {
         Ok(())
     }
 
-    fn answers_to(&self, word: &str) -> bool {
+    /// Whether this command (or one of its aliases) is `word`, ignoring case.
+    pub fn answers_to(&self, word: &str) -> bool {
         self.name.eq_ignore_ascii_case(word) || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(word))
     }
 }

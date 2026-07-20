@@ -261,6 +261,7 @@ impl Engine {
         if e.origin == Origin::Live {
             self.state_mut().session.record(e);
         }
+        self.loyalty_saw(e);
         let message_id = e.source_id.clone().unwrap_or_default();
 
         let (on_sight, verdict, bot_on) = {
@@ -335,6 +336,9 @@ impl Engine {
         // Only live chat from this channel gets answers: replayed history and Shared Chat
         // messages from a partner channel never make the bot speak (R-11).
         if bot_on && e.origin == Origin::Live && e.channel.is_none() && content.text.trim_start().starts_with('!') {
+            if self.answer_points_command(e).await {
+                return Moderated::Shown;
+            }
             self.answer_command(e).await;
         }
         Moderated::Shown
@@ -372,6 +376,7 @@ impl Engine {
         if e.origin == Origin::Live {
             self.state_mut().session.record(e);
             self.count_goals(e).await;
+            self.loyalty_bonus(e).await;
         }
 
         let (rules, test_alerts, tts_decision, paused_tts) = {

@@ -138,6 +138,21 @@ pub fn link(store: &Store, platform: Platform, user_id: &str, to_platform: Platf
             "UPDATE viewer_identities SET viewer_id = ?1 WHERE platform = ?2 AND user_id = ?3",
             params![to, pkey(platform), user_id],
         )?;
+        // When the old person row is left empty, its points move to the person it joined
+        // (capped, never overflowing) before the row and its balance go.
+        let emptied: bool =
+            tx.query_row("SELECT NOT EXISTS (SELECT 1 FROM viewer_identities WHERE viewer_id = ?1)", [from], |r| {
+                r.get(0)
+            })?;
+        if emptied {
+            tx.execute(
+                "INSERT INTO loyalty_balances(viewer_id, points, updated_at)
+                   SELECT ?1, points, ?3 FROM loyalty_balances WHERE viewer_id = ?2
+                 ON CONFLICT(viewer_id) DO UPDATE SET points = MIN(points + excluded.points, ?4),
+                   updated_at = excluded.updated_at",
+                params![to, from, now_ms(), ferrocast_core::loyalty::MAX_BALANCE],
+            )?;
+        }
         tx.execute(
             "DELETE FROM viewers WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM viewer_identities WHERE viewer_id = ?1)",
             [from],

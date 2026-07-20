@@ -8,6 +8,7 @@ use ferrocast_connector::{Connector, ConnectorError};
 use ferrocast_core::command::{Access, Command, Timer};
 use ferrocast_core::event::*;
 use ferrocast_core::goal::{Goal, GoalKind};
+use ferrocast_core::loyalty::MAX_ADJUST;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use ferrocast_core::money::Money;
 use ferrocast_core::queue::AckPhase;
@@ -939,4 +940,114 @@ async fn a_forgotten_relay_install_registers_again() {
         assert!(tokio::time::Instant::now() < deadline, "the install was never replaced");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ---------------------------------------------------------------- loyalty points
+
+async fn go_live(e: &Engine, p: Platform) {
+    e.ingest(Event::live(p, Some(format!("online-{p:?}")), Millis(0), EventKind::StreamOnline { title: None })).await;
+}
+
+fn as_mod(mut ev: Event) -> Event {
+    if let EventKind::ChatMessage { actor, .. } = &mut ev.kind {
+        actor.roles = Roles::MODERATOR;
+    }
+    ev
+}
+
+#[tokio::test]
+async fn chatters_earn_points_while_live_and_linked_accounts_earn_once() {
+    let (e, _d) = engine().await;
+    e.ingest(chat(Platform::Twitch, "pre", "sam", "before the stream")).await;
+    assert_eq!(e.pay_watch_time(Millis(0)).await, 0, "offline chat earns nothing");
+    go_live(&e, Platform::Twitch).await;
+    go_live(&e, Platform::Kick).await;
+    e.ingest(chat(Platform::Twitch, "c1", "sam", "hi")).await;
+    e.ingest(chat(Platform::Kick, "c2", "sam_k", "hi from kick")).await;
+    e.ingest(chat(Platform::Twitch, "c3", "ana", "hello")).await;
+    let store = e.store();
+    repo::viewers::link(&store, Platform::Kick, "sam_k-id", Platform::Twitch, "sam-id").unwrap();
+    assert_eq!(e.pay_watch_time(Millis(1_000)).await, 0, "the interval clock starts");
+    assert_eq!(e.pay_watch_time(Millis(301_000)).await, 2, "Sam (two accounts) and Ana, once each");
+    assert_eq!(e.points(Platform::Kick, "sam_k-id").await.unwrap(), 10);
+    assert_eq!(e.points(Platform::Twitch, "ana-id").await.unwrap(), 10);
+    assert_eq!(e.pay_watch_time(Millis(601_000)).await, 0, "nobody chatted since");
+}
+
+#[tokio::test]
+async fn support_bonuses_pay_live_events_once() {
+    let (e, _d) = engine().await;
+    let mut fan = Actor::named(Platform::Twitch, "Fan");
+    fan.id = Some("fan-id".into());
+    let follow = Event::live(Platform::Twitch, Some("f-1".into()), Millis(0), EventKind::Follow { actor: fan.clone() });
+    e.ingest(follow.clone()).await;
+    e.ingest(follow).await; // a redelivery
+    assert_eq!(e.points(Platform::Twitch, "fan-id").await.unwrap(), 50);
+    e.test("follow", None).await.unwrap();
+    e.ingest(Event::live(Platform::Twitch, Some("r-1".into()), Millis(0), EventKind::Raid { from: fan, viewers: 12 }))
+        .await;
+    assert_eq!(e.points(Platform::Twitch, "fan-id").await.unwrap(), 150, "follow + raid; the test paid nothing");
+}
+
+#[tokio::test]
+async fn points_commands_answer_mods_and_viewers() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    e.ingest(chat(Platform::Twitch, "m1", "Sam", "hello")).await;
+    e.ingest(chat(Platform::Twitch, "m2", "Sam", "!points")).await;
+    eventually(|| tw.log().contains(&"say @Sam, you have 0 points. reply=m2".to_string())).await;
+    e.ingest(chat(Platform::Twitch, "m3", "Sam", "!addpoints sam 500")).await;
+    e.ingest(as_mod(chat(Platform::Twitch, "m4", "Mo", "!addpoints @SAM 1,000"))).await;
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Gave 1,000 points to Sam. They have 1,000 points now.")))
+        .await;
+    assert_eq!(e.points(Platform::Twitch, "Sam-id").await.unwrap(), 1_000, "only the mod's command counted");
+    e.ingest(as_mod(chat(Platform::Twitch, "m5", "Mo", "!removepoints sam 5000"))).await;
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Took 5,000 points from Sam. They have 0 points now.")))
+        .await;
+    e.ingest(as_mod(chat(Platform::Twitch, "m6", "Mo", "!addpoints ghost 5"))).await;
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say I haven't seen @ghost in chat yet."))).await;
+    e.ingest(as_mod(chat(Platform::Twitch, "m7", "Mo", "!addpoints sam -5"))).await;
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Use !addpoints @name 100"))).await;
+    // A command the streamer made with the same name wins.
+    e.save_command(Command {
+        id: "p".into(),
+        name: "!points".into(),
+        aliases: vec![],
+        response: "Points are coming soon!".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    e.ingest(chat(Platform::Twitch, "m8", "Ana", "!points")).await;
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Points are coming soon!"))).await;
+}
+
+#[tokio::test]
+async fn dashboard_adjustments_refuse_bad_amounts() {
+    let (e, _d) = engine().await;
+    e.ingest(chat(Platform::Youtube, "y1", "Lee", "hi")).await;
+    assert_eq!(e.adjust_points(Platform::Youtube, "Lee-id", 75).await.unwrap(), 75);
+    for bad in [0, MAX_ADJUST + 1, -MAX_ADJUST - 1, i64::MIN] {
+        let err = e.adjust_points(Platform::Youtube, "Lee-id", bad).await.unwrap_err();
+        assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with("delta:")), "{bad}: {err}");
+    }
+    let err = e.adjust_points(Platform::Youtube, "Lee-id", -76).await.unwrap_err();
+    assert!(matches!(&err, EngineError::Invalid(m) if m.contains("at most 75")), "{err}");
+    assert!(matches!(
+        e.adjust_points(Platform::Kick, "nobody", 5).await,
+        Err(EngineError::Missing { code: "viewer_not_found", .. })
+    ));
+    let patch = serde_json::json!({ "name": "Coins", "per_interval": "ten" });
+    let err = e.patch_loyalty(patch.as_object().unwrap()).await.unwrap_err();
+    assert_eq!(err.to_string(), "per_interval: must be a whole number of 0 or more.");
+    let patch = serde_json::json!({ "name": "Coins", "interval_min": 0 });
+    assert!(e.patch_loyalty(patch.as_object().unwrap()).await.unwrap_err().to_string().starts_with("interval_min:"));
+    let patch = serde_json::json!({ "name": "  Coins " });
+    assert_eq!(e.patch_loyalty(patch.as_object().unwrap()).await.unwrap().name, "Coins");
+    assert_eq!(e.leaderboard(10).await.unwrap()[0].points, 75);
 }

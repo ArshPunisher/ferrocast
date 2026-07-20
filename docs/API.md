@@ -160,13 +160,36 @@ type Filters = { words: { enabled; list: string[]; lookalikes: boolean; action }
                  solicitation: { enabled; action }, timeout_seconds: number, exempt_roles: number, max_length? }
 type PanicConfig = { followers_only; followers_only_minutes; emote_only; slow_mode_seconds /* 0 = leave alone */; hold_new_accounts; pause_alerts; pause_tts; hotkey: string; subscribers_only? }
 type ViewerCard = { platform; user_id; login; display_name; avatar_url: string | null; roles: number; first_seen: number | null; messages: number;
-                    follows_since: number | null; note: string; banned: boolean; timeouts: number; other_identities: { platform, login }[] }
+                    follows_since: number | null; note: string; banned: boolean; timeouts: number; other_identities: { platform, login }[];
+                    points: number /* loyalty balance, shared by linked accounts */ }
 ```
 
 ### Bot
 GET/POST `/api/v1/commands`, PUT/DELETE `/api/v1/commands/{id}`; GET/POST `/api/v1/timers`, PUT/DELETE `/api/v1/timers/{id}`.
 `Command = { id, name: "!discord", aliases: string[], response: string (template), roles: "everyone" | "subs" | "vips" | "mods", cooldown_s: number, user_cooldown_s: number, platforms: Platform[] | [], enabled }` (`id` may be blank on POST; the engine picks one)
 `Timer = { id, name, message, every_min: number, min_chat_lines: number, platforms: Platform[] | [], enabled }`
+
+### Loyalty points
+One balance per person: linked accounts on Twitch, YouTube and Kick share it. Never below 0, never above 1,000,000,000,000.
+
+```ts
+type LoyaltyConfig = { enabled: boolean; name: string /* "points", 1–20 letters, numbers, spaces, - _ */;
+                       per_interval: number; interval_min: number /* 1–120 */;
+                       follow_bonus: number; sub_bonus: number /* per sub, and per gifted sub for the gifter */;
+                       tip_bonus: number /* per tip, Super Chat, Bits cheer or Kicks gift */; raid_bonus: number }  // amounts 0–1,000,000
+type LeaderboardEntry = { rank: number; platform; user_id; login; display_name; points: number }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET / PUT | `/api/v1/loyalty` | `LoyaltyConfig`. PUT saves only the fields sent; 400 names a bad field (`interval_min: must be between 1 and 120 minutes.`) |
+| GET | `/api/v1/loyalty/leaderboard?limit=20` | → `LeaderboardEntry[]`, highest first, balances above 0 only (`limit` 1–100, else 400 `limit: …`) |
+| GET | `/api/v1/loyalty/viewers/{platform}/{user_id}` | → `{ points, name }` (404 `viewer_not_found`) |
+| POST | `/api/v1/loyalty/viewers/{platform}/{user_id}/adjust` | `{ delta }` (whole number, not 0, at most ±1,000,000,000) → `{ points, name }`. Taking more than they have is a 400 `delta: they have 75 points, so you can take away at most 75.` |
+
+Defaults: on, "points", 10 every 5 minutes for each viewer who chatted while their platform was live, 50 per follow, 250 per sub, 100 per tip, 100 per raid. Only live events pay (never tests, replays or backfill), each event once. The streamer, bots (the bot role and well-known bot accounts) and anonymous supporters never earn.
+
+Chat (when the bot is on): `!points` (or `!<name>`, like `!coins`) replies with the sender's balance, once per 15 s per person. Mods: `!addpoints @name 100`, `!removepoints @name 100` (stops at 0). A custom command with the same name wins. Balances are in `.ferropack` exports (`loyalty_balances`).
 
 ### TTS
 GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.

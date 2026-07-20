@@ -4,6 +4,7 @@
 pub mod bot;
 pub mod events;
 pub mod goals;
+pub mod loyalty;
 pub mod media;
 pub mod overlays;
 pub mod rules;

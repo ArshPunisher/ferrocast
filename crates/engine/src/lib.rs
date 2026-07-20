@@ -11,7 +11,9 @@ mod accounts;
 mod actions;
 mod dispatcher;
 mod error;
+mod loyalty;
 mod obs;
+mod patch;
 mod pipeline;
 mod relay;
 mod snapshot;
@@ -86,6 +88,9 @@ struct Inner {
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Who chatted this interval, for watch-time points.
+    activity: Mutex<ferrocast_core::loyalty::Activity>,
+    points_cooldown: Mutex<loyalty::PointsCooldowns>,
 }
 
 impl Engine {
@@ -158,12 +163,15 @@ impl Engine {
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
                 relay_link: Mutex::new(None),
+                activity: Mutex::new(Default::default()),
+                points_cooldown: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(loyalty::run(engine.clone()));
         engine.resume_accounts().await;
         Ok(engine)
     }
@@ -453,6 +461,7 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
         bans: repo::bot::ban_list(store)?,
         panic: get_or_default(store, "panic")?,
         goals: repo::goals::list(store)?,
+        loyalty: get_or_default(store, "loyalty")?,
         ..State::default()
     };
     for key in ["twitch", "youtube", "kick", "obs", "relay"] {

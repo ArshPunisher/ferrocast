@@ -34,6 +34,7 @@ const TABLES: &[&str] = &[
     "quotes",
     "viewers",
     "viewer_identities",
+    "loyalty_balances",
 ];
 
 /// Largest single entry, all entries together once unpacked, and the number of entries:
@@ -403,6 +404,27 @@ fn import_staged<R: Read + Seek>(
                 {
                     continue;
                 }
+                // A balance must be a whole number from 0 to the cap; a hand-edited pack
+                // with anything else is skipped rather than failing the whole import.
+                if *table == "loyalty_balances"
+                    && !row
+                        .get("points")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|p| (0..=ferrocast_core::loyalty::MAX_BALANCE).contains(&p))
+                {
+                    continue;
+                }
+                if *table == "loyalty_balances" {
+                    let owner = row.get("viewer_id").and_then(Value::as_i64);
+                    let known: bool = tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM viewers WHERE id = ?1)",
+                        [owner.unwrap_or(-1)],
+                        |r| r.get(0),
+                    )?;
+                    if !known {
+                        continue;
+                    }
+                }
                 // Only real columns, so a crafted pack can't inject SQL through key names.
                 let cols: Vec<&String> = row.keys().filter(|k| allowed.contains(k)).collect();
                 if cols.is_empty() {
@@ -481,8 +503,14 @@ mod tests {
         );
         tip.id = "t1".into();
         repo::events::insert(&s, &tip).unwrap();
+        let mut fan = ferrocast_core::event::Actor::named(ferrocast_core::event::Platform::Twitch, "Fan");
+        fan.id = Some("fan-1".into());
+        repo::viewers::touch(&s, &fan, true).unwrap();
+        repo::loyalty::change(&s, ferrocast_core::event::Platform::Twitch, "fan-1", 420, repo::loyalty::Floor::Strict)
+            .unwrap();
         let pack = a.path().join("out.ferropack");
         let manifest = export(&s, &pack, "0.1.0").unwrap();
+        assert_eq!(manifest.counts["loyalty_balances"], 1);
         assert_eq!(manifest.counts["overlays"], 1);
 
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&pack).unwrap()).unwrap();
@@ -498,6 +526,11 @@ mod tests {
         let back = repo::overlays::get(&s2, &o.id).unwrap();
         assert_eq!(back.token, o.token, "OBS URLs keep working on the new PC");
         assert_eq!(repo::bot::counter(&s2, "deaths").unwrap(), 7);
+        assert_eq!(
+            repo::loyalty::balance(&s2, ferrocast_core::event::Platform::Twitch, "fan-1").unwrap(),
+            Some(420),
+            "points come across with their viewer"
+        );
         let (media, path) = repo::media::get(&s2, &m.id).unwrap().unwrap();
         assert_eq!(media.mime, "image/png");
         assert_eq!(std::fs::read(path).unwrap(), png);
@@ -649,5 +682,35 @@ mod tests {
         import(&s, local.path()).unwrap();
         let obs: Value = repo::settings::get(&s, "obs").unwrap().unwrap();
         assert_eq!(obs["port"], 4460, "OBS on this computer is kept");
+    }
+
+    #[test]
+    fn a_pack_cannot_plant_impossible_balances() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path()).unwrap();
+        let viewers = serde_json::to_vec(&json!([{ "id": 7, "note": "" }])).unwrap();
+        let balances = serde_json::to_vec(&json!([
+            { "viewer_id": 7, "points": -50, "updated_at": 0 },
+            { "viewer_id": 99, "points": 10, "updated_at": 0 },
+            { "viewer_id": 7, "points": "lots", "updated_at": 0 },
+        ]))
+        .unwrap();
+        let pack = write_pack(&[
+            ("manifest.json", &manifest_bytes(1)),
+            ("viewers.json", &viewers),
+            ("loyalty_balances.json", &balances),
+        ]);
+        import(&s, pack.path()).unwrap();
+        let n: i64 = s.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM loyalty_balances", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0, "negative, orphaned and non-numeric balances are skipped, the import still works");
+        let ok = serde_json::to_vec(&json!([{ "viewer_id": 7, "points": 25, "updated_at": 0 }])).unwrap();
+        let pack = write_pack(&[
+            ("manifest.json", &manifest_bytes(1)),
+            ("viewers.json", &viewers),
+            ("loyalty_balances.json", &ok),
+        ]);
+        import(&s, pack.path()).unwrap();
+        let p: i64 = s.read(|c| Ok(c.query_row("SELECT points FROM loyalty_balances", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(p, 25);
     }
 }

@@ -200,10 +200,11 @@ pub async fn viewer(State(app): State<AppState>, Path((p, user)): Path<(String, 
             let card = repo::viewers::card(s, p, &uid)?;
             let chat = repo::events::latest_by_actor(s, p, &uid, "chat_message")?;
             let follow = repo::events::first_follow(s, p, &uid)?;
-            Ok((card, chat, follow))
+            let points = repo::loyalty::balance(s, p, &uid)?.unwrap_or(0);
+            Ok((card, chat, follow, points))
         })
         .await;
-    let (card, chat, follows_since) = match found {
+    let (card, chat, follows_since, points) = match found {
         Ok(v) => v,
         Err(ferrocast_engine::EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => {
             return Err(ApiError::new(
@@ -239,6 +240,7 @@ pub async fn viewer(State(app): State<AppState>, Path((p, user)): Path<(String, 
         "banned": banned,
         "timeouts": me.map(|i| i.timeouts).unwrap_or(0),
         "other_identities": others,
+        "points": points,
     })))
 }
 

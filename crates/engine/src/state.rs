@@ -150,6 +150,7 @@ pub struct State {
     pub panic_on: bool,
     pub tts_paused: bool,
     pub goals: Vec<Goal>,
+    pub loyalty: ferrocast_core::loyalty::LoyaltyConfig,
     pub live: HashMap<Platform, bool>,
     pub viewers: HashMap<Platform, u64>,
     pub connectors: HashMap<String, ConnectorView>,

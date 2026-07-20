@@ -12,6 +12,7 @@ pub mod dedupe;
 pub mod event;
 pub mod filter;
 pub mod goal;
+pub mod loyalty;
 pub mod moderation;
 pub mod money;
 pub mod overlay;

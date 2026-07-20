@@ -3,6 +3,7 @@
 mod app;
 mod bot;
 mod core;
+mod loyalty;
 #[cfg(test)]
 pub(crate) use core::lan_ip;
 mod media;
@@ -67,6 +68,11 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/commands/{id}", put(bot::update_command).delete(bot::delete_command))
         .route("/timers", get(bot::timers).post(bot::create_timer))
         .route("/timers/{id}", put(bot::update_timer).delete(bot::delete_timer))
+        // loyalty points
+        .route("/loyalty", get(loyalty::config).put(loyalty::save_config))
+        .route("/loyalty/leaderboard", get(loyalty::leaderboard))
+        .route("/loyalty/viewers/{platform}/{user_id}", get(loyalty::balance))
+        .route("/loyalty/viewers/{platform}/{user_id}/adjust", post(loyalty::adjust))
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))

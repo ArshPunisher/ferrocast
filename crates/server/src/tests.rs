@@ -12,6 +12,7 @@ struct Running {
     base: String,
     token: String,
     client: reqwest::Client,
+    engine: Engine,
     _dir: tempfile::TempDir,
 }
 
@@ -25,6 +26,30 @@ impl Running {
     async fn put(&self, path: &str, body: Value) -> reqwest::Response {
         self.client.put(format!("{}{path}", self.base)).bearer_auth(&self.token).json(&body).send().await.unwrap()
     }
+    /// A body that isn't JSON at all, with the JSON content type.
+    async fn raw(&self, method: reqwest::Method, path: &str, body: &'static str) -> reqwest::Response {
+        self.client
+            .request(method, format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+    /// The same request without the session token.
+    async fn anonymous(&self, method: reqwest::Method, path: &str) -> reqwest::Response {
+        self.client.request(method, format!("{}{path}", self.base)).json(&json!({})).send().await.unwrap()
+    }
+}
+
+/// A person who chatted once, so they have a viewer card (and a balance).
+async fn seen(r: &Running, platform: ferrocast_core::event::Platform, user: &str) {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis};
+    let mut a = Actor::named(platform, user);
+    a.id = Some(format!("{user}-id"));
+    let kind = EventKind::ChatMessage { actor: a, content: Content::plain("hi"), reply_to: None, is_action: false };
+    r.engine.ingest(Event::live(platform, Some(format!("seen-{user}")), Millis(0), kind)).await;
 }
 
 async fn start() -> Running {
@@ -33,11 +58,12 @@ async fn start() -> Running {
         Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
             .await
             .unwrap();
-    let server = serve(engine, ServeOptions { port: 0, lan: false, dev_origins: vec![] }).await.unwrap();
+    let server = serve(engine.clone(), ServeOptions { port: 0, lan: false, dev_origins: vec![] }).await.unwrap();
     Running {
         base: server.base_url(),
         token: server.sessions.desktop_token().to_string(),
         client: reqwest::Client::new(),
+        engine,
         _dir: dir,
     }
 }
@@ -311,11 +337,12 @@ async fn start_with_relay() -> (Running, tempfile::TempDir) {
     let engine = Engine::start_with(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()), apps)
         .await
         .unwrap();
-    let server = serve(engine, ServeOptions { port: 0, lan: false, dev_origins: vec![] }).await.unwrap();
+    let server = serve(engine.clone(), ServeOptions { port: 0, lan: false, dev_origins: vec![] }).await.unwrap();
     let r = Running {
         base: server.base_url(),
         token: server.sessions.desktop_token().to_string(),
         client: reqwest::Client::new(),
+        engine,
         _dir: dir,
     };
     (r, rdir)
@@ -713,4 +740,95 @@ async fn lan_pairing_links_point_at_this_computer_on_the_network() {
     if let Some(ip) = super::routes::lan_ip() {
         assert!(url.starts_with(&format!("http://{ip}:")), "{url}");
     }
+}
+
+#[tokio::test]
+async fn loyalty_routes_refuse_every_kind_of_bad_request() {
+    use reqwest::Method;
+    let r = start().await;
+    seen(&r, ferrocast_core::event::Platform::Twitch, "sam").await;
+    let cfg: Value = r.get("/api/v1/loyalty").await.json().await.unwrap();
+    assert_eq!(
+        (cfg["name"].as_str(), cfg["per_interval"].as_u64(), cfg["enabled"].as_bool()),
+        (Some("points"), Some(10), Some(true))
+    );
+    // Missing auth on every loyalty route.
+    for (m, path) in [
+        (Method::GET, "/api/v1/loyalty"),
+        (Method::PUT, "/api/v1/loyalty"),
+        (Method::GET, "/api/v1/loyalty/leaderboard"),
+        (Method::GET, "/api/v1/loyalty/viewers/twitch/sam-id"),
+        (Method::POST, "/api/v1/loyalty/viewers/twitch/sam-id/adjust"),
+    ] {
+        assert_eq!(error_code(r.anonymous(m, path).await).await.0, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // Bad JSON and wrong shapes.
+    let bad = r.raw(Method::PUT, "/api/v1/loyalty", "{nope").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    let bad = r.raw(Method::POST, "/api/v1/loyalty/viewers/twitch/sam-id/adjust", "[1,").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    let msg = |res: reqwest::Response| async move {
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        (status, v["error"]["message"].as_str().unwrap_or("").to_string())
+    };
+    let (s, m) = msg(r.put("/api/v1/loyalty", json!(["not", "an object"])).await).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{m}");
+    for (body, field) in [
+        (json!({ "per_interval": "ten" }), "per_interval:"),
+        (json!({ "per_interval": -1 }), "per_interval:"),
+        (json!({ "per_interval": 2_000_000 }), "per_interval:"),
+        (json!({ "interval_min": 0 }), "interval_min:"),
+        (json!({ "enabled": "yes" }), "enabled:"),
+        (json!({ "name": "" }), "name:"),
+        (json!({ "name": 5 }), "name:"),
+        (json!({ "raid_bonus": 1.5 }), "raid_bonus:"),
+    ] {
+        let (s, m) = msg(r.put("/api/v1/loyalty", body.clone()).await).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(m.starts_with(field), "{body}: {m}");
+    }
+    let saved: Value =
+        r.put("/api/v1/loyalty", json!({ "name": "Coins", "follow_bonus": 0 })).await.json().await.unwrap();
+    assert_eq!(
+        (saved["name"].as_str(), saved["follow_bonus"].as_u64(), saved["sub_bonus"].as_u64()),
+        (Some("Coins"), Some(0), Some(250))
+    );
+    // Adjust: wrong types, out of range, unknown people and platforms.
+    let adjust = "/api/v1/loyalty/viewers/twitch/sam-id/adjust";
+    for body in [
+        json!({}),
+        json!({ "delta": "5" }),
+        json!({ "delta": 1.5 }),
+        json!({ "delta": 0 }),
+        json!({ "delta": 1e12 }),
+        json!({ "delta": null }),
+    ] {
+        let (s, m) = msg(r.post(adjust, body.clone()).await).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(m.starts_with("delta:"), "{body}: {m}");
+    }
+    let ok: Value = r.post(adjust, json!({ "delta": 300 })).await.json().await.unwrap();
+    assert_eq!((ok["points"].as_i64(), ok["name"].as_str()), (Some(300), Some("Coins")));
+    let (s, m) = msg(r.post(adjust, json!({ "delta": -301 })).await).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(m.contains("at most 300"), "{m}");
+    let unknown = r.post("/api/v1/loyalty/viewers/kick/ghost/adjust", json!({ "delta": 5 })).await;
+    assert_eq!(error_code(unknown).await, (StatusCode::NOT_FOUND, "viewer_not_found".into()));
+    let unknown = r.get("/api/v1/loyalty/viewers/youtube/ghost").await;
+    assert_eq!(error_code(unknown).await, (StatusCode::NOT_FOUND, "viewer_not_found".into()));
+    let platform = r.get("/api/v1/loyalty/viewers/tiktok/sam-id").await;
+    assert_eq!(error_code(platform).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    // Leaderboard and the viewer card.
+    for q in ["?limit=0", "?limit=101", "?limit=ten", "?limit=-1"] {
+        let res = r.get(&format!("/api/v1/loyalty/leaderboard{q}")).await;
+        assert_eq!(error_code(res).await, (StatusCode::BAD_REQUEST, "invalid".into()), "{q}");
+    }
+    let top: Value = r.get("/api/v1/loyalty/leaderboard?limit=5").await.json().await.unwrap();
+    assert_eq!(top[0]["display_name"], "sam");
+    assert_eq!((top[0]["rank"].as_u64(), top[0]["points"].as_i64()), (Some(1), Some(300)));
+    let card: Value = r.get("/api/v1/viewers/twitch/sam-id").await.json().await.unwrap();
+    assert_eq!(card["points"], 300);
+    let bal: Value = r.get("/api/v1/loyalty/viewers/twitch/sam-id").await.json().await.unwrap();
+    assert_eq!(bal["points"], 300);
 }
