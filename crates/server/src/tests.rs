@@ -832,3 +832,108 @@ async fn loyalty_routes_refuse_every_kind_of_bad_request() {
     let bal: Value = r.get("/api/v1/loyalty/viewers/twitch/sam-id").await.json().await.unwrap();
     assert_eq!(bal["points"], 300);
 }
+
+#[tokio::test]
+async fn poll_routes_validate_and_refuse_races() {
+    use reqwest::Method;
+    let r = start().await;
+    assert_eq!(r.get("/api/v1/polls/current").await.json::<Value>().await.unwrap(), Value::Null);
+    for (m, path) in [
+        (Method::GET, "/api/v1/polls/current"),
+        (Method::POST, "/api/v1/polls"),
+        (Method::POST, "/api/v1/polls/current/end"),
+        (Method::DELETE, "/api/v1/polls/current"),
+    ] {
+        assert_eq!(error_code(r.anonymous(m, path).await).await.0, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let bad = r.raw(Method::POST, "/api/v1/polls", "{\"question\":").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    let msg = |res: reqwest::Response| async move {
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        (status, v["error"]["message"].as_str().unwrap_or("").to_string())
+    };
+    let ok = json!({ "question": "Which map?", "options": ["Ascent", "Bind"], "duration_s": 60 });
+    let mut cases = vec![
+        (json!([]), "Send the poll"),
+        (json!({ "options": ["a", "b"] }), "question:"),
+        (json!({ "question": 5, "options": ["a", "b"] }), "question:"),
+        (json!({ "question": " ", "options": ["a", "b"] }), "question:"),
+        (json!({ "question": "q" }), "options:"),
+        (json!({ "question": "q", "options": "a,b" }), "options:"),
+        (json!({ "question": "q", "options": ["a", 2] }), "options:"),
+        (json!({ "question": "q", "options": ["a"] }), "options:"),
+        (json!({ "question": "q", "options": ["a", "b", "c", "d", "e", "f"] }), "options:"),
+        (json!({ "question": "q", "options": ["a", "A"] }), "options:"),
+    ];
+    for d in [json!(5), json!(1801), json!(-1), json!(1.5), json!("60"), json!(1e20)] {
+        let mut b = ok.clone();
+        b["duration_s"] = d;
+        cases.push((b, "duration_s:"));
+    }
+    for (body, prefix) in cases {
+        let (s, m) = msg(r.post("/api/v1/polls", body.clone()).await).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(m.starts_with(prefix), "{body}: {m}");
+    }
+    let none = r.post("/api/v1/polls/current/end", json!({})).await;
+    assert_eq!(error_code(none).await, (StatusCode::NOT_FOUND, "poll_not_found".into()));
+    let created = r.post("/api/v1/polls", ok.clone()).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let p: Value = created.json().await.unwrap();
+    assert_eq!((p["closed"].as_bool(), p["total"].as_u64()), (Some(false), Some(0)));
+    let again = r.post("/api/v1/polls", ok.clone()).await;
+    assert_eq!(error_code(again).await, (StatusCode::CONFLICT, "conflict".into()));
+    // Two dashboards press "End" at once: one wins, the other gets a conflict.
+    let (a, b) =
+        tokio::join!(r.post("/api/v1/polls/current/end", json!({})), r.post("/api/v1/polls/current/end", json!({})));
+    let mut codes = vec![a.status(), b.status()];
+    codes.sort();
+    assert_eq!(codes, vec![StatusCode::OK, StatusCode::CONFLICT]);
+    let current: Value = r.get("/api/v1/polls/current").await.json().await.unwrap();
+    assert_eq!(current["closed"], true, "the finished poll stays visible");
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/polls/current", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let gone = r.client.delete(format!("{}/api/v1/polls/current", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(error_code(gone).await, (StatusCode::NOT_FOUND, "poll_not_found".into()));
+    let fresh = r.post("/api/v1/polls", ok).await;
+    assert_eq!(fresh.status(), StatusCode::CREATED, "a new poll after the last one ended");
+}
+
+#[tokio::test]
+async fn only_overlays_with_a_poll_widget_get_live_results() {
+    let r = start().await;
+    let with: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Poll", "preset": "blank" })).await.json().await.unwrap();
+    let id = with["id"].as_str().unwrap().to_string();
+    let mut edit = with.clone();
+    edit["widgets"] =
+        json!([{ "id": "p", "kind": "poll", "x": 0, "y": 0, "w": 600, "h": 400, "config": { "theme": "molten" } }]);
+    assert_eq!(r.put(&format!("/api/v1/overlays/{id}"), edit).await.status(), StatusCode::OK);
+    let without: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Chat", "preset": "chat_only" })).await.json().await.unwrap();
+    let open = |o: &Value| o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws, _) = tokio_tungstenite::connect_async(open(&with)).await.unwrap();
+    let (mut other, _) = tokio_tungstenite::connect_async(open(&without)).await.unwrap();
+    let snap: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["data"]["state"]["poll"], Value::Null);
+    let _ = other.next().await; // its snapshot
+    r.post("/api/v1/polls", json!({ "question": "Pizza?", "options": ["Yes", "No"], "duration_s": 30 })).await;
+    let state = loop {
+        let v: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        if v["type"] == "state" {
+            break v;
+        }
+    };
+    assert_eq!(state["data"]["poll"]["question"], "Pizza?");
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), other.next()).await;
+    assert!(quiet.is_err(), "a chat-only overlay gets no poll frames");
+}

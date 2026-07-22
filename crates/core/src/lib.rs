@@ -16,6 +16,7 @@ pub mod loyalty;
 pub mod moderation;
 pub mod money;
 pub mod overlay;
+pub mod poll;
 pub mod queue;
 pub mod sample;
 pub mod template;

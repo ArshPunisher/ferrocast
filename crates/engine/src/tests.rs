@@ -1051,3 +1051,79 @@ async fn dashboard_adjustments_refuse_bad_amounts() {
     assert_eq!(e.patch_loyalty(patch.as_object().unwrap()).await.unwrap().name, "Coins");
     assert_eq!(e.leaderboard(10).await.unwrap()[0].points, 75);
 }
+
+// ---------------------------------------------------------------- polls
+
+fn poll_spec(opts: &[&str]) -> ferrocast_core::poll::PollSpec {
+    ferrocast_core::poll::PollSpec {
+        question: "Which map next?".into(),
+        options: opts.iter().map(|s| s.to_string()).collect(),
+        duration_s: 60,
+    }
+}
+
+#[tokio::test]
+async fn polls_count_one_vote_per_person_and_post_the_result_once() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(tw.clone());
+    e.register_connector(kick.clone());
+    // Sam has a Twitch and a Kick account, linked.
+    e.ingest(chat(Platform::Twitch, "s1", "sam", "hi")).await;
+    e.ingest(chat(Platform::Kick, "s2", "sam_k", "hi")).await;
+    repo::viewers::link(&e.store(), Platform::Kick, "sam_k-id", Platform::Twitch, "sam-id").unwrap();
+    let mut live = e.subscribe_live();
+    let p = e.start_poll(poll_spec(&["Ascent", "Bind", "Haven"])).await.unwrap();
+    assert_eq!(p.options.len(), 3);
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Poll: Which map next? Type !vote 1 for Ascent"))).await;
+    eventually(|| kick.log().iter().any(|l| l.starts_with("say Poll: Which map next?"))).await;
+    assert!(matches!(e.start_poll(poll_spec(&["a", "b"])).await, Err(EngineError::Conflict(_))), "one at a time");
+    e.ingest(chat(Platform::Twitch, "v1", "sam", "!vote 1")).await;
+    e.ingest(chat(Platform::Kick, "v2", "sam_k", "!vote 2")).await; // same person: changes the vote
+    e.ingest(chat(Platform::Twitch, "v3", "ana", "!vote 2")).await;
+    e.ingest(chat(Platform::Twitch, "v4", "lee", "!vote 9")).await; // no such answer
+    e.ingest(chat(Platform::Twitch, "v5", "kim", "!vote two")).await;
+    let mut shared = chat(Platform::Twitch, "v6", "guest", "!vote 3");
+    shared.channel = Some(ChannelRef { platform: Platform::Twitch, id: "partner".into(), name: "partner".into() });
+    e.ingest(shared).await; // Shared Chat from another channel doesn't vote here
+    let v = e.poll().unwrap();
+    assert_eq!(v.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![0, 2, 0]);
+    assert_eq!(v.leaders, vec![1]);
+    // The timer and the button race: exactly one of them closes it and posts the result.
+    let (a, b) = tokio::join!(e.end_poll(), e.finish_poll(Some(&p.id)));
+    assert!(a.is_ok() != b.is_ok(), "exactly one wins: {a:?} {b:?}");
+    assert!(matches!(e.end_poll().await, Err(EngineError::Conflict(_))));
+    eventually(|| {
+        tw.log().iter().any(|l| l.starts_with("say Poll closed: Which map next? Winner: Bind with 2 votes (100%)."))
+    })
+    .await;
+    let results = tw.log().iter().filter(|l| l.contains("Poll closed")).count();
+    assert_eq!(results, 1, "posted once");
+    e.ingest(chat(Platform::Twitch, "v7", "zoe", "!vote 1")).await;
+    assert_eq!(e.poll().unwrap().total, 2, "votes after the end don't count");
+    let mut saw_poll_frame = false;
+    while let Ok(f) = live.try_recv() {
+        saw_poll_frame |= f.text.contains("\"type\":\"poll\"");
+    }
+    assert!(saw_poll_frame, "dashboards get live results");
+    e.clear_poll().unwrap();
+    assert!(e.poll().is_none());
+    assert!(matches!(e.clear_poll(), Err(EngineError::Missing { code: "poll_not_found", .. })));
+    assert!(matches!(e.end_poll().await, Err(EngineError::Missing { code: "poll_not_found", .. })));
+    assert!(e.start_poll(poll_spec(&["only one"])).await.is_err());
+}
+
+#[tokio::test]
+async fn a_poll_without_any_chat_connected_says_so() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    e.start_poll(poll_spec(&["a", "b"])).await.unwrap();
+    let mut notice = None;
+    while let Ok(f) = live.try_recv() {
+        if f.text.contains("\"type\":\"notice\"") {
+            notice = Some(f.text.to_string());
+        }
+    }
+    assert!(notice.unwrap().contains("No chat is connected"));
+}

@@ -257,7 +257,8 @@ impl Engine {
             return Moderated::Shown;
         };
         let a = actor.clone();
-        let _ = self.db(move |s| repo::viewers::touch(s, &a, true)).await;
+        // The person behind this account (linked accounts share one), for one vote each.
+        let person = self.db(move |s| repo::viewers::touch(s, &a, true)).await.ok().flatten();
         if e.origin == Origin::Live {
             self.state_mut().session.record(e);
         }
@@ -331,6 +332,17 @@ impl Engine {
                 }
                 return Moderated::Hidden;
             }
+        }
+
+        let voter = match (person, &actor.id) {
+            (Some(v), _) => Some(format!("viewer:{v}")),
+            (None, Some(id)) => Some(format!("{}:{id}", platform_key(e.platform))),
+            (None, None) => None,
+        };
+        if let Some(voter) = voter
+            && let Some(Err(refused)) = self.poll_vote(e, &voter)
+        {
+            tracing::debug!(?refused, "vote not counted");
         }
 
         // Only live chat from this channel gets answers: replayed history and Shared Chat

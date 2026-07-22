@@ -8,6 +8,7 @@ mod loyalty;
 pub(crate) use core::lan_ip;
 mod media;
 mod moderation;
+mod polls;
 
 use axum::Router;
 use axum::routing::{delete, get, post, put};
@@ -73,6 +74,10 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/loyalty/leaderboard", get(loyalty::leaderboard))
         .route("/loyalty/viewers/{platform}/{user_id}", get(loyalty::balance))
         .route("/loyalty/viewers/{platform}/{user_id}/adjust", post(loyalty::adjust))
+        // polls
+        .route("/polls", post(polls::start))
+        .route("/polls/current", get(polls::current).delete(polls::clear))
+        .route("/polls/current/end", post(polls::end))
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))

@@ -15,6 +15,8 @@ pub enum WidgetKind {
     Goal,
     Label,
     Viewers,
+    /// A chat poll's live results.
+    Poll,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

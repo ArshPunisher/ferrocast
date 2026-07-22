@@ -19,6 +19,8 @@ pub enum Audience {
     Alerts,
     /// One overlay (config changes).
     Overlay(String),
+    /// Overlays with a widget of this kind (poll results, giveaway cards).
+    Widget(ferrocast_core::overlay::WidgetKind),
 }
 
 #[derive(Debug, Clone)]

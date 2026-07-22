@@ -15,6 +15,7 @@ mod loyalty;
 mod obs;
 mod patch;
 mod pipeline;
+mod polls;
 mod relay;
 mod snapshot;
 pub mod speech;
@@ -91,6 +92,7 @@ struct Inner {
     /// Who chatted this interval, for watch-time points.
     activity: Mutex<ferrocast_core::loyalty::Activity>,
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
+    poll: Mutex<polls::PollSlot>,
 }
 
 impl Engine {
@@ -165,6 +167,7 @@ impl Engine {
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
+                poll: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -172,6 +175,7 @@ impl Engine {
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
+        tokio::spawn(polls::run(engine.clone()));
         engine.resume_accounts().await;
         Ok(engine)
     }

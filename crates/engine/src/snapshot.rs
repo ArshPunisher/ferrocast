@@ -150,7 +150,8 @@ impl Engine {
         let view = self.overlay_view(o);
         Ok(json!({
             "overlay": view_public(&view),
-            "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat },
+            "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
+                       "poll": self.poll() },
         }))
     }
 }

@@ -93,7 +93,7 @@ An overlay is one OBS browser source (a 1920×1080 canvas by default) holding wi
 
 ```ts
 type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number };
-type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers";
+type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll";
                 x: number; y: number; w: number; h: number; config: object };
 ```
 
@@ -112,6 +112,7 @@ Widget `config` per kind:
 - `goal`: `{ goal_id: string, theme: string }`
 - `label`: `{ source: "latest_follower" | "latest_sub" | "latest_tip" | "top_tip_session" | "session_follows" | "session_subs", template: string, theme: string }`
 - `viewers`: `{ platforms: Platform[], theme: string }`
+- `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
 
 ### Alerts
 | Method | Path | Body → Response |
@@ -191,6 +192,23 @@ Defaults: on, "points", 10 every 5 minutes for each viewer who chatted while the
 
 Chat (when the bot is on): `!points` (or `!<name>`, like `!coins`) replies with the sender's balance, once per 15 s per person. Mods: `!addpoints @name 100`, `!removepoints @name 100` (stops at 0). A custom command with the same name wins. Balances are in `.ferropack` exports (`loyalty_balances`).
 
+### Polls
+Chat polls that work the same on Twitch, YouTube and Kick: viewers type `!vote 2`. No platform poll API, so no extra permissions.
+
+```ts
+type PollView = { id: string; question: string; options: { text: string; votes: number }[]; total: number;
+                  started_at: number; ends_at: number; closed: boolean; leaders: number[] /* indexes of the leading answers; several on a tie */ }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/polls/current` | → `PollView \| null`: the running poll, or the last one that finished |
+| POST | `/api/v1/polls` | `{ question (1–120 chars), options: string[] (2–5, 1–60 chars, no duplicates), duration_s (10–1800, default 60) }` → 201 `PollView`. 409 while another poll is open. The poll is announced in chat on every connected platform |
+| POST | `/api/v1/polls/current/end` | → `PollView`: closes it now and posts the result. 404 `poll_not_found`; 409 when it already ended (the timer or another dashboard got there first) |
+| DELETE | `/api/v1/polls/current` | → 204: removes it without posting anything (404 `poll_not_found`) |
+
+One vote per person: linked accounts vote once, voting again changes the vote, a vote after the end doesn't count. Only live chat in this channel votes (not Shared Chat from a partner, not replays). When time runs out the result is posted in chat. Polls live in memory: a restart forgets them.
+
 ### TTS
 GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.
 GET `/api/v1/tts/voices` → `{ id, name, language, pro: false }[]` (the computer's own voices). GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
@@ -232,6 +250,7 @@ POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
 - `panic { on, plan: PanicConfig }`
+- `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
 The client sends nothing but pings.
@@ -243,11 +262,11 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50) } }`, always first |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null } }`, always first |
 | `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
-| `state` | partial `{ goals?, labels?, viewers? }` |
+| `state` | partial `{ goals?, labels?, viewers?, poll? }` (`poll` only to overlays with a poll widget) |
 | `config` | `Overlay` (re-render without reloading) |
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |
