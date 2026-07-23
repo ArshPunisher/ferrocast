@@ -151,7 +151,7 @@ impl Engine {
         Ok(json!({
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
-                       "poll": self.poll() },
+                       "poll": self.poll(), "giveaway": self.giveaway_card().await },
         }))
     }
 }

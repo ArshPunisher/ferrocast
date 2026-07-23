@@ -11,6 +11,7 @@ mod accounts;
 mod actions;
 mod dispatcher;
 mod error;
+mod giveaways;
 mod loyalty;
 mod obs;
 mod patch;
@@ -93,6 +94,7 @@ struct Inner {
     activity: Mutex<ferrocast_core::loyalty::Activity>,
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
+    giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
 }
 
 impl Engine {
@@ -168,6 +170,7 @@ impl Engine {
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
+                giveaway: tokio::sync::Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -176,6 +179,7 @@ impl Engine {
         tokio::spawn(timers::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
+        tokio::spawn(giveaways::run(engine.clone()));
         engine.resume_accounts().await;
         Ok(engine)
     }

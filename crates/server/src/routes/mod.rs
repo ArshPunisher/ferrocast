@@ -3,6 +3,7 @@
 mod app;
 mod bot;
 mod core;
+mod giveaways;
 mod loyalty;
 #[cfg(test)]
 pub(crate) use core::lan_ip;
@@ -78,6 +79,13 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/polls", post(polls::start))
         .route("/polls/current", get(polls::current).delete(polls::clear))
         .route("/polls/current/end", post(polls::end))
+        // giveaways
+        .route("/giveaways", post(giveaways::start))
+        .route("/giveaways/current", get(giveaways::current).delete(giveaways::cancel))
+        .route("/giveaways/current/close", post(giveaways::close))
+        .route("/giveaways/current/draw", post(giveaways::draw))
+        .route("/giveaways/current/redraw", post(giveaways::redraw))
+        .route("/giveaways/current/end", post(giveaways::end))
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))

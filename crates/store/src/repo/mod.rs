@@ -3,6 +3,7 @@
 
 pub mod bot;
 pub mod events;
+pub mod giveaways;
 pub mod goals;
 pub mod loyalty;
 pub mod media;

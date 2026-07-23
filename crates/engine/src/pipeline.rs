@@ -339,10 +339,11 @@ impl Engine {
             (None, Some(id)) => Some(format!("{}:{id}", platform_key(e.platform))),
             (None, None) => None,
         };
-        if let Some(voter) = voter
-            && let Some(Err(refused)) = self.poll_vote(e, &voter)
-        {
-            tracing::debug!(?refused, "vote not counted");
+        if let Some(voter) = voter {
+            if let Some(Err(refused)) = self.poll_vote(e, &voter) {
+                tracing::debug!(?refused, "vote not counted");
+            }
+            self.giveaway_entry(e, &voter).await;
         }
 
         // Only live chat from this channel gets answers: replayed history and Shared Chat

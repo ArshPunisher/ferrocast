@@ -1127,3 +1127,130 @@ async fn a_poll_without_any_chat_connected_says_so() {
     }
     assert!(notice.unwrap().contains("No chat is connected"));
 }
+
+// ---------------------------------------------------------------- giveaways
+
+fn giveaway_spec(cost: i64, subs: bool) -> ferrocast_core::giveaway::GiveawaySpec {
+    ferrocast_core::giveaway::GiveawaySpec {
+        prize: "a game key".into(),
+        keyword: "!join".into(),
+        cost,
+        subscriber_bonus: subs,
+    }
+}
+
+fn with_roles(mut ev: Event, roles: Roles) -> Event {
+    if let EventKind::ChatMessage { actor, .. } = &mut ev.kind {
+        actor.roles = roles;
+    }
+    ev
+}
+
+/// Lets the giveaway's entry handling (it waits on a lock) finish.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+#[tokio::test]
+async fn giveaways_take_one_paid_entry_per_person_and_never_the_streamer_or_bots() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    for (id, user) in [("a1", "ana"), ("b1", "bo"), ("k1", "ana_k"), ("s1", "sub")] {
+        let p = if user == "ana_k" { Platform::Kick } else { Platform::Twitch };
+        e.ingest(chat(p, id, user, "hi")).await;
+    }
+    repo::viewers::link(&e.store(), Platform::Kick, "ana_k-id", Platform::Twitch, "ana-id").unwrap();
+    e.adjust_points(Platform::Twitch, "ana-id", 100).await.unwrap();
+    e.adjust_points(Platform::Twitch, "sub-id", 100).await.unwrap();
+    e.adjust_points(Platform::Twitch, "bo-id", 10).await.unwrap();
+    assert!(
+        matches!(e.start_giveaway(giveaway_spec(-5, true)).await, Err(EngineError::Invalid(m)) if m.starts_with("cost:"))
+    );
+    e.start_giveaway(giveaway_spec(50, true)).await.unwrap();
+    eventually(|| {
+        tw.log().iter().any(|l| l.starts_with("say Giveaway: a game key! Type !join to enter. It costs 50 points."))
+    })
+    .await;
+    assert!(matches!(e.start_giveaway(giveaway_spec(0, false)).await, Err(EngineError::Conflict(_))));
+    e.ingest(chat(Platform::Twitch, "j1", "ana", "!join")).await;
+    e.ingest(chat(Platform::Twitch, "j2", "ana", "!JOIN")).await; // again: no second fee
+    e.ingest(chat(Platform::Kick, "j3", "ana_k", "!join")).await; // same person on Kick
+    e.ingest(with_roles(chat(Platform::Twitch, "j4", "sub", "!join"), Roles::SUBSCRIBER)).await;
+    e.ingest(chat(Platform::Twitch, "j5", "bo", "!join")).await; // can't afford it
+    e.ingest(chat(Platform::Twitch, "j6", "bo", "!join")).await; // told once only
+    e.ingest(with_roles(chat(Platform::Twitch, "j7", "me", "!join"), Roles::BROADCASTER)).await;
+    e.ingest(chat(Platform::Twitch, "j8", "Nightbot", "!join")).await;
+    settle().await;
+    let g = e.giveaway().await.unwrap();
+    assert_eq!((g.entries, g.tickets), (2, 3), "Ana once, the sub twice");
+    assert_eq!(e.points(Platform::Twitch, "ana-id").await.unwrap(), 50, "paid once");
+    assert_eq!(e.points(Platform::Twitch, "bo-id").await.unwrap(), 10);
+    eventually(|| {
+        tw.log().iter().filter(|l| l.contains("entering costs 50 points and you have 10 points")).count() == 1
+    })
+    .await;
+    // Cancelling gives every fee back.
+    assert_eq!(e.cancel_giveaway().await.unwrap(), 2);
+    assert_eq!(e.points(Platform::Twitch, "ana-id").await.unwrap(), 100);
+    assert_eq!(e.points(Platform::Twitch, "sub-id").await.unwrap(), 100);
+    assert!(e.giveaway().await.is_none());
+    assert!(matches!(e.cancel_giveaway().await, Err(EngineError::Missing { code: "giveaway_not_found", .. })));
+}
+
+#[tokio::test]
+async fn draws_are_serialised_redraws_skip_winners_and_entries_close() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    assert!(matches!(e.draw_giveaway(false).await, Err(EngineError::Missing { .. })));
+    e.start_giveaway(giveaway_spec(0, false)).await.unwrap();
+    assert!(matches!(e.draw_giveaway(false).await, Err(EngineError::Unavailable(_))), "nobody entered");
+    assert!(matches!(e.draw_giveaway(true).await, Err(EngineError::Conflict(_))), "redraw before draw");
+    e.ingest(chat(Platform::Twitch, "j1", "ana", "!join")).await;
+    e.ingest(chat(Platform::Twitch, "j2", "bo", "!join")).await;
+    settle().await;
+    let (a, b) = tokio::join!(e.draw_giveaway(false), e.draw_giveaway(false));
+    assert!(a.is_ok() != b.is_ok(), "a double click draws once: {a:?} {b:?}");
+    let first = a.or(b).unwrap();
+    assert!(!first.open, "drawing closes entries");
+    e.ingest(chat(Platform::Twitch, "j3", "late", "!join")).await;
+    settle().await;
+    assert_eq!(e.giveaway().await.unwrap().entries, 2, "no entries after the draw");
+    let winner = first.winners[0].display_name.clone();
+    eventually(|| tw.log().iter().any(|l| l == &format!("say Congratulations @{winner}, you won a game key! reply=-")))
+        .await;
+    let second = e.draw_giveaway(true).await.unwrap();
+    assert_ne!(second.winners[0].user_id, second.winners[1].user_id);
+    assert!(matches!(e.draw_giveaway(true).await, Err(EngineError::Unavailable(m)) if m.contains("already won")));
+    assert!(matches!(e.close_giveaway().await, Err(EngineError::Conflict(_))));
+    let ended = e.end_giveaway().await.unwrap();
+    assert!(ended.ended);
+    assert!(matches!(e.end_giveaway().await, Err(EngineError::Conflict(_))));
+    assert!(matches!(e.draw_giveaway(true).await, Err(EngineError::Conflict(_))));
+    e.start_giveaway(giveaway_spec(0, false)).await.unwrap();
+}
+
+#[tokio::test]
+async fn fees_from_a_giveaway_that_never_finished_come_back_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+        e.ingest(chat(Platform::Twitch, "c1", "ana", "hi")).await;
+        e.adjust_points(Platform::Twitch, "ana-id", 30).await.unwrap();
+        e.start_giveaway(giveaway_spec(20, false)).await.unwrap();
+        e.ingest(chat(Platform::Twitch, "j1", "ana", "!join")).await;
+        settle().await;
+        assert_eq!(e.points(Platform::Twitch, "ana-id").await.unwrap(), 10);
+    }
+    let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+    let mut back = false;
+    for _ in 0..100 {
+        if e.points(Platform::Twitch, "ana-id").await.unwrap() == 30 {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(back, "the entry fee was refunded at start");
+}

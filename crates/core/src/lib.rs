@@ -11,6 +11,7 @@ pub mod command;
 pub mod dedupe;
 pub mod event;
 pub mod filter;
+pub mod giveaway;
 pub mod goal;
 pub mod loyalty;
 pub mod moderation;

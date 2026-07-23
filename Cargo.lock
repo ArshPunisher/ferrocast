@@ -1343,6 +1343,7 @@ dependencies = [
  "ferrocast-twitch",
  "ferrocast-youtube",
  "futures-util",
+ "getrandom 0.4.3",
  "rand_core 0.6.4",
  "reqwest",
  "rsa",

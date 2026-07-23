@@ -17,6 +17,8 @@ pub enum WidgetKind {
     Viewers,
     /// A chat poll's live results.
     Poll,
+    /// A giveaway: how to enter, then the winner.
+    Giveaway,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -937,3 +937,90 @@ async fn only_overlays_with_a_poll_widget_get_live_results() {
     let quiet = tokio::time::timeout(std::time::Duration::from_millis(300), other.next()).await;
     assert!(quiet.is_err(), "a chat-only overlay gets no poll frames");
 }
+
+#[tokio::test]
+async fn giveaway_routes_validate_and_refuse_races() {
+    use reqwest::Method;
+    let r = start().await;
+    assert_eq!(r.get("/api/v1/giveaways/current").await.json::<Value>().await.unwrap(), Value::Null);
+    for (m, path) in [
+        (Method::GET, "/api/v1/giveaways/current"),
+        (Method::POST, "/api/v1/giveaways"),
+        (Method::POST, "/api/v1/giveaways/current/close"),
+        (Method::POST, "/api/v1/giveaways/current/draw"),
+        (Method::POST, "/api/v1/giveaways/current/redraw"),
+        (Method::POST, "/api/v1/giveaways/current/end"),
+        (Method::DELETE, "/api/v1/giveaways/current"),
+    ] {
+        assert_eq!(error_code(r.anonymous(m, path).await).await.0, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let bad = r.raw(Method::POST, "/api/v1/giveaways", "{\"prize\"").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    let msg = |res: reqwest::Response| async move {
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        (status, v["error"]["message"].as_str().unwrap_or("").to_string())
+    };
+    for (body, prefix) in [
+        (json!("prize"), "Send the giveaway"),
+        (json!({}), "prize:"),
+        (json!({ "prize": 5 }), "prize:"),
+        (json!({ "prize": "  " }), "prize:"),
+        (json!({ "prize": "Key", "keyword": "join" }), "keyword:"),
+        (json!({ "prize": "Key", "keyword": 1 }), "keyword:"),
+        (json!({ "prize": "Key", "cost": -1 }), "cost:"),
+        (json!({ "prize": "Key", "cost": 1.5 }), "cost:"),
+        (json!({ "prize": "Key", "cost": "10" }), "cost:"),
+        (json!({ "prize": "Key", "cost": 2_000_000_000 }), "cost:"),
+        (json!({ "prize": "Key", "subscriber_bonus": "yes" }), "subscriber_bonus:"),
+    ] {
+        let (s, m) = msg(r.post("/api/v1/giveaways", body.clone()).await).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(m.starts_with(prefix), "{body}: {m}");
+    }
+    for path in ["close", "draw", "redraw", "end"] {
+        let res = r.post(&format!("/api/v1/giveaways/current/{path}"), json!({})).await;
+        assert_eq!(error_code(res).await, (StatusCode::NOT_FOUND, "giveaway_not_found".into()), "{path}");
+    }
+    let created = r.post("/api/v1/giveaways", json!({ "prize": "A game key", "subscriber_bonus": true })).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let g: Value = created.json().await.unwrap();
+    assert_eq!((g["keyword"].as_str(), g["open"].as_bool(), g["cost"].as_i64()), (Some("!join"), Some(true), Some(0)));
+    let again = r.post("/api/v1/giveaways", json!({ "prize": "Another" })).await;
+    assert_eq!(error_code(again).await, (StatusCode::CONFLICT, "conflict".into()));
+    let nobody = r.post("/api/v1/giveaways/current/draw", json!({})).await;
+    assert_eq!(error_code(nobody).await, (StatusCode::UNPROCESSABLE_ENTITY, "unavailable".into()));
+    seen(&r, ferrocast_core::event::Platform::Twitch, "ana").await;
+    seen(&r, ferrocast_core::event::Platform::Twitch, "bo").await;
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
+    for user in ["ana", "bo"] {
+        let mut a = Actor::named(Platform::Twitch, user);
+        a.id = Some(format!("{user}-id"));
+        let kind =
+            EventKind::ChatMessage { actor: a, content: Content::plain("!join"), reply_to: None, is_action: false };
+        r.engine.ingest(Event::live(Platform::Twitch, Some(format!("join-{user}")), Millis(0), kind)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (a, b) = tokio::join!(
+        r.post("/api/v1/giveaways/current/draw", json!({})),
+        r.post("/api/v1/giveaways/current/draw", json!({}))
+    );
+    let mut codes = vec![a.status(), b.status()];
+    codes.sort();
+    assert_eq!(codes, vec![StatusCode::OK, StatusCode::CONFLICT], "a double-draw draws once");
+    let re: Value = r.post("/api/v1/giveaways/current/redraw", json!({})).await.json().await.unwrap();
+    assert_eq!(re["winners"].as_array().unwrap().len(), 2);
+    let none_left = r.post("/api/v1/giveaways/current/redraw", json!({})).await;
+    assert_eq!(error_code(none_left).await, (StatusCode::UNPROCESSABLE_ENTITY, "unavailable".into()));
+    assert_eq!(r.post("/api/v1/giveaways/current/end", json!({})).await.status(), StatusCode::OK);
+    let twice = r.post("/api/v1/giveaways/current/end", json!({})).await;
+    assert_eq!(error_code(twice).await, (StatusCode::CONFLICT, "conflict".into()));
+    let cancelled =
+        r.client.delete(format!("{}/api/v1/giveaways/current", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(cancelled.json::<Value>().await.unwrap()["refunded"], 0);
+    // Paid entries need points turned on.
+    r.put("/api/v1/loyalty", json!({ "enabled": false })).await;
+    let (s, m) = msg(r.post("/api/v1/giveaways", json!({ "prize": "Key", "cost": 10 })).await).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(m.starts_with("cost:"), "{m}");
+}

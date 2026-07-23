@@ -93,7 +93,7 @@ An overlay is one OBS browser source (a 1920×1080 canvas by default) holding wi
 
 ```ts
 type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number };
-type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll";
+type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway";
                 x: number; y: number; w: number; h: number; config: object };
 ```
 
@@ -113,6 +113,7 @@ Widget `config` per kind:
 - `label`: `{ source: "latest_follower" | "latest_sub" | "latest_tip" | "top_tip_session" | "session_follows" | "session_subs", template: string, theme: string }`
 - `viewers`: `{ platforms: Platform[], theme: string }`
 - `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
+- `giveaway`: `{ theme: string }` (how to enter while open, then a winner card)
 
 ### Alerts
 | Method | Path | Body → Response |
@@ -209,6 +210,28 @@ type PollView = { id: string; question: string; options: { text: string; votes: 
 
 One vote per person: linked accounts vote once, voting again changes the vote, a vote after the end doesn't count. Only live chat in this channel votes (not Shared Chat from a partner, not replays). When time runs out the result is posted in chat. Polls live in memory: a restart forgets them.
 
+### Giveaways
+Viewers type a keyword (`!join`) on any platform to enter; entries can cost loyalty points.
+
+```ts
+type GiveawayEntrant = { platform; user_id; login; display_name; tickets: 1 | 2 }
+type GiveawayView = { id; prize; keyword; cost: number; subscriber_bonus: boolean; started_at; open: boolean /* taking entries */; ended: boolean;
+                      entries: number; tickets: number; entrants: GiveawayEntrant[] /* newest first, up to 500 */; winners: GiveawayEntrant[] }
+type GiveawayCard = { id; prize; keyword; open: boolean; entries: number; winner: GiveawayEntrant | null /* the latest */ }  // for overlays
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/giveaways/current` | → `GiveawayView \| null`: the running giveaway, or the last one that ended |
+| POST | `/api/v1/giveaways` | `{ prize (1–100 chars), keyword?: "!join", cost?: 0 (points, 0–1,000,000,000; needs points turned on), subscriber_bonus?: false }` → 201 `GiveawayView`, announced in chat. 409 while another hasn't ended |
+| POST | `/api/v1/giveaways/current/close` | → `GiveawayView`: stop taking entries (409 when already closed) |
+| POST | `/api/v1/giveaways/current/draw` | → `GiveawayView`: closes entries and draws the first winner, announced in chat. 409 if one was already drawn (two clicks at once draw once), 422 when nobody entered |
+| POST | `/api/v1/giveaways/current/redraw` | → `GiveawayView`: draws another winner, never someone who already won. 409 before the first draw, 422 when everyone has won |
+| POST | `/api/v1/giveaways/current/end` | → `GiveawayView`: finished; fees are spent (409 when already ended) |
+| DELETE | `/api/v1/giveaways/current` | → `{ refunded }`: cancels it and gives every unfinished entry fee back |
+
+All of them answer 404 `giveaway_not_found` when there's no giveaway. One entry per person (linked accounts enter once); subscribers and members get 2 tickets with `subscriber_bonus`. The streamer, bots and anonymous accounts can't enter. Someone who can't afford the fee is told once. Winners are drawn with the operating system's random numbers, weighted by tickets, without modulo bias. Fees are recorded with the entry: if Ferrocast stops before the giveaway ends, they're refunded at the next start.
+
 ### TTS
 GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.
 GET `/api/v1/tts/voices` → `{ id, name, language, pro: false }[]` (the computer's own voices). GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
@@ -250,6 +273,7 @@ POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
 - `panic { on, plan: PanicConfig }`
+- `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
@@ -262,11 +286,11 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null } }`, always first |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null } }`, always first |
 | `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
-| `state` | partial `{ goals?, labels?, viewers?, poll? }` (`poll` only to overlays with a poll widget) |
+| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway? }` (`poll` and `giveaway` only to overlays with that widget) |
 | `config` | `Overlay` (re-render without reloading) |
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |
