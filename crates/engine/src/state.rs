@@ -151,6 +151,7 @@ pub struct State {
     pub tts_paused: bool,
     pub goals: Vec<Goal>,
     pub loyalty: ferrocast_core::loyalty::LoyaltyConfig,
+    pub welcome: ferrocast_core::welcome::WelcomeConfig,
     pub live: HashMap<Platform, bool>,
     pub viewers: HashMap<Platform, u64>,
     pub connectors: HashMap<String, ConnectorView>,

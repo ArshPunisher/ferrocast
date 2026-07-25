@@ -232,6 +232,13 @@ type GiveawayCard = { id; prize; keyword; open: boolean; entries: number; winner
 
 All of them answer 404 `giveaway_not_found` when there's no giveaway. One entry per person (linked accounts enter once); subscribers and members get 2 tickets with `subscriber_bonus`. The streamer, bots and anonymous accounts can't enter. Someone who can't afford the fee is told once. Winners are drawn with the operating system's random numbers, weighted by tickets, without modulo bias. Fees are recorded with the entry: if Ferrocast stops before the giveaway ends, they're refunded at the next start.
 
+### First-time chatters
+The dashboard marks someone's first message ever (counting all their linked accounts) and people chatting again after a while, with the live `chatter` frame. A welcome message is optional and **off** by default.
+
+`WelcomeConfig = { enabled: boolean /* post the welcome */; template: string /* 1–300 chars; {user}, {name}, {platform} */; returning_badge: boolean; returning_days: number /* 7–365, default 30 */ }`
+
+GET / PUT `/api/v1/welcome`: PUT saves only the fields sent; 400 names a bad field. The welcome replies on the chatter's own platform, only for live chat in this channel, never during panic mode or when the bot is off, and at most once every 10 seconds (a raid of first-timers doesn't flood chat).
+
 ### TTS
 GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.
 GET `/api/v1/tts/voices` → `{ id, name, language, pro: false }[]` (the computer's own voices). GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
@@ -273,6 +280,7 @@ POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
 - `panic { on, plan: PanicConfig }`
+- `chatter { event_id, kind: "first" } | { event_id, kind: "returning", days }` (after that message's `event` frame; replayed with it on reconnect)
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `resync { missed }`: the socket fell behind; refetch status, queue and events

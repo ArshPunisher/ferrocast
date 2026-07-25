@@ -1254,3 +1254,55 @@ async fn fees_from_a_giveaway_that_never_finished_come_back_after_a_restart() {
     }
     assert!(back, "the entry fee was refunded at start");
 }
+
+// ---------------------------------------------------------------- first-time chatters
+
+fn chatter_frames(rx: &mut tokio::sync::broadcast::Receiver<frames::LiveFrame>) -> Vec<Value> {
+    let mut out = Vec::new();
+    while let Ok(f) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "chatter" {
+            out.push(v["data"].clone());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn first_messages_are_marked_and_welcomed_only_when_turned_on() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let mut live = e.subscribe_live();
+    e.ingest(chat(Platform::Twitch, "m1", "newbie", "hello!")).await;
+    e.ingest(chat(Platform::Twitch, "m2", "newbie", "second")).await;
+    let marks = chatter_frames(&mut live);
+    assert_eq!(marks.len(), 1, "only the first message is marked: {marks:?}");
+    assert_eq!(marks[0]["kind"], "first");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!tw.log().iter().any(|l| l.contains("Welcome")), "the welcome is off by default");
+    let patch = serde_json::json!({ "enabled": true, "template": "Hi {user}, welcome!" });
+    e.patch_welcome(patch.as_object().unwrap()).await.unwrap();
+    e.ingest(chat(Platform::Twitch, "m3", "fresh", "hey")).await;
+    e.ingest(chat(Platform::Twitch, "m4", "fresh2", "hey")).await; // within 10 s: no second welcome
+    eventually(|| tw.log().contains(&"say Hi fresh, welcome! reply=m3".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!tw.log().iter().any(|l| l.contains("fresh2")), "welcomes are spaced out");
+    let bad = serde_json::json!({ "template": "{oops" });
+    assert!(e.patch_welcome(bad.as_object().unwrap()).await.unwrap_err().to_string().starts_with("template:"));
+    let bad = serde_json::json!({ "returning_days": 3 });
+    assert!(e.patch_welcome(bad.as_object().unwrap()).await.unwrap_err().to_string().starts_with("returning_days:"));
+}
+
+#[tokio::test]
+async fn people_back_after_a_month_get_a_returning_mark() {
+    let (e, _d) = engine().await;
+    e.ingest(chat(Platform::Kick, "m1", "regular", "hi")).await;
+    let long_ago = now().0 - 45 * 86_400_000;
+    e.store().write(|tx| Ok(tx.execute("UPDATE viewer_identities SET last_message_at = ?1", [long_ago])?)).unwrap();
+    let mut live = e.subscribe_live();
+    e.ingest(chat(Platform::Kick, "m2", "regular", "I'm back")).await;
+    let marks = chatter_frames(&mut live);
+    assert_eq!(marks.len(), 1);
+    assert_eq!((marks[0]["kind"].as_str(), marks[0]["days"].as_u64()), (Some("returning"), Some(45)));
+}

@@ -21,6 +21,7 @@ mod relay;
 mod snapshot;
 pub mod speech;
 mod timers;
+mod welcome;
 
 pub mod frames;
 pub mod state;
@@ -95,6 +96,8 @@ struct Inner {
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
+    /// When the last welcome went out (they're spaced out during raids).
+    last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
 }
 
 impl Engine {
@@ -171,6 +174,7 @@ impl Engine {
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
+                last_welcome: Mutex::new(None),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -470,6 +474,7 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
         panic: get_or_default(store, "panic")?,
         goals: repo::goals::list(store)?,
         loyalty: get_or_default(store, "loyalty")?,
+        welcome: get_or_default(store, "welcome")?,
         ..State::default()
     };
     for key in ["twitch", "youtube", "kick", "obs", "relay"] {

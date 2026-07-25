@@ -153,8 +153,9 @@ impl Engine {
 
         let mut show_in_overlays = true;
         let mut held: Option<String> = None;
+        let mut chatter: Option<ferrocast_core::welcome::ChatterMark> = None;
         match &e.kind {
-            EventKind::ChatMessage { .. } => match self.moderate_and_answer(&e).await {
+            EventKind::ChatMessage { .. } => match self.moderate_and_answer(&e, &mut chatter).await {
                 Moderated::Shown => {}
                 Moderated::Hidden => show_in_overlays = false,
                 Moderated::Held(reason) => {
@@ -236,6 +237,12 @@ impl Engine {
         if let Some(reason) = held {
             self.send_live_event(e.seq, LiveFrame::new("held", &json!({ "event_id": e.id, "reason": reason })));
         }
+        // First message ever, or back after a long time: the dashboard marks the line.
+        if let Some(mark) = chatter {
+            let mut v = json!(mark);
+            v["event_id"] = json!(e.id);
+            self.send_live_event(e.seq, LiveFrame::new("chatter", &v));
+        }
         if show_in_overlays {
             let audience = match e.kind {
                 EventKind::ChatMessage { .. } => Some(Audience::Chat),
@@ -252,13 +259,19 @@ impl Engine {
 
     /// Ban-on-sight, the chat filter, and bot commands. Returns whether the message may
     /// appear in overlays.
-    async fn moderate_and_answer(&self, e: &Event) -> Moderated {
+    async fn moderate_and_answer(
+        &self,
+        e: &Event,
+        chatter: &mut Option<ferrocast_core::welcome::ChatterMark>,
+    ) -> Moderated {
         let EventKind::ChatMessage { actor, content, .. } = &e.kind else {
             return Moderated::Shown;
         };
         let a = actor.clone();
         // The person behind this account (linked accounts share one), for one vote each.
-        let person = self.db(move |s| repo::viewers::touch(s, &a, true)).await.ok().flatten();
+        let touched = self.db(move |s| repo::viewers::touch_chat(s, &a)).await.ok().flatten();
+        let person = touched.map(|t| t.viewer_id);
+        *chatter = self.chatter_mark(e, touched);
         if e.origin == Origin::Live {
             self.state_mut().session.record(e);
         }

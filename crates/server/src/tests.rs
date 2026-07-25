@@ -1024,3 +1024,35 @@ async fn giveaway_routes_validate_and_refuse_races() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(m.starts_with("cost:"), "{m}");
 }
+
+#[tokio::test]
+async fn welcome_settings_name_bad_fields() {
+    use reqwest::Method;
+    let r = start().await;
+    let cfg: Value = r.get("/api/v1/welcome").await.json().await.unwrap();
+    assert_eq!((cfg["enabled"].as_bool(), cfg["returning_days"].as_u64()), (Some(false), Some(30)));
+    for m in [Method::GET, Method::PUT] {
+        assert_eq!(error_code(r.anonymous(m, "/api/v1/welcome").await).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let bad = r.raw(Method::PUT, "/api/v1/welcome", "nope").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    for (body, field) in [
+        (json!(5), "The welcome"),
+        (json!({ "enabled": 1 }), "enabled:"),
+        (json!({ "template": "" }), "template:"),
+        (json!({ "template": "{name" }), "template:"),
+        (json!({ "template": 5 }), "template:"),
+        (json!({ "returning_days": 0 }), "returning_days:"),
+        (json!({ "returning_days": -3 }), "returning_days:"),
+        (json!({ "returning_badge": "no" }), "returning_badge:"),
+    ] {
+        let res = r.put("/api/v1/welcome", body.clone()).await;
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(v["error"]["message"].as_str().unwrap().starts_with(field), "{body}: {v}");
+    }
+    let saved: Value =
+        r.put("/api/v1/welcome", json!({ "enabled": true, "returning_days": 60 })).await.json().await.unwrap();
+    assert_eq!((saved["enabled"].as_bool(), saved["returning_days"].as_u64()), (Some(true), Some(60)));
+}

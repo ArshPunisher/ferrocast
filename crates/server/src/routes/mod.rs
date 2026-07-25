@@ -10,6 +10,7 @@ pub(crate) use core::lan_ip;
 mod media;
 mod moderation;
 mod polls;
+mod welcome;
 
 use axum::Router;
 use axum::routing::{delete, get, post, put};
@@ -86,6 +87,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/giveaways/current/draw", post(giveaways::draw))
         .route("/giveaways/current/redraw", post(giveaways::redraw))
         .route("/giveaways/current/end", post(giveaways::end))
+        // first-time chatters
+        .route("/welcome", get(welcome::config).put(welcome::save))
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))

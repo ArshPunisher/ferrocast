@@ -71,6 +71,47 @@ pub fn touch(store: &Store, actor: &Actor, chatted: bool) -> Result<Option<i64>>
     })
 }
 
+/// What Ferrocast knew about a person just before this chat message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatTouch {
+    pub viewer_id: i64,
+    /// Their first message ever, on any of their linked accounts.
+    pub first_message: bool,
+    /// When they last chatted before this, on any linked account.
+    pub previous_message_at: Option<i64>,
+}
+
+/// [`touch`] for a chat message, also telling whether it's the person's first message
+/// ever and when they last chatted. `None` for actors without an id.
+pub fn touch_chat(store: &Store, actor: &Actor) -> Result<Option<ChatTouch>> {
+    let Some(user_id) = actor.id.as_deref() else {
+        return Ok(None);
+    };
+    let before: Option<(i64, Option<i64>, i64)> = store.read(|c| {
+        Ok(c.query_row(
+            "SELECT i.viewer_id, MAX(o.last_message_at), SUM(o.messages)
+             FROM viewer_identities i JOIN viewer_identities o ON o.viewer_id = i.viewer_id
+             WHERE i.platform = ?1 AND i.user_id = ?2 GROUP BY i.viewer_id",
+            params![pkey(actor.platform), user_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+    })?;
+    let Some(viewer_id) = touch(store, actor, true)? else { return Ok(None) };
+    store.write(|tx| {
+        tx.execute(
+            "UPDATE viewer_identities SET last_message_at = ?3 WHERE platform = ?1 AND user_id = ?2",
+            params![pkey(actor.platform), user_id, now_ms()],
+        )?;
+        Ok(())
+    })?;
+    let (previous_message_at, messages) = match before {
+        Some((_, at, n)) => (at, n),
+        None => (None, 0),
+    };
+    Ok(Some(ChatTouch { viewer_id, first_message: messages == 0, previous_message_at }))
+}
+
 pub fn card(store: &Store, platform: Platform, user_id: &str) -> Result<ViewerCard> {
     store.read(|c| {
         let viewer_id: i64 = c
@@ -182,6 +223,26 @@ mod tests {
         assert_eq!(c.identities[0].display_name, "New");
         assert_eq!(c.identities[0].messages, 2);
         assert_eq!(touch(&s, &Actor::anonymous(Platform::Tips), false).unwrap(), None);
+    }
+
+    #[test]
+    fn first_messages_count_across_linked_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        // Seen through a follow first: that isn't a message.
+        touch(&s, &actor(Platform::Twitch, "t", "Sam"), false).unwrap();
+        let first = touch_chat(&s, &actor(Platform::Twitch, "t", "Sam")).unwrap().unwrap();
+        assert!(first.first_message);
+        assert_eq!(first.previous_message_at, None);
+        let second = touch_chat(&s, &actor(Platform::Twitch, "t", "Sam")).unwrap().unwrap();
+        assert!(!second.first_message);
+        assert!(second.previous_message_at.is_some());
+        // Sam's Kick account, once linked, is the same person: not a first message.
+        touch(&s, &actor(Platform::Kick, "k", "sam_k"), false).unwrap();
+        link(&s, Platform::Kick, "k", Platform::Twitch, "t").unwrap();
+        let kick = touch_chat(&s, &actor(Platform::Kick, "k", "sam_k")).unwrap().unwrap();
+        assert!(!kick.first_message);
+        assert_eq!(touch_chat(&s, &Actor::anonymous(Platform::Tips)).unwrap(), None);
     }
 
     #[test]

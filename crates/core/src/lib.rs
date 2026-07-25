@@ -22,3 +22,4 @@ pub mod queue;
 pub mod sample;
 pub mod template;
 pub mod tts;
+pub mod welcome;
