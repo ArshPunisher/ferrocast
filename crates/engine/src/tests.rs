@@ -1306,3 +1306,44 @@ async fn people_back_after_a_month_get_a_returning_mark() {
     assert_eq!(marks.len(), 1);
     assert_eq!((marks[0]["kind"].as_str(), marks[0]["days"].as_u64()), (Some("returning"), Some(45)));
 }
+
+// ---------------------------------------------------------------- recap
+
+#[tokio::test]
+async fn the_recap_lists_this_streams_supporters_and_chatters() {
+    let (e, _d) = engine().await;
+    let empty = e.recap(None).await.unwrap();
+    assert!(empty.started_at.is_none() && empty.thanks.is_empty(), "no stream yet");
+    go_live(&e, Platform::Twitch).await;
+    let mut fan = Actor::named(Platform::Twitch, "Fan");
+    fan.id = Some("fan".into());
+    e.ingest(Event::live(Platform::Twitch, Some("f".into()), Millis(0), EventKind::Follow { actor: fan.clone() }))
+        .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("g".into()),
+        Millis(0),
+        EventKind::GiftBatch { gifter: fan.clone(), tier: Tier::Tier1, count: 3 },
+    ))
+    .await;
+    for i in 0..3 {
+        e.ingest(chat(Platform::Twitch, &format!("c{i}"), "talker", "hey")).await;
+    }
+    e.ingest(chat(Platform::Kick, "k", "quiet", "hi")).await;
+    e.test("tip", None).await.unwrap(); // tests never count
+    e.ingest(Event::live(Platform::Twitch, Some("v".into()), Millis(0), EventKind::ViewerCount { count: 80 })).await;
+    let r = e.recap(None).await.unwrap();
+    assert!(r.live && r.started_at.is_some() && r.ended_at.is_none());
+    assert_eq!((r.totals.follows, r.totals.subs, r.totals.messages, r.totals.peak_viewers), (1, 3, 4, 80));
+    assert!(r.totals.tips.is_empty());
+    assert_eq!(r.subscribers[0].gifts, 3);
+    assert_eq!(r.top_chatters[0].name, "talker");
+    assert_eq!(r.top_chatters[0].messages, 3);
+    assert_eq!(r.thanks, vec!["Fan"]);
+    e.ingest(Event::live(Platform::Twitch, Some("off".into()), Millis(0), EventKind::StreamOffline)).await;
+    let after = e.recap(None).await.unwrap();
+    assert!(!after.live && after.ended_at.is_some(), "still there after the stream");
+    let custom = e.recap(Some(0)).await.unwrap();
+    assert_eq!(custom.totals.peak_viewers, 0, "a custom window counts from the log only");
+    assert_eq!(custom.totals.follows, 1);
+}

@@ -19,6 +19,7 @@ pub mod money;
 pub mod overlay;
 pub mod poll;
 pub mod queue;
+pub mod recap;
 pub mod sample;
 pub mod template;
 pub mod tts;

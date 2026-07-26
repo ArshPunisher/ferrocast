@@ -76,8 +76,19 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | POST | `/api/v1/session/pair-code` | → `{ code, url, expires_at }` (makes an "open in browser" link) |
 | POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
 | GET | `/api/v1/stats/session` | → `{ started_at, follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
+| GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
 | GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta", blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
+
+```ts
+type Recap = { started_at: number | null /* null: no stream on record yet */; ended_at: number | null; live: boolean;
+               follows; subs; tips: Money[]; bits; messages; peak_viewers /* the live session's numbers for this stream; from the log otherwise (peak 0) */;
+               new_followers: { platform, name }[]; subscribers: { platform, name, months, gifts }[];
+               tippers: { platform, name, amounts: Money[], bits }[]; raiders: { platform, name, viewers }[];
+               top_chatters: { platform, name, messages }[] /* top 10, never the streamer or bots */;
+               thanks: string[] /* subs and gifters, tippers, raiders, followers; each name once */ }
+```
+Lists come from the event log (live events only, refunded tips left out), up to 200 each.
 
 `ConnectorState = { state: "off" | "connected" | "reconnecting" | "disconnected" | "sign_in_needed" | "scopes_missing", account: { name, avatar_url } | null, detail: string | null, last_event_at: number | null }`
 

@@ -1056,3 +1056,39 @@ async fn welcome_settings_name_bad_fields() {
         r.put("/api/v1/welcome", json!({ "enabled": true, "returning_days": 60 })).await.json().await.unwrap();
     assert_eq!((saved["enabled"].as_bool(), saved["returning_days"].as_u64()), (Some(true), Some(60)));
 }
+
+#[tokio::test]
+async fn recap_route_checks_since() {
+    use reqwest::Method;
+    let r = start().await;
+    assert_eq!(error_code(r.anonymous(Method::GET, "/api/v1/recap").await).await.0, StatusCode::UNAUTHORIZED);
+    let empty: Value = r.get("/api/v1/recap").await.json().await.unwrap();
+    assert_eq!(empty["started_at"], Value::Null);
+    assert_eq!(empty["thanks"], json!([]));
+    for q in ["?since=-1", "?since=soon", "?since=99999999999999", "?since=1.5"] {
+        let res = r.get(&format!("/api/v1/recap{q}")).await;
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{q}");
+        assert!(v["error"]["message"].as_str().unwrap().starts_with("since:"), "{q}");
+    }
+    let ok: Value = r.get("/api/v1/recap?since=0").await.json().await.unwrap();
+    assert_eq!(ok["started_at"], 0);
+    for key in [
+        "follows",
+        "subs",
+        "tips",
+        "bits",
+        "messages",
+        "peak_viewers",
+        "new_followers",
+        "subscribers",
+        "tippers",
+        "raiders",
+        "top_chatters",
+        "live",
+        "ended_at",
+    ] {
+        assert!(ok.get(key).is_some(), "{key}");
+    }
+}

@@ -8,6 +8,7 @@ pub mod goals;
 pub mod loyalty;
 pub mod media;
 pub mod overlays;
+pub mod recap;
 pub mod rules;
 pub mod settings;
 pub mod viewers;

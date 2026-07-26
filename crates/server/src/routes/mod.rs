@@ -10,6 +10,7 @@ pub(crate) use core::lan_ip;
 mod media;
 mod moderation;
 mod polls;
+mod recap;
 mod welcome;
 
 use axum::Router;
@@ -107,6 +108,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/settings", get(core::settings).put(core::save_settings))
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
+        .route("/recap", get(recap::recap))
         .route("/updates", get(app::updates))
         .route("/setup/complete", post(app::setup_complete))
         .route("/backups", get(core::backups).post(core::backup_now))

@@ -17,6 +17,7 @@ mod obs;
 mod patch;
 mod pipeline;
 mod polls;
+mod recap;
 mod relay;
 mod snapshot;
 pub mod speech;
