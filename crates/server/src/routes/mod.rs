@@ -3,6 +3,7 @@
 mod app;
 mod bot;
 mod core;
+mod discord;
 mod giveaways;
 mod loyalty;
 #[cfg(test)]
@@ -102,6 +103,9 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/live", get(crate::ws::live))
         // tips
         .route("/tips", get(core::tips).put(core::save_tips).delete(core::delete_tips))
+        // Discord go-live posts
+        .route("/discord", get(discord::get).put(discord::save))
+        .route("/discord/test", post(discord::test))
         // OBS
         .route("/obs", get(core::obs).put(core::save_obs))
         // settings and data

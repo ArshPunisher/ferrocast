@@ -1092,3 +1092,56 @@ async fn recap_route_checks_since() {
         assert!(ok.get(key).is_some(), "{key}");
     }
 }
+
+#[tokio::test]
+async fn discord_settings_keep_the_webhook_secret() {
+    use reqwest::Method;
+    let r = start().await;
+    for (m, p) in
+        [(Method::GET, "/api/v1/discord"), (Method::PUT, "/api/v1/discord"), (Method::POST, "/api/v1/discord/test")]
+    {
+        assert_eq!(error_code(r.anonymous(m, p).await).await.0, StatusCode::UNAUTHORIZED, "{p}");
+    }
+    let v: Value = r.get("/api/v1/discord").await.json().await.unwrap();
+    assert_eq!((v["has_webhook"].as_bool(), v["webhook_hint"].clone()), (Some(false), Value::Null));
+    let no_hook = r.post("/api/v1/discord/test", json!({})).await;
+    assert_eq!(error_code(no_hook).await, (StatusCode::UNPROCESSABLE_ENTITY, "unavailable".into()));
+    let bad = r.raw(Method::PUT, "/api/v1/discord", "{").await;
+    assert_eq!(error_code(bad).await, (StatusCode::BAD_REQUEST, "invalid".into()));
+    for (body, field) in [
+        (json!([]), "The Discord"),
+        (json!({ "webhook_url": "https://evil.example/api/webhooks/1/2" }), "webhook_url:"),
+        (
+            json!({ "webhook_url": "http://discord.com/api/webhooks/112233445566778899/AbCdEfGhIjKlMnOpQrStUvWx" }),
+            "webhook_url:",
+        ),
+        (json!({ "webhook_url": 5 }), "webhook_url:"),
+        (json!({ "template": "" }), "template:"),
+        (json!({ "template": "{x" }), "template:"),
+        (json!({ "enabled": "yes" }), "enabled:"),
+        (json!({ "mention_everyone": 1 }), "mention_everyone:"),
+    ] {
+        let res = r.put("/api/v1/discord", body.clone()).await;
+        let status = res.status();
+        let v: Value = res.json().await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(v["error"]["message"].as_str().unwrap().starts_with(field), "{body}: {v}");
+    }
+    let url = "https://discord.com/api/webhooks/112233445566778899/AbCdEfGhIjKlMnOpQrStUvWx_yz-0123";
+    let saved = r.put("/api/v1/discord", json!({ "webhook_url": url })).await.text().await.unwrap();
+    assert!(!saved.contains("AbCdEf"), "never echoed: {saved}");
+    let v: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(
+        (v["has_webhook"].as_bool(), v["webhook_hint"].as_str()),
+        (Some(true), Some("discord.com webhook …8899"))
+    );
+    // It's not in the database, so it's never in an export either.
+    let stored: String = r
+        .engine
+        .store()
+        .read(|c| Ok(c.query_row("SELECT COALESCE(group_concat(value), '') FROM settings", [], |row| row.get(0))?))
+        .unwrap();
+    assert!(stored.contains("template") && !stored.contains("AbCdEf"), "settings hold the template, never the webhook");
+    let cleared: Value = r.put("/api/v1/discord", json!({ "webhook_url": null })).await.json().await.unwrap();
+    assert_eq!(cleared["has_webhook"], false);
+}

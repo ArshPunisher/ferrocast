@@ -9,6 +9,7 @@ mod macros;
 pub mod alert;
 pub mod command;
 pub mod dedupe;
+pub mod discord;
 pub mod event;
 pub mod filter;
 pub mod giveaway;

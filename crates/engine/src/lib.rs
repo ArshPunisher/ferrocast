@@ -9,6 +9,7 @@
 
 mod accounts;
 mod actions;
+mod discord;
 mod dispatcher;
 mod error;
 mod giveaways;
@@ -41,6 +42,7 @@ use ferrocast_store::{Store, StoreError, repo};
 use tokio::sync::{Notify, broadcast, mpsc};
 
 pub use accounts::{ConnectFlow, PlatformApps};
+pub use discord::{DiscordFailure, DiscordView};
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
 pub use obs::{ObsView, PasswordChange};
@@ -99,6 +101,7 @@ struct Inner {
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
     /// When the last welcome went out (they're spaced out during raids).
     last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
+    discord_posts: Mutex<discord::LastPosts>,
 }
 
 impl Engine {
@@ -176,6 +179,7 @@ impl Engine {
                 poll: Mutex::new(Default::default()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
+                discord_posts: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));

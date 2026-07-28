@@ -1347,3 +1347,84 @@ async fn the_recap_lists_this_streams_supporters_and_chatters() {
     assert_eq!(custom.totals.peak_viewers, 0, "a custom window counts from the log only");
     assert_eq!(custom.totals.follows, 1);
 }
+
+// ---------------------------------------------------------------- Discord
+
+/// A fake Discord webhook that answers with `status` and records what it was sent.
+async fn fake_discord(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<Value>>>) {
+    use axum::routing::post;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let app = axum::Router::new().route(
+        "/api/webhooks/{id}/{token}",
+        post(move |axum::Json(v): axum::Json<Value>| {
+            let s = s2.clone();
+            async move {
+                s.lock().unwrap().push(v);
+                (axum::http::StatusCode::from_u16(status).unwrap(), [("content-type", "application/json")], body)
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (format!("http://{addr}/api/webhooks/123456789012345678/tok"), seen)
+}
+
+#[tokio::test]
+async fn going_live_posts_to_discord_once_per_platform() {
+    let (e, _d) = engine().await;
+    let (url, seen) = fake_discord(204, "").await;
+    e.set_discord_webhook_for_tests(&url);
+    let patch = serde_json::json!({ "template": "{name} is live on {platform}: {title}", "mention_everyone": true });
+    e.save_discord(patch.as_object().unwrap()).await.unwrap();
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("on1".into()),
+        Millis(0),
+        EventKind::StreamOnline { title: Some("Ranked".into()) },
+    ))
+    .await;
+    e.ingest(Event::live(Platform::Twitch, Some("on2".into()), Millis(0), EventKind::StreamOnline { title: None }))
+        .await;
+    e.ingest(Event::live(Platform::Kick, Some("on3".into()), Millis(0), EventKind::StreamOnline { title: None })).await;
+    eventually(|| seen.lock().unwrap().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let posts = seen.lock().unwrap().clone();
+    assert_eq!(posts.len(), 2, "Twitch once (the reconnect isn't news), Kick once");
+    assert_eq!(posts[0]["content"], "I'm is live on Twitch: Ranked");
+    assert_eq!(posts[0]["allowed_mentions"]["parse"], serde_json::json!(["everyone"]));
+    let view = e.discord().await.unwrap();
+    assert!(view.has_webhook);
+    assert!(!serde_json::to_string(&view).unwrap().contains("tok"), "the URL never comes back");
+}
+
+#[tokio::test]
+async fn discord_errors_become_plain_messages() {
+    let (e, _d) = engine().await;
+    assert!(
+        matches!(e.test_discord().await, Err(DiscordFailure { error: EngineError::Unavailable(m), .. }) if m.contains("webhook URL first"))
+    );
+    let (gone, _) = fake_discord(404, r#"{"message":"Unknown Webhook","code":10015}"#).await;
+    e.set_discord_webhook_for_tests(&gone);
+    let f = e.test_discord().await.unwrap_err();
+    assert!(matches!(&f.error, EngineError::Unavailable(m) if m.contains("was deleted")), "{:?}", f.error);
+    let (slow, _) =
+        fake_discord(429, r#"{"message":"You are being rate limited.","retry_after":2.4,"global":false}"#).await;
+    e.set_discord_webhook_for_tests(&slow);
+    let f = e.test_discord().await.unwrap_err();
+    assert!(matches!(&f.error, EngineError::TooMany(m) if m.contains("3 seconds")), "{:?}", f.error);
+    assert_eq!(f.retry_after, Some(3));
+    let (denied, _) = fake_discord(401, r#"{"message":"Invalid Webhook Token"}"#).await;
+    e.set_discord_webhook_for_tests(&denied);
+    assert!(matches!(e.test_discord().await.unwrap_err().error, EngineError::Unavailable(m) if m.contains("refused")));
+    e.set_discord_webhook_for_tests("http://127.0.0.1:1/api/webhooks/1/x");
+    assert!(
+        matches!(e.test_discord().await.unwrap_err().error, EngineError::Unavailable(m) if m.contains("Couldn't reach Discord"))
+    );
+    let (ok, seen) = fake_discord(204, "").await;
+    e.set_discord_webhook_for_tests(&ok);
+    e.test_discord().await.unwrap();
+    assert!(seen.lock().unwrap()[0]["content"].as_str().unwrap().starts_with("Test from Ferrocast"));
+    assert_eq!(seen.lock().unwrap()[0]["allowed_mentions"]["parse"], serde_json::json!([]), "tests never ping");
+}

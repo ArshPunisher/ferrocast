@@ -205,9 +205,12 @@ impl Engine {
                     &json!({ "platform": e.platform, "user_id": target.id }),
                 ));
             }
-            EventKind::StreamOnline { .. } => {
+            EventKind::StreamOnline { title } => {
                 if e.platform != Platform::Youtube {
                     self.wake_youtube();
+                }
+                if e.origin == Origin::Live {
+                    self.discord_go_live(e.platform, title.clone());
                 }
                 let mut st = self.state_mut();
                 let anyone_live = st.live.values().any(|l| *l);

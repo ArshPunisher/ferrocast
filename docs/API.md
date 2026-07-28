@@ -272,6 +272,22 @@ Errors: 400 `invalid` (handle 3–30 of `a-z 0-9 - _`, reserved words, links mus
 | GET | `/api/v1/media` | → media list |
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
+### Discord go-live posts
+The streamer pastes a Discord webhook URL; Ferrocast posts when a platform goes live. The URL is a secret: it is kept in the OS keychain, never in the database, never in a `.ferropack`, never sent back.
+
+```ts
+type DiscordView = { has_webhook: boolean; webhook_hint: string | null /* "discord.com webhook …4821" */;
+                     enabled: boolean; template: string /* 1–1,500 chars; {name}, {platform}, {title}, {url} */; mention_everyone: boolean }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/discord` | → `DiscordView` |
+| PUT | `/api/v1/discord` | `{ webhook_url?: string \| null, enabled?, template?, mention_everyone? }` → `DiscordView`. Only fields sent change; `null` removes the webhook. The URL must be `https://discord.com/api/webhooks/<id>/<token>` (or `discordapp.com`, or `/api/v10/…`), nothing else: 400 `webhook_url: …` |
+| POST | `/api/v1/discord/test` | → 204 after posting a test message (never pings). 422 without a webhook; 422 "Discord says this webhook was deleted…" (Discord 404); 422 "Discord refused this webhook…" (401/403); 429 with `Retry-After` when Discord rate-limits; 422 when Discord can't be reached |
+
+Defaults: on, `{name} is live on {platform}! {title|default:"Come hang out."} {url}`, no @everyone ping (`mention_everyone` lets the message ping). One post per platform per 30 minutes (a stream that drops and comes back isn't news). A failed go-live post becomes one `notice` with a link to the Discord settings.
+
 ### OBS
 GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the keychain; absent keeps it, `null` clears it).
 
