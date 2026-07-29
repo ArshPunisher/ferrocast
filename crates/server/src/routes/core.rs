@@ -157,6 +157,16 @@ pub(crate) fn obs_view(o: &ferrocast_engine::ObsView) -> Value {
     v
 }
 
+/// What auto-detect finds in OBS's own settings (never the password itself).
+pub async fn obs_detect(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.obs_detect().await?)))
+}
+
+/// Uses the detected port and password (the password goes to the keychain), then tries OBS.
+pub async fn obs_use_detected(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(obs_view(&app.engine.obs_use_detected().await?)))
+}
+
 #[derive(Deserialize)]
 pub struct ObsBody {
     host: String,

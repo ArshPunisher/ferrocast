@@ -1428,3 +1428,29 @@ async fn discord_errors_become_plain_messages() {
     assert!(seen.lock().unwrap()[0]["content"].as_str().unwrap().starts_with("Test from Ferrocast"));
     assert_eq!(seen.lock().unwrap()[0]["allowed_mentions"]["parse"], serde_json::json!([]), "tests never ping");
 }
+
+// ---------------------------------------------------------------- OBS auto-detect
+
+#[tokio::test]
+async fn obs_settings_are_found_and_used_without_typing() {
+    let (e, d) = engine().await;
+    let cfg = d.path().join("obs-config.json");
+    std::fs::write(
+        &cfg,
+        br#"{"auth_required":true,"server_enabled":true,"server_password":"pw-from-obs","server_port":4466}"#,
+    )
+    .unwrap();
+    let (view, _) = e.obs_detect_in(vec![cfg.clone()]).await.unwrap();
+    assert!(view.found && view.has_password && view.reason.is_none());
+    assert_eq!(view.port, Some(4466));
+    assert!(!serde_json::to_string(&view).unwrap().contains("pw-from-obs"), "the password never leaves the engine");
+    let used = e.obs_use_detected_in(vec![cfg]).await.unwrap();
+    assert_eq!((used.host.as_str(), used.port, used.has_password), ("127.0.0.1", 4466, true));
+    let missing = e.obs_use_detected_in(vec![d.path().join("none.json")]).await.unwrap_err();
+    assert!(matches!(missing, EngineError::Unavailable(m) if m.contains("aren't on this computer")));
+    let junk = d.path().join("junk.json");
+    std::fs::write(&junk, b"{oops").unwrap();
+    let (view, _) = e.obs_detect_in(vec![junk.clone()]).await.unwrap();
+    assert!(!view.found && view.reason.unwrap().contains("couldn't be read"));
+    assert!(matches!(e.obs_use_detected_in(vec![junk]).await, Err(EngineError::Unavailable(_))));
+}

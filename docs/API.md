@@ -291,6 +291,10 @@ Defaults: on, `{name} is live on {platform}! {title|default:"Come hang out."} {u
 ### OBS
 GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the keychain; absent keeps it, `null` clears it).
 
+Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/config.json` in OBS's config folder: `~/Library/Application Support/obs-studio` on macOS, `%APPDATA%\obs-studio` on Windows, `$XDG_CONFIG_HOME` or `~/.config/obs-studio` and the Flatpak folder on Linux), so nobody types the port or password:
+- GET `/api/v1/obs/detect` → `{ found, port: number | null, has_password, server_enabled, reason: string | null }`. Never the password. A missing or damaged file is `found: false` with a plain `reason`; `server_enabled: false` comes with how to switch it on.
+- POST `/api/v1/obs/detect` → the OBS view (as GET `/obs`) after saving `127.0.0.1`, the detected port and password (to the keychain). 422 with the reason when nothing usable was found.
+
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
 POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`. StreamElements and Streamlabs imports aren't in this build yet.

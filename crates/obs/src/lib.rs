@@ -4,6 +4,8 @@
 //! current scene as a Browser Source in one click, or fix the URL of one that's already
 //! there, so nobody has to copy a URL into a dialog (VISION: few clicks).
 
+pub mod detect;
+
 use std::time::Duration;
 
 use obws::Client;

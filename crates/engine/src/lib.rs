@@ -45,7 +45,7 @@ pub use accounts::{ConnectFlow, PlatformApps};
 pub use discord::{DiscordFailure, DiscordView};
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
-pub use obs::{ObsView, PasswordChange};
+pub use obs::{ObsDetectView, ObsView, PasswordChange};
 use state::{ConnectorView, EngineSettings, State};
 
 /// Current wall-clock time. Only the engine reads the clock; `core` gets time passed in.

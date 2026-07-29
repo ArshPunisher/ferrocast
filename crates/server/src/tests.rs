@@ -1145,3 +1145,23 @@ async fn discord_settings_keep_the_webhook_secret() {
     let cleared: Value = r.put("/api/v1/discord", json!({ "webhook_url": null })).await.json().await.unwrap();
     assert_eq!(cleared["has_webhook"], false);
 }
+
+#[tokio::test]
+async fn obs_detect_answers_with_a_reason_and_never_a_password() {
+    use reqwest::Method;
+    let r = start().await;
+    for m in [Method::GET, Method::POST] {
+        assert_eq!(error_code(r.anonymous(m, "/api/v1/obs/detect").await).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let res = r.get("/api/v1/obs/detect").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: Value = res.json().await.unwrap();
+    for key in ["found", "port", "has_password", "server_enabled", "reason"] {
+        assert!(v.get(key).is_some(), "{key}");
+    }
+    assert!(v.get("password").is_none());
+    if v["found"] == false {
+        let used = r.post("/api/v1/obs/detect", json!({})).await;
+        assert_eq!(error_code(used).await, (StatusCode::UNPROCESSABLE_ENTITY, "unavailable".into()));
+    }
+}

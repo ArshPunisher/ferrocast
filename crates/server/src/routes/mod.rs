@@ -108,6 +108,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/discord/test", post(discord::test))
         // OBS
         .route("/obs", get(core::obs).put(core::save_obs))
+        .route("/obs/detect", get(core::obs_detect).post(core::obs_use_detected))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
         .route("/themes", get(app::themes))

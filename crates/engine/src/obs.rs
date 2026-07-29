@@ -24,6 +24,19 @@ pub struct ObsView {
     pub status: Option<ObsStatus>,
 }
 
+/// What auto-detect found in OBS's own settings. The password itself never leaves the
+/// engine: "Use these" saves it straight to the keychain.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObsDetectView {
+    pub found: bool,
+    pub port: Option<u16>,
+    pub has_password: bool,
+    /// OBS's WebSocket server is switched on.
+    pub server_enabled: bool,
+    /// Why nothing usable was found, in plain words.
+    pub reason: Option<String>,
+}
+
 /// What to do with the stored password when saving OBS settings.
 #[derive(Debug, Clone)]
 pub enum PasswordChange {
@@ -101,6 +114,70 @@ impl Engine {
             r.map_err(|e| EngineError::Unavailable(e.to_string()))?;
         }
         self.obs().await
+    }
+
+    /// Looks for OBS's WebSocket settings on this computer.
+    pub async fn obs_detect(&self) -> Result<ObsDetectView, EngineError> {
+        self.obs_detect_in(ferrocast_obs::detect::default_paths()).await.map(|(v, _)| v)
+    }
+
+    /// [`Engine::obs_detect`] in chosen places (tests), with the details kept inside.
+    pub async fn obs_detect_in(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<(ObsDetectView, Option<ferrocast_obs::detect::Detected>), EngineError> {
+        use ferrocast_obs::detect::{Detection, detect};
+        let found = tokio::task::spawn_blocking(move || detect(&paths))
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok(match found {
+            Detection::Found(d) => (
+                ObsDetectView {
+                    found: true,
+                    port: Some(d.port),
+                    has_password: d.password.is_some(),
+                    server_enabled: d.server_enabled,
+                    reason: (!d.server_enabled).then(|| {
+                        "OBS's WebSocket server is switched off. In OBS open Tools, WebSocket Server Settings and tick Enable WebSocket server.".to_string()
+                    }),
+                },
+                Some(d),
+            ),
+            Detection::Missing => (
+                ObsDetectView {
+                    found: false,
+                    port: None,
+                    has_password: false,
+                    server_enabled: false,
+                    reason: Some("OBS's settings aren't on this computer. Is OBS 28 or newer installed here?".into()),
+                },
+                None,
+            ),
+            Detection::Unreadable(why) => (
+                ObsDetectView { found: false, port: None, has_password: false, server_enabled: false, reason: Some(why) },
+                None,
+            ),
+        })
+    }
+
+    /// Uses what was detected: OBS on this computer, its port, and its password (to the
+    /// keychain). 422 with the reason when nothing usable was found.
+    pub async fn obs_use_detected(&self) -> Result<ObsView, EngineError> {
+        self.obs_use_detected_in(ferrocast_obs::detect::default_paths()).await
+    }
+
+    pub async fn obs_use_detected_in(&self, paths: Vec<std::path::PathBuf>) -> Result<ObsView, EngineError> {
+        let (view, found) = self.obs_detect_in(paths).await?;
+        let Some(d) = found else {
+            return Err(EngineError::Unavailable(
+                view.reason.unwrap_or_else(|| "OBS's settings weren't found.".into()),
+            ));
+        };
+        let change = match d.password {
+            Some(p) => PasswordChange::Set(p),
+            None => PasswordChange::Clear,
+        };
+        self.save_obs(ObsConfig { host: "127.0.0.1".into(), port: d.port }, change).await
     }
 
     /// Puts an overlay into OBS's current scene, or fixes the existing source.
