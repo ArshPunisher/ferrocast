@@ -70,6 +70,9 @@ impl Connector for FakePlatform {
     async fn set_mode(&self, c: ModeChange) -> ferrocast_connector::Result<()> {
         self.push(format!("mode {:?} {}", c.mode, c.enabled))
     }
+    async fn last_game(&self, login: &str) -> ferrocast_connector::Result<Option<String>> {
+        Ok((login == "friend").then(|| "Hades II".to_string()))
+    }
 }
 
 fn mem() -> Arc<dyn ferrocast_secrets::Secrets> {
@@ -1453,4 +1456,44 @@ async fn obs_settings_are_found_and_used_without_typing() {
     let (view, _) = e.obs_detect_in(vec![junk.clone()]).await.unwrap();
     assert!(!view.found && view.reason.unwrap().contains("couldn't be read"));
     assert!(matches!(e.obs_use_detected_in(vec![junk]).await, Err(EngineError::Unavailable(_))));
+}
+
+// ---------------------------------------------------------------- starter commands
+
+#[tokio::test]
+async fn the_starter_pack_skips_names_in_use_and_shoutouts_name_the_game() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    e.save_command(Command {
+        id: "mine".into(),
+        name: "!hi".into(),
+        aliases: vec!["!LURK".into()],
+        response: "my own lurk".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    let r = e.add_starter_commands().await.unwrap();
+    assert_eq!(r.added.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["!socials", "!uptime", "!so"]);
+    assert_eq!(r.skipped, vec!["!lurk"], "an alias counts as taken");
+    let again = e.add_starter_commands().await.unwrap();
+    assert!(again.added.is_empty() && again.skipped.len() == 4, "a second click adds nothing");
+    e.ingest(as_mod(chat(Platform::Twitch, "s1", "Mo", "!so @friend"))).await;
+    eventually(|| {
+        tw.log().iter().any(|l| {
+            l == "say Go show friend some love and give them a follow! They were last playing Hades II. reply=s1"
+        })
+    })
+    .await;
+    e.ingest(as_mod(chat(Platform::Twitch, "s2", "Mo", "!so someone"))).await;
+    eventually(|| tw.log().iter().any(|l| l == "say Go show someone some love and give them a follow! reply=s2")).await;
+    e.ingest(chat(Platform::Twitch, "s3", "viewer", "!so friend")).await; // mods only
+    e.ingest(chat(Platform::Twitch, "u1", "viewer", "!uptime")).await;
+    eventually(|| tw.log().iter().any(|l| l == "say We're not live right now. reply=u1")).await;
+    assert!(!tw.log().iter().any(|l| l.ends_with("reply=s3")));
 }

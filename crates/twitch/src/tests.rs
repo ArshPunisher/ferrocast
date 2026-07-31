@@ -94,6 +94,17 @@ async fn chat_that_twitch_drops_is_reported_not_silently_lost() {
 }
 
 #[tokio::test]
+async fn shoutouts_find_the_last_game_someone_streamed() {
+    let (_st, ep) = fake().await;
+    let c = connector::TwitchConnector { helix: Helix::new(auth_for(&ep, Arc::default())), user_id: "111".into() };
+    use ferrocast_connector::Connector;
+    assert_eq!(c.last_game("@Friend").await.unwrap().as_deref(), Some("Hades II"));
+    assert_eq!(c.last_game("quiet").await.unwrap(), None, "no game set");
+    assert_eq!(c.last_game("nobody").await.unwrap(), None, "no such channel");
+    assert_eq!(c.last_game("bad login!").await.unwrap(), None, "never sent to Twitch");
+}
+
+#[tokio::test]
 async fn eventsub_subscribes_maps_events_and_survives_a_handover() {
     let (st, ep) = fake().await;
     let helix = Helix::new(auth_for(&ep, Arc::default()));

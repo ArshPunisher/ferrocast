@@ -74,6 +74,26 @@ impl Helix {
         serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))
     }
 
+    /// The game a channel last streamed (`game_name` of Get Channel Information), by login.
+    /// `None` for an unknown login or a channel that never set one.
+    pub async fn channel_game(&self, login: &str) -> Result<Option<String>, TwitchError> {
+        let login = login.trim().trim_start_matches('@').to_lowercase();
+        if login.is_empty() || login.len() > 25 || !login.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Ok(None);
+        }
+        let users = self.call(Method::GET, "/users", &[("login", login.as_str())], None).await?;
+        let Some(id) = users.pointer("/data/0/id").and_then(Value::as_str).map(str::to_string) else {
+            return Ok(None);
+        };
+        let ch = self.call(Method::GET, "/channels", &[("broadcaster_id", id.as_str())], None).await?;
+        Ok(ch
+            .pointer("/data/0/game_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(|g| g.chars().take(80).collect()))
+    }
+
     pub async fn send_chat(
         &self,
         broadcaster: &str,

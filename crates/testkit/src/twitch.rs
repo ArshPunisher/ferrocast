@@ -54,6 +54,7 @@ pub async fn fake() -> (St, (String, String, String)) {
         .route("/oauth2/token", post(token))
         .route("/oauth2/validate", get(validate))
         .route("/helix/users", get(users))
+        .route("/helix/channels", get(channels))
         .route("/helix/chat/messages", post(chat))
         .route("/helix/eventsub/subscriptions", post(subscribe))
         .route("/helix/moderation/bans", any(ok))
@@ -108,12 +109,33 @@ fn check_auth(st: &St, headers: &axum::http::HeaderMap) -> bool {
     true
 }
 
-async fn users(State(st): State<St>, headers: axum::http::HeaderMap) -> Response {
+async fn users(
+    State(st): State<St>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     if !check_auth(&st, &headers) {
         return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Invalid OAuth token" }))).into_response();
     }
+    // Looking someone else up: "friend" streams Hades II, "quiet" never set a game, others don't exist.
+    if let Some(login) = q.get("login") {
+        let data = match login.as_str() {
+            "friend" => json!([{ "id": "222", "login": "friend", "display_name": "Friend" }]),
+            "quiet" => json!([{ "id": "333", "login": "quiet", "display_name": "Quiet" }]),
+            _ => json!([]),
+        };
+        return axum::Json(json!({ "data": data })).into_response();
+    }
     axum::Json(json!({ "data": [{ "id": "111", "login": "streamer", "display_name": "Streamer", "profile_image_url": "https://x/p.png" }] }))
         .into_response()
+}
+
+async fn channels(Query(q): Query<HashMap<String, String>>) -> Response {
+    let game = match q.get("broadcaster_id").map(String::as_str) {
+        Some("222") => "Hades II",
+        _ => "",
+    };
+    axum::Json(json!({ "data": [{ "broadcaster_id": q.get("broadcaster_id"), "game_name": game }] })).into_response()
 }
 
 async fn chat(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {

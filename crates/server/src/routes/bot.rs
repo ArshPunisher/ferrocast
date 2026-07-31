@@ -45,6 +45,11 @@ pub async fn delete_command(State(app): State<AppState>, Path(id): Path<String>)
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// "Add starter commands": `!socials`, `!lurk`, `!uptime`, `!so`, skipping names in use.
+pub async fn add_starter(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.add_starter_commands().await?)))
+}
+
 pub async fn timers(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.timers()))
 }

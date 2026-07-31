@@ -1165,3 +1165,28 @@ async fn obs_detect_answers_with_a_reason_and_never_a_password() {
         assert_eq!(error_code(used).await, (StatusCode::UNPROCESSABLE_ENTITY, "unavailable".into()));
     }
 }
+
+#[tokio::test]
+async fn starter_commands_are_added_once() {
+    use reqwest::Method;
+    let r = start().await;
+    assert_eq!(
+        error_code(r.anonymous(Method::POST, "/api/v1/commands/starter").await).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (x, y) =
+        tokio::join!(r.post("/api/v1/commands/starter", json!({})), r.post("/api/v1/commands/starter", json!({})));
+    assert_eq!((x.status(), y.status()), (StatusCode::OK, StatusCode::OK), "a double click on a fresh install is fine");
+    let (x, y): (Value, Value) = (x.json().await.unwrap(), y.json().await.unwrap());
+    assert_eq!(x["added"].as_array().unwrap().len() + y["added"].as_array().unwrap().len(), 4);
+    let first = if x["added"].as_array().unwrap().is_empty() { y } else { x };
+    assert!(first["added"].as_array().unwrap().iter().all(|c| !c["id"].as_str().unwrap().is_empty()));
+    let (a, b) =
+        tokio::join!(r.post("/api/v1/commands/starter", json!({})), r.post("/api/v1/commands/starter", json!({})));
+    for res in [a, b] {
+        let v: Value = res.json().await.unwrap();
+        assert_eq!(v["added"], json!([]), "never twice, even with two clicks at once");
+    }
+    let all: Value = r.get("/api/v1/commands").await.json().await.unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 4);
+}

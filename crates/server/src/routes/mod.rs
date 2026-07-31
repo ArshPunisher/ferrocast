@@ -70,6 +70,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/viewers/{platform}/{user_id}/note", get(moderation::note).put(moderation::save_note))
         // bot
         .route("/commands", get(bot::commands).post(bot::create_command))
+        .route("/commands/starter", post(bot::add_starter))
         .route("/commands/{id}", put(bot::update_command).delete(bot::delete_command))
         .route("/timers", get(bot::timers).post(bot::create_timer))
         .route("/timers/{id}", put(bot::update_timer).delete(bot::delete_timer))

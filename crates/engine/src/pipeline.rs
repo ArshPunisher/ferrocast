@@ -378,10 +378,19 @@ impl Engine {
             return;
         };
         let mut extra = Vars::new();
-        if let Some(started) = self.state().session.started_at {
-            let mins = now().seconds_since(started) / 60;
-            extra.insert("uptime".into(), format!("{}h {}m", mins / 60, mins % 60));
+        let live = self.state().live.values().any(|l| *l);
+        match self.state().session.started_at.filter(|_| live) {
+            Some(started) => {
+                let mins = now().seconds_since(started) / 60;
+                let up = format!("{}h {}m", mins / 60, mins % 60);
+                extra.insert("uptime_text".into(), format!("We've been live for {up}."));
+                extra.insert("uptime".into(), up);
+            }
+            None => {
+                extra.insert("uptime_text".into(), "We're not live right now.".into());
+            }
         }
+        self.shoutout_vars(e.platform, &content.text, &mut extra).await;
         let result = {
             let commands = self.state().commands.clone();
             let mut cd = self.inner.cooldowns.lock().unwrap_or_else(|p| p.into_inner());

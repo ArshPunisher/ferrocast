@@ -64,6 +64,12 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn unban(&self, user_id: &str) -> Result<()>;
 
     async fn set_mode(&self, change: ModeChange) -> Result<()>;
+
+    /// The game another channel last streamed (for shoutouts), when the platform says.
+    /// `Ok(None)` when unknown; platforms without a lookup keep this default.
+    async fn last_game(&self, _login: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// The longest chat message each platform accepts. Adapters split longer bot replies.

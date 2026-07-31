@@ -182,6 +182,8 @@ GET/POST `/api/v1/commands`, PUT/DELETE `/api/v1/commands/{id}`; GET/POST `/api/
 `Command = { id, name: "!discord", aliases: string[], response: string (template), roles: "everyone" | "subs" | "vips" | "mods", cooldown_s: number, user_cooldown_s: number, platforms: Platform[] | [], enabled }` (`id` may be blank on POST; the engine picks one)
 `Timer = { id, name, message, every_min: number, min_chat_lines: number, platforms: Platform[] | [], enabled }`
 
+POST `/api/v1/commands/starter` → `{ added: Command[], skipped: string[] }`: adds `!socials`, `!lurk`, `!uptime` and `!so` (mods only), skipping any name a command or alias already uses (two clicks at once never add a command twice). Reply variables the engine fills in: `{uptime}` ("1h 5m", only while live), `{uptime_text}` ("We've been live for 1h 5m." or "We're not live right now."), and for replies that use them, `{target_game}` (what the first argument's channel last streamed, empty when unknown) and `{target_game_note}` ("They were last playing Hades II." or empty). The game comes from the platform when it offers a lookup (Twitch: Get Channel Information); elsewhere the shoutout is plain.
+
 ### Loyalty points
 One balance per person: linked accounts on Twitch, YouTube and Kick share it. Never below 0, never above 1,000,000,000,000.
 

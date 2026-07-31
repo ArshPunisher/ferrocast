@@ -59,6 +59,10 @@ impl Connector for TwitchConnector {
     async fn set_mode(&self, change: ModeChange) -> Result<()> {
         Ok(self.helix.chat_settings(&self.user_id, &self.user_id, mode_patch(change)).await?)
     }
+
+    async fn last_game(&self, login: &str) -> Result<Option<String>> {
+        Ok(self.helix.channel_game(login).await?)
+    }
 }
 
 /// The Helix chat-settings body for one change.

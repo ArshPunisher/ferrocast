@@ -22,6 +22,7 @@ pub mod poll;
 pub mod queue;
 pub mod recap;
 pub mod sample;
+pub mod starter;
 pub mod template;
 pub mod tts;
 pub mod welcome;

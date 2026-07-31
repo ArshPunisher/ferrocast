@@ -22,6 +22,7 @@ mod recap;
 mod relay;
 mod snapshot;
 pub mod speech;
+mod starter;
 mod timers;
 mod welcome;
 
@@ -46,6 +47,7 @@ pub use discord::{DiscordFailure, DiscordView};
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
 pub use obs::{ObsDetectView, ObsView, PasswordChange};
+pub use starter::StarterResult;
 use state::{ConnectorView, EngineSettings, State};
 
 /// Current wall-clock time. Only the engine reads the clock; `core` gets time passed in.
