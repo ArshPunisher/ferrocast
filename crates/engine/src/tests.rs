@@ -71,6 +71,7 @@ impl Connector for FakePlatform {
         self.push(format!("mode {:?} {}", c.mode, c.enabled))
     }
     async fn last_game(&self, login: &str) -> ferrocast_connector::Result<Option<String>> {
+        self.push(format!("lookup {login}"))?;
         Ok((login == "friend").then(|| "Hades II".to_string()))
     }
 }
@@ -297,7 +298,7 @@ async fn held_marks_are_replayed_with_their_messages() {
         .iter()
         .map(|f| serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string())
         .collect();
-    assert_eq!(types, ["event", "held"]);
+    assert_eq!(types, ["event", "held", "chatter"], "a first message's mark is replayed with it too");
     assert!(e.current_seq() > 1_000_000_000_000, "seqs start from the clock, so they grow across restarts");
 }
 
@@ -1291,6 +1292,15 @@ async fn first_messages_are_marked_and_welcomed_only_when_turned_on() {
     eventually(|| tw.log().contains(&"say Hi fresh, welcome! reply=m3".to_string())).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(!tw.log().iter().any(|l| l.contains("fresh2")), "welcomes are spaced out");
+    // A first message the filter holds gets its dashboard mark, but no public welcome.
+    let mut f = e.filter();
+    f.words.list.push("spamword".into());
+    f.words.action = ferrocast_core::filter::RuleAction::Hold;
+    e.save_filter(f).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10_100)).await; // past the welcome gap
+    e.ingest(chat(Platform::Twitch, "m5", "spammer", "spamword here")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!tw.log().iter().any(|l| l.contains("spammer")), "held messages aren't welcomed");
     let bad = serde_json::json!({ "template": "{oops" });
     assert!(e.patch_welcome(bad.as_object().unwrap()).await.unwrap_err().to_string().starts_with("template:"));
     let bad = serde_json::json!({ "returning_days": 3 });
@@ -1395,7 +1405,7 @@ async fn going_live_posts_to_discord_once_per_platform() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let posts = seen.lock().unwrap().clone();
     assert_eq!(posts.len(), 2, "Twitch once (the reconnect isn't news), Kick once");
-    assert_eq!(posts[0]["content"], "I'm is live on Twitch: Ranked");
+    assert_eq!(posts[0]["content"], "The stream is live on Twitch: Ranked");
     assert_eq!(posts[0]["allowed_mentions"]["parse"], serde_json::json!(["everyone"]));
     let view = e.discord().await.unwrap();
     assert!(view.has_webhook);
@@ -1496,4 +1506,9 @@ async fn the_starter_pack_skips_names_in_use_and_shoutouts_name_the_game() {
     e.ingest(chat(Platform::Twitch, "u1", "viewer", "!uptime")).await;
     eventually(|| tw.log().iter().any(|l| l == "say We're not live right now. reply=u1")).await;
     assert!(!tw.log().iter().any(|l| l.ends_with("reply=s3")));
+    assert_eq!(
+        tw.log().iter().filter(|l| *l == "lookup friend").count(),
+        1,
+        "a viewer's !so asks the platform nothing"
+    );
 }

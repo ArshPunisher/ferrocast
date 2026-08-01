@@ -129,6 +129,27 @@ pub struct Cooldowns {
     per_user: HashMap<(String, String), Millis>,
 }
 
+impl Cooldowns {
+    /// Whether `actor` could run `cmd` now (access and cooldowns), without recording a
+    /// use. The engine asks before doing slow work for a command, like a platform lookup.
+    pub fn ready(&self, cmd: &Command, actor: &Actor, now: Millis) -> bool {
+        if !cmd.enabled || !cmd.access.allows(actor.roles) {
+            return false;
+        }
+        if Access::Mods.allows(actor.roles) {
+            return true;
+        }
+        let user = actor.id.clone().unwrap_or_else(|| actor.display_name.clone());
+        let global_ok =
+            self.global.get(&cmd.id).is_none_or(|last| now.seconds_since(*last) >= i64::from(cmd.cooldown_s));
+        let user_ok = self
+            .per_user
+            .get(&(cmd.id.clone(), user))
+            .is_none_or(|last| now.seconds_since(*last) >= i64::from(cmd.user_cooldown_s));
+        global_ok && user_ok
+    }
+}
+
 /// Why a command didn't run (shown to mods in the log, never in chat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skip {
@@ -318,6 +339,23 @@ mod tests {
         let mut b = cmd("!dc", "x");
         b.aliases = vec!["!Discord".into()];
         assert_eq!(b.validate(&[a]), Err(CommandError::Taken("!Discord".into())));
+    }
+
+    #[test]
+    fn ready_checks_access_and_cooldowns_without_recording() {
+        let mut c = cmd("!so", "x");
+        c.access = Access::Mods;
+        let mut cd = Cooldowns::default();
+        assert!(!cd.ready(&c, &viewer("a"), Millis(0)), "viewers can't");
+        let mut m = viewer("m");
+        m.roles = Roles::MODERATOR;
+        assert!(cd.ready(&c, &m, Millis(0)));
+        let open = cmd("!d", "x");
+        assert!(cd.ready(&open, &viewer("a"), Millis(0)));
+        run(std::slice::from_ref(&open), &mut cd, Platform::Twitch, &viewer("a"), "!d", &Vars::new(), Millis(0))
+            .unwrap();
+        assert!(!cd.ready(&open, &viewer("b"), Millis(5_000)), "global cooldown");
+        assert!(cd.ready(&open, &viewer("b"), Millis(11_000)));
     }
 
     #[test]

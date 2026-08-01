@@ -278,7 +278,6 @@ impl Engine {
         if e.origin == Origin::Live {
             self.state_mut().session.record(e);
         }
-        self.loyalty_saw(e);
         let message_id = e.source_id.clone().unwrap_or_default();
 
         let (on_sight, verdict, bot_on) = {
@@ -350,6 +349,12 @@ impl Engine {
             }
         }
 
+        // Only now is the message known to be shown: hidden or held chat earns no points
+        // and gets no public welcome.
+        self.loyalty_saw(e);
+        if let Some(mark) = *chatter {
+            self.maybe_welcome(e, mark);
+        }
         let voter = match (person, &actor.id) {
             (Some(v), _) => Some(format!("viewer:{v}")),
             (None, Some(id)) => Some(format!("{}:{id}", platform_key(e.platform))),
@@ -390,7 +395,7 @@ impl Engine {
                 extra.insert("uptime_text".into(), "We're not live right now.".into());
             }
         }
-        self.shoutout_vars(e.platform, &content.text, &mut extra).await;
+        self.shoutout_vars(e.platform, actor, &content.text, &mut extra).await;
         let result = {
             let commands = self.state().commands.clone();
             let mut cd = self.inner.cooldowns.lock().unwrap_or_else(|p| p.into_inner());

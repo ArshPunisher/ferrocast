@@ -24,6 +24,9 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-17
+- Community features: loyalty points (watch time, support bonuses, `!points`/`!addpoints`/`!removepoints`, leaderboard, in `.ferropack`), chat polls (`!vote N`, live results, poll overlay), giveaways (keyword entry, point cost, sub bonus, OS-random draws, refunds), first-time and returning chatter marks with an optional welcome, the stream recap, Discord go-live posts (webhook in the keychain), OBS auto-detect, and the starter command pack (`!so` names the last game on Twitch). Migrations 0005 to 0007.
+
 ### 2026-05-27
 - Tips through the relay with verified webhooks; export/import; TTS synthesis.
 ### 2026-05-24

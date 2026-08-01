@@ -32,40 +32,46 @@ impl Engine {
         Ok(cfg)
     }
 
-    /// How the dashboard should mark this live message, and the welcome when it's someone's
-    /// first message ever (only if turned on, the bot is on, and not during panic mode).
+    /// How the dashboard should mark this live message (first message ever, or back
+    /// after a while). Only marks: the welcome is [`Engine::maybe_welcome`], sent once the
+    /// message has passed moderation.
     pub(crate) fn chatter_mark(&self, e: &Event, touch: Option<ChatTouch>) -> Option<ChatterMark> {
-        let EventKind::ChatMessage { actor, .. } = &e.kind else { return None };
-        if e.origin != Origin::Live {
+        if !matches!(e.kind, EventKind::ChatMessage { .. }) || e.origin != Origin::Live {
             return None;
         }
         let t = touch?;
+        let cfg = self.state().welcome.clone();
+        welcome::mark(&cfg, t.first_message, t.previous_message_at.map(Millis), now())
+    }
+
+    /// The welcome for someone's first message ever, if it's turned on, the bot is on, it
+    /// isn't panic mode, and none went out in the last 10 seconds. Call it only for a
+    /// message that is shown.
+    pub(crate) fn maybe_welcome(&self, e: &Event, mark: ChatterMark) {
+        let EventKind::ChatMessage { actor, .. } = &e.kind else { return };
         let (cfg, bot_on, panic) = {
             let st = self.state();
             (st.welcome.clone(), st.settings.bot_enabled, st.panic_on)
         };
-        let at = now();
-        let m = welcome::mark(&cfg, t.first_message, t.previous_message_at.map(Millis), at)?;
         let streamer = actor.roles.contains(ferrocast_core::event::Roles::BROADCASTER);
-        if m == ChatterMark::First && cfg.enabled && bot_on && !panic && !streamer && e.channel.is_none() {
-            let due = {
-                let mut last = self.inner.last_welcome.lock().unwrap_or_else(|p| p.into_inner());
-                let ok = last.is_none_or(|l| at.0 - l.0 >= WELCOME_GAP.as_millis() as i64);
-                if ok {
-                    *last = Some(at);
-                }
-                ok
-            };
-            if due {
-                let text = ferrocast_core::command::safe_reply(&cfg.render(&actor.display_name, e.platform.label()));
-                if !text.is_empty() {
-                    let reply_to = e.source_id.clone();
-                    self.spawn_action(e.platform, "welcome a first-time chatter", move |c| {
-                        Box::pin(async move { c.send_chat(&text, reply_to.as_deref()).await })
-                    });
-                }
-            }
+        if mark != ChatterMark::First || !cfg.enabled || !bot_on || panic || streamer || e.channel.is_some() {
+            return;
         }
-        Some(m)
+        let at = now();
+        {
+            let mut last = self.inner.last_welcome.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|l| at.0 - l.0 < WELCOME_GAP.as_millis() as i64) {
+                return;
+            }
+            *last = Some(at);
+        }
+        let text = ferrocast_core::command::safe_reply(&cfg.render(&actor.display_name, e.platform.label()));
+        if text.is_empty() {
+            return;
+        }
+        let reply_to = e.source_id.clone();
+        self.spawn_action(e.platform, "welcome a first-time chatter", move |c| {
+            Box::pin(async move { c.send_chat(&text, reply_to.as_deref()).await })
+        });
     }
 }

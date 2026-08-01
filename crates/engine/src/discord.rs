@@ -160,7 +160,7 @@ impl Engine {
             };
             v.insert("url".into(), url);
         } else {
-            v.insert("name".into(), "I'm".into());
+            v.insert("name".into(), "The stream".into());
         }
         v
     }

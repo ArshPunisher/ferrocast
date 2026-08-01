@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use ferrocast_core::command::{self, Command};
-use ferrocast_core::event::Platform;
+use ferrocast_core::event::{Actor, Platform};
 use ferrocast_core::template::Vars;
 use serde::Serialize;
 
@@ -45,15 +45,19 @@ impl Engine {
     /// For a command whose reply mentions the target's game (`!so @friend`): asks the
     /// platform what they last played. `{target_game}` is the game or empty;
     /// `{target_game_note}` is "They were last playing X." or empty.
-    pub(crate) async fn shoutout_vars(&self, platform: Platform, text: &str, vars: &mut Vars) {
+    pub(crate) async fn shoutout_vars(&self, platform: Platform, actor: &Actor, text: &str, vars: &mut Vars) {
         vars.insert("target_game".into(), String::new());
         vars.insert("target_game_note".into(), String::new());
         let Some(inv) = command::parse(text) else { return };
-        let wants = self
-            .state()
-            .commands
-            .iter()
-            .any(|c| c.enabled && c.answers_to(inv.word) && c.response.contains("target_game"));
+        // Only for someone allowed to run the command, and not during its cooldown: a
+        // viewer spamming !so must not spend the platform's request budget.
+        let wants = {
+            let st = self.state();
+            let cd = self.inner.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
+            st.commands.iter().any(|c| {
+                c.answers_to(inv.word) && c.response.contains("target_game") && cd.ready(c, actor, crate::now())
+            })
+        };
         let Some(login) = inv.args.first().map(|a| a.trim_start_matches('@').to_string()) else { return };
         if !wants || login.is_empty() {
             return;
