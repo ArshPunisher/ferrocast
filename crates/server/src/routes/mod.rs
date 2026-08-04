@@ -116,6 +116,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))
         .route("/updates", get(app::updates))
+        .route("/updates/install", post(app::install_update))
         .route("/setup/complete", post(app::setup_complete))
         .route("/backups", get(core::backups).post(core::backup_now))
         .route("/backups/{id}/restore", post(core::restore_backup))

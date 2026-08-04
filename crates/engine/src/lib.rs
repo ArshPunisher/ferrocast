@@ -24,6 +24,8 @@ mod snapshot;
 pub mod speech;
 mod starter;
 mod timers;
+mod updates;
+pub use updates::AvailableUpdate;
 mod welcome;
 
 pub mod frames;
@@ -104,6 +106,9 @@ struct Inner {
     /// When the last welcome went out (they're spaced out during raids).
     last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
     discord_posts: Mutex<discord::LastPosts>,
+    /// What the update feed offers, as the desktop shell last saw it.
+    update: Mutex<Option<updates::AvailableUpdate>>,
+    install_update: Notify,
 }
 
 impl Engine {
@@ -182,6 +187,8 @@ impl Engine {
                 giveaway: tokio::sync::Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
                 discord_posts: Mutex::new(Default::default()),
+                update: Mutex::new(None),
+                install_update: Notify::new(),
             }),
         };
         tokio::spawn(prune(engine.clone()));

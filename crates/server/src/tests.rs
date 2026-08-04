@@ -1190,3 +1190,44 @@ async fn starter_commands_are_added_once() {
     let all: Value = r.get("/api/v1/commands").await.json().await.unwrap();
     assert_eq!(all.as_array().unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn updates_are_offered_only_when_found_and_never_while_live() {
+    use ferrocast_core::event::{Event, EventKind, Millis, Platform};
+    let r = start().await;
+    let none: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(none["latest"], Value::Null);
+    let nothing = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(error_code(nothing).await, (StatusCode::NOT_FOUND, "no_update".into()));
+
+    r.engine.set_available_update(Some(ferrocast_engine::AvailableUpdate {
+        version: "9.9.9".into(),
+        notes_url: Some("https://example.com/notes".into()),
+    }));
+    let found: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!((found["latest"].as_str(), found["blocked_while_live"].as_bool()), (Some("9.9.9"), Some(false)));
+    let no_token = r.client.post(format!("{}/api/v1/updates/install", r.base)).send().await.unwrap();
+    assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+    // Live, with "never update while live" on by default: the update waits.
+    r.engine
+        .ingest(Event::live(Platform::Twitch, Some("on".into()), Millis(0), EventKind::StreamOnline { title: None }))
+        .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !r.engine.is_live() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let live: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(live["blocked_while_live"], true);
+    let blocked = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+
+    r.engine.ingest(Event::live(Platform::Twitch, Some("off".into()), Millis(1), EventKind::StreamOffline)).await;
+    while r.engine.is_live() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let ok = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(ok.status(), StatusCode::ACCEPTED);
+    let v: Value = ok.json().await.unwrap();
+    assert_eq!(v["installing"], "9.9.9");
+}

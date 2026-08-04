@@ -79,6 +79,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
 | GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta", blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
+| POST | `/api/v1/updates/install` | → 202 `{ installing }`; the desktop app downloads it, checks its signature, installs and restarts. 404 `no_update` when nothing newer was found, 409 while live with "never update while live" on (R-60) |
 
 ```ts
 type Recap = { started_at: number | null /* null: no stream on record yet */; ended_at: number | null; live: boolean;
@@ -349,4 +350,4 @@ Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/
 
 ## 7. Not in this build yet
 
-`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. StreamElements and Streamlabs imports, and the update feed (`/updates` always has `latest: null`), aren't in this build yet.
+`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. StreamElements and Streamlabs imports aren't in this build yet. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself).

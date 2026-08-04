@@ -43,18 +43,24 @@ pub async fn session_stats(State(app): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// Update state (API-REQUESTS R9). There is no update feed yet, so `latest` is null; the
+/// Update state (API-REQUESTS R9): what the desktop found in the signed update feed. The
 /// dashboard must never offer an update while `blocked_while_live` (R-60).
 pub async fn updates(State(app): State<AppState>) -> Json<Value> {
     let settings = app.engine.settings();
-    let live = app.engine.status()["live"].as_object().is_some_and(|m| m.values().any(|v| v == true));
+    let found = app.engine.available_update();
     Json(json!({
         "current": env!("CARGO_PKG_VERSION"),
-        "latest": Value::Null,
+        "latest": found.as_ref().map(|u| u.version.clone()),
         "channel": settings.update_channel,
-        "blocked_while_live": live && settings.never_update_while_live,
-        "notes_url": Value::Null,
+        "blocked_while_live": app.engine.update_blocked(),
+        "notes_url": found.and_then(|u| u.notes_url),
     }))
+}
+
+/// `POST /updates/install`: the desktop downloads, verifies and installs it, then restarts.
+pub async fn install_update(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
+    let update = app.engine.request_update_install()?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "installing": update.version }))))
 }
 
 /// First run is finished: the dashboard stops showing onboarding (API-REQUESTS R10).
