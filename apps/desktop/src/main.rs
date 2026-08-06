@@ -22,6 +22,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
@@ -69,6 +70,7 @@ fn main() {
         .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -106,6 +108,8 @@ fn main() {
                 tracing::warn!(error = %e, "couldn't register the show-window shortcut (another app may use it)");
             }
             tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
+            tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
+            tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone()));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
             if !minimized {
                 show_window(app.handle());
@@ -154,6 +158,96 @@ fn shortcut_of(s: &str) -> Shortcut {
 
 /// Applies the settings the shell owns whenever the dashboard changes them: launch at
 /// login, close to tray, and the panic hotkey (PanicConfig.hotkey).
+/// First check shortly after start, then every few hours.
+const UPDATE_FIRST: Duration = Duration::from_secs(90);
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Where to read about a release.
+const RELEASES_URL: &str = "https://github.com/ArshPunisher/ferrocast/releases";
+
+/// The signed feed and its manifest's endpoint; beta reads the newest pre-release too.
+fn update_feed(engine: &Engine) -> Option<String> {
+    match engine.settings().update_channel.as_str() {
+        "beta" => Some("https://github.com/ArshPunisher/ferrocast/releases/download/beta/latest.json".into()),
+        _ => None, // stable: the endpoint in tauri.conf.json
+    }
+}
+
+async fn check_update(app: &AppHandle, engine: &Engine) -> Option<tauri_plugin_updater::Update> {
+    let mut builder = app.updater_builder();
+    if let Some(feed) = update_feed(engine)
+        && let Ok(url) = feed.parse()
+    {
+        builder = match builder.endpoints(vec![url]) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "bad update feed");
+                return None;
+            }
+        };
+    }
+    match builder.build() {
+        Ok(updater) => match updater.check().await {
+            Ok(found) => found,
+            // No feed yet, offline, or a release without a manifest: nothing to offer.
+            Err(e) => {
+                tracing::debug!(error = %e, "update check failed");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't set up the updater");
+            None
+        }
+    }
+}
+
+/// Checks the signed update feed and tells the engine what it found, so the dashboard can
+/// offer it (R-60). Signatures are checked against the public key in tauri.conf.json.
+async fn keep_updated(app: AppHandle, engine: Engine) {
+    tokio::time::sleep(UPDATE_FIRST).await;
+    loop {
+        let found = check_update(&app, &engine).await.map(|u| ferrocast_engine::AvailableUpdate {
+            notes_url: Some(format!("{RELEASES_URL}/tag/v{}", u.version)),
+            version: u.version,
+        });
+        engine.set_available_update(found);
+        tokio::time::sleep(UPDATE_EVERY).await;
+    }
+}
+
+/// Installs when the dashboard asks (the engine already refused it while live), then
+/// restarts into the new version.
+async fn install_when_asked(app: AppHandle, engine: Engine) {
+    loop {
+        engine.update_install_requested().await;
+        let Some(update) = check_update(&app, &engine).await else {
+            engine.update_failed("the update is no longer available");
+            engine.set_available_update(None);
+            continue;
+        };
+        let bytes = match update.download(|_, _| {}, || {}).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "update download failed");
+                engine.update_failed(&e.to_string());
+                continue;
+            }
+        };
+        // A stream may have started during the download: check again right before applying.
+        if engine.update_blocked() {
+            engine.update_failed("you went live, so it waits until the stream ends; press Update again after");
+            continue;
+        }
+        match update.install(bytes) {
+            Ok(()) => app.restart(),
+            Err(e) => {
+                tracing::error!(error = %e, "update install failed");
+                engine.update_failed(&e.to_string());
+            }
+        }
+    }
+}
+
 async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
     let mut login: Option<bool> = None;
     let mut hotkey: Option<String> = None;

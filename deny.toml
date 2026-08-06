@@ -31,7 +31,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 # Layering (ARCHITECTURE.md §2): only the desktop app may use Tauri.
-deny = [{ name = "tauri", wrappers = ["ferrocast-desktop", "tauri-plugin-single-instance", "tauri-plugin-global-shortcut", "tauri-plugin-opener", "tauri-plugin-autostart", "tauri-plugin-window-state", "tauri-plugin-notification"] }]
+deny = [{ name = "tauri", wrappers = ["ferrocast-desktop", "tauri-plugin-single-instance", "tauri-plugin-global-shortcut", "tauri-plugin-opener", "tauri-plugin-autostart", "tauri-plugin-window-state", "tauri-plugin-notification", "tauri-plugin-updater"] }]
 
 [sources]
 unknown-registry = "deny"
