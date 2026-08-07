@@ -6,7 +6,7 @@ name: Release
 #
 # Needs, in this repo's settings:
 #   secrets FERROCAST_WEB_TOKEN (read access to ferrocast-web while it is private) and
-#           FERROCAST_YOUTUBE_CLIENT_SECRET;
+#           FERROCAST_YOUTUBE_CLIENT_SECRET, TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) for updates;
 #   variables FERROCAST_TWITCH_CLIENT_ID and FERROCAST_YOUTUBE_CLIENT_ID.
 # macOS builds are ad-hoc signed (no paid Apple account): people install with Homebrew
 # (packaging/homebrew) or open the DMG and press "Open Anyway" once. Windows builds are
@@ -98,8 +98,12 @@ jobs:
           FERROCAST_YOUTUBE_CLIENT_ID: ${{ vars.FERROCAST_YOUTUBE_CLIENT_ID }}
           FERROCAST_YOUTUBE_CLIENT_SECRET: ${{ secrets.FERROCAST_YOUTUBE_CLIENT_SECRET }}
           FERROCAST_RELAY_URL: https://ferrocast-relay.clearcraftlabs.com
+          # Signs the updater bundles; the public key is in tauri.conf.json (R-60).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         working-directory: apps/desktop
-        run: cargo tauri build ${{ matrix.args }}
+        # Updater bundles are signed only here, where the key exists; local builds skip them.
+        run: cargo tauri build ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ferrocast-${{ matrix.name }}
@@ -109,6 +113,8 @@ jobs:
             ${{ matrix.out }}/deb/*.deb
             ${{ matrix.out }}/rpm/*.rpm
             ${{ matrix.out }}/appimage/*.AppImage
+            ${{ matrix.out }}/macos/*.app.tar.gz
+            ${{ matrix.out }}/**/*.sig
           if-no-files-found: error
 
   draft:
@@ -126,6 +132,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Put every bundle at the top of dist
+        run: find dist -mindepth 2 -type f -exec mv -t dist {} +
       - name: Homebrew cask with this release's checksum
         env:
           TAG: ${{ github.ref_name }}
@@ -133,6 +141,10 @@ jobs:
           version="${TAG#v}"
           packaging/homebrew/update-cask.sh "$version" dist/Ferrocast_"${version}"_universal.dmg
           cp packaging/homebrew/Casks/ferrocast.rb dist/ferrocast.rb
+      - name: Update feed (latest.json)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: packaging/updater-manifest.sh "${TAG#v}" dist > dist/latest.json
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
