@@ -4,23 +4,23 @@ Newest entry first. Update at the end of every working session.
 
 ## Now
 
-- **Engine and adapters are feature-complete for v1 on fakes.** Twitch (device code, EventSub WebSocket with handover and watchdog, Helix), YouTube (PKCE sign-in, gRPC `streamList`), Kick (relay-delivered webhooks, public API), OBS (Add to OBS), TTS with the computer's voices, tips (Razorpay/UPI, Ko-fi, Stripe through the relay), export/import `.ferropack`.
-- **Relay** (`crates/relay`) is ready to deploy on the Oracle ARM server (`deploy/`).
-- **Desktop shell** (`apps/desktop`, Tauri 2) and `apps/headless`.
-- Every step is tested against fakes; nothing has been run against the real Twitch, YouTube or Kick yet because the platform apps aren't registered.
+- **v1 feature-complete.** Engine, adapters (Twitch, YouTube, Kick, OBS), tips through the relay, export/import, plus community features: loyalty points, chat polls, giveaways, first-time chatter marks, stream recap, Discord go-live posts, OBS auto-detect and starter commands.
+- **Relay is live** at ferrocast-relay.clearcraftlabs.com (Docker on the Oracle server behind its own Cloudflare tunnel).
+- **Platform apps are registered** (Twitch, Google/YouTube, Kick); ids are in the release workflow's variables and secrets.
+- **Desktop:** Spark icons, the overlay-collage install window, LAN access, and signed auto-updates (key in GitHub secrets, feed is `latest.json` on GitHub releases).
+- **Security:** imported packs can't choose media types or change device settings; media is served sandboxed; relay sign-ups are capped and unused installs pruned.
 
 ## Waiting on the owner
 
-1. Register the platform apps (free): Twitch (dev.twitch.tv, public client), Google Cloud project with the YouTube Data API (OAuth desktop client), Kick (dev.kick.com, redirect and webhook URLs on the relay).
-2. SSH access to the Oracle server and a DNS record for the relay (suggested `ferrocast-relay.clearcraftlabs.com`).
-3. Apple Developer account for signing (later).
+1. Redeploy the relay (`deploy/deploy-relay.sh`) to ship the sign-up cap and pruning.
+2. A StreamElements token, if the StreamElements importer is wanted.
+3. Making releases public (Homebrew tap, updates and downloads need it).
 
 ## Next
 
-- StreamElements and Streamlabs importers (P9.2, P9.3): StreamElements' REST shapes aren't publicly documented well enough to build blind; build and test against the owner's own StreamElements account (JWT from the SE dashboard).
-- Packaging, updater, signing (P10) once the dashboard build exists.
+- StreamElements and Streamlabs importers (P9.2, P9.3), once there's a real account to test against.
+- Live tests against the real platforms (Twitch `!so` game lookup, Discord delivery).
 - Panic-mode "hold new accounts" needs account ages from each platform.
-- Held messages need a release action in the dashboard.
 
 ## Log
 
