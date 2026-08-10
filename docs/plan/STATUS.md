@@ -12,9 +12,8 @@ Newest entry first. Update at the end of every working session.
 
 ## Waiting on the owner
 
-1. Redeploy the relay (`deploy/deploy-relay.sh`) to ship the sign-up cap and pruning.
-2. A StreamElements token, if the StreamElements importer is wanted.
-3. Making releases public (Homebrew tap, updates and downloads need it).
+1. A StreamElements token, if the StreamElements importer is wanted.
+2. Making releases public (Homebrew tap, updates and downloads need it).
 
 ## Next
 
