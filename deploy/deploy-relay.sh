@@ -2,16 +2,17 @@
 # Builds the relay image, ships it to the server and (re)starts it behind its own
 # Cloudflare Tunnel. Nothing else on the server is touched.
 #
-#   deploy/deploy-relay.sh [ssh-host]        (default host: transformx-server)
+#   deploy/deploy-relay.sh [ssh-host]
 #
 # Secrets come from ../secrets/relay.env next to the repo (never committed):
+#   RELAY_HOST=...            ssh host (or ~/.ssh/config alias) of the server; an
+#                             argument overrides it
 #   TUNNEL_TOKEN=...          from Cloudflare → Networking → Tunnels → ferrocast-relay
 #   KICK_CLIENT_ID=...        from kick.com → Settings → Developer (optional until then)
 #   KICK_CLIENT_SECRET=...
 # shellcheck disable=SC2029 # $dir is meant to expand here, before ssh sends the command.
 set -euo pipefail
 
-host="${1:-transformx-server}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 secrets="$repo/../secrets/relay.env"
 dir=/opt/ferrocast-relay
@@ -22,6 +23,11 @@ if [[ ! -f "$secrets" ]]; then
 fi
 # Read as plain KEY=value lines, never executed (a pasted command must not run).
 value() { sed -n "s/^$1=//p" "$secrets" | tail -n 1; }
+host="${1:-$(value RELAY_HOST)}"
+if [[ -z "$host" ]]; then
+  echo "No server given: pass the ssh host as an argument, or set RELAY_HOST in $secrets." >&2
+  exit 1
+fi
 TUNNEL_TOKEN="$(value TUNNEL_TOKEN)"
 KICK_CLIENT_ID="$(value KICK_CLIENT_ID)"
 KICK_CLIENT_SECRET="$(value KICK_CLIENT_SECRET)"
