@@ -18,5 +18,5 @@ ENV RELAY_BIND=0.0.0.0:8787 RELAY_DATA=/data/relay.db RUST_LOG=info
 EXPOSE 8787
 VOLUME /data
 # Bash (part of every Debian image) for /dev/tcp: no curl needed in the image.
-HEALTHCHECK --interval=30s --timeout=5s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8787 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --start-interval=2s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8787 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
 ENTRYPOINT ["/usr/local/bin/ferrocast-relay"]

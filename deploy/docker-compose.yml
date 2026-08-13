@@ -6,7 +6,9 @@ name: ferrocast-relay
 
 services:
   relay:
-    image: ferrocast-relay:${RELAY_TAG:-latest}
+    # GitHub Actions deploys set RELAY_IMAGE/RELAY_TAG (ghcr.io/arshpunisher/ferrocast-relay);
+    # a hand deploy (deploy/deploy-relay.sh) builds and loads ferrocast-relay:latest.
+    image: ${RELAY_IMAGE:-ferrocast-relay}:${RELAY_TAG:-latest}
     container_name: ferrocast-relay
     restart: unless-stopped
     env_file: relay.env

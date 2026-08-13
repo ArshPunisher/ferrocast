@@ -39,27 +39,41 @@ if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
   exit 1
 fi
 
-echo "Building the relay image..."
-docker build -q -f "$repo/deploy/relay.Dockerfile" -t ferrocast-relay:latest "$repo" >/dev/null
-
-echo "Sending it to $host..."
-docker save ferrocast-relay:latest | gzip | ssh "$host" 'sudo docker load' >/dev/null
+# Once GitHub Actions deploys the relay ("🚀 Deploy relay"), this script only updates the
+# config and secrets and keeps the version that is live; it never swaps in a local build.
+live="$(ssh "$host" "sudo cat $dir/state/current 2>/dev/null || true")"
+if [[ -n "$live" && ! "$live" =~ ^1\.0\.[0-9]{6}-[0-9a-f]{7}$ ]]; then
+  echo "Unexpected live version '$live' in $dir/state/current; fix it on the server first." >&2
+  exit 1
+fi
+if [[ -n "$live" ]]; then
+  echo "GitHub Actions deploys the relay now (live: $live): updating config and secrets only."
+  image_env="RELAY_IMAGE=ghcr.io/arshpunisher/ferrocast-relay RELAY_TAG=$live"
+else
+  echo "Building the relay image..."
+  docker build -q -f "$repo/deploy/relay.Dockerfile" -t ferrocast-relay:latest "$repo" >/dev/null
+  echo "Sending it to $host..."
+  docker save ferrocast-relay:latest | gzip | ssh "$host" 'sudo docker load' >/dev/null
+  image_env="RELAY_IMAGE=ferrocast-relay RELAY_TAG=latest"
+fi
+# The files belong to the server's `deploy` user once deploys come from GitHub Actions.
+owner="$(ssh "$host" "id deploy >/dev/null 2>&1 && test -f $dir/deploy.sh && echo deploy || echo root")"
 
 echo "Writing the config..."
 # Secrets go straight to their final, root-owned 0600 files through `sudo install` reading
 # stdin: nothing passes through a guessable /tmp path another user could pre-create.
 ssh "$host" "sudo mkdir -p $dir && sudo chmod 755 $dir"
-ssh "$host" "sudo install -m 644 -o root -g root /dev/stdin $dir/docker-compose.yml" < "$repo/deploy/docker-compose.yml"
+ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-compose.yml" < "$repo/deploy/docker-compose.yml"
 {
   printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
   printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
-} | ssh "$host" "sudo install -m 600 -o root -g root /dev/stdin $dir/relay.env"
-printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o root -g root /dev/stdin $dir/tunnel.env"
+} | ssh "$host" "sudo install -m 600 -o $owner -g $owner /dev/stdin $dir/relay.env"
+printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o $owner -g $owner /dev/stdin $dir/tunnel.env"
 
 ssh "$host" "set -e
-  cd $dir && sudo docker compose up -d --remove-orphans
+  cd $dir && sudo env $image_env docker compose up -d --remove-orphans
   sleep 5
   sudo docker ps --filter name=ferrocast --format '{{.Names}}: {{.Status}}'"
 

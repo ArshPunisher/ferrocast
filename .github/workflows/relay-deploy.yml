@@ -1,0 +1,137 @@
+name: 🚀 Deploy relay
+run-name: "🚀 Relay ${{ inputs.version || 'latest build' }} by @${{ github.actor }}"
+
+# The release button for ferrocast-relay.clearcraftlabs.com: Actions → "🚀 Deploy relay" →
+# Run workflow. Leave the version blank to release the latest successful "🧱 Build relay",
+# or enter an older version (e.g. 1.0.261018-ab12cd3) to roll back. The server runs
+# /opt/ferrocast-relay/deploy.sh (deploy/relay-server-deploy.sh): pull, switch, health
+# check, and the previous version comes back if the new one isn't healthy.
+#
+# Secrets of the `relay` environment, usable from main only (set by deploy/relay-ci-setup.sh):
+#   RELAY_DEPLOY_HOST         the server's public address
+#   RELAY_DEPLOY_PORT         its ssh port
+#   RELAY_DEPLOY_SSH_KEY      private key whose public half is locked to deploy.sh
+#   RELAY_DEPLOY_KNOWN_HOSTS  the server's ssh host key
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (blank = latest successful build)'
+        required: false
+        type: string
+
+# One relay deploy at a time; a second click waits instead of racing.
+concurrency:
+  group: deploy-relay
+  cancel-in-progress: false
+
+permissions:
+  contents: read # check out main (private repo)
+  actions: read # find the latest successful build
+  packages: write # point :prod at what went live
+
+env:
+  IMAGE: ghcr.io/arshpunisher/ferrocast-relay
+  HEALTH_URL: https://ferrocast-relay.clearcraftlabs.com/health
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.version || 'latest successful build' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: relay
+      url: https://ferrocast-relay.clearcraftlabs.com/health
+    steps:
+      - name: Check secrets are set
+        env:
+          HOST: ${{ secrets.RELAY_DEPLOY_HOST }}
+          KEY: ${{ secrets.RELAY_DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.RELAY_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=""
+          [ -n "$HOST" ]  || missing="$missing RELAY_DEPLOY_HOST"
+          [ -n "$KEY" ]   || missing="$missing RELAY_DEPLOY_SSH_KEY"
+          [ -n "$KNOWN" ] || missing="$missing RELAY_DEPLOY_KNOWN_HOSTS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets of the relay environment:$missing (run deploy/relay-ci-setup.sh once)"; exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0 # the latest build's commit may be older than main's tip
+          persist-credentials: false
+
+      - name: Choose version
+        env:
+          REQUESTED: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="$(printf '%s' "$REQUESTED" | tr -d '[:space:]')"
+          if [ -z "$v" ]; then
+            sha=$(gh run list -R "$GITHUB_REPOSITORY" --workflow relay-build.yml --branch main --status success \
+                    --limit 1 --json headSha --jq '.[0].headSha')
+            if [ -z "$sha" ]; then echo "::error::No successful relay build yet. Run 🧱 Build relay first."; exit 1; fi
+            day=$(TZ=UTC git show -s --format=%cd --date=format-local:%y%m%d "$sha")
+            v="1.0.${day}-${sha::7}"
+          fi
+          if ! [[ "$v" =~ ^1\.0\.[0-9]{6}-[0-9a-f]{7}$ ]]; then
+            echo "::error::\"$v\" is not a version (expected 1.0.YYMMDD-abcdef1)"; exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Check the build exists
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if ! docker manifest inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+            echo "::error::No image $VERSION. Wait for 🧱 Build relay for that commit to finish (or check the version), then run this again."
+            exit 1
+          fi
+
+      - name: Deploy on the server
+        env:
+          HOST: ${{ secrets.RELAY_DEPLOY_HOST }}
+          PORT: ${{ secrets.RELAY_DEPLOY_PORT }}
+          DEPLOY_KEY: ${{ secrets.RELAY_DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.RELAY_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          set -o pipefail
+          # The key is locked to /opt/ferrocast-relay/deploy.sh; this string is its only
+          # input (SSH_ORIGINAL_COMMAND).
+          ssh -i ~/.ssh/deploy_key -p "${PORT:-22}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+              "deploy@$HOST" "$VERSION $GITHUB_ACTOR" 2>&1 | tee deploy.log
+
+      # The server already checked health on its own network; this checks the public path
+      # through the Cloudflare Tunnel. A tunnel problem doesn't undo the release, so it warns.
+      - name: Check the public endpoint
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 10 "$HEALTH_URL" | grep -q ok; then echo "Public health check OK"; exit 0; fi
+            sleep 10
+          done
+          echo "::warning::$VERSION is live on the server, but $HEALTH_URL isn't answering. Check the Cloudflare Tunnel."
+
+      # Point :prod at what went live.
+      - name: Mark as :prod in GHCR
+        run: docker buildx imagetools create --tag "$IMAGE:prod" "$IMAGE:$VERSION"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            if [ "${{ job.status }}" = "success" ]; then echo "### ✅ Relay \`$VERSION\` is live"
+            elif grep -q "Rolled back:" deploy.log 2>/dev/null; then
+              echo "### ↩️ \`${VERSION:-?}\` failed its health check; the previous version was put back"
+            else echo "### ❌ Relay \`${VERSION:-?}\` was not released"; fi
+            echo "Requested by @$GITHUB_ACTOR."
+            if [ -f deploy.log ]; then echo; echo '```'; tail -n 40 deploy.log; echo '```'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f ~/.ssh/deploy_key

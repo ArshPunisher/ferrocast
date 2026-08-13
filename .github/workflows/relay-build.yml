@@ -1,0 +1,93 @@
+name: 🧱 Build relay
+
+# Every push to main that can change the relay builds a tested, versioned image:
+#   ghcr.io/arshpunisher/ferrocast-relay:1.0.<YYMMDD>-<sha7>
+# Nothing goes live here; releasing is Actions → "🚀 Deploy relay" → Run workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'deploy/relay.Dockerfile'
+      - '.github/workflows/relay-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: relay-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/arshpunisher/ferrocast-relay
+
+jobs:
+  build:
+    name: Test, build and push
+    # Native arm64: the same architecture as the Oracle Ampere server.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Derived from the commit (not the clock) so "🚀 Deploy relay" can work out the same
+      # version for the latest successful build.
+      - name: Version
+        id: version
+        run: |
+          day=$(TZ=UTC git show -s --format=%cd --date=format-local:%y%m%d HEAD)
+          echo "tag=1.0.${day}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Relay tests
+        run: cargo test --locked -p ferrocast-relay
+
+      - name: Build image
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          CREATED: ${{ steps.version.outputs.time }}
+        run: |
+          docker build -f deploy/relay.Dockerfile -t "$IMAGE:$TAG" \
+            --label "org.opencontainers.image.version=$TAG" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$CREATED" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" .
+
+      # The exact image that would ship has to start and answer /health.
+      - name: Smoke test the image
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          docker run -d --name relay-smoke -p 8787:8787 \
+            -e RELAY_PUBLIC_URL=https://ferrocast-relay.example.invalid "$IMAGE:$TAG"
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8787/health | grep -q ok; then echo "Health OK"; exit 0; fi
+            sleep 2
+          done
+          docker logs relay-smoke
+          echo "::error::The image started but /health never answered"
+          exit 1
+
+      - name: Push to GHCR
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$TAG"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Built relay \`${{ steps.version.outputs.tag }}\`"
+            echo "Tests and the image health check passed. Not live yet; to release it:"
+            echo "**Actions → 🚀 Deploy relay → Run workflow** (leave the version blank for this build)."
+          } >> "$GITHUB_STEP_SUMMARY"
