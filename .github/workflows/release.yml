@@ -5,8 +5,7 @@ name: Release
 # the owner reviews the draft. Actions are pinned to commit SHAs.
 #
 # Needs, in this repo's settings:
-#   secrets FERROCAST_WEB_TOKEN (read access to ferrocast-web while it is private) and
-#           FERROCAST_YOUTUBE_CLIENT_SECRET, TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) for updates;
+#   secrets FERROCAST_YOUTUBE_CLIENT_SECRET, TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) for updates;
 #   variables FERROCAST_TWITCH_CLIENT_ID and FERROCAST_YOUTUBE_CLIENT_ID.
 # macOS builds are ad-hoc signed (no paid Apple account): people install with Homebrew
 # (packaging/homebrew) or open the DMG and press "Open Anyway" once. Windows builds are
@@ -54,7 +53,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/ferrocast-web
-          token: ${{ secrets.FERROCAST_WEB_TOKEN }}
+          # ferrocast-web is public, so the built-in token can read it.
+          token: ${{ github.token }}
           path: ferrocast-web
           # Build scripts run later; they must not find the token in .git/config.
           persist-credentials: false
