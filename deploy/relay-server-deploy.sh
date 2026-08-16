@@ -33,6 +33,8 @@ read -r version actor extra <<<"${SSH_ORIGINAL_COMMAND:-$*}" || true
 [[ "${actor:-unknown}" =~ ^[A-Za-z0-9-]{1,39}$ ]] || die "invalid actor name"
 [[ -z "${extra:-}" ]] || die "unexpected extra arguments"
 [[ -f "$DIR/docker-compose.yml" ]] || die "$DIR/docker-compose.yml is missing: run deploy/deploy-relay.sh once from the repo"
+grep -q 'RELAY_IMAGE' "$DIR/docker-compose.yml" ||
+  die "$DIR/docker-compose.yml is too old to run GHCR images: run deploy/relay-ci-setup.sh again from the repo"
 
 mkdir -p "$STATE_DIR"
 exec 9>"$STATE_DIR/deploy.lock"

@@ -51,10 +51,12 @@ ssh "$host" "sudo test -f $dir/docker-compose.yml" || {
 ssh "$host" "sudo grep -q ghcr.io ~deploy/.docker/config.json 2>/dev/null" ||
   echo "WARNING: 'deploy' is not logged in to ghcr.io; deploys can't pull images until it is (DEPLOY.md §6)." >&2
 
-echo "Installing the deploy script and handing the relay files to 'deploy'..."
+echo "Installing the deploy script and the current compose file, and handing the relay files to 'deploy'..."
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/deploy.sh" <"$repo/deploy/relay-server-deploy.sh"
+# The compose file must read RELAY_IMAGE/RELAY_TAG; older installs don't. Containers keep
+# running: compose only reads it on the next deploy.
+ssh "$host" "sudo install -m 644 -o deploy -g deploy /dev/stdin $dir/docker-compose.yml" <"$repo/deploy/docker-compose.yml"
 ssh "$host" "sudo install -d -m 750 -o deploy -g deploy $dir/state &&
-  sudo chown deploy:deploy $dir/docker-compose.yml &&
   for f in relay.env tunnel.env; do if sudo test -f $dir/\$f; then sudo chown deploy:deploy $dir/\$f && sudo chmod 600 $dir/\$f; fi; done"
 
 echo "Locking the key to the deploy script..."
