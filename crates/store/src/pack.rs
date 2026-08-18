@@ -35,6 +35,8 @@ const TABLES: &[&str] = &[
     "viewers",
     "viewer_identities",
     "loyalty_balances",
+    "pending_points",
+    "imported_tips",
 ];
 
 /// Largest single entry, all entries together once unpacked, and the number of entries:
@@ -95,9 +97,40 @@ fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
 }
 
-/// The tip history as CSV, newest last.
+/// `minor` as a decimal in its currency's own digits: 50000 INR is "500.00".
+fn decimal(minor: i64, currency: &str) -> String {
+    let digits = ferrocast_core::money::exponent(currency) as usize;
+    if digits == 0 {
+        return minor.to_string();
+    }
+    let scale = 10i64.pow(digits as u32);
+    format!("{}.{:0width$}", minor / scale, (minor % scale).abs(), width = digits)
+}
+
+/// The tip history as CSV: tips imported from another service first (oldest first), then
+/// Ferrocast's own, newest last.
 fn tips_csv(conn: &rusqlite::Connection) -> Result<String> {
     let mut out = String::from("date_utc_ms,provider,payment_id,name,amount,currency,status,message\n");
+    let mut st = conn.prepare(
+        "SELECT occurred_at, source, provider, source_id, name, amount_minor, currency, message
+         FROM imported_tips ORDER BY occurred_at, source_id",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok([
+            r.get::<_, i64>(0)?.to_string(),
+            format!("{}:{}", r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            decimal(r.get::<_, i64>(5)?, &r.get::<_, String>(6)?),
+            r.get::<_, String>(6)?,
+            "imported".to_string(),
+            r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+        ])
+    })?;
+    for line in rows {
+        out.push_str(&line?.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
     let mut st = conn.prepare("SELECT occurred_at, data FROM events WHERE kind IN ('tip', 'reversal') ORDER BY seq")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     for row in rows {
@@ -107,17 +140,7 @@ fn tips_csv(conn: &rusqlite::Connection) -> Result<String> {
             let minor = v.pointer("/money/minor").and_then(Value::as_i64).unwrap_or(0);
             let cur = v.pointer("/money/currency").and_then(Value::as_str).unwrap_or("");
             let money = ferrocast_core::money::Money::new(minor, cur);
-            let digits = ferrocast_core::money::exponent(&money.currency) as usize;
-            let amount = if digits == 0 {
-                minor.to_string()
-            } else {
-                format!(
-                    "{}.{:0width$}",
-                    minor / 10i64.pow(digits as u32),
-                    (minor % 10i64.pow(digits as u32)).abs(),
-                    width = digits
-                )
-            };
+            let amount = decimal(minor, &money.currency);
             [
                 at.to_string(),
                 v["provider"].as_str().unwrap_or("").into(),
@@ -411,6 +434,18 @@ fn import_staged<R: Read + Seek>(
                         .get("points")
                         .and_then(Value::as_i64)
                         .is_some_and(|p| (0..=ferrocast_core::loyalty::MAX_BALANCE).contains(&p))
+                {
+                    continue;
+                }
+                if *table == "pending_points"
+                    && !row
+                        .get("points")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|p| (1..=ferrocast_core::loyalty::MAX_BALANCE).contains(&p))
+                {
+                    continue;
+                }
+                if *table == "imported_tips" && !row.get("amount_minor").and_then(Value::as_i64).is_some_and(|a| a >= 0)
                 {
                     continue;
                 }

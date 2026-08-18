@@ -64,6 +64,9 @@ pub fn touch(store: &Store, actor: &Actor, chatted: bool) -> Result<Option<i64>>
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
                     params![pkey(actor.platform), user_id, v, login, actor.display_name, now, i64::from(chatted)],
                 )?;
+                // Points an import is holding for this name are theirs now.
+                // Only a real login counts here, never a display name standing in for one.
+                crate::import::claim_pending(tx, &pkey(actor.platform), user_id, actor.login.as_deref(), v)?;
                 v
             }
         };
