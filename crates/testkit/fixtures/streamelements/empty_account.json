@@ -1,0 +1,5 @@
+{ "commands": [], "timers": [], "points_top": { "_total": 0, "users": [] },
+  "tips": { "docs": [], "total": 0, "totalDocs": 0, "limit": 100, "pages": 0, "totalPages": 0, "page": 1, "pagingCounter": 1,
+            "hasPrevPage": false, "hasNextPage": false, "prevPage": null, "nextPage": null, "offset": 0 },
+  "overlays": { "docs": [] }, "store_items": [],
+  "loyalty_status": 404, "loyalty": { "statusCode": 404, "error": "Not Found" } }

@@ -1,0 +1,9 @@
+{ "docs": [
+  { "donation": { "user": { "username": "Big Fan", "geo": null }, "message": "Keep it up!", "amount": 12.5, "currency": "USD" },
+    "provider": "paypal", "status": "success", "deleted": false, "_id": "5c0aab85de9a4c6756a14e0d", "channel": "5b2e2007760aeb7729487dab",
+    "transactionId": "IMPORTED", "createdAt": "2018-12-07T17:19:01.957Z", "approved": "allowed" },
+  { "donation": { "user": { "username": "Refunded" }, "amount": 5, "currency": "USD" }, "provider": "paypal", "status": "refunded",
+    "deleted": false, "_id": "5c0aab85de9a4c6756a14e0e", "createdAt": "2018-12-08T10:00:00.000Z" },
+  { "donation": { "user": { "username": "Rupee Fan" }, "amount": 500, "currency": "INR", "message": "" }, "provider": "razorpay",
+    "status": "success", "deleted": false, "_id": "5c0aab85de9a4c6756a14e0f", "createdAt": "2019-01-01T00:00:00.000Z" }
+], "total": 3, "limit": 100, "offset": 0 }

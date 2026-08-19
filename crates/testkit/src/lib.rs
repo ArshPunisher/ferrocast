@@ -2,4 +2,5 @@
 //! fake is the right failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod streamelements;
 pub mod twitch;
