@@ -1365,6 +1365,7 @@ dependencies = [
  "ferrocast-youtube",
  "futures-util",
  "getrandom 0.4.3",
+ "quick-xml",
  "rand_core 0.6.4",
  "reqwest",
  "rsa",
@@ -1377,6 +1378,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "url",
+ "zip 9.0.4",
 ]
 
 [[package]]
@@ -1466,6 +1468,7 @@ dependencies = [
  "ferrocast-relay",
  "ferrocast-secrets",
  "ferrocast-store",
+ "ferrocast-testkit",
  "futures-util",
  "getrandom 0.4.3",
  "mime_guess",

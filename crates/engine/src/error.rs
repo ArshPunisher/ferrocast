@@ -22,6 +22,10 @@ pub enum EngineError {
     /// Gone or never there, with its own error code (404).
     #[error("{message}")]
     Missing { code: &'static str, message: &'static str, hint: &'static str },
+    /// Another service an importer reads from refused or failed, or what it sent can't be
+    /// used. Carries its own status (401 bad token, 413/415/422 bad file, 429, 502).
+    #[error("{message}")]
+    Refused { status: u16, code: &'static str, message: String, hint: String, retry_after: Option<u64> },
     #[error(transparent)]
     Connector(#[from] ConnectorError),
     #[error(transparent)]

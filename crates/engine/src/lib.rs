@@ -13,6 +13,7 @@ mod discord;
 mod dispatcher;
 mod error;
 mod giveaways;
+pub mod import;
 mod loyalty;
 mod obs;
 mod patch;
@@ -109,6 +110,10 @@ struct Inner {
     /// What the update feed offers, as the desktop shell last saw it.
     update: Mutex<Option<updates::AvailableUpdate>>,
     install_update: Notify,
+    /// The import preview that can be applied, and one import step at a time.
+    import: Mutex<import::Slot>,
+    import_busy: tokio::sync::Mutex<()>,
+    streamelements_api: RwLock<String>,
 }
 
 impl Engine {
@@ -189,6 +194,9 @@ impl Engine {
                 discord_posts: Mutex::new(Default::default()),
                 update: Mutex::new(None),
                 install_update: Notify::new(),
+                import: Mutex::new(None),
+                import_busy: tokio::sync::Mutex::new(()),
+                streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
