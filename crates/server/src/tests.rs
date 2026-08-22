@@ -1231,3 +1231,107 @@ async fn updates_are_offered_only_when_found_and_never_while_live() {
     let v: Value = ok.json().await.unwrap();
     assert_eq!(v["installing"], "9.9.9");
 }
+
+#[tokio::test]
+async fn streamelements_import_preview_and_apply() {
+    use ferrocast_testkit::streamelements as se;
+    let r = start().await;
+    let fake = se::fake().await;
+    r.engine.set_streamelements_api(&fake.base);
+    let path = "/api/v1/import/streamelements/preview";
+    let anon = r.anonymous(reqwest::Method::POST, path).await;
+    assert_eq!(error_code(anon).await, (StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    let shape = r.post(path, json!({ "token": "my-overlay-token" })).await;
+    let (status, body) = (shape.status(), shape.json::<Value>().await.unwrap());
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]["message"].as_str().unwrap().starts_with("token:"));
+    assert_eq!(error_code(r.post(path, json!({})).await).await.0, StatusCode::BAD_REQUEST);
+    let wrong = r.post(path, json!({ "token": "eyJhbGciOiJIUzI1NiJ9.eyJ4IjoxfQ.d3Jvbmctc2lnbmF0dXJlLXRleHQ" })).await;
+    let (status, body) = (wrong.status(), wrong.json::<Value>().await.unwrap());
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("streamelements_token_rejected"))
+    );
+    assert!(body["error"]["hint"].as_str().unwrap().contains("Account → Channels → Show secrets"));
+    fake.set(|s| {
+        s.fail.insert("/tips".into(), 500);
+    });
+    assert_eq!(
+        error_code(r.post(path, json!({ "token": se::TOKEN })).await).await,
+        (StatusCode::BAD_GATEWAY, "streamelements_unavailable".into())
+    );
+    fake.set(|s| {
+        s.fail.clear();
+        s.fail.insert("/bot/commands".into(), 429);
+    });
+    let limited = r.post(path, json!({ "token": se::TOKEN })).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers().get("retry-after").and_then(|v| v.to_str().ok()), Some("7"));
+    fake.set(|s| s.fail.clear());
+
+    let ok = r.post(path, json!({ "token": format!("Bearer {}", se::TOKEN) })).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let preview: Value = ok.json().await.unwrap();
+    assert_eq!(preview["source"], "streamelements");
+    assert_eq!(preview["account"]["platform"], "twitch");
+    assert!(preview["sections"].as_array().unwrap().iter().any(|s| s["kind"] == "commands" && s["new"] == 3));
+    assert!(!preview.to_string().contains(se::TOKEN), "the token never comes back");
+    let id = preview["preview_id"].as_str().unwrap().to_string();
+    let bad_choice = r.post("/api/v1/import/apply", json!({ "preview_id": id, "on_conflict": "merge" })).await;
+    assert_eq!(error_code(bad_choice).await.0, StatusCode::BAD_REQUEST);
+    let applied = r.post("/api/v1/import/apply", json!({ "preview_id": id, "on_conflict": "keep" })).await;
+    assert_eq!(applied.status(), StatusCode::OK);
+    let report: Value = applied.json().await.unwrap();
+    assert_eq!(report["on_conflict"], "keep");
+    assert!(report["backup"].as_str().unwrap().contains("before-streamelements-import"));
+    let cmds: Value = r.get("/api/v1/commands").await.json().await.unwrap();
+    assert_eq!(cmds.as_array().unwrap().len(), 3);
+    let again = r.post("/api/v1/import/apply", json!({ "preview_id": id, "on_conflict": "keep" })).await;
+    assert_eq!(error_code(again).await, (StatusCode::NOT_FOUND, "preview_expired".into()));
+    assert!(fake.requests().iter().all(|(m, _)| m == "GET"));
+}
+
+#[tokio::test]
+async fn streamlabs_import_files_are_checked() {
+    let r = start().await;
+    let send = |parts: Vec<(&'static str, Option<Vec<u8>>, &'static str)>| {
+        let mut form = reqwest::multipart::Form::new();
+        for (name, bytes, text) in parts {
+            form = match bytes {
+                Some(b) => form.part(name, reqwest::multipart::Part::bytes(b).file_name(text)),
+                None => form.text(name, text),
+            };
+        }
+        r.client
+            .post(format!("{}/api/v1/import/streamlabs/preview", r.base))
+            .bearer_auth(&r.token)
+            .multipart(form)
+            .send()
+    };
+    let csv = b"Name,Rank,Points,Hours\nsam,Viewer,1500,12\n".to_vec();
+    let ok = send(vec![("platform", None, "twitch"), ("points", Some(csv.clone()), "Currency.csv")]).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: Value = ok.json().await.unwrap();
+    assert_eq!(v["source"], "streamlabs");
+    assert_eq!(v["sections"][0]["waiting"], 1);
+    let no_platform = send(vec![("points", Some(csv.clone()), "Currency.csv")]).await.unwrap();
+    assert_eq!(error_code(no_platform).await.0, StatusCode::BAD_REQUEST);
+    let bad_platform = send(vec![("platform", None, "tiktok"), ("points", Some(csv), "c.csv")]).await.unwrap();
+    assert_eq!(error_code(bad_platform).await.0, StatusCode::BAD_REQUEST);
+    let nothing = send(vec![("platform", None, "twitch")]).await.unwrap();
+    assert_eq!(error_code(nothing).await.0, StatusCode::BAD_REQUEST);
+    let png = send(vec![("platform", None, "twitch"), ("points", Some(b"\x89PNG\r\n\x1a\n\0\0".to_vec()), "a.png")])
+        .await
+        .unwrap();
+    assert_eq!(error_code(png).await, (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_type".into()));
+    let broken =
+        send(vec![("platform", None, "twitch"), ("points", Some(b"Name,Points\nsam,many\n".to_vec()), "c.csv")])
+            .await
+            .unwrap();
+    let (status, body) = (broken.status(), broken.json::<Value>().await.unwrap());
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body["error"]["message"].as_str().unwrap().contains("row 2, column \"Points\""));
+    let huge = vec![b'a'; 10 * 1024 * 1024 + 1];
+    let big = send(vec![("platform", None, "twitch"), ("points", Some(huge), "c.csv")]).await.unwrap();
+    assert_eq!(error_code(big).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
+}

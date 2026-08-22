@@ -81,6 +81,12 @@ impl From<EngineError> for ApiError {
             EngineError::Missing { code, message, hint } => {
                 ApiError::new(StatusCode::NOT_FOUND, code, message).hint(hint)
             }
+            EngineError::Refused { status, code, message, hint, retry_after } => {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                let mut a = ApiError::new(status, code, message).hint(hint);
+                a.retry_after = retry_after;
+                a
+            }
             EngineError::Connector(c) => c.into(),
             EngineError::Store(s) => s.into(),
             EngineError::Internal(m) => {

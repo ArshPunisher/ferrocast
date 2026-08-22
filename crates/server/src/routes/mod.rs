@@ -5,6 +5,7 @@ mod bot;
 mod core;
 mod discord;
 mod giveaways;
+mod import;
 mod loyalty;
 #[cfg(test)]
 pub(crate) use core::lan_ip;
@@ -118,6 +119,9 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/updates", get(app::updates))
         .route("/updates/install", post(app::install_update))
         .route("/setup/complete", post(app::setup_complete))
+        // StreamElements and Streamlabs importers (the Streamlabs upload is in `uploads`)
+        .route("/import/streamelements/preview", post(import::streamelements_preview))
+        .route("/import/apply", post(import::apply))
         .route("/backups", get(core::backups).post(core::backup_now))
         .route("/backups/{id}/restore", post(core::restore_backup))
 }
@@ -128,6 +132,11 @@ pub(crate) fn uploads() -> Router<AppState> {
         .route("/media", post(media::upload))
         .route("/export", post(media::export))
         .layer(axum::extract::DefaultBodyLimit::max(media::MAX_UPLOAD + 64 * 1024))
+        .merge(
+            Router::new()
+                .route("/import/streamlabs/preview", post(import::streamlabs_preview))
+                .layer(axum::extract::DefaultBodyLimit::max(import::MAX_STREAMLABS_BODY)),
+        )
         .merge(Router::new().route("/import", post(media::import)).layer(axum::extract::DefaultBodyLimit::max(
             usize::try_from(ferrocast_store::pack::MAX_PACK).unwrap_or(usize::MAX).saturating_add(64 * 1024),
         )))
