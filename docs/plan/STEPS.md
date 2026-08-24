@@ -68,8 +68,8 @@ Each step is one focused commit (or a few) and names its test. Tick only when th
 
 ## P9 Own your setup
 - [x] 9.1 Export everything (`.ferropack`: JSON + media) — R-02
-- [ ] 9.2 Import StreamElements (overlays, commands, timers, loyalty) — R-03
-- [ ] 9.3 Import Streamlabs (Cloudbot commands, timers, quotes)
+- [x] 9.2 Import StreamElements (commands, timers, points and their settings, tip history; overlays listed as not importable) — R-03
+- [x] 9.3 Import Streamlabs (points and tip history from exported files; Cloudbot commands and timers have no export)
 - [x] 9.4 Restore snapshots from the UI
 
 ## P10 Release

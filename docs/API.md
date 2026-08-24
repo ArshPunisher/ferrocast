@@ -300,7 +300,42 @@ Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/con
 
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
-POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`. StreamElements and Streamlabs imports aren't in this build yet.
+POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`.
+
+### Importing from StreamElements and Streamlabs
+Two steps: a **preview** reads everything and says what would happen (nothing is written), then **apply** imports it. Apply takes a backup first (restore it from Settings → Your data to undo), writes everything in one transaction, never deletes anything, and then the engine reloads commands, timers and points settings. One preview at a time can be applied, for 30 minutes; a new preview replaces it.
+
+```ts
+type ImportKind = "commands" | "timers" | "points" | "loyalty_settings" | "tips"
+type ImportItem = { name: string; reason: string }
+type NotImported = { what: string; count: number /* 0 = not counted */; reason: string }
+type ImportPreview = { preview_id: string; source: "streamelements" | "streamlabs"; expires_at: number;
+                       account: { name: string; platform: "twitch" | "youtube" | "kick" | null } | null /* StreamElements only */;
+                       sections: { kind: ImportKind; found: number; new: number; conflicts: number;
+                                   waiting: number /* points for people Ferrocast hasn't seen yet, paid when they show up */;
+                                   needs_match: number /* YouTube points with only a name: never paid automatically */; skipped: number;
+                                   conflict_items: ImportItem[]; skipped_items: ImportItem[]; needs_match_items: ImportItem[] /* up to 100 each; counts are exact */;
+                                   notes: string[] }[];
+                       not_imported: NotImported[] }
+type ImportReport = { source: "streamelements" | "streamlabs"; backup: string /* backup id */; on_conflict: "keep" | "replace";
+                      sections: { kind: ImportKind; found: number; added: number; replaced: number; kept: number; waiting: number;
+                                  needs_match: number; skipped: number; skipped_items: ImportItem[]; needs_match_items: ImportItem[]; notes: string[] }[];
+                      not_imported: NotImported[] }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| POST | `/api/v1/import/streamelements/preview` | `{ token }` (the JWT from StreamElements → Account → Channels → Show secrets; "Bearer " is fine) → `ImportPreview`. The token is used for this request only: never stored, logged or sent back. Ferrocast only makes GET requests to StreamElements |
+| POST | `/api/v1/import/streamlabs/preview` | multipart: `platform` (`twitch` \| `youtube` \| `kick`, needed with `points`), `points` and/or `tips` files (CSV or Excel `.xlsx`, up to 10 MB and 200,000 rows each) → `ImportPreview` |
+| POST | `/api/v1/import/apply` | `{ preview_id, on_conflict: "keep" \| "replace" }` → `ImportReport`. 404 `preview_expired` when the preview is gone (used, replaced or older than 30 minutes) |
+
+What comes over:
+- **StreamElements**: custom commands (name, aliases, reply, cooldowns, user level: everyone → everyone, subscriber → subs, regular and VIP → vips, moderator and above → mods; `${user}`, `${touser}`, `${1}`…`${9}`, `${1:}`, `${uptime}` become `{user}`, `{target}`, `{arg1}`…, `{args}`, `{uptime}`; a reply with any other variable is imported **switched off**, with a note), timers (first message, online interval, at least 5 minutes, chat lines), points balances (`/points/{channel}/top`; on a YouTube channel these usually carry names only, so they need a match), points settings (name, on/off, amount every 10 minutes, follow/sub/tip/host bonuses as follow/sub/tip/raid bonuses) and tip history. Overlays and custom widgets, loyalty store items and bot modules are listed in `not_imported` with the reason.
+- **Streamlabs**: points from a Streamlabs Chatbot Currency export (or any sheet with a name column such as `Name`/`Username` and a points column such as `Points`/`Currency`), and tip history from a sheet with date, name, amount and currency columns (`message` and `id` optional). Commands, timers and widgets can't be exported from Streamlabs; `not_imported` says so.
+- **Clashes** (`conflicts`): a command with the same name or alias, a timer with the same name, someone who already has points in Ferrocast, points settings already saved. `keep` leaves Ferrocast's version, `replace` overwrites it in place (same id). Entries listed twice, unusable names or replies, bots, zero balances and tips already imported are `skipped` with the reason.
+- **Matching people** (never by display name, which anyone can set): by platform user id when the source has one (a StreamElements `providerId`, or a `User ID`/`Channel ID` column in a Streamlabs file), else on Twitch and Kick by the unique login, case-insensitive. People Ferrocast already knows get their balance now; the rest are `waiting` and paid the first time that id or login shows up (an account without a login can only be matched by id). YouTube names aren't unique: a YouTube balance with only a name is `needs_match`, listed in the report, kept (in `.ferropack` too) but never paid automatically; the streamer adds it by hand from the viewer card (`POST /api/v1/loyalty/viewers/{platform}/{user_id}/adjust`). Tip history is kept for records and `tips.csv`; it never fires alerts or changes goals, the recap or the activity feed.
+
+Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 401 `streamelements_token_rejected` (expired or not the JWT; the hint says where to copy a fresh one), 409 `conflict` (another import step is running), 413 `too_large` (a file over 10 MB or 200,000 rows), 415 `unsupported_type` (not CSV or .xlsx, including old .xls), 422 `bad_file` (the message names the file, row and column: `points file: row 14, column "Points": "lots" isn't a whole number of points (0 or more).`), 429 `streamelements_rate_limited` with `Retry-After`, 502 `streamelements_unavailable` (their 5xx) / `streamelements_unreachable` / `streamelements_bad_response` / `streamelements_error`. Nothing is imported when a preview fails.
 
 ## 5. Live socket for the dashboard
 
@@ -350,4 +385,4 @@ Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/
 
 ## 7. Not in this build yet
 
-`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. StreamElements and Streamlabs imports aren't in this build yet. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself).
+`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself).
