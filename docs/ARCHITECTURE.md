@@ -22,7 +22,7 @@
 │   └─ /media/<id>      sounds and images, with Range                      │
 │                                                                          │
 │  store: SQLite (WAL), numbered migrations, snapshots before updates      │
-│  secrets: OS keychain only                                               │
+│  secrets: private 0600 file (macOS), OS keychain (Windows, Linux)        │
 └───────────────┬──────────────────────────────────────────────────────────┘
                 │ outbound WSS only (no inbound ports), optional
 ┌───────────────▼──────────────── Ferrocast relay (Oracle ARM, Rust) ──────┐
@@ -88,7 +88,7 @@ Every platform becomes one envelope (`core::event`):
 
 - Server binds `127.0.0.1` only; LAN is an opt-in toggle (R-43).
 - Dashboard API: bearer session token generated per app run, delivered to the Tauri window by an init script; `Origin`/`Host` checked (anti DNS-rebinding).
-- Tokens and secrets in the OS keychain via `keyring` (R-45). Never in SQLite, settings, exports or logs.
+- Tokens and secrets in `ferrocast-secrets` (R-45): on macOS a private `secrets.json` in the data folder (folder `0700`, file `0600`, atomic writes), on Windows and Linux the OS keychain via `keyring`. Never in SQLite, settings, exports, backups or logs. macOS skips the Keychain because unsigned (ad-hoc) builds get a new code identity with every update, so the Keychain would ask for the login password after each one.
 - No client secrets in the binary for Kick; YouTube and Twitch use public/installed-app clients injected at build time, never committed (R-46).
 - Scripts and imported widgets run sandboxed with declared capabilities (R-47).
 

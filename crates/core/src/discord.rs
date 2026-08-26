@@ -1,5 +1,5 @@
 //! Discord go-live posts through a webhook the streamer pastes in. The webhook URL is a
-//! secret (anyone with it can post to the channel): it lives in the keychain, never in the
+//! secret (anyone with it can post to the channel): it lives in the secret store (R-45), never in the
 //! database, exports or logs. Only a masked hint is ever shown back.
 
 use serde::{Deserialize, Serialize};

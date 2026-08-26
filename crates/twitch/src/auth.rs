@@ -36,7 +36,7 @@ pub struct DeviceCode {
     pub interval: u64,
 }
 
-/// Saved in the keychain as JSON. `expires_at` lets us refresh before Twitch says no.
+/// Saved in the secret store as JSON. `expires_at` lets us refresh before Twitch says no.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     pub access_token: String,

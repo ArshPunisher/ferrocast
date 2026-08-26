@@ -1,7 +1,7 @@
 //! `.ferropack`: everything a streamer made, in one open file (R-02).
 //!
 //! A zip with plain JSON per table, the media files, and `tips.csv` (tip history for
-//! taxes). It never contains tokens or secrets: those live in the keychain, not the
+//! taxes). It never contains tokens or secrets: those live in the secret store, not the
 //! database. Overlay URLs are kept, so moving to a new PC keeps OBS working.
 //!
 //! Import takes a snapshot first, checks every path inside the zip (no `../`), and writes

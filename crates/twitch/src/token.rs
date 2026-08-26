@@ -27,7 +27,7 @@ impl fmt::Debug for Auth {
 }
 
 impl Auth {
-    /// `on_tokens` must persist new tokens (keychain) and return an error if it couldn't;
+    /// `on_tokens` must persist new tokens (the secret store) and return an error if it couldn't;
     /// a refresh whose result can't be saved would lose the account at the next restart.
     pub fn new(http: reqwest::Client, ep: Endpoints, client_id: String, tokens: Tokens, on_tokens: OnTokens) -> Self {
         Auth { http, ep, client_id, tokens: Mutex::new(tokens), on_tokens }
