@@ -453,7 +453,11 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
     assert_eq!(result.applied[0].modes, vec!["followers_only".to_string(), "slow".to_string()]);
     let mut kinds = Vec::new();
     while let Ok(f) = live.try_recv() {
-        kinds.push(serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string());
+        let v = serde_json::from_str::<Value>(&f.text).unwrap();
+        if v["type"] == "notice" {
+            assert_eq!(v["data"]["key"], "panic", "panic notices replace each other on the dashboard");
+        }
+        kinds.push(v["type"].as_str().unwrap_or("").to_string());
     }
     assert!(kinds.contains(&"panic".to_string()) && kinds.contains(&"notice".to_string()), "{kinds:?}");
     assert!(e.queue().await.paused);
@@ -637,7 +641,7 @@ async fn connecting_twitch_signs_in_runs_eventsub_and_answers_commands() {
     while st.lock().unwrap().sessions == 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(secrets.get("twitch-tokens").unwrap().is_some(), "tokens went to the keychain");
+    assert!(secrets.get("twitch-tokens").unwrap().is_some(), "tokens went to the secret store");
     while st.lock().unwrap().subs.is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1466,6 +1470,120 @@ async fn obs_settings_are_found_and_used_without_typing() {
     let (view, _) = e.obs_detect_in(vec![junk.clone()]).await.unwrap();
     assert!(!view.found && view.reason.unwrap().contains("couldn't be read"));
     assert!(matches!(e.obs_use_detected_in(vec![junk]).await, Err(EngineError::Unavailable(_))));
+}
+
+/// A tiny obs-websocket v5 server (no password): enough for "connected" and the scene.
+async fn fake_obs() -> u16 {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else { return };
+                let hello = serde_json::json!({ "op": 0, "d": { "obsWebSocketVersion": "5.5.0", "rpcVersion": 1 } });
+                let _ = ws.send(Message::text(hello.to_string())).await;
+                let _ = ws.next().await;
+                let _ = ws.send(Message::text(r#"{"op":2,"d":{"negotiatedRpcVersion":1}}"#)).await;
+                while let Some(Ok(msg)) = ws.next().await {
+                    let Ok(req) = serde_json::from_str::<Value>(msg.to_text().unwrap_or("")) else { continue };
+                    let d = &req["d"];
+                    let data = match d["requestType"].as_str() {
+                        Some("GetVersion") => {
+                            serde_json::json!({ "obsVersion": "32.0.1", "obsWebSocketVersion": "5.5.0",
+                            "rpcVersion": 1, "availableRequests": [], "supportedImageFormats": [], "platform": "macos",
+                            "platformDescription": "macOS" })
+                        }
+                        _ => {
+                            serde_json::json!({ "sceneName": "Gaming", "sceneUuid": "11111111-1111-4111-8111-111111111111",
+                            "currentProgramSceneName": "Gaming",
+                            "currentProgramSceneUuid": "11111111-1111-4111-8111-111111111111" })
+                        }
+                    };
+                    let resp = serde_json::json!({ "op": 7, "d": { "requestType": d["requestType"], "requestId": d["requestId"],
+                        "requestStatus": { "result": true, "code": 100 }, "responseData": data } });
+                    if ws.send(Message::text(resp.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+async fn obs_state_becomes(e: &Engine, want: &str) -> crate::state::ConnectorView {
+    for _ in 0..100 {
+        let v = e.state().connectors.get("obs").cloned().unwrap();
+        if v.state == want {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("OBS never became {want}: {:?}", e.state().connectors.get("obs"));
+}
+
+#[tokio::test]
+async fn obs_connects_by_itself_once_its_websocket_is_switched_on() {
+    let (e, d) = engine().await;
+    let cfg = d.path().join("obs-config.json");
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    std::fs::write(&cfg, format!(r#"{{"server_enabled":false,"server_port":{closed}}}"#)).unwrap();
+    e.set_obs_detect_paths(vec![cfg.clone()]);
+    let mut live = e.subscribe_live();
+    e.watch_obs();
+    let off = obs_state_becomes(&e, "disconnected").await;
+    assert!(off.detail.unwrap().contains("switched off"), "says how to fix it");
+
+    // The streamer ticks "Enable WebSocket server" in OBS: no click in Ferrocast.
+    let port = fake_obs().await;
+    std::fs::write(&cfg, format!(r#"{{"server_enabled":true,"server_port":{port}}}"#)).unwrap();
+    obs_state_becomes(&e, "connected").await;
+    let mut saw_status = false;
+    while let Ok(f) = live.try_recv() {
+        saw_status |= f.text.contains(r#""type":"status""#) && f.text.contains(r#""state":"connected""#);
+    }
+    assert!(saw_status, "dashboards hear about it");
+    let view = e.obs().await.unwrap();
+    assert_eq!((view.state.as_str(), view.port, view.auto), ("connected", port, true));
+    assert!(e.obs_detect().await.unwrap().in_use, "nothing to offer");
+
+    // Pressing Connect without changing anything keeps following OBS.
+    let same =
+        e.save_obs(ferrocast_obs::ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
+    assert!(same.auto);
+
+    // Changing only the address keeps the password read from OBS (now saved as typed).
+    std::fs::write(
+        &cfg,
+        format!(r#"{{"server_enabled":true,"server_port":{port},"auth_required":true,"server_password":"from-obs"}}"#),
+    )
+    .unwrap();
+    let moved =
+        e.save_obs(ferrocast_obs::ObsConfig { host: "localhost".into(), port }, PasswordChange::Keep).await.unwrap();
+    assert!(!moved.auto && moved.has_password);
+    assert_eq!(e.inner.secrets.get("obs-password").unwrap().as_deref(), Some("from-obs"));
+    std::fs::write(&cfg, format!(r#"{{"server_enabled":true,"server_port":{port}}}"#)).unwrap();
+
+    // Typed details are never replaced by detected ones...
+    let typed = e
+        .save_obs(
+            ferrocast_obs::ObsConfig { host: "127.0.0.1".into(), port: closed },
+            PasswordChange::Set("typed".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!((typed.state.as_str(), typed.port, typed.auto), ("disconnected", closed, false));
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(e.state().connectors.get("obs").unwrap().state, "disconnected", "still the streamer's details");
+    let offer = e.obs_detect().await.unwrap();
+    assert!(offer.found && !offer.in_use, "so \"Use these\" is offered");
+
+    // ...until they choose "Use these".
+    let used = e.obs_use_detected().await.unwrap();
+    assert_eq!((used.state.as_str(), used.port, used.auto, used.has_password), ("connected", port, true, false));
+    obs_state_becomes(&e, "connected").await;
 }
 
 // ---------------------------------------------------------------- starter commands

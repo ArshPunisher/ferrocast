@@ -174,6 +174,7 @@ impl Engine {
             self.send_live(LiveFrame::new(
                 "notice",
                 &Notice {
+                    key: Some("no-chat".into()),
                     level: NoticeLevel::Warn,
                     message: format!("No chat is connected, so Ferrocast couldn't {what}."),
                     action: None,

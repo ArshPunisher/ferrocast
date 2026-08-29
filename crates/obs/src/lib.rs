@@ -6,9 +6,11 @@
 
 pub mod detect;
 
+/// The open connection [`connect`] returns.
+pub use obws::Client;
+
 use std::time::Duration;
 
-use obws::Client;
 use obws::requests::inputs::{Create, InputId, SetSettings};
 use obws::requests::scene_items::{CreateSceneItem, Id};
 use obws::requests::scenes::SceneId;
@@ -16,7 +18,7 @@ use obws::requests::sources::SourceId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-/// Where OBS listens. The password, if any, is looked up from the keychain by the caller.
+/// Where OBS listens. The password, if any, is looked up from the secret store by the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObsConfig {
     pub host: String,

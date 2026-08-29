@@ -114,17 +114,28 @@ struct Inner {
     import: Mutex<import::Slot>,
     import_busy: tokio::sync::Mutex<()>,
     streamelements_api: RwLock<String>,
+    /// Wakes the OBS connection task when its settings change.
+    obs_wake: Notify,
+    /// Where OBS's own settings are looked for.
+    obs_paths: RwLock<Vec<std::path::PathBuf>>,
 }
 
 impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
-        Self::start_with(data_dir, Arc::from(ferrocast_secrets::best_available()), PlatformApps::from_env()).await
+        let engine = Self::start_with(
+            data_dir,
+            Arc::from(ferrocast_secrets::best_available(data_dir)),
+            PlatformApps::from_env(),
+        )
+        .await?;
+        engine.watch_obs();
+        Ok(engine)
     }
 
     /// Like [`Engine::start`] with a chosen secret store (tests use memory, never the
-    /// developer's real keychain).
+    /// developer's real secrets).
     pub async fn start_with_secrets(
         data_dir: &Path,
         secrets: Arc<dyn ferrocast_secrets::Secrets>,
@@ -197,6 +208,9 @@ impl Engine {
                 import: Mutex::new(None),
                 import_busy: tokio::sync::Mutex::new(()),
                 streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),
+                obs_wake: Notify::new(),
+                // Tests never read (or connect to) the developer's real OBS: `start` sets the real places.
+                obs_paths: RwLock::new(Vec::new()),
             }),
         };
         tokio::spawn(prune(engine.clone()));

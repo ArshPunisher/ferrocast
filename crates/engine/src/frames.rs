@@ -63,6 +63,10 @@ pub fn envelope(seq: Option<u64>, kind: &str, data: &impl Serialize) -> Arc<str>
 /// A message for the dashboard's notice area.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Notice {
+    /// Notices with the same key replace each other on the dashboard (one line per
+    /// subject, never a stack): `panic`, `account:twitch`, `discord`, …
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub level: NoticeLevel,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]

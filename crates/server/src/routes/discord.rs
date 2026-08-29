@@ -1,4 +1,4 @@
-//! Discord go-live posts: settings (the webhook stays in the keychain) and a test post.
+//! Discord go-live posts: settings (the webhook stays in the secret store) and a test post.
 
 use axum::Json;
 use axum::extract::State;

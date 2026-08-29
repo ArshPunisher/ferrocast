@@ -101,6 +101,7 @@ impl Engine {
                     self.send_live(LiveFrame::new(
                         "notice",
                         &Notice {
+                            key: Some("alerts-folded".into()),
                             level: NoticeLevel::Info,
                             message: format!(
                                 "{} alert{} waited too long and went to the event list instead.",

@@ -60,6 +60,7 @@ impl Engine {
     /// The shell couldn't install: tell the streamer on the dashboard.
     pub fn update_failed(&self, why: &str) {
         self.notice(
+            "update",
             NoticeLevel::Warn,
             &format!("The update couldn't be installed: {why}. Ferrocast keeps running the current version."),
         );

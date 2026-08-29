@@ -55,6 +55,7 @@ impl Engine {
                 engine.send_live(LiveFrame::new(
                     "notice",
                     &Notice {
+                        key: None,
                         level: NoticeLevel::Warn,
                         message: format!("Couldn't {what} on {platform}: {err}"),
                         action: None,
@@ -343,7 +344,7 @@ impl Engine {
         } else {
             (NoticeLevel::Error, format!("{message} Some changes didn't apply: {}.", failed.join("; ")))
         };
-        self.send_live(LiveFrame::new("notice", &Notice { level, message, action: None }));
+        self.send_live(LiveFrame::new("notice", &Notice { key: Some("panic".into()), level, message, action: None }));
         Ok(PanicResult { on, applied })
     }
 

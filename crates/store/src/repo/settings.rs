@@ -1,4 +1,4 @@
-//! Typed key-value settings and connected accounts (no secrets: those live in the keychain).
+//! Typed key-value settings and connected accounts (no secrets: those live in the secret store).
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

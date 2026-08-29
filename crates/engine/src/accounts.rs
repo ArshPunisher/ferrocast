@@ -1,6 +1,6 @@
 //! Signing platforms in and out, and running their adapters.
 //!
-//! Tokens live in the keychain (R-45); the `accounts` table only remembers who is
+//! Tokens live in the secret store (R-45); the `accounts` table only remembers who is
 //! connected. On start, every saved account's adapter starts by itself.
 
 use std::sync::Arc;
@@ -118,7 +118,11 @@ impl Engine {
             loop {
                 tokio::time::sleep(interval).await;
                 if tokio::time::Instant::now() > deadline {
-                    engine.notice(NoticeLevel::Warn, "The Twitch sign-in code expired. Press Connect again.");
+                    engine.notice(
+                        "account:twitch",
+                        NoticeLevel::Warn,
+                        "The Twitch sign-in code expired. Press Connect again.",
+                    );
                     return;
                 }
                 match twitch_auth::poll(&http, &ep, &client_id, &code.device_code).await {
@@ -126,12 +130,16 @@ impl Engine {
                     Ok(Poll::SlowDown) => interval += Duration::from_secs(5),
                     Ok(Poll::Done(tokens)) => {
                         if let Err(e) = engine.finish_twitch(tokens).await {
-                            engine.notice(NoticeLevel::Error, &format!("Twitch sign-in didn't finish: {e}"));
+                            engine.notice(
+                                "account:twitch",
+                                NoticeLevel::Error,
+                                &format!("Twitch sign-in didn't finish: {e}"),
+                            );
                         }
                         return;
                     }
                     Err(e) => {
-                        engine.notice(NoticeLevel::Warn, &e.to_string());
+                        engine.notice("account:twitch", NoticeLevel::Warn, &e.to_string());
                         return;
                     }
                 }
@@ -161,7 +169,7 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_twitch(auth, account);
-        self.notice(NoticeLevel::Info, "Twitch is connected.");
+        self.notice("account:twitch", NoticeLevel::Info, "Twitch is connected.");
         Ok(())
     }
 
@@ -303,10 +311,14 @@ impl Engine {
             match ferrocast_youtube::oauth::finish(&http, &ep, &app, pending, YOUTUBE_SIGN_IN).await {
                 Ok(tokens) => {
                     if let Err(e) = engine.finish_youtube(tokens).await {
-                        engine.notice(NoticeLevel::Error, &format!("YouTube sign-in didn't finish: {e}"));
+                        engine.notice(
+                            "account:youtube",
+                            NoticeLevel::Error,
+                            &format!("YouTube sign-in didn't finish: {e}"),
+                        );
                     }
                 }
-                Err(e) => engine.notice(NoticeLevel::Warn, &e.to_string()),
+                Err(e) => engine.notice("account:youtube", NoticeLevel::Warn, &e.to_string()),
             }
         });
         Ok(ConnectFlow::Browser { url })
@@ -328,7 +340,11 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_youtube(api, account);
-        self.notice(NoticeLevel::Info, "YouTube is connected. Chat shows up whenever you're live there.");
+        self.notice(
+            "account:youtube",
+            NoticeLevel::Info,
+            "YouTube is connected. Chat shows up whenever you're live there.",
+        );
         Ok(())
     }
 
@@ -382,7 +398,11 @@ impl Engine {
         }
     }
 
-    pub(crate) fn notice(&self, level: NoticeLevel, message: &str) {
-        self.send_live(LiveFrame::new("notice", &Notice { level, message: message.to_string(), action: None }));
+    /// One line on the dashboard. Notices with the same `key` replace each other there.
+    pub(crate) fn notice(&self, key: &str, level: NoticeLevel, message: &str) {
+        self.send_live(LiveFrame::new(
+            "notice",
+            &Notice { key: Some(key.to_string()), level, message: message.to_string(), action: None },
+        ));
     }
 }

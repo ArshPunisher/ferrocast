@@ -158,7 +158,7 @@ Tips goals are in **major units** of their currency everywhere (API, `goals` fra
 | POST | `/api/v1/mod/unban` | `{ platform, user_id }` → 204 (always asks the platform, so bans the filter made can be undone) |
 | GET | `/api/v1/mod/bans` | → `BanEntry[]`, newest first |
 | GET | `/api/v1/mod/panic` | → `{ on, plan: PanicConfig }` |
-| POST | `/api/v1/mod/panic` | `{ on: boolean }` → `{ on, applied: { platform, modes: string[] }[] }`; also sends `panic` and one `notice` frame |
+| POST | `/api/v1/mod/panic` | `{ on: boolean }` → `{ on, applied: { platform, modes: string[] }[] }`; also sends `panic` and one `notice` frame with `key: "panic"` (it replaces the previous panic notice) |
 | GET / PUT | `/api/v1/mod/panic/config` | `PanicConfig` (400 names the field) |
 | GET / PUT | `/api/v1/mod/filters` | `Filters` (400 names the field, e.g. `timeout_seconds: must be between 1 second and 14 days.`) |
 | GET | `/api/v1/mod/held` | → held chat `Event[]`, oldest first |
@@ -276,7 +276,7 @@ Errors: 400 `invalid` (handle 3–30 of `a-z 0-9 - _`, reserved words, links mus
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
 ### Discord go-live posts
-The streamer pastes a Discord webhook URL; Ferrocast posts when a platform goes live. The URL is a secret: it is kept in the OS keychain, never in the database, never in a `.ferropack`, never sent back.
+The streamer pastes a Discord webhook URL; Ferrocast posts when a platform goes live. The URL is a secret: it is kept in the secret store (R-45), never in the database, never in a `.ferropack`, never sent back.
 
 ```ts
 type DiscordView = { has_webhook: boolean; webhook_hint: string | null /* "discord.com webhook …4821" */;
@@ -292,11 +292,13 @@ type DiscordView = { has_webhook: boolean; webhook_hint: string | null /* "disco
 Defaults: on, `{name} is live on {platform}! {title|default:"Come hang out."} {url}`, no @everyone ping (`mention_everyone` lets the message ping). One post per platform per 30 minutes (a stream that drops and comes back isn't news). A failed go-live post becomes one `notice` with a link to the Discord settings.
 
 ### OBS
-GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the keychain; absent keeps it, `null` clears it).
+GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, auto, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the secret store; absent keeps it, `null` clears it).
+
+The engine keeps OBS connected by itself: it checks a working connection every 5 s, retries a closed OBS every 3 s, and sends one `status` frame whenever the state changes. `auto: true` means Ferrocast follows OBS's own settings (below): each attempt re-reads them, so switching on OBS's WebSocket server (or changing its password) connects within seconds, no click needed, and the password is never copied out of OBS's file. The details become the streamer's own (`auto: false`) when they PUT `/obs` with anything different from what's in use; from then on detected values never replace them, until POST `/obs/detect`. Settings saved before `auto` existed count as the streamer's own only if the address or port differ from `127.0.0.1:4455`. With `auto` and no OBS settings on this computer, a failed attempt is `state: "off"` (nothing set up), not `disconnected`.
 
 Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/config.json` in OBS's config folder: `~/Library/Application Support/obs-studio` on macOS, `%APPDATA%\obs-studio` on Windows, `$XDG_CONFIG_HOME` or `~/.config/obs-studio` and the Flatpak folder on Linux), so nobody types the port or password:
-- GET `/api/v1/obs/detect` → `{ found, port: number | null, has_password, server_enabled, reason: string | null }`. Never the password. A missing or damaged file is `found: false` with a plain `reason`; `server_enabled: false` comes with how to switch it on.
-- POST `/api/v1/obs/detect` → the OBS view (as GET `/obs`) after saving `127.0.0.1`, the detected port and password (to the keychain). 422 with the reason when nothing usable was found.
+- GET `/api/v1/obs/detect` → `{ found, port: number | null, has_password, server_enabled, in_use, reason: string | null }`. `in_use`: Ferrocast already uses these (following OBS, or the typed details match), so there is nothing to offer. Never the password. A missing or damaged file is `found: false` with a plain `reason`; `server_enabled: false` comes with how to switch it on.
+- POST `/api/v1/obs/detect` ("Use these") → the OBS view (as GET `/obs`) after switching back to following OBS's settings (`auto: true`; a typed password is forgotten). 422 with the reason when nothing usable was found.
 
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
@@ -345,7 +347,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `status { connectors }`
 - `queue Queue`
 - `tts_pending [...]`
-- `notice { level: "info" | "warn" | "error", message, action?: { label, href } }` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
+- `notice { key?, level: "info" | "warn" | "error", message, action?: { label, href } }`. A notice replaces the shown one with the same `key` (one line per subject, never a stack): `panic`, `account:twitch` / `account:youtube` / `account:kick`, `discord`, `update`, `no-chat`, `alerts-folded` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
 - `panic { on, plan: PanicConfig }`

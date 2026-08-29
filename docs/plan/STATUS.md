@@ -24,6 +24,7 @@ Newest entry first. Update at the end of every working session.
 ## Log
 
 ### 2026-10-18
+- Owner-reported fixes. Secrets on macOS move from the Keychain to a private `secrets.json` in the data folder (`FileSecrets`; 0700/0600, atomic writes, damaged file = clear error, never wiped), because ad-hoc signed updates made macOS ask for the login password (R-45 rewritten). Old Keychain items are not read: macOS users reconnect once. OBS: a background connection follows OBS's own settings until the streamer types different details (`auto` on `/obs`, `in_use` on `/obs/detect`), retries every 3 s, re-reads OBS's file each attempt, and sends `status` frames on every change. Notices carry a `key` so the dashboard replaces instead of stacking (`panic`, `account:*`, …).
 - StreamElements and Streamlabs importers (P9.2, P9.3): `/api/v1/import/streamelements/preview`, `/import/streamlabs/preview`, `/import/apply`. Migration 0008 (`pending_points`, `imported_tips`; both in `.ferropack`, imported tips in `tips.csv`). Preview tried against the owner's real StreamElements account (fresh, so empty).
 
 ### 2026-10-17

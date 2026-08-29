@@ -707,6 +707,7 @@ fn obs_version_is_the_bare_number() {
         host: "127.0.0.1".into(),
         port: 4455,
         has_password: false,
+        auto: true,
         detail: None,
         status: Some(ferrocast_obs::ObsStatus {
             obs_version: "31.1.2".into(),
@@ -1156,7 +1157,7 @@ async fn obs_detect_answers_with_a_reason_and_never_a_password() {
     let res = r.get("/api/v1/obs/detect").await;
     assert_eq!(res.status(), StatusCode::OK);
     let v: Value = res.json().await.unwrap();
-    for key in ["found", "port", "has_password", "server_enabled", "reason"] {
+    for key in ["found", "port", "has_password", "server_enabled", "in_use", "reason"] {
         assert!(v.get(key).is_some(), "{key}");
     }
     assert!(v.get("password").is_none());

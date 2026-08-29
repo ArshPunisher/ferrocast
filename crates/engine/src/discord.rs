@@ -1,4 +1,4 @@
-//! Discord go-live posts. The webhook URL is a secret kept in the keychain (R-45), never in
+//! Discord go-live posts. The webhook URL is a secret kept in the secret store (R-45), never in
 //! the database, so it is never in an export either. Discord's answers become plain
 //! messages: a deleted webhook, a bad token, rate limits.
 
@@ -89,9 +89,7 @@ impl Engine {
                 Some(None) => self.inner.secrets.delete(WEBHOOK_KEY),
                 Some(Some(url)) => self.inner.secrets.set(WEBHOOK_KEY, &url),
             };
-            r.map_err(|e| {
-                EngineError::Unavailable(format!("The webhook couldn't be saved in this computer's keychain: {e}"))
-            })?;
+            r.map_err(|e| EngineError::Unavailable(format!("The webhook couldn't be saved: {e}")))?;
         }
         self.discord().await
     }
@@ -131,6 +129,7 @@ impl Engine {
                 engine.send_live(LiveFrame::new(
                     "notice",
                     &Notice {
+                        key: Some("discord".into()),
                         level: NoticeLevel::Warn,
                         message: format!("The Discord go-live post didn't go out. {}", f.error),
                         action: Some(crate::frames::NoticeAction {

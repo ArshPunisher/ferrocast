@@ -162,7 +162,8 @@ pub async fn obs_detect(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.obs_detect().await?)))
 }
 
-/// Uses the detected port and password (the password goes to the keychain), then tries OBS.
+/// "Use these": back to following OBS's own settings (a typed password is forgotten; the
+/// detected one is never copied), then tries OBS.
 pub async fn obs_use_detected(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(obs_view(&app.engine.obs_use_detected().await?)))
 }

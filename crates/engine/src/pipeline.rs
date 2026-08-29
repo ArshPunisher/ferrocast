@@ -88,6 +88,7 @@ impl Engine {
                     self.send_live(LiveFrame::new(
                         "notice",
                         &Notice {
+                            key: Some(format!("account:{}", platform_key(e.platform))),
                             level: NoticeLevel::Warn,
                             message,
                             action: Some(crate::frames::NoticeAction {
@@ -555,7 +556,10 @@ impl Engine {
         } else {
             format!("{what} took a tip back.")
         };
-        self.send_live(LiveFrame::new("notice", &Notice { level: NoticeLevel::Warn, message, action: None }));
+        self.send_live(LiveFrame::new(
+            "notice",
+            &Notice { key: None, level: NoticeLevel::Warn, message, action: None },
+        ));
     }
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {
