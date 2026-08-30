@@ -617,14 +617,14 @@ fn loyalty(c: &Connection, inc: &Incoming, choice: OnConflict, write: bool, t: &
     }
     if saved.is_some() {
         let detail = format!(
-            "You've already set up points in Ferrocast (\"{}\", {} every {} minutes); {} uses \"{}\", {} every {} minutes.",
+            "You've already set up points in Ferrocast (\"{}\", {} every {}); {} uses \"{}\", {} every {}.",
             current.name,
             current.per_interval,
-            current.interval_min,
+            ferrocast_core::template::plural(u64::from(current.interval_min), "minute", "minutes"),
             inc.source.label(),
             merged.name,
             merged.per_interval,
-            merged.interval_min
+            ferrocast_core::template::plural(u64::from(merged.interval_min), "minute", "minutes"),
         );
         if !t.conflict(name, detail, choice) {
             return Ok(());

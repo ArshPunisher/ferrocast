@@ -199,6 +199,7 @@ pub fn event_vars(event: &Event) -> Vars {
     match &event.kind {
         EventKind::Subscription { tier, months, message, gifted_by, .. } => {
             v.insert("months".into(), months.to_string());
+            v.insert("months_text".into(), plural(u64::from(*months), "month", "months"));
             v.insert("tier".into(), tier_label(tier));
             if let Some(m) = message {
                 v.insert("message".into(), m.text.clone());
@@ -209,6 +210,7 @@ pub fn event_vars(event: &Event) -> Vars {
         }
         EventKind::GiftBatch { tier, count, .. } => {
             v.insert("count".into(), count.to_string());
+            v.insert("count_text".into(), plural(u64::from(*count), "sub", "subs"));
             v.insert("amount".into(), count.to_string());
             v.insert("tier".into(), tier_label(tier));
         }
@@ -236,6 +238,7 @@ pub fn event_vars(event: &Event) -> Vars {
         }
         EventKind::Raid { viewers, .. } => {
             v.insert("viewers".into(), viewers.to_string());
+            v.insert("viewers_text".into(), plural(u64::from(*viewers), "viewer", "viewers"));
             v.insert("amount".into(), viewers.to_string());
         }
         EventKind::RewardRedemption { reward, cost, input, .. } => {
@@ -264,10 +267,49 @@ fn tier_label(t: &crate::event::Tier) -> String {
     }
 }
 
+/// "1 month", "12 months": a count with the word that fits it.
+pub fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Templates written as "{months} months" (the old default, and what most people type)
+/// read "1 months" for a first sub. Each pair is rewritten to its `_text` variable before
+/// rendering, so existing templates say "1 month" without being edited.
+const COUNTED_WORDS: [(&str, &str); 3] =
+    [("{months} months", "{months_text}"), ("{count} subs", "{count_text}"), ("{viewers} viewers", "{viewers_text}")];
+
+/// Rewrites "{months} months" and friends to their singular-aware variables.
+pub fn with_plurals(src: &str) -> std::borrow::Cow<'_, str> {
+    if !COUNTED_WORDS.iter().any(|(from, _)| src.contains(from)) {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = src.to_string();
+    for (from, to) in COUNTED_WORDS {
+        out = out.replace(from, to);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Every variable name any event can set, for the editor's autocomplete.
-pub const KNOWN_VARS: [&str; 15] = [
-    "name", "user", "platform", "amount", "currency", "message", "months", "tier", "gifter", "count", "value", "unit",
-    "viewers", "reward", "cost",
+pub const KNOWN_VARS: [&str; 18] = [
+    "name",
+    "user",
+    "platform",
+    "amount",
+    "currency",
+    "message",
+    "months",
+    "months_text",
+    "tier",
+    "gifter",
+    "count",
+    "count_text",
+    "value",
+    "unit",
+    "viewers",
+    "viewers_text",
+    "reward",
+    "cost",
 ];
 
 #[cfg(test)]
@@ -286,6 +328,19 @@ mod tests {
         assert_eq!(t.render(&vars(&[("name", "asha"), ("amount", "₹500")])), "ASHA gave ₹500! no message");
         let t = Template::parse("{name|title}").unwrap();
         assert_eq!(t.render(&vars(&[("name", "pixel panda")])), "Pixel Panda");
+    }
+
+    #[test]
+    fn counts_read_right_for_one() {
+        assert_eq!(plural(1, "month", "months"), "1 month");
+        assert_eq!(plural(0, "month", "months"), "0 months");
+        assert_eq!(plural(12, "month", "months"), "12 months");
+        let v = vars(&[("months", "1"), ("months_text", "1 month"), ("count", "1"), ("count_text", "1 sub")]);
+        let t = Template::parse(&with_plurals("{name} subscribed for {months} months! Gifted {count} subs")).unwrap();
+        assert_eq!(t.render(&v), " subscribed for 1 month! Gifted 1 sub");
+        // Anything else is left exactly as written.
+        assert_eq!(with_plurals("{months} mo"), "{months} mo");
+        assert!(matches!(with_plurals("plain"), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

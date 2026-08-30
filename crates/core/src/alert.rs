@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::{Event, EventKind, Platform};
-use crate::template::{Template, TemplateError, Vars, event_vars};
+use crate::template::{Template, TemplateError, Vars, event_vars, with_plurals};
 
 /// One condition. Variations combine them with all/any.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,7 +269,8 @@ pub struct RenderedAlert {
 /// paid alert.
 pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) -> RenderedAlert {
     let vars: Vars = event_vars(event);
-    let fill = |src: &str| Template::parse(src).map(|t| t.render(&vars)).unwrap_or_else(|_| src.to_string());
+    let fill =
+        |src: &str| Template::parse(&with_plurals(src)).map(|t| t.render(&vars)).unwrap_or_else(|_| src.to_string());
     let body = fill(&v.body);
     RenderedAlert {
         alert_id: alert_id.into(),
@@ -304,12 +305,12 @@ pub fn default_rules() -> Vec<AlertRule> {
     };
     vec![
         rule("follow", "Follows", "follow", "{name} followed!"),
-        rule("sub", "Subscriptions", "subscription", "{name} subscribed for {months} months!"),
-        rule("gift", "Gifted subs", "gift_batch", "{name} gifted {count} subs!"),
+        rule("sub", "Subscriptions", "subscription", "{name} subscribed for {months_text}!"),
+        rule("gift", "Gifted subs", "gift_batch", "{name} gifted {count_text}!"),
         rule("bits", "Bits and KICKs", "platform_gift", "{name} sent {value}!"),
         rule("superchat", "Super Chats", "paid_message", "{name} sent {amount}!"),
         rule("tip", "Tips", "tip", "{name} tipped {amount}!"),
-        rule("raid", "Raids", "raid", "{name} is raiding with {viewers} viewers!"),
+        rule("raid", "Raids", "raid", "{name} is raiding with {viewers_text}!"),
         rule("redeem", "Channel points", "reward_redemption", "{name} redeemed {reward}"),
     ]
 }
@@ -447,5 +448,22 @@ mod tests {
         assert_eq!(a.tts_text.as_deref(), Some("Keep it up!"));
         let follow = any_sample("follow", Millis(0)).unwrap();
         assert_eq!(render("a", &rule, &v, &follow).tts_text, None);
+    }
+
+    #[test]
+    fn a_first_sub_reads_one_month_with_old_and_new_templates() {
+        let defaults = default_rules();
+        let sub_rule = defaults.iter().find(|r| r.id == "sub").unwrap();
+        let one = sub_with_months(1);
+        let a = render("a", sub_rule, &sub_rule.variations[0], &one);
+        assert!(a.title.ends_with("subscribed for 1 month!"), "{}", a.title);
+        let many = render("a", sub_rule, &sub_rule.variations[0], &sub_with_months(12));
+        assert!(many.title.ends_with("subscribed for 12 months!"), "{}", many.title);
+        // A rule saved with the old default text still reads right.
+        let old = Variation::new("old", "{name} subscribed for {months} months!");
+        assert!(render("a", sub_rule, &old, &one).title.ends_with("subscribed for 1 month!"));
+        // And other wording is left alone.
+        let own = Variation::new("own", "{months}");
+        assert_eq!(render("a", sub_rule, &own, &one).title, "1");
     }
 }
