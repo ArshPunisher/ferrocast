@@ -59,7 +59,7 @@ pub async fn updates(State(app): State<AppState>) -> Json<Value> {
 
 /// `POST /updates/install`: the desktop downloads, verifies and installs it, then restarts.
 pub async fn install_update(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
-    let update = app.engine.request_update_install()?;
+    let update = app.engine.request_update_install().await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "installing": update.version }))))
 }
 

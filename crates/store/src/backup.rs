@@ -1,20 +1,56 @@
-//! Database snapshots: taken before every migration and update, kept rotating (R-34).
+//! Database snapshots: taken every day, before every migration, update and import, and on
+//! request, kept rotating (R-34).
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StoreError};
 
-/// How many snapshots to keep. Older ones are deleted after a new one is written.
+/// How many snapshots to keep besides the daily ones. Older ones are deleted after a new
+/// one is written.
 pub const KEEP: usize = 10;
+/// How many daily snapshots to keep (a week), on top of [`KEEP`], so a week of daily copies
+/// never pushes out the copy taken before a migration or an import.
+pub const KEEP_DAILY: usize = 7;
+
+/// The label daily snapshots are taken with.
+pub const DAILY: &str = "daily";
+/// The label of the snapshot taken right before an app update installs.
+pub const BEFORE_UPDATE: &str = "before-update";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BackupInfo {
     pub id: String,
     pub bytes: u64,
     pub created_at: i64,
+    /// Why it was taken: `daily`, `update`, `migration`, `import`, `restore` (the data a
+    /// restore replaced), `manual`, or `other`.
+    pub reason: &'static str,
+    /// The Ferrocast version that took it; `null` for snapshots from before this was kept.
+    pub version: Option<String>,
+}
+
+/// What a snapshot's label says about why it was taken.
+pub fn reason_of(label: &str) -> &'static str {
+    match label {
+        DAILY => "daily",
+        BEFORE_UPDATE => "update",
+        "manual" => "manual",
+        "replaced" => "restore",
+        l if l.ends_with("import") => "import",
+        l if l.strip_prefix("before-v").is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())) => {
+            "migration"
+        }
+        _ => "other",
+    }
+}
+
+/// Kept next to each snapshot as `<id>.json`.
+#[derive(Debug, Serialize, Deserialize)]
+struct Meta {
+    version: String,
 }
 
 /// Writes a consistent copy with `VACUUM INTO` (safe while the app is running) to a temp
@@ -30,8 +66,21 @@ pub fn snapshot(conn: &Connection, dir: &Path, label: &str) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&tmp);
     conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()]).map_err(|e| StoreError::Backup(e.to_string()))?;
     rename_patiently(&tmp, &path).map_err(|e| StoreError::Backup(e.to_string()))?;
+    // Which version took it, for "restore previous" after an update. Losing this file only
+    // loses the label, never the backup, so a failure is logged, not returned.
+    let meta = Meta { version: env!("CARGO_PKG_VERSION").to_string() };
+    let meta_path = path.with_extension("json");
+    if let Err(e) = serde_json::to_vec(&meta).map_err(std::io::Error::other).and_then(|b| std::fs::write(&meta_path, b))
+    {
+        tracing::warn!(error = %e, "couldn't write the backup's version");
+    }
     rotate(&backups)?;
     Ok(path)
+}
+
+/// When the newest snapshot of any kind was taken (each one is a full copy).
+pub fn newest(dir: &Path) -> Result<Option<i64>> {
+    Ok(list(dir)?.first().map(|b| b.created_at))
 }
 
 /// Lists snapshots, newest first.
@@ -47,8 +96,19 @@ pub fn list(dir: &Path) -> Result<Vec<BackupInfo>> {
         let Some(id) = name.strip_suffix(".db") else {
             continue;
         };
-        let created_at = id.split('-').next().and_then(|t| t.parse().ok()).unwrap_or(0);
-        out.push(BackupInfo { id: id.to_string(), bytes: entry.metadata()?.len(), created_at });
+        let (stamp, label) = id.split_once('-').unwrap_or((id, ""));
+        let created_at = stamp.parse().unwrap_or(0);
+        let version = std::fs::read(backups.join(format!("{id}.json")))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Meta>(&b).ok())
+            .map(|m| m.version);
+        out.push(BackupInfo {
+            id: id.to_string(),
+            bytes: entry.metadata()?.len(),
+            created_at,
+            reason: reason_of(label),
+            version,
+        });
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
     Ok(out)
@@ -117,14 +177,20 @@ pub(crate) fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Keeps the newest [`KEEP_DAILY`] daily snapshots and the newest [`KEEP`] others, and
+/// removes the rest with their `.json` labels.
 fn rotate(backups: &Path) -> Result<()> {
     let mut all: Vec<_> = std::fs::read_dir(backups)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
         .collect();
     all.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-    for old in all.into_iter().skip(KEEP) {
-        let _ = std::fs::remove_file(old.path());
+    let is_daily = |e: &std::fs::DirEntry| e.file_name().to_string_lossy().ends_with(&format!("-{DAILY}.db"));
+    let (daily, other): (Vec<_>, Vec<_>) = all.into_iter().partition(is_daily);
+    for old in daily.into_iter().skip(KEEP_DAILY).chain(other.into_iter().skip(KEEP)) {
+        let path = old.path();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json"));
     }
     Ok(())
 }
@@ -178,5 +244,54 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let p = s.snapshot("../../evil/../x").unwrap();
         assert_eq!(p.parent().unwrap(), dir.path().join("backups"));
+    }
+
+    #[test]
+    fn backups_say_why_and_which_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        for label in [
+            DAILY,
+            BEFORE_UPDATE,
+            "manual",
+            "before-import",
+            "before-streamelements-import",
+            "before-v7",
+            "replaced",
+            "x",
+        ] {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            s.snapshot(label).unwrap();
+        }
+        let all = list(dir.path()).unwrap();
+        let reasons: Vec<_> = all.iter().rev().map(|b| b.reason).collect();
+        assert_eq!(reasons, ["daily", "update", "manual", "import", "import", "migration", "restore", "other"]);
+        assert!(all.iter().all(|b| b.version.as_deref() == Some(env!("CARGO_PKG_VERSION"))));
+        // A snapshot from before labels were kept still lists, without a version.
+        std::fs::remove_file(dir.path().join("backups").join(format!("{}.json", all[0].id))).unwrap();
+        assert_eq!(list(dir.path()).unwrap()[0].version, None);
+        assert_eq!(reason_of("before-v"), "other");
+        assert_eq!(reason_of("before-vx"), "other");
+    }
+
+    #[test]
+    fn a_week_of_daily_copies_never_pushes_out_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        s.snapshot("before-v3").unwrap();
+        for _ in 0..(KEEP_DAILY + 5) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            s.snapshot(DAILY).unwrap();
+        }
+        let all = list(dir.path()).unwrap();
+        assert_eq!(all.iter().filter(|b| b.reason == "daily").count(), KEEP_DAILY);
+        assert!(all.iter().any(|b| b.reason == "migration"));
+        // Rotated snapshots take their labels with them.
+        let labels = std::fs::read_dir(dir.path().join("backups"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".json"))
+            .count();
+        assert_eq!(labels, all.len());
+        assert_eq!(newest(dir.path()).unwrap(), Some(all[0].created_at));
     }
 }

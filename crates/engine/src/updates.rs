@@ -34,8 +34,9 @@ impl Engine {
         self.is_live() && self.settings().never_update_while_live
     }
 
-    /// The dashboard asks to install the update the shell found.
-    pub fn request_update_install(&self) -> Result<AvailableUpdate, EngineError> {
+    /// The dashboard asks to install the update the shell found. A backup is taken first
+    /// (R-34); without one the update doesn't start.
+    pub async fn request_update_install(&self) -> Result<AvailableUpdate, EngineError> {
         let Some(update) = self.available_update() else {
             return Err(EngineError::Missing {
                 code: "no_update",
@@ -48,6 +49,7 @@ impl Engine {
                 "You're live, so the update waits until the stream ends (Settings › Updates).".into(),
             ));
         }
+        self.backup_before_update().await?;
         self.inner.install_update.notify_one();
         Ok(update)
     }
