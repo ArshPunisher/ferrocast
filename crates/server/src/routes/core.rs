@@ -37,17 +37,29 @@ pub async fn pair(State(app): State<AppState>, Body(b): Body<PairBody>) -> ApiRe
 pub async fn pair_code(State(app): State<AppState>) -> Json<Value> {
     let code = app.sessions.new_code();
     let expires_at = now_ms() + crate::auth::PAIR_TTL.as_millis() as i64;
-    Json(json!({ "code": code, "url": format!("{}/app/#pair={code}", pair_base(&app)), "expires_at": expires_at }))
+    let (url, network) = pair_base(&app);
+    // "Allow other devices" applies at the next start: until then the link only works here.
+    let restart_needed = app.engine.settings().lan_access && !app.guard.lan;
+    Json(json!({
+        "code": code,
+        "url": format!("{url}/app/#pair={code}"),
+        "expires_at": expires_at,
+        "lan": { "active": network, "restart_needed": restart_needed },
+    }))
 }
 
 /// Where another device should open the dashboard: this computer's address on the local
 /// network when LAN access is on (127.0.0.1 would mean the phone itself), else loopback.
-fn pair_base(app: &AppState) -> String {
+/// The flag says whether the link works from another device.
+fn pair_base(app: &AppState) -> (String, bool) {
     let base = app.engine.base_url();
     if !app.guard.lan {
-        return base;
+        return (base, false);
     }
-    lan_ip().map(|ip| format!("http://{ip}:{}", app.guard.port)).unwrap_or(base)
+    match lan_ip() {
+        Some(ip) => (format!("http://{ip}:{}", app.guard.port), true),
+        None => (base, false),
+    }
 }
 
 /// The address the OS would use to reach the internet. A UDP "connect" picks the route

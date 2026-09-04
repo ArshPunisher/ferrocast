@@ -209,6 +209,24 @@ async fn held_messages_wait_then_are_released_or_dropped_once() {
     e.drop_held(&held[1].id).await.unwrap();
     eventually(|| tw.log().contains(&"delete m2".to_string())).await;
     assert!(e.held().await.unwrap().is_empty());
+    // Every dashboard hears how each one ended, so another mod's list clears too.
+    let mut resolved = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        let v = serde_json::from_str::<Value>(&f.text).unwrap();
+        if v["type"] == "held_resolved" {
+            resolved.push((v["data"]["event_id"].as_str().unwrap().to_string(), v["data"]["outcome"].clone()));
+        }
+    }
+    assert_eq!(resolved, [(held[0].id.clone(), Value::from("released")), (held[1].id.clone(), Value::from("dropped"))]);
+    // A dashboard that saw both messages (and their marks) and reconnects afterwards still
+    // hears how they ended.
+    let since = held.iter().map(|h| h.seq).max().unwrap();
+    let (replayed, _) = e.events_since(since);
+    let kinds: Vec<String> = replayed
+        .iter()
+        .map(|f| serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(kinds.iter().filter(|k| *k == "held_resolved").count(), 2, "{kinds:?}");
 }
 
 #[tokio::test]
@@ -1623,10 +1641,28 @@ async fn the_starter_pack_skips_names_in_use_and_shoutouts_name_the_game() {
     e.ingest(chat(Platform::Twitch, "s3", "viewer", "!so friend")).await; // mods only
     e.ingest(chat(Platform::Twitch, "u1", "viewer", "!uptime")).await;
     eventually(|| tw.log().iter().any(|l| l == "say We're not live right now. reply=u1")).await;
+    // !socials is off until the streamer adds their links: viewers never get the placeholder.
+    e.ingest(chat(Platform::Twitch, "x1", "viewer", "!socials")).await;
+    e.ingest(chat(Platform::Twitch, "u2", "viewer2", "!hi")).await; // no cooldown: shows the bot replied after
+    eventually(|| tw.log().iter().any(|l| l.ends_with("reply=u2"))).await;
+    assert!(!tw.log().iter().any(|l| l.ends_with("reply=x1") || l.contains("add your links")));
     assert!(!tw.log().iter().any(|l| l.ends_with("reply=s3")));
     assert_eq!(
         tw.log().iter().filter(|l| *l == "lookup friend").count(),
         1,
         "a viewer's !so asks the platform nothing"
     );
+}
+
+#[tokio::test]
+async fn daily_backups_wait_a_day_after_the_newest() {
+    let (e, dir) = engine().await;
+    // The start-up task takes the first one (nothing was backed up yet).
+    let d = dir.path().to_path_buf();
+    eventually(|| ferrocast_store::backup::list(&d).unwrap().iter().any(|b| b.reason == "daily")).await;
+    let newest = ferrocast_store::backup::newest(dir.path()).unwrap().unwrap();
+    assert!(!e.daily_backup_due_at(newest + crate::backups::DAILY_EVERY_MS - 1).await.unwrap());
+    assert!(e.daily_backup_due_at(newest + crate::backups::DAILY_EVERY_MS).await.unwrap());
+    let list = ferrocast_store::backup::list(dir.path()).unwrap();
+    assert_eq!(list.iter().filter(|b| b.reason == "daily").count(), 2);
 }

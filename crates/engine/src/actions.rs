@@ -211,7 +211,21 @@ impl Engine {
         let mut public = e.clone();
         public.raw = None;
         self.send_overlay(crate::frames::OverlayFrame::new(crate::frames::Audience::Chat, e.seq, "event", &public));
+        self.held_resolved(&e, "released");
         Ok(())
+    }
+
+    /// Tells every dashboard a held message was dealt with, so another mod's list clears
+    /// too. It gets its own (newer) seq, so a dashboard that reconnects with a `since` from
+    /// after the `held` mark still replays it.
+    fn held_resolved(&self, e: &Event, outcome: &str) {
+        self.send_live_event(
+            self.next_seq(),
+            crate::frames::LiveFrame::new(
+                "held_resolved",
+                &serde_json::json!({ "event_id": e.id, "outcome": outcome }),
+            ),
+        );
     }
 
     /// Throws a held message away and deletes it on its platform.
@@ -223,6 +237,7 @@ impl Engine {
                 Box::pin(async move { c.delete_message(&mid).await })
             });
         }
+        self.held_resolved(&e, "dropped");
         Ok(())
     }
 

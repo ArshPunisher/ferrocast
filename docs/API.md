@@ -73,7 +73,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 |---|---|---|
 | GET | `/api/v1/status` | → `{ version, port, live: { twitch, youtube, kick }, connectors: { twitch: ConnectorState, youtube, kick, obs, relay }, setup_done: boolean }` |
 | POST | `/api/v1/session/pair` | `{ code }` → `{ token }` (no auth needed) |
-| POST | `/api/v1/session/pair-code` | → `{ code, url, expires_at }` (makes an "open in browser" link) |
+| POST | `/api/v1/session/pair-code` | → `{ code, url, expires_at, lan: { active, restart_needed } }` (makes an "open in browser" link). With LAN access on, `url` uses this computer's network address and `lan.active` is true; otherwise it's `127.0.0.1` (works on this computer only), and `restart_needed` says LAN access was switched on but applies at the next start |
 | POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
 | GET | `/api/v1/stats/session` | → `{ started_at, follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
@@ -183,7 +183,7 @@ GET/POST `/api/v1/commands`, PUT/DELETE `/api/v1/commands/{id}`; GET/POST `/api/
 `Command = { id, name: "!discord", aliases: string[], response: string (template), roles: "everyone" | "subs" | "vips" | "mods", cooldown_s: number, user_cooldown_s: number, platforms: Platform[] | [], enabled }` (`id` may be blank on POST; the engine picks one)
 `Timer = { id, name, message, every_min: number, min_chat_lines: number, platforms: Platform[] | [], enabled }`
 
-POST `/api/v1/commands/starter` → `{ added: Command[], skipped: string[] }`: adds `!socials`, `!lurk`, `!uptime` and `!so` (mods only), skipping any name a command or alias already uses (two clicks at once never add a command twice). Reply variables the engine fills in: `{uptime}` ("1h 5m", only while live), `{uptime_text}` ("We've been live for 1h 5m." or "We're not live right now."), and for replies that use them, `{target_game}` (what the first argument's channel last streamed, empty when unknown) and `{target_game_note}` ("They were last playing Hades II." or empty). The game comes from the platform when it offers a lookup (Twitch: Get Channel Information); elsewhere the shoutout is plain.
+POST `/api/v1/commands/starter` → `{ added: Command[], skipped: string[] }`: adds `!socials` (switched **off**: its reply is a placeholder until the streamer writes their links, so viewers never see it), `!lurk`, `!uptime` and `!so` (mods only), skipping any name a command or alias already uses (two clicks at once never add a command twice). Reply variables the engine fills in: `{uptime}` ("1h 5m", only while live), `{uptime_text}` ("We've been live for 1h 5m." or "We're not live right now."), and for replies that use them, `{target_game}` (what the first argument's channel last streamed, empty when unknown) and `{target_game_note}` ("They were last playing Hades II." or empty). The game comes from the platform when it offers a lookup (Twitch: Get Channel Information); elsewhere the shoutout is plain.
 
 ### Loyalty points
 One balance per person: linked accounts on Twitch, YouTube and Kick share it. Never below 0, never above 1,000,000,000,000.
@@ -302,7 +302,14 @@ Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/con
 
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
-POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups`, POST `/api/v1/backups/{id}/restore`.
+POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups` → `Backup[]`, newest first; POST `/api/v1/backups` → 201 `Backup[]` (takes one now); POST `/api/v1/backups/{id}/restore` → `{ restart_needed, message }` (it's swapped in at the next start, keeping the current data as one more backup).
+
+```ts
+type Backup = { id: string; bytes: number; created_at: number;
+                reason: "daily" | "update" | "migration" | "import" | "restore" /* the data a restore replaced */ | "manual" | "other";
+                version: string | null /* the Ferrocast version that took it; null for older backups */ }
+```
+Backups are taken automatically: once a day (at start when the newest backup is more than 24 hours old, then every 24 hours while running), right before an update installs (`/updates/install` answers 422 and doesn't start the update when that backup fails), before a database migration and before every import. The newest 7 daily backups and the newest 10 others are kept.
 
 ### Importing from StreamElements and Streamlabs
 Two steps: a **preview** reads everything and says what would happen (nothing is written), then **apply** imports it. Apply takes a backup first (restore it from Settings → Your data to undo), writes everything in one transaction, never deletes anything, and then the engine reloads commands, timers and points settings. One preview at a time can be applied, for 30 minutes; a new preview replaces it.
@@ -350,6 +357,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `notice { key?, level: "info" | "warn" | "error", message, action?: { label, href } }`. A notice replaces the shown one with the same `key` (one line per subject, never a stack): `panic`, `account:twitch` / `account:youtube` / `account:kick`, `discord`, `update`, `no-chat`, `alerts-folded` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
+- `held_resolved { event_id, outcome: "released" | "dropped" }` (a mod approved or removed a held message, from any dashboard; it has its own seq, so a reconnecting dashboard replays it even with a `since` from after the `held` mark)
 - `panic { on, plan: PanicConfig }`
 - `chatter { event_id, kind: "first" } | { event_id, kind: "returning", days }` (after that message's `event` frame; replayed with it on reconnect)
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)

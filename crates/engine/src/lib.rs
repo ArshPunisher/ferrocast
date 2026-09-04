@@ -9,6 +9,7 @@
 
 mod accounts;
 mod actions;
+mod backups;
 mod discord;
 mod dispatcher;
 mod error;
@@ -214,6 +215,7 @@ impl Engine {
             }),
         };
         tokio::spawn(prune(engine.clone()));
+        tokio::spawn(backups::run(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));

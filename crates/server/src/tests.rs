@@ -740,7 +740,20 @@ async fn lan_pairing_links_point_at_this_computer_on_the_network() {
     // On a machine with a network, the phone gets a reachable address, not its own loopback.
     if let Some(ip) = super::routes::lan_ip() {
         assert!(url.starts_with(&format!("http://{ip}:")), "{url}");
+        assert_eq!(v["lan"], json!({ "active": true, "restart_needed": false }));
     }
+}
+
+#[tokio::test]
+async fn pairing_links_say_when_other_devices_must_wait_for_a_restart() {
+    let r = start().await;
+    let v: Value = r.post("/api/v1/session/pair-code", json!({})).await.json().await.unwrap();
+    assert!(v["url"].as_str().unwrap().starts_with("http://127.0.0.1:"), "{v}");
+    assert_eq!(v["lan"], json!({ "active": false, "restart_needed": false }));
+    // Switched on now, but the server still listens on loopback until the next start.
+    assert_eq!(r.put("/api/v1/settings", json!({ "lan_access": true })).await.status(), StatusCode::OK);
+    let v: Value = r.post("/api/v1/session/pair-code", json!({})).await.json().await.unwrap();
+    assert_eq!(v["lan"], json!({ "active": false, "restart_needed": true }));
 }
 
 #[tokio::test]
@@ -1231,6 +1244,33 @@ async fn updates_are_offered_only_when_found_and_never_while_live() {
     assert_eq!(ok.status(), StatusCode::ACCEPTED);
     let v: Value = ok.json().await.unwrap();
     assert_eq!(v["installing"], "9.9.9");
+    // The data was backed up first, labelled with why and by which version.
+    let backups: Value = r.get("/api/v1/backups").await.json().await.unwrap();
+    let before =
+        backups.as_array().unwrap().iter().find(|b| b["reason"] == "update").expect("a backup before the update");
+    assert_eq!(before["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn a_daily_backup_is_taken_at_start_and_listed_with_its_reason() {
+    let r = start().await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let daily = loop {
+        let list: Value = r.get("/api/v1/backups").await.json().await.unwrap();
+        if let Some(b) = list.as_array().unwrap().iter().find(|b| b["reason"] == "daily") {
+            break b.clone();
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no daily backup at start");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(daily["version"], env!("CARGO_PKG_VERSION"));
+    assert!(daily["created_at"].as_i64().unwrap() > 0 && daily["bytes"].as_u64().unwrap() > 0);
+    // A day hasn't passed: no second one.
+    assert!(!r.engine.daily_backup_if_due().await.unwrap());
+    let manual = r.post("/api/v1/backups", json!({})).await;
+    assert_eq!(manual.status(), StatusCode::CREATED);
+    let list: Value = manual.json().await.unwrap();
+    assert_eq!(list[0]["reason"], "manual");
 }
 
 #[tokio::test]
