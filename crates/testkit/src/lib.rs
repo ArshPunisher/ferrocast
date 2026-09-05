@@ -2,5 +2,7 @@
 //! fake is the right failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod obs;
+pub mod razorpay;
 pub mod streamelements;
 pub mod twitch;

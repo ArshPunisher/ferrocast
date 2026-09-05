@@ -12,6 +12,7 @@ publish.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 serde_json.workspace = true
 tokio.workspace = true
+base64 = "0.23"
 
 [lints]
 workspace = true

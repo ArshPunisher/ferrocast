@@ -28,6 +28,7 @@ pub const SCOPES: &[&str] = &[
     "channel:read:ads",
     "channel:moderate",
     "bits:read",
+    "channel:manage:broadcast",
 ];
 
 /// State of the fake Twitch, open for tests to inspect and steer.
@@ -42,6 +43,12 @@ pub struct Fake {
     pub sessions: u32,
     pub sockets: HashMap<String, mpsc::UnboundedSender<String>>,
     pub base: String,
+    /// Bodies of Modify Channel Information (PATCH /channels).
+    pub channel_patches: Vec<Value>,
+    /// Bodies of Create Stream Marker.
+    pub markers: Vec<Value>,
+    /// Answer the next channel PATCH with 401 "Missing scope" (an old sign-in).
+    pub refuse_channel_scope: bool,
 }
 
 pub type St = Arc<Mutex<Fake>>;
@@ -54,7 +61,10 @@ pub async fn fake() -> (St, (String, String, String)) {
         .route("/oauth2/token", post(token))
         .route("/oauth2/validate", get(validate))
         .route("/helix/users", get(users))
-        .route("/helix/channels", get(channels))
+        .route("/helix/channels", get(channels).patch(patch_channel))
+        .route("/helix/search/categories", get(search_categories))
+        .route("/helix/streams/markers", post(marker))
+        .route("/helix/channels/followers", get(followers))
         .route("/helix/chat/messages", post(chat))
         .route("/helix/eventsub/subscriptions", post(subscribe))
         .route("/helix/moderation/bans", any(ok))
@@ -136,6 +146,48 @@ async fn channels(Query(q): Query<HashMap<String, String>>) -> Response {
         _ => "",
     };
     axum::Json(json!({ "data": [{ "broadcaster_id": q.get("broadcaster_id"), "game_name": game }] })).into_response()
+}
+
+async fn patch_channel(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
+    let mut s = st.lock().unwrap();
+    if s.refuse_channel_scope {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Missing scope: channel:manage:broadcast" })))
+            .into_response();
+    }
+    if body.get("title").and_then(Value::as_str).is_some_and(|t| t.contains("refuse")) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "message": "The title contains a blocked term" })))
+            .into_response();
+    }
+    s.channel_patches.push(body);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Two games: "Valorant" (516575) and "Valheim" (498566), plus "Just Chatting" (509658).
+async fn search_categories(Query(q): Query<HashMap<String, String>>) -> Response {
+    let all = [("516575", "Valorant"), ("498566", "Valheim"), ("509658", "Just Chatting")];
+    let query = q.get("query").map(|s| s.to_lowercase()).unwrap_or_default();
+    let data: Vec<Value> = all
+        .iter()
+        .filter(|(_, n)| n.to_lowercase().contains(&query))
+        .map(
+            |(id, n)| json!({ "id": id, "name": n, "box_art_url": format!("https://x/{id}-{{width}}x{{height}}.jpg") }),
+        )
+        .collect();
+    axum::Json(json!({ "data": data })).into_response()
+}
+
+async fn marker(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
+    st.lock().unwrap().markers.push(body);
+    axum::Json(json!({ "data": [{ "id": "1", "position_seconds": 60 }] })).into_response()
+}
+
+/// User 222 followed on 2024-01-02; nobody else follows.
+async fn followers(Query(q): Query<HashMap<String, String>>) -> Response {
+    let data = match q.get("user_id").map(String::as_str) {
+        Some("222") => json!([{ "user_id": "222", "followed_at": "2024-01-02T03:04:05Z" }]),
+        _ => json!([]),
+    };
+    axum::Json(json!({ "data": data })).into_response()
 }
 
 async fn chat(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
