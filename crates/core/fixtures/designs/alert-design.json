@@ -1,0 +1,288 @@
+{
+  "schema": 1,
+  "id": "fixture-alert",
+  "name": "Molten test",
+  "description": "A test alert design.",
+  "tags": {
+    "style": "bold",
+    "motion": "smooth"
+  },
+  "pro": false,
+  "built_in": false,
+  "branded": false,
+  "origin": {
+    "type": "scratch",
+    "from": null
+  },
+  "kind": "alert",
+  "content": {
+    "events": {
+      "follow": {
+        "variations": [
+          {
+            "id": "follow-0",
+            "name": "Every follow",
+            "condition": null,
+            "priority": 0,
+            "look": {
+              "frame": "plate",
+              "layout": "above",
+              "media": {
+                "kind": "emblem",
+                "ref": null
+              },
+              "media_size": 150,
+              "offsets": {
+                "text_x": 0,
+                "text_y": 0,
+                "media_x": 0,
+                "media_y": 0
+              },
+              "title": "{name} just followed",
+              "body": "{message}",
+              "font": {
+                "family": "Bricolage Grotesque",
+                "source": "bundled",
+                "size": 42,
+                "weight": 800,
+                "uppercase": false,
+                "italic": false,
+                "letter_spacing": 0
+              },
+              "colors": {
+                "text": "#eef0f4",
+                "highlight": "#ffa424",
+                "plate": "#101216",
+                "accent": "#33d4ff",
+                "outline": "#07080a"
+              },
+              "plate": true,
+              "shadow": "soft",
+              "outline": 0,
+              "anim": {
+                "in": "magnet",
+                "out": "sink",
+                "text": "wave",
+                "in_ms": 650,
+                "out_ms": 450,
+                "text_delay_ms": 300
+              },
+              "sound": {
+                "ref": null,
+                "builtin": "chime",
+                "volume": 70
+              },
+              "duration_ms": 6000,
+              "tts": {
+                "enabled": false,
+                "min_amount": 0
+              },
+              "brand": "corner",
+              "css": ""
+            }
+          }
+        ]
+      },
+      "sub": {
+        "variations": [
+          {
+            "id": "sub-0",
+            "name": "Every sub",
+            "condition": null,
+            "priority": 0,
+            "look": {
+              "frame": "plate",
+              "layout": "above",
+              "media": {
+                "kind": "emblem",
+                "ref": null
+              },
+              "media_size": 150,
+              "offsets": {
+                "text_x": 0,
+                "text_y": 0,
+                "media_x": 0,
+                "media_y": 0
+              },
+              "title": "{name} subscribed for {months_text}",
+              "body": "{message}",
+              "font": {
+                "family": "Bricolage Grotesque",
+                "source": "bundled",
+                "size": 42,
+                "weight": 800,
+                "uppercase": false,
+                "italic": false,
+                "letter_spacing": 0
+              },
+              "colors": {
+                "text": "#eef0f4",
+                "highlight": "#ffa424",
+                "plate": "#101216",
+                "accent": "#33d4ff",
+                "outline": "#07080a"
+              },
+              "plate": true,
+              "shadow": "soft",
+              "outline": 0,
+              "anim": {
+                "in": "magnet",
+                "out": "sink",
+                "text": "wave",
+                "in_ms": 650,
+                "out_ms": 450,
+                "text_delay_ms": 300
+              },
+              "sound": {
+                "ref": null,
+                "builtin": "chime",
+                "volume": 70
+              },
+              "duration_ms": 6000,
+              "tts": {
+                "enabled": false,
+                "min_amount": 0
+              },
+              "brand": "corner",
+              "css": ""
+            }
+          }
+        ]
+      },
+      "tip": {
+        "variations": [
+          {
+            "id": "tip-0",
+            "name": "Every tip",
+            "condition": null,
+            "priority": 0,
+            "look": {
+              "frame": "plate",
+              "layout": "above",
+              "media": {
+                "kind": "emblem",
+                "ref": null
+              },
+              "media_size": 150,
+              "offsets": {
+                "text_x": 0,
+                "text_y": 0,
+                "media_x": 0,
+                "media_y": 0
+              },
+              "title": "{name} tipped {amount}!",
+              "body": "{message}",
+              "font": {
+                "family": "Bricolage Grotesque",
+                "source": "bundled",
+                "size": 42,
+                "weight": 800,
+                "uppercase": false,
+                "italic": false,
+                "letter_spacing": 0
+              },
+              "colors": {
+                "text": "#eef0f4",
+                "highlight": "#ffa424",
+                "plate": "#101216",
+                "accent": "#33d4ff",
+                "outline": "#07080a"
+              },
+              "plate": true,
+              "shadow": "soft",
+              "outline": 0,
+              "anim": {
+                "in": "magnet",
+                "out": "sink",
+                "text": "wave",
+                "in_ms": 650,
+                "out_ms": 450,
+                "text_delay_ms": 300
+              },
+              "sound": {
+                "ref": null,
+                "builtin": "chime",
+                "volume": 70
+              },
+              "duration_ms": 6000,
+              "tts": {
+                "enabled": false,
+                "min_amount": 0
+              },
+              "brand": "corner",
+              "css": ""
+            }
+          },
+          {
+            "id": "tip-big",
+            "name": "Big tips",
+            "condition": {
+              "type": "amount_at_least",
+              "value": 1000,
+              "currency": null
+            },
+            "priority": 5,
+            "look": {
+              "frame": "neon",
+              "layout": "above",
+              "media": {
+                "kind": "emblem",
+                "ref": null
+              },
+              "media_size": 150,
+              "offsets": {
+                "text_x": 0,
+                "text_y": 0,
+                "media_x": 0,
+                "media_y": 0
+              },
+              "title": "{name} sent a huge {amount}!",
+              "body": "{message}",
+              "font": {
+                "family": "Bricolage Grotesque",
+                "source": "bundled",
+                "size": 42,
+                "weight": 800,
+                "uppercase": false,
+                "italic": false,
+                "letter_spacing": 0
+              },
+              "colors": {
+                "text": "#eef0f4",
+                "highlight": "#ffa424",
+                "plate": "#101216",
+                "accent": "#33d4ff",
+                "outline": "#07080a"
+              },
+              "plate": true,
+              "shadow": "soft",
+              "outline": 0,
+              "anim": {
+                "in": "magnet",
+                "out": "sink",
+                "text": "wave",
+                "in_ms": 650,
+                "out_ms": 450,
+                "text_delay_ms": 300
+              },
+              "sound": {
+                "ref": null,
+                "builtin": "chime",
+                "volume": 70
+              },
+              "duration_ms": 6000,
+              "tts": {
+                "enabled": false,
+                "min_amount": 0
+              },
+              "brand": "corner",
+              "css": ""
+            }
+          }
+        ]
+      }
+    }
+  },
+  "created_at": 0,
+  "updated_at": 0
+}

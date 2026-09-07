@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "id": "fixture-scene",
+  "name": "BRB test",
+  "description": "",
+  "tags": {
+    "style": "minimal",
+    "motion": "still"
+  },
+  "pro": false,
+  "built_in": false,
+  "branded": false,
+  "origin": {
+    "type": "scratch",
+    "from": null
+  },
+  "kind": "scene",
+  "content": {
+    "key": "brb",
+    "name": "Be right back",
+    "width": 1920,
+    "height": 1080,
+    "background": "#0a0b0d",
+    "layers": [
+      {
+        "id": "bg",
+        "kind": "layer",
+        "x": 0,
+        "y": 0,
+        "w": 1920,
+        "h": 1080,
+        "config": {
+          "type": "shape",
+          "shape": "rect",
+          "fill": "#101216"
+        }
+      },
+      {
+        "id": "title",
+        "kind": "layer",
+        "x": 160,
+        "y": 440,
+        "w": 1600,
+        "h": 200,
+        "config": {
+          "type": "text",
+          "text": "Be right back",
+          "size": 120,
+          "weight": 800,
+          "color": "#eef0f4",
+          "align": "center"
+        }
+      },
+      {
+        "id": "events",
+        "kind": "events",
+        "x": 1460,
+        "y": 60,
+        "w": 400,
+        "h": 300,
+        "config": {
+          "kinds": [
+            "follow",
+            "tip"
+          ],
+          "max_items": 5,
+          "theme": "molten"
+        }
+      }
+    ]
+  },
+  "created_at": 0,
+  "updated_at": 0
+}

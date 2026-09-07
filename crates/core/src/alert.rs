@@ -262,6 +262,10 @@ pub struct RenderedAlert {
     #[serde(default)]
     pub tts_audio: Option<String>,
     pub test: bool,
+    /// The look from the alert design in use, when there is one (API.md §4 Designs). Absent
+    /// otherwise, so overlays without design support see the same alert as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<crate::design::AlertDesignView>,
 }
 
 /// Renders the chosen variation for `event`. Templates were validated when saved; a
@@ -290,6 +294,7 @@ pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) ->
         layout: v.layout.clone(),
         css: v.css.clone(),
         test: event.origin == crate::event::Origin::Test,
+        design: None,
     }
 }
 
