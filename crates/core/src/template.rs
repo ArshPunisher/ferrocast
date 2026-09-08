@@ -122,12 +122,59 @@ impl Template {
         }
         out
     }
+
+    /// Renders like [`Template::render`], but keeps track of which text came from the
+    /// variables in `highlight`, so an alert design can colour the name and amount. Neighbours
+    /// with the same flag are merged; the joined text is exactly what `render` returns.
+    pub fn render_parts(&self, vars: &Vars, highlight: &[&str]) -> Vec<TextPart> {
+        let mut parts: Vec<TextPart> = Vec::new();
+        let mut total = 0usize;
+        for piece in &self.pieces {
+            let (mut text, hl) = match piece {
+                Piece::Text(t) => (t.clone(), false),
+                Piece::Var { name, filters } => {
+                    let mut value = vars.get(name).cloned().unwrap_or_default();
+                    for f in filters {
+                        value = apply(f, value);
+                    }
+                    (value, highlight.contains(&name.as_str()))
+                }
+            };
+            let n = text.chars().count();
+            if total + n > MAX_OUTPUT_CHARS {
+                text = text.chars().take(MAX_OUTPUT_CHARS - total).collect();
+            }
+            total += text.chars().count();
+            if text.is_empty() {
+                continue;
+            }
+            match parts.last_mut() {
+                Some(last) if last.hl == hl => last.text.push_str(&text),
+                _ => parts.push(TextPart { text, hl }),
+            }
+            if total >= MAX_OUTPUT_CHARS {
+                break;
+            }
+        }
+        parts
+    }
+}
+
+/// A run of rendered text; `hl` marks text that came from a highlighted variable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TextPart {
+    pub text: String,
+    pub hl: bool,
 }
 
 fn parse_var(inner: &str) -> Result<Piece, TemplateError> {
     let mut parts = inner.split('|');
     let name = parts.next().unwrap_or("").trim().to_string();
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+    // `count:deaths` reads a named counter (see `chatbot`); the colon is only allowed after
+    // `count`, so `{name:x}` stays a mistake the editor reports.
+    let named_counter = name.strip_prefix("count:").is_some_and(|n| !n.is_empty());
+    let plain = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    if name.is_empty() || !(plain(&name) || named_counter && plain(&name[6..])) {
         return Err(TemplateError::BadName(inner.to_string()));
     }
     let mut filters = Vec::new();
@@ -400,5 +447,24 @@ mod tests {
         let tip = any_sample("tip", crate::event::Millis(0)).unwrap();
         assert_eq!(event_vars(&tip).get("amount").map(String::as_str), Some("₹500"));
         assert_eq!(tip.platform, Platform::Tips);
+    }
+
+    #[test]
+    fn parts_mark_highlighted_variables_and_join_to_render() {
+        let t = Template::parse("{name|upper} tipped {amount}! {missing}{{x}}").unwrap();
+        let mut v = Vars::new();
+        v.insert("name".into(), "kavya".into());
+        v.insert("amount".into(), "₹750".into());
+        let parts = t.render_parts(&v, &["name", "amount"]);
+        let joined: String = parts.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(joined, t.render(&v));
+        assert_eq!(parts[0], TextPart { text: "KAVYA".into(), hl: true });
+        assert_eq!(parts[1], TextPart { text: " tipped ".into(), hl: false });
+        assert_eq!(parts[2], TextPart { text: "₹750".into(), hl: true });
+        assert_eq!(parts[3], TextPart { text: "! {x}".into(), hl: false }, "empty values vanish, neighbours merge");
+        let long = Template::parse("{name}{name}").unwrap();
+        v.insert("name".into(), "é".repeat(MAX_OUTPUT_CHARS));
+        let capped = long.render_parts(&v, &["name"]);
+        assert_eq!(capped.iter().map(|p| p.text.chars().count()).sum::<usize>(), MAX_OUTPUT_CHARS);
     }
 }

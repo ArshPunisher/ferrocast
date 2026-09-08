@@ -7,22 +7,28 @@
 mod macros;
 
 pub mod alert;
+pub mod chatbot;
 pub mod command;
 pub mod dedupe;
+pub mod design;
 pub mod discord;
 pub mod event;
 pub mod filter;
 pub mod giveaway;
 pub mod goal;
+pub mod layer;
 pub mod loyalty;
 pub mod moderation;
+pub mod moments;
 pub mod money;
 pub mod overlay;
 pub mod poll;
 pub mod queue;
 pub mod recap;
 pub mod sample;
+pub mod show;
 pub mod starter;
+pub mod stream_info;
 pub mod template;
 pub mod tts;
 pub mod welcome;
