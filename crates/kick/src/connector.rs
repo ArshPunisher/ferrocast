@@ -46,6 +46,14 @@ impl Connector for KickConnector {
         Ok(self.api.unban(&self.broadcaster_id, user_id).await?)
     }
 
+    async fn update_stream_info(&self, info: &ferrocast_connector::StreamInfo) -> Result<Vec<String>> {
+        Ok(self.api.update_channel(info).await?)
+    }
+
+    async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>> {
+        Ok(self.api.search_categories(query).await?)
+    }
+
     async fn set_mode(&self, _change: ModeChange) -> Result<()> {
         Err(ConnectorError::NotSupported { platform: Platform::Kick, what: "change chat modes yet" })
     }

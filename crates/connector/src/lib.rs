@@ -70,6 +70,37 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn last_game(&self, _login: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Changes the stream's title, category, tags and language (fields left `None` stay).
+    /// Returns the fields the platform took; fields it has no API for are left out.
+    async fn update_stream_info(&self, _info: &StreamInfo) -> Result<Vec<String>> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "change stream info" })
+    }
+
+    /// Categories (games) matching `query`, best first, for the stream-info form.
+    async fn search_categories(&self, _query: &str) -> Result<Vec<CategoryHit>> {
+        Ok(Vec::new())
+    }
+
+    /// Puts a marker in the live stream's timeline (Twitch stream markers), when supported.
+    async fn create_marker(&self, _description: &str) -> Result<()> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "add stream markers" })
+    }
+
+    /// When `login` followed the channel, if the platform says (Unix ms).
+    async fn followed_at(&self, _user_id: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+}
+
+pub use ferrocast_core::stream_info::StreamInfo;
+
+/// One category search result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CategoryHit {
+    pub id: String,
+    pub name: String,
+    pub image_url: Option<String>,
 }
 
 /// The longest chat message each platform accepts. Adapters split longer bot replies.

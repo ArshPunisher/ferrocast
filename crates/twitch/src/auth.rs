@@ -24,6 +24,8 @@ pub const SCOPES: &[&str] = &[
     "channel:read:ads",
     "channel:moderate",
     "bits:read",
+    // The stream-info editor and stream markers (Modify Channel Information).
+    "channel:manage:broadcast",
 ];
 
 /// What the streamer sees while signing in.

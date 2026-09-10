@@ -265,3 +265,91 @@ fn backoff_grows_and_caps() {
     assert!(eventsub::backoff(3) >= Duration::from_secs(4));
     assert!(eventsub::backoff(50) <= Duration::from_millis(60_500));
 }
+
+// ---------------------------------------------------------------- stream info (Studio)
+
+fn connector_for(ep: &Endpoints, scopes: Vec<String>) -> crate::connector::TwitchConnector {
+    let tokens = Tokens {
+        access_token: "access-0".into(),
+        refresh_token: "refresh-0".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes,
+    };
+    let auth = Arc::new(Auth::new(http_client(), ep.clone(), "client".into(), tokens, Arc::new(|_: &Tokens| Ok(()))));
+    crate::connector::TwitchConnector { helix: Helix::new(auth), user_id: "111".into() }
+}
+
+#[tokio::test]
+async fn stream_info_goes_to_modify_channel_with_the_game_looked_up() {
+    use ferrocast_connector::Connector;
+    use ferrocast_core::stream_info::{Category, CategoryIds, StreamInfo};
+    let (st, ep) = fake().await;
+    let c = connector_for(&ep, crate::auth::SCOPES.iter().map(|s| s.to_string()).collect());
+    let info = StreamInfo {
+        title: Some("Ranked grind".into()),
+        category: Some(Category { name: "valorant".into(), ids: CategoryIds::default() }),
+        tags: Some(vec!["English".into()]),
+        language: Some("en".into()),
+    };
+    let applied = c.update_stream_info(&info).await.unwrap();
+    assert_eq!(applied, vec!["title", "category", "tags", "language"]);
+    let body = st.lock().unwrap().channel_patches[0].clone();
+    assert_eq!(body["game_id"], "516575", "found by exact name, case-blind");
+    assert_eq!(body["broadcaster_language"], "en");
+    assert_eq!(body["tags"], json!(["English"]));
+    // A picked id is used as is; an unknown name is a clear refusal.
+    let picked = StreamInfo {
+        category: Some(Category {
+            name: "Whatever".into(),
+            ids: CategoryIds { twitch: Some("42".into()), ..Default::default() },
+        }),
+        ..Default::default()
+    };
+    c.update_stream_info(&picked).await.unwrap();
+    assert_eq!(st.lock().unwrap().channel_patches[1]["game_id"], "42");
+    let unknown = StreamInfo {
+        category: Some(Category { name: "Valo".into(), ids: CategoryIds::default() }),
+        ..Default::default()
+    };
+    let err = c.update_stream_info(&unknown).await.unwrap_err();
+    assert!(err.to_string().contains("no category called \"Valo\""), "{err}");
+    let blocked = StreamInfo { title: Some("please refuse".into()), ..Default::default() };
+    assert!(matches!(c.update_stream_info(&blocked).await, Err(ferrocast_connector::ConnectorError::Refused { .. })));
+    let hits = c.search_categories("val").await.unwrap();
+    assert_eq!(hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), vec!["Valorant", "Valheim"]);
+    assert_eq!(hits[0].image_url.as_deref(), Some("https://x/516575-52x72.jpg"));
+    assert!(c.search_categories("  ").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_old_sign_in_without_the_broadcast_scope_says_reconnect() {
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::stream_info::StreamInfo;
+    let (st, ep) = fake().await;
+    let info = StreamInfo { title: Some("x".into()), ..Default::default() };
+    // Known scopes without it: refused before asking Twitch.
+    let old = connector_for(&ep, vec!["user:read:chat".into()]);
+    let err = old.update_stream_info(&info).await.unwrap_err();
+    assert!(
+        matches!(&err, ConnectorError::MissingScope { scope, .. } if scope == "channel:manage:broadcast"),
+        "{err:?}"
+    );
+    assert!(st.lock().unwrap().channel_patches.is_empty());
+    assert!(matches!(old.create_marker("x").await, Err(ConnectorError::MissingScope { .. })));
+    // Scopes unknown: Twitch's own 401 "Missing scope" becomes the same answer, not "sign in".
+    st.lock().unwrap().refuse_channel_scope = true;
+    let unknown = connector_for(&ep, vec![]);
+    let err = unknown.update_stream_info(&info).await.unwrap_err();
+    assert!(matches!(err, ConnectorError::MissingScope { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn markers_and_follow_dates() {
+    use ferrocast_connector::Connector;
+    let (st, ep) = fake().await;
+    let c = connector_for(&ep, vec![]);
+    c.create_marker("Raid from Bo\nwow").await.unwrap();
+    assert_eq!(st.lock().unwrap().markers[0]["description"], "Raid from Bowow");
+    assert_eq!(c.followed_at("222").await.unwrap(), Some(1_704_164_645_000));
+    assert_eq!(c.followed_at("999").await.unwrap(), None);
+}

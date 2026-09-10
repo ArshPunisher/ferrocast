@@ -40,6 +40,8 @@ pub const SCOPES: &[&str] = &[
     "moderation:chat_message:manage",
     "channel:rewards:read",
     "kicks:read",
+    // The stream-info editor (title, category, tags).
+    "channel:write",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -52,6 +54,11 @@ pub enum KickError {
     RateLimited(Duration),
     #[error("Kick refused: {0}")]
     Refused(String),
+    /// A 403: the sign-in lacks a permission (Kick names it rarely, so the caller does).
+    #[error("Kick refused: {0}")]
+    Forbidden(String),
+    #[error("Kick is missing permission: {0}")]
+    MissingScope(String),
 }
 
 impl KickError {
@@ -76,6 +83,7 @@ impl KickError {
         match status {
             401 => KickError::SignInNeeded,
             429 => KickError::RateLimited(Duration::from_secs(retry.clamp(1, 600))),
+            403 => KickError::Forbidden(message),
             _ => KickError::Refused(message),
         }
     }
@@ -88,7 +96,10 @@ impl From<KickError> for ConnectorError {
             KickError::Network(message) => ConnectorError::Network { platform, message },
             KickError::SignInNeeded => ConnectorError::SignInNeeded(platform),
             KickError::RateLimited(retry_after) => ConnectorError::RateLimited { platform, retry_after },
-            KickError::Refused(message) => ConnectorError::Refused { platform, message },
+            KickError::Refused(message) | KickError::Forbidden(message) => {
+                ConnectorError::Refused { platform, message }
+            }
+            KickError::MissingScope(scope) => ConnectorError::MissingScope { platform, scope },
         }
     }
 }

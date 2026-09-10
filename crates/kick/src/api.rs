@@ -179,6 +179,74 @@ impl KickApi {
     }
 }
 
+impl KickApi {
+    /// Categories matching `query` (`GET /public/v1/categories?q=`), up to 10.
+    pub async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>, KickError> {
+        let q: String = query.trim().chars().take(100).collect();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let v = self.call(Method::GET, "/public/v1/categories", &[("q", q.as_str())], None).await?;
+        Ok(v.get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let id = match c.get("id")? {
+                    Value::Number(n) => n.to_string(),
+                    Value::String(s) => s.clone(),
+                    _ => return None,
+                };
+                Some(ferrocast_connector::CategoryHit {
+                    id,
+                    name: c.get("name")?.as_str()?.to_string(),
+                    image_url: c.get("thumbnail").and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from),
+                })
+            })
+            .take(10)
+            .collect())
+    }
+
+    /// `PATCH /public/v1/channels`: title, category and tags (`channel:write`). Kick has
+    /// no stream language. Returns the fields sent.
+    pub async fn update_channel(
+        &self,
+        info: &ferrocast_core::stream_info::StreamInfo,
+    ) -> Result<Vec<String>, KickError> {
+        let mut body = json!({});
+        let mut applied = Vec::new();
+        if let Some(t) = &info.title {
+            body["stream_title"] = json!(t);
+            applied.push("title".to_string());
+        }
+        if let Some(c) = &info.category {
+            let id = match c.ids.kick.clone() {
+                Some(id) => id,
+                None => self
+                    .search_categories(&c.name)
+                    .await?
+                    .into_iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(c.name.trim()))
+                    .map(|h| h.id)
+                    .ok_or_else(|| KickError::Refused(format!("Kick has no category called \"{}\"", c.name)))?,
+            };
+            body["category_id"] = json!(numeric(&id)?);
+            applied.push("category".to_string());
+        }
+        if let Some(tags) = &info.tags {
+            body["custom_tags"] = json!(tags);
+            applied.push("tags".to_string());
+        }
+        if applied.is_empty() {
+            return Ok(applied);
+        }
+        match self.call(Method::PATCH, "/public/v1/channels", &[], Some(body)).await {
+            Err(KickError::Forbidden(_)) => Err(KickError::MissingScope("channel:write".into())),
+            other => other.map(|_| applied),
+        }
+    }
+}
+
 fn numeric(id: &str) -> Result<u64, KickError> {
     id.parse().map_err(|_| KickError::Refused(format!("\"{id}\" isn't a Kick user id")))
 }

@@ -157,3 +157,99 @@ impl Api {
         }
     }
 }
+
+/// YouTube's video categories that fit a stream (YouTube has no per-game API).
+pub const VIDEO_CATEGORIES: &[(&str, &str)] = &[
+    ("20", "Gaming"),
+    ("22", "People & Blogs"),
+    ("24", "Entertainment"),
+    ("10", "Music"),
+    ("26", "Howto & Style"),
+    ("27", "Education"),
+    ("28", "Science & Technology"),
+    ("17", "Sports"),
+    ("23", "Comedy"),
+];
+
+/// YouTube's title limit (Twitch allows 140).
+pub const MAX_TITLE_CHARS: usize = 100;
+
+impl Api {
+    /// The live broadcast, or the next scheduled one (1 unit each).
+    pub async fn current_broadcast(&self) -> Result<Option<String>, YoutubeError> {
+        for status in ["active", "upcoming"] {
+            let q = [("part", "id"), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "1")];
+            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            if let Some(id) = v.pointer("/items/0/id").and_then(Value::as_str) {
+                return Ok(Some(id.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Changes the broadcast video's title, category, tags and language (`videos.update`,
+    /// 50 units). The video's snippet is read first so its description is kept.
+    pub async fn update_broadcast_info(
+        &self,
+        info: &ferrocast_core::stream_info::StreamInfo,
+    ) -> Result<Vec<String>, YoutubeError> {
+        if let Some(t) = &info.title
+            && t.chars().count() > MAX_TITLE_CHARS
+        {
+            return Err(YoutubeError::Refused(format!("YouTube titles are {MAX_TITLE_CHARS} characters at most")));
+        }
+        let id = self.current_broadcast().await?.ok_or_else(|| {
+            YoutubeError::Refused(
+                "you don't have a live or scheduled stream on YouTube; start or schedule one in YouTube Studio first"
+                    .into(),
+            )
+        })?;
+        let v = self.call(Method::GET, "/videos", &[("part", "snippet"), ("id", id.as_str())], None).await?;
+        let mut snippet = v
+            .pointer("/items/0/snippet")
+            .cloned()
+            .ok_or_else(|| YoutubeError::Protocol("the broadcast's video wasn't found".into()))?;
+        // Read-only fields YouTube refuses back.
+        if let Some(o) = snippet.as_object_mut() {
+            for k in ["publishedAt", "channelId", "thumbnails", "channelTitle", "liveBroadcastContent", "localized"] {
+                o.remove(k);
+            }
+        }
+        let mut applied = Vec::new();
+        if let Some(t) = &info.title {
+            snippet["title"] = json!(t);
+            applied.push("title".to_string());
+        }
+        if let Some(c) = &info.category {
+            let cat =
+                c.ids.youtube.clone().unwrap_or_else(|| ferrocast_core::stream_info::youtube_category_for(c).into());
+            snippet["categoryId"] = json!(cat);
+            applied.push("category".to_string());
+        }
+        if let Some(tags) = &info.tags {
+            snippet["tags"] = json!(tags);
+            applied.push("tags".to_string());
+        }
+        if let Some(l) = &info.language {
+            snippet["defaultLanguage"] = json!(l);
+            snippet["defaultAudioLanguage"] = json!(l);
+            applied.push("language".to_string());
+        }
+        if snippet.get("categoryId").is_none() {
+            snippet["categoryId"] = json!("20");
+        }
+        let body = json!({ "id": id, "snippet": snippet });
+        self.call(Method::PUT, "/videos", &[("part", "snippet")], Some(body)).await?;
+        Ok(applied)
+    }
+}
+
+/// The video categories matching `query` (no API call, no quota).
+pub fn search_video_categories(query: &str) -> Vec<ferrocast_connector::CategoryHit> {
+    let q = query.trim().to_lowercase();
+    VIDEO_CATEGORIES
+        .iter()
+        .filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q))
+        .map(|(id, n)| ferrocast_connector::CategoryHit { id: (*id).into(), name: (*n).into(), image_url: None })
+        .collect()
+}

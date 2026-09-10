@@ -301,3 +301,88 @@ async fn the_stream_marks_history_resumes_after_a_drop_and_ends_with_the_chat() 
     assert_eq!(requests, vec![None, Some("p2".into())], "resumed from the last page token");
     assert!(live.read().unwrap().is_none(), "no live chat after it ended");
 }
+
+// ---------------------------------------------------------------- stream info (Studio)
+
+/// A fake YouTube Data API for the broadcast's video: `scheduled` decides whether there's
+/// an upcoming broadcast; PUT /videos bodies are recorded.
+async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::Query;
+    use std::collections::HashMap;
+    let puts = Arc::new(Mutex::new(Vec::new()));
+    let p2 = puts.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(move |Query(q): Query<HashMap<String, String>>| async move {
+                let upcoming = q.get("broadcastStatus").map(String::as_str) == Some("upcoming");
+                let items = if upcoming && scheduled { json!([{ "id": "vid-1" }]) } else { json!([]) };
+                axum::Json(json!({ "items": items }))
+            }),
+        )
+        .route(
+            "/api/videos",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "items": [{ "id": "vid-1", "snippet": {
+                    "title": "Old", "description": "Keep me", "categoryId": "24", "channelId": "UC1",
+                    "publishedAt": "2026-01-01T00:00:00Z", "thumbnails": {}, "localized": {} } }] }))
+            })
+            .put(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let p = p2.clone();
+                async move {
+                    p.lock().unwrap().push(body.clone());
+                    axum::Json(body)
+                }
+            }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    (ep, puts)
+}
+
+fn video_api(ep: Endpoints) -> crate::api::Api {
+    let tokens =
+        oauth::Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    crate::api::Api::new(http_client(), ep, app(), tokens, Arc::new(|_| Ok(())))
+}
+
+#[tokio::test]
+async fn stream_info_updates_the_broadcast_video_and_keeps_its_description() {
+    use ferrocast_core::stream_info::{Category, CategoryIds, StreamInfo};
+    let (ep, puts) = fake_videos(true).await;
+    let api = video_api(ep);
+    let info = StreamInfo {
+        title: Some("Ranked grind".into()),
+        category: Some(Category { name: "Valorant".into(), ids: CategoryIds::default() }),
+        tags: Some(vec!["valorant".into()]),
+        language: Some("hi".into()),
+    };
+    assert_eq!(api.update_broadcast_info(&info).await.unwrap(), vec!["title", "category", "tags", "language"]);
+    let body = puts.lock().unwrap()[0].clone();
+    assert_eq!(body["id"], "vid-1");
+    assert_eq!(body["snippet"]["title"], "Ranked grind");
+    assert_eq!(body["snippet"]["description"], "Keep me", "videos.update would wipe it otherwise");
+    assert_eq!(body["snippet"]["categoryId"], "20", "a game is YouTube's Gaming category");
+    assert_eq!(body["snippet"]["defaultAudioLanguage"], "hi");
+    assert!(body["snippet"].get("channelId").is_none() && body["snippet"].get("publishedAt").is_none());
+    let long = StreamInfo { title: Some("x".repeat(101)), ..Default::default() };
+    assert!(api.update_broadcast_info(&long).await.unwrap_err().to_string().contains("100 characters"));
+    assert_eq!(crate::api::search_video_categories("gam")[0].id, "20");
+    assert_eq!(crate::api::search_video_categories("").len(), crate::api::VIDEO_CATEGORIES.len());
+}
+
+#[tokio::test]
+async fn no_live_or_scheduled_broadcast_is_a_clear_refusal() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let (ep, puts) = fake_videos(false).await;
+    let err = video_api(ep).update_broadcast_info(&StreamInfo { title: Some("x".into()), ..Default::default() }).await;
+    assert!(err.unwrap_err().to_string().contains("live or scheduled stream"));
+    assert!(puts.lock().unwrap().is_empty());
+}

@@ -7,6 +7,7 @@
 //! [`Event`]: ferrocast_core::event::Event
 
 pub mod auth;
+pub mod channel;
 pub mod eventsub;
 pub mod helix;
 pub mod map;
@@ -75,6 +76,8 @@ impl TwitchError {
             .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
             .unwrap_or_else(|| format!("status {status}"));
         match status {
+            // Twitch answers a missing scope with 401 "Missing scope: …".
+            401 if message.to_lowercase().contains("missing scope") => TwitchError::MissingScope(message),
             401 => TwitchError::SignInNeeded,
             403 if message.to_lowercase().contains("scope") || message.to_lowercase().contains("permission") => {
                 TwitchError::MissingScope(message)

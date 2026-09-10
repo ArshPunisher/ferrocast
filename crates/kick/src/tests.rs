@@ -162,3 +162,95 @@ async fn requests_have_the_shapes_kick_documents() {
     assert_eq!(seen.lock().unwrap().bodies.last().unwrap().0, "DELETE /public/v1/chat/admin");
     assert!(kick.delete_message("///").await.is_err());
 }
+
+// ---------------------------------------------------------------- stream info (Studio)
+
+/// A fake Kick channel API: categories "Valorant" (12) and "Just Chatting" (15); PATCH
+/// /channels answers 403 when `forbid` is set (an old sign-in without `channel:write`).
+async fn fake_channels(forbid: bool) -> (String, Arc<Mutex<Seen>>) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let s = seen.clone();
+    let handler = move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+        let s = s.clone();
+        async move {
+            let path = uri.path().to_string();
+            if path == "/public/v1/categories" {
+                let q = uri.query().unwrap_or("").to_lowercase();
+                let all = [(12, "Valorant"), (15, "Just Chatting")];
+                let data: Vec<Value> = all
+                    .iter()
+                    .filter(|(_, n)| {
+                        q.contains(&n.to_lowercase().replace(' ', "+")) || q.contains(&n.to_lowercase()[..3])
+                    })
+                    .map(|(id, n)| json!({ "id": id, "name": n, "thumbnail": "" }))
+                    .collect();
+                return (axum::http::StatusCode::OK, axum::Json(json!({ "data": data })));
+            }
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            s.lock().unwrap().bodies.push((format!("{method} {path}"), v));
+            if forbid {
+                return (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "message": "Forbidden" })));
+            }
+            (axum::http::StatusCode::NO_CONTENT, axum::Json(json!({})))
+        }
+    };
+    let app = axum::Router::new().fallback(handler);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (base, seen)
+}
+
+#[tokio::test]
+async fn stream_info_patches_the_channel_and_finds_the_category() {
+    use ferrocast_core::stream_info::{Category, CategoryIds, StreamInfo};
+    let (base, seen) = fake_channels(false).await;
+    let kick = api(&base, seen.clone());
+    let info = StreamInfo {
+        title: Some("Ranked".into()),
+        category: Some(Category { name: "valorant".into(), ids: CategoryIds::default() }),
+        tags: Some(vec!["English".into()]),
+        language: Some("en".into()),
+    };
+    assert_eq!(kick.update_channel(&info).await.unwrap(), vec!["title", "category", "tags"], "no language on Kick");
+    let b = seen.lock().unwrap().bodies.clone();
+    assert_eq!(
+        b[0],
+        (
+            "PATCH /public/v1/channels".into(),
+            json!({ "stream_title": "Ranked", "category_id": 12, "custom_tags": ["English"] })
+        )
+    );
+    let hits = kick.search_categories("just").await.unwrap();
+    assert_eq!(hits[0].id, "15");
+    assert!(hits[0].image_url.is_none(), "empty thumbnails are left out");
+    let unknown = StreamInfo {
+        category: Some(Category { name: "Nope".into(), ids: CategoryIds::default() }),
+        ..Default::default()
+    };
+    assert!(kick.update_channel(&unknown).await.unwrap_err().to_string().contains("no category called"));
+    let bad_id = StreamInfo {
+        category: Some(Category {
+            name: "x".into(),
+            ids: CategoryIds { kick: Some("abc".into()), ..Default::default() },
+        }),
+        ..Default::default()
+    };
+    assert!(kick.update_channel(&bad_id).await.is_err());
+    let only_language = StreamInfo { language: Some("en".into()), ..Default::default() };
+    assert!(kick.update_channel(&only_language).await.unwrap().is_empty(), "nothing Kick takes: no request");
+}
+
+#[tokio::test]
+async fn a_403_on_the_channel_means_reconnect_for_channel_write() {
+    use ferrocast_connector::ConnectorError;
+    use ferrocast_core::stream_info::StreamInfo;
+    let (base, seen) = fake_channels(true).await;
+    let kick = api(&base, seen);
+    let err = kick.update_channel(&StreamInfo { title: Some("x".into()), ..Default::default() }).await.unwrap_err();
+    assert_eq!(err, KickError::MissingScope("channel:write".into()));
+    assert!(
+        matches!(ConnectorError::from(err), ConnectorError::MissingScope { scope, .. } if scope == "channel:write")
+    );
+    assert!(SCOPES.contains(&"channel:write"));
+}

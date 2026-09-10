@@ -1,7 +1,7 @@
 //! Twitch actions for the engine (send chat, moderate, chat modes).
 
 use async_trait::async_trait;
-use ferrocast_connector::{Connector, Result};
+use ferrocast_connector::{CategoryHit, Connector, Result, StreamInfo};
 use ferrocast_core::event::{ChatMode, Platform};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use serde_json::json;
@@ -62,6 +62,41 @@ impl Connector for TwitchConnector {
 
     async fn last_game(&self, login: &str) -> Result<Option<String>> {
         Ok(self.helix.channel_game(login).await?)
+    }
+
+    async fn update_stream_info(&self, info: &StreamInfo) -> Result<Vec<String>> {
+        self.need_broadcast_scope().await?;
+        Ok(self.helix.modify_channel(&self.user_id, info).await?)
+    }
+
+    async fn search_categories(&self, query: &str) -> Result<Vec<CategoryHit>> {
+        Ok(self.helix.search_categories(query).await?)
+    }
+
+    async fn create_marker(&self, description: &str) -> Result<()> {
+        self.need_broadcast_scope().await?;
+        Ok(self.helix.create_marker(&self.user_id, description).await?)
+    }
+
+    async fn followed_at(&self, user_id: &str) -> Result<Option<i64>> {
+        let at = self.helix.followed_at(&self.user_id, user_id).await?;
+        Ok(at.as_deref().and_then(crate::channel::rfc3339_ms))
+    }
+}
+
+impl TwitchConnector {
+    /// Older sign-ins predate `channel:manage:broadcast`: say "reconnect" before Twitch
+    /// refuses (R-22). A token with no recorded scopes (tests, very old saves) is tried.
+    async fn need_broadcast_scope(&self) -> Result<()> {
+        const SCOPE: &str = "channel:manage:broadcast";
+        let have = self.helix.auth.scopes().await;
+        if !have.is_empty() && !have.iter().any(|s| s == SCOPE) {
+            return Err(ferrocast_connector::ConnectorError::MissingScope {
+                platform: Platform::Twitch,
+                scope: SCOPE.into(),
+            });
+        }
+        Ok(())
     }
 }
 

@@ -70,4 +70,12 @@ impl Connector for YoutubeConnector {
     async fn set_mode(&self, _change: ModeChange) -> Result<()> {
         Err(ConnectorError::NotSupported { platform: Platform::Youtube, what: "change chat modes" })
     }
+
+    async fn update_stream_info(&self, info: &ferrocast_connector::StreamInfo) -> Result<Vec<String>> {
+        Ok(self.api.update_broadcast_info(info).await?)
+    }
+
+    async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>> {
+        Ok(crate::api::search_video_categories(query))
+    }
 }
