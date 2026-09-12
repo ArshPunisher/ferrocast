@@ -27,6 +27,7 @@ const TABLES: &[&str] = &[
     "overlays",
     "alert_rules",
     "media",
+    "designs",
     "goals",
     "commands",
     "timers",
@@ -367,6 +368,21 @@ pub fn import(store: &Store, pack: &Path) -> Result<ImportReport> {
     result
 }
 
+/// The design in a pack's `designs` row, made safe: its id matches the row, it isn't
+/// built-in or branded, and it passes every check. `None` skips the row.
+fn pack_design(row: &Map<String, Value>) -> Option<ferrocast_core::design::Design> {
+    let id = row.get("id")?.as_str()?;
+    let mut d: ferrocast_core::design::Design = serde_json::from_str(row.get("data")?.as_str()?).ok()?;
+    if d.id != id {
+        return None;
+    }
+    d.built_in = false;
+    d.branded = false;
+    d.pro = false;
+    d.validate().ok()?;
+    Some(d)
+}
+
 /// Settings that belong to this computer, not to the streamer's setup: a pack (perhaps one
 /// someone else shared) must not open the server to the network, start the app at login,
 /// or point the OBS connection, and with it the OBS password, at another machine.
@@ -449,6 +465,16 @@ fn import_staged<R: Read + Seek>(
                 {
                     continue;
                 }
+                // A design must be one this build can read, and never a forged built-in: a
+                // pack someone shared can't plant a "branded" design or a broken one.
+                let mut row = row.clone();
+                if *table == "designs" {
+                    let Some(design) = pack_design(&row) else { continue };
+                    row.insert("data".into(), Value::String(serde_json::to_string(&design)?));
+                    row.insert("kind".into(), Value::String(design.kind().key().into()));
+                    row.insert("name".into(), Value::String(design.name.clone()));
+                }
+                let row = &row;
                 if *table == "loyalty_balances" {
                     let owner = row.get("viewer_id").and_then(Value::as_i64);
                     let known: bool = tx.query_row(
@@ -717,6 +743,54 @@ mod tests {
         import(&s, local.path()).unwrap();
         let obs: Value = repo::settings::get(&s, "obs").unwrap().unwrap();
         assert_eq!(obs["port"], 4460, "OBS on this computer is kept");
+    }
+
+    #[test]
+    fn designs_travel_in_a_pack_but_never_as_forged_built_ins() {
+        let a = tempfile::tempdir().unwrap();
+        let s = Store::open(a.path()).unwrap();
+        let mut d: ferrocast_core::design::Design =
+            serde_json::from_str(include_str!("../../core/fixtures/designs/alert-design.json")).unwrap();
+        d.id = "mine".into();
+        repo::designs::insert(&s, &d).unwrap();
+        let mut o = repo::overlays::create(&s, "BRB", ferrocast_core::overlay::Preset::Blank).unwrap();
+        o.design = Some(ferrocast_core::overlay::DesignRef { id: "mine".into(), scene: "brb".into(), branded: false });
+        repo::overlays::update(&s, &o).unwrap();
+        let pack = a.path().join("p.ferropack");
+        let manifest = export(&s, &pack, "0.1.0").unwrap();
+        assert_eq!(manifest.counts["designs"], 1);
+        let b = tempfile::tempdir().unwrap();
+        let s2 = Store::open(b.path()).unwrap();
+        import(&s2, &pack).unwrap();
+        assert_eq!(repo::designs::get(&s2, "mine").unwrap(), d);
+        assert_eq!(repo::overlays::get(&s2, &o.id).unwrap().design, o.design, "the overlay keeps its design link");
+
+        // A hand-edited pack: a forged built-in, a broken design and a mismatched id.
+        let mut forged = d.clone();
+        forged.id = "forged".into();
+        forged.built_in = true;
+        forged.branded = true;
+        let mut broken = d.clone();
+        broken.id = "broken".into();
+        broken.name = String::new();
+        let row = |id: &str, design: &ferrocast_core::design::Design| {
+            json!({ "id": id, "kind": "alert", "name": "x", "data": serde_json::to_string(design).unwrap(),
+                    "created_at": 0, "updated_at": 0 })
+        };
+        let rows = serde_json::to_vec(&json!([
+            row("forged", &forged),
+            row("broken", &broken),
+            row("other-id", &d),
+            json!({ "id": "junk", "kind": "alert", "name": "x", "data": "{not json", "created_at": 0, "updated_at": 0 }),
+        ]))
+        .unwrap();
+        let hostile = write_pack(&[("manifest.json", &manifest_bytes(1)), ("designs.json", &rows)]);
+        import(&s2, hostile.path()).unwrap();
+        let got = repo::designs::get(&s2, "forged").unwrap();
+        assert!(!got.built_in && !got.branded, "a pack can't make a branded built-in");
+        assert!(repo::designs::get(&s2, "broken").is_err());
+        assert!(repo::designs::get(&s2, "other-id").is_err());
+        assert!(repo::designs::get(&s2, "junk").is_err());
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod db;
 mod error;
 
 pub mod backup;
+pub mod designfile;
 pub mod import;
 pub mod repo;
 

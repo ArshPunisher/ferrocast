@@ -20,6 +20,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_giveaway_entries.sql"),
     include_str!("../migrations/0007_last_message.sql"),
     include_str!("../migrations/0008_imports.sql"),
+    include_str!("../migrations/0009_designs.sql"),
+    include_str!("../migrations/0010_studio.sql"),
 ];
 
 /// Schema version this build understands.
@@ -130,6 +132,34 @@ mod tests {
         drop(s);
         Store::open(dir.path()).unwrap();
         assert!(!dir.path().join("backups").exists(), "no backup when nothing migrated");
+    }
+
+    #[test]
+    fn version_8_databases_gain_designs_and_keep_their_overlays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferrocast.db");
+        {
+            let mut c = Connection::open(&path).unwrap();
+            for (i, sql) in MIGRATIONS.iter().take(8).enumerate() {
+                let tx = c.transaction().unwrap();
+                tx.execute_batch(sql).unwrap();
+                tx.pragma_update(None, "user_version", i as i64 + 1).unwrap();
+                tx.commit().unwrap();
+            }
+            c.execute(
+                "INSERT INTO overlays(id, name, token, width, height, widgets, created_at, updated_at)
+                 VALUES ('o1', 'Main', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1920, 1080, '[]', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let s = Store::open(dir.path()).unwrap();
+        let v: i64 = s.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(dir.path().join("backups").exists(), "a backup is taken before migrating");
+        let o = crate::repo::overlays::get(&s, "o1").unwrap();
+        assert_eq!((o.name.as_str(), o.design), ("Main", None), "existing overlays keep working");
+        assert!(crate::repo::designs::list(&s).unwrap().is_empty());
     }
 
     #[test]

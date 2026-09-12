@@ -214,6 +214,16 @@ pub fn get(store: &Store, id: &str) -> Result<Option<(Media, PathBuf)>> {
     }))
 }
 
+/// The library file with this content, if there is one (imports reuse it).
+pub fn find_by_sha256(store: &Store, sha256: &str) -> Result<Option<String>> {
+    let id: Option<String> = store.read(|c| {
+        Ok(c.query_row("SELECT id FROM media WHERE sha256 = ?1 ORDER BY created_at LIMIT 1", [sha256], |r| r.get(0))
+            .optional()?)
+    })?;
+    // Only if the file is really still there.
+    Ok(id.filter(|id| media_dir(store).join(id).is_file()))
+}
+
 pub fn delete(store: &Store, id: &str) -> Result<()> {
     let n = store.write(|tx| Ok(tx.execute("DELETE FROM media WHERE id = ?1", [id])?))?;
     if n == 0 {

@@ -2,6 +2,7 @@
 //! SQL, and every write stamps its own time.
 
 pub mod bot;
+pub mod designs;
 pub mod events;
 pub mod giveaways;
 pub mod goals;
@@ -11,6 +12,7 @@ pub mod overlays;
 pub mod recap;
 pub mod rules;
 pub mod settings;
+pub mod studio;
 pub mod viewers;
 
 use rusqlite::types::Type;
