@@ -1,5 +1,6 @@
 //! The relay's own small SQLite database: installs, who owns which Kick channel, the
-//! per-install delivery queue, seen webhook ids, and sign-ins in progress.
+//! per-install delivery queue, seen webhook ids, sign-ins in progress, and Pro
+//! subscriptions (`billing::store`).
 //! It never stores platform tokens beyond the moment they're handed to the desktop.
 
 use std::path::Path;
@@ -67,10 +68,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(crate::billing::store::SCHEMA)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
-    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -293,14 +295,16 @@ impl Db {
         c.execute("DELETE FROM released_handles WHERE released_at < ?1", [now - crate::tips::HANDLE_HOLD_MS])?;
         c.execute("DELETE FROM pending_oauth WHERE created_at < ?1", [now - 600_000])?;
         // Installs registered but never used again (a scripted sign-up flood, or an app that
-        // was installed and removed) go after a week; anything with a tip page or a Kick
-        // channel stays.
+        // was installed and removed) go after a week; anything with a tip page, a Kick
+        // channel or Pro stays.
         c.execute(
             "DELETE FROM installs WHERE last_seen = created_at AND created_at < ?1
                AND id NOT IN (SELECT install_id FROM tip_pages)
-               AND id NOT IN (SELECT install_id FROM kick_owners)",
+               AND id NOT IN (SELECT install_id FROM kick_owners)
+               AND id NOT IN (SELECT install_id FROM pro_installs)",
             [now - UNUSED_INSTALL_MS],
         )?;
-        Ok(())
+        drop(c);
+        self.prune_billing()
     }
 }

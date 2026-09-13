@@ -1,10 +1,12 @@
 //! The Ferrocast relay (ARCHITECTURE.md §1): the only server Ferrocast runs.
 //!
 //! It exists because some things need a public URL or a client secret: Kick's webhooks,
-//! Kick's token exchange, and (later) payment webhooks for the tip page. Everything it
+//! Kick's token exchange, payment webhooks for the tip page, and Ferrocast Pro billing
+//! (`billing`). Everything it
 //! receives is forwarded to the streamer's desktop over an outbound WebSocket (no inbound
 //! ports on their PC), queued while the desktop is offline (R-01, R-13 in VISION).
 
+pub mod billing;
 pub mod db;
 pub mod kick;
 pub mod tips;
@@ -69,6 +71,9 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub http: reqwest::Client,
     pub keys: Arc<kick::KeyCache>,
+    /// Ferrocast Pro billing (Razorpay); off until its keys are set.
+    pub billing_cfg: Arc<billing::BillingConfig>,
+    pub(crate) billing: Arc<billing::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -84,10 +89,19 @@ impl AppState {
             db: Arc::new(db),
             http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default(),
             keys: Arc::default(),
+            billing_cfg: Arc::default(),
+            billing: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
         }
+    }
+
+    /// Billing settings (`billing::BillingConfig::from_env()` in production).
+    pub fn with_billing(mut self, cfg: billing::BillingConfig) -> AppState {
+        self.billing_cfg = Arc::new(cfg);
+        self.billing = Arc::default();
+        self
     }
 
     fn waker(&self, install: &str) -> Arc<Notify> {
@@ -122,6 +136,12 @@ impl ApiError {
         tracing::error!(error = %e, "relay database error");
         ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage", "The relay couldn't save that. Try again shortly.")
     }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
     fn unauthorized() -> Self {
         ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "This Ferrocast install isn't recognised.")
     }
@@ -154,6 +174,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tips/kofi/{install}", post(tips::kofi))
         .route("/v1/tips/stripe/{install}", post(tips::stripe))
         .route("/t/{handle}", get(tips::page))
+        .route("/v1/pro/status", get(billing::status))
+        .route("/v1/pro/checkout", post(billing::checkout))
+        .route("/v1/pro/cancel", post(billing::cancel))
+        .route("/v1/pro/manage-link", post(billing::manage_link))
+        .route("/v1/pro/restore", post(billing::restore))
+        .route("/pro/manage/{token}", get(billing::manage_page))
+        .route("/pro/manage/{token}/cancel", post(billing::manage_cancel))
+        .route("/billing/razorpay/webhook", post(billing::webhook))
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
@@ -352,6 +380,7 @@ pub const KICK_SCOPES: &[&str] = &[
     "moderation:chat_message:manage",
     "channel:rewards:read",
     "kicks:read",
+    "channel:write",
 ];
 
 #[derive(Deserialize)]
