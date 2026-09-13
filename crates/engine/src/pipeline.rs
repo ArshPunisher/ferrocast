@@ -248,6 +248,9 @@ impl Engine {
             self.send_live_event(e.seq, LiveFrame::new("chatter", &v));
         }
         if show_in_overlays {
+            // Studio: the "Don't miss" lane, markers, clips, watch time (never for hidden chat).
+            let first = matches!(chatter, Some(ferrocast_core::welcome::ChatterMark::First));
+            self.studio_saw(&e, first).await;
             let audience = match e.kind {
                 EventKind::ChatMessage { .. } => Some(Audience::Chat),
                 _ if e.kind.is_alertable() && e.origin == Origin::Live => Some(Audience::Alerts),
@@ -371,7 +374,7 @@ impl Engine {
         // Only live chat from this channel gets answers: replayed history and Shared Chat
         // messages from a partner channel never make the bot speak (R-11).
         if bot_on && e.origin == Origin::Live && e.channel.is_none() && content.text.trim_start().starts_with('!') {
-            if self.answer_points_command(e).await {
+            if self.answer_studio_command(e).await || self.answer_points_command(e).await {
                 return Moderated::Shown;
             }
             self.answer_command(e).await;
@@ -397,6 +400,7 @@ impl Engine {
             }
         }
         self.shoutout_vars(e.platform, actor, &content.text, &mut extra).await;
+        self.counter_vars(&mut extra); // `{count:deaths}` (Studio counters)
         let result = {
             let commands = self.state().commands.clone();
             let mut cd = self.inner.cooldowns.lock().unwrap_or_else(|p| p.into_inner());
@@ -427,7 +431,7 @@ impl Engine {
             let st = self.state();
             (st.rules.clone(), st.settings.test_alerts, tts::decide(&st.tts, &st.filter, e), st.tts_paused)
         };
-        let decision =
+        let mut decision =
             if paused_tts { Decision::Skip { reason: "panic mode paused TTS".into() } } else { tts_decision };
 
         let mut alerted = false;
@@ -443,6 +447,17 @@ impl Engine {
             reasons.push("Test alerts are turned off in settings.".into());
         } else if let Some((rule, variation)) = select(&rules, e) {
             let mut alert = render(&ferrocast_store::new_id(), rule, variation, e);
+            // The alert design in use (or the one a designer test asked for) dresses it,
+            // and its TTS switch and minimum come on top of the TTS policy.
+            let design = self.take_test_design(e).or_else(|| self.state().active_design.clone());
+            if let Some(d) = &design
+                && let Some((key, dv)) = ferrocast_core::design::pick(d, e)
+            {
+                ferrocast_core::design::render_onto(&mut alert, d, key, dv, e);
+                if !ferrocast_core::design::allows_tts(&dv.look, e) && !matches!(decision, Decision::Skip { .. }) {
+                    decision = Decision::Skip { reason: "the alert design doesn't read messages aloud".into() };
+                }
+            }
             if let Decision::Speak { text } = &decision {
                 alert.tts_text = Some(text.clone());
             } else {

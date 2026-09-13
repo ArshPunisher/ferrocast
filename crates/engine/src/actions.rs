@@ -67,12 +67,36 @@ impl Engine {
 
     /// Fires a test event of `kind` through the real pipeline (API `POST /test`).
     pub async fn test(&self, kind: &str, platform: Option<Platform>) -> Result<(), EngineError> {
+        self.test_with(kind, platform, TestOptions::default()).await
+    }
+
+    /// A test event with a chosen amount and, for the designer's "Send test alert", the
+    /// design to show it with (instead of the one in use).
+    pub async fn test_with(
+        &self,
+        kind: &str,
+        platform: Option<Platform>,
+        opts: TestOptions,
+    ) -> Result<(), EngineError> {
         let at = now();
-        let event = match platform {
+        let mut event = match platform {
             Some(p) => sample::sample(kind, p, at),
             None => sample::any_sample(kind, at),
         }
         .ok_or_else(|| EngineError::Invalid(format!("There's no test for \"{kind}\" on that platform.")))?;
+        if let Some(amount) = opts.amount {
+            set_amount(&mut event, amount)?;
+        }
+        if let Some(id) = opts.design_id.as_deref() {
+            let d = self.design(id).await?;
+            if d.kind() != ferrocast_core::design::DesignKind::Alert {
+                return Err(EngineError::Invalid("design_id: test alerts need an alert design.".into()));
+            }
+            // The pipeline gives the event its id; the design is found by this unique key.
+            let key = format!("design-test-{}", ferrocast_store::new_id());
+            event.source_id = Some(key.clone());
+            self.put_test_design(&key, d);
+        }
         self.submit(event).await
     }
 
@@ -102,12 +126,19 @@ impl Engine {
         e.origin = Origin::Test;
         e.seq = self.next_seq();
         e.received_at = at;
-        let rules = self.state().rules.clone();
-        let alert = e
-            .may_alert()
-            .then(|| ferrocast_core::alert::select(&rules, &e))
-            .flatten()
-            .map(|(rule, v)| ferrocast_core::alert::render(&format!("preview-{n}"), rule, v, &e));
+        let (rules, design) = {
+            let st = self.state();
+            (st.rules.clone(), st.active_design.clone())
+        };
+        let alert = e.may_alert().then(|| ferrocast_core::alert::select(&rules, &e)).flatten().map(|(rule, v)| {
+            let mut a = ferrocast_core::alert::render(&format!("preview-{n}"), rule, v, &e);
+            if let Some(d) = &design
+                && let Some((key, dv)) = ferrocast_core::design::pick(d, &e)
+            {
+                ferrocast_core::design::render_onto(&mut a, d, key, dv, &e);
+            }
+            a
+        });
         (e, alert)
     }
 
@@ -603,4 +634,34 @@ fn mode_label(m: ferrocast_core::event::ChatMode) -> &'static str {
         Slow => "slow mode",
         UniqueChat => "unique chat",
     }
+}
+
+/// Options for [`Engine::test_with`].
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TestOptions {
+    pub design_id: Option<String>,
+    /// In major units: ₹750 is 750; also bits, gifted subs, raid viewers or sub months.
+    pub amount: Option<f64>,
+}
+
+/// Puts `amount` into a sample event, so a test can check how big numbers look.
+fn set_amount(e: &mut Event, amount: f64) -> Result<(), EngineError> {
+    use ferrocast_core::event::EventKind;
+    if !amount.is_finite() || amount <= 0.0 || amount > 1_000_000_000.0 {
+        return Err(EngineError::Invalid("amount: must be a number above 0 and up to 1,000,000,000.".into()));
+    }
+    let whole = || u32::try_from(amount.round() as i64).unwrap_or(u32::MAX).max(1);
+    match &mut e.kind {
+        EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } => {
+            let digits = ferrocast_core::money::exponent(&money.currency);
+            let minor = (amount * 10f64.powi(i32::try_from(digits).unwrap_or(2))).round() as i64;
+            *money = ferrocast_core::money::Money::new(minor.max(1), &money.currency);
+        }
+        EventKind::PlatformGift { value, .. } => value.amount = u64::from(whole()),
+        EventKind::GiftBatch { count, .. } => *count = whole(),
+        EventKind::Raid { viewers, .. } => *viewers = whole(),
+        EventKind::Subscription { months, .. } => *months = whole().min(1200),
+        _ => return Err(EngineError::Invalid("amount: this kind of alert has no amount.".into())),
+    }
+    Ok(())
 }

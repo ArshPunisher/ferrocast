@@ -158,6 +158,8 @@ pub struct State {
     pub session: Session,
     /// Why recent events did or didn't alert, newest last (bounded).
     pub why: VecDeque<(String, Why)>,
+    /// The alert design every alert plays with (API.md §4 Designs), if one is picked.
+    pub active_design: Option<ferrocast_core::design::Design>,
 }
 
 /// Health of one connection as the dashboard shows it (API.md `ConnectorState`).

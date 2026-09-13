@@ -25,18 +25,18 @@ pub(crate) const INSTALL: &str = "relay-install";
 const KICK_TOKENS: &str = "kick-tokens";
 
 impl Engine {
-    fn relay_url(&self) -> Result<String, EngineError> {
+    pub(crate) fn relay_url(&self) -> Result<String, EngineError> {
         self.apps().relay_url.clone().ok_or_else(|| {
             EngineError::Unavailable("This build of Ferrocast has no relay set up, so Kick and tips can't work.".into())
         })
     }
 
-    fn relay_http(&self) -> reqwest::Client {
+    pub(crate) fn relay_http(&self) -> reqwest::Client {
         reqwest::Client::builder().timeout(Duration::from_secs(15)).build().unwrap_or_default()
     }
 
     /// The install's `id.secret`, registering with the relay the first time.
-    async fn relay_auth(&self) -> Result<String, EngineError> {
+    pub(crate) async fn relay_auth(&self) -> Result<String, EngineError> {
         if let Some(a) = self.inner.secrets.get(INSTALL).map_err(|e| EngineError::Unavailable(e.to_string()))? {
             return Ok(a);
         }

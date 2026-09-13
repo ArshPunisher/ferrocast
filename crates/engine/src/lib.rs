@@ -10,6 +10,7 @@
 mod accounts;
 mod actions;
 mod backups;
+pub mod designs;
 mod discord;
 mod dispatcher;
 mod error;
@@ -20,11 +21,14 @@ mod obs;
 mod patch;
 mod pipeline;
 mod polls;
+mod pro;
+pub use pro::{ProStatus, ProView};
 mod recap;
 mod relay;
 mod snapshot;
 pub mod speech;
 mod starter;
+pub mod studio;
 mod timers;
 mod updates;
 pub use updates::AvailableUpdate;
@@ -47,6 +51,7 @@ use ferrocast_store::{Store, StoreError, repo};
 use tokio::sync::{Notify, broadcast, mpsc};
 
 pub use accounts::{ConnectFlow, PlatformApps};
+pub use actions::TestOptions;
 pub use discord::{DiscordFailure, DiscordView};
 pub use error::EngineError;
 use frames::{LiveFrame, OverlayFrame};
@@ -119,6 +124,12 @@ struct Inner {
     obs_wake: Notify,
     /// Where OBS's own settings are looked for.
     obs_paths: RwLock<Vec<std::path::PathBuf>>,
+    /// The design catalogue that ships with the app.
+    builtins: RwLock<Arc<Vec<ferrocast_core::design::Design>>>,
+    /// Test alerts that asked for a particular design.
+    test_designs: Mutex<designs::TestDesigns>,
+    /// Studio: counters, quotes, modules, stream info, show, OBS helpers, moments.
+    studio: studio::Studio,
 }
 
 impl Engine {
@@ -132,6 +143,7 @@ impl Engine {
         )
         .await?;
         engine.watch_obs();
+        engine.watch_obs_health();
         Ok(engine)
     }
 
@@ -212,6 +224,9 @@ impl Engine {
                 obs_wake: Notify::new(),
                 // Tests never read (or connect to) the developer's real OBS: `start` sets the real places.
                 obs_paths: RwLock::new(Vec::new()),
+                builtins: RwLock::new(Arc::new(Vec::new())),
+                test_designs: Mutex::new(Default::default()),
+                studio: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -222,6 +237,9 @@ impl Engine {
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
         tokio::spawn(giveaways::run(engine.clone()));
+        engine.load_studio().await;
+        tokio::spawn(studio::run(engine.clone()));
+        engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)
     }
@@ -413,14 +431,17 @@ impl Engine {
         // No config save can land between the read and the swap and be overwritten.
         let _one_at_a_time = self.inner.config.lock().await;
         let (fresh, _) = self.db(load_state).await?;
-        let mut st = self.state_mut();
-        let connectors = std::mem::take(&mut st.connectors);
-        let live = std::mem::take(&mut st.live);
-        let viewers = std::mem::take(&mut st.viewers);
-        let session = std::mem::take(&mut st.session);
-        let why = std::mem::take(&mut st.why);
-        let (panic_on, tts_paused) = (st.panic_on, st.tts_paused);
-        *st = State { connectors, live, viewers, session, why, panic_on, tts_paused, ..fresh };
+        {
+            let mut st = self.state_mut();
+            let connectors = std::mem::take(&mut st.connectors);
+            let live = std::mem::take(&mut st.live);
+            let viewers = std::mem::take(&mut st.viewers);
+            let session = std::mem::take(&mut st.session);
+            let why = std::mem::take(&mut st.why);
+            let (panic_on, tts_paused) = (st.panic_on, st.tts_paused);
+            *st = State { connectors, live, viewers, session, why, panic_on, tts_paused, ..fresh };
+        }
+        self.refresh_active_design().await;
         Ok(())
     }
 

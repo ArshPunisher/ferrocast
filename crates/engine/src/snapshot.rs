@@ -19,6 +19,8 @@ pub struct OverlayView {
     pub height: i32,
     pub widgets: Vec<ferrocast_core::overlay::Widget>,
     pub updated_at: i64,
+    /// The gallery design it was made from (API.md §4 Designs).
+    pub design: Option<ferrocast_core::overlay::DesignRef>,
 }
 
 const ALERTABLE: [&str; 7] = ["follow", "subscription", "gift_batch", "platform_gift", "paid_message", "tip", "raid"];
@@ -33,6 +35,7 @@ impl Engine {
             height: o.height,
             widgets: o.widgets.clone(),
             updated_at: o.updated_at,
+            design: o.design.clone(),
         }
     }
 
@@ -52,18 +55,27 @@ impl Engine {
         Ok(self.overlay_view(&o))
     }
 
-    /// Saves an edited overlay and pushes the new layout to its open pages.
+    /// Saves an edited overlay and pushes the new layout to its open pages. A built-in
+    /// design's mark can't be edited away (`check_branding`).
     pub async fn update_overlay(&self, o: Overlay) -> Result<OverlayView, EngineError> {
         o.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let current = self.overlay(&o.id).await?;
+        self.check_branding(&current, &o)?;
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
+        self.push_config(&saved);
+        Ok(view)
+    }
+
+    /// Sends an overlay's new layout to its open pages.
+    pub(crate) fn push_config(&self, o: &Overlay) {
+        let view = self.overlay_view(o);
         self.send_overlay(OverlayFrame::new(
-            Audience::Overlay(saved.id.clone()),
+            Audience::Overlay(o.id.clone()),
             self.next_seq(),
             "config",
             &view_public(&view),
         ));
-        Ok(view)
     }
 
     pub async fn regenerate_overlay_url(&self, id: &str) -> Result<OverlayView, EngineError> {
@@ -141,6 +153,7 @@ impl Engine {
                     let tpl = w.config.get("template").and_then(Value::as_str).unwrap_or("{value}");
                     let mut vars = Vars::new();
                     vars.insert("value".into(), st.session.label(source));
+                    self.counter_vars(&mut vars); // `{count:deaths}` (Studio counters)
                     let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
                     (w.id.clone(), json!(text))
                 })
@@ -158,5 +171,6 @@ impl Engine {
 
 /// Overlay pages don't need to see their own URL (it contains the token).
 fn view_public(v: &OverlayView) -> Value {
-    json!({ "id": v.id, "name": v.name, "width": v.width, "height": v.height, "widgets": v.widgets, "updated_at": v.updated_at })
+    json!({ "id": v.id, "name": v.name, "width": v.width, "height": v.height, "widgets": v.widgets,
+            "updated_at": v.updated_at, "design": v.design })
 }
