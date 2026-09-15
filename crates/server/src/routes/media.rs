@@ -77,13 +77,17 @@ pub async fn remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiR
         .filter(|(_, v)| v.image.as_deref() == Some(&id) || v.sound.as_deref() == Some(&id))
         .map(|(r, v)| format!("{} → {}", r.name, v.name))
         .collect();
+    let used_by: Vec<String> = used_by
+        .into_iter()
+        .chain(app.engine.designs_using_media(&id).await?.into_iter().map(|d| format!("the design {d}")))
+        .collect();
     if !used_by.is_empty() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "in_use",
             format!("This file is used by: {}.", used_by.join(", ")),
         )
-        .hint("Change those alerts to another file first."));
+        .hint("Change those alerts or designs to another file first."));
     }
     app.engine.db(move |s| media::delete(s, &id)).await?;
     Ok(StatusCode::NO_CONTENT)

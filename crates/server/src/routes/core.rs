@@ -243,11 +243,18 @@ pub struct TestBody {
     kind: String,
     #[serde(default)]
     platform: Option<String>,
+    /// Show it with this alert design instead of the one in use (the designer's test).
+    #[serde(default)]
+    design_id: Option<String>,
+    /// Major units (₹750 is 750), bits, gifted subs, raid viewers or sub months.
+    #[serde(default)]
+    amount: Option<f64>,
 }
 
 pub async fn test(State(app): State<AppState>, Body(b): Body<TestBody>) -> ApiResult<impl IntoResponse> {
     let p = b.platform.as_deref().map(platform).transpose()?;
-    app.engine.test(&b.kind, p).await?;
+    let opts = ferrocast_engine::TestOptions { design_id: b.design_id, amount: b.amount };
+    app.engine.test_with(&b.kind, p, opts).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true }))))
 }
 

@@ -92,6 +92,8 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
         guard: auth::Guard { port: addr.port(), lan: opts.lan, dev_origins: opts.dev_origins },
     };
     engine.set_base_url(&format!("http://127.0.0.1:{}", addr.port()));
+    // The built-in designs ship inside the overlay bundle (API.md §4 Designs).
+    engine.set_builtin_designs(assets::builtin_designs()).await;
     let app = router(state);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -179,5 +181,7 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
 }
 
+#[cfg(test)]
+mod designs_tests;
 #[cfg(test)]
 mod tests;

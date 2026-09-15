@@ -31,10 +31,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"
+async-trait = "0.1"
 ferrocast-testkit.workspace = true
 ferrocast-relay = { path = "../relay" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 tokio-tungstenite = "0.30"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

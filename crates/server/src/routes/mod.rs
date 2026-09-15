@@ -3,6 +3,7 @@
 mod app;
 mod bot;
 mod core;
+mod designs;
 mod discord;
 mod giveaways;
 mod import;
@@ -12,7 +13,9 @@ pub(crate) use core::lan_ip;
 mod media;
 mod moderation;
 mod polls;
+mod pro;
 mod recap;
+mod studio;
 mod welcome;
 
 use axum::Router;
@@ -36,6 +39,13 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/overlays/{id}", get(core::overlay).put(core::update_overlay).delete(core::delete_overlay))
         .route("/overlays/{id}/regenerate-url", post(core::regenerate_url))
         .route("/overlays/{id}/add-to-obs", post(core::add_to_obs))
+        // designs (gallery, designer, Use, share files)
+        .route("/designs", get(designs::list).post(designs::create))
+        .route("/designs/active-alert", get(designs::active_alert).put(designs::set_active_alert))
+        .route("/designs/{id}", get(designs::get).put(designs::update).delete(designs::remove))
+        .route("/designs/{id}/duplicate", post(designs::duplicate))
+        .route("/designs/{id}/use", post(designs::use_design))
+        .route("/designs/{id}/export", post(designs::export))
         // alerts and queue
         .route("/alert-rules", get(core::rules).post(core::create_rule))
         .route("/alert-rules/{id}", put(core::update_rule).delete(core::delete_rule))
@@ -124,6 +134,15 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/import/apply", post(import::apply))
         .route("/backups", get(core::backups).post(core::backup_now))
         .route("/backups/{id}/restore", post(core::restore_backup))
+        // Ferrocast Pro (through the relay; see routes/pro.rs)
+        .route("/pro", get(pro::status))
+        .route("/pro/refresh", post(pro::refresh))
+        .route("/pro/checkout", post(pro::checkout))
+        .route("/pro/manage", post(pro::manage))
+        .route("/pro/cancel", post(pro::cancel))
+        .route("/pro/restore", post(pro::restore))
+        // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
+        .merge(studio::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.
@@ -136,6 +155,11 @@ pub(crate) fn uploads() -> Router<AppState> {
             Router::new()
                 .route("/import/streamlabs/preview", post(import::streamlabs_preview))
                 .layer(axum::extract::DefaultBodyLimit::max(import::MAX_STREAMLABS_BODY)),
+        )
+        .merge(
+            Router::new()
+                .route("/designs/import", post(designs::import))
+                .layer(axum::extract::DefaultBodyLimit::max(designs::MAX_DESIGN_BODY)),
         )
         .merge(Router::new().route("/import", post(media::import)).layer(axum::extract::DefaultBodyLimit::max(
             usize::try_from(ferrocast_store::pack::MAX_PACK).unwrap_or(usize::MAX).saturating_add(64 * 1024),

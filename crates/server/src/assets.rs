@@ -34,6 +34,48 @@ const OVERLAY_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'sel
     img-src 'self' data: https:; media-src 'self' data: blob:; font-src 'self' data: https:; \
     connect-src 'self' ws://127.0.0.1:* ws://localhost:*; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
+/// The design catalogue bundled with the overlays (`designs/catalog.json`, written by the
+/// web build). A missing or unreadable catalogue means no built-ins, never a failed start.
+pub(crate) fn builtin_designs() -> Vec<ferrocast_core::design::Design> {
+    let Some(file) = Overlays::get("designs/catalog.json") else {
+        return Vec::new();
+    };
+    parse_catalog(&file.data)
+}
+
+#[derive(serde::Deserialize)]
+struct Catalog {
+    format: String,
+    version: u32,
+    designs: Vec<serde_json::Value>,
+}
+
+/// Reads a catalogue; each design that doesn't parse is skipped with a warning.
+pub(crate) fn parse_catalog(bytes: &[u8]) -> Vec<ferrocast_core::design::Design> {
+    let catalog: Catalog = match serde_json::from_slice(bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "the built-in design catalogue can't be read");
+            return Vec::new();
+        }
+    };
+    if catalog.format != "ferrocast-designs" || catalog.version > 1 {
+        tracing::warn!(format = %catalog.format, version = catalog.version, "unknown design catalogue");
+        return Vec::new();
+    }
+    catalog
+        .designs
+        .into_iter()
+        .filter_map(|v| match serde_json::from_value(v) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::warn!(error = %e, "skipped a built-in design that can't be read");
+                None
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/app/") }))
