@@ -4,6 +4,12 @@ name: Release
 # AppImage) and attaches them to a draft GitHub release (R-62). Nothing is published until
 # the owner reviews the draft. Actions are pinned to commit SHAs.
 #
+# Tags: v0.1.0 is a stable release; v0.1.0-beta.1 (any version with a "-") is a beta: a
+# draft *prerelease* that never becomes "latest", so stable users' feed
+# (releases/latest/download/latest.json) never offers it. Publishing either one runs
+# "Beta feed" (beta-feed.yml), which puts it in the beta channel's own feed. The tag must
+# match [workspace.package] version in Cargo.toml, or nothing is built.
+#
 # Needs, in this repo's settings:
 #   secrets FERROCAST_YOUTUBE_CLIENT_SECRET, TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) for updates;
 #   variables FERROCAST_TWITCH_CLIENT_ID and FERROCAST_YOUTUBE_CLIENT_ID.
@@ -24,8 +30,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Version check
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag matches Cargo.toml
+        id: check
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_TYPE" == tag ]]; then
+            packaging/check-version.sh "$TAG" | tee -a "$GITHUB_OUTPUT"
+          else
+            # A manual run without a tag builds whatever Cargo.toml says, as a test.
+            v="$(awk '/^\[workspace.package\]/{s=1;next} /^\[/{s=0} s&&$1=="version"{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+            packaging/check-version.sh "v$v" | tee -a "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build (${{ matrix.name }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -119,7 +150,7 @@ jobs:
 
   draft:
     name: Draft release
-    needs: build
+    needs: [version, build]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -135,6 +166,8 @@ jobs:
       - name: Put every bundle at the top of dist
         run: find dist -mindepth 2 -type f -exec mv -t dist {} +
       - name: Homebrew cask with this release's checksum
+        # The cask follows stable releases only.
+        if: needs.version.outputs.prerelease != 'true'
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -145,8 +178,16 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: packaging/updater-manifest.sh "${TAG#v}" dist > dist/latest.json
+      - name: Checksums (SHA256SUMS.txt)
+        working-directory: dist
+        run: |
+          sums="$(find . -maxdepth 1 -type f -printf '%f\n' | sort | xargs sha256sum)"
+          printf '%s\n' "$sums" > SHA256SUMS.txt
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          # A beta must never become "latest": stable users' update feed reads that one.
+          make_latest: ${{ needs.version.outputs.prerelease == 'true' && 'false' || 'true' }}
           generate_release_notes: true
           files: dist/*

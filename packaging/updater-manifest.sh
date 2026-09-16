@@ -3,9 +3,16 @@
 # release's updater bundles and their .sig files in <dir>.
 #
 #   packaging/updater-manifest.sh <version> <dir> > latest.json
+#
+# Works the same for betas (0.1.0-beta.1): the URLs point at that tag's own release, and
+# the Release workflow publishes the beta feed separately (packaging/beta-feed.sh).
 set -euo pipefail
-version=$1
-dir=$2
+version=${1:?usage: updater-manifest.sh <version> <dir>}
+dir=${2:?usage: updater-manifest.sh <version> <dir>}
+"$(dirname "$0")/semver.sh" valid "$version" || {
+  echo "'$version' isn't a version (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-beta.N)" >&2
+  exit 1
+}
 base="https://github.com/ArshPunisher/ferrocast/releases/download/v${version}"
 
 entry() { # <platform key> <file>

@@ -9,5 +9,6 @@ echo "== rustfmt";  cargo fmt --all --check
 echo "== clippy";   cargo clippy --workspace --all-targets --locked -q -- -D warnings
 echo "== tests";    cargo nextest run --workspace --locked --no-fail-fast --status-level fail --final-status-level fail --no-tests=pass
 echo "== deny";     cargo deny check -s 2>/dev/null || cargo deny check
-echo "== shellcheck"; shellcheck tools/*.sh
+echo "== shellcheck"; shellcheck tools/*.sh packaging/*.sh deploy/*.sh deploy/tests/*.sh
+echo "== scripts";  packaging/tests.sh >/dev/null && deploy/tests/razorpay-keys.test.sh >/dev/null
 echo "All checks passed."

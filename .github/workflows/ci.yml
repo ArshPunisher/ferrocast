@@ -42,7 +42,11 @@ jobs:
       - name: cargo-deny (licences, advisories, bans, sources)
         run: cargo deny check
       - name: shellcheck
-        run: shellcheck tools/*.sh
+        run: shellcheck tools/*.sh packaging/*.sh deploy/*.sh deploy/tests/*.sh
+      - name: Release and deploy script tests
+        run: |
+          packaging/tests.sh
+          deploy/tests/razorpay-keys.test.sh
 
   test:
     name: Tests (${{ matrix.os }})

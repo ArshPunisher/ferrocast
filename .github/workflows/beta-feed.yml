@@ -1,0 +1,43 @@
+name: Beta feed
+
+# Beta users' update feed (Settings › Updates › Beta). GitHub's "latest" release never
+# points at a prerelease, so the beta channel reads latest.json from a fixed release
+# tagged `beta` instead (apps/desktop/src/main.rs). When the owner publishes a reviewed
+# release draft, beta or stable, this copies its latest.json there if it's newer
+# (packaging/beta-feed.sh). Drafts never reach the feed: their downloads aren't public.
+# Actions are pinned to commit SHAs.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release to put in the beta feed (e.g. v0.1.0-beta.1)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta-feed
+  cancel-in-progress: false
+
+jobs:
+  feed:
+    name: Update the beta feed
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'beta'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Copy the release's latest.json into the beta feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9A-Za-z.+-]+$ ]] || { echo "'$TAG' isn't a release tag." >&2; exit 1; }
+          packaging/beta-feed.sh "$TAG"
