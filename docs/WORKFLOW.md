@@ -20,3 +20,9 @@ Every batch of changes gets a review before it is committed: CodeRabbit (`codera
 - Pure logic in `core` gets unit tests for the happy path **and** for hostile input (empty, huge, unicode tricks, wrong types, replays, out-of-order).
 - Adapters get fixture tests (raw payload → `Event`) and fake-server tests (disconnects, keepalive loss, reconnect handoff, 401 then refresh, 429 with Retry-After).
 - Server routes get negative tests for every way a request can be wrong: no token, wrong token, wrong Origin, wrong Host, oversized body (413), wrong type (415), unknown ids (404), bad JSON (400).
+
+## Releases
+
+1. Bump `[workspace.package] version` in `Cargo.toml` (`0.1.0-beta.2`, or `0.1.0` for stable), run `cargo update --workspace` so `Cargo.lock` follows, commit.
+2. Tag and push the tag: `git tag v0.1.0-beta.2 && git push origin v0.1.0-beta.2`. The Release workflow fails at once if the tag and `Cargo.toml` differ.
+3. Review the draft on GitHub (a beta is marked *Pre-release*), then **Publish**. Publishing runs "Beta feed", which offers it to beta users; stable users get only stable releases (ARCHITECTURE.md §11).

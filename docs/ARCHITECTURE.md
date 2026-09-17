@@ -29,7 +29,7 @@
 │  Kick webhooks (RSA verify, timestamp window, replay table) → desktop    │
 │  Kick OAuth broker (holds the client secret)                             │
 │  Tip pages + payment webhooks (Ko-fi, Razorpay, Stripe) → desktop        │
-│  Pro: licence checks, cloud bot, sync (later)                            │
+│  Pro billing: Razorpay subscriptions + status (§10); cloud bot (later)   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,7 +94,7 @@ Every platform becomes one envelope (`core::event`):
 
 ## 7. Storage
 
-SQLite in WAL mode, a small pool, numbered migrations in `crates/store/migrations`, each with a test. Before any migration or update the store copies itself to `backups/<date>.db` (R-34). Tables: `settings`, `accounts` (no secrets), `overlays`, `alert_rules`, `media`, `events`, `alert_queue`, `viewers`, `viewer_identities`, `ledger`, `commands`, `timers`, `counters`, `quotes`, `filters`, `bans`, `tips`.
+SQLite in WAL mode, a small pool, numbered migrations in `crates/store/migrations`, each with a test. Before any migration or update the store copies itself to `backups/<date>.db` (R-34). Tables: `settings`, `accounts` (no secrets), `overlays`, `alert_rules`, `media`, `events`, `alert_queue`, `viewers`, `viewer_identities`, `ledger`, `commands`, `timers`, `counters`, `quotes`, `filters`, `bans`, `tips`, `markers` and `watch_time` (Studio), `designs` (the streamer's own designs; built-ins ship in the overlay bundle's `designs/catalog.json`).
 
 ## 8. Web version
 
@@ -104,3 +104,28 @@ The same `server` + `engine` run multi-tenant behind the relay later (Pro). The 
 
 - `ferrocast` (this repo): Rust engine, server, relay, desktop shell.
 - `ferrocast-web`: dashboard SPA, overlay bundle, website, Remotion videos, shared UI kit. Its build output (`dashboard/dist`, `overlays/dist`) is embedded into the desktop binary at build time (`FERROCAST_WEB_DIST`, defaults to `../ferrocast-web/dist`).
+
+## 10. Ferrocast Pro: identity and billing
+
+**Identity is the install, not an account.** The desktop already has a relay identity (`install_id` + `install_secret`, registered once, kept in the secret store). Pro hangs off that: no Ferrocast account, no password, no email login, no mail server to run. Checkout asks for one email, which goes to Razorpay's page for receipts and is kept by the relay only as an HMAC-SHA256 keyed with the server's `PRO_EMAIL_KEY` (also in the subscription's Razorpay notes, so a rebuilt relay database can still recover). Moving Pro to a new PC or a reinstall is **Restore**: the subscription id from Razorpay's email plus that email; both must match (one 404 for every mismatch, 5 tries an hour). Up to 3 installs share one subscription; restoring on a 4th drops the oldest. We chose this over email magic links because it needs no outgoing mail, stores no address, and works the same for streamers who never sign in anywhere (R-51); the cost is that a lost subscription id means asking support, who can find it in the Razorpay dashboard.
+
+```
+Settings › Pro ──/api/v1/pro──▶ engine (pro.rs) ──Bearer install──▶ relay /v1/pro/*
+                                 remembers the last answer            │ create / fetch / cancel
+                                 (10 min fresh, 7 days offline)       ▼
+browser ◀── checkout_url (rzp.io, Razorpay's page) ─────────────── Razorpay ── webhook ──▶ relay
+                                                                   /billing/razorpay/webhook
+```
+
+- **Razorpay owns the money, the relay owns access.** Every change (webhook, Refresh, cancel, the daily re-check) re-reads the subscription from Razorpay and copies its status and period, so duplicate, late or out-of-order events can't leave access wrong. Access: `active`/`pending` → paid period + 3 days' grace (none once cancelled); `cancelled`/`completed` → the paid period; `created`, `authenticated`, `halted`, `paused`, `expired` → none; a payment refunded in full → none, and the subscription is cancelled at once. Pure rules in `crates/relay/src/billing/access.rs`.
+- **Webhooks**: HMAC-SHA256 of the raw body, constant-time; each event id handled once, recorded in the same SQLite transaction as its effect (a failure leaves it for Razorpay's retry). The Razorpay account and its one key pair are shared with the owner's other products, so the relay ignores subscriptions and payments it didn't create (`notes.product = "ferrocast-pro"`), without calling Razorpay.
+- **Prices** live in the relay (`Plan::amount_paise`: ₹199 a month, ₹1,999 a year, INR, every charge under the ₹15,000 e-mandate limit). Plans are created once per Razorpay mode by `deploy/razorpay-keys.sh`; checkout refuses a configured plan whose amount, currency or period differ.
+- **Not on sale until Pro's features exist**: `PRO_SALES_OPEN=false` (default) makes checkout 409 `pro_not_on_sale`. Status, cancel, restore and webhooks work regardless, so the plumbing is tested with test-mode keys first.
+- **Offline**: the app never needs the relay to run (R-01). A status the relay confirmed stays valid 7 days without contact, never past the paid period.
+- **Keys** are typed on the server (`razorpay-keys.sh`), never in chat, a command line, the Mac or GitHub; `deploy-relay.sh` carries them over on config updates.
+
+## 11. Releases and update channels
+
+- `vX.Y.Z` tags are stable releases; `vX.Y.Z-beta.N` are betas. The Release workflow refuses a tag that differs from `[workspace.package] version` (`packaging/check-version.sh`), builds every OS, and drafts the release with `SHA256SUMS.txt` and `latest.json`; a beta is drafted as a prerelease that never becomes "latest". The owner reviews and publishes.
+- Stable channel: `releases/latest/download/latest.json` (in `apps/desktop/tauri.conf.json`), which GitHub never points at a prerelease.
+- Beta channel (Settings `update_channel: "beta"`): `releases/download/beta/latest.json`, the `latest.json` asset of a fixed prerelease tagged `beta`. Publishing any release runs "Beta feed" (`packaging/beta-feed.sh`), which copies that release's `latest.json` there when it is newer by semver, so beta users get betas and stable releases, and stable users never get a beta. Drafts never reach either feed.

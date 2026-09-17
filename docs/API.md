@@ -61,7 +61,8 @@ type Event = { id: string; seq: number; platform: Platform; channel: { platform:
 
 type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; variation_id: string; kind: string; platform: Platform;
                        title: string; body: string; image: string | null; sound: string | null; volume: number;
-                       duration_ms: number; layout: string; css: string; tts_text: string | null; tts_audio: string | null; test: boolean };
+                       duration_ms: number; layout: string; css: string; tts_text: string | null; tts_audio: string | null; test: boolean;
+                       design?: AlertDesignView /* only when an alert design dressed it (§4 Designs); layout is then "design" */ };
 // tts_audio is a media id of a WAV made with the computer's own voices; it may be null even when tts_text is set
 // (synthesis still running or unavailable): then speak tts_text with speechSynthesis.
 ```
@@ -104,9 +105,12 @@ Lists come from the event log (live events only, refunded tips left out), up to 
 An overlay is one OBS browser source (a 1920×1080 canvas by default) holding widgets.
 
 ```ts
-type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number };
-type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway";
-                x: number; y: number; w: number; h: number; config: object };
+type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number;
+                 design: { id: string; scene: string; branded: boolean } | null /* the gallery design it came from (§4 Designs) */ };
+type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway" | "layer";
+                x: number; y: number; w: number; h: number; config: object;
+                locked?: boolean; hidden?: boolean; rotation?: number /* degrees, -360…360 */; opacity?: number /* 0…1 */ };
+// locked/hidden/rotation/opacity are left out when false/false/0/1. Widgets are drawn bottom to top in array order.
 ```
 
 | Method | Path | Body → Response |
@@ -126,6 +130,17 @@ Widget `config` per kind:
 - `viewers`: `{ platforms: Platform[], theme: string }`
 - `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
 - `giveaway`: `{ theme: string }` (how to enter while open, then a winner card)
+- `layer` (a static piece of a scene): `{ type: "image" | "text" | "shape" | "frame" | "webcam" | "brand", anim?: { in: AnimIn, delay_ms: 0…10000, loop: "none" | "float" | "pulse" | "shimmer" }, css?: string }` plus, by type:
+  - `image`: `{ media: MediaRef, fit?: "cover" | "contain" | "fill", radius? }`
+  - `text`: `{ text (≤500 chars, shown as is), font?: FontFamily, size? 6…400, weight? 100…900, color?, align?: "left" | "center" | "right", uppercase?, italic?, letter_spacing? -0.2…1, shadow?: "none" | "soft" | "hard" | "glow", outline? 0…20, outline_color? }`
+  - `shape`: `{ shape?: "rect" | "ellipse" | "line" | "slant" | "triangle", fill?, fill2? (gradient end), angle? 0…360, stroke?, stroke_width? 0…50, radius? }`
+  - `frame` / `webcam` (a frame with a see-through middle for the camera): `{ style?: "line" | "double" | "corners" | "notch" | "glow", color?, accent?, thickness? 1…40, radius? 0…400, label? ≤40 }`
+  - `brand`: `{ variant?: "mark" | "badge" | "watermark", color? }`: the small Spark mark of a built-in design (below)
+- Any live widget may carry a style from a widget design: `config.style = { variant?, font?, text?, accent?, background?, track?, muted?, radius? 0…64, font_size? 8…120, uppercase?, brand?: BrandSpot }`, with `config.design_id` and `config.branded`.
+
+Colours are `#rgb`, `#rrggbb`, `#rrggbbaa` or `transparent`. `MediaRef` is a media library id or `asset:<path>` (a file bundled with the app, lowercase `a-z 0-9 / _ . -`). `FontFamily` is letters, digits, spaces and hyphens (1–60). Every check fails with 400 naming the field (`layer 'title': config.color: "red;}" isn't a colour; use #rrggbb.`).
+
+PUT `/overlays/{id}` can't change `design`. An overlay made from a **built-in** design (`design.branded`) keeps its `brand` layer, and a widget styled by a built-in widget design keeps `config.branded: true`: an edit that removes, hides or unbrands it is a 409 `branding` ("Duplicate the design in the gallery to make an unbranded copy").
 
 ### Alerts
 | Method | Path | Body → Response |
@@ -134,13 +149,79 @@ Widget `config` per kind:
 | PUT | `/api/v1/alert-rules/{id}` | `AlertRule` → `AlertRule` (400 with the validation message) |
 | POST | `/api/v1/alert-rules` | `AlertRule` → `AlertRule` |
 | DELETE | `/api/v1/alert-rules/{id}` | → 204 |
-| POST | `/api/v1/test` | `{ kind, platform? }` → `{ event_id }` (fires a `test` event through the real pipeline) |
+| POST | `/api/v1/test` | `{ kind, platform?, design_id?, amount? }` → 202 `{ ok: true }` (fires a `test` event through the real pipeline). `amount` (major units; bits, gifted subs, raid viewers or sub months for those kinds; above 0, up to 1,000,000,000) changes the sample's amount, else 400 `amount: …`. `design_id` shows it with that alert design instead of the one in use (the designer's "Send test alert"); 404 when unknown, 400 when it isn't an alert design |
 | GET | `/api/v1/queue` | → `{ paused, playing: { alert, started_at } \| null, waiting: { alert, priority, enqueued_at }[] }` |
 | POST | `/api/v1/queue/pause` · `/resume` · `/skip` · `/clear` | → queue |
 | POST | `/api/v1/queue/{alert_id}/remove` | → queue |
 | POST | `/api/v1/events/{event_id}/replay` | → `{ event_id }` |
 | GET | `/api/v1/events?before=<seq>&limit=50&kinds=follow,tip` | → `{ events: Event[], next_before: number \| null }` |
 | GET | `/api/v1/events/{event_id}/why` | → `{ alerted: boolean, reasons: string[] }` ("No alert rule for Kick raids", "Twitch hid this follow", "Below the ₹100 minimum") |
+
+### Designs
+Alert looks, full overlay themes, single scenes and widget styles: made in the dashboard's designer, shipped with the app (built-ins), or imported. Built-ins come with Ferrocast inside the overlay bundle (`designs/catalog.json`, `{ format: "ferrocast-designs", version: 1, designs: Design[] }`; the engine reads it at start, so new ones arrive with app updates and nothing needs a server). A built-in carries a small Ferrocast Spark mark (`branded`) and can't be edited, deleted or exported: **Duplicate** makes the streamer's own copy, with no branding, fully editable. Only built-ins are ever branded; every design the API creates or imports is the streamer's own.
+
+```ts
+type DesignKind = "alert" | "theme" | "scene" | "widget"
+type Design = { schema: 1; id: string /* built-ins: "builtin.<name>" */; name: string /* 1–60 */; description: string /* ≤200 */;
+                tags: { style: "minimal" | "bold" | "retro" | "playful" | "tech" | "cozy"; motion: "still" | "smooth" | "lively" | "bouncy" };
+                pro: boolean /* built-ins only */; built_in: boolean; branded: boolean;
+                origin: { type: "built_in" | "scratch" | "duplicate" | "import" | "asset_pack"; from: string | null };
+                kind: DesignKind; content: AlertContent | ThemeContent | Scene | WidgetContent /* by kind */;
+                created_at: number; updated_at: number }
+
+type EventKey = "follow" | "sub" | "resub" | "gift" | "member" | "bits" | "kicks" | "tip" | "superchat" | "raid" | "redeem"
+// follow; subscription → member on YouTube, resub at 2+ months, else sub; gift_batch → gift; platform_gift → kicks for KICKs, else bits;
+// paid_message → superchat; tip; raid; reward_redemption → redeem. A missing look falls back: resub, member, gift → sub; kicks → bits;
+// superchat → tip. An event with no look plays the alert rule's own look.
+type AlertContent = { events: { [key in EventKey]?: { variations: DesignVariation[] } } }   // ≥1 event
+type DesignVariation = { id: string; name: string /* 1–40 */; condition: Condition | null; priority: number; look: AlertLook }
+// 1–10 per event, exactly one with condition null (the default). Picked like rule variations: the highest-priority match, else the default.
+type AlertLook = {
+  frame: "plate" | "neon" | "comic" | "glass" | "pixel" | "banner" | "pill" | "none";
+  layout: "above" | "left" | "right" | "over" | "text" | "custom";
+  media: { kind: "none" | "emblem" | "image" | "video"; ref: MediaRef | null }; media_size: number /* 24–480, on an 800×450 alert canvas */;
+  offsets: { text_x, text_y, media_x, media_y } /* -400…400, used by layout "custom" */;
+  title: string /* template, ≤300 */; body: string /* template, ≤500 */;
+  font: { family: FontFamily; source: "bundled" | "google" | "system"; size: 10–160; weight: 100–900; uppercase: boolean; italic: boolean; letter_spacing: -0.2…0.5 };
+  colors: { text; highlight /* name and amount */; plate; accent; outline };
+  plate: boolean; shadow: "none" | "soft" | "hard" | "glow"; outline: 0–12;
+  anim: { in: AnimIn; out: AnimOut; text: "none" | "wave" | "wiggle" | "bounce" | "pop" | "type" | "glow"; in_ms: 0–3000; out_ms: 0–3000; text_delay_ms: 0–10000 };
+  sound: { ref: MediaRef | null /* plays instead of builtin */; builtin: "none" | "chime" | "coin" | "whoosh" | "boing" | "bass" | "sparkle"; volume: 0–100 };
+  duration_ms: 1000–60000 /* more than in_ms + out_ms */;
+  tts: { enabled: boolean; min_amount: number /* major units; 0 reads all */ };
+  brand: "corner" | "divider" | "watermark" | "notch" | "badge" | "edge" /* where the mark sits when the design is branded */;
+  css: string /* ≤20,000; no @import, url() only for data:image/… */ }
+type AnimIn = "none" | "fade" | "rise" | "drop" | "slide_left" | "slide_right" | "zoom" | "pop" | "bounce" | "flip" | "wipe" | "magnet"
+type AnimOut = "none" | "fade" | "sink" | "lift" | "slide_left" | "slide_right" | "zoom" | "shrink" | "flip" | "wipe"
+
+type ThemeContent = { scenes: Scene[] /* 1–8, keys unique */; alert_design: string | null /* the alert design that goes with it */ }
+type Scene = { key: "in_game" | "just_chatting" | "starting_soon" | "brb" | "ending" | `custom_${number}`; name: string /* 1–40 */;
+               width: number; height: number; background: string | null; layers: Widget[] /* checked exactly like an overlay's widgets */ }
+type WidgetContent = { widget: WidgetKind /* not "layer" */; w: 40–1920; h: 20–1080; config: object /* starting settings, no style */; style: WidgetStyle }
+
+type AlertDesignView = { design_id: string; variation_id: string; event_key: EventKey; branded: boolean; look: AlertLook;
+                         title_parts: { text: string; hl: boolean }[]; body_parts: { text: string; hl: boolean }[] }
+// title/body already rendered; hl marks text from {name}, {amount}, {value}, {count}, {count_text}, {viewers}, {viewers_text}, {reward}.
+```
+
+**The alert design in use** dresses every alert (and the overlay `?test` previews): the rule still decides whether an event alerts, the design gives the look, text, media, sound, length and CSS, and its `tts` switch and minimum apply on top of the TTS policy (a message the design doesn't read is never held for approval either). With none picked, alerts look exactly as before and carry no `design`.
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/designs?kind=alert` | → `Design[]`: built-ins first (catalogue order), then your own, newest first. 400 `kind: …` for an unknown kind |
+| POST | `/api/v1/designs` | `Design` → 201 `Design`, always your own: a new id, never built-in, branded or Pro. `origin.type` may be `scratch`, `duplicate` or `asset_pack` (anything else becomes `scratch`) |
+| GET | `/api/v1/designs/{id}` | → `Design` |
+| PUT | `/api/v1/designs/{id}` | `Design` → `Design`. 409 `built_in` for a built-in; 409 `conflict` when the kind would change; `id`, `origin` and `created_at` stay as they were |
+| DELETE | `/api/v1/designs/{id}` | → 204. 409 `built_in`; 409 `in_use` while it's the alert design in use |
+| POST | `/api/v1/designs/{id}/duplicate` | `{ name? }` (body optional) → 201 `Design`: your own copy, unbranded, named "… copy", without the mark layers. A theme whose alert design is a built-in gets a copy of that too |
+| POST | `/api/v1/designs/{id}/use` | `{ overlay_id?: string, scenes?: string[], alert_style?: boolean }` (body optional) → `{ alert_design: string \| null, overlays: Overlay[] }`. Alert design: becomes the one in use. Theme: one new overlay per scene (or the `scenes` listed), named "Scene (Theme)", plus its alert design when `alert_style` isn't false. Scene: a new overlay. With `overlay_id` (one scene only), that overlay's size and widgets are replaced and its URL stays, so OBS keeps working. Widget design: adds the styled widget to `overlay_id` (required). Layers keep their ids; built-ins keep their mark. 400 names a bad field, 404 for an unknown overlay, 409 when the overlay is full |
+| GET / PUT | `/api/v1/designs/active-alert` | `{ design_id: string \| null }`. PUT 404 for an unknown design, 400 for a design that isn't an alert design |
+| POST | `/api/v1/designs/{id}/export` | → a `.ferrodesign` download (`application/zip`). 409 `built_in` (duplicate it first) |
+| POST | `/api/v1/designs/import` | multipart `file` (up to 100 MB) → 201 `{ designs: Design[], media_files: number, notes: string[] }` |
+
+**`.ferrodesign`** (version 1) is a zip with `manifest.json` (`{ format: "ferrodesign", version: 1, app_version, created_at, name, kind, designs: number, files: { "media/<sha256>.<ext>": { sha256, bytes, mime } } }`), `designs/<n>.json` (a theme's own alert design travels with it) and `media/<sha256>.<ext>` (png, jpg, gif, webp, mp3, ogg, wav, webm, mp4). Inside the designs, library files are named by their SHA-256. Nothing else is allowed in the file: no scripts, web pages or SVG, no settings, tokens, overlay URLs or viewer data. Import checks every name, every file's real type, size and checksum and every design, then always adds **new** designs of your own (new ids, unbranded, `origin.type: "import"`) and reuses a library file with the same content. Errors: 413 `too_large` (the file over 100 MB, one media file over its limit, more than 10 designs or 300 files), 415 `wrong_content_type` (not multipart), 415 `bad_design_file` (not a zip, or not a Ferrocast design file: a `.ferropack` too), 415 `unsafe_design_file` (a script, page or unexpected file inside), 415 `damaged_design_file` (a checksum doesn't match), 415 `unsupported_type` (a media file that isn't a picture, sound or video Ferrocast plays), 422 `design_too_new` (made by a newer Ferrocast), 422 `invalid_design` (the message names the file and field: `designs/1.json: content.events.tip.variations[0].look.colors.highlight: "red" isn't a colour; use #rrggbb.`), 400 when there's no `file` field or it's empty. Nothing is saved when an import fails.
+
+Designs are in `.ferropack` exports (`designs`); a pack can't bring in a built-in or branded design, or one that fails these checks (it's skipped). Media used by a design can't be deleted (409 `in_use` names the design).
 
 ### Goals
 `Goal = { id, title, kind: "follows" | "subs" | "tips" | "bits" | "custom", target: number, currency: string | null, starts_at, ends_at: number | null, current: number }`
@@ -268,6 +349,40 @@ type TipSettings = { handle; display_name; message; page_url: string | null; web
 GET `/api/v1/tips` → `TipSettings` (never secrets). PUT with the same fields; a provider is `null` (off) or `{ page_url, page_id?, test_mode?, secret? }`, where a blank secret keeps the saved one → the normalised `TipSettings`. DELETE → 204 (page down; the name stays held for this install for 30 days).
 Errors: 400 `invalid` (handle 3–30 of `a-z 0-9 - _`, reserved words, links must be https on the provider's own domains, Stripe secrets start `whsec_`, `page_id` must be a `plink_` id), 409 `conflict` (name taken), 429 `rate_limited` (three name changes a day), 422 `unavailable` (no relay in this build or the relay can't be reached).
 
+### Ferrocast Pro
+Pro is billed through the relay (Razorpay Subscriptions, INR); nothing the free app does needs it (R-05). The engine asks the relay with this install's identity and remembers the last answer: it is reused for 10 minutes, and when the relay can't be reached a status the relay confirmed keeps counting for 7 days (`offline_grace_days`), never past `access_until`. Pro is **not on sale** until the relay's `PRO_SALES_OPEN` is switched on (after version 1).
+
+```ts
+type ProView = {
+  active: boolean            // Pro right now, offline grace included: use this
+  pro: boolean               // what the relay last said
+  status: "none" | "created" | "authenticated" | "active" | "pending" | "halted" | "paused" | "cancelled" | "completed" | "expired"
+  plan: "monthly" | "yearly" | null
+  subscription_id: string | null       // sub_…, also in Razorpay's emails (for Restore)
+  current_end: number | null           // end of the paid period (ms)
+  access_until: number | null          // when Pro stops (period + 3-day grace for a late renewal; no grace once cancelled)
+  cancel_at_period_end: boolean; refunded: boolean; installs: number /* of 3 */
+  sales_open: boolean
+  prices: { currency: "INR"; monthly: 19900; yearly: 199900 } | null   // paise
+  checked_at: number                   // when the relay said this (ms; 0 = never)
+  stale: boolean                       // the relay couldn't be reached; this is the remembered answer
+  offline_grace_days: 7
+  launch_note: string                  // "Ferrocast Pro launches after version 1. …"
+  warning: string | null
+}
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/pro` | → `ProView` (never an error: no relay answer at all is `status: "none"`, `stale: true`, with a `warning`) |
+| POST | `/api/v1/pro/refresh` | → `ProView`, asking the relay and Razorpay now (e.g. after paying) |
+| POST | `/api/v1/pro/checkout` | `{ plan: "monthly" \| "yearly", email }` → 201 `{ checkout_url, subscription_id, plan, amount, currency }`. Open `checkout_url` (Razorpay's hosted page) in the browser, then POST `/pro/refresh`. |
+| POST | `/api/v1/pro/manage` | → 201 `{ url, expires_at }`: the relay's manage page (status, stop renewing), valid 30 minutes. Open it in the browser. |
+| POST | `/api/v1/pro/cancel` | → `ProView`: stops renewing; Pro lasts until `current_end` |
+| POST | `/api/v1/pro/restore` | `{ subscription_id, email }` → `ProView`: moves Pro onto this install (new PC, reinstall). At most 3 installs share one subscription; the oldest drops off. |
+
+Errors pass the relay's code, message and hint through: 409 `pro_not_on_sale` (hint: launches after version 1), 409 `already_pro`, 409 `already_cancelled`, 409 `not_cancellable`, 404 `no_subscription`, 404 `not_found` (restore: id and email don't match, always the same answer), 422 `invalid_plan` / `invalid_email` / `invalid_subscription`, 429 `rate_limited`, 502 `razorpay_unavailable`, 503 `billing_unavailable` (no keys on the relay yet) / `billing_misconfigured`, 503 `relay_unrecognised` (the relay forgot this install; it re-registers by itself), 502 `relay_unreachable`. 400 for a body that isn't JSON or misses a field, 415 without `Content-Type: application/json`.
+
 ### Media
 | Method | Path | Body → Response |
 |---|---|---|
@@ -299,6 +414,104 @@ The engine keeps OBS connected by itself: it checks a working connection every 5
 Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/config.json` in OBS's config folder: `~/Library/Application Support/obs-studio` on macOS, `%APPDATA%\obs-studio` on Windows, `$XDG_CONFIG_HOME` or `~/.config/obs-studio` and the Flatpak folder on Linux), so nobody types the port or password:
 - GET `/api/v1/obs/detect` → `{ found, port: number | null, has_password, server_enabled, in_use, reason: string | null }`. `in_use`: Ferrocast already uses these (following OBS, or the typed details match), so there is nothing to offer. Never the password. A missing or damaged file is `found: false` with a plain `reason`; `server_enabled: false` comes with how to switch it on.
 - POST `/api/v1/obs/detect` ("Use these") → the OBS view (as GET `/obs`) after switching back to following OBS's settings (`auto: true`; a typed password is forgotten). 422 with the reason when nothing usable was found.
+
+### Studio (streamer tools, all free)
+Production helpers that run on the streamer's PC. OBS requests use the OBS details above; when OBS can't be reached every OBS route answers 422 `obs_unreachable` (`obs_password`, or `obs_refused` for an unknown scene/source) with a hint. Settings PUTs save only the fields sent; 400 names the field.
+
+**Chatbot: counters, quotes, modules.** A custom command with the same name always wins, then counters, then modules. Only live chat in this channel gets answers (R-11); viewers have a 10 s per-person and 3 s per-command cooldown, mods none.
+
+```ts
+type Counter = { name: string /* a-z 0-9 _, 1–30 */; value: number /* ±1,000,000,000 */; command: string | null /* "!deaths" */;
+                 reply: string /* template: {count}, {counter}, {user}; 1–300 */; enabled: boolean }
+type Quote = { id: number; text: string /* 1–400 */; added_by: string; at: number }
+type ModulesConfig = { eight_ball: { enabled }; dice: { enabled }; followage: { enabled }; watchtime: { enabled }; uptime: { enabled };
+                       quotes: { enabled }; roulette: { enabled /* off by default */; min_bet; max_bet; win_percent /* 1–99 */ };
+                       duel: { enabled /* off */; max_bet; accept_s /* 10–300 */ }; game_title: { enabled; mods_can_change };
+                       shoutout: { enabled; template /* {target} {target_game_note} {url} */ } }
+```
+| Method | Path | Body → Response |
+|---|---|---|
+| GET / POST | `/api/v1/counters` | → `Counter[]`; POST `{ name /* "Boss Deaths" becomes boss_deaths */, command?: string \| null, reply?, enabled?, value? }` → 201 `Counter`. 409 when the name or command is taken (another counter, a custom command, or a built-in like `!quote`), 400 for a bad name/command/reply |
+| PUT / DELETE | `/api/v1/counters/{name}` | `{ command?, reply?, enabled?, value? }` → `Counter`; DELETE → 204. 404 `counter_not_found` |
+| POST | `/api/v1/counters/{name}/change` | `{ op: "add" \| "set" \| "reset", amount? }` → `Counter` (add defaults to 1, may be negative) |
+| GET / POST | `/api/v1/quotes` | → `Quote[]` oldest first; POST `{ text }` → 201 (`added_by: "Dashboard"`); 409 at 5,000 quotes |
+| PUT / DELETE | `/api/v1/quotes/{id}` | `{ text }` → `Quote`; → 204. 404 `quote_not_found` |
+| GET / PUT | `/api/v1/modules` | `ModulesConfig`; PUT one module at a time (`{ "dice": { "enabled": false } }`); 400 `roulette.win_percent: …` |
+
+Chat: `!deaths` shows the count (everyone); mods `!deaths +`, `+5`, `-`, `set 10`, `reset` (a wrong number gets the usage). `{count:deaths}` works in command replies, timers and overlay `label` templates (labels update live through a `state { labels }` frame). `!quote`, `!quote 12`, mods `!quote add <text>` / `!quote remove 12`. `!8ball`, `!roll 2d6` (1–10 dice, 2–1000 sides), `!roulette 100|half|all|10%` and `!duel @name 100` + `!accept`/`!deny` (loyalty points; never creates points; OS randomness), `!followage [@name]` (Twitch's follow date, else Ferrocast's log), `!watchtime` (minutes counted while live, every 5 minutes for people who chatted), `!uptime`, `!title` / `!game` (show; mods with text change them on every connected platform), `!so @name` (mods). Banned words are the Moderation filter's word list (`/mod/filters`), not a separate list.
+
+**Stream info.** One form for Twitch, YouTube and Kick; each platform answers for itself.
+
+```ts
+type StreamInfo = { title?: string /* 1–140 (YouTube: 100) */; category?: { name: string; ids?: { twitch?, youtube?, kick? } };
+                    tags?: string[] /* ≤10, letters and digits, ≤25 each; [] clears */; language?: string /* "en" */ }
+type PlatformResult = { platform; ok: boolean; applied: string[]; skipped: string[] /* "language: Kick has no stream language setting" */;
+                        error: { code: "not_connected" | "reconnect_needed" | "rate_limited" | "refused" | "unreachable" | "no_broadcast"
+                                       | "unknown_category" | "not_supported"; message; hint } | null }
+type StreamInfoView = { last: HistoryEntry | null; presets: Preset[]; history: HistoryEntry[] /* newest first, 20 */;
+                        platforms: { platform; connected; can_edit; needs: string | null; supports: { title, category, tags, language } }[] }
+type Preset = { id; name /* 1–60, unique */; info: StreamInfo; updated_at }   // up to 50
+type HistoryEntry = { info: StreamInfo; at: number; results: PlatformResult[] }
+```
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/stream-info` | → `StreamInfoView` |
+| POST | `/api/v1/stream-info/apply` | `{ info, platforms?: Platform[] }` (default: every connected one) → **200** all took it, **207** some did, **422** `stream_info_failed` none did; every answer carries `{ results: PlatformResult[], ok, failed }`. 400 for a bad field or platform, 422 `no_platforms` when nothing is connected |
+| GET | `/api/v1/stream-info/categories?platform=twitch&q=valo` | → `{ platform, items: { id, name, image_url }[] }` (YouTube: its video categories). 400 without `q`, 422 when that platform isn't connected |
+| POST | `/api/v1/stream-info/presets` | `{ name, info }` → 201 `Preset`; 409 name taken |
+| PUT / DELETE | `/api/v1/stream-info/presets/{id}` | `Preset` → `Preset`; → 204. 404 `preset_not_found` |
+
+Permissions: Twitch needs `channel:manage:broadcast` (Modify Channel Information, stream markers) and Kick `channel:write`; both are asked for at sign-in from this version. Accounts connected earlier show `can_edit: false` with `needs` ("Reconnect Twitch…") and get `reconnect_needed` instead of a silent failure (R-22). YouTube uses the existing `youtube.force-ssl` sign-in and changes the live (or next scheduled) broadcast's video, keeping its description; a game category becomes YouTube's Gaming category.
+
+**Show (go-live checklist).**
+
+```ts
+type ShowConfig = { preset_id: string | null; starting_scene: string | null; countdown_s: number /* 0 or 10–3600 */; live_scene: string | null;
+                    alerts_on: boolean; discord: boolean; bot_on: boolean; replay_buffer: boolean; ending_scene: string | null;
+                    recap_message: string | null /* {thanks} {follows} {subs} {duration} */; mic_sources: string[]; cam_sources: string[];
+                    min_disk_gb: number; platforms: Platform[] }
+type Check = { id; label; status: "ok" | "warn" | "fail" | "skip"; detail; fix: { label, href /* "#/settings/obs" or "action:unmute:Mic" */ } | null }
+type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started_at; countdown_ends_at: number | null; live_scene; ended_at;
+                 steps: { id, label, status: "done" | "failed" | "skipped" | "waiting", detail }[] }
+```
+| Method | Path | Body → Response |
+|---|---|---|
+| GET / PUT | `/api/v1/show/config` | `ShowConfig` (400 `countdown_s: …`, `preset_id: …`) |
+| GET | `/api/v1/show/preflight` | → `{ checks: Check[], ready }`: OBS, scenes exist, mics not muted, cameras shown, disk space (OBS's recording drive), platforms connected, stream-info permission, Discord webhook |
+| POST | `/api/v1/show/preflight/fix` | `{ action: "unmute:<input>" \| "show:<scene>/<source>" \| "start_replay_buffer" }` → the new pre-flight |
+| GET | `/api/v1/show` | → `{ show: ShowRun \| null }` |
+| POST | `/api/v1/show/start` | `{ force?: boolean }` → 201 `{ show }`. Runs: preset → replay buffer → starting scene → alerts on → bot on → Discord post → countdown (switches to the live scene at zero). 409 while a show runs, 422 `preflight_failed` (unless `force`) |
+| POST | `/api/v1/show/countdown/skip` · `/countdown/cancel` · `/live-scene` | → `{ show }`. 404 `no_countdown` |
+| POST | `/api/v1/show/end` | → `{ show }`: ending scene, thank-you in chat, an "Show ended" marker. Never stops the stream itself |
+
+**OBS helpers.** `ScenesConfig = { chat_enabled; chat_allowed: string[] /* !scene allow-list */; hotkeys: string[] /* Alt+1…9 in the dashboard */; brb_scene; brb_on_ads; brb_mute: string[]; clip_command; clip_on_big_moments }`.
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/obs/scenes` | → `{ current, scenes: { name, items: { id, source, enabled, kind }[] }[] }` (top of the dock first) |
+| GET | `/api/v1/obs/inputs` | → `{ name, kind }[]` |
+| POST | `/api/v1/obs/scene` | `{ scene }` → 204 |
+| POST | `/api/v1/obs/source` | `{ scene, item_id, visible }` → 204 |
+| POST | `/api/v1/obs/input/mute` | `{ input, muted }` → 204 |
+| POST | `/api/v1/obs/replay/save` | `{ label? /* ≤200 */ }` → 201 `{ saved, path, marker }`; 422 with how to start the replay buffer |
+| POST | `/api/v1/obs/brb` | `{ on }` → `{ on, scene }` (remembers the scene to go back to; mutes `brb_mute`). 422 `no_brb_scene` / `no_return_scene` |
+| GET / POST | `/api/v1/obs/health` | GET → `{ health: Health \| null }` (the watcher's last reading, every 5 s while OBS is connected); POST reads now |
+| GET / PUT | `/api/v1/obs/switcher` | `ScenesConfig` |
+
+`Health = { at, streaming, cpu, memory_mb, disk_gb, fps, render_skipped_pct, encoder_skipped_pct, dropped_pct, bitrate_kbps, warnings: { id: "dropped" | "encoder" | "render" | "cpu" | "disk" | "reconnecting", level: "warn" | "error", message, hint }[] }`, percentages over the last 5 s. Chat (mods, when `chat_enabled`): `!scene <name>` (allowed scenes only, unique prefixes work), `!brb`, `!back`; `!clip` (mods, every 20 s at most, when `clip_command`). With `brb_on_ads`, a Twitch ad break switches to BRB and back when it ends.
+
+**Moments.** `MomentsConfig = { big_tip /* main currency, major units */; big_gift_value /* bits/kicks */; big_sub_gift; raid_viewers; first_chatters; sound: "chime" | "coin" | "bell" | "none"; volume; markers; spike_factor /* 2–10 */; spike_min /* 5–500 per 30 s */; twitch_markers }`. `LaneItem = { id, kind, title, detail, platform, event_id, at }`; `Marker = { id, at, offset_ms /* into the stream */ | null, kind: "tip" | "superchat" | "bits" | "gift" | "raid" | "first_chatter" | "chat_spike" | "clip" | "manual", label, platform, clip }`.
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET / PUT | `/api/v1/moments/config` | `MomentsConfig` |
+| GET | `/api/v1/moments/lane` | → `LaneItem[]` newest first (50 kept, memory only) |
+| POST | `/api/v1/moments/lane/{id}/dismiss` · `/lane/dismiss-all` | → `LaneItem[]`. 404 `lane_item_not_found` |
+| GET / POST | `/api/v1/moments/markers?since=<ms>` | → `Marker[]` (default: this stream, else the last 24 h); POST `{ label? }` → 201 manual marker |
+| DELETE | `/api/v1/moments/markers/{id}` | → 204. 404 `marker_not_found` |
+| GET | `/api/v1/moments/markers/export?format=csv\|txt&since=` | a download: CSV `timecode,offset_seconds,kind,label,platform,clip,unix_ms` (formulas defused) or text lines `00:42:10  label` |
+
+Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */, added: LaneItem | null, sound, volume }` (play the sound for `added`, only in the dashboard), `marker Marker`, `counter { name, value }`, `show { show: ShowRun | null }`, `obs_health Health`, `brb { on, scene }`.
 
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
@@ -396,3 +609,20 @@ Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/
 ## 7. Not in this build yet
 
 `POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself).
+
+## 8. Relay: Ferrocast Pro billing
+
+The relay's own HTTP API for Pro (`crates/relay/src/billing`), at `https://ferrocast-relay.clearcraftlabs.com`. App routes take the install's `Authorization: Bearer <install_id>.<install_secret>` (from `POST /v1/installs`); errors are `{error:{code,message,hint}}` with the statuses above (401 `unauthorized` without a known install).
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/v1/pro/status` | `?refresh=1` asks Razorpay first (at most every 10 s per install) → `{ pro, status, plan, subscription_id, current_end, access_until, cancel_at_period_end, refunded, installs, sales_open, prices, checked_at, warning? }` |
+| POST | `/v1/pro/checkout` | `{ plan, email }` → 201 `{ subscription_id, checkout_url /* https://rzp.io/… */, key_id, plan, amount, currency }`. 409 `pro_not_on_sale` while `PRO_SALES_OPEN` is off. 10 per install per hour, one at a time; an earlier unpaid checkout is cancelled at Razorpay first (if Razorpay says it was paid meanwhile: 409 `already_pro`). |
+| POST | `/v1/pro/cancel` | → status; cancel at the end of the cycle |
+| POST | `/v1/pro/manage-link` | → 201 `{ url, expires_at }` (`/pro/manage/<token>`, 30 minutes, token stored hashed) |
+| POST | `/v1/pro/restore` | `{ subscription_id, email }` → status. 5 tries per install and 20 per address per hour. |
+| GET | `/pro/manage/{token}` | HTML: plan, status in words, renewal or end date, "Stop renewing". `no-store`, `no-referrer`, no scripts. 404 page once expired. |
+| POST | `/pro/manage/{token}/cancel` | HTML result (409 page if already cancelled) |
+| POST | `/billing/razorpay/webhook` | Razorpay → relay. `X-Razorpay-Signature` = hex HMAC-SHA256 of the raw body with `RAZORPAY_WEBHOOK_SECRET` (constant-time compare) else 401; `X-Razorpay-Event-Id` required (400); body must be JSON with `event` (400). Each event id is handled once (`{status:"duplicate"}`), recorded in the same transaction as its effect. `subscription.*` re-reads the subscription from Razorpay and copies that state; `subscription.charged` also records the payment id and amount; `refund.*` re-reads the payment's refunds and ends Pro (and cancels the subscription now) once refunds that didn't fail add up to the payment. Subscriptions and payments that aren't Pro's (the Razorpay account is shared with other products) → 200 `{status:"ignored"}`, no Razorpay call. Razorpay unreachable → 502, storage → 503, without recording the event, so Razorpay's retry gets another go. 503 `billing_unavailable` until the secret is set. |
+
+Data kept (R-51): subscription id, plan, status, period end, cancel/refund flags, an HMAC-SHA256 of the lowercased checkout email keyed with `PRO_EMAIL_KEY` (never the email), which installs share it, payment ids and amounts, handled event ids (30 days), hashed manage tokens. Never card, UPI, name or phone. A daily re-check re-reads unfinished subscriptions and the refunds of the last 60 days' payments, in case webhooks were lost.
