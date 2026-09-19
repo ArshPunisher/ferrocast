@@ -41,3 +41,23 @@ jobs:
         run: |
           [[ "$TAG" =~ ^v[0-9A-Za-z.+-]+$ ]] || { echo "'$TAG' isn't a release tag." >&2; exit 1; }
           packaging/beta-feed.sh "$TAG"
+
+  site:
+    # The download page reads the newest beta when the site builds, so a newly published
+    # release needs a rebuild. SITE_DEPLOY_HOOK is the Cloudflare Pages deploy hook of the
+    # ferrocast-web project (a URL, kept secret); without it this step only says so.
+    name: Rebuild the website's download page
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name != 'beta'
+    needs: feed
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Ask Cloudflare Pages for a new build
+        env:
+          HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [[ -z "$HOOK" ]]; then
+            echo "::notice::No SITE_DEPLOY_HOOK secret; the download page shows this release after the site's next build."
+            exit 0
+          fi
+          curl -fsS -X POST --retry 3 -o /dev/null "$HOOK"
+          echo "Site rebuild requested."
