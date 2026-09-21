@@ -13,6 +13,17 @@ ignore = [
   # Kick's webhook signatures with Kick's public key (relay) and signs in tests; no private
   # key ever decrypts anything in a shipped binary. Revisit when rsa 0.10 is stable.
   { id = "RUSTSEC-2023-0071", reason = "signature verification only; no RSA decryption in shipped code" },
+  # zip 4 inside tauri-plugin-updater: the extract() flaws need an attacker-made archive, and
+  # the updater only unpacks an update after checking our minisign signature. Ferrocast's
+  # own code uses zip 9 and never calls extract(). Revisit when the updater moves to zip 9.
+  { id = "RUSTSEC-2026-0367", reason = "zip 4 via tauri-plugin-updater; archives are signature-checked first" },
+  { id = "RUSTSEC-2026-0368", reason = "zip 4 via tauri-plugin-updater; archives are signature-checked first" },
+  { id = "RUSTSEC-2026-0369", reason = "zip 4 via tauri-plugin-updater; archives are signature-checked first" },
+  # zbus's zvariant crates, marked unmaintained, not vulnerable: Linux notifications and the
+  # keyring use them, and there is no replacement yet. Revisit with the next Tauri release.
+  { id = "RUSTSEC-2026-0370", reason = "unmaintained, transitive via zbus (Linux notifications, keyring)" },
+  { id = "RUSTSEC-2026-0371", reason = "unmaintained, transitive via zbus (Linux notifications, keyring)" },
+  { id = "RUSTSEC-2026-0372", reason = "unmaintained, transitive via zbus (Linux notifications, keyring)" },
 ]
 
 [licenses]
