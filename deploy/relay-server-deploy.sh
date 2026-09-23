@@ -91,6 +91,6 @@ docker image ls "$IMAGE" --format '{{.Tag}}' |
   grep -E '^1\.0\.[0-9]{6}-[0-9a-f]{7}$' | sort -r | tail -n +"$((keep + 1))" |
   while read -r old; do
     [[ "$old" == "$version" || "$old" == "$previous" ]] && continue
-    docker image rm "$IMAGE:$old" >/dev/null 2>&1 && log "Removed old image $old" || true
+    if docker image rm "$IMAGE:$old" >/dev/null 2>&1; then log "Removed old image $old"; fi
   done
 exit 0
