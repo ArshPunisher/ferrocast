@@ -132,9 +132,16 @@ jobs:
           # Signs the updater bundles; the public key is in tauri.conf.json (R-60).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          OS_NAME: ${{ matrix.name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
         working-directory: apps/desktop
         # Updater bundles are signed only here, where the key exists; local builds skip them.
-        run: cargo tauri build ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+        # RPM refuses a '-' in the version, so betas (0.1.0-beta.1) ship AppImage and .deb only.
+        run: |
+          bundles=""
+          if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
+          # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
+          cargo tauri build ${{ matrix.args }} $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ferrocast-${{ matrix.name }}

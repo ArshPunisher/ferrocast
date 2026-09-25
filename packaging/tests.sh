@@ -67,6 +67,10 @@ if command -v jq >/dev/null; then
   is "every platform" "$(jq -r '.platforms | keys | join(",")' <<<"$json")" \
     darwin-aarch64,darwin-x86_64,linux-x86_64,linux-x86_64-deb,linux-x86_64-rpm,windows-x86_64
   is "signature" "$(jq -r '.platforms["darwin-aarch64"].signature' <<<"$json")" sig-of-Ferrocast.app.tar.gz
+  # Betas ship no .rpm (RPM refuses a '-' in the version): the manifest just leaves it out.
+  rm "$tmp/dist/"*.rpm "$tmp/dist/"*.rpm.sig
+  is "a beta without an rpm" "$(jq -r '.platforms | keys | join(",")' <<<"$("$m" 0.1.0-beta.1 "$tmp/dist")")" \
+    darwin-aarch64,darwin-x86_64,linux-x86_64,linux-x86_64-deb,windows-x86_64
   refuse "refuses a version that isn't one" "$m" "0.1 beta" "$tmp/dist"
   mkdir -p "$tmp/empty"
   refuse "refuses a folder without signed bundles" "$m" 0.1.0 "$tmp/empty"
