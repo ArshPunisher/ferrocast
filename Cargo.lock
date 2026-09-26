@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-connector"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "ferrocast-core",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-core"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-desktop"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "dirs 6.0.0",
  "ferrocast-core",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-engine"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-headless"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "dirs 6.0.0",
  "ferrocast-engine",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-kick"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-obs"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ferrocast-core",
  "ferrocast-testkit",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-relay"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-secrets"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "keyring",
  "serde_json",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-server"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-store"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ferrocast-core",
  "getrandom 0.4.3",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-testkit"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-twitch"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "ferrocast-connector",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocast-youtube"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "axum",
