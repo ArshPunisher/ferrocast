@@ -142,6 +142,9 @@ impl Engine {
             PlatformApps::from_env(),
         )
         .await?;
+        // OBS's own settings file in its usual place (`start_with` leaves this empty so
+        // tests never read the developer's real OBS).
+        engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
         engine.watch_obs();
         engine.watch_obs_health();
         Ok(engine)
