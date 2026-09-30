@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::accounts::ConnectFlow;
-use crate::frames::NoticeLevel;
+use crate::frames::{LiveFrame, NoticeLevel};
 use crate::state::{AccountView, ConnectorView};
 use crate::{Engine, EngineError, now};
 
@@ -263,7 +263,10 @@ impl Engine {
         v.account = Some(AccountView { name: account.display_name.clone(), avatar_url: account.avatar_url.clone() });
         v.state = "connected".into();
         v.detail = Some("Events can arrive a few seconds late on Kick.".into());
+        let view = st.connectors.clone();
         drop(st);
+        // Open dashboards (and a waiting "Connect Kick" dialog) learn it now, not on reload.
+        self.send_live(LiveFrame::new("status", &json!({ "connectors": view })));
         self.ensure_relay_link();
     }
 

@@ -820,6 +820,7 @@ async fn kick_connects_through_the_relay_and_its_chat_gets_answers() {
     .await
     .unwrap();
 
+    let mut live = e.subscribe_live();
     let ConnectFlow::Browser { url } = e.connect_account(Platform::Kick).await.unwrap() else {
         panic!("Kick uses the browser")
     };
@@ -840,6 +841,26 @@ async fn kick_connects_through_the_relay_and_its_chat_gets_answers() {
         .cloned()
         .expect("subscribed");
     assert_eq!(sub.1["broadcaster_user_id"], 4242);
+    // A dashboard waiting in "Connect Kick" hears it without a reload.
+    let told = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match live.recv().await {
+                Ok(f)
+                    if f.text.contains(r#""type":"status""#)
+                        && f.text.contains(r#""kick":{"#)
+                        && f.text.contains("kicker") =>
+                {
+                    return true;
+                }
+                // A burst of other frames can push some out; keep listening.
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(told, "a status frame says Kick is connected");
 
     let body = serde_json::json!({
         "message_id": "kmsg-1", "broadcaster": { "user_id": 4242 },
