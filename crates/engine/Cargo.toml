@@ -19,6 +19,9 @@ ferrocast-youtube.workspace = true
 ferrocast-kick.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# Pinned as the process-wide TLS provider (see `tls::install`): two backends end up in the
+# app, and rustls then refuses to guess.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -132,6 +132,15 @@ struct Inner {
     studio: studio::Studio,
 }
 
+/// Picks rustls' crypto provider for the whole process, once. The app links two backends
+/// (ring and aws-lc-rs, through different crates), and with both present rustls won't
+/// choose: every `wss://` connection (Twitch EventSub, the relay link) then panics in its
+/// task and the platform sits on "reconnecting" forever.
+pub fn install_tls() {
+    // Err means a provider is already installed, which is all we need.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
@@ -165,6 +174,7 @@ impl Engine {
         secrets: Arc<dyn ferrocast_secrets::Secrets>,
         apps: PlatformApps,
     ) -> Result<Engine, EngineError> {
+        install_tls();
         let dir = data_dir.to_path_buf();
         let store = tokio::task::spawn_blocking(move || -> Result<Store, StoreError> {
             if let Some(id) = ferrocast_store::backup::apply_scheduled_restore(&dir)? {

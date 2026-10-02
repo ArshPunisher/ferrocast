@@ -1687,3 +1687,11 @@ async fn daily_backups_wait_a_day_after_the_newest() {
     let list = ferrocast_store::backup::list(dir.path()).unwrap();
     assert_eq!(list.iter().filter(|b| b.reason == "daily").count(), 2);
 }
+
+#[tokio::test]
+async fn starting_the_engine_picks_one_tls_provider() {
+    // With two rustls backends linked and none chosen, every wss:// task panics
+    // (Twitch EventSub, the relay link). Starting the engine must choose one.
+    let (_e, _d) = engine().await;
+    assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+}
