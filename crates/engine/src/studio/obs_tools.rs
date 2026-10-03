@@ -231,6 +231,11 @@ impl Engine {
     async fn check_health_with(&self, c: &ferrocast_obs::Client) -> Result<ferrocast_core::show::Health, EngineError> {
         let sample = ferrocast_obs::control::health_sample(c, now().0).await.map_err(obs_error)?;
         let prev = self.studio().health.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(s, _)| s.clone());
+        // OBS just started streaming: YouTube only looks for a live broadcast now and
+        // then, so ask it to look now rather than up to ten minutes later.
+        if sample.streaming && !prev.as_ref().is_some_and(|p| p.streaming) {
+            self.wake_youtube();
+        }
         let h = ferrocast_core::show::health(prev.as_ref(), &sample);
         *self.studio().health.lock().unwrap_or_else(|p| p.into_inner()) = Some((sample, h.clone()));
         self.studio_frame("obs_health", &h);

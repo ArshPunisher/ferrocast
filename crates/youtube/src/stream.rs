@@ -16,6 +16,10 @@ use crate::{YoutubeError, map, now_ms};
 
 /// How often to look for a live broadcast when nothing else says one started.
 const LOOK_EVERY: Duration = Duration::from_secs(600);
+/// After a wake (OBS started streaming, another platform went live), YouTube can take a
+/// few seconds to mark the broadcast active: look again this often, this many times.
+const EAGER_EVERY: Duration = Duration::from_secs(15);
+const EAGER_LOOKS: u32 = 5;
 
 /// The live chat id the connector sends to, shared with the stream task.
 pub type LiveChat = Arc<RwLock<Option<String>>>;
@@ -35,6 +39,7 @@ async fn emit(sink: &EventSink, kind: EventKind) -> bool {
 /// (another platform just went live).
 pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveChat) {
     let mut attempt = 0u32;
+    let mut eager = 0u32;
     if !emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await {
         return;
     }
@@ -64,9 +69,15 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
                 }
             }
             Ok(None) => {
+                let wait = if eager > 0 {
+                    eager -= 1;
+                    EAGER_EVERY
+                } else {
+                    LOOK_EVERY
+                };
                 tokio::select! {
-                    _ = wake.notified() => {}
-                    _ = tokio::time::sleep(LOOK_EVERY) => {}
+                    _ = wake.notified() => eager = EAGER_LOOKS,
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
             Err(YoutubeError::SignInNeeded) => {
