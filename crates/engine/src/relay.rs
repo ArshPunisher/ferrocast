@@ -262,7 +262,8 @@ impl Engine {
         let v = st.connectors.entry("kick".into()).or_insert_with(ConnectorView::off);
         v.account = Some(AccountView { name: account.display_name.clone(), avatar_url: account.avatar_url.clone() });
         v.state = "connected".into();
-        v.detail = Some("Events can arrive a few seconds late on Kick.".into());
+        // No standing caveat: the dashboard warns only while the relay link is down.
+        v.detail = None;
         let view = st.connectors.clone();
         drop(st);
         // Open dashboards (and a waiting "Connect Kick" dialog) learn it now, not on reload.
