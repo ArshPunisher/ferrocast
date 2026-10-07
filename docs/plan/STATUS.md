@@ -7,7 +7,8 @@ Newest entry first. Update at the end of every working session.
 - **v1 feature-complete.** Engine, adapters (Twitch, YouTube, Kick, OBS), tips through the relay, export/import, plus community features: loyalty points, chat polls, giveaways, first-time chatter marks, stream recap, Discord go-live posts, OBS auto-detect and starter commands.
 - **Relay is live** at ferrocast-relay.clearcraftlabs.com (Docker on the Oracle server behind its own Cloudflare tunnel).
 - **Pro billing built, not on sale** (18 Oct): Razorpay Subscriptions in the relay (`crates/relay/src/billing`), Pro status in the engine (`/api/v1/pro`), `deploy/razorpay-keys.sh` for keys and plans. `PRO_SALES_OPEN=false` until Pro's features exist (ARCHITECTURE.md §10).
-- **Beta channel ready** (18 Oct): version `0.1.0-beta.1`, Release workflow checks the tag against `Cargo.toml` and drafts betas as prereleases; "Beta feed" publishes `releases/download/beta/latest.json` (ARCHITECTURE.md §11). Not tagged yet.
+- **Betas are public** (18 Oct): beta.2 and beta.3 published, beta.4 building. Razorpay is set up in test mode (website verified, keys, plans, webhook).
+- **First real stream test** (18 Oct, private YouTube via OBS): found and fixed three real bugs. (1) Two rustls backends in the app and none chosen: every `wss://` task panicked, so Twitch EventSub never connected and the relay link (Kick events) stayed off; `install_tls()` now picks ring at start. (2) OBS auto-detect never ran in the real app (`start` didn't set the settings paths). (3) YouTube only looked for a live broadcast every 10 min; OBS starting a stream now wakes it, with quick re-checks for a minute. Also: Kick's connect dialog now closes by itself.
 - **Platform apps are registered** (Twitch, Google/YouTube, Kick); ids are in the release workflow's variables and secrets.
 - **Desktop:** Spark icons, the overlay-collage install window, LAN access, and signed auto-updates (key in GitHub secrets, feed is `latest.json` on GitHub releases).
 - **Importers:** StreamElements (JWT, GET only, never stored) and Streamlabs (exported CSV/XLSX files), with a preview, keep/replace for clashes, a backup first and a report. Points for people not seen yet wait and are paid when they show up.
@@ -15,7 +16,7 @@ Newest entry first. Update at the end of every working session.
 
 ## Waiting on the owner
 
-1. Making releases public (Homebrew tap, updates and downloads need it).
+1. See `../NEEDS-FROM-YOU.md`.
 
 ## Next
 
