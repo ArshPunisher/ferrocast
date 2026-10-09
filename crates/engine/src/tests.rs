@@ -1695,3 +1695,17 @@ async fn starting_the_engine_picks_one_tls_provider() {
     let (_e, _d) = engine().await;
     assert!(rustls::crypto::CryptoProvider::get_default().is_some());
 }
+
+#[tokio::test]
+async fn going_offline_everywhere_ends_live_but_keeps_the_stream_numbers() {
+    let (e, _d) = engine().await;
+    let live = |p: Platform, kind: EventKind| Event::live(p, None, Millis(0), kind);
+    e.ingest(live(Platform::Kick, EventKind::StreamOnline { title: None })).await;
+    e.ingest(live(Platform::Twitch, EventKind::StreamOnline { title: None })).await;
+    assert!(e.is_live());
+    e.ingest(live(Platform::Kick, EventKind::StreamOffline)).await;
+    assert!(e.is_live(), "Twitch is still going");
+    e.ingest(live(Platform::Twitch, EventKind::StreamOffline)).await;
+    assert!(!e.is_live());
+    assert!(e.session_view().0.started_at.is_some(), "the ended stream's numbers stay readable");
+}

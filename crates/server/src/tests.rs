@@ -435,6 +435,7 @@ async fn app_routes_have_the_dashboard_shapes() {
     let ids: Vec<_> = themes.as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["molten", "daylight", "arcade", "minimal", "sticker"]);
     let stats: Value = r.get("/api/v1/stats/session").await.json().await.unwrap();
+    assert_eq!(stats["live"], false);
     for k in ["started_at", "follows", "subs", "tips", "bits", "messages", "peak_viewers", "viewers"] {
         assert!(stats.get(k).is_some(), "stats.{k}");
     }

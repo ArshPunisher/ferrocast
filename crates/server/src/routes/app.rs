@@ -27,11 +27,13 @@ pub async fn themes() -> Json<Value> {
     Json(json!(list))
 }
 
-/// This stream so far (API-REQUESTS R7).
+/// This stream so far (API-REQUESTS R7). `started_at` stays set after the stream ends so the
+/// numbers can still be read; `live` says whether it is still going.
 pub async fn session_stats(State(app): State<AppState>) -> Json<Value> {
     let (session, viewers) = app.engine.session_view();
     let messages: u32 = session.chat_lines.values().sum();
     Json(json!({
+        "live": app.engine.is_live(),
         "started_at": session.started_at,
         "follows": session.follows,
         "subs": session.subs,

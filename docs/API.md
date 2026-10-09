@@ -76,7 +76,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | POST | `/api/v1/session/pair` | `{ code }` → `{ token }` (no auth needed) |
 | POST | `/api/v1/session/pair-code` | → `{ code, url, expires_at, lan: { active, restart_needed } }` (makes an "open in browser" link). With LAN access on, `url` uses this computer's network address and `lan.active` is true; otherwise it's `127.0.0.1` (works on this computer only), and `restart_needed` says LAN access was switched on but applies at the next start |
 | POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
-| GET | `/api/v1/stats/session` | → `{ started_at, follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
+| GET | `/api/v1/stats/session` | → `{ live, started_at (kept after the stream ends), follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
 | GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta", blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
