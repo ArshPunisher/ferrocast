@@ -93,12 +93,17 @@ struct Relay {
 }
 
 async fn relay(kick: &str) -> Relay {
+    relay_with(kick, None).await
+}
+
+async fn relay_with(kick: &str, tip_url: Option<&str>) -> Relay {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("relay.db")).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     let cfg = Config {
         public_url: base.clone(),
+        tip_url: tip_url.map(Into::into),
         kick_client_id: Some("cid".into()),
         kick_client_secret: Some("csecret".into()),
         kick_id_url: kick.into(),
@@ -484,6 +489,27 @@ mod tip_tests {
 
     async fn save(http: &reqwest::Client, r: &Relay, auth: &str, c: &TipConfig) -> reqwest::Response {
         http.put(format!("{}/v1/tips/config", r.base)).bearer_auth(auth).json(c).send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn tip_pages_live_on_the_tip_host_and_old_links_keep_working() {
+        let kick = fake_kick().await;
+        let r = relay_with(&kick, Some("https://tip.example")).await;
+        let auth = install(&r).await;
+        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let saved: Value = save(&http, &r, &auth, &cfg()).await.json().await.unwrap();
+        assert_eq!(saved["page_url"], "https://tip.example/nova");
+        assert!(saved["webhooks"]["razorpay"].as_str().unwrap().starts_with(&r.base), "webhooks stay on the relay");
+
+        let on_tip = |path: &str| http.get(format!("{}{path}", r.base)).header("host", "tip.example").send();
+        let page = on_tip("/nova").await.unwrap();
+        assert_eq!(page.status(), 200);
+        assert!(page.text().await.unwrap().contains("Nova &lt;b&gt;Plays&lt;/b&gt;"));
+        assert_eq!(on_tip("/nobody").await.unwrap().status(), 404);
+        assert_eq!(on_tip("/").await.unwrap().status(), 307, "the bare tip host points at Ferrocast");
+        assert_eq!(http.get(format!("{}/nova", r.base)).send().await.unwrap().status(), 404, "only on the tip host");
+        assert_eq!(http.get(format!("{}/t/nova", r.base)).send().await.unwrap().status(), 200, "old links still work");
+        assert_eq!(http.get(format!("{}/health", r.base)).send().await.unwrap().status(), 200);
     }
 
     #[tokio::test]

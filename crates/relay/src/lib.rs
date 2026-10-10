@@ -43,6 +43,10 @@ pub fn now_ms() -> i64 {
 pub struct Config {
     /// The relay's public base URL, e.g. `https://ferrocast-relay.clearcraftlabs.com`.
     pub public_url: String,
+    /// Where tip pages live, an origin such as `https://tip.clearcraftlabs.com` (any path in
+    /// `RELAY_TIP_URL` is dropped): a page is `<tip_url>/<name>`.
+    /// Unset: tip pages are `<public_url>/t/<name>`. Old `/t/` links keep working either way.
+    pub tip_url: Option<String>,
     pub kick_client_id: Option<String>,
     pub kick_client_secret: Option<String>,
     pub kick_id_url: String,
@@ -57,6 +61,11 @@ impl Config {
                 .unwrap_or_else(|| "http://127.0.0.1:8787".into())
                 .trim_end_matches('/')
                 .to_string(),
+            // Only the origin counts: pages are served at `/<name>` on that host.
+            tip_url: env("RELAY_TIP_URL")
+                .and_then(|u| reqwest::Url::parse(&u).ok())
+                .map(|u| u.origin().ascii_serialization())
+                .filter(|o| o != "null"),
             kick_client_id: env("KICK_CLIENT_ID"),
             kick_client_secret: env("KICK_CLIENT_SECRET"),
             kick_id_url: env("KICK_ID_URL").unwrap_or_else(|| "https://id.kick.com".into()),
@@ -174,6 +183,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tips/kofi/{install}", post(tips::kofi))
         .route("/v1/tips/stripe/{install}", post(tips::stripe))
         .route("/t/{handle}", get(tips::page))
+        .route("/", get(tips::tip_host_home))
+        .route("/{handle}", get(tips::tip_host_page))
         .route("/v1/pro/status", get(billing::status))
         .route("/v1/pro/checkout", post(billing::checkout))
         .route("/v1/pro/cancel", post(billing::cancel))

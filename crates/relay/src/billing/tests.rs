@@ -189,6 +189,7 @@ async fn start(rzp: FakeRazorpay, cfg: BillingConfig) -> Billing {
     let base = format!("http://{}", l.local_addr().unwrap());
     let relay_cfg = crate::Config {
         public_url: base.clone(),
+        tip_url: None,
         kick_client_id: None,
         kick_client_secret: None,
         kick_id_url: base.clone(),
@@ -764,6 +765,7 @@ async fn reconcile_rereads_open_subscriptions_and_refunds() {
     let st = crate::AppState::new(
         crate::Config {
             public_url: "http://127.0.0.1".into(),
+            tip_url: None,
             kick_client_id: None,
             kick_client_secret: None,
             kick_id_url: String::new(),

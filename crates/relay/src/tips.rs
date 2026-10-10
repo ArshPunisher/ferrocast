@@ -328,7 +328,7 @@ pub async fn save_config(
     let base = &st.cfg.public_url;
     Ok(axum::Json(json!({
         "config": public_config(&cfg),
-        "page_url": format!("{base}/t/{}", cfg.handle),
+        "page_url": page_url(&st.cfg, &cfg.handle),
         "webhooks": {
             "razorpay": format!("{base}/v1/tips/razorpay/{install}"),
             "kofi": format!("{base}/v1/tips/kofi/{install}"),
@@ -351,6 +351,41 @@ fn config_for(st: &AppState, install: &str) -> Option<TipConfig> {
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// A tip page's public link: on the tip host when there is one, else under the relay.
+pub(crate) fn page_url(cfg: &crate::Config, handle: &str) -> String {
+    match &cfg.tip_url {
+        Some(tip) => format!("{tip}/{handle}"),
+        None => format!("{}/t/{handle}", cfg.public_url),
+    }
+}
+
+/// Whether this request came in on the tip host (`RELAY_TIP_URL`).
+fn on_tip_host(st: &AppState, headers: &HeaderMap) -> bool {
+    let Some(tip) = &st.cfg.tip_url else { return false };
+    let want = tip.split_once("://").map_or(tip.as_str(), |(_, h)| h);
+    headers.get(axum::http::header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|h| h.eq_ignore_ascii_case(want))
+}
+
+fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, Html(shell("Not found", "<p class=lead>There's no tip page here.</p>"))).into_response()
+}
+
+/// `GET /` on the tip host: there's nothing to list, so point at Ferrocast.
+pub async fn tip_host_home(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if !on_tip_host(&st, &headers) {
+        return not_found();
+    }
+    axum::response::Redirect::temporary("https://ferrocast.clearcraftlabs.com").into_response()
+}
+
+/// `GET /{handle}` on the tip host: the tip page. Anywhere else it's not a page.
+pub async fn tip_host_page(State(st): State<AppState>, headers: HeaderMap, path: Path<String>) -> Response {
+    if !on_tip_host(&st, &headers) {
+        return not_found();
+    }
+    page(State(st), path).await
 }
 
 /// `GET /t/{handle}`: the public tip page. Static HTML, no scripts, no trackers.
