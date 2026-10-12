@@ -71,6 +71,7 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
 # itself, so they never travel to this Mac and a config update can't wipe them.
 {
   printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
+  printf 'RELAY_TIP_URL=https://tip.clearcraftlabs.com\n'
   printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
