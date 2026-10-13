@@ -118,6 +118,7 @@ mod tests {
         let relay = format!("http://{}", rl.local_addr().unwrap());
         let cfg = ferrocast_relay::Config {
             public_url: relay.clone(),
+            tip_url: None,
             kick_client_id: None,
             kick_client_secret: None,
             kick_id_url: relay.clone(),

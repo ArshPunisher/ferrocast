@@ -791,6 +791,7 @@ async fn kick_connects_through_the_relay_and_its_chat_gets_answers() {
     let relay = format!("http://{}", rl.local_addr().unwrap());
     let cfg = ferrocast_relay::Config {
         public_url: relay.clone(),
+        tip_url: None,
         kick_client_id: Some("cid".into()),
         kick_client_secret: Some("cs".into()),
         kick_id_url: kick.clone(),
@@ -959,6 +960,7 @@ async fn a_forgotten_relay_install_registers_again() {
     let relay = format!("http://{}", rl.local_addr().unwrap());
     let cfg = ferrocast_relay::Config {
         public_url: relay.clone(),
+        tip_url: None,
         kick_client_id: None,
         kick_client_secret: None,
         kick_id_url: relay.clone(),
