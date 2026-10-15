@@ -359,10 +359,12 @@ fn show_window(app: &AppHandle) {
         .on_navigation(move |u| {
             // The window only ever shows our dashboard; links to the web open in the browser.
             let ours = u.as_str().starts_with(&format!("{origin}/"));
-            if !ours && matches!(u.scheme(), "http" | "https") {
+            // A pair link links a browser, never this window: "Open in browser" makes one.
+            let pair = ours && u.fragment().is_some_and(|f| f.starts_with("pair="));
+            if (!ours || pair) && matches!(u.scheme(), "http" | "https") {
                 let _ = opener.opener().open_url(u.as_str(), None::<&str>);
             }
-            ours
+            ours && !pair
         })
         .build();
     if let Err(e) = built {
