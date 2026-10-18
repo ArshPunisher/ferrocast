@@ -113,6 +113,7 @@ impl Engine {
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
                 self.history_saw(&e, None);
+                self.discord_saw(&e);
                 return;
             }
             _ => {}
@@ -235,6 +236,8 @@ impl Engine {
 
         // Pro stream history counts it (nothing happens without Pro).
         self.history_saw(&e, chatter.as_ref());
+        // Pro Discord bot: perks and stream ends (nothing happens without Pro).
+        self.discord_saw(&e);
 
         if e.kind.is_alertable() || matches!(e.kind, EventKind::Tip { .. }) {
             self.support_event(&e).await;

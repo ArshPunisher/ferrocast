@@ -1,6 +1,14 @@
 //! Discord go-live posts. The webhook URL is a secret kept in the secret store (R-45), never in
 //! the database, so it is never in an export either. Discord's answers become plain
 //! messages: a deleted webhook, a bad token, rate limits.
+//!
+//! With Pro and the relay's Ferrocast bot (`pro`), the bot posts go-live instead and the free
+//! webhook post is skipped; the webhook stays the fallback whenever the bot can't post.
+
+mod pro;
+#[cfg(test)]
+mod pro_tests;
+pub(crate) use pro::{DiscordPro, run};
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -31,6 +39,8 @@ pub struct DiscordView {
     pub enabled: bool,
     pub template: String,
     pub mention_everyone: bool,
+    /// The Ferrocast bot (Pro) posts go-live instead, so the webhook post is skipped.
+    pub pro_go_live: bool,
 }
 
 /// A failed post: the error and, for rate limits, how long to wait.
@@ -64,6 +74,7 @@ impl Engine {
             enabled: cfg.enabled,
             template: cfg.template,
             mention_everyone: cfg.mention_everyone,
+            pro_go_live: self.discord_pro_go_live(),
         })
     }
 
@@ -107,12 +118,30 @@ impl Engine {
     pub(crate) fn discord_go_live(&self, platform: Platform, title: Option<String>) {
         let engine = self.clone();
         tokio::spawn(async move {
+            let at = now();
+            // Pro: the Ferrocast bot posts (it keeps its own 30-minute rule). When it did,
+            // the webhook stays quiet; when it can't, the webhook below posts as before.
+            if engine.discord_pro().on {
+                if engine
+                    .inner
+                    .discord_posts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&platform)
+                    .is_some_and(|t| at.0 - t.0 < REPOST_AFTER_MS)
+                {
+                    return;
+                }
+                if engine.discord_pro_go_live_post(platform, title.clone(), at.0).await {
+                    engine.inner.discord_posts.lock().unwrap_or_else(|p| p.into_inner()).insert(platform, at);
+                    return;
+                }
+            }
             let Ok(Some(url)) = engine.discord_webhook() else { return };
             let Ok(cfg) = engine.discord_config().await else { return };
             if !cfg.enabled {
                 return;
             }
-            let at = now();
             {
                 let mut last = engine.inner.discord_posts.lock().unwrap_or_else(|p| p.into_inner());
                 if last.get(&platform).is_some_and(|t| at.0 - t.0 < REPOST_AFTER_MS) {

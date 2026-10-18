@@ -135,7 +135,7 @@ pub(crate) fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 52] = [
+    const KNOWN: [&str; 66] = [
         "pro_required",
         "vault_unavailable",
         "storage_unavailable",
@@ -193,6 +193,21 @@ fn code(c: &str) -> &'static str {
         "pc_offline",
         "pc_timeout",
         "remote_rate",
+        // The Ferrocast bot for Discord (API.md §9.6).
+        "missing_permission",
+        "guild_not_found",
+        "not_connected",
+        "already_connected",
+        "channel_not_found",
+        "no_channel",
+        "too_many_rules",
+        "invalid_rule",
+        "role_not_found",
+        "rule_not_found",
+        "invalid_event",
+        "too_many_events",
+        "discord_rate",
+        "discord_unavailable",
     ];
     KNOWN.into_iter().find(|k| *k == c).unwrap_or("relay_error")
 }

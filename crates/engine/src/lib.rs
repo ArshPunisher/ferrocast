@@ -123,6 +123,12 @@ struct Inner {
     /// When the last welcome went out (they're spaced out during raids).
     last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
     discord_posts: Mutex<discord::LastPosts>,
+    /// Pro Discord bot: perk events waiting for the relay, whether the bot posts go-live.
+    discord_pro: Mutex<discord::DiscordPro>,
+    /// One Discord perk save or upload round at a time.
+    discord_pro_io: tokio::sync::Mutex<()>,
+    /// One stream-end flush at a time (never behind a perk upload).
+    discord_ends_io: tokio::sync::Mutex<()>,
     /// What the update feed offers, as the desktop shell last saw it.
     update: Mutex<Option<updates::AvailableUpdate>>,
     install_update: Notify,
@@ -251,6 +257,9 @@ impl Engine {
                 giveaway: tokio::sync::Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
                 discord_posts: Mutex::new(Default::default()),
+                discord_pro: Mutex::new(Default::default()),
+                discord_pro_io: tokio::sync::Mutex::new(()),
+                discord_ends_io: tokio::sync::Mutex::new(()),
                 update: Mutex::new(None),
                 install_update: Notify::new(),
                 import: Mutex::new(None),
@@ -283,6 +292,8 @@ impl Engine {
         engine.load_history().await;
         tokio::spawn(history::run(engine.clone()));
         tokio::spawn(cloud_backup::run(engine.clone()));
+        engine.load_discord_pro().await;
+        tokio::spawn(discord::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)
