@@ -268,13 +268,27 @@ async fn a_slow_voice_never_holds_a_line_past_eight_seconds() {
     w.fake.slow(Some(Duration::from_secs(30)));
     let mut live = w.e.subscribe_live();
     let started = tokio::time::Instant::now();
-    w.e.speak_line("hello", None).await;
+    let e = w.e.clone();
+    let speak = tokio::spawn(async move { e.speak_line("hello", None).await });
+    // Timed to the notice, not to the end of the line: the system voice that takes over can be
+    // slow on a CI runner, and that isn't the wait this test is about.
+    let notice = tokio::time::timeout(CLOUD_TIMEOUT + Duration::from_secs(5), async {
+        loop {
+            let f = live.recv().await.unwrap();
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"] == NOTICE_KEY {
+                return v["data"].clone();
+            }
+        }
+    })
+    .await
+    .expect("a notice");
     let took = started.elapsed();
     // The relay gives up on the provider at 7 s (and says so); the PC at 8 s whatever happens.
     assert!(took >= Duration::from_secs(6) && took < CLOUD_TIMEOUT + Duration::from_millis(1500), "{took:?}");
-    let n = notices(&mut live);
-    let m = n[0]["message"].as_str().unwrap();
-    assert!(m.contains("can't answer right now") || m.contains("didn't answer in time"), "{n:?}");
+    tokio::time::timeout(Duration::from_secs(30), speak).await.expect("the line ends").unwrap();
+    let m = notice["message"].as_str().unwrap();
+    assert!(m.contains("can't answer right now") || m.contains("didn't answer in time"), "{notice:?}");
     let used = w.relay_db.quota_used("sub_1", "tts_chars", ferrocast_relay::quota::Period::Month).unwrap();
     assert_eq!(used, 0, "the characters came back");
 }
