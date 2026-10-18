@@ -54,23 +54,54 @@ fi
 
 # Read as plain KEY=value lines, never executed.
 value() { grep -E "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true; }
+# The backup taken before relay.env is changed, whether a write to it is under way, the
+# temporary copy being written, and curl's credentials folder.
+BACKUP=""
+WRITING=0
+TMP=""
+work=""
+# Any exit in the middle of rewriting relay.env (a failed write, a signal) puts the backup
+# back, so relay.env is never left cut short. relay.env is rewritten in place, not replaced
+# by a rename: its folder belongs to root, so deploy can't make files there.
+on_exit() {
+  local code=$?
+  # The new contents and curl's file hold the keys: never leave them lying around.
+  [[ -n "$TMP" ]] && rm -f "$TMP"
+  [[ -n "$work" ]] && rm -rf "$work"
+  if [[ "$WRITING" == 1 && -n "$BACKUP" ]]; then
+    if cp "$BACKUP" "$ENV_FILE" 2>/dev/null; then
+      echo "Writing relay.env failed; it was put back as it was." >&2
+    else
+      echo "Writing relay.env failed and it couldn't be put back: copy ${BACKUP#"$DIR"/} over it by hand." >&2
+    fi
+    exit 1
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+trap 'exit 1' INT TERM HUP
+# setv <name> <value>: the value reaches awk through its environment, never its arguments
+# (which any user on the server can see in `ps`). Needs a backup first.
 setv() {
-  local tmp
+  [[ -n "$BACKUP" ]] || die "Internal error: no backup before changing relay.env. Nothing was changed."
   # $DIR belongs to root; the state folder is deploy's.
-  tmp="$(mktemp "$STATE_DIR/env.XXXXXX")"
-  awk -v k="$1" -v v="$2" 'BEGIN { done = 0 }
+  TMP="$(mktemp "$STATE_DIR/env.XXXXXX")"
+  K="$1" V="$2" awk 'BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; done = 0 }
     index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next } { print }
-    END { if (!done) print k "=" v }' "$ENV_FILE" >"$tmp"
+    END { if (!done) print k "=" v }' "$ENV_FILE" >"$TMP"
   # Same file (same owner and 0600), new contents.
-  cat "$tmp" >"$ENV_FILE" && rm -f "$tmp"
+  WRITING=1
+  cat "$TMP" >"$ENV_FILE"
+  WRITING=0
+  rm -f "$TMP"
+  TMP=""
   chmod 600 "$ENV_FILE"
 }
+# backup: copies relay.env into the state folder and sets $BACKUP.
 backup() {
-  local b
-  b="$STATE_DIR/env-backup-$(date +%y%m%d%H%M%S)"
-  cp "$ENV_FILE" "$b"
-  chmod 600 "$b"
-  echo "$b"
+  BACKUP="$STATE_DIR/env-backup-$(date +%y%m%d%H%M%S)"
+  cp "$ENV_FILE" "$BACKUP"
+  chmod 600 "$BACKUP"
 }
 
 # restart: recreate the relay container with the live version, wait until it's healthy.
@@ -89,9 +120,11 @@ restart() {
   done
   return 1
 }
-# put_back <backup>: undo, restart on the old settings, and fail.
+# put_back <backup> <why>: undo, restart on the old settings, and fail.
 put_back() {
-  cat "$1" >"$ENV_FILE"
+  WRITING=1
+  cp "$1" "$ENV_FILE"
+  WRITING=0
   restart || true
   die "$2 relay.env was put back as it was."
 }
@@ -126,9 +159,9 @@ case "${1:-}" in
         [[ -n "$(value "$k")" ]] || die "$k isn't set: run this script without arguments first. Nothing was changed."
       done
     fi
-    b="$(backup)"
+    backup
     setv PRO_SALES_OPEN "$want"
-    restart || put_back "$b" "The relay didn't come back healthy."
+    restart || put_back "$BACKUP" "The relay didn't come back healthy."
     echo "✓ PRO_SALES_OPEN=$want, relay restarted."
     exit 0
     ;;
@@ -147,7 +180,6 @@ KEY_SECRET="$(printf '%s' "$KEY_SECRET" | tr -d '[:space:]')"
 
 # Credentials go to curl in a private file (0600, removed on exit), never on a command line.
 work="$(mktemp -d "$STATE_DIR/rzp.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
 printf 'user = "%s:%s"\n' "$KEY_ID" "$KEY_SECRET" >"$work/auth"
 rzp() { # <method> <path> [json body on stdin] → body in $work/out, prints the HTTP status
   local method=$1 path=$2
@@ -170,7 +202,8 @@ same_keys=0
 have_plans=0
 [[ "$(value RAZORPAY_PLAN_MONTHLY)" == plan_* && "$(value RAZORPAY_PLAN_YEARLY)" == plan_* ]] && have_plans=1
 
-b="$(backup)"
+backup
+b="$BACKUP"
 echo "✓ Backed up relay.env to ${b#"$DIR"/}"
 setv RAZORPAY_KEY_ID "$KEY_ID"
 setv RAZORPAY_KEY_SECRET "$KEY_SECRET"

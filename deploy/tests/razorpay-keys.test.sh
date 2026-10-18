@@ -117,6 +117,33 @@ is "a failed plan fails the run" "$code" 1
 has "says it put relay.env back" "$out" "put back"
 is "relay.env is exactly as before" "$(cat "$tmp/relay/relay.env")" "$before"
 
+# A write to relay.env that fails halfway (disk full): the shell has already emptied the
+# file when `cat` fails, so the script must put the backup back.
+start_fake 0
+fresh_relay
+before="$(cat "$tmp/relay/relay.env")"
+mkdir -p "$tmp/bin"
+# shellcheck disable=SC2016 # the stub's own $1 and $@, expanded when it runs
+printf '#!/bin/sh\ncase "$1" in */state/env.*) exit 1 ;; esac\nexec /bin/cat "$@"\n' >"$tmp/bin/cat"
+chmod +x "$tmp/bin/cat"
+set +e
+out="$(printf '%b' "$KEY_ID\n$SECRET\n" | PATH="$tmp/bin:$PATH" RELAY_DIR="$tmp/relay" RZP_API="$api" NO_RESTART=1 "$script" 2>&1)"
+code=$?
+set -e
+is "a failed write fails the run" "$code" 1
+has "says relay.env was put back" "$out" "put back as it was"
+is "relay.env is exactly as before (after a failed write)" "$(cat "$tmp/relay/relay.env")" "$before"
+is "no temporary copy (it holds the keys) is left" "$(find "$tmp/relay/state" -name 'env.*' | wc -l | tr -d ' ')" 0
+is "no curl credentials are left" "$(find "$tmp/relay/state" -name 'rzp.*' | wc -l | tr -d ' ')" 0
+# The same through --sales (a write with no keys involved).
+set +e
+out="$(PATH="$tmp/bin:$PATH" RELAY_DIR="$tmp/relay" RZP_API="$api" NO_RESTART=1 "$script" --sales closed 2>&1 </dev/null)"
+code=$?
+set -e
+is "a failed --sales write fails" "$code" 1
+is "relay.env still as before" "$(cat "$tmp/relay/relay.env")" "$before"
+rm -rf "${tmp:?}/bin"
+
 if ((fails)); then
   echo "$fails failed"
   exit 1
