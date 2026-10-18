@@ -369,8 +369,13 @@ type ProView = {
   offline_grace_days: 7
   launch_note: string                  // "Ferrocast Pro launches after version 1. …"
   warning: string | null
+  features: ProFeatures                // which Pro features the relay has (§9); all false until each ships
+  quotas: { [name: string]: ProQuota } // this subscription's counters (§9); {} without one
 }
+type ProFeatures = { cloud_bot: boolean; remote: boolean; tts: boolean; discord: boolean; backups: boolean; tip_brand: boolean; history: boolean }
+type ProQuota = { used: number; limit: number; period: "day" | "month" /* UTC calendar */; reset_at: number /* ms */ }
 ```
+Show a Pro feature's panel only when `features.<name>` is true and `active || sales_open` (§9).
 
 | Method | Path | Body → Response |
 |---|---|---|
@@ -381,7 +386,7 @@ type ProView = {
 | POST | `/api/v1/pro/cancel` | → `ProView`: stops renewing; Pro lasts until `current_end` |
 | POST | `/api/v1/pro/restore` | `{ subscription_id, email }` → `ProView`: moves Pro onto this install (new PC, reinstall). At most 3 installs share one subscription; the oldest drops off. |
 
-Errors pass the relay's code, message and hint through: 409 `pro_not_on_sale` (hint: launches after version 1), 409 `already_pro`, 409 `already_cancelled`, 409 `not_cancellable`, 404 `no_subscription`, 404 `not_found` (restore: id and email don't match, always the same answer), 422 `invalid_plan` / `invalid_email` / `invalid_subscription`, 429 `rate_limited`, 502 `razorpay_unavailable`, 503 `billing_unavailable` (no keys on the relay yet) / `billing_misconfigured`, 503 `relay_unrecognised` (the relay forgot this install; it re-registers by itself), 502 `relay_unreachable`. 400 for a body that isn't JSON or misses a field, 415 without `Content-Type: application/json`.
+Errors pass the relay's code, message and hint through: 409 `pro_not_on_sale` (hint: launches after version 1), 409 `already_pro`, 409 `already_cancelled`, 409 `not_cancellable`, 404 `no_subscription`, 404 `not_found` (restore: id and email don't match, always the same answer), 422 `invalid_plan` / `invalid_email` / `invalid_subscription`, 429 `rate_limited`, 502 `razorpay_unavailable`, 503 `billing_unavailable` (no keys on the relay yet) / `billing_misconfigured`, 503 `relay_unrecognised` (the relay forgot this install; it re-registers by itself), 502 `relay_unreachable`. Pro feature calls (§9) also pass through 402 `pro_required`, 413 `too_large`, 415 `unsupported_type`, 429 with the relay's `Retry-After`, 503 `vault_unavailable` / `storage_unavailable`. 400 for a body that isn't JSON or misses a field, 415 without `Content-Type: application/json`.
 
 ### Media
 | Method | Path | Body → Response |
@@ -616,7 +621,7 @@ The relay's own HTTP API for Pro (`crates/relay/src/billing`), at `https://ferro
 
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | `/v1/pro/status` | `?refresh=1` asks Razorpay first (at most every 10 s per install) → `{ pro, status, plan, subscription_id, current_end, access_until, cancel_at_period_end, refunded, installs, sales_open, prices, checked_at, warning? }` |
+| GET | `/v1/pro/status` | `?refresh=1` asks Razorpay first (at most every 10 s per install) → `{ pro, status, plan, subscription_id, current_end, access_until, cancel_at_period_end, refunded, installs, sales_open, prices, checked_at, features, quotas, warning? }`. `features` and `quotas` are as in §9, for every install (`quotas` is `{}` without a subscription) |
 | POST | `/v1/pro/checkout` | `{ plan, email }` → 201 `{ subscription_id, checkout_url /* https://rzp.io/… */, key_id, plan, amount, currency }`. 409 `pro_not_on_sale` while `PRO_SALES_OPEN` is off. 10 per install per hour, one at a time; an earlier unpaid checkout is cancelled at Razorpay first (if Razorpay says it was paid meanwhile: 409 `already_pro`). |
 | POST | `/v1/pro/cancel` | → status; cancel at the end of the cycle |
 | POST | `/v1/pro/manage-link` | → 201 `{ url, expires_at }` (`/pro/manage/<token>`, 30 minutes, token stored hashed) |
@@ -626,3 +631,30 @@ The relay's own HTTP API for Pro (`crates/relay/src/billing`), at `https://ferro
 | POST | `/billing/razorpay/webhook` | Razorpay → relay. `X-Razorpay-Signature` = hex HMAC-SHA256 of the raw body with `RAZORPAY_WEBHOOK_SECRET` (constant-time compare) else 401; `X-Razorpay-Event-Id` required (400); body must be JSON with `event` (400). Each event id is handled once (`{status:"duplicate"}`), recorded in the same transaction as its effect. `subscription.*` re-reads the subscription from Razorpay and copies that state; `subscription.charged` also records the payment id and amount; `refund.*` re-reads the payment's refunds and ends Pro (and cancels the subscription now) once refunds that didn't fail add up to the payment. Subscriptions and payments that aren't Pro's (the Razorpay account is shared with other products) → 200 `{status:"ignored"}`, no Razorpay call. Razorpay unreachable → 502, storage → 503, without recording the event, so Razorpay's retry gets another go. 503 `billing_unavailable` until the secret is set. |
 
 Data kept (R-51): subscription id, plan, status, period end, cancel/refund flags, an HMAC-SHA256 of the lowercased checkout email keyed with `PRO_EMAIL_KEY` (never the email), which installs share it, payment ids and amounts, handled event ids (30 days), hashed manage tokens. Never card, UPI, name or phone. A daily re-check re-reads unfinished subscriptions and the refunds of the last 60 days' payments, in case webhooks were lost.
+
+## 9. Relay: Pro features
+
+Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. Nothing here is built yet: this is the contract each one follows as it ships, and its routes are added to §9.x.
+
+**The gate.** Every Pro feature route checks, first:
+
+| Status | Code | When |
+|---|---|---|
+| 401 | `unauthorized` | No `Authorization`, or an install the relay doesn't know |
+| 402 | `pro_required` | The install has no current Pro: never bought, not paid yet, lapsed past `access_until` (every renewal failed, or the period ended) or refunded. `message`: "This runs on Ferrocast's servers and is part of Pro.", `hint` points to Settings › Pro |
+
+Access is the same rule as `/v1/pro/status` `pro` (paid period, 3-day grace for a late renewal, none after a full refund), so Settings › Pro and a feature never disagree. A lapsed subscription stops cloud work at the next hourly sweep, keeps its data 30 days, and its export stays open (R-04).
+
+**Shared errors** (besides each feature's own):
+
+| Status | Code | When |
+|---|---|---|
+| 413 | `too_large` (or the feature's own code) | `message` states the limit |
+| 415 | `unsupported_type` | `message` says which types are allowed |
+| 429 | the feature's quota code (e.g. `tts_quota`) | A per-subscription counter is used up. Headers: `X-Quota-Reset` (when it starts again, Unix ms) and `Retry-After` (seconds). The hint gives the date |
+| 503 | `vault_unavailable` | The relay has no vault key yet (features that keep secrets), or a saved sign-in can't be read (hint: connect that account again) |
+| 503 | `storage_unavailable` | The relay can't store files right now |
+
+**Features and quotas in the status.** `/v1/pro/status` `features` says which features this relay has, built *and* configured (`cloud_bot`, `remote`, `tts`, `discord`, `backups`, `tip_brand`, `history`; all `false` today). `quotas` lists the subscription's counters as `{ [name]: { used, limit, period: "day" | "month", reset_at } }`; quotas are per subscription, shared by its installs, and count in UTC calendar days or months.
+
+**The dashboard.** A Pro feature's panel is hidden unless the feature is in `features` and `active || sales_open`. Not Pro (but on sale): one calm line, "Runs on Ferrocast's servers, part of Pro.", and a link to Settings › Pro, never a nag. Pro: the feature itself.

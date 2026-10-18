@@ -26,6 +26,11 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-19 (Pro M0: foundations)
+- Relay: `billing/gate.rs` (`require_pro` → 401 / 402 `pro_required`, same access rule as status), `vault.rs` (AES-256-GCM, `RELAY_VAULT_KEY`, AAD `install|purpose`, 503 `vault_unavailable` without a key), `quota.rs` (per-subscription day/month counters, 429 + `X-Quota-Reset` + `Retry-After`), `blob.rs` (`BlobStore`, `FsBlobStore` at `RELAY_BLOB_DIR` or `<db dir>/blobs`), numbered migrations in `migrate.rs` (`user_version`; the live tables are migration 1, a copy is taken before migrating), per-module `routes()` with stubs for history, backups, remote, bot, tts, discord (mail has none), `tips.rs` → `tips/mod.rs`. `/v1/pro/status` gains `features` (all false) and `quotas`.
+- Engine: `ProStatus` passes `features`/`quotas` through; relay 402/413 and its `Retry-After` reach the dashboard. API.md §8 status shape and new §9 (the gate and shared errors).
+- Deploy: `deploy/vault-key.sh` (+ `tests/vault-key.test.sh`, in CI and `tools/check.sh`); `deploy-relay.sh` keeps `RELAY_VAULT_KEY`; `relay-ci-setup.sh` installs the script. Follow-ups in PRO.md.
+
 ### 2026-10-18 (designs)
 - Overlay design system, phase 1 (API.md §4 Designs): `core::design` and `core::layer` (alert looks per event key with fallbacks and conditional variations, themes, scenes, widget styles; every check names the field; CSS can't fetch files), `layer` widgets and widget rotation/opacity/lock/hide, an overlay's `design` link with the branding check (a built-in keeps its mark). Store: migration 0009 (`designs`, `overlays.design`), designs in `.ferropack`, `.ferrodesign` share files (`store::designfile`, strict 413/415/422). Engine: built-in catalogue read from the overlay bundle's `designs/catalog.json`, the active alert design dresses alerts and `?test` previews, its TTS switch and paid-amount minimum on top of the policy, Use, Duplicate, designer test alerts with a design and an amount. Server: `/api/v1/designs` routes. Tests: `docs/TESTING.md`.
 ### 2026-10-18

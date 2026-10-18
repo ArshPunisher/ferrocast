@@ -34,6 +34,21 @@ Shared pieces (M0):
   Ferrocast's servers, part of Pro", link to Settings › Pro, no nagging). Pro panels show only
   when `active || sales_open`.
 
+M0 as built (19 Oct 2026):
+- Migrations live in `relay/src/migrate.rs` (append one line per feature: version, name, that
+  module's `SCHEMA`); 1 = every table from before, 2 = `quota_usage`. A copy is taken first
+  (`relay.db.before-vN.from-vM.<ms>`, never overwritten); migrations only add, so a rollback still runs on a newer DB.
+- Each feature module (`history`, `backups`, `remote`, `bot`, `tts`, `discord`, `tips`) has
+  `routes()`, `available()` (→ `/v1/pro/status` `features`) and `QUOTAS` (→ `quotas`); `mail`
+  has no routes. `quota::Db::try_take` returns `TakeErr::{Over(QuotaErr { reset_at }), Db}` →
+  `into_api(code, message)` (429 + `X-Quota-Reset` ms + `Retry-After`).
+- `AppState::vault()` / `blobs()` answer 503 `vault_unavailable` / `storage_unavailable` when
+  the key or the folder is missing.
+- Follow-ups: split `Db` into one writer + a small read pool (still one `Mutex<Connection>`);
+  vault key rotation (`RELAY_VAULT_KEY_OLD` with `key_v` 2) if it's ever needed; the demo-only
+  `#/preview/pro` route in the dashboard goes once a real Pro panel exists (M1 History);
+  raise the relay container's memory limit before M3/M6.
+
 ## Features
 
 ### F1. 24/7 cloud bot
