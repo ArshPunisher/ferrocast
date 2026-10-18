@@ -292,10 +292,15 @@ impl Engine {
 
     pub fn unregister_connector(&self, platform: Platform) {
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
-        let mut st = self.state_mut();
-        st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
-        st.live.remove(&platform);
-        st.viewers.remove(&platform);
+        let view = {
+            let mut st = self.state_mut();
+            st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
+            st.live.remove(&platform);
+            st.viewers.remove(&platform);
+            st.connectors.clone()
+        };
+        // Open dashboards drop the account at once instead of after a reload.
+        self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
     }
 
     /// Held while saving any setting (see `Inner::config`).

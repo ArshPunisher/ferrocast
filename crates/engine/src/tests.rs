@@ -1711,3 +1711,25 @@ async fn going_offline_everywhere_ends_live_but_keeps_the_stream_numbers() {
     assert!(!e.is_live());
     assert!(e.session_view().0.started_at.is_some(), "the ended stream's numbers stay readable");
 }
+
+#[tokio::test]
+async fn disconnecting_an_account_tells_open_dashboards() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    e.disconnect_account(Platform::Twitch).await.unwrap();
+    let told = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match live.recv().await {
+                Ok(f) if f.text.contains(r#""type":"status""#) => {
+                    let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+                    return v["data"]["connectors"]["twitch"]["state"] == "off";
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(told, "a status frame says Twitch is off");
+}
