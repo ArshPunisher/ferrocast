@@ -48,7 +48,11 @@ impl Engine {
 pub(crate) async fn run(engine: Engine) {
     loop {
         match engine.daily_backup_if_due().await {
-            Ok(true) => tracing::info!("took the daily backup"),
+            Ok(true) => {
+                tracing::info!("took the daily backup");
+                // Pro: the cloud copy follows when the data changed (cloud_backup.rs).
+                engine.cloud_backup_after_daily();
+            }
             Ok(false) => {}
             Err(err) => tracing::warn!(%err, "couldn't take the daily backup; trying again in an hour"),
         }

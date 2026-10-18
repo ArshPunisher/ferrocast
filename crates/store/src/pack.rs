@@ -180,7 +180,11 @@ pub fn export(store: &Store, out: &Path, app_version: &str) -> Result<Manifest> 
     let (tables, csv, media_ids) = store.read(|c| {
         let mut tables = Vec::new();
         for t in TABLES {
-            tables.push((*t, table_json(c, t)?));
+            let mut rows = table_json(c, t)?;
+            if *t == "settings" {
+                rows.retain(|r| !is_device_local(r));
+            }
+            tables.push((*t, rows));
         }
         let ids: Vec<String> =
             c.prepare("SELECT id FROM media")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -219,6 +223,56 @@ pub fn export(store: &Store, out: &Path, app_version: &str) -> Result<Manifest> 
     zip.finish().map_err(zerr)?.sync_all()?;
     crate::backup::rename_patiently(&tmp, out)?;
     Ok(manifest)
+}
+
+/// Settings rows that belong to this install, not to the setup: the remembered Pro status
+/// (it's this install's, re-checked every 10 minutes) and stream history waiting to upload.
+/// They're never exported, an import never replaces them, and [`content_hash`] leaves them
+/// out. (Cloud backup state is a file of its own, never in the database.)
+pub const DEVICE_LOCAL_SETTINGS: &[&str] = &["pro_status", "history_upload"];
+
+fn is_device_local(row: &Value) -> bool {
+    row["key"].as_str().is_some_and(|k| DEVICE_LOCAL_SETTINGS.contains(&k))
+}
+
+/// A SHA-256 (hex) of what a pack exported now would hold: the tables, the tip history and
+/// every media file, without the export time. Two exports of an unchanged setup hash the
+/// same, so the automatic cloud backup can skip a day when nothing changed.
+pub fn content_hash(store: &Store) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let (tables, csv, media_ids) = store.read(|c| {
+        let mut tables = Vec::new();
+        for t in TABLES {
+            let mut rows = table_json(c, t)?;
+            if *t == "settings" {
+                rows.retain(|r| !is_device_local(r));
+            }
+            tables.push((*t, rows));
+        }
+        let ids: Vec<String> = c
+            .prepare("SELECT id FROM media ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((tables, tips_csv(c)?, ids))
+    })?;
+    // Each part is framed by its name and length, so moving bytes between parts changes it.
+    let mut part = |name: &str, bytes: &[u8]| {
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    for (name, rows) in &tables {
+        part(name, serde_json::to_string(rows)?.as_bytes());
+    }
+    part("tips.csv", csv.as_bytes());
+    for id in media_ids {
+        if let Ok(bytes) = std::fs::read(store.dir().join("media").join(&id)) {
+            part(&format!("media/{id}"), &bytes);
+        }
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn corrupt(e: impl std::fmt::Display) -> StoreError {
@@ -412,6 +466,8 @@ fn keep_device_settings(store: &Store, tables: &mut [(&str, Vec<Map<String, Valu
             row.insert("value".into(), Value::String(Value::Object(engine).to_string()));
             true
         }
+        // This install's own rows stay as they are (unsent history, its Pro status).
+        Some(k) if DEVICE_LOCAL_SETTINGS.contains(&k) => false,
         Some("obs") => parse(row)
             .and_then(|o| o.get("host").and_then(Value::as_str).map(str::to_string))
             .is_some_and(|h| matches!(h.as_str(), "127.0.0.1" | "localhost" | "::1")),
@@ -597,6 +653,25 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), png);
     }
 
+    #[test]
+    fn the_content_hash_changes_with_the_setup_only() {
+        let a = tempfile::tempdir().unwrap();
+        let s = Store::open(a.path()).unwrap();
+        repo::bot::bump_counter(&s, "deaths", 1).unwrap();
+        let first = content_hash(&s).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(content_hash(&s).unwrap(), first, "nothing changed, the same hash");
+        // The Pro status being re-checked, or history waiting to upload, isn't a change.
+        repo::settings::set(&s, "pro_status", &json!({ "checked_at": 5 })).unwrap();
+        repo::settings::set(&s, "history_upload", &json!({ "queue": [1] })).unwrap();
+        assert_eq!(content_hash(&s).unwrap(), first);
+        repo::bot::bump_counter(&s, "deaths", 1).unwrap();
+        let second = content_hash(&s).unwrap();
+        assert_ne!(second, first, "a counter moved");
+        repo::media::save(&s, "logo.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        assert_ne!(content_hash(&s).unwrap(), second, "a new media file");
+    }
+
     fn write_pack(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
         let f = tempfile::NamedTempFile::new().unwrap();
         let mut zip = zip::ZipWriter::new(f.reopen().unwrap());
@@ -712,6 +787,39 @@ mod tests {
         let rowless = write_pack(&[("manifest.json", &m), (&format!("media/{}", mine.id), &other_png)]);
         import(&s, rowless.path()).unwrap();
         assert_eq!(std::fs::read(dir.join(&mine.id)).unwrap(), png);
+    }
+
+    #[test]
+    fn this_installs_own_rows_never_leave_or_get_replaced() {
+        let a = tempfile::tempdir().unwrap();
+        let s = Store::open(a.path()).unwrap();
+        repo::settings::set(&s, "pro_status", &json!({ "pro": true, "checked_at": 1 })).unwrap();
+        repo::settings::set(&s, "history_upload", &json!({ "queue": ["unsent"] })).unwrap();
+        repo::settings::set(&s, "welcome", &json!({ "on": true })).unwrap();
+        let pack = a.path().join("out.ferropack");
+        export(&s, &pack, "0.1.0").unwrap();
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&pack).unwrap()).unwrap();
+        let settings = String::from_utf8(read_entry(&mut zip, "settings.json").unwrap().unwrap()).unwrap();
+        assert!(settings.contains("welcome"), "the setup is exported");
+        assert!(!settings.contains("pro_status") && !settings.contains("history_upload"), "{settings}");
+        // A pack that has them anyway (an older export) can't replace this install's rows.
+        let b = tempfile::tempdir().unwrap();
+        let s2 = Store::open(b.path()).unwrap();
+        repo::settings::set(&s2, "history_upload", &json!({ "queue": ["mine"] })).unwrap();
+        let setting = |key: &str, value: Value| json!({ "key": key, "value": value.to_string(), "updated_at": 0 });
+        let rows = serde_json::to_vec(&json!([
+            setting("history_upload", json!({ "queue": ["old pc"] })),
+            setting("pro_status", json!({ "pro": true })),
+            setting("welcome", json!({ "on": false })),
+        ]))
+        .unwrap();
+        let old = write_pack(&[("manifest.json", &manifest_bytes(1)), ("settings.json", &rows)]);
+        import(&s2, old.path()).unwrap();
+        let q: Value = repo::settings::get(&s2, "history_upload").unwrap().unwrap();
+        assert_eq!(q["queue"], json!(["mine"]));
+        assert!(repo::settings::get::<Value>(&s2, "pro_status").unwrap().is_none());
+        let w: Value = repo::settings::get(&s2, "welcome").unwrap().unwrap();
+        assert_eq!(w["on"], false, "the rest of the setup comes across");
     }
 
     #[test]
