@@ -123,7 +123,7 @@ fn view(status: ProStatus, stale: bool, warning: Option<String>) -> ProView {
     ProView { status, active, stale, offline_grace_days: OFFLINE_GRACE_DAYS, launch_note: LAUNCH_NOTE, warning }
 }
 
-fn unreachable(e: impl std::fmt::Display) -> EngineError {
+pub(crate) fn unreachable(e: impl std::fmt::Display) -> EngineError {
     EngineError::Refused {
         status: 502,
         code: "relay_unreachable",
@@ -135,7 +135,7 @@ fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 19] = [
+    const KNOWN: [&str; 40] = [
         "pro_required",
         "vault_unavailable",
         "storage_unavailable",
@@ -155,12 +155,36 @@ fn code(c: &str) -> &'static str {
         "billing_unavailable",
         "billing_misconfigured",
         "bad_json",
+        // Stream history (API.md §9.1).
+        "invalid",
+        "invalid_range",
+        "invalid_platform",
+        "invalid_stream",
+        "invalid_sample",
+        "stream_not_found",
+        "ended_stream_locked",
+        "too_many_samples",
+        "history_rate",
+        // Tip page branding and goal (API.md §9.2).
+        "image_unreadable",
+        "tip_image_quota",
+        "no_tip_page",
+        // Cloud backups (API.md §9.3).
+        "invalid_backup",
+        "invalid_part",
+        "parts_missing",
+        "hash_mismatch",
+        "upload_in_progress",
+        "already_complete",
+        "backup_quota",
+        "backup_upload_quota",
+        "storage",
     ];
     KNOWN.into_iter().find(|k| *k == c).unwrap_or("relay_error")
 }
 
 /// Turns a relay error answer into the same status, code, message and hint.
-async fn relay_error(res: reqwest::Response) -> EngineError {
+pub(crate) async fn relay_error(res: reqwest::Response) -> EngineError {
     let status = res.status();
     // The relay's own wait (a quota's reset), else a minute.
     let wait = res
@@ -210,7 +234,12 @@ impl Engine {
     }
 
     /// Calls the relay with this install's identity.
-    async fn pro_call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, EngineError> {
+    pub(crate) async fn pro_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, EngineError> {
         let url = self.relay_url()?;
         let auth = self.relay_auth().await.map_err(unreachable)?;
         let mut req = self.relay_http().request(method, format!("{url}{path}")).bearer_auth(auth);
@@ -271,6 +300,60 @@ impl Engine {
     /// Pro right now, from memory only (no network): for gating Pro extras.
     pub async fn is_pro(&self) -> bool {
         self.pro_cached().await.is_some_and(|s| still_pro(&s, now().0))
+    }
+
+    /// Pro right now and this relay has the feature, from memory only (no network).
+    pub(crate) async fn pro_has(&self, feature: fn(&ProFeatures) -> bool) -> bool {
+        self.pro_cached().await.is_some_and(|s| still_pro(&s, now().0) && feature(&s.features))
+    }
+
+    /// A Pro file from the relay (a CSV export): its content type and bytes.
+    pub(crate) async fn pro_download(&self, path: &str) -> Result<(String, Vec<u8>), EngineError> {
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await.map_err(unreachable)?;
+        let res = self
+            .relay_http()
+            .get(format!("{url}{path}"))
+            .bearer_auth(auth)
+            .send()
+            .await
+            .map_err(|e| unreachable(e.without_url()))?;
+        if !res.status().is_success() {
+            return Err(relay_error(res).await);
+        }
+        let ct = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = res.bytes().await.map_err(|e| unreachable(e.without_url()))?;
+        Ok((ct, bytes.to_vec()))
+    }
+
+    /// A Pro call whose body isn't JSON (an image) or whose answer may be empty (204):
+    /// `body` is `(content type, bytes)`; `None` back for an empty answer.
+    pub(crate) async fn pro_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<(&str, Vec<u8>)>,
+    ) -> Result<Option<Value>, EngineError> {
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await.map_err(unreachable)?;
+        let mut req = self.relay_http().request(method, format!("{url}{path}")).bearer_auth(auth);
+        if let Some((ct, bytes)) = body {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct).body(bytes);
+        }
+        let res = req.send().await.map_err(|e| unreachable(e.without_url()))?;
+        if !res.status().is_success() {
+            return Err(relay_error(res).await);
+        }
+        let bytes = res.bytes().await.map_err(|e| unreachable(e.without_url()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| unreachable("it sent an answer Ferrocast can't read"))
     }
 
     /// Starts checkout: the link to Razorpay's page, to open in the browser.

@@ -2,10 +2,12 @@
 
 mod app;
 mod bot;
+mod cloud_backups;
 mod core;
 mod designs;
 mod discord;
 mod giveaways;
+mod history;
 mod import;
 mod loyalty;
 #[cfg(test)]
@@ -16,6 +18,7 @@ mod polls;
 mod pro;
 mod recap;
 mod studio;
+mod tip_pro;
 mod welcome;
 
 use axum::Router;
@@ -115,6 +118,9 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/live", get(crate::ws::live))
         // tips
         .route("/tips", get(core::tips).put(core::save_tips).delete(core::delete_tips))
+        // Pro: tip page branding and goal (the images are in `uploads`)
+        .route("/tips/brand", get(tip_pro::brand).put(tip_pro::save_brand).delete(tip_pro::reset_brand))
+        .route("/tips/goal", get(tip_pro::goal).put(tip_pro::save_goal).delete(tip_pro::delete_goal))
         // Discord go-live posts
         .route("/discord", get(discord::get).put(discord::save))
         .route("/discord/test", post(discord::test))
@@ -141,6 +147,16 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/manage", post(pro::manage))
         .route("/pro/cancel", post(pro::cancel))
         .route("/pro/restore", post(pro::restore))
+        .route("/pro/history", get(history::list))
+        .route("/pro/history/export.csv", get(history::export))
+        // Pro cloud backups (see routes/cloud_backups.rs)
+        .route("/pro/backups", get(cloud_backups::list).post(cloud_backups::now))
+        .route("/pro/backups/key", get(cloud_backups::key))
+        .route("/pro/backups/key/saved", post(cloud_backups::key_saved))
+        .route("/pro/backups/passphrase", put(cloud_backups::set_passphrase).delete(cloud_backups::clear_passphrase))
+        .route("/pro/backups/settings", put(cloud_backups::settings))
+        .route("/pro/backups/{id}", delete(cloud_backups::remove))
+        .route("/pro/backups/{id}/restore", post(cloud_backups::restore))
         // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
         .merge(studio::routes())
 }
@@ -160,6 +176,11 @@ pub(crate) fn uploads() -> Router<AppState> {
             Router::new()
                 .route("/designs/import", post(designs::import))
                 .layer(axum::extract::DefaultBodyLimit::max(designs::MAX_DESIGN_BODY)),
+        )
+        .merge(
+            Router::new()
+                .route("/tips/brand/{kind}", put(tip_pro::save_image).delete(tip_pro::delete_image))
+                .layer(axum::extract::DefaultBodyLimit::max(tip_pro::MAX_IMAGE_BODY)),
         )
         .merge(Router::new().route("/import", post(media::import)).layer(axum::extract::DefaultBodyLimit::max(
             usize::try_from(ferrocast_store::pack::MAX_PACK).unwrap_or(usize::MAX).saturating_add(64 * 1024),

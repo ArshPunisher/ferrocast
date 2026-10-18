@@ -10,11 +10,14 @@
 mod accounts;
 mod actions;
 mod backups;
+mod cloud_backup;
+pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod designs;
 mod discord;
 mod dispatcher;
 mod error;
 mod giveaways;
+mod history;
 pub mod import;
 mod loyalty;
 mod obs;
@@ -32,6 +35,8 @@ pub mod studio;
 mod timers;
 mod updates;
 pub use updates::AvailableUpdate;
+mod tip_pro;
+pub use tip_pro::TIP_IMAGES;
 mod welcome;
 
 pub mod frames;
@@ -130,6 +135,14 @@ struct Inner {
     test_designs: Mutex<designs::TestDesigns>,
     /// Studio: counters, quotes, modules, stream info, show, OBS helpers, moments.
     studio: studio::Studio,
+    /// Pro stream history: streams being counted and uploads waiting for the relay.
+    history: Mutex<history::History>,
+    /// One history save or upload round at a time.
+    history_io: tokio::sync::Mutex<()>,
+    /// The category last set from Ferrocast, for a stream that starts.
+    history_category: Mutex<Option<String>>,
+    /// Pro cloud backups: one upload or restore at a time, and its progress.
+    cloud_backup: cloud_backup::Cloud,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -240,6 +253,10 @@ impl Engine {
                 builtins: RwLock::new(Arc::new(Vec::new())),
                 test_designs: Mutex::new(Default::default()),
                 studio: Default::default(),
+                history: Mutex::new(Default::default()),
+                history_io: tokio::sync::Mutex::new(()),
+                history_category: Mutex::new(None),
+                cloud_backup: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -252,6 +269,9 @@ impl Engine {
         tokio::spawn(giveaways::run(engine.clone()));
         engine.load_studio().await;
         tokio::spawn(studio::run(engine.clone()));
+        engine.load_history().await;
+        tokio::spawn(history::run(engine.clone()));
+        tokio::spawn(cloud_backup::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)

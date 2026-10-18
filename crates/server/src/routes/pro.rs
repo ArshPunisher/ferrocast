@@ -192,11 +192,11 @@ mod tests {
         );
         assert!(v["launch_note"].as_str().unwrap().contains("after version 1"));
         assert_eq!(v["offline_grace_days"], 7);
-        // The relay's feature list and counters come through (nothing is built yet).
+        // The relay's feature list and counters come through (history is built, M1).
         assert_eq!(
             v["features"],
             json!({ "cloud_bot": false, "remote": false, "tts": false, "discord": false, "backups": false,
-                    "tip_brand": false, "history": false })
+                    "tip_brand": false, "history": true })
         );
         assert_eq!(v["quotas"], json!({}));
         let (s, v) =
