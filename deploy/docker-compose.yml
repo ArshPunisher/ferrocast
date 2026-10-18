@@ -3,6 +3,9 @@
 #   relay.env    RELAY_PUBLIC_URL, KICK_CLIENT_ID, KICK_CLIENT_SECRET, and Pro's RAZORPAY_* and
 #                PRO_SALES_OPEN from razorpay-keys.sh, RELAY_VAULT_KEY from vault-key.sh
 #                (chmod 600). Pro's files go to /data/blobs in the relay-data volume.
+#   dashboard/   the dashboard builds phones get (Pro "Dashboard anywhere"): releases/<date>/
+#                and a `current` link, switched by dashboard-swap.sh; mounted read-only at
+#                /dashboard and never renamed (RELAY_DASHBOARD_DIR=/dashboard/current)
 #   tunnel.env   TUNNEL_TOKEN from the Cloudflare dashboard (chmod 600)
 name: ferrocast-relay
 
@@ -16,6 +19,7 @@ services:
     env_file: relay.env
     volumes:
       - relay-data:/data
+      - ./dashboard:/dashboard:ro
     networks: [ferrocast]
     read_only: true
     tmpfs: [/tmp]

@@ -14,6 +14,13 @@
 # razorpay-keys.sh (see deploy/README.md), and this script keeps them as they are. Same for
 # the vault key (RELAY_VAULT_KEY), made on the server by vault-key.sh, and the Ferrocast
 # voices key and cap (GOOGLE_TTS_KEY, TTS_GLOBAL_MONTHLY_CHARS), added on the server by hand.
+#
+# Pro "Dashboard anywhere": the dashboard build phones get (../ferrocast-web/dist/dashboard,
+# run `pnpm build:embed` there first) goes to $dir/dashboard/releases/<date> and the
+# `current` link inside switches to it (dashboard-swap.sh). $dir/dashboard is mounted
+# read-only at /dashboard and never renamed (a bind mount would keep the old folder);
+# RELAY_DASHBOARD_DIR=/dashboard/current. The page lives at RELAY_REMOTE_URL. Without a build
+# the copy is skipped and the server keeps the one it has.
 # shellcheck disable=SC2029 # $dir is meant to expand here, before ssh sends the command.
 set -euo pipefail
 
@@ -76,16 +83,30 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
 {
   printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
   printf 'RELAY_TIP_URL=https://tip.clearcraftlabs.com\n'
+  printf 'RELAY_REMOTE_URL=https://remote.clearcraftlabs.com\n'
+  printf 'RELAY_DASHBOARD_DIR=/dashboard/current\n'
   printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
 } | ssh "$host" "sudo sh -c 'umask 077 && cat > $dir/relay.env.new &&
-    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
+    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
     chown $owner:$owner $dir/relay.env.new && chmod 600 $dir/relay.env.new && mv $dir/relay.env.new $dir/relay.env'"
+dashboard="$repo/../ferrocast-web/dist/dashboard"
+if [[ -f "$dashboard/index.html" ]]; then
+  echo "Copying the phone dashboard (Dashboard anywhere)..."
+  # Unpacked in full as a new release inside the mounted folder, then the `current` link
+  # switches with one rename, so phones never see half a build (dashboard-swap.sh).
+  release="$(date -u +%Y%m%d%H%M%S)"
+  ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/dashboard-swap.sh" < "$repo/deploy/dashboard-swap.sh"
+  tar -C "$dashboard" -czf - . | ssh "$host" "sudo bash $dir/dashboard-swap.sh $dir/dashboard $release $owner"
+else
+  echo "No dashboard build at $dashboard (run 'pnpm build:embed' in ferrocast-web): phones keep the copy the server has."
+fi
 printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o $owner -g $owner /dev/stdin $dir/tunnel.env"
 
 ssh "$host" "set -e
   cd $dir && sudo env $image_env docker compose up -d --remove-orphans
+  if [ -x $dir/dashboard-swap.sh ]; then sudo bash $dir/dashboard-swap.sh --tidy $dir/dashboard; fi
   sleep 5
   sudo docker ps --filter name=ferrocast --format '{{.Names}}: {{.Status}}'"
 
