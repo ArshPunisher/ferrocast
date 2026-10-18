@@ -22,6 +22,31 @@ const CACHE_KEY: &str = "pro_status";
 pub const LAUNCH_NOTE: &str =
     "Ferrocast Pro launches after version 1. Everything Ferrocast does today is free, and stays free.";
 
+/// Which Pro features the relay has: built and configured on that server. Pro panels show
+/// only for these. An older relay without the field means none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProFeatures {
+    pub cloud_bot: bool,
+    pub remote: bool,
+    pub tts: bool,
+    pub discord: bool,
+    pub backups: bool,
+    pub tip_brand: bool,
+    pub history: bool,
+}
+
+/// One of the subscription's usage counters (API.md §9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProQuota {
+    pub used: i64,
+    pub limit: i64,
+    /// `day` or `month` (UTC calendar periods).
+    pub period: String,
+    /// When it starts again (ms).
+    pub reset_at: i64,
+}
+
 /// The relay's answer (`GET /v1/pro/status`), as last received.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProStatus {
@@ -45,6 +70,11 @@ pub struct ProStatus {
     /// When the relay said this, by this computer's clock (ms).
     #[serde(default)]
     pub checked_at: i64,
+    #[serde(default)]
+    pub features: ProFeatures,
+    /// By counter name (`tts_chars`, …); empty without a subscription.
+    #[serde(default)]
+    pub quotas: std::collections::BTreeMap<String, ProQuota>,
 }
 
 impl ProStatus {
@@ -62,6 +92,8 @@ impl ProStatus {
             sales_open: false,
             prices: None,
             checked_at: 0,
+            features: ProFeatures::default(),
+            quotas: Default::default(),
         }
     }
 }
@@ -103,7 +135,12 @@ fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 14] = [
+    const KNOWN: [&str; 19] = [
+        "pro_required",
+        "vault_unavailable",
+        "storage_unavailable",
+        "too_large",
+        "unsupported_type",
         "pro_not_on_sale",
         "already_pro",
         "already_cancelled",
@@ -125,6 +162,12 @@ fn code(c: &str) -> &'static str {
 /// Turns a relay error answer into the same status, code, message and hint.
 async fn relay_error(res: reqwest::Response) -> EngineError {
     let status = res.status();
+    // The relay's own wait (a quota's reset), else a minute.
+    let wait = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let v: Value = res.json().await.unwrap_or(Value::Null);
     let text = |k: &str| v.pointer(&format!("/error/{k}")).and_then(Value::as_str).unwrap_or("").to_string();
     let message = text("message");
@@ -140,7 +183,7 @@ async fn relay_error(res: reqwest::Response) -> EngineError {
         };
     }
     let status = match status.as_u16() {
-        s @ (400 | 404 | 409 | 415 | 422 | 429 | 502 | 503) => s,
+        s @ (400 | 402 | 404 | 409 | 413 | 415 | 422 | 429 | 502 | 503) => s,
         _ => 502,
     };
     EngineError::Refused {
@@ -148,7 +191,7 @@ async fn relay_error(res: reqwest::Response) -> EngineError {
         code: code(&text("code")),
         message: if message.is_empty() { "The Ferrocast relay refused that.".into() } else { message },
         hint: text("hint"),
-        retry_after: (status == 429).then_some(60),
+        retry_after: (status == 429).then(|| wait.unwrap_or(60)),
     }
 }
 
@@ -300,5 +343,27 @@ mod tests {
                         "current_end": 5, "access_until": 6 });
         let s: ProStatus = serde_json::from_value(v).unwrap();
         assert!(s.pro && !s.sales_open && s.checked_at == 0);
+        assert_eq!(s.features, ProFeatures::default(), "no features field: none");
+        assert!(s.quotas.is_empty());
+    }
+
+    #[test]
+    fn features_and_quotas_pass_through() {
+        let v = json!({ "pro": true, "status": "active", "plan": "monthly", "subscription_id": "sub_1",
+                        "current_end": 5, "access_until": 6,
+                        "features": { "tts": true, "history": true, "something_new": true },
+                        "quotas": { "tts_chars": { "used": 120, "limit": 20000, "period": "month", "reset_at": 9 } } });
+        let s: ProStatus = serde_json::from_value(v).unwrap();
+        assert!(s.features.tts && s.features.history && !s.features.cloud_bot, "unknown features are ignored");
+        assert_eq!(s.quotas["tts_chars"].used, 120);
+        let out = serde_json::to_value(&s).unwrap();
+        assert_eq!(out["features"]["backups"], false);
+        assert_eq!(out["quotas"]["tts_chars"]["limit"], 20000);
+    }
+
+    #[test]
+    fn the_pro_gate_and_size_errors_keep_their_status() {
+        assert_eq!(code("pro_required"), "pro_required");
+        assert_eq!(code("vault_unavailable"), "vault_unavailable");
     }
 }
