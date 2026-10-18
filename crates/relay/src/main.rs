@@ -1,11 +1,14 @@
-//! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` and the settings in
-//! `deploy/relay.env.example`.
+//! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` (and optionally `RELAY_BLOB_DIR`,
+//! `RELAY_VAULT_KEY`) and the settings in `deploy/relay.env.example`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferrocast_relay::billing::{self, BillingConfig};
+use ferrocast_relay::blob::{BlobStore, FsBlobStore};
+use ferrocast_relay::vault::Vault;
 use ferrocast_relay::{AppState, Config, Db, router};
 
 #[tokio::main]
@@ -37,7 +40,27 @@ async fn main() {
         }
         _ => tracing::warn!("Razorpay keys, webhook secret, PRO_EMAIL_KEY or plan ids not set: Pro billing is off"),
     }
-    let state = AppState::new(cfg, db).with_billing(billing_cfg);
+    // Pro's shared parts. Missing ones only switch off the features that need them.
+    let vault = match Vault::from_env() {
+        Ok(Some(v)) => Some(v),
+        Ok(None) => {
+            tracing::warn!("RELAY_VAULT_KEY not set: Pro features that keep secrets are off");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "RELAY_VAULT_KEY is unusable: Pro features that keep secrets are off");
+            None
+        }
+    };
+    let blob_dir = FsBlobStore::default_root(&data);
+    let blobs: Option<Arc<dyn BlobStore>> = match FsBlobStore::new(&blob_dir) {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::error!(error = %e, dir = %blob_dir.display(), "can't use the blob folder: Pro file storage is off");
+            None
+        }
+    };
+    let state = AppState::new(cfg, db).with_billing(billing_cfg).with_vault(vault).with_blobs(blobs);
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.

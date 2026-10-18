@@ -1,4 +1,4 @@
-//! Ferrocast Pro billing through Razorpay Subscriptions (ARCHITECTURE.md §6, API.md §7).
+//! Ferrocast Pro billing through Razorpay Subscriptions (ARCHITECTURE.md §6, API.md §8).
 //!
 //! Identity is the relay install the desktop already has (`Bearer <install>.<secret>`):
 //! no Ferrocast account, no password, no email login. Checkout makes a Razorpay
@@ -18,9 +18,12 @@
 //! `PRO_SALES_OPEN` is off by default: checkout answers 409 until Pro's features exist.
 
 pub mod access;
+pub(crate) mod gate;
 mod pages;
 pub mod razorpay;
 pub mod store;
+
+pub(crate) use pages::date;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -37,6 +40,20 @@ use razorpay::{Razorpay, RzpError};
 use store::{Applied, SubRow, Synced};
 
 use crate::{ApiError, AppState, authed, now_ms};
+
+/// Billing's routes: the app's Pro calls, the manage page, Razorpay's webhook.
+pub(crate) fn routes() -> axum::Router<AppState> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/v1/pro/status", get(status))
+        .route("/v1/pro/checkout", post(checkout))
+        .route("/v1/pro/cancel", post(cancel))
+        .route("/v1/pro/manage-link", post(manage_link))
+        .route("/v1/pro/restore", post(restore))
+        .route("/pro/manage/{token}", get(manage_page))
+        .route("/pro/manage/{token}/cancel", post(manage_cancel))
+        .route("/billing/razorpay/webhook", post(webhook))
+}
 
 /// `notes.product` on every plan and subscription Pro makes, to tell them apart from the
 /// other products on the same Razorpay account.
@@ -250,6 +267,43 @@ async fn refresh(st: &AppState, id: &str) -> Result<Option<SubRow>, ApiError> {
     st.db.pro_sub(id).map_err(ApiError::db)
 }
 
+/// Which Pro features work on this server: built and configured (the dashboard shows a Pro
+/// panel only for these). Each feature module answers for itself.
+fn features(st: &AppState) -> Value {
+    json!({
+        "cloud_bot": crate::bot::available(st),
+        "remote": crate::remote::available(st),
+        "tts": crate::tts::available(st),
+        "discord": crate::discord::available(st),
+        "backups": crate::backups::available(st),
+        "tip_brand": crate::tips::brand_available(st),
+        "history": crate::history::available(st),
+    })
+}
+
+/// The subscription's counters, `{ name: { used, limit, period, reset_at } }`.
+fn quotas(st: &AppState, sub: &str) -> Value {
+    let all = [
+        crate::bot::QUOTAS,
+        crate::remote::QUOTAS,
+        crate::tts::QUOTAS,
+        crate::discord::QUOTAS,
+        crate::backups::QUOTAS,
+        crate::tips::QUOTAS,
+        crate::history::QUOTAS,
+    ];
+    let mut m = serde_json::Map::new();
+    for l in all.into_iter().flatten() {
+        match st.db.usage(sub, l) {
+            Ok(u) => {
+                m.insert(l.name.to_string(), json!(u));
+            }
+            Err(e) => tracing::warn!(error = %e, quota = l.name, "couldn't read a quota"),
+        }
+    }
+    Value::Object(m)
+}
+
 /// What the app and the manage page show.
 fn view(st: &AppState, sub: Option<&SubRow>) -> Value {
     let now = now_ms();
@@ -258,7 +312,8 @@ fn view(st: &AppState, sub: Option<&SubRow>) -> Value {
     let Some(s) = sub else {
         return json!({ "pro": false, "status": "none", "plan": null, "subscription_id": null, "current_end": null,
                        "access_until": null, "cancel_at_period_end": false, "refunded": false, "installs": 0,
-                       "sales_open": st.billing_cfg.sales_open, "prices": prices, "checked_at": now });
+                       "sales_open": st.billing_cfg.sales_open, "prices": prices, "checked_at": now,
+                       "features": features(st), "quotas": {} });
     };
     let a = s.access();
     json!({
@@ -274,6 +329,8 @@ fn view(st: &AppState, sub: Option<&SubRow>) -> Value {
         "sales_open": st.billing_cfg.sales_open,
         "prices": prices,
         "checked_at": now,
+        "features": features(st),
+        "quotas": quotas(st, &s.id),
     })
 }
 

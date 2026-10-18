@@ -196,9 +196,16 @@ async fn start(rzp: FakeRazorpay, cfg: BillingConfig) -> Billing {
         kick_api_url: base.clone(),
     };
     let state = crate::AppState::new(relay_cfg, db).with_billing(cfg);
-    let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // A stand-in Pro feature route, to test the gate through real requests.
+    let probe = axum::Router::new().route("/test/pro-only", axum::routing::get(gate_probe)).with_state(state.clone());
+    let app = probe.merge(router(state)).into_make_service_with_connect_info::<std::net::SocketAddr>();
     tokio::spawn(async move { axum::serve(l, app).await });
     Billing { base, rzp, http: reqwest::Client::new(), _dir: dir }
+}
+
+async fn gate_probe(State(st): State<AppState>, headers: HeaderMap) -> Result<axum::Json<Value>, ApiError> {
+    let ctx = gate::require_pro(&st, &headers).await?;
+    Ok(axum::Json(json!({ "install": ctx.install, "sub_id": ctx.sub_id })))
 }
 
 fn cfg(rzp: &FakeRazorpay, open: bool) -> BillingConfig {
@@ -244,6 +251,16 @@ impl Billing {
         let res = self.http.get(format!("{}/v1/pro/status{q}", self.base)).bearer_auth(auth).send().await.unwrap();
         assert_eq!(res.status(), 200);
         res.json().await.unwrap()
+    }
+
+    async fn probe(&self, auth: Option<&str>) -> (u16, Value) {
+        let mut r = self.http.get(format!("{}/test/pro-only", self.base));
+        if let Some(a) = auth {
+            r = r.bearer_auth(a);
+        }
+        let res = r.send().await.unwrap();
+        let s = res.status().as_u16();
+        (s, res.json().await.unwrap_or(Value::Null))
     }
 
     async fn checkout(&self, auth: &str, plan: &str) -> (u16, Value) {
@@ -345,6 +362,70 @@ async fn a_new_install_has_no_pro_and_sees_the_prices() {
     assert_eq!(v["status"], "none");
     assert_eq!(v["sales_open"], false);
     assert_eq!(v["prices"], json!({ "currency": "INR", "monthly": 19_900, "yearly": 199_900 }));
+}
+
+#[tokio::test]
+async fn status_lists_which_pro_features_this_server_has() {
+    let b = billing(true).await;
+    let none = b.status(&b.install().await, false).await;
+    let (auth, _) = b.pro_install().await;
+    let pro = b.status(&auth, false).await;
+    for v in [&none, &pro] {
+        // Nothing is built yet (M0), so every feature is off and there are no counters.
+        assert_eq!(
+            v["features"],
+            json!({ "cloud_bot": false, "remote": false, "tts": false, "discord": false, "backups": false,
+                    "tip_brand": false, "history": false }),
+            "{v}"
+        );
+        assert_eq!(v["quotas"], json!({}));
+    }
+}
+
+#[tokio::test]
+async fn the_pro_gate_lets_only_current_subscribers_through() {
+    let b = billing(true).await;
+    let (s, v) = b.probe(None).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (401, Some("unauthorized")));
+    let (s, v) = b.probe(Some("nobody.nothing")).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (401, Some("unauthorized")), "an unknown install");
+    let free = b.install().await;
+    let (s, v) = b.probe(Some(&free)).await;
+    assert_eq!(s, 402, "{v}");
+    assert_eq!(v["error"]["code"], "pro_required");
+    assert_eq!(v["error"]["message"], "This runs on Ferrocast's servers and is part of Pro.");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Pro"), "{v}");
+    // An unpaid checkout isn't Pro either.
+    let (s, _) = b.checkout(&free, "monthly").await;
+    assert_eq!(s, 201);
+    assert_eq!(b.probe(Some(&free)).await.0, 402, "checkout started but not paid");
+
+    let (auth, id) = b.pro_install().await;
+    let (s, v) = b.probe(Some(&auth)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["sub_id"], id.as_str());
+    assert_eq!(v["install"].as_str(), auth.split('.').next());
+    // Lapsed (every renewal failed): the gate closes with the status that says so.
+    b.rzp.set_status(&id, "halted", None);
+    b.hook("evt_gate_h", &sub_event("subscription.halted", &id), None).await;
+    assert_eq!(b.status(&auth, false).await["pro"], false);
+    assert_eq!(b.probe(Some(&auth)).await.0, 402);
+    // Renewed again: open again.
+    b.rzp.activate(&id, 30);
+    b.hook("evt_gate_a", &sub_event("subscription.activated", &id), None).await;
+    assert_eq!(b.probe(Some(&auth)).await.0, 200);
+}
+
+#[tokio::test]
+async fn a_refund_closes_the_pro_gate() {
+    let b = billing(true).await;
+    let (auth, id) = b.pro_install().await;
+    b.hook("evt_gc1", &charged_event(&id, "pay_Gate00001", 19_900), None).await;
+    assert_eq!(b.probe(Some(&auth)).await.0, 200);
+    b.rzp.add_refund("pay_Gate00001", 19_900, "processed");
+    b.hook("evt_gr1", &refund_event("pay_Gate00001", 19_900), None).await;
+    let (s, v) = b.probe(Some(&auth)).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (402, Some("pro_required")));
 }
 
 #[tokio::test]

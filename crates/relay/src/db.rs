@@ -1,7 +1,8 @@
 //! The relay's own small SQLite database: installs, who owns which Kick channel, the
 //! per-install delivery queue, seen webhook ids, sign-ins in progress, and Pro
-//! subscriptions (`billing::store`).
+//! subscriptions (`billing::store`), Pro's quota counters (`quota`).
 //! It never stores platform tokens beyond the moment they're handed to the desktop.
+//! Tables come from numbered migrations (`migrate`); each module owns its `SCHEMA`.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -10,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::now_ms;
 
-const SCHEMA: &str = "
+/// Migration 1, with `billing::store::SCHEMA`.
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS installs (id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS kick_owners (broadcaster_id TEXT PRIMARY KEY, install_id TEXT NOT NULL REFERENCES installs(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS queue (id INTEGER PRIMARY KEY AUTOINCREMENT, install_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -64,11 +66,10 @@ pub struct Item {
 
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Db> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(crate::billing::store::SCHEMA)?;
+        crate::migrate::run(&mut conn, path)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -305,6 +306,7 @@ impl Db {
             [now - UNUSED_INSTALL_MS],
         )?;
         drop(c);
-        self.prune_billing()
+        self.prune_billing()?;
+        self.prune_quotas()
     }
 }

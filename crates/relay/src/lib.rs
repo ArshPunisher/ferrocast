@@ -5,11 +5,27 @@
 //! (`billing`). Everything it
 //! receives is forwarded to the streamer's desktop over an outbound WebSocket (no inbound
 //! ports on their PC), queued while the desktop is offline (R-01, R-13 in VISION).
+//!
+//! Pro's features (docs/plan/PRO.md) each live in their own module with their own
+//! `routes()`, merged in [`router`], and their own migrations (`migrate`). The shared parts:
+//! `billing::gate` (402 without Pro), `vault` (encrypted secrets), `quota` (per-subscription
+//! counters) and `blob` (files).
 
+mod backups;
 pub mod billing;
+pub mod blob;
+mod bot;
 pub mod db;
+mod discord;
+mod history;
 pub mod kick;
+mod mail;
+mod migrate;
+pub mod quota;
+mod remote;
 pub mod tips;
+mod tts;
+pub mod vault;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -83,6 +99,10 @@ pub struct AppState {
     /// Ferrocast Pro billing (Razorpay); off until its keys are set.
     pub billing_cfg: Arc<billing::BillingConfig>,
     pub(crate) billing: Arc<billing::Runtime>,
+    /// Encrypts the secrets Pro keeps; `None` without `RELAY_VAULT_KEY`.
+    vault: Option<Arc<vault::Vault>>,
+    /// Pro's files; `None` until the store is set up.
+    blobs: Option<Arc<dyn blob::BlobStore>>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -100,6 +120,8 @@ impl AppState {
             keys: Arc::default(),
             billing_cfg: Arc::default(),
             billing: Arc::default(),
+            vault: None,
+            blobs: None,
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -111,6 +133,30 @@ impl AppState {
         self.billing_cfg = Arc::new(cfg);
         self.billing = Arc::default();
         self
+    }
+
+    /// The vault (`vault::Vault::from_env()` in production).
+    pub fn with_vault(mut self, vault: Option<vault::Vault>) -> AppState {
+        self.vault = vault.map(Arc::new);
+        self
+    }
+
+    /// Where Pro keeps files (`blob::FsBlobStore` in production).
+    pub fn with_blobs(mut self, blobs: Option<Arc<dyn blob::BlobStore>>) -> AppState {
+        self.blobs = blobs;
+        self
+    }
+
+    /// The vault, or 503 `vault_unavailable` for a feature that needs it.
+    #[allow(dead_code)] // the first users are M1+ features
+    pub(crate) fn vault(&self) -> Result<&vault::Vault, ApiError> {
+        self.vault.as_deref().ok_or_else(vault::unavailable)
+    }
+
+    /// The file store, or 503 `storage_unavailable` for a feature that needs it.
+    #[allow(dead_code)] // the first users are M1+ features
+    pub(crate) fn blobs(&self) -> Result<&dyn blob::BlobStore, ApiError> {
+        self.blobs.as_deref().ok_or_else(blob::unavailable)
     }
 
     fn waker(&self, install: &str) -> Arc<Notify> {
@@ -131,16 +177,23 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     hint: Option<String>,
+    /// Extra response headers (`Retry-After`, `X-Quota-Reset`).
+    headers: Vec<(axum::http::HeaderName, String)>,
 }
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        ApiError { status, code, message: message.into(), hint: None }
+        ApiError { status, code, message: message.into(), hint: None, headers: Vec::new() }
     }
     pub(crate) fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
     }
+    pub(crate) fn header(mut self, name: axum::http::HeaderName, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
+
     pub(crate) fn db(e: rusqlite::Error) -> Self {
         tracing::error!(error = %e, "relay database error");
         ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage", "The relay couldn't save that. Try again shortly.")
@@ -158,8 +211,17 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, axum::Json(json!({ "error": { "code": self.code, "message": self.message, "hint": self.hint } })))
-            .into_response()
+        let mut res = (
+            self.status,
+            axum::Json(json!({ "error": { "code": self.code, "message": self.message, "hint": self.hint } })),
+        )
+            .into_response();
+        for (name, value) in self.headers {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+                res.headers_mut().insert(name, v);
+            }
+        }
+        res
     }
 }
 
@@ -178,21 +240,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/kick/callback", get(kick_callback))
         .route("/v1/kick/refresh", post(kick_refresh))
         .route("/v1/kick/webhook", post(kick_webhook))
-        .route("/v1/tips/config", axum::routing::put(tips::save_config).delete(tips::delete_config))
-        .route("/v1/tips/razorpay/{install}", post(tips::razorpay))
-        .route("/v1/tips/kofi/{install}", post(tips::kofi))
-        .route("/v1/tips/stripe/{install}", post(tips::stripe))
-        .route("/t/{handle}", get(tips::page))
-        .route("/", get(tips::tip_host_home))
-        .route("/{handle}", get(tips::tip_host_page))
-        .route("/v1/pro/status", get(billing::status))
-        .route("/v1/pro/checkout", post(billing::checkout))
-        .route("/v1/pro/cancel", post(billing::cancel))
-        .route("/v1/pro/manage-link", post(billing::manage_link))
-        .route("/v1/pro/restore", post(billing::restore))
-        .route("/pro/manage/{token}", get(billing::manage_page))
-        .route("/pro/manage/{token}/cancel", post(billing::manage_cancel))
-        .route("/billing/razorpay/webhook", post(billing::webhook))
+        // Each feature's own routes: later milestones only change their module.
+        .merge(tips::routes())
+        .merge(billing::routes())
+        .merge(history::routes())
+        .merge(backups::routes())
+        .merge(remote::routes())
+        .merge(bot::routes())
+        .merge(tts::routes())
+        .merge(discord::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }

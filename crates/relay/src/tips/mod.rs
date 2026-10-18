@@ -24,6 +24,29 @@ use crate::{ApiError, AppState, authed, now_ms};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The tip routes: the desktop's config, each provider's webhook, and the public pages
+/// (`/t/<name>`, and `/<name>` on the tip host).
+pub(crate) fn routes() -> axum::Router<AppState> {
+    use axum::routing::{get, post, put};
+    axum::Router::new()
+        .route("/v1/tips/config", put(save_config).delete(delete_config))
+        .route("/v1/tips/razorpay/{install}", post(razorpay))
+        .route("/v1/tips/kofi/{install}", post(kofi))
+        .route("/v1/tips/stripe/{install}", post(stripe))
+        .route("/t/{handle}", get(page))
+        .route("/", get(tip_host_home))
+        .route("/{handle}", get(tip_host_page))
+}
+
+/// `features.tip_brand` in `/v1/pro/status`: Pro's tip page branding and goal (M2), once
+/// built and configured here.
+pub(crate) fn brand_available(_st: &AppState) -> bool {
+    false
+}
+
+/// Pro's tip page counters, listed in `/v1/pro/status` `quotas`.
+pub(crate) const QUOTAS: &[crate::quota::Limit] = &[];
+
 /// What a streamer sets up, stored on the relay (the webhook secrets are needed to check
 /// that a payment notice really came from the provider).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

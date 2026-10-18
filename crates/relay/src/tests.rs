@@ -758,3 +758,36 @@ mod tip_isolation {
         assert_eq!(got["payload"]["status"], "disputed");
     }
 }
+
+#[tokio::test]
+async fn pro_parts_without_a_key_or_a_store_say_so_and_work_once_set() {
+    use axum::response::IntoResponse;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("relay.db")).unwrap();
+    let cfg = Config {
+        public_url: "http://127.0.0.1:1".into(),
+        tip_url: None,
+        kick_client_id: None,
+        kick_client_secret: None,
+        kick_id_url: "http://127.0.0.1:1".into(),
+        kick_api_url: "http://127.0.0.1:1".into(),
+    };
+    let st = AppState::new(cfg, db);
+    let res = st.vault().unwrap_err().into_response();
+    assert_eq!(res.status(), 503);
+    let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "vault_unavailable");
+    assert!(v["error"]["hint"].is_string());
+    let res = st.blobs().unwrap_err().into_response();
+    assert_eq!(res.status(), 503);
+    let v: Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], "storage_unavailable");
+
+    let key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+    let store = blob::FsBlobStore::new(dir.path().join("blobs")).unwrap();
+    let st = st.with_vault(Some(vault::Vault::from_base64(&key).unwrap())).with_blobs(Some(std::sync::Arc::new(store)));
+    let sealed = st.vault().unwrap().seal("i", "p", b"x").unwrap();
+    assert_eq!(st.vault().unwrap().open("i", "p", &sealed).unwrap(), b"x");
+    st.blobs().unwrap().put("a/b", axum::body::Bytes::from_static(b"y")).await.unwrap();
+    assert_eq!(st.blobs().unwrap().size("a/b").await.unwrap(), Some(1));
+}
