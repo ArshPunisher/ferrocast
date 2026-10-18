@@ -1,5 +1,5 @@
 //! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` (and optionally `RELAY_BLOB_DIR`,
-//! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`) and the settings in `deploy/relay.env.example`.
+//! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`, `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR`) and the settings in `deploy/relay.env.example`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -73,6 +73,15 @@ async fn main() {
     };
     let state =
         AppState::new(cfg, db).with_billing(billing_cfg).with_vault(vault).with_blobs(blobs).with_tts(tts, tts_cap);
+    let remote_cfg = ferrocast_relay::remote::RemoteConfig::from_env();
+    match (&remote_cfg.origin, remote_cfg.dashboard_dir.is_some()) {
+        (Some(o), true) => tracing::info!(origin = %o, "the dashboard from anywhere is on"),
+        (Some(o), false) => {
+            tracing::warn!(origin = %o, "RELAY_DASHBOARD_DIR not set: phones can pair, but /app/ has no dashboard")
+        }
+        (None, _) => tracing::warn!("RELAY_REMOTE_URL not set: the dashboard from anywhere is off"),
+    }
+    let state = state.with_remote(remote_cfg);
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.
@@ -105,6 +114,14 @@ async fn main() {
         // Pro cloud backups: unfinished uploads after a day, lapsed subscriptions' after 30 days.
         loop {
             ferrocast_relay::backups::sweep(&backups).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let remote = state.clone();
+    tokio::spawn(async move {
+        // Dashboard from anywhere: expired devices and codes, audit lines past 30 days.
+        loop {
+            ferrocast_relay::remote::sweep(&remote).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

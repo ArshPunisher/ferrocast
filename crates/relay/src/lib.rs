@@ -22,7 +22,7 @@ pub mod kick;
 mod mail;
 mod migrate;
 pub mod quota;
-mod remote;
+pub mod remote;
 pub mod tips;
 pub mod tts;
 pub mod vault;
@@ -105,6 +105,8 @@ pub struct AppState {
     blobs: Option<Arc<dyn blob::BlobStore>>,
     /// Pro voices: the provider (`None` without `GOOGLE_TTS_KEY`) and the relay-wide caps.
     pub(crate) tts: Arc<tts::Runtime>,
+    /// The dashboard from anywhere: its settings, open tunnels and phone sockets.
+    pub(crate) remote: Arc<remote::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -125,6 +127,7 @@ impl AppState {
             vault: None,
             blobs: None,
             tts: Arc::default(),
+            remote: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -154,6 +157,12 @@ impl AppState {
     /// character cap (`tts::global_cap_from_env()`).
     pub fn with_tts(mut self, provider: Option<Arc<dyn tts::TtsProvider>>, global_monthly_chars: i64) -> AppState {
         self.tts = Arc::new(tts::Runtime::new(provider, global_monthly_chars));
+        self
+    }
+
+    /// The dashboard from anywhere (`remote::RemoteConfig::from_env()` in production).
+    pub fn with_remote(mut self, cfg: remote::RemoteConfig) -> AppState {
+        self.remote = Arc::new(remote::Runtime::new(cfg));
         self
     }
 
