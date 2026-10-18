@@ -10,10 +10,13 @@
 //!   BRB and ads), source visibility, the replay buffer ("clip that") and OBS health.
 //! - [`moments`]: the "Don't miss" lane on Home and stream markers with CSV/TXT export.
 //!
-//! The pipeline calls two hooks: [`Engine::answer_studio_command`] for chat commands and
-//! [`Engine::studio_saw`] for every event. Settings live as JSON in `settings` (keys below);
+//! - [`autoreplies`]: the bot answers chat that mentions something ("discord" → the link).
+//!
+//! The pipeline calls three hooks: [`Engine::answer_studio_command`] for chat commands,
+//! [`Engine::answer_autoreply`] for other chat, and [`Engine::studio_saw`] for every event. Settings live as JSON in `settings` (keys below);
 //! counter values, quotes, markers and watch time have tables.
 
+pub mod autoreplies;
 pub mod chatbot;
 pub mod moments;
 pub mod obs_tools;
@@ -69,6 +72,8 @@ pub(crate) struct Studio {
     pub brb_from: Mutex<Option<String>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
+    /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
+    pub autoreplies: autoreplies::AutoReplies,
 }
 
 impl Engine {
@@ -118,6 +123,7 @@ impl Engine {
         if let Ok(v) = values {
             *st.counters.lock().unwrap_or_else(|p| p.into_inner()) = v.into_iter().collect();
         }
+        self.load_autoreplies().await;
     }
 
     /// Every event, after the pipeline handled it: the "Don't miss" lane, markers, chat

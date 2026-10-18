@@ -377,19 +377,32 @@ impl Engine {
 
         // Only live chat from this channel gets answers: replayed history and Shared Chat
         // messages from a partner channel never make the bot speak (R-11).
-        if bot_on && e.origin == Origin::Live && e.channel.is_none() && content.text.trim_start().starts_with('!') {
-            if self.answer_studio_command(e).await || self.answer_points_command(e).await {
-                return Moderated::Shown;
+        if bot_on && e.origin == Origin::Live && e.channel.is_none() {
+            if content.text.trim_start().starts_with('!') {
+                if self.answer_studio_command(e).await || self.answer_points_command(e).await {
+                    return Moderated::Shown;
+                }
+                if self.answer_command(e).await {
+                    return Moderated::Shown;
+                }
             }
-            self.answer_command(e).await;
+            // Auto-replies only for chat no command handled (studio/autoreplies.rs).
+            self.answer_autoreply(e).await;
         }
         Moderated::Shown
     }
 
-    async fn answer_command(&self, e: &Event) {
+    /// Answers a custom command. Returns whether the message is one (even when it didn't
+    /// run: on cooldown, off, not allowed), so nothing else answers it.
+    async fn answer_command(&self, e: &Event) -> bool {
         let EventKind::ChatMessage { actor, content, .. } = &e.kind else {
-            return;
+            return false;
         };
+        let is_command = command::parse(&content.text)
+            .is_some_and(|inv| self.state().commands.iter().any(|c| c.answers_to(inv.word)));
+        if !is_command {
+            return false;
+        }
         let mut extra = Vars::new();
         let live = self.state().live.values().any(|l| *l);
         match self.state().session.started_at.filter(|_| live) {
@@ -420,6 +433,7 @@ impl Engine {
             Ok(_) | Err(Skip::NotACommand | Skip::Unknown) => {}
             Err(skip) => tracing::debug!(?skip, "command not run"),
         }
+        true
     }
 
     /// Goals, session numbers, TTS and the alert for a support event.
