@@ -307,6 +307,7 @@ impl Db {
         )?;
         drop(c);
         self.prune_billing()?;
+        self.prune_history()?;
         self.prune_quotas()
     }
 }

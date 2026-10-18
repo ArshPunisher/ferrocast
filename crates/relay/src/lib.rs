@@ -11,7 +11,7 @@
 //! `billing::gate` (402 without Pro), `vault` (encrypted secrets), `quota` (per-subscription
 //! counters) and `blob` (files).
 
-mod backups;
+pub mod backups;
 pub mod billing;
 pub mod blob;
 mod bot;

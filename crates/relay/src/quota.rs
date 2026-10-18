@@ -20,12 +20,14 @@ pub const KEEP_MS: i64 = 62 * 86_400_000;
 /// What a counter counts in. Calendar periods in UTC, so everyone's resets at the same time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
+    /// A UTC clock minute: request rates (`history_requests`), never shown as a quota.
+    Minute,
     Day,
     Month,
 }
 
 /// (year, month 1–12, day 1–31) of a day number since 1970-01-01.
-fn civil(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -49,10 +51,14 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 impl Period {
-    /// The period `now` falls in: `d2026-10-19` or `m2026-10`.
+    /// The period `now` falls in: `n2026-10-19T12:05`, `d2026-10-19` or `m2026-10`.
     pub fn key(self, now: i64) -> String {
         let (y, m, d) = civil(now.div_euclid(86_400_000));
         match self {
+            Period::Minute => {
+                let mins = now.rem_euclid(86_400_000) / 60_000;
+                format!("n{y:04}-{m:02}-{d:02}T{:02}:{:02}", mins / 60, mins % 60)
+            }
             Period::Day => format!("d{y:04}-{m:02}-{d:02}"),
             Period::Month => format!("m{y:04}-{m:02}"),
         }
@@ -62,6 +68,7 @@ impl Period {
     pub fn reset_at(self, now: i64) -> i64 {
         let day = now.div_euclid(86_400_000);
         match self {
+            Period::Minute => (now.div_euclid(60_000) + 1) * 60_000,
             Period::Day => (day + 1) * 86_400_000,
             Period::Month => {
                 let (y, m, _) = civil(day);
@@ -73,6 +80,7 @@ impl Period {
 
     pub fn label(self) -> &'static str {
         match self {
+            Period::Minute => "minute",
             Period::Day => "day",
             Period::Month => "month",
         }
@@ -181,7 +189,11 @@ impl Db {
     }
 
     pub(crate) fn prune_quotas(&self) -> rusqlite::Result<()> {
-        self.c().execute("DELETE FROM quota_usage WHERE reset_at < ?1", [now_ms() - KEEP_MS])?;
+        let now = now_ms();
+        let c = self.c();
+        c.execute("DELETE FROM quota_usage WHERE reset_at < ?1", [now - KEEP_MS])?;
+        // Request-rate minutes are only worth anything while they last.
+        c.execute("DELETE FROM quota_usage WHERE period LIKE 'n%' AND reset_at < ?1", [now - 3_600_000])?;
         Ok(())
     }
 }
@@ -228,6 +240,8 @@ mod tests {
     fn periods_are_utc_calendar_days_and_months() {
         assert_eq!(Period::Day.key(NOW), "d2026-10-19");
         assert_eq!(Period::Month.key(NOW), "m2026-10");
+        assert_eq!(Period::Minute.key(NOW + 5 * 60_000 + 59_999), "n2026-10-19T12:05");
+        assert_eq!(Period::Minute.reset_at(NOW + 1), NOW + 60_000, "the next minute");
         assert_eq!(Period::Day.reset_at(NOW), 1_792_454_400_000, "midnight on the 20th");
         assert_eq!(Period::Month.reset_at(NOW), 1_793_491_200_000, "1 Nov 2026");
         // December rolls into January of the next year.

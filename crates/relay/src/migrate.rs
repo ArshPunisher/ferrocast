@@ -25,6 +25,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         sql: &[crate::db::SCHEMA, crate::billing::store::SCHEMA],
     },
     Migration { version: 2, name: "Pro quota counters", sql: &[crate::quota::SCHEMA] },
+    Migration {
+        version: 3,
+        name: "Pro tip page branding and goals",
+        sql: &[crate::tips::brand::SCHEMA, crate::tips::goal::SCHEMA],
+    },
+    Migration { version: 4, name: "Pro stream history", sql: &[crate::history::SCHEMA] },
+    Migration { version: 5, name: "Pro cloud backups", sql: &[crate::backups::SCHEMA] },
 ];
 
 pub(crate) fn latest() -> i64 {
@@ -102,7 +109,18 @@ mod tests {
         let path = dir.path().join("relay.db");
         let db = Db::open(&path).unwrap();
         assert_eq!(version(&db.c()).unwrap(), latest());
-        for t in ["installs", "queue", "tip_pages", "pro_subs", "pro_installs", "quota_usage"] {
+        for t in [
+            "installs",
+            "queue",
+            "tip_pages",
+            "pro_subs",
+            "pro_installs",
+            "quota_usage",
+            "streams",
+            "stream_samples",
+            "cloud_backups",
+            "cloud_backup_parts",
+        ] {
             let n: i64 =
                 db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [t], |r| r.get(0)).unwrap();
             assert_eq!(n, 1, "{t}");

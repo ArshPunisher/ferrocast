@@ -80,6 +80,22 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
+    let tips = state.clone();
+    tokio::spawn(async move {
+        // Pro tip pages: ended goals and lapsed installs' branding (tips::sweep).
+        loop {
+            ferrocast_relay::tips::sweep(&tips).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let backups = state.clone();
+    tokio::spawn(async move {
+        // Pro cloud backups: unfinished uploads after a day, lapsed subscriptions' after 30 days.
+        loop {
+            ferrocast_relay::backups::sweep(&backups).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {

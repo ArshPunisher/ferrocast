@@ -9,6 +9,9 @@
 //! Amounts leave the relay as integer minor units with the provider's digit count; the
 //! desktop converts with Ferrocast's own currency table, so a provider's quirks (Stripe
 //! sends ISK in hundredths) never change what an alert says.
+//!
+//! Pro adds branding (`brand`: colours, avatar, banner) and a goal page (`goal`); both show
+//! only while the install is Pro, and the free page never changes for anyone else.
 
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -22,10 +25,15 @@ use subtle::ConstantTimeEq;
 use crate::db::Saved;
 use crate::{ApiError, AppState, authed, now_ms};
 
+pub(crate) mod brand;
+pub(crate) mod goal;
+#[cfg(test)]
+mod pro_tests;
+
 type HmacSha256 = Hmac<Sha256>;
 
-/// The tip routes: the desktop's config, each provider's webhook, and the public pages
-/// (`/t/<name>`, and `/<name>` on the tip host).
+/// The tip routes: the desktop's config, each provider's webhook, the public pages
+/// (`/t/<name>`, and `/<name>` on the tip host), and Pro's branding and goal.
 pub(crate) fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post, put};
     axum::Router::new()
@@ -33,19 +41,108 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .route("/v1/tips/razorpay/{install}", post(razorpay))
         .route("/v1/tips/kofi/{install}", post(kofi))
         .route("/v1/tips/stripe/{install}", post(stripe))
+        .route("/v1/pro/tips/brand", get(brand::get_brand).put(brand::put_brand).delete(brand::delete_brand))
+        // The image is read with its own cap (1 MB / 3 MB), not the 256 KB JSON limit.
+        .route("/v1/pro/tips/brand/{kind}", put(brand::put_image).delete(brand::delete_image))
+        .route("/v1/pro/tips/goal", get(goal::get_goal).put(goal::put_goal).delete(goal::delete_goal))
+        .route("/t/a/{file}", get(brand::asset))
         .route("/t/{handle}", get(page))
+        .route("/t/{handle}/goal", get(goal::page))
         .route("/", get(tip_host_home))
         .route("/{handle}", get(tip_host_page))
+        .route("/{handle}/goal", get(goal::tip_host_goal))
 }
 
-/// `features.tip_brand` in `/v1/pro/status`: Pro's tip page branding and goal (M2), once
-/// built and configured here.
-pub(crate) fn brand_available(_st: &AppState) -> bool {
-    false
+/// `features.tip_brand` in `/v1/pro/status`: Pro's tip page branding and goal. Needs the
+/// file store (avatars and banners).
+pub(crate) fn brand_available(st: &AppState) -> bool {
+    st.blobs().is_ok()
 }
 
 /// Pro's tip page counters, listed in `/v1/pro/status` `quotas`.
-pub(crate) const QUOTAS: &[crate::quota::Limit] = &[];
+pub(crate) const QUOTAS: &[crate::quota::Limit] = &[brand::IMAGES_PER_DAY];
+
+/// Whether an install has Pro right now (the same rule as the gate and `/v1/pro/status`).
+pub(crate) fn install_is_pro(st: &AppState, install: &str) -> bool {
+    st.db
+        .pro_sub_for_install(install)
+        .ok()
+        .flatten()
+        .is_some_and(|s| crate::billing::access::is_pro(&s.access(), now_ms()))
+}
+
+/// How long a lapsed install's branding and goal are kept (R-04).
+pub const LAPSED_KEEP_MS: i64 = 30 * 86_400_000;
+
+/// Hourly: goals that ended over 60 days ago go with their rows; branding and goals of
+/// installs without Pro are marked lapsed, and deleted (images too) after 30 days.
+pub async fn sweep(st: &AppState) {
+    let now = now_ms();
+    if let Err(e) = st.db.prune_tip_goals(now) {
+        tracing::warn!(error = %e, "couldn't prune old tip goals");
+    }
+    let installs = match st.db.tip_pro_installs() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list tip branding");
+            return;
+        }
+    };
+    let mut images = Vec::new();
+    for install in installs {
+        let pro = install_is_pro(st, &install);
+        match st.db.mark_tip_lapse(&install, pro, now, LAPSED_KEEP_MS) {
+            Ok(gone) => images.extend(gone),
+            Err(e) => tracing::warn!(error = %e, "couldn't sweep tip branding"),
+        }
+    }
+    brand::forget_images(st, images).await;
+}
+
+impl crate::Db {
+    /// Installs with tip branding or a goal.
+    fn tip_pro_installs(&self) -> rusqlite::Result<Vec<String>> {
+        let c = self.c();
+        let mut q = c.prepare("SELECT install_id FROM tip_brand UNION SELECT install_id FROM tip_goals")?;
+        let rows = q.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Clears or sets the lapse mark; deletes what lapsed over `keep_ms` ago. Returns the
+    /// images that branding used.
+    fn mark_tip_lapse(&self, install: &str, pro: bool, now: i64, keep_ms: i64) -> rusqlite::Result<Vec<String>> {
+        use rusqlite::params;
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        let mut gone = Vec::new();
+        for table in ["tip_brand", "tip_goals"] {
+            if pro {
+                tx.execute(&format!("UPDATE {table} SET lapsed_at = NULL WHERE install_id = ?1"), [install])?;
+                continue;
+            }
+            tx.execute(
+                &format!("UPDATE {table} SET lapsed_at = ?2 WHERE install_id = ?1 AND lapsed_at IS NULL"),
+                params![install, now],
+            )?;
+        }
+        if !pro {
+            let cut = now - keep_ms;
+            let imgs: Option<(Option<String>, Option<String>)> = rusqlite::OptionalExtension::optional(tx.query_row(
+                "SELECT avatar, banner FROM tip_brand WHERE install_id = ?1 AND lapsed_at < ?2",
+                params![install, cut],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ))?;
+            if let Some((a, b)) = imgs {
+                gone.extend(a);
+                gone.extend(b);
+            }
+            tx.execute("DELETE FROM tip_brand WHERE install_id = ?1 AND lapsed_at < ?2", params![install, cut])?;
+            tx.execute("DELETE FROM tip_goals WHERE install_id = ?1 AND lapsed_at < ?2", params![install, cut])?;
+        }
+        tx.commit()?;
+        Ok(gone)
+    }
+}
 
 /// What a streamer sets up, stored on the relay (the webhook secrets are needed to check
 /// that a payment notice really came from the provider).
@@ -392,7 +489,21 @@ fn on_tip_host(st: &AppState, headers: &HeaderMap) -> bool {
 }
 
 fn not_found() -> Response {
-    (StatusCode::NOT_FOUND, Html(shell("Not found", "<p class=lead>There's no tip page here.</p>"))).into_response()
+    let mut res = (StatusCode::NOT_FOUND, Html(shell("Not found", "<p class=lead>There's no tip page here.</p>")))
+        .into_response();
+    page_headers(&mut res);
+    res
+}
+
+/// The public pages' headers: no scripts, nothing from other sites, images from here only.
+fn page_headers(res: &mut Response) {
+    let h = res.headers_mut();
+    h.insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    );
+    h.insert("referrer-policy", axum::http::HeaderValue::from_static("no-referrer"));
+    h.insert("x-content-type-options", axum::http::HeaderValue::from_static("nosniff"));
 }
 
 /// `GET /` on the tip host: there's nothing to list, so point at Ferrocast.
@@ -411,21 +522,25 @@ pub async fn tip_host_page(State(st): State<AppState>, headers: HeaderMap, path:
     page(State(st), path).await
 }
 
-/// `GET /t/{handle}`: the public tip page. Static HTML, no scripts, no trackers.
+/// `GET /t/{handle}`: the public tip page. Static HTML, no scripts, no trackers. A Pro
+/// install's page has its colours, avatar, banner and goal.
 pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Response {
-    let cfg = st
+    let found = st
         .db
-        .tip_config_by_handle(&handle.to_lowercase())
+        .tip_install_by_handle(&handle.to_lowercase())
         .ok()
         .flatten()
-        .and_then(|j| serde_json::from_str::<TipConfig>(&j).ok());
-    let Some(cfg) = cfg else {
-        return (
-            StatusCode::NOT_FOUND,
-            Html(shell("Not found", "<p class=lead>There's no tip page with this name.</p>")),
-        )
-            .into_response();
+        .and_then(|(install, j)| serde_json::from_str::<TipConfig>(&j).ok().map(|c| (install, c)));
+    let Some((install, cfg)) = found else {
+        let mut res =
+            (StatusCode::NOT_FOUND, Html(shell("Not found", "<p class=lead>There's no tip page with this name.</p>")))
+                .into_response();
+        page_headers(&mut res);
+        return res;
     };
+    let pro = install_is_pro(&st, &install);
+    let brand =
+        if pro { st.db.tip_brand(&install).ok().flatten().unwrap_or_default() } else { brand::Brand::default() };
     let mut buttons = String::new();
     for (p, label, hint) in [
         (&cfg.razorpay, "Tip with UPI or card", "Razorpay"),
@@ -442,34 +557,83 @@ pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Res
     if buttons.is_empty() {
         buttons = "<p class=muted>Tips aren't set up yet.</p>".into();
     }
+    let banner = brand
+        .banner
+        .as_deref()
+        .map(|b| format!("<img class=banner src=\"{}\" alt=\"\" width=1500 height=500>", brand::asset_path(b)))
+        .unwrap_or_default();
+    let avatar = brand
+        .avatar
+        .as_deref()
+        .map(|a| {
+            let cls = if brand.banner.is_some() { "avatar over" } else { "avatar" };
+            format!("<img class=\"{cls}\" src=\"{}\" alt=\"\" width=96 height=96>", brand::asset_path(a))
+        })
+        .unwrap_or_default();
+    let goal = if pro { goal_card(&st, &install, &cfg.handle) } else { String::new() };
     let body = format!(
-        "<h1>{}</h1>{}<div class=buttons>{buttons}</div>\
+        "{banner}{avatar}<h1>{}</h1>{}<div class=buttons>{buttons}</div>{goal}\
          <p class=fine>Your name and message can show on stream. Payments go straight to the streamer through the provider you pick; Ferrocast never sees your card or bank details.</p>",
         esc(&cfg.display_name),
         if cfg.message.is_empty() { String::new() } else { format!("<p class=lead>{}</p>", esc(&cfg.message)) }
     );
-    let mut res = Html(shell(&format!("Tip {}", cfg.display_name), &body)).into_response();
-    let h = res.headers_mut();
-    h.insert(
-        "content-security-policy",
-        axum::http::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
-    );
-    h.insert("referrer-policy", axum::http::HeaderValue::from_static("no-referrer"));
+    let html = shell_with(&format!("Tip {}", cfg.display_name), &body, &brand.palette(), "", false);
+    let mut res = Html(html).into_response();
+    page_headers(&mut res);
     res
 }
 
+/// The goal's progress on the tip page, linking to the goal page.
+fn goal_card(st: &AppState, install: &str, handle: &str) -> String {
+    let Some(g) = st.db.tip_goal(install).ok().flatten() else { return String::new() };
+    let Some(p) = goal::progress(st, &g) else { return String::new() };
+    format!(
+        "<a class=goal href=\"{handle}/goal\"><span class=goal-head><span>{}</span><span class=muted>{} of {}</span></span>{}</a>",
+        esc(&g.title),
+        esc(&p.raised),
+        esc(&p.target),
+        goal::bar(p.pct, &g.title),
+    )
+}
+
 fn shell(title: &str, body: &str) -> String {
+    shell_with(title, body, &brand::Palette::default(), "", false)
+}
+
+/// A public page: the palette's colours, `head` added to `<head>`, and for OBS a
+/// transparent page with nothing but the content.
+fn shell_with(title: &str, body: &str, p: &brand::Palette, head: &str, overlay: bool) -> String {
+    let page_bg = if overlay {
+        "background:transparent".to_string()
+    } else {
+        "background:radial-gradient(1200px 600px at 50% 110%,var(--glow) 0,var(--bg) 60%)".to_string()
+    };
     format!(
         "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-         <meta name=robots content=noindex><title>{}</title><style>\
-         :root{{color-scheme:dark;--bg:#0c0e12;--fg:#eef0f4;--muted:#9aa3b2;--accent:#3461f5}}\
-         body{{margin:0;min-height:100dvh;display:grid;place-items:center;background:radial-gradient(1200px 600px at 50% 110%,#1b2a5c 0,var(--bg) 60%);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:24px}}\
-         main{{width:min(440px,100%);text-align:center}}h1{{font-size:clamp(28px,7vw,40px);margin:0 0 8px;letter-spacing:-.02em}}\
-         .lead{{color:var(--muted);margin:0 0 28px}}.buttons{{display:grid;gap:12px;margin-bottom:28px}}\
-         .btn{{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-radius:14px;background:#151a24;border:1px solid #263047;color:var(--fg);text-decoration:none;font-weight:600}}\
+         <meta name=robots content=noindex>{head}<title>{}</title><style>\
+         :root{{{}}}\
+         body{{margin:0;min-height:100dvh;display:grid;place-items:center;{page_bg};color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;padding:24px;box-sizing:border-box}}\
+         main{{width:min(440px,100%);text-align:center}}h1{{font-size:clamp(28px,7vw,40px);margin:0 0 8px;letter-spacing:-.02em;overflow-wrap:anywhere}}\
+         .lead{{color:var(--muted);margin:0 0 28px;overflow-wrap:anywhere}}.buttons{{display:grid;gap:12px;margin-bottom:28px}}\
+         .btn{{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-radius:14px;background:var(--surface);border:1px solid var(--line);color:var(--fg);text-decoration:none;font-weight:600}}\
          .btn:hover,.btn:focus-visible{{border-color:var(--accent);outline:none}}.btn small{{color:var(--muted);font-weight:400}}\
+         .btn.primary{{justify-content:center;background:var(--accent);border-color:var(--accent);color:var(--on-accent)}}\
+         .btn.primary:focus-visible{{outline:2px solid var(--fg);outline-offset:2px}}\
+         .banner{{display:block;width:100%;height:auto;aspect-ratio:3/1;object-fit:cover;border-radius:16px;margin:0 0 20px;background:var(--surface)}}\
+         .avatar{{display:block;width:96px;height:96px;border-radius:50%;object-fit:cover;margin:0 auto 16px;background:var(--surface);border:3px solid var(--bg)}}\
+         .avatar.over{{margin-top:-68px;position:relative}}\
+         .eyebrow{{color:var(--muted);margin:0 0 4px;font-weight:600}}\
+         .bar{{height:14px;border-radius:99px;background:var(--surface);border:1px solid var(--line);overflow:hidden;margin:20px 0 12px}}\
+         .bar span{{display:block;height:100%;background:var(--accent);border-radius:99px;min-width:4px}}\
+         .nums{{margin:0 0 4px;font-size:18px}}.nums strong{{font-size:28px;letter-spacing:-.02em}}.pct{{color:var(--muted);margin-left:6px}}\
+         .goal{{display:block;text-align:left;padding:16px 20px;border-radius:14px;background:var(--surface);border:1px solid var(--line);color:var(--fg);text-decoration:none;margin:0 0 28px}}\
+         .goal:hover,.goal:focus-visible{{border-color:var(--accent);outline:none}}\
+         .goal-head{{display:flex;justify-content:space-between;gap:12px;font-weight:600;flex-wrap:wrap}}.goal .bar{{margin:10px 0 0;height:10px}}\
+         .ov{{width:min(640px,100%);text-align:left;text-shadow:0 1px 3px rgba(0,0,0,.6)}}.ov-title{{font-size:28px;font-weight:700;margin:0}}\
+         .ov .bar{{height:22px;box-shadow:0 2px 8px rgba(0,0,0,.35)}}\
          .fine{{color:var(--muted);font-size:13px}}.muted{{color:var(--muted)}}</style><main>{}</main></html>",
         esc(title),
+        p.css_vars(),
         body
     )
 }
@@ -531,6 +695,8 @@ fn queue_tip(st: &AppState, install: &str, n: Notice<'_>) -> Response {
         }
         return e.into_response();
     }
+    // Pro: count it towards the goal page (or take a refunded one back).
+    goal::record(st, install, &n);
     StatusCode::OK.into_response()
 }
 

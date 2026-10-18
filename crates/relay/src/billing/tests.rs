@@ -371,15 +371,16 @@ async fn status_lists_which_pro_features_this_server_has() {
     let (auth, _) = b.pro_install().await;
     let pro = b.status(&auth, false).await;
     for v in [&none, &pro] {
-        // Nothing is built yet (M0), so every feature is off and there are no counters.
+        // History (M1) is built; the rest is off, and history has no counter to list.
         assert_eq!(
             v["features"],
             json!({ "cloud_bot": false, "remote": false, "tts": false, "discord": false, "backups": false,
-                    "tip_brand": false, "history": false }),
+                    "tip_brand": false, "history": true }),
             "{v}"
         );
-        assert_eq!(v["quotas"], json!({}));
+        assert!(v["quotas"].get("history_requests").is_none(), "a request rate, not a quota: {v}");
     }
+    assert_eq!(none["quotas"], json!({}), "no subscription, no counters");
 }
 
 #[tokio::test]
