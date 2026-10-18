@@ -93,3 +93,23 @@ prints them, and restarts the relay. Running it again keeps the key: a new key c
 what the old one sealed, so it never changes. Until it's set, Pro features that keep secrets
 answer 503 `vault_unavailable` and everything else works. `deploy-relay.sh` keeps it when it
 rewrites `relay.env`. Keep the server's `state/env-backup-*` files as safe as `relay.env`.
+
+## Ferrocast Pro: voices (Google Cloud TTS)
+
+In the Google Cloud console (a project with billing, which the free tier needs): enable the
+Cloud Text-to-Speech API, make an API key, and restrict it to that API only (APIs & Services ›
+Credentials › the key › API restrictions). Also set a budget alert of ₹1 on the project. Then
+add it on the server by hand, so it never passes through this Mac:
+
+```bash
+ssh -t <server> 'sudo -u deploy sh -c "cp /opt/ferrocast-relay/relay.env /opt/ferrocast-relay/state/env-backup-tts && \
+  nano /opt/ferrocast-relay/relay.env"'      # add GOOGLE_TTS_KEY=AIza… (and TTS_GLOBAL_MONTHLY_CHARS if not 800000)
+ssh <server> 'cd /opt/ferrocast-relay && sudo docker compose up -d'
+```
+
+The relay checks two caps before it ever calls Google: 20,000 characters a month per
+subscription, and `TTS_GLOBAL_MONTHLY_CHARS` (default 800,000) for everyone together, never
+more than Google's free 1,000,000. Once that's reached the voices "rest" (503) until the 1st
+and Ferrocast reads with each PC's own voice. Without the key, `features.tts` is false and the
+dashboard doesn't offer the voices. `deploy-relay.sh` keeps both lines when it rewrites
+`relay.env`.
