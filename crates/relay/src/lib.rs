@@ -24,7 +24,7 @@ mod migrate;
 pub mod quota;
 mod remote;
 pub mod tips;
-mod tts;
+pub mod tts;
 pub mod vault;
 
 use std::collections::HashMap;
@@ -103,6 +103,8 @@ pub struct AppState {
     vault: Option<Arc<vault::Vault>>,
     /// Pro's files; `None` until the store is set up.
     blobs: Option<Arc<dyn blob::BlobStore>>,
+    /// Pro voices: the provider (`None` without `GOOGLE_TTS_KEY`) and the relay-wide caps.
+    pub(crate) tts: Arc<tts::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -122,6 +124,7 @@ impl AppState {
             billing: Arc::default(),
             vault: None,
             blobs: None,
+            tts: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -144,6 +147,13 @@ impl AppState {
     /// Where Pro keeps files (`blob::FsBlobStore` in production).
     pub fn with_blobs(mut self, blobs: Option<Arc<dyn blob::BlobStore>>) -> AppState {
         self.blobs = blobs;
+        self
+    }
+
+    /// Pro voices (`tts::GoogleTts::from_env()` in production) and the relay-wide monthly
+    /// character cap (`tts::global_cap_from_env()`).
+    pub fn with_tts(mut self, provider: Option<Arc<dyn tts::TtsProvider>>, global_monthly_chars: i64) -> AppState {
+        self.tts = Arc::new(tts::Runtime::new(provider, global_monthly_chars));
         self
     }
 

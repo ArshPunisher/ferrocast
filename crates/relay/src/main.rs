@@ -1,5 +1,5 @@
 //! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` (and optionally `RELAY_BLOB_DIR`,
-//! `RELAY_VAULT_KEY`) and the settings in `deploy/relay.env.example`.
+//! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`) and the settings in `deploy/relay.env.example`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,7 +60,19 @@ async fn main() {
             None
         }
     };
-    let state = AppState::new(cfg, db).with_billing(billing_cfg).with_vault(vault).with_blobs(blobs);
+    let tts_cap = ferrocast_relay::tts::global_cap_from_env();
+    let tts: Option<Arc<dyn ferrocast_relay::tts::TtsProvider>> = match ferrocast_relay::tts::GoogleTts::from_env() {
+        Some(g) => {
+            tracing::info!(monthly_cap = tts_cap, "Ferrocast voices are on (Google Cloud TTS)");
+            Some(Arc::new(g))
+        }
+        None => {
+            tracing::warn!("GOOGLE_TTS_KEY not set: Ferrocast voices are off");
+            None
+        }
+    };
+    let state =
+        AppState::new(cfg, db).with_billing(billing_cfg).with_vault(vault).with_blobs(blobs).with_tts(tts, tts_cap);
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.
