@@ -359,7 +359,18 @@ pub fn health(prev: Option<&HealthSample>, cur: &HealthSample) -> Health {
             "Your upload can't keep up: lower the bitrate in OBS Settings, Output, or use a wired connection.",
         );
     }
-    if encoder >= 1.0 {
+    // OBS's encoder-lag counter is global, and extra canvases or outputs (vertical video,
+    // multistream plugins) push it near 100% while every real output runs at full rate. So
+    // it only counts while streaming, between two readings, when the stream itself fell
+    // short of the frame rate.
+    let stream_short = match p {
+        Some(p) if cur.streaming && p.streaming && cur.at > p.at && cur.fps > 0.0 => {
+            let expected = cur.fps * (cur.at - p.at) as f64 / 1000.0;
+            (delta(cur.stream_total, Some(p.stream_total)) as f64) < expected * 0.9
+        }
+        _ => false,
+    };
+    if encoder >= 1.0 && stream_short {
         warn(
             "encoder",
             if encoder >= 5.0 { "error" } else { "warn" },
@@ -519,7 +530,9 @@ mod tests {
         let restarted = health(Some(&b), &sample(10_000, 10, 0, 10, 100));
         assert_eq!(restarted.dropped_pct, 0.0);
         assert_eq!(restarted.bitrate_kbps, 0.0);
-        let mut bad = sample(5_000, 600, 0, 600, 0);
+        // The stream sent 240 of the 300 frames 60 fps asks for in 5 s: the encoder lag is real.
+        let mut bad = sample(5_000, 600, 0, 540, 0);
+        bad.fps = 60.0;
         bad.cpu = 97.0;
         bad.disk_mb = 600.0;
         bad.reconnecting = true;
@@ -530,6 +543,22 @@ mod tests {
         assert_eq!(ids, vec!["reconnecting", "encoder", "render", "cpu", "disk"]);
         assert!(h.warnings.iter().all(|w| !w.hint.is_empty()));
         assert_eq!(h.warnings[1].level, "error", "20% encoder lag");
+    }
+
+    #[test]
+    fn encoder_lag_counts_only_when_the_stream_itself_falls_short() {
+        // Tonight's real case: multistream outputs and a vertical canvas made OBS report 98%
+        // encoder lag while the stream sent all 300 frames in 5 s.
+        let a = sample(0, 300, 0, 300, 0);
+        let mut b = sample(5_000, 600, 0, 600, 0);
+        b.fps = 60.0;
+        b.output_skipped = 290;
+        assert!(health(Some(&a), &b).warnings.iter().all(|w| w.id != "encoder"));
+        // Not streaming, or no earlier reading: lifetime counters say nothing about now.
+        let mut idle = b.clone();
+        idle.streaming = false;
+        assert!(health(Some(&a), &idle).warnings.iter().all(|w| w.id != "encoder"));
+        assert!(health(None, &b).warnings.iter().all(|w| w.id != "encoder"));
     }
 
     #[test]
