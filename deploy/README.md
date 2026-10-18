@@ -113,3 +113,51 @@ more than Google's free 1,000,000. Once that's reached the voices "rest" (503) u
 and Ferrocast reads with each PC's own voice. Without the key, `features.tts` is false and the
 dashboard doesn't offer the voices. `deploy-relay.sh` keeps both lines when it rewrites
 `relay.env`.
+
+## Ferrocast Pro: dashboard from anywhere
+
+Phones open the dashboard at `https://remote.clearcraftlabs.com/app/` and its API at `/r/…` on
+the same host (API.md §9.5). To switch it on:
+
+1. Cloudflare → Networking → Tunnels → ferrocast-relay → Public hostnames: add
+   `remote.clearcraftlabs.com` → `http://ferrocast-relay:8787` (like `tip.clearcraftlabs.com`).
+2. In `../ferrocast-web`: `pnpm build:embed` (writes `dist/dashboard`).
+3. `deploy/deploy-relay.sh`: writes `RELAY_REMOTE_URL` and `RELAY_DASHBOARD_DIR=/dashboard/current`,
+   and copies the build to `/opt/ferrocast-relay/dashboard/releases/<date>`, then switches the
+   `current` link inside to it with one rename (`deploy/dashboard-swap.sh`). The folder itself
+   is mounted read-only and never renamed: a Docker bind mount follows the folder, so swapping
+   the folder would leave the relay serving the old copy until a restart. The live release and
+   the one before stay; to roll back by hand, point `current` at the older one
+   (`sudo ln -sfn releases/<date> current.next && sudo mv -fT current.next current` inside the
+   folder). Run it again after each dashboard release so phones get the same version as the
+   app. Test: `deploy/tests/dashboard-swap.test.sh`.
+
+Phone tokens and pairing codes are stored as hashes keyed with `RELAY_REMOTE_PEPPER` if it's set
+on the server (any long random text, added by hand, kept by `deploy-relay.sh`), else with a key
+derived from `RELAY_VAULT_KEY`. Changing either signs every phone out.
+
+## Ferrocast Pro: the Discord bot
+
+The app "Ferrocast" (id 1561463863197835294) at discord.com/developers. In the portal:
+
+1. **OAuth2 → Redirects**: add `https://ferrocast-relay.clearcraftlabs.com/discord/callback`
+   (one address for both the bot install and viewers linking their accounts).
+2. **General Information → Interactions Endpoint URL**:
+   `https://ferrocast-relay.clearcraftlabs.com/discord/interactions`. Save it only after the
+   relay runs with the keys below: Discord checks the address with a signed PING at once.
+3. **Bot**: Public Bot on (streamers add it to their own servers), no privileged intents
+   (the relay uses REST only, no gateway). Reset Token to get `DISCORD_BOT_TOKEN`.
+4. **Installation**: Install Link "None" (the relay makes its own invite with the state it
+   checks), Guild Install only.
+
+Then add the four values on the server by hand, so they never pass through this Mac:
+
+```bash
+ssh -t <server> 'sudo -u deploy sh -c "cp /opt/ferrocast-relay/relay.env /opt/ferrocast-relay/state/env-backup-discord && \
+  nano /opt/ferrocast-relay/relay.env"'   # DISCORD_APP_ID=…, DISCORD_PUBLIC_KEY=…, DISCORD_CLIENT_SECRET=…, DISCORD_BOT_TOKEN=…
+ssh <server> 'cd /opt/ferrocast-relay && sudo docker compose up -d'
+```
+
+With all four set, `features.discord` is true and Settings › Discord shows "Ferrocast bot".
+Missing or partial, the relay logs which and the bot stays off; the free webhook posts keep
+working. `deploy-relay.sh` keeps the lines when it rewrites `relay.env`.

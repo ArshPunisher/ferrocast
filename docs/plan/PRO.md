@@ -97,6 +97,67 @@ M0 as built (19 Oct 2026):
   /r/api/v1/*` (401, 403 `not_allowed_for_role`, 413 over 2 MB, 429 over 20 req/s, 503
   `pc_offline`, 504 `pc_timeout` after 15 s), `GET (WS) /r/api/v1/live`. Bodies never stored or
   logged.
+- M6 as built (19 Oct 2026, API.md §9.5), online proxy only: relay `remote/{mod,limits,scope,store,
+  tunnel,proxy,app,tests}.rs`, migration 7; engine `remote.rs` (the tunnel: opens only with Pro +
+  `features.remote` and a paired phone or a waiting link, settings `remote_tunnel`; backoff 1 s to
+  60 s; 32 requests at once; live frames per phone socket, marked owner-only when a mod may not see
+  them); server `remote.rs` (`RemotePrincipal` extension, `oneshot` through the same router,
+  `api_guard` checks the role; `PUT /settings` can't flip `lan_access`) and
+  `routes/remote_scope.rs`. Devices belong to the PC (install), limits 5 own + 10 mods per PC with
+  unused links counted. The phone page is served from `RELAY_DASHBOARD_DIR` (deploy-relay.sh copies
+  `ferrocast-web/dist/dashboard` to `/opt/ferrocast-relay/dashboard/releases/<date>` and switches
+  its `current` link, the folder mounted read-only): the relay
+  image can't contain it because CI builds the image from this repo alone. Frame field `to` (a
+  phone socket id) is used instead of `device_id` so one device can have two tabs. Reads aren't
+  audited, only changes and refused changes.
+  **Review fixes (19 Oct 2026):** the 30-day device token never goes in a URL: `POST /r/v1/ticket`
+  gives a single-use 60 s live ticket (in memory, hashed) and a 5-minute signed media ticket that
+  only opens `GET /media/{id}`; `?session=` is refused. At most 3 live sockets per device (a 4th
+  closes the oldest with 4409) and opening one counts in the device's 20/s. Close codes 4401
+  removed (the page stops, forgets the token, "Pair this phone"), 4402 Pro paused (stops, keeps the
+  token; `/r/v1/me` 402 too), 4408 fell behind (taken out of the map at once, reconnects and
+  refetches); a close travels on its own channel, never behind a full queue. The relay lets 32
+  requests wait per PC (the engine's own limit; a test keeps relay ≤ engine) and never waits for
+  queue room (503 `pc_busy` "Your PC is busy, try again in a moment."). The engine never awaits in
+  its tunnel loop: requests (32 at once, else an instant 503 `pc_busy`, 14 s each else 504
+  `pc_timeout`) and new phones' first frames (4 at once) run in the session's `JoinSet`, aborted
+  when the session ends; the backoff starts over after a connection that held 30 s. Rate limits are
+  token buckets (pairing: 5, then one every 2 minutes; IPv6 per /64) in a map capped at 100,000
+  keys (oldest out, O(1)) and pruned once a minute. Refused `GET`s aren't audited, refused changes
+  at most once per device and route a minute, and routes the PC doesn't know (404/405) or refused
+  ones outside the known list are `{unknown}`. Code limits are counted and inserted in one
+  statement. The config script goes right after the `<head …>` tag, never before the doctype.
+  Media `Range` is passed through (cut to 4 MB on the PC; `Content-Range`/`Accept-Ranges` come
+  back) so video previews stream under the 8 MB per answer. The phone's client refuses calls its
+  role can't make before they're sent (`remoteAllowed`), so boot reads don't fill the audit; phones
+  skip first-time setup and the update install button. The "PC is off" screen polls `/r/v1/me`
+  quietly and changes only when the answer does. The link dialog counts down from `expires_in`.
+  The phone dashboard is deployed as `dashboard/releases/<date>` with a `current` link swapped by
+  one rename (`deploy/dashboard-swap.sh`, `RELAY_DASHBOARD_DIR=/dashboard/current`): the mounted
+  folder itself is never renamed, which a Docker bind mount wouldn't follow.
+  **Stored (privacy, R-51):** per device id, PC, subscription, role, name, token hash
+  (HMAC-SHA256 with a server pepper: `RELAY_REMOTE_PEPPER`, else derived from `RELAY_VAULT_KEY`)
+  and created/last-used/expiry times; per unused link its hash, role, name, 10 minutes; audit lines
+  (method + route template, never ids or bodies; status; device id and name; time) for 30 days.
+  Bodies, queries and live frames are in the relay's memory only while passing through (decision 4).
+  **Threat model:** a stolen phone token reaches only that role's routes and is revocable at once
+  (sockets close 4401); it never appears in a URL (tickets instead), so it can't leak through
+  logs, history or `Referer`; a mod token can never reach settings, secrets or other screens (checked on
+  the relay and again on the PC, which an attacker controlling the relay process can't skip without
+  also faking the tunnel's install auth); a phone token can never pair more devices, see accounts,
+  secrets, Pro or export data; codes are 10 symbols of 31 (~49 bits), single use, 10 minutes, 5
+  tries per address (IPv6 /64) then one every 2 minutes, every miss the same 404; the token in the page lives in
+  `localStorage` on the remote origin, which serves only our own build under a strict CSP (no
+  inline script, no third-party script, no framing) and has no other content; requests carry no
+  cookies (Bearer only) and no CORS, and a foreign `Origin` is refused; the relay only ever forwards
+  to the paired PC's own tunnel (no URL from the phone is fetched, no SSRF) and only `/api/v1/*`
+  with a plain path; 2 MB requests, 8 MB answers, 20 requests/s per device, 3 live sockets per device, 32 waiting
+  per PC, 15 s timeout. The relay sees traffic in memory (E2E later, decision 4). Follow-ups: the Cloudflare
+  tunnel needs the public hostname `remote.clearcraftlabs.com` → `http://ferrocast-relay:8787`;
+  run `pnpm build:embed` in ferrocast-web before `deploy-relay.sh` so phones get the current
+  dashboard (a version mismatch between the PC's engine and the phone's page is possible until the
+  page is versioned); memory limit of the relay container (8 MB answers in flight); privacy/terms
+  pages must list these items before sales open; offline mode (M10).
 
 ### F3. Premium TTS (Google Cloud TTS)
 - Relay `tts/{mod,fake,google}.rs`: `trait TtsProvider { fn voices(); async fn synthesize(text,
@@ -144,6 +205,36 @@ M0 as built (19 Oct 2026):
 - Tables `discord_guilds`, `discord_rules`, `discord_links`, `discord_grants` (hourly sweep).
 - Errors 402, 403 `missing_permission` (50013: "Move Ferrocast's role above the perk roles."),
   404 `guild_not_found`, 409, 429 passthrough. Quotas 1 guild, 10 rules, 5,000 links.
+- M8 as built (19 Oct 2026, API.md §9.6): relay `discord/{mod,api,perks,live,pages,interactions,store,
+  tests}.rs`, migration 8 (`discord_guilds`, `discord_rules`, `discord_links`, `discord_grants`,
+  `discord_posts`), REST only behind `DiscordApi` (fake in tests); env `DISCORD_APP_ID`,
+  `DISCORD_BOT_TOKEN`, `DISCORD_PUBLIC_KEY`, `DISCORD_CLIENT_SECRET` (all four or `features.discord`
+  is false; `deploy-relay.sh` carries them over). One OAuth redirect `/discord/callback` for the bot
+  install (server taken from Discord's token answer, never the URL; state HMAC-signed with the client
+  secret, 10 minutes) and viewer linking. Interactions endpoint verifies Ed25519 (`ed25519-dalek` 2,
+  verify only) and answers PING. Engine `discord/pro.rs`: go-live reported to the relay, the free
+  webhook post skipped only when the bot actually posted (the webhook is the fallback otherwise);
+  perk events from subs, YouTube memberships and paid messages queued in settings `discord_pro`.
+  **Stored (privacy, R-51):** the server id/name/icon hash, channel id, go-live switch and line, a
+  random link code, the rules; per viewer who linked *themselves* (viewer-started, never posted by us)
+  their Discord user id and the ids of their verified Twitch/YouTube connections, never names, email
+  or the token (revoked right after two reads); per role given the user, role, rule and end; the last
+  go-live post per platform for 30 days. Everything goes on disconnect or 30 days after Pro ends.
+  Follow-ups: Kick linking via a `/ferrocast link` slash command (register commands); go-live
+  `@everyone`/role ping option (the bot never pings today); YouTube/Kick preview images (needs the
+  video id / Kick's thumbnail); removing given roles on disconnect (they stay today); the cloud bot
+  (M7) sending perk events and go-live too; privacy/terms pages must list these items before sales open.
+- M8 review fixes (19 Oct 2026): stream ends are queued with `ended_at` and retried; the relay
+  treats a report starting 30+ minutes after the open post as a new stream (old post closed), the
+  engine keeps reported streams across restarts and counts `recent` only for its own stream. Perk
+  grants stand alone (`blocked`/`skipped`/`invalid` counts, 50001 = server gone, only 429/5xx stop
+  a batch) and the view shows `perk_issue`; bad or clock-skewed events are skipped/clamped one by
+  one. Grants carry `attempts`/`retry_at` (migration 8): backoff 1 h to a day, forgotten after 5
+  failures, renewals put the role back. Live reports are serialised per subscription+platform and a
+  post Discord accepted counts even if saving fails. The bot leaves a server it can't keep (no Pro,
+  one server already). Install phishing: the "connected" page and the view show a PC code (HMAC of
+  the install id). The perk queue removes by sequence number. Interactions hex is strict. Web:
+  currency exponents mirror `money.rs`; the Pro section is hidden in remote mode.
 
 ### F5. Cloud backup and sync
 - Engine `cloud_backup.rs` + `store/src/pack.rs`: reuse `.ferropack` (no secrets), encrypt with
