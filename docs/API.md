@@ -385,6 +385,9 @@ Show a Pro feature's panel only when `features.<name>` is true and `active || sa
 | POST | `/api/v1/pro/manage` | → 201 `{ url, expires_at }`: the relay's manage page (status, stop renewing), valid 30 minutes. Open it in the browser. |
 | POST | `/api/v1/pro/cancel` | → `ProView`: stops renewing; Pro lasts until `current_end` |
 | POST | `/api/v1/pro/restore` | `{ subscription_id, email }` → `ProView`: moves Pro onto this install (new PC, reinstall). At most 3 installs share one subscription; the oldest drops off. |
+| GET | `/api/v1/pro/history` | `?from&to&platform` (ms; `twitch` \| `youtube` \| `kick`) → the relay's `{ from, to, streams, truncated, weekly }` (§9.1). 400 for a bad `from`/`to`/`platform`, then the relay's errors |
+| GET | `/api/v1/pro/history/export.csv` | Same filters → `text/csv` download (`ferrocast-history.csv`) |
+| GET, POST, … | `/api/v1/pro/backups…` | Cloud backups: list, back up now, recovery key, passphrase, restore, delete (§9.3) |
 
 Errors pass the relay's code, message and hint through: 409 `pro_not_on_sale` (hint: launches after version 1), 409 `already_pro`, 409 `already_cancelled`, 409 `not_cancellable`, 404 `no_subscription`, 404 `not_found` (restore: id and email don't match, always the same answer), 422 `invalid_plan` / `invalid_email` / `invalid_subscription`, 429 `rate_limited`, 502 `razorpay_unavailable`, 503 `billing_unavailable` (no keys on the relay yet) / `billing_misconfigured`, 503 `relay_unrecognised` (the relay forgot this install; it re-registers by itself), 502 `relay_unreachable`. Pro feature calls (§9) also pass through 402 `pro_required`, 413 `too_large`, 415 `unsupported_type`, 429 with the relay's `Retry-After`, 503 `vault_unavailable` / `storage_unavailable`. 400 for a body that isn't JSON or misses a field, 415 without `Content-Type: application/json`.
 
@@ -520,7 +523,7 @@ Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */
 
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
-POST `/api/v1/export` → a streamed `.ferropack` download. POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups` → `Backup[]`, newest first; POST `/api/v1/backups` → 201 `Backup[]` (takes one now); POST `/api/v1/backups/{id}/restore` → `{ restart_needed, message }` (it's swapped in at the next start, keeping the current data as one more backup).
+POST `/api/v1/export` → a streamed `.ferropack` download (this install's own settings rows, `pro_status` and `history_upload`, are never in it, and an import never replaces them). POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups` → `Backup[]`, newest first; POST `/api/v1/backups` → 201 `Backup[]` (takes one now); POST `/api/v1/backups/{id}/restore` → `{ restart_needed, message }` (it's swapped in at the next start, keeping the current data as one more backup).
 
 ```ts
 type Backup = { id: string; bytes: number; created_at: number;
@@ -634,7 +637,7 @@ Data kept (R-51): subscription id, plan, status, period end, cancel/refund flags
 
 ## 9. Relay: Pro features
 
-Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. Nothing here is built yet: this is the contract each one follows as it ships, and its routes are added to §9.x.
+Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. This is the contract each one follows as it ships; its routes are added as §9.x (§9.1 stream history, §9.2 tip branding and §9.3 cloud backups are built).
 
 **The gate.** Every Pro feature route checks, first:
 
@@ -655,6 +658,123 @@ Access is the same rule as `/v1/pro/status` `pro` (paid period, 3-day grace for 
 | 503 | `vault_unavailable` | The relay has no vault key yet (features that keep secrets), or a saved sign-in can't be read (hint: connect that account again) |
 | 503 | `storage_unavailable` | The relay can't store files right now |
 
-**Features and quotas in the status.** `/v1/pro/status` `features` says which features this relay has, built *and* configured (`cloud_bot`, `remote`, `tts`, `discord`, `backups`, `tip_brand`, `history`; all `false` today). `quotas` lists the subscription's counters as `{ [name]: { used, limit, period: "day" | "month", reset_at } }`; quotas are per subscription, shared by its installs, and count in UTC calendar days or months.
+**Features and quotas in the status.** `/v1/pro/status` `features` says which features this relay has, built *and* configured (`cloud_bot`, `remote`, `tts`, `discord`, `backups`, `tip_brand`, `history`; `history` is always on, `backups` and `tip_brand` are on when the relay has a file store, the rest are `false` until each ships). `quotas` lists the subscription's counters as `{ [name]: { used, limit, period: "day" | "month", reset_at } }`; quotas are per subscription, shared by its installs, and count in UTC calendar days or months.
 
 **The dashboard.** A Pro feature's panel is hidden unless the feature is in `features` and `active || sales_open`. Not Pro (but on sale): one calm line, "Runs on Ferrocast's servers, part of Pro.", and a link to Settings › Pro, never a nag. Pro: the feature itself.
+
+### 9.1 Stream history (F7)
+
+`crates/relay/src/history`, migration 4 (`streams`, `stream_samples`). One row per stream **per platform**, owned by the subscription (the PCs sharing Pro share one history). The engine (`crates/engine/src/history.rs`) counts each live platform while Pro is active (the remembered status, no network check), uploads the stream when it starts and again with its totals when it ends, and a viewer sample every 5 minutes while live. Uploads wait in a queue in the local store (settings `history_upload`) and are retried with backoff (30 s doubling to 15 min); 400/404/409/413/415/422 answers are dropped (retrying can't help), 401/402/429/5xx and no connection keep them. A stream the app restarted in the middle of ends where it was last seen once its platform isn't live for 10 minutes. Only counts are stored, never chat, names or viewers (R-51).
+
+```ts
+type HistoryStream = {
+  platform: "twitch" | "youtube" | "kick"
+  key: string                    // the engine's id for it: "<platform>:<started_at>"
+  started_at: number; ended_at: number | null   // null while live
+  title: string | null; category: string | null // category: the last one set from Ferrocast
+  peak_viewers: number; avg_viewers: number
+  chat_lines: number; chatters: number; new_chatters: number   // chatters counted once each; new = first message ever
+  follows: number; subs: number                  // subs include gifted ones
+  tips: { currency: string; minor: number }[]    // per currency, never converted (R-32)
+  platform_value: { unit: string; amount: number }[]   // "bits", "kicks", "jewels"
+  updated_at: number
+}
+type HistoryWeek = { week_start: number /* Monday 00:00 UTC */; streams: number; by_platform: { twitch: number; youtube: number; kick: number };
+                     minutes: number; peak_viewers: number; avg_viewers: number /* weighted by length */; follows: number; subs: number; chat_lines: number }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| POST | `/v1/pro/history/streams` | `HistoryStream` without `updated_at` (`platform`, `key`, `started_at` required; the rest default to 0 / empty) → 201 `{stream}` new, 200 `{stream}` replaced. Same `platform` + `key` is the same stream (a retry changes nothing); the peak never goes down. 409 `ended_stream_locked` once it ended over 24 h ago (a first upload of an old stream is still taken). |
+| POST | `/v1/pro/history/samples` | `{ platform, key, samples: [{ at, viewers }] }`, 1 to 100 → `{ saved }`. Same `at` again keeps the newer count. While the stream is live its peak and average follow the samples. 404 `stream_not_found`, 409 `ended_stream_locked`, 413 `too_many_samples` over 100, 422 `invalid_sample` (empty, negative, or `at` outside the stream ± 1 minute). |
+| GET | `/v1/pro/history` | `?from&to&platform` (default the last 28 days; up to 400 days) → `{ from, to, streams /* newest first, at most 2,000 */, truncated, weekly /* every week from from's to to's, empty ones too, oldest first */ }` |
+| GET | `/v1/pro/history/export.csv` | Same filters (default everything kept, 400 days) → `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="ferrocast-history.csv"`, `no-store`. Columns `platform, started_utc, ended_utc, minutes, title, category, peak_viewers, avg_viewers, chat_lines, chatters, new_chatters, follows, subs, tips, platform_value`; text is quoted and a leading `= + - @` gets a `'` (no spreadsheet formulas). **Open after Pro ends** while the history is kept (R-04): 402 only without a subscription, or a lapsed one with nothing kept. |
+
+Errors (besides the gate's 401 / 402, which every route checks before the body): 400 `invalid` (not JSON, a missing or wrong-typed field, a `from`/`to` that isn't a number; the message names it), 415 `unsupported_type` (no `Content-Type: application/json`), 413 `too_large` (over the relay's 256 KB), 422 `invalid_stream` (the message names the field: unknown platform, bad key, a start in the future or over 400 days ago, an end before the start or over 31 days after it, negative counts, `avg_viewers` over `peak_viewers`, `new_chatters` over `chatters`, a currency that isn't three capitals, two entries for one currency), 422 `invalid_range` (`to` not after `from`, over 400 days), 422 `invalid_platform`, 429 `history_rate` (60 requests a minute per subscription, every route together; `X-Quota-Reset`, `Retry-After`; not a quota, so not in `quotas`), 503 `storage`.
+
+Kept while Pro lasts. The hourly housekeeping deletes a subscription's history 30 days after its access ended (period over, every renewal failed, refunded, or the subscription is gone), and viewer samples older than 400 days for everyone. Titles and categories lose control and direction characters and are cut to 300 / 120 characters.
+
+### 9.2 Tip page branding and goal (F6)
+
+`crates/relay/src/tips/{brand,goal}.rs`, migration 3 (`tip_brand`, `tip_goals`, `tip_goal_payments`). Owned by the install (its tip page). `features.tip_brand` is true when the relay has a file store; `quotas.tip_images` counts image uploads (30 per subscription per UTC day). The engine passes each call through unchanged (the dashboard's paths are `/api/v1/tips/brand…` and `/api/v1/tips/goal`, same bodies and answers; the engine checks an image's type and size before sending it).
+
+```ts
+type TipBrand = { accent: string | null; background: string | null; text: string | null  // "#rrggbb", all null = default look
+                  avatar_url: string | null; banner_url: string | null                    // https://<relay>/t/a/<sha256>.webp
+                  applied: boolean                                                         // the tip page shows it (Pro now)
+                  changes: { field: "text" | "accent"; from: string; to: string; contrast_before: number; contrast_after: number; message: string }[] }
+type TipGoal = { title: string; target: number /* minor units */; currency: string; digits: number; starts_at: number; ends_at: number | null; ended: boolean
+                 raised: number /* minor units */; tips: number; page_url: string | null; overlay_url: string | null /* page_url + "?overlay=1" */ }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/v1/pro/tips/brand` | → `TipBrand` (`changes` empty) |
+| PUT | `/v1/pro/tips/brand` | `{ accent, background, text }` (`#rgb` or `#rrggbb`) → `TipBrand`. Text under 4.5:1 on the background, or an accent under 3:1, is moved towards white or black until it passes; the background never changes. `changes` says what moved, with a sentence to show. |
+| DELETE | `/v1/pro/tips/brand` | → 204, the default colours again (images stay) |
+| PUT | `/v1/pro/tips/brand/{avatar\|banner}` | Raw image body, `Content-Type: image/png \| image/jpeg \| image/webp` → `TipBrand`. Avatar ≤ 1 MB, banner ≤ 3 MB, at most 4096 × 4096 pixels. Decoded, turned upright, shrunk to fit 512 × 512 / 1500 × 500 and re-encoded as lossless WebP from the pixels only (EXIF, GPS, ICC and XMP never kept). Stored by its SHA-256. |
+| DELETE | `/v1/pro/tips/brand/{avatar\|banner}` | → 204 (the file goes when nothing else uses it) |
+| GET | `/v1/pro/tips/goal` | → `TipGoal`, or 404 `not_found` without one |
+| PUT | `/v1/pro/tips/goal` | `{ title /* 1–60 */, target /* 1 to 10^12 minor units */, currency /* 3 letters */, ends_at? /* future, within 366 days */ }` → `TipGoal`. The same currency keeps the goal and what it raised; another currency starts the count again. |
+| DELETE | `/v1/pro/tips/goal` | → 204, the goal and its count are deleted |
+
+Errors (the gate's 401 / 402 come before the body): 400 `invalid` (the message names the field), 404 `not_found` (unknown image name), 413 `too_large` ("Avatars can be up to 1 MB.", "Banners can be up to 3 MB.", or too many pixels), 415 `unsupported_type` (by the header or by the file's own bytes; "… can be PNG, JPEG or WebP."), 422 `image_unreadable` (broken or empty file), 422 `no_tip_page` (a goal needs a tip page), 429 `tip_image_quota` (+ `X-Quota-Reset`, `Retry-After`), 503 `storage_unavailable`.
+
+Public pages (script-free, the tip page's CSP with `img-src 'self' data:`, `no-referrer`):
+
+| Path | What |
+|---|---|
+| `GET /t/a/<sha>.webp` (relay and tip host) | A stored image: `image/webp`, `Cache-Control: public, max-age=31536000, immutable`, `nosniff`. 404 for anything else. |
+| `GET /t/<handle>` · `<tip host>/<handle>` | The tip page; while the install is Pro, in its colours with its banner, avatar and the goal's progress (linking to the goal page). Not Pro: the default look. |
+| `GET /t/<handle>/goal` · `<tip host>/<handle>/goal` | Title, progress bar (`role=progressbar`), raised of target, percent, end date, a Tip button back to the page, and "Counts verified tips in <currency> since <date>. Tips in other currencies aren't counted. Refunds come off." 404 page without Pro or a goal. `?overlay=1`: transparent background, just title, bar and numbers, reloads itself every 30 s (meta refresh) for an OBS browser source. |
+
+Counting: the relay counts each tip it verifies and forwards for this install (§4 Tips) while the install is Pro, the goal is running, and the tip is in the goal's currency (Ko-fi's decimal amounts and Stripe's hundredths are converted to the currency's minor unit). A full refund or a dispute takes that tip off; a tip whose refund arrived first is never counted (R-32).
+
+Data kept (R-51): the three colours and two image hashes per install; the image files (pixels only); the goal's title, target, currency and dates; per counted tip only `(goal_id, SHA-256 of install|provider|payment id, amount_minor)`, never a name, message or payment id. Payment rows (and the goal) are deleted 60 days after the goal ends, or with the goal. An install without Pro keeps all of it 30 days after the hourly sweep first sees the lapse (Pro again clears that), then it's deleted with its images.
+
+### 9.3 Cloud backups (F5)
+
+`crates/relay/src/backups`, migration 5 (`cloud_backups`, `cloud_backup_parts`). Backups belong to the subscription (its PCs share the list). `features.backups` is true when the relay has a file store; `quotas.backup_uploads` counts uploads started (6 per subscription per UTC day). The relay only ever holds **ciphertext**: the engine (`crates/engine/src/cloud_backup.rs`) exports the same `.ferropack` as `POST /api/v1/export` (no tokens or secrets), encrypts it on the PC with [age](https://age-encryption.org) to an X25519 key made on first use and kept in the secret store as `cloud-backup-key`, and uploads that.
+
+The file (`.ferrobackup`): a line `ferrocast-backup v1`, an optional line `passphrase <base64 of an age scrypt file holding the AGE-SECRET-KEY line>` (when a passphrase is set: a new PC can then restore with the passphrase alone), an empty line, then an age file encrypted to the X25519 recipient holding the pack. Unknown header lines are skipped (later versions).
+
+```ts
+type CloudBackup = { id: string /* bk_ + 24 hex */; bytes: number /* encrypted */; sha256: string; created_at: number /* completed */
+                     app_version: string; from_install: string; this_install: boolean; reason: "automatic" | "manual" }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| POST | `/v1/pro/backups` | `{ bytes, sha256 /* of the ciphertext */, app_version, reason: "automatic" \| "manual" }` → 201 `{ id, part_size /* 8388608 */, parts }`. One upload at a time per subscription: another PC's upload that moved in the last hour is 409 `upload_in_progress`; this PC's own unfinished upload (it restarted) or a stalled one is replaced. 413 `backup_quota` when it can't fit even after pruning (over 250 MB alone, or only backups made by hand left). 429 `backup_upload_quota` (+ `X-Quota-Reset`, `Retry-After`). |
+| PUT | `/v1/pro/backups/{id}/parts/{n}` | Raw body, `Content-Type: application/octet-stream` only (415 otherwise), parts numbered from 0, each exactly `part_size` bytes except the last (the rest) → `{ part, bytes }`. 413 `too_large` over `part_size` (by `Content-Length` or while streaming), 422 `invalid_part` (number out of range, wrong size), 400 `invalid_part` (the body broke off), 409 `already_complete`. Sending a part again replaces it. |
+| POST | `/v1/pro/backups/{id}/complete` | → 201 `{ backup: CloudBackup, pruned: string[] }` (200 if already complete). Joins the parts and checks size and SHA-256: 409 `hash_mismatch` **deletes the upload**; 409 `parts_missing` keeps it (the message names the part). To make room the oldest automatic backups are deleted first (`pruned`). |
+| GET | `/v1/pro/backups` | → `CloudBackup[]`, newest first (complete ones only). |
+| GET | `/v1/pro/backups/{id}` | → the ciphertext, streamed: `application/octet-stream`, `Content-Length`, `X-Content-SHA256`, `Content-Disposition: attachment; filename="ferrocast-<id>.ferrobackup"`, `no-store`. |
+| DELETE | `/v1/pro/backups/{id}` | → 204 (a finished backup or an upload in progress). |
+
+Limits per subscription: 7 backups and 250 MB in all. Errors (the gate's 401 / 402 come first): 400 `invalid`, 404 `not_found`, 415 `unsupported_type`, 422 `invalid_backup` (the message names the field), 503 `storage_unavailable`. **After Pro ends** the list, download and delete stay open while backups are kept (R-04: 402 only without a subscription, or a lapsed one with nothing kept); uploads need Pro. Unfinished uploads are deleted a day after their last part; everything is deleted 30 days after Pro ends (the hourly `backups::sweep`).
+
+Data kept (R-51): per backup the id, the install that made it, size, SHA-256, app version, reason and dates, and the encrypted file. Never the key, the passphrase or anything readable from the pack.
+
+**The dashboard** (engine routes, Settings › Your data › Cloud backups):
+
+```ts
+type CloudBackupsView = { key: { exists: boolean; saved: boolean /* confirmed before the first upload */; passphrase: boolean }
+  auto: boolean; busy: { phase: "packing" | "encrypting" | "uploading" | "downloading" | "decrypting" | "restoring"; done: number; total: number } | null
+  last: { at: number; ok: boolean; what: "upload" | "restore"; message: string | null } | null; last_upload_at: number | null
+  uploading: { parts_done: number; parts: number } | null      // an upload that carries on after a restart
+  limits: { bytes: 250000000; backups: 7; uploads_per_day: 6 }; backups: CloudBackup[] }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/pro/backups` | → `CloudBackupsView` (the relay's errors pass through: 402, 502 `relay_unreachable`, …) |
+| POST | `/api/v1/pro/backups` | Back up now, waiting for the upload → 201 `CloudBackupsView`. Always packs the data as it is now (an unfinished automatic upload is dropped, not resumed). 409 `key_not_saved` until the key is confirmed, 409 `backup_running`, 413 `backup_quota` (the encrypted pack is over 250 MB), then the relay's errors. |
+| GET | `/api/v1/pro/backups/key` | → `text/plain` attachment `ferrocast-recovery-key.txt` (`no-store`): a few comment lines and the `AGE-SECRET-KEY-1…` line. Makes the key the first time. |
+| POST | `/api/v1/pro/backups/key/saved` | The streamer saved the key → `CloudBackupsView` without `backups`. 409 `no_key` before there is one. Bound to that key (its public key is kept): if the stored key ever changes, `saved` is false again and uploads answer 409 `key_not_saved`. The key is made once even when several first uses arrive together. |
+| PUT / DELETE | `/api/v1/pro/backups/passphrase` | `{ passphrase }` (12+ characters; 400 names the field) / none → `CloudBackupsView` without `backups`. Applies to new backups; older ones keep theirs. |
+| PUT | `/api/v1/pro/backups/settings` | `{ auto: boolean }` → `CloudBackupsView` without `backups`. |
+| POST | `/api/v1/pro/backups/{id}/restore` | `{ key?, passphrase? }` → `{ imported, media_files, backup }` (the import report; a local backup is taken first, then the engine reloads). Opens with this PC's key, then `key`, then `passphrase`. 422 `key_needed`, `wrong_key`, `wrong_passphrase`, `no_passphrase`, `damaged_backup`; 400 for a `key` without an `AGE-SECRET-KEY-1` line; 502 `download_damaged` (hash didn't match); 415 `damaged_pack`, 422 `pack_too_new`. A PC whose own key was never used takes the key that worked. |
+| DELETE | `/api/v1/pro/backups/{id}` | → 204 |
+
+Automatic uploads: while Pro is active (the remembered status) with the key saved and `auto` on, after the daily local backup (and on an hourly check) the pack's content hash (`store::pack::content_hash`: tables, tip CSV and media, without the export time, the remembered Pro status or the history queue) is compared with the last upload's; once a day at most, and only when it changed. Downloads have no total time limit, only a 20 s connect timeout and a 60 s idle timeout per read; each part upload has 10 minutes. An interrupted upload (crash, restart, no connection) carries on from the next part (`<data>/cloud-backup/state.json` + the ciphertext next to it). None of this ever runs without Pro.

@@ -135,6 +135,23 @@ M0 as built (19 Oct 2026):
   413 `backup_quota` (250 MB / 7 backups, oldest automatic pruned), 415, 429 (6 uploads/day).
 - Blobs in `BlobStore`; table `cloud_backups`. "Sync" in v1 = automatic upload after the daily
   local backup when changed + "Use your newest backup from <other PC>" on a new install.
+- M3 as built (19 Oct 2026, API.md §9.3): relay `backups/{mod,store,tests}.rs`, migration 5
+  (`cloud_backups`, `cloud_backup_parts`), parts as blobs `backups/<sub>/<id>.part<n>` joined into
+  `backups/<sub>/<id>` on complete; `backups::sweep` (spawned in `main.rs`, hourly) deletes uploads
+  a day after their last part and everything 30 days after Pro ends; list/download/delete stay
+  open meanwhile (R-04). Engine `cloud_backup.rs`: age 0.12 (no default features), the file is
+  `ferrocast-backup v1` + an optional `passphrase <age scrypt of the key>` line + the age X25519
+  file, because age forbids mixing an scrypt recipient with others; the passphrase therefore
+  wraps the key inside each backup. State lives in `<data>/cloud-backup/state.json` (a file, so
+  it's never in a pack and a restore can't bring another PC's state). `store::pack::content_hash`
+  skips unchanged days. **Stored (privacy, R-51):** per backup the id, the uploading install id,
+  size, SHA-256 of the ciphertext, app version, reason (automatic/manual) and dates, and the
+  encrypted file; the relay never has the key, the passphrase or any plaintext. On the PC: the key
+  in the secret store (never in settings, packs or logs). Follow-ups: the "other PC" is unnamed
+  (no device names are sent; a user-chosen label could come later); packs over 250 MB once
+  encrypted (big videos) can't go up (the message says to use Export); move to R2 behind
+  `BlobStore` before many subscriptions; raise the relay's memory limit (joining streams 64 KB
+  chunks, so memory stays flat); privacy/terms pages must list these items before sales open.
 
 ### F6. Tip page upgrades
 - `tips.rs` → `tips/{mod,brand,goal,domains}.rs`.
@@ -147,6 +164,16 @@ M0 as built (19 Oct 2026):
 - Custom domain via Cloudflare for SaaS (`CF_SAAS_TOKEN`, `CF_ZONE_ID`): subdomains only, 1 per
   subscription, free up to 100 hostnames; errors 409 `domain_taken`, 422 `apex_not_supported` /
   `invalid_hostname`, 503 `domains_full`, 502 `cloudflare_unavailable`.
+- M2 as built (19 Oct 2026, API.md §9.2): branding and goal are per install (its tip page);
+  migration 3. **Stored (privacy, R-51):** three colours and two image hashes per install; the
+  images as lossless WebP re-encoded from pixels only (no EXIF/GPS/ICC/XMP), shared by hash;
+  goal title, target, currency, dates; per counted tip only `(goal_id, SHA-256(install|provider|
+  payment id), amount_minor)`, never a name, message or payment id. Payment rows go with the goal
+  60 days after it ends; a lapsed install's branding and goal go 30 days after the hourly sweep
+  first sees the lapse (`tips::sweep`, spawned in `main.rs`). Uploads: 30 a day per subscription
+  (`tip_images`), one decode at a time, ≤ 4096 × 4096 pixels. Goal page `?overlay=1` for OBS.
+  Follow-ups: lossless WebP keeps photos large (a 1500 × 500 banner can be ~1 MB; lossy WebP needs
+  libwebp); privacy/terms pages must list the new stored items before sales open.
 
 ### F7. Stream history and reports
 - Engine `history.rs` uploads recap totals at stream end and a 5-minute viewer sample while
