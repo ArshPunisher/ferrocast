@@ -16,7 +16,7 @@ pub mod billing;
 pub mod blob;
 mod bot;
 pub mod db;
-mod discord;
+pub mod discord;
 mod history;
 pub mod kick;
 mod mail;
@@ -107,6 +107,8 @@ pub struct AppState {
     pub(crate) tts: Arc<tts::Runtime>,
     /// The dashboard from anywhere: its settings, open tunnels and phone sockets.
     pub(crate) remote: Arc<remote::Runtime>,
+    /// The Ferrocast bot for Discord (off without the `DISCORD_*` settings).
+    pub(crate) discord: Arc<discord::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -128,6 +130,7 @@ impl AppState {
             blobs: None,
             tts: Arc::default(),
             remote: Arc::default(),
+            discord: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -163,6 +166,13 @@ impl AppState {
     /// The dashboard from anywhere (`remote::RemoteConfig::from_env()` in production).
     pub fn with_remote(mut self, cfg: remote::RemoteConfig) -> AppState {
         self.remote = Arc::new(remote::Runtime::new(cfg));
+        self
+    }
+
+    /// The Ferrocast bot for Discord (`discord::Runtime::from_config(DiscordConfig::from_env())`
+    /// in production, a fake Discord in tests).
+    pub fn with_discord(mut self, rt: discord::Runtime) -> AppState {
+        self.discord = Arc::new(rt);
         self
     }
 

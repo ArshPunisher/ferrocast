@@ -82,6 +82,23 @@ async fn main() {
         (None, _) => tracing::warn!("RELAY_REMOTE_URL not set: the dashboard from anywhere is off"),
     }
     let state = state.with_remote(remote_cfg);
+    let discord_cfg = match ferrocast_relay::discord::DiscordConfig::from_env() {
+        Ok(Some(c)) => {
+            tracing::info!(app_id = %c.app_id, "the Ferrocast bot for Discord is on");
+            Some(c)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "DISCORD_APP_ID / DISCORD_BOT_TOKEN / DISCORD_PUBLIC_KEY / DISCORD_CLIENT_SECRET not set: the Discord bot is off"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "the Discord settings are incomplete: the Discord bot is off");
+            None
+        }
+    };
+    let state = state.with_discord(ferrocast_relay::discord::Runtime::from_config(discord_cfg));
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.
@@ -122,6 +139,14 @@ async fn main() {
         // Dashboard from anywhere: expired devices and codes, audit lines past 30 days.
         loop {
             ferrocast_relay::remote::sweep(&remote).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let discord = state.clone();
+    tokio::spawn(async move {
+        // Discord perks: ended roles taken back; servers of lapsed subscriptions after 30 days.
+        loop {
+            ferrocast_relay::discord::sweep(&discord).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

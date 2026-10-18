@@ -32,6 +32,8 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Tip page images (Pro F6): decode PNG/JPEG/WebP, re-encode as WebP. Pure Rust, no C codecs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Discord interactions (Pro F4): Ed25519 signature checks only, no signing in shipped code.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 
 [dev-dependencies]
 ferrocast-testkit.workspace = true
