@@ -139,20 +139,11 @@ impl Engine {
         }
     }
 
-    /// Synthesises `text` into the media library; `None` if this computer can't (the
-    /// overlay then uses the browser's voice).
+    /// Synthesises `text` into the media library (a Ferrocast voice with Pro, else this
+    /// computer's, see `speech::cloud`); `None` if neither can (the overlay then uses the
+    /// browser's voice).
     pub(crate) async fn speak_to_media(&self, text: &str) -> Option<String> {
-        let voice = self.state().tts.voice.clone();
-        let work = self.store().dir().join("tmp");
-        let out = work.join(format!("tts-{}.wav", ferrocast_store::new_id()));
-        if let Err(e) = crate::speech::synthesize(text, voice.as_deref(), &work, &out).await {
-            tracing::warn!(error = %e, "text-to-speech failed; the overlay will use the browser voice");
-            return None;
-        }
-        let bytes = tokio::fs::read(&out).await.ok()?;
-        let _ = tokio::fs::remove_file(&out).await;
-        let saved = self.db(move |s| Ok(repo::media::save(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
-        Some(saved.id)
+        self.speak_line(text, None).await.map(|s| s.media_id)
     }
 
     /// An overlay reports progress on an alert. Only the alert that is playing counts.

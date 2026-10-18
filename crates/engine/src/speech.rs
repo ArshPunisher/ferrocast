@@ -1,5 +1,6 @@
 //! Text-to-speech with the voices the computer already has (no downloads, no cloud):
-//! `say` on macOS, System.Speech on Windows, espeak-ng or pico2wave on Linux.
+//! `say` on macOS, System.Speech on Windows, espeak-ng or pico2wave on Linux. With Pro, also
+//! Ferrocast voices (Google Cloud TTS through the relay, API.md §9.4): see [`CloudTts`].
 //!
 //! The text always goes through a file, never a shell or an argument, so a viewer's message
 //! can't become a command-line option or a script. The WAV lands in the media library and
@@ -10,6 +11,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tokio::process::Command;
+
+mod cloud;
+#[cfg(test)]
+mod cloud_tests;
+pub(crate) use cloud::CloudTts;
+pub use cloud::{
+    CLOUD_MAX_CHARS, CLOUD_PREFIX, CLOUD_TIMEOUT, CloudUsage, CloudView, CloudVoice, NOTICE_KEY, Spoken, is_cloud,
+    sample_line,
+};
 
 /// The longest a synthesis may take before we give up and the overlay falls back to the
 /// browser's own voice.

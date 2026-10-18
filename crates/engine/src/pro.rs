@@ -135,7 +135,7 @@ pub(crate) fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 40] = [
+    const KNOWN: [&str; 46] = [
         "pro_required",
         "vault_unavailable",
         "storage_unavailable",
@@ -178,6 +178,13 @@ fn code(c: &str) -> &'static str {
         "already_complete",
         "backup_quota",
         "backup_upload_quota",
+        // Ferrocast voices (API.md §9.4).
+        "tts_unavailable",
+        "tts_quota",
+        "tts_rate",
+        "voice_not_found",
+        "too_long",
+        "empty_text",
         "storage",
     ];
     KNOWN.into_iter().find(|k| *k == c).unwrap_or("relay_error")

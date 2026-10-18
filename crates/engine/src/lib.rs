@@ -143,6 +143,8 @@ struct Inner {
     history_category: Mutex<Option<String>>,
     /// Pro cloud backups: one upload or restore at a time, and its progress.
     cloud_backup: cloud_backup::Cloud,
+    /// Pro voices: the relay's voice list, usage, the fallback notice and previews.
+    cloud_tts: speech::CloudTts,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -257,6 +259,7 @@ impl Engine {
                 history_io: tokio::sync::Mutex::new(()),
                 history_category: Mutex::new(None),
                 cloud_backup: Default::default(),
+                cloud_tts: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -480,6 +483,8 @@ impl Engine {
             *st = State { connectors, live, viewers, session, why, panic_on, tts_paused, ..fresh };
         }
         self.refresh_active_design().await;
+        // Auto-replies live outside `State`; an import or restore brings new ones.
+        self.load_autoreplies().await;
         Ok(())
     }
 
