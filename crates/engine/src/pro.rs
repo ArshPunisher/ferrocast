@@ -135,7 +135,7 @@ pub(crate) fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 46] = [
+    const KNOWN: [&str; 52] = [
         "pro_required",
         "vault_unavailable",
         "storage_unavailable",
@@ -186,6 +186,13 @@ fn code(c: &str) -> &'static str {
         "too_long",
         "empty_text",
         "storage",
+        // Dashboard from anywhere (API.md §9.5).
+        "remote_unavailable",
+        "too_many_devices",
+        "not_allowed_for_role",
+        "pc_offline",
+        "pc_timeout",
+        "remote_rate",
     ];
     KNOWN.into_iter().find(|k| *k == c).unwrap_or("relay_error")
 }
@@ -214,7 +221,7 @@ pub(crate) async fn relay_error(res: reqwest::Response) -> EngineError {
         };
     }
     let status = match status.as_u16() {
-        s @ (400 | 402 | 404 | 409 | 413 | 415 | 422 | 429 | 502 | 503) => s,
+        s @ (400 | 402 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 502 | 503) => s,
         _ => 502,
     };
     EngineError::Refused {

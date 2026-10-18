@@ -18,6 +18,7 @@ mod moderation;
 mod polls;
 mod pro;
 mod recap;
+pub(crate) mod remote_scope;
 mod studio;
 mod tip_pro;
 mod tts;
@@ -165,6 +166,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(studio::routes())
         // auto-replies (bot answers to chat that mentions something)
         .merge(autoreplies::routes())
+        // Pro dashboard from anywhere: devices, pairing links (see crate::remote)
+        .merge(crate::remote::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.

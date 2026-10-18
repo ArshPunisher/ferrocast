@@ -28,6 +28,11 @@ mod pro;
 pub use pro::{ProStatus, ProView};
 mod recap;
 mod relay;
+mod remote;
+pub use remote::{
+    IN_FLIGHT as REMOTE_IN_FLIGHT, MAX_RESPONSE as REMOTE_MAX_RESPONSE, RemoteHandler, RemoteRequest, RemoteResponse,
+    TunnelView,
+};
 mod snapshot;
 pub mod speech;
 mod starter;
@@ -145,6 +150,8 @@ struct Inner {
     cloud_backup: cloud_backup::Cloud,
     /// Pro voices: the relay's voice list, usage, the fallback notice and previews.
     cloud_tts: speech::CloudTts,
+    /// Pro dashboard from anywhere: the tunnel to the relay and the server's handler.
+    remote: remote::Remote,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -260,6 +267,7 @@ impl Engine {
                 history_category: Mutex::new(None),
                 cloud_backup: Default::default(),
                 cloud_tts: Default::default(),
+                remote: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));

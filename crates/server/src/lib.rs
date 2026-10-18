@@ -7,6 +7,7 @@ mod assets;
 mod auth;
 mod error;
 mod extract;
+mod remote;
 mod routes;
 mod ws;
 
@@ -95,6 +96,8 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
     // The built-in designs ship inside the overlay bundle (API.md §4 Designs).
     engine.set_builtin_designs(assets::builtin_designs()).await;
     let app = router(state);
+    // The dashboard from anywhere answers phones through this same router (Pro F2).
+    engine.set_remote_handler(remote::handler(app.clone(), engine.clone(), addr.port()));
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "the local server stopped");
@@ -128,8 +131,18 @@ async fn host_guard(State(app): State<AppState>, req: Request, next: Next) -> Re
     next.run(req).await
 }
 
-/// API requests: Origin check, CORS for dev origins, and the session token.
+/// API requests: Origin check, CORS for dev origins, and the session token. A request from
+/// the relay's tunnel carries a `RemotePrincipal` instead (only `remote::Handler` can set it)
+/// and is checked against its role.
 async fn api_guard(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(p) = req.extensions().get::<remote::RemotePrincipal>() {
+        let path = req.uri().path();
+        let rel = path.strip_prefix("/api/v1").unwrap_or(path);
+        if !routes::remote_scope::allowed(p.role, req.method().as_str(), rel) {
+            return remote::not_allowed(p.role).into_response();
+        }
+        return next.run(req).await;
+    }
     if !app.guard.origin_ok(req.headers()) {
         return ApiError::forbidden("Requests from other websites aren't allowed.").into_response();
     }
@@ -183,5 +196,7 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
 
 #[cfg(test)]
 mod designs_tests;
+#[cfg(test)]
+mod remote_tests;
 #[cfg(test)]
 mod tests;
