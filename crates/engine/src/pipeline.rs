@@ -112,6 +112,7 @@ impl Engine {
                         .collect::<std::collections::HashMap<_, _>>()
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                self.history_saw(&e, None);
                 return;
             }
             _ => {}
@@ -231,6 +232,9 @@ impl Engine {
             }
             _ => {}
         }
+
+        // Pro stream history counts it (nothing happens without Pro).
+        self.history_saw(&e, chatter.as_ref());
 
         if e.kind.is_alertable() || matches!(e.kind, EventKind::Tip { .. }) {
             self.support_event(&e).await;
