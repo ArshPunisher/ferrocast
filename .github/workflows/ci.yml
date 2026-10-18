@@ -47,6 +47,7 @@ jobs:
         run: |
           packaging/tests.sh
           deploy/tests/razorpay-keys.test.sh
+          deploy/tests/vault-key.test.sh
 
   test:
     name: Tests (${{ matrix.os }})

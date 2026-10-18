@@ -25,9 +25,11 @@ summary says what went live, or that the previous version was put back.
 | `docker-compose.yml` | server | Relay + `cloudflared`; the relay's image comes from `RELAY_IMAGE`/`RELAY_TAG` |
 | `relay-server-deploy.sh` | server (`/opt/ferrocast-relay/deploy.sh`) | Pull, switch, health check, rollback; the only thing the deploy key can run |
 | `deploy-relay.sh` | your Mac | First install, and changing config or secrets (`../secrets/relay.env`). Once GitHub deploys, it keeps the live version and never swaps in a local build |
-| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh` |
+| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh` and `vault-key.sh` |
 | `razorpay-keys.sh` | server (`/opt/ferrocast-relay/razorpay-keys.sh`) | Ferrocast Pro's Razorpay keys, plans, webhook secret, and the `PRO_SALES_OPEN` switch (below) |
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
+| `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
+| `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
 
 ## One-time setup for GitHub deploys
 
@@ -74,3 +76,20 @@ ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/razorpay-keys.sh --sales cl
 ```
 
 `deploy-relay.sh` keeps these settings when it rewrites `relay.env`.
+
+## Ferrocast Pro: the vault key
+
+Pro keeps a few secrets on the relay (platform sign-ins for the cloud bot, a mail address),
+always encrypted with the relay's vault key. Make it once, on the server (after
+`deploy/relay-ci-setup.sh` has installed the script):
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/vault-key.sh'           # makes it, restarts the relay
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/vault-key.sh --status'  # set or missing, never the key
+```
+
+It makes 32 random bytes on the server, saves them in `relay.env` (backed up first), never
+prints them, and restarts the relay. Running it again keeps the key: a new key couldn't open
+what the old one sealed, so it never changes. Until it's set, Pro features that keep secrets
+answer 503 `vault_unavailable` and everything else works. `deploy-relay.sh` keeps it when it
+rewrites `relay.env`. Keep the server's `state/env-backup-*` files as safe as `relay.env`.

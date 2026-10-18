@@ -11,7 +11,8 @@
 #   KICK_CLIENT_ID=...        from kick.com → Settings → Developer (optional until then)
 #   KICK_CLIENT_SECRET=...
 # Razorpay keys for Ferrocast Pro are NOT here: they're typed on the server with
-# razorpay-keys.sh (see deploy/README.md), and this script keeps them as they are.
+# razorpay-keys.sh (see deploy/README.md), and this script keeps them as they are. Same for
+# the vault key (RELAY_VAULT_KEY), made on the server by vault-key.sh.
 # shellcheck disable=SC2029 # $dir is meant to expand here, before ssh sends the command.
 set -euo pipefail
 
@@ -66,9 +67,10 @@ echo "Writing the config..."
 # stdin: nothing passes through a guessable /tmp path another user could pre-create.
 ssh "$host" "sudo mkdir -p $dir && sudo chmod 755 $dir"
 ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-compose.yml" < "$repo/deploy/docker-compose.yml"
-# Pro's Razorpay settings (RAZORPAY_*, PRO_SALES_OPEN, PRO_EMAIL_KEY) live only on the server, written
-# there by razorpay-keys.sh: they're carried over from the current relay.env on the server
-# itself, so they never travel to this Mac and a config update can't wipe them.
+# Pro's Razorpay settings (RAZORPAY_*, PRO_SALES_OPEN, PRO_EMAIL_KEY) and the vault key
+# (RELAY_VAULT_KEY) live only on the server, written there by razorpay-keys.sh and
+# vault-key.sh: they're carried over from the current relay.env on the server itself, so
+# they never travel to this Mac and a config update can't wipe them.
 {
   printf 'RELAY_PUBLIC_URL=https://ferrocast-relay.clearcraftlabs.com\n'
   printf 'RELAY_TIP_URL=https://tip.clearcraftlabs.com\n'
@@ -76,7 +78,7 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
 } | ssh "$host" "sudo sh -c 'umask 077 && cat > $dir/relay.env.new &&
-    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
+    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
     chown $owner:$owner $dir/relay.env.new && chmod 600 $dir/relay.env.new && mv $dir/relay.env.new $dir/relay.env'"
 printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o $owner -g $owner /dev/stdin $dir/tunnel.env"
 
