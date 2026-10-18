@@ -1586,6 +1586,8 @@ dependencies = [
 name = "ferrocast-core"
 version = "0.1.0-beta.9"
 dependencies = [
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

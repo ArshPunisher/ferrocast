@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_imports.sql"),
     include_str!("../migrations/0009_designs.sql"),
     include_str!("../migrations/0010_studio.sql"),
+    include_str!("../migrations/0011_autoreplies.sql"),
 ];
 
 /// Schema version this build understands.

@@ -14,8 +14,11 @@ use crate::template::{Template, TemplateError, Vars};
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     Everyone,
+    #[serde(alias = "subscriber", alias = "subscribers")]
     Subs,
+    #[serde(alias = "vip")]
     Vips,
+    #[serde(alias = "mod", alias = "moderator", alias = "moderators")]
     Mods,
 }
 

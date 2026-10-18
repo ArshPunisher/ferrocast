@@ -1,6 +1,7 @@
 //! Repositories: one module per kind of data. Each takes `&Store` so callers never touch
 //! SQL, and every write stamps its own time.
 
+pub mod autoreplies;
 pub mod bot;
 pub mod designs;
 pub mod events;

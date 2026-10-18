@@ -7,6 +7,7 @@
 mod macros;
 
 pub mod alert;
+pub mod autoreply;
 pub mod chatbot;
 pub mod command;
 pub mod dedupe;

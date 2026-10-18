@@ -31,6 +31,7 @@ const TABLES: &[&str] = &[
     "goals",
     "commands",
     "timers",
+    "autoreplies",
     "counters",
     "quotes",
     "viewers",
@@ -603,6 +604,14 @@ mod tests {
         let o = repo::overlays::create(&s, "Main", ferrocast_core::overlay::Preset::Starter).unwrap();
         repo::bot::bump_counter(&s, "deaths", 7).unwrap();
         repo::bot::add_quote(&s, "=HYPERLINK(\"x\") gg", "mod").unwrap();
+        let mut rule = ferrocast_core::autoreply::AutoReply::new(
+            "Discord",
+            ferrocast_core::autoreply::MatchKind::Word,
+            "discord",
+            "Join us: discord.gg/example",
+        );
+        rule.id = "ar-1".into();
+        repo::autoreplies::save(&s, &rule).unwrap();
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
         let m = repo::media::save(&s, "logo.png", png).unwrap();
         let mut tip = ferrocast_core::event::Event::live(
@@ -643,6 +652,11 @@ mod tests {
         let back = repo::overlays::get(&s2, &o.id).unwrap();
         assert_eq!(back.token, o.token, "OBS URLs keep working on the new PC");
         assert_eq!(repo::bot::counter(&s2, "deaths").unwrap(), 7);
+        assert_eq!(
+            repo::autoreplies::list(&s2).unwrap().iter().map(|r| r.reply.as_str()).collect::<Vec<_>>(),
+            ["Join us: discord.gg/example"],
+            "auto-replies come across too"
+        );
         assert_eq!(
             repo::loyalty::balance(&s2, ferrocast_core::event::Platform::Twitch, "fan-1").unwrap(),
             Some(420),
