@@ -1378,3 +1378,30 @@ async fn streamlabs_import_files_are_checked() {
     let big = send(vec![("platform", None, "twitch"), ("points", Some(huge), "c.csv")]).await.unwrap();
     assert_eq!(error_code(big).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
 }
+
+#[tokio::test]
+async fn ferrocast_voices_without_pro_answer_calmly() {
+    let r = start().await;
+    let v: Value = r.get("/api/v1/tts/cloud").await.json().await.unwrap();
+    assert_eq!(
+        (v["available"].as_bool(), v["voice"].is_null(), v["max_chars"].as_u64()),
+        (Some(false), true, Some(300))
+    );
+    let voices: Value = r.get("/api/v1/tts/voices").await.json().await.unwrap();
+    assert!(voices.as_array().unwrap().iter().all(|x| x["pro"] == false), "only this computer's voices");
+    let res = r.put("/api/v1/tts/cloud", json!({ "voice": "google:hi-IN-Neural2-A" })).await;
+    assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "pro_required");
+    assert!(body["error"]["hint"].as_str().unwrap().contains("Settings › Pro"));
+    let back: Value = r.put("/api/v1/tts/cloud", json!({ "voice": null })).await.json().await.unwrap();
+    assert!(back["voice"].is_null(), "the system voice is always allowed");
+    let raw = reqwest::Client::new()
+        .post(format!("{}/api/v1/tts/preview", r.base))
+        .bearer_auth(&r.token)
+        .body("voice")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}

@@ -170,13 +170,3 @@ pub async fn tts_reject(State(app): State<AppState>, Path(id): Path<String>) -> 
     app.engine.decide_tts(&id, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-
-/// The computer's own voices. All free: `pro` is there for the dashboard's shape.
-pub async fn tts_voices() -> Json<Value> {
-    let list: Vec<Value> = ferrocast_engine::speech::voices()
-        .await
-        .into_iter()
-        .map(|v| json!({ "id": v.id, "name": v.name, "language": v.language, "pro": false }))
-        .collect();
-    Json(json!(list))
-}

@@ -1,6 +1,7 @@
 //! `/api/v1` routes (API.md §4).
 
 mod app;
+mod autoreplies;
 mod bot;
 mod cloud_backups;
 mod core;
@@ -19,6 +20,7 @@ mod pro;
 mod recap;
 mod studio;
 mod tip_pro;
+mod tts;
 mod welcome;
 
 use axum::Router;
@@ -109,7 +111,9 @@ pub(crate) fn api() -> Router<AppState> {
         // tts
         .route("/tts", get(bot::tts).put(bot::save_tts))
         .route("/tts/pending", get(bot::tts_pending))
-        .route("/tts/voices", get(bot::tts_voices))
+        .route("/tts/voices", get(tts::voices))
+        .route("/tts/cloud", get(tts::cloud).put(tts::set_cloud))
+        .route("/tts/preview", post(tts::preview))
         .route("/tts/{id}/approve", post(bot::tts_approve))
         .route("/tts/{id}/reject", post(bot::tts_reject))
         // media list/delete (upload is in `uploads` with its own size limit)
@@ -159,6 +163,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/backups/{id}/restore", post(cloud_backups::restore))
         // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
         .merge(studio::routes())
+        // auto-replies (bot answers to chat that mentions something)
+        .merge(autoreplies::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.
