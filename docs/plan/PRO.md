@@ -108,6 +108,26 @@ M0 as built (19 Oct 2026):
 - Engine `speech.rs` gains cloud voices (`pro: true`); local approval and filters first (R-48);
   audio saved like the system WAV; fallback to the system voice with one notice.
 - UI: "Ferrocast voices" group with a quiet Pro chip and usage.
+- M4 as built (19 Oct 2026, API.md §9.4): relay `tts/{mod,provider,google,fake,store,tests}.rs`,
+  migration 6 (`tts_usage`); `GoogleTts` (REST, Ogg Opus, key in the `X-Goog-Api-Key` header,
+  6 s per call, 7 s per relay request) with 10 curated voices (hi-IN and en-IN Neural2 + WaveNet,
+  female and male, then en-US Neural2 F/D). **Money safety:** 20 requests/min per subscription and
+  60/min relay-wide (429 `tts_rate`), 20,000 characters/month per subscription (`tts_chars`, 429
+  `tts_quota`), then `TTS_GLOBAL_MONTHLY_CHARS` (default 800,000, hard ceiling 1,000,000 = Google's
+  free Neural2 tier) checked and counted in one statement before Google is called; once reached,
+  503 "Ferrocast voices are resting until next month" and Google is never called until the 1st.
+  Failed calls give the subscription back its characters; the relay-wide count only when Google
+  refused before working (its 429, bad voice, too long), never after a timeout/5xx (maybe billed).
+  `deploy-relay.sh` carries `GOOGLE_TTS_KEY` and `TTS_GLOBAL_MONTHLY_CHARS` over like the Razorpay
+  keys (added on the server by hand, deploy/README.md). **Stored (privacy, R-51):** the per-
+  subscription counter and one `tts_usage` row a month (characters and requests, everyone
+  together); never the text, the voice or the audio. Engine `speech/cloud.rs`: only lines the
+  local rules passed (R-48) are sent; `speech.ogg` saved and attached like the WAV; settings
+  `tts_cloud {voice}` with the policy's system voice as the backup; 8 s overall, then the system
+  voice with one `tts-cloud` notice; previews cached per voice per run. Follow-ups: set a ₹1 budget
+  alert and lower the API's per-minute quota in Google Cloud too; Chirp 3 HD voices if the free
+  tier allows later; privacy/terms pages must list the counters before sales open; the per-minute
+  relay-wide limit is in memory (fine for one relay process).
 
 ### F4. Discord perks
 - Relay `discord/{mod,api,perks,interactions}.rs`, REST only; env `DISCORD_BOT_TOKEN`,

@@ -336,7 +336,7 @@ GET / PUT `/api/v1/welcome`: PUT saves only the fields sent; 400 names a bad fie
 
 ### TTS
 GET/PUT `/api/v1/tts` (`{ enabled, voice, min_amount, currency, max_chars, hold_for_approval, read_names }` plus `min_amounts: Money[]` and `min_platform_value`). `min_amount` is in major units of the main currency (Settings `currency`, from the computer's region by default; echoed as `currency`), and wins over that currency's entry in `min_amounts`; the other currencies keep their own minimum. Every field is optional on PUT: what isn't sent is kept.
-GET `/api/v1/tts/voices` → `{ id, name, language, pro: false }[]` (the computer's own voices). GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
+GET `/api/v1/tts/voices` → `{ id, name, language, pro }[]`: the computer's own voices (`pro: false`), then, while Pro is active and the relay has them, Ferrocast voices (`pro: true`, ids `google:…`, plus `gender` and `family`; §9.4). GET / PUT `/api/v1/tts/cloud` and POST `/api/v1/tts/preview`: §9.4. GET `/api/v1/tts/pending` and the `tts_pending` frame → `{ id, event_id, platform, name, text, amount: string | null ("₹500", "1,000 bits"), received_at }[]`. POST `/api/v1/tts/{id}/approve` · `/reject`.
 
 ### Tips
 The streamer uses their own provider pages; the relay verifies each provider's webhook and forwards name, amount and message only.
@@ -521,6 +521,29 @@ type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started
 
 Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */, added: LaneItem | null, sound, volume }` (play the sound for `added`, only in the dashboard), `marker Marker`, `counter { name, value }`, `show { show: ShowRun | null }`, `obs_health Health`, `brb { on, scene }`.
 
+### Auto-replies (free, local)
+The bot answers chat that mentions something ("discord" → the invite), without a `!command`. Checked on live chat from this channel after moderation passed it; never for a message a command answers (custom, counter, module or points command), never for the streamer's own account (the bot speaks as it, R-28), the connected account, accounts with the bot role or well-known bots (Nightbot, StreamElements…), and never for text the bot itself sent in the last 2 minutes (loop guard). Quiet while the bot is off (`bot_enabled`) or panic mode is on. Rules are checked in order and the **first match wins** (a later rule never answers a message an earlier one matched, even while that one cools down). Each platform has a send budget for auto-replies (R-19: 6 per 30 s on Twitch and Kick, 2 per minute on YouTube); a platform's own rate limit pauses auto-replies there for its `Retry-After`.
+
+```ts
+type AutoReply = { id: string /* blank on POST */; name: string /* 1–60 */; enabled: boolean /* true */;
+                   match: { kind: "contains" | "word" | "starts_with" | "regex" /* "contains" */; text: string /* 1–200 */; case_sensitive: boolean /* false */ };
+                   reply: string /* template, 1–500 characters */; platforms: ChatPlatform[] /* [] = all */;
+                   cooldown_s: number /* 30; per rule per platform chat, 0–86400, at least 5 s in practice */;
+                   user_cooldown_s: number /* 120; per viewer, 0–86400 */;
+                   min_role: "everyone" | "subs" | "vips" | "mods" /* "everyone"; "subscriber", "vip", "mod" are accepted */;
+                   only_when_live: boolean /* true */ }
+type AutoReplyTry = { matched: boolean; rule_id: string | null; rule_name: string | null; reply: string | null }
+```
+Matching folds both sides: Unicode NFKC (`ＤＩＳＣＯＲＤ` matches `discord`), whitespace runs as one space, lowercase unless `case_sensitive`. `word` needs a word boundary on each side whose needle edge is a letter, digit or `_` ("game" matches "what game?" and "new-game", not "gameplay"). `regex` is Rust `regex` syntax (linear time, no look-around or back-references), compiled once with a size cap; a pattern that matches the empty message is refused. Reply variables: `{user}` / `{name}` (who wrote it), `{platform}`, `{channel}` (the connected account), `{game}` and `{title}` (last set from Ferrocast; `{game}` falls back to "something fun"), `{uptime}`, `{uptime_text}`, `{count:<counter>}`. The reply is one line, ≤ 500 characters, never starting with `/` or `.`.
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET / POST | `/api/v1/autoreplies` | → `AutoReply[]` in order; POST `AutoReply` (defaults above) → 201, added last. 400 names a bad field (`name:`, `match.text:`, `reply:`, `cooldown_s:`), **413 `reply_too_long`** over 500 characters, **422 `bad_pattern`** (`match.text: the pattern has a problem at character 6: unclosed group.` + hint), 422 `pattern_too_complex` / `pattern_too_broad`, **422 `too_many_autoreplies`** at 100, 409 for a taken id |
+| PUT / DELETE | `/api/v1/autoreplies/{id}` | `AutoReply` → `AutoReply` (keeps its place, cooldowns start fresh); → 204. 404 `autoreply_not_found` |
+| PUT | `/api/v1/autoreplies/order` | `{ ids: string[] }` (every id once) → `AutoReply[]`; 409 when the list changed |
+| POST | `/api/v1/autoreplies/try` | `{ text, rule?: AutoReply, platform? }` → `AutoReplyTry`: the saved rules, or only the unsaved `rule` (name and reply may be blank; `reply` is then null). Ignores platform, role, live and cooldowns; renders with the viewer "viewer". A bad pattern answers the same 422 as a save |
+| GET | `/api/v1/autoreplies/starters` | → the examples an empty list offers ("discord" → link, "what game" → `{game}`, "hello" → welcome) |
+
 ### Settings and data
 GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
 POST `/api/v1/export` → a streamed `.ferropack` download (this install's own settings rows, `pro_status` and `history_upload`, are never in it, and an import never replaces them). POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups` → `Backup[]`, newest first; POST `/api/v1/backups` → 201 `Backup[]` (takes one now); POST `/api/v1/backups/{id}/restore` → `{ restart_needed, message }` (it's swapped in at the next start, keeping the current data as one more backup).
@@ -637,7 +660,7 @@ Data kept (R-51): subscription id, plan, status, period end, cancel/refund flags
 
 ## 9. Relay: Pro features
 
-Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. This is the contract each one follows as it ships; its routes are added as §9.x (§9.1 stream history, §9.2 tip branding and §9.3 cloud backups are built).
+Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. This is the contract each one follows as it ships; its routes are added as §9.x (§9.1 stream history, §9.2 tip branding, §9.3 cloud backups and §9.4 voices are built).
 
 **The gate.** Every Pro feature route checks, first:
 
@@ -658,7 +681,7 @@ Access is the same rule as `/v1/pro/status` `pro` (paid period, 3-day grace for 
 | 503 | `vault_unavailable` | The relay has no vault key yet (features that keep secrets), or a saved sign-in can't be read (hint: connect that account again) |
 | 503 | `storage_unavailable` | The relay can't store files right now |
 
-**Features and quotas in the status.** `/v1/pro/status` `features` says which features this relay has, built *and* configured (`cloud_bot`, `remote`, `tts`, `discord`, `backups`, `tip_brand`, `history`; `history` is always on, `backups` and `tip_brand` are on when the relay has a file store, the rest are `false` until each ships). `quotas` lists the subscription's counters as `{ [name]: { used, limit, period: "day" | "month", reset_at } }`; quotas are per subscription, shared by its installs, and count in UTC calendar days or months.
+**Features and quotas in the status.** `/v1/pro/status` `features` says which features this relay has, built *and* configured (`cloud_bot`, `remote`, `tts`, `discord`, `backups`, `tip_brand`, `history`; `history` is always on, `backups` and `tip_brand` are on when the relay has a file store, `tts` when it has a voice provider (`GOOGLE_TTS_KEY`), the rest are `false` until each ships). `quotas` lists the subscription's counters as `{ [name]: { used, limit, period: "day" | "month", reset_at } }`; quotas are per subscription, shared by its installs, and count in UTC calendar days or months.
 
 **The dashboard.** A Pro feature's panel is hidden unless the feature is in `features` and `active || sales_open`. Not Pro (but on sale): one calm line, "Runs on Ferrocast's servers, part of Pro.", and a link to Settings › Pro, never a nag. Pro: the feature itself.
 
@@ -778,3 +801,41 @@ type CloudBackupsView = { key: { exists: boolean; saved: boolean /* confirmed be
 | DELETE | `/api/v1/pro/backups/{id}` | → 204 |
 
 Automatic uploads: while Pro is active (the remembered status) with the key saved and `auto` on, after the daily local backup (and on an hourly check) the pack's content hash (`store::pack::content_hash`: tables, tip CSV and media, without the export time, the remembered Pro status or the history queue) is compared with the last upload's; once a day at most, and only when it changed. Downloads have no total time limit, only a 20 s connect timeout and a 60 s idle timeout per read; each part upload has 10 minutes. An interrupted upload (crash, restart, no connection) carries on from the next part (`<data>/cloud-backup/state.json` + the ciphertext next to it). None of this ever runs without Pro.
+
+### 9.4 Ferrocast voices (F3, Google Cloud TTS)
+
+`crates/relay/src/tts/{mod,provider,google,fake,store,tests}.rs`, migration 6 (`tts_usage`). A `TtsProvider` (`voices()`, `synthesize(text, voice)` → Ogg Opus or `TtsError { Quota, Unavailable, BadVoice, TooLong }`): `GoogleTts` in production (REST `v1/text:synthesize`, `audioEncoding: OGG_OPUS`, the key from `GOOGLE_TTS_KEY` sent as the `X-Goog-Api-Key` header, never in a URL or a log; 6 s per call), `FakeTts` in tests. `features.tts` is true only with a provider. `quotas.tts_chars` counts characters (Unicode characters, not bytes) per subscription per UTC calendar month: 20,000.
+
+**Money safety** (the owner must never get a bill). Before Google is called, in this order: 20 requests a minute per subscription and 60 a minute for the whole relay (429 `tts_rate`), the subscription's month (429 `tts_quota`), then the relay-wide month `TTS_GLOBAL_MONTHLY_CHARS` (default 800,000; never above 1,000,000, Google's free Neural2 tier, whatever the variable says), counted in `tts_usage` in the same statement that checks it. Once that cap would be passed every request is a 503 and Google isn't called again until the 1st. A failed call gives the subscription its characters back; the relay-wide count is given back only when Google refused before doing the work (its own 429, a bad voice, too long), never after a timeout or a 5xx (it may have been billed).
+
+```ts
+type CloudVoice = { id: string /* "google:hi-IN-Neural2-A" */; name: string /* "Hindi, female (Neural2)" */; language: string /* BCP 47 */; gender: "female" | "male"; family: "Neural2" | "WaveNet" }
+```
+
+Voices (Hindi and Indian English first): `hi-IN` Neural2 A (female) and B (male), WaveNet D (female) and C (male); `en-IN` the same four; `en-US` Neural2 F (female) and D (male).
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/v1/pro/tts/voices` | → `{ voices: CloudVoice[], usage: { used, limit, period: "month", reset_at }, resting: boolean /* the relay-wide month is used up */, max_chars: 300 }`, `no-store` |
+| POST | `/v1/pro/tts` | `{ text, voice }` (JSON) → 200 `audio/ogg` (Opus), `no-store`, `X-Tts-Chars-Used`, `X-Tts-Chars-Limit`, `X-Quota-Reset`. Control and direction characters become spaces and the text is trimmed first. |
+
+Errors (the gate's 401 / 402 come first): 400 `invalid` (not JSON, no `text` or `voice`), 415 `unsupported_type`, 422 `empty_text` (nothing left to read), 413 `too_long` ("Ferrocast voices read up to 300 characters at a time."), 404 `voice_not_found`, 429 `tts_rate` (+ `X-Quota-Reset`, `Retry-After` to the next minute), 429 `tts_quota` (+ `X-Quota-Reset`, `Retry-After`, the hint gives the date), 503 `tts_unavailable`: no provider ("Ferrocast voices aren't set up on this relay yet."), the relay-wide month used up ("Ferrocast voices are resting until next month.", `X-Quota-Reset` and `Retry-After` to the 1st), Google busy (`Retry-After: 60`) or down; 503 `storage`. Every 503 hint says the PC's own voice reads instead.
+
+Data kept (R-51): the per-subscription counter in `quota_usage` and one `tts_usage` row a month (characters and requests for everyone together). Never the text, the voice picked or the audio.
+
+**The engine** (`crates/engine/src/speech/cloud.rs`). Only a line the local rules already passed is sent (R-48: TTS on, the minimum, the word filter and length, the approval list, panic pause; a held line only once a mod approves it, a rejected one never). The audio is saved to the media library as `speech.ogg` and attached to the alert (or the approved line) exactly like the system voice's WAV. With no Pro (the remembered status), a line over 300 characters, the relay refusing, unreachable or slow (8 s for the whole call), the system voice picked in the TTS settings reads it instead, and the dashboard gets one `notice` (key `tts-cloud`, "… Reading with this PC's voice (…) for now.", action Voice settings) until a Ferrocast voice works again. The alert queue never waits for it. Settings `tts_cloud` keeps the picked Ferrocast voice (`{ voice }`); the TTS policy's `voice` stays the system voice (the backup).
+
+```ts
+type TtsCloudView = { voice: string | null; available: boolean /* Pro active and features.tts */; resting: boolean
+  usage: { used: number; limit: number; reset_at: number } | null; fallback: string | null /* why the last line used the PC's voice */
+  max_chars: 300; voices: CloudVoice[] }
+type TtsPreview = { media_id: string; url: string /* /api/v1/media/<id> */; voice: string | null; cloud: boolean; notice: string | null }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/tts/cloud` | → `TtsCloudView` (asks the relay for the voices and usage; the last list when it can't) |
+| PUT | `/api/v1/tts/cloud` | `{ voice: string \| null }` → `TtsCloudView`. A Ferrocast voice needs Pro (402 `pro_required`) and one the relay lists (404 `voice_not_found`); `null` (back to the PC's voice) always works |
+| POST | `/api/v1/tts/preview` | `{ voice? }` (default: what alerts use) → `TtsPreview`: a short sample line in the voice's language through the same path as alerts. A Ferrocast voice's preview is made once per run and reused (no characters spent twice). 422 when the computer has no voice at all |
+
+The dashboard (Settings › Text-to-speech): one Voice picker with a "Ferrocast voices (Pro)" group (Hindi and Indian English first) above "On this computer", a Preview button, a Backup voice picker when a Ferrocast voice is picked, and the month's usage ("4,120 of 20,000 characters this month"). Not Pro but on sale: the calm line and Settings › Pro.

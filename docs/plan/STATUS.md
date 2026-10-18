@@ -26,6 +26,20 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-19 (Pro M4: Ferrocast voices, Google Cloud TTS)
+- Relay `tts/` (replaces the stub): `TtsProvider` (boxed futures), `GoogleTts` (REST, Ogg Opus, key in a header, never logged, redacted `Debug`), `FakeTts` (records calls, can fail or be slow); `GET /v1/pro/tts/voices`, `POST /v1/pro/tts` (401/402, 400/415, 422 `empty_text`, 413 `too_long`, 404 `voice_not_found`, 429 `tts_rate` / `tts_quota`, 503 `tts_unavailable`). Migration 6 `tts_usage` (relay-wide monthly cap, default 800k, ceiling 1M). `AppState::with_tts`, `main.rs` reads `GOOGLE_TTS_KEY` / `TTS_GLOBAL_MONTHLY_CHARS`; `tts` is now `pub mod`.
+- Engine `speech/cloud.rs`: cloud voices in `/api/v1/tts/voices` (`pro: true`), `GET|PUT /api/v1/tts/cloud`, `POST /api/v1/tts/preview`; `speak_to_media` goes through `speak_line` (Ferrocast voice, else system voice with one notice; 8 s). Server `routes/tts.rs` (the old `bot::tts_voices` moved there). `pro.rs` passes the TTS codes through.
+- Deploy: env example, `deploy-relay.sh` carries the two variables over, README section.
+- Tests: relay 17 (unit, a fake Google, every route status, per-sub quota, global cap never calls the provider, rates, give-back, nothing but counters stored), engine 9 against the real relay with `FakeTts` (approved text only, fallback notice once, lapsed Pro, month used up, 8 s timeout, preview cache), server 1.
+- Follow-ups: in PRO.md F3 "as built".
+
+### 2026-10-19 (Pro M5: local auto-replies, free)
+- Core `autoreply.rs`: rules (`contains`/`word`/`starts_with`/`regex`, case, platforms, roles, live-only, cooldowns), NFKC + case folding, word boundaries, regex via the `regex` crate with size/nest caps and a pointed error (`at character N`), "matches every message" refused, first match wins, per-rule-per-platform and per-viewer cooldowns (5 s floor), a per-platform send budget (R-19) with pause on the platform's rate limit, starters. `Access` accepts `subscriber`/`vip`/`mod`. New deps: `regex`, `regex-syntax` (already in the lockfile).
+- Store migration `0011_autoreplies.sql` + `repo::autoreplies` (ordered list, reorder).
+- Engine `studio/autoreplies.rs`: CRUD, order, Try it (saved list or a draft), `{channel}`/`{game}`/`{title}`/`{uptime}` variables, the pipeline hook after moderation and after commands (`answer_command` now says whether the message was a command), loop guard (streamer, connected account, bot role, known bots, echo of its own replies for 2 min), quiet when the bot is off or panic is on. Server `routes/autoreplies.rs` (400/404/409/413/422). API.md §4 "Auto-replies".
+- Tests: core 19, store 1, engine 8, server 5.
+- `pack.rs` `TABLES` includes `"autoreplies"`, so Export/Import and cloud backups carry the rules; the engine reloads them after an import or restore.
+
 ### 2026-10-19 (Pro M3: cloud backups)
 - Relay: `backups/{mod,store,tests}.rs`, migration 5; `POST /v1/pro/backups` (201 `{id, part_size, parts}`, 409 `upload_in_progress`, 413 `backup_quota`, 429 `backup_upload_quota` at 6/day via `quota.rs`), `PUT …/parts/{n}` (octet-stream only, 413 over 8 MiB, 422 `invalid_part`), `POST …/complete` (size + SHA-256, 409 `hash_mismatch` deletes, 409 `parts_missing` keeps, prunes the oldest automatic backups to stay within 7 / 250 MB), `GET` list, `GET {id}` (streamed ciphertext), `DELETE`. Read routes open after a lapse while kept (R-04); `backups::sweep` hourly. `features.backups` true with a file store. `backups` is now `pub mod` (for `main.rs`).
 - Engine: `cloud_backup.rs` (age X25519 key in `ferrocast-secrets` as `cloud-backup-key`, optional passphrase wrapping the key with age scrypt inside each backup, 8 MiB part upload that resumes after a restart, automatic upload after the daily backup when `pack::content_hash` changed, restore = download → hash check → decrypt → existing import + reload, adopting the key on a fresh PC). Hook in `backups::run`. Server: `routes/cloud_backups.rs` (`/api/v1/pro/backups…`). `pro.rs` passes the new relay codes through. API.md §9.3, PRO.md F5 "as built".
