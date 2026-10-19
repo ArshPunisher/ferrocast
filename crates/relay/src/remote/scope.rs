@@ -68,6 +68,9 @@ pub const MOD_ALLOWED: &[Rule] = &[
 /// email's state (the address only as a hint). Changing the address stays on the PC.
 pub const OWNER_ALLOWED: &[Rule] = &[
     ("GET", "/pro/history/email"),
+    // The cloud bot (Pro F1): look at it and switch it on or off; connecting stays on the PC.
+    ("GET", "/pro/bot"),
+    ("PUT", "/pro/bot/enabled"),
 ];
 
 /// What an owner's phone may never do (`*` as the method: any method).

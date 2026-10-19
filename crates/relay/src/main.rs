@@ -99,6 +99,24 @@ async fn main() {
         }
     };
     let state = state.with_discord(ferrocast_relay::discord::Runtime::from_config(discord_cfg));
+    let twitch_cloud = match ferrocast_relay::bot::TwitchConfig::from_env() {
+        Ok(Some(c)) => {
+            tracing::info!(client_id = %c.client_id, "the cloud bot for Twitch is on");
+            Some(c)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "TWITCH_CLOUD_CLIENT_ID / TWITCH_CLOUD_CLIENT_SECRET / TWITCH_CLOUD_EVENTSUB_SECRET not set: the Twitch cloud bot is off"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "the Twitch cloud bot settings are incomplete: it's off");
+            None
+        }
+    };
+    let bot_rt = ferrocast_relay::bot::Runtime::from_config(twitch_cloud, &state.cfg);
+    let state = state.with_bot(bot_rt);
     let mailer: Option<Arc<dyn ferrocast_relay::mail::Mailer>> = match ferrocast_relay::mail::BrevoMailer::from_env() {
         Some(b) => {
             tracing::info!("the weekly email is on (Brevo)");
@@ -168,6 +186,16 @@ async fn main() {
             let now = ferrocast_relay::now_ms();
             ferrocast_relay::mail::run_weekly(&mail, now).await;
             ferrocast_relay::mail::sweep(&mail, now).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let bot_timers = state.clone();
+    // The cloud bot: timers while it's on duty, and the hourly sign-in check and lapse sweep.
+    tokio::spawn(ferrocast_relay::bot::run(bot_timers));
+    let bot_sweep = state.clone();
+    tokio::spawn(async move {
+        loop {
+            ferrocast_relay::bot::sweep(&bot_sweep).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

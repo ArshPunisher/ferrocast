@@ -36,6 +36,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration { version: 7, name: "Pro dashboard from anywhere", sql: &[crate::remote::SCHEMA] },
     Migration { version: 8, name: "Pro Discord bot: servers, rules, links, grants", sql: &[crate::discord::SCHEMA] },
     Migration { version: 9, name: "Pro weekly email: sealed addresses, sends", sql: &[crate::mail::SCHEMA] },
+    Migration {
+        version: 10,
+        name: "Pro cloud bot: channels, sealed sign-ins, config, counter changes",
+        sql: &[crate::bot::SCHEMA],
+    },
 ];
 
 pub(crate) fn latest() -> i64 {
@@ -133,6 +138,10 @@ mod tests {
             "discord_links",
             "discord_grants",
             "discord_posts",
+            "bot_channels",
+            "bot_tokens",
+            "bot_config",
+            "bot_counter_changes",
             "mail_addresses",
             "mail_sent",
             "mail_budget",

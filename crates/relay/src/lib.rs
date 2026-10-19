@@ -14,7 +14,7 @@
 pub mod backups;
 pub mod billing;
 pub mod blob;
-mod bot;
+pub mod bot;
 pub mod db;
 pub mod discord;
 mod history;
@@ -111,6 +111,8 @@ pub struct AppState {
     pub(crate) discord: Arc<discord::Runtime>,
     /// The weekly email (off without `BREVO_API_KEY`).
     pub(crate) mail: Arc<mail::Runtime>,
+    /// The 24/7 cloud bot (Twitch off without `TWITCH_CLOUD_*`, Kick with the Kick app).
+    pub(crate) bot: Arc<bot::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -134,6 +136,7 @@ impl AppState {
             remote: Arc::default(),
             discord: Arc::default(),
             mail: Arc::default(),
+            bot: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -183,6 +186,13 @@ impl AppState {
     /// `mail::FakeMailer` in tests) and its settings (`mail::MailConfig::from_env()`).
     pub fn with_mail(mut self, mailer: Option<Arc<dyn mail::Mailer>>, cfg: mail::MailConfig) -> AppState {
         self.mail = Arc::new(mail::Runtime::new(mailer, cfg));
+        self
+    }
+
+    /// The 24/7 cloud bot (`bot::Runtime::from_config(TwitchConfig::from_env(), &cfg)` in
+    /// production, fake platforms in tests).
+    pub fn with_bot(mut self, rt: bot::Runtime) -> AppState {
+        self.bot = Arc::new(rt);
         self
     }
 
@@ -430,11 +440,15 @@ async fn link_loop(st: AppState, install: String, socket: WebSocket) {
             }
             msg = rx.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
-                    if let Ok(v) = serde_json::from_str::<Value>(&t)
-                        && v["type"] == "ack"
-                        && let Some(id) = v["id"].as_i64()
-                    {
-                        let _ = st.db.ack(&install, id);
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        if v["type"] == "ack"
+                            && let Some(id) = v["id"].as_i64()
+                        {
+                            let _ = st.db.ack(&install, id);
+                        } else if v["type"] == "bot_seen" {
+                            // The PC's bot is on: the cloud bot stands by (bot::lease).
+                            bot::desktop_seen(&st, &install, &bot::seen_platforms(&v));
+                        }
                     }
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
@@ -561,6 +575,12 @@ async fn kick_callback(State(st): State<AppState>, Query(q): Query<Callback>) ->
         Value::String(s) => s.clone(),
         _ => return page(StatusCode::BAD_GATEWAY, "Kick sent an account without an id."),
     };
+    if state.starts_with(bot::kick::STATE_PREFIX) {
+        // The cloud bot's opt-in sign-in: kept here (sealed), never sent to the PC, and the
+        // channel's owner stays as it is.
+        let name = user["name"].as_str().unwrap_or("Kick");
+        return bot::kick::finish(&st, &install, &tokens, &broadcaster, name, &state).await;
+    }
     if st.db.set_kick_owner(&broadcaster, &install).is_err() {
         return page(StatusCode::SERVICE_UNAVAILABLE, "The relay couldn't save that. Try again shortly.");
     }
@@ -652,6 +672,9 @@ async fn kick_webhook(State(st): State<AppState>, headers: HeaderMap, body: axum
             if let Err(e) = st.enqueue(&install, "kick_event", &payload) {
                 return e.into_response();
             }
+            // The cloud bot answers while the PC is off (bot::kick): queued, bounded, never
+            // holding up Kick.
+            bot::kick::queue_webhook(&st, install, broadcaster, ty.clone(), id.clone(), v);
         }
         Ok(None) => tracing::debug!(%broadcaster, "a Kick event for a channel no install owns"),
         Err(e) => return ApiError::db(e).into_response(),

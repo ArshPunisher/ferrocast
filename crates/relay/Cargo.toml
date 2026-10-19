@@ -13,6 +13,10 @@ name = "ferrocast-relay"
 path = "src/main.rs"
 
 [dependencies]
+# The cloud bot (Pro F1) shares the desktop bot's rules and the platforms' event mapping.
+ferrocast-core.workspace = true
+ferrocast-twitch.workspace = true
+ferrocast-kick.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -37,6 +41,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "z
 
 [dev-dependencies]
 ferrocast-testkit.workspace = true
+# Paused clocks for the cloud bot's lease tests.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tokio-tungstenite = "0.30"
 rand_core = { version = "0.6", features = ["getrandom"] }
