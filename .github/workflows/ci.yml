@@ -50,6 +50,7 @@ jobs:
           deploy/tests/vault-key.test.sh
           deploy/tests/pro-keys.test.sh
           deploy/tests/pro-grant.test.sh
+          deploy/tests/relay-backup.test.sh
           deploy/tests/deploy-relay-env.test.sh
           deploy/tests/dashboard-swap.test.sh
 
