@@ -1746,3 +1746,80 @@ async fn interactions_answer_ping_only_when_signed_by_discord() {
     let a = interact(&w, junk, Some(sign(junk, &ts)), Some(ts)).await;
     assert_eq!(a.status, 400);
 }
+
+#[tokio::test]
+async fn perk_roles_come_off_when_pro_ends_and_go_back_on_when_it_returns() {
+    const GONE: &str = "800000000000000099";
+    let w = world().await;
+    let auth = ready(&w).await;
+    w.add_rule(&auth, json!({ "kind": "sub", "role_id": ROLE_VIP, "keep_days": 0 })).await;
+    perks(&w, &auth, json!([sub_event(TWITCH_ID, "1")])).await;
+    // A grant to a member who has left the server since.
+    w.db.discord_grant(GUILD, GONE, ROLE_SUB, "dr", Some(now_ms() + DAY), now_ms()).unwrap();
+    let both: BTreeSet<String> = [ROLE_SUB.to_string(), ROLE_VIP.to_string()].into();
+    sweep(&w.state).await;
+    assert_eq!(w.fake.calls("remove_role"), 0, "nothing comes off while Pro is on");
+
+    // Pro ended yesterday (well inside the 30 days the server is kept).
+    w.set_sub("sub_1", "cancelled", Some(now_ms() - DAY));
+    // Discord rate limits: the round stops, nothing is counted as a try.
+    w.fake.fail("remove_role", Some(DiscordError::RateLimited { retry_after_s: 3 }));
+    sweep(&w.state).await;
+    assert_eq!(w.fake.calls("remove_role"), 1, "stopped at the first rate limit");
+    assert_eq!(w.db.discord_grant_paused(GUILD, VIEWER, ROLE_SUB).unwrap(), Some(false));
+    assert_eq!(w.db.discord_grant_row(GUILD, VIEWER, ROLE_SUB).unwrap().unwrap().attempts, 0);
+    // A failure for one member doesn't stop the others: every grant is tried.
+    w.fake.fail("remove_role", Some(DiscordError::MissingPermission));
+    let before = w.fake.calls("remove_role");
+    sweep(&w.state).await;
+    assert_eq!(w.fake.calls("remove_role") - before, 3);
+    assert_eq!(w.db.discord_grant_row(GUILD, VIEWER, ROLE_VIP).unwrap().unwrap().attempts, 1);
+    // Discord is fine again and the retry is due: every role the bot gave comes off now,
+    // not 30 days later; the grants wait, paused.
+    w.fake.fail("remove_role", None);
+    w.db.c().execute("UPDATE discord_grants SET retry_at = ?1", [now_ms() - 1]).unwrap();
+    sweep(&w.state).await;
+    assert!(w.fake.roles_of(VIEWER).is_disjoint(&both), "{:?}", w.fake.roles_of(VIEWER));
+    for (user, role) in [(VIEWER, ROLE_SUB), (VIEWER, ROLE_VIP), (GONE, ROLE_SUB)] {
+        assert_eq!(w.db.discord_grant_paused(GUILD, user, role).unwrap(), Some(true), "{user} {role}");
+    }
+    assert!(w.fake.with(|d| d.joined.contains(GUILD)), "the bot stays during the 30 days");
+    let calls = w.fake.calls("remove_role");
+    sweep(&w.state).await;
+    assert_eq!(w.fake.calls("remove_role"), calls, "paused grants aren't taken off again");
+
+    // Pro is back. Giving roles back failing for a member backs off instead of retrying
+    // every hour; then the roles go back on and the member who left is forgotten.
+    w.set_sub("sub_1", "active", Some(now_ms() + 30 * DAY));
+    w.fake.fail("add_role", Some(DiscordError::MissingPermission));
+    sweep(&w.state).await;
+    assert_eq!(w.db.discord_grant_row(GUILD, VIEWER, ROLE_SUB).unwrap().unwrap().attempts, 1);
+    let calls = w.fake.calls("add_role");
+    sweep(&w.state).await;
+    assert_eq!(w.fake.calls("add_role"), calls, "backing off");
+    w.fake.fail("add_role", None);
+    w.db.c().execute("UPDATE discord_grants SET retry_at = ?1", [now_ms() - 1]).unwrap();
+    sweep(&w.state).await;
+    assert_eq!(w.db.discord_grant_row(GUILD, VIEWER, ROLE_SUB).unwrap().unwrap().attempts, 0);
+    assert!(w.fake.roles_of(VIEWER).is_superset(&both));
+    assert_eq!(w.db.discord_grant_paused(GUILD, VIEWER, ROLE_SUB).unwrap(), Some(false));
+    assert_eq!(w.db.discord_grant_paused(GUILD, VIEWER, ROLE_VIP).unwrap(), Some(false));
+    assert_eq!(w.db.discord_grant_paused(GUILD, GONE, ROLE_SUB).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_paused_perk_that_ends_meanwhile_doesnt_come_back() {
+    let w = world().await;
+    let auth = ready(&w).await;
+    perks(&w, &auth, json!([sub_event(TWITCH_ID, "1")])).await;
+    w.set_sub("sub_1", "cancelled", Some(now_ms() - DAY));
+    sweep(&w.state).await;
+    assert!(!w.fake.roles_of(VIEWER).contains(ROLE_SUB));
+    // Its month ran out while Pro was off: the expiry sweep forgets it, and Pro returning
+    // doesn't give it back.
+    w.db.c().execute("UPDATE discord_grants SET expires_at = ?1", [now_ms() - 1]).unwrap();
+    w.set_sub("sub_1", "active", Some(now_ms() + 30 * DAY));
+    sweep(&w.state).await;
+    assert!(!w.fake.roles_of(VIEWER).contains(ROLE_SUB));
+    assert!(w.db.discord_grant_row(GUILD, VIEWER, ROLE_SUB).unwrap().is_none());
+}

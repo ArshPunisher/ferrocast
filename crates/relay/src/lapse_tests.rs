@@ -808,3 +808,140 @@ async fn lapse_a_halted_subscription_rechecked_daily_is_still_deleted_after_30_d
         assert_eq!(w.count(&format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
     }
 }
+
+/// Every table the carry-over moves, with how many rows of it a subscription has.
+fn rows_of(w: &World, sub: &str) -> Vec<(&'static str, i64)> {
+    [
+        "streams",
+        "cloud_backups",
+        "bot_channels",
+        "bot_tokens",
+        "bot_config",
+        "discord_guilds",
+        "discord_rules",
+        "mail_addresses",
+        "remote_devices",
+    ]
+    .into_iter()
+    .map(|t| {
+        let n = w.st.db.c().query_row(&format!("SELECT COUNT(*) FROM {t} WHERE sub_id = ?1"), [sub], |r| r.get(0));
+        (t, n.unwrap())
+    })
+    .collect()
+}
+
+/// Decided 2026-10-19: lapsed, then a new checkout (a new subscription id) on the same PC
+/// within the 30 days: everything moves to the new id (sealed sign-ins and the address sealed
+/// again for it), the Discord roles taken off at the lapse come back, the phone keeps working,
+/// and the old id's day 30 deletes nothing. A replayed webhook moves nothing twice.
+#[tokio::test]
+async fn lapse_then_a_new_subscription_within_30_days_carries_everything_over() {
+    let w = world().await;
+    let (auth, install, sub) = w.buy(None).await;
+    let p = w.set_up_everything(&auth, &install, &sub).await;
+    let before = rows_of(&w, &sub);
+    assert!(before.iter().all(|(_, n)| *n > 0), "{before:?}");
+
+    // Cancelled; the period ended yesterday. The hourly sweep takes the perk roles off now.
+    w.razorpay_says(&sub, "subscription.cancelled", "cancelled", Some(-1)).await;
+    w.hourly().await;
+    assert!(!w.dc.roles_of(VIEWER).contains(ROLE_SUB), "perk roles come off when Pro ends");
+    assert!(w.dc.with(|d| d.joined.contains(GUILD)), "the bot stays in the server");
+    w.phone_paused(&p).await;
+
+    // Ten days later, a new checkout on the same PC.
+    let (auth2, _, sub2) = w.buy(Some(auth.clone())).await;
+    assert_ne!(sub2, sub);
+    assert_eq!(rows_of(&w, &sub2), before, "every row moved to the new subscription");
+    assert!(rows_of(&w, &sub).iter().all(|(_, n)| *n == 0), "{:?}", rows_of(&w, &sub));
+    // The sealed values open for the new id only.
+    let v = vault();
+    let t = w.st.db.bot_token(&sub2, "twitch", "bot").unwrap().unwrap();
+    assert_eq!(v.open(&sub2, &crate::bot::token_purpose("twitch", "bot"), &t).unwrap(), b"rt-bot");
+    assert!(v.open(&sub, &crate::bot::token_purpose("twitch", "bot"), &t).is_err());
+    let m = w.st.db.mail_row(&sub2).unwrap().unwrap();
+    assert_eq!(v.open(&sub2, crate::mail::PURPOSE, &m.on().unwrap().sealed).unwrap(), ADDRESS.as_bytes());
+
+    // Everything is there under the new subscription.
+    let v = w.ok(M::GET, "/v1/pro/history", &auth2, None, 200).await;
+    assert_eq!(v["streams"].as_array().unwrap().len(), 1, "{v}");
+    w.exports_open(&p).await;
+    let v = w.ok(M::GET, "/v1/pro/bot", &auth2, None, 200).await;
+    assert_eq!((v["enabled"].as_bool(), v["version"].as_i64()), (Some(true), Some(1)), "{v}");
+    assert_eq!(v["channels"].as_array().unwrap().len(), 3, "{v}");
+    let v = w.ok(M::GET, "/v1/pro/discord", &auth2, None, 200).await;
+    assert_eq!(v["guild"]["id"], GUILD, "{v}");
+    assert!(w.dc.roles_of(VIEWER).contains(ROLE_SUB), "the paused roles are back");
+    let v = w.ok(M::GET, "/v1/pro/history/email", &auth2, None, 200).await;
+    assert_eq!(v["status"], "on", "{v}");
+    w.ok(M::GET, "/r/v1/me", &p.phone, None, 200).await;
+    assert!(w.page_branded().await);
+
+    // Razorpay sends the activation again: nothing changes.
+    w.hook(&format!("evt_act_{sub2}"), &sub_event("subscription.activated", &sub2)).await;
+    w.hook("evt_act_again", &sub_event("subscription.activated", &sub2)).await;
+    assert!(crate::billing::carry::carry_over(&w.st, &sub2).await.from.is_empty(), "nothing left to move");
+    assert_eq!(rows_of(&w, &sub2), before);
+
+    // The cloud bot runs again for the new subscription.
+    w.hourly().await;
+    assert_eq!(w.st.db.bot_channel(&sub2, "twitch").unwrap().unwrap().subscriptions.len(), 3);
+
+    // The old subscription's day 30 passes: nothing of the streamer's is deleted or revoked.
+    w.st.db.c().execute("UPDATE pro_subs SET current_end = ?1 WHERE id = ?2", (now_ms() - 31 * DAY, &sub)).unwrap();
+    w.hourly().await;
+    assert_eq!(rows_of(&w, &sub2), before);
+    assert!(w.tw.with(|t| t.revoked.is_empty()) && w.kk.with(|k| k.revoked.is_empty()));
+    assert!(w.yt.with(|y| y.revoked.is_empty()));
+    assert!(w.dc.with(|d| d.joined.contains(GUILD)), "the Discord bot stays");
+    assert!(w.dc.roles_of(VIEWER).contains(ROLE_SUB));
+    w.exports_open(&p).await;
+}
+
+/// More than 30 days after the old subscription stopped, a new one takes nothing over (even
+/// before the hourly sweep has deleted it).
+#[tokio::test]
+async fn lapse_a_new_subscription_after_30_days_takes_nothing_over() {
+    let w = world().await;
+    let (auth, install, sub) = w.buy(None).await;
+    w.set_up_everything(&auth, &install, &sub).await;
+    let before = rows_of(&w, &sub);
+    w.razorpay_says(&sub, "subscription.cancelled", "cancelled", Some(-31)).await;
+    let (_, _, sub2) = w.buy(Some(auth.clone())).await;
+    assert!(rows_of(&w, &sub2).iter().all(|(_, n)| *n == 0), "{:?}", rows_of(&w, &sub2));
+    assert_eq!(rows_of(&w, &sub), before, "left for the sweep");
+    w.hourly().await;
+    // (A paired phone stays until its token expires; it can't reach anything.)
+    let gone = rows_of(&w, &sub);
+    assert!(gone.iter().filter(|(t, _)| *t != "remote_devices").all(|(_, n)| *n == 0), "{gone:?}");
+    assert!(rows_of(&w, &sub2).iter().all(|(_, n)| *n == 0));
+}
+
+/// Another person's install never pulls a lapsed subscription's data, even with the same
+/// checkout email; nor does a test (comp) grant on the owner's own install.
+#[tokio::test]
+async fn lapse_another_install_or_a_test_grant_never_takes_the_data() {
+    let w = world().await;
+    let (auth, install, sub) = w.buy(None).await;
+    w.set_up_everything(&auth, &install, &sub).await;
+    let before = rows_of(&w, &sub);
+    w.razorpay_says(&sub, "subscription.cancelled", "cancelled", Some(-1)).await;
+
+    // Someone else's PC buys Pro (with the same email, even).
+    let (auth_b, _, sub_b) = w.buy(None).await;
+    assert!(rows_of(&w, &sub_b).iter().all(|(_, n)| *n == 0), "{:?}", rows_of(&w, &sub_b));
+    let v = w.ok(M::GET, "/v1/pro/history", &auth_b, None, 200).await;
+    assert!(v["streams"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(rows_of(&w, &sub), before);
+
+    // A test grant on the owner's PC: not a target.
+    let g = w.st.db.comp_grant(&install, 5).unwrap();
+    assert!(crate::billing::carry::carry_over(&w.st, &g.sub_id).await.from.is_empty());
+    assert_eq!(rows_of(&w, &sub), before);
+    // A different checkout email from the same PC isn't taken as the same owner either.
+    w.st.db.comp_revoke(&install).unwrap();
+    w.st.db.c().execute("UPDATE pro_subs SET email_hash = 'other' WHERE id = ?1", [&sub]).unwrap();
+    let (_, _, sub2) = w.buy(Some(auth)).await;
+    assert!(rows_of(&w, &sub2).iter().all(|(_, n)| *n == 0));
+    assert_eq!(rows_of(&w, &sub), before);
+}
