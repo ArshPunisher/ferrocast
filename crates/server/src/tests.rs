@@ -441,7 +441,7 @@ async fn app_routes_have_the_dashboard_shapes() {
         assert!(stats.get(k).is_some(), "stats.{k}");
     }
     let up: Value = r.get("/api/v1/updates").await.json().await.unwrap();
-    assert_eq!(up["channel"], "stable");
+    assert_eq!(up["channel"], ferrocast_engine::update_channel(env!("CARGO_PKG_VERSION")));
     assert_eq!(up["blocked_while_live"], false);
     let status: Value = r.get("/api/v1/status").await.json().await.unwrap();
     assert_eq!(status["setup_done"], false);
@@ -458,7 +458,11 @@ async fn settings_save_what_was_sent_and_name_bad_fields() {
     let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
     assert_eq!((s["theme"].as_str(), s["close_to_tray"].as_bool()), (Some("dark"), Some(false)));
     assert_eq!(s["keep_chat_days"], 30, "fields that weren't sent are kept");
-    assert_eq!(s["update_channel"], "stable");
+    assert!(s.get("update_channel").is_none(), "the channel follows the build, not a setting");
+    // An older dashboard may still send it: accepted and ignored.
+    assert_eq!(r.put("/api/v1/settings", json!({ "update_channel": "beta" })).await.status(), StatusCode::OK);
+    let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+    assert!(s.get("update_channel").is_none());
     let bad = r.put("/api/v1/settings", json!({ "theme": "neon" })).await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let v: Value = bad.json().await.unwrap();

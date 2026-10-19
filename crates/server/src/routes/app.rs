@@ -48,12 +48,12 @@ pub async fn session_stats(State(app): State<AppState>) -> Json<Value> {
 /// Update state (API-REQUESTS R9): what the desktop found in the signed update feed. The
 /// dashboard must never offer an update while `blocked_while_live` (R-60).
 pub async fn updates(State(app): State<AppState>) -> Json<Value> {
-    let settings = app.engine.settings();
     let found = app.engine.available_update();
     Json(json!({
         "current": env!("CARGO_PKG_VERSION"),
         "latest": found.as_ref().map(|u| u.version.clone()),
-        "channel": settings.update_channel,
+        // Read-only: the installed build decides (a prerelease reads the beta feed).
+        "channel": ferrocast_engine::update_channel(env!("CARGO_PKG_VERSION")),
         "blocked_while_live": app.engine.update_blocked(),
         "notes_url": found.and_then(|u| u.notes_url),
     }))

@@ -14,6 +14,13 @@ pub struct AvailableUpdate {
     pub notes_url: Option<String>,
 }
 
+/// The update channel follows the installed build: a prerelease version (`0.1.0-beta.10`)
+/// reads the beta feed, which also carries newer stable releases, so a beta user lands on
+/// stable when it ships and stays there; a stable version reads only the stable feed.
+pub fn update_channel(version: &str) -> &'static str {
+    if version.contains('-') { "beta" } else { "stable" }
+}
+
 impl Engine {
     /// The desktop shell reports the feed's answer (`None`: up to date or no feed).
     pub fn set_available_update(&self, update: Option<AvailableUpdate>) {
@@ -66,5 +73,26 @@ impl Engine {
             NoticeLevel::Warn,
             &format!("The update couldn't be installed: {why}. Ferrocast keeps running the current version."),
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::update_channel;
+
+    #[test]
+    fn the_running_version_picks_the_channel() {
+        assert_eq!(update_channel("0.1.0-beta.10"), "beta");
+        assert_eq!(update_channel("1.2.0-rc.1"), "beta");
+        assert_eq!(update_channel("0.1.0"), "stable");
+        assert_eq!(update_channel("1.0.0"), "stable", "a beta user who updated to stable stays on stable");
+    }
+
+    #[test]
+    fn old_saved_settings_with_a_channel_still_load() {
+        let old = serde_json::json!({ "theme": "dark", "update_channel": "beta" });
+        let s: crate::EngineSettings = serde_json::from_value(old).unwrap();
+        assert_eq!(s.theme, "dark");
+        assert!(serde_json::to_value(&s).unwrap().get("update_channel").is_none());
     }
 }

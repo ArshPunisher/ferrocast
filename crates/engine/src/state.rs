@@ -33,8 +33,6 @@ pub struct EngineSettings {
     pub low_motion_overlays: bool,
     /// Let phones and tablets on this network open the dashboard (applies on next start).
     pub lan_access: bool,
-    /// "stable" or "beta".
-    pub update_channel: String,
     /// Never install an update while any platform is live (R-60).
     pub never_update_while_live: bool,
     pub launch_at_login: bool,
@@ -57,7 +55,6 @@ impl Default for EngineSettings {
             reduced_motion: "system".into(),
             low_motion_overlays: false,
             lan_access: false,
-            update_channel: "stable".into(),
             never_update_while_live: true,
             launch_at_login: false,
             close_to_tray: true,
@@ -123,7 +120,6 @@ impl EngineSettings {
         };
         one_of("theme", &self.theme, &["system", "dark", "light"])?;
         one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
-        one_of("update_channel", &self.update_channel, &["stable", "beta"])?;
         if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err("currency: a three-letter code like INR or USD.".into());
         }

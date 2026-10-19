@@ -164,17 +164,18 @@ const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Where to read about a release.
 const RELEASES_URL: &str = "https://github.com/ArshPunisher/ferrocast/releases";
 
-/// The signed feed and its manifest's endpoint; beta reads the newest pre-release too.
-fn update_feed(engine: &Engine) -> Option<String> {
-    match engine.settings().update_channel.as_str() {
+/// The signed feed for this build: a prerelease version reads the beta feed (betas and newer
+/// stable releases), a stable version only the stable one, so the installed build decides.
+fn update_feed() -> Option<String> {
+    match ferrocast_engine::update_channel(env!("CARGO_PKG_VERSION")) {
         "beta" => Some("https://github.com/ArshPunisher/ferrocast/releases/download/beta/latest.json".into()),
         _ => None, // stable: the endpoint in tauri.conf.json
     }
 }
 
-async fn check_update(app: &AppHandle, engine: &Engine) -> Option<tauri_plugin_updater::Update> {
+async fn check_update(app: &AppHandle) -> Option<tauri_plugin_updater::Update> {
     let mut builder = app.updater_builder();
-    if let Some(feed) = update_feed(engine)
+    if let Some(feed) = update_feed()
         && let Ok(url) = feed.parse()
     {
         builder = match builder.endpoints(vec![url]) {
@@ -206,7 +207,7 @@ async fn check_update(app: &AppHandle, engine: &Engine) -> Option<tauri_plugin_u
 async fn keep_updated(app: AppHandle, engine: Engine) {
     tokio::time::sleep(UPDATE_FIRST).await;
     loop {
-        let found = check_update(&app, &engine).await.map(|u| ferrocast_engine::AvailableUpdate {
+        let found = check_update(&app).await.map(|u| ferrocast_engine::AvailableUpdate {
             notes_url: Some(format!("{RELEASES_URL}/tag/v{}", u.version)),
             version: u.version,
         });
@@ -220,7 +221,7 @@ async fn keep_updated(app: AppHandle, engine: Engine) {
 async fn install_when_asked(app: AppHandle, engine: Engine) {
     loop {
         engine.update_install_requested().await;
-        let Some(update) = check_update(&app, &engine).await else {
+        let Some(update) = check_update(&app).await else {
             engine.update_failed("the update is no longer available");
             engine.set_available_update(None);
             continue;

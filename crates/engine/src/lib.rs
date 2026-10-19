@@ -40,7 +40,7 @@ mod starter;
 pub mod studio;
 mod timers;
 mod updates;
-pub use updates::AvailableUpdate;
+pub use updates::{AvailableUpdate, update_channel};
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
 mod weekly_email;
