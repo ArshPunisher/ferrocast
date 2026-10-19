@@ -31,12 +31,12 @@ fn shell(status: StatusCode, title: &str, body: &str) -> Response {
     let html = format!(
         "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <meta name=robots content=noindex><title>{t} · Ferrocast</title>\
-         <style>:root{{color-scheme:dark light;--bg:#0a0b0d;--card:#101216;--line:#252a31;--text:#eef0f4;--muted:#b3b9c4;--accent:#ffa424;--on:#120a00;--ring:#33d4ff}}\
-         @media (prefers-color-scheme:light){{:root{{--bg:#f2f3f6;--card:#fff;--line:#dfe2e8;--text:#0e1014;--muted:#424854;--accent:#cf7400;--on:#0a0600;--ring:#05678c}}}}\
+         <style>:root{{color-scheme:dark light;--bg:#0a0b0d;--card:#101216;--line:#252a31;--text:#eef0f4;--muted:#b3b9c4;--btn:#b35900;--btn-hover:#9e4f00;--on:#ffffff;--ring:#33d4ff}}\
+         @media (prefers-color-scheme:light){{:root{{--bg:#f2f3f6;--card:#fff;--line:#dfe2e8;--text:#0e1014;--muted:#424854;--ring:#05678c}}}}\
          body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;box-sizing:border-box;background:var(--bg);color:var(--text);font:17px/1.5 system-ui,sans-serif}}\
          main{{width:100%;max-width:460px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px;box-sizing:border-box}}\
          h1{{font-size:1.6rem;line-height:1.2;margin:0 0 12px;letter-spacing:-.02em;overflow-wrap:anywhere}}p{{margin:0 0 12px}}.muted{{color:var(--muted);font-size:.94rem}}\
-         form{{margin:20px 0 8px}}button{{min-height:48px;padding:0 24px;border:0;border-radius:10px;background:var(--accent);color:var(--on);font:700 1rem system-ui,sans-serif;cursor:pointer}}\
+         form{{margin:20px 0 8px}}button{{min-height:48px;padding:0 24px;border:0;border-radius:10px;background:var(--btn);color:var(--on);font:700 1rem system-ui,sans-serif;cursor:pointer}}button:hover{{background:var(--btn-hover)}}\
          button:focus-visible{{outline:2px solid var(--ring);outline-offset:3px}}</style>\
          <main><h1>{t}</h1>{body}</main></html>",
         t = esc(title),

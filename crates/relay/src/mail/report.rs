@@ -328,7 +328,7 @@ pub fn confirm(link: &str) -> Rendered {
          <tr><td style=\"padding:28px 24px\">\
          <h1 style=\"margin:0 0 12px;{font};font-size:24px;line-height:30px;font-weight:800;color:#14161b\">Confirm your weekly email</h1>\
          <p style=\"margin:0 0 20px;{font};font-size:16px;line-height:24px;color:#14161b\">Press the button, then Confirm, to get a short report of your streams once a week.</p>\
-         <a href=\"{link_e}\" style=\"display:inline-block;padding:14px 22px;border-radius:10px;background:#cf7400;color:#0a0600;{font};font-size:16px;font-weight:700;text-decoration:none\">Confirm my email</a>\
+         <a href=\"{link_e}\" style=\"display:inline-block;padding:14px 22px;border-radius:10px;background:#b35900;color:#ffffff;{font};font-size:16px;font-weight:700;text-decoration:none\">Confirm my email</a>\
          <p style=\"margin:20px 0 0;{font};font-size:13px;line-height:19px;color:#4a505b\">The link works for 24 hours. Didn't ask for this? Ignore this email: nothing is sent without the confirm.</p>\
          </td></tr></table></td></tr></table></body></html>",
         link_e = esc(link),
