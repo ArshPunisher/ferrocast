@@ -1,5 +1,6 @@
 //! Ferrocast Pro F2, the dashboard from anywhere (docs/plan/PRO.md F2, milestone M6;
-//! API.md §9.5). Online proxy only: the streaming PC must be on (offline mode is M10).
+//! API.md §9.5). Through the PC's tunnel while it's on; while it's off the relay answers chat,
+//! moderation (by the cloud bot), history and the cloud bot's switch itself (`offline`, M10).
 //!
 //! - The PC keeps an outbound WebSocket here, `/v1/remote/tunnel` (install `Authorization`,
 //!   Pro), separate from `/v1/link`, while Pro is on and a phone is paired (`tunnel`).
@@ -17,6 +18,9 @@
 
 mod app;
 pub(crate) mod limits;
+mod offline;
+#[cfg(test)]
+mod offline_tests;
 mod proxy;
 pub mod scope;
 mod store;
@@ -37,7 +41,8 @@ use axum::routing::{any, delete, get, post};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-pub(crate) use store::SCHEMA;
+pub(crate) use offline::{cloud_changed, cloud_chat};
+pub(crate) use store::{SCHEMA, SCHEMA_SOURCE};
 
 use crate::billing::gate::require_pro;
 use crate::quota::Limit;
@@ -159,6 +164,10 @@ pub struct Runtime {
     pub(crate) cfg: RemoteConfig,
     tunnels: Mutex<HashMap<String, Arc<tunnel::Tunnel>>>,
     phones: Mutex<HashMap<String, Vec<proxy::Phone>>>,
+    /// The installs with open phone sockets per subscription (for the cloud's offline frames,
+    /// so a chat line doesn't scan every phone on the relay). Added on open, cleaned lazily
+    /// when a look finds the install's phones gone; when both are held, `phones` is locked first.
+    phone_subs: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     limits: Mutex<limits::Limits>,
     /// Unused live tickets: hash → (device id, expiry).
     tickets: Mutex<HashMap<String, (String, i64)>>,

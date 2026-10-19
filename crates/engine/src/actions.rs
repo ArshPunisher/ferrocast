@@ -294,6 +294,7 @@ impl Engine {
             display_name: display_name.unwrap_or(login).to_string(),
             everywhere,
             by: None,
+            offline: false,
         };
         if everywhere {
             let (p, uid) = (platform, user_id.to_string());
@@ -324,6 +325,53 @@ impl Engine {
         self.db(move |s| repo::bot::save_ban_list(s, &saved)).await?;
         self.state_mut().bans = list;
         Ok(out)
+    }
+
+    /// A `cloud_moderation` item from the link (API.md §9.5 Offline): a phone banned or timed
+    /// out someone through the cloud bot while this PC was off. The platform already took it,
+    /// so it's only recorded here, as if done on this PC: a ban joins the shared list (marked
+    /// `offline`, by the mod's name; Unban works as usual), a timeout counts on the viewer's
+    /// card. The link resends an item until it's acked, and a ban already on the list isn't
+    /// added twice.
+    pub(crate) async fn apply_cloud_moderation(&self, payload: &serde_json::Value) {
+        let platform = match payload["platform"].as_str() {
+            Some("twitch") => Platform::Twitch,
+            Some("kick") => Platform::Kick,
+            _ => return,
+        };
+        let Some(user_id) = payload["target_id"].as_str().filter(|s| !s.is_empty()) else { return };
+        let text = |k: &str| {
+            payload[k].as_str().filter(|s| !s.trim().is_empty()).map(|s| s.chars().take(500).collect::<String>())
+        };
+        match payload["action"].as_str() {
+            Some("ban") => {
+                let login = text("target_login").unwrap_or_else(|| user_id.to_string());
+                let entry = BanEntry {
+                    platform,
+                    user_id: Some(user_id.to_string()),
+                    display_name: text("target_name").unwrap_or_else(|| login.clone()),
+                    login,
+                    reason: text("reason"),
+                    at: payload["at"].as_i64().filter(|a| *a > 0).map_or_else(now, Millis),
+                    linked: Vec::new(),
+                    everywhere: false,
+                    // A mod's phone names the mod; the streamer's own phone is the streamer.
+                    by: if payload["by_role"] == "mod" { text("by_device") } else { None },
+                    offline: true,
+                };
+                let _one_at_a_time = self.config_lock().await;
+                let mut list = self.state().bans.clone();
+                list.add(entry);
+                let saved = list.clone();
+                if let Err(err) = self.db(move |s| repo::bot::save_ban_list(s, &saved)).await {
+                    tracing::warn!(%err, "couldn't record a ban made from a phone");
+                    return;
+                }
+                self.state_mut().bans = list;
+            }
+            Some("timeout") => self.count_timeout(platform, user_id).await,
+            other => tracing::debug!(action = ?other, "ignored a cloud moderation item"),
+        }
     }
 
     pub async fn unban(&self, platform: Platform, user_id: &str) -> Result<(), EngineError> {

@@ -41,6 +41,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "Pro cloud bot: channels, sealed sign-ins, config, counter changes",
         sql: &[crate::bot::SCHEMA],
     },
+    Migration { version: 11, name: "Pro offline remote mode: audit source", sql: &[crate::remote::SCHEMA_SOURCE] },
 ];
 
 pub(crate) fn latest() -> i64 {

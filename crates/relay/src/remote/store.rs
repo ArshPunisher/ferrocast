@@ -17,6 +17,13 @@ CREATE INDEX IF NOT EXISTS remote_audit_install_at ON remote_audit(install_id, a
 CREATE INDEX IF NOT EXISTS remote_audit_at ON remote_audit(at);
 ";
 
+/// Migration 11 (M10): where a change from a phone was answered, `pc` (the streaming PC,
+/// through its tunnel) or `cloud` (the relay itself while the PC is off). Older relays write
+/// rows without it and get `pc`.
+pub(crate) const SCHEMA_SOURCE: &str = "
+ALTER TABLE remote_audit ADD COLUMN source TEXT NOT NULL DEFAULT 'pc';
+";
+
 /// One paired phone or browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Device {
@@ -39,6 +46,8 @@ pub(crate) struct AuditRow {
     pub action: String,
     pub status: i64,
     pub at: i64,
+    /// `pc` or `cloud` (answered by the relay while the PC was off).
+    pub source: String,
 }
 
 /// A pairing code that was taken (and is now gone).
@@ -188,9 +197,25 @@ impl Db {
         status: u16,
         at: i64,
     ) -> rusqlite::Result<()> {
+        self.remote_audit_from(sub, install, device_id, device_name, action, status, at, "pc")
+    }
+
+    /// An audit line with where it was answered (`pc` or `cloud`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn remote_audit_from(
+        &self,
+        sub: &str,
+        install: &str,
+        device_id: &str,
+        device_name: &str,
+        action: &str,
+        status: u16,
+        at: i64,
+        source: &str,
+    ) -> rusqlite::Result<()> {
         self.c().execute(
-            "INSERT INTO remote_audit(sub_id, install_id, device_id, device_name, action, status, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![sub, install, device_id, device_name, action, i64::from(status), at],
+            "INSERT INTO remote_audit(sub_id, install_id, device_id, device_name, action, status, at, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![sub, install, device_id, device_name, action, i64::from(status), at, source],
         )?;
         Ok(())
     }
@@ -199,7 +224,7 @@ impl Db {
     pub(crate) fn remote_audit_list(&self, install: &str, limit: i64) -> rusqlite::Result<Vec<AuditRow>> {
         let c = self.c();
         let mut q = c.prepare(
-            "SELECT device_id, device_name, action, status, at FROM remote_audit WHERE install_id = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
+            "SELECT device_id, device_name, action, status, at, source FROM remote_audit WHERE install_id = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
         )?;
         q.query_map(params![install, limit], |r| {
             Ok(AuditRow {
@@ -208,6 +233,7 @@ impl Db {
                 action: r.get(2)?,
                 status: r.get(3)?,
                 at: r.get(4)?,
+                source: r.get(5)?,
             })
         })?
         .collect()

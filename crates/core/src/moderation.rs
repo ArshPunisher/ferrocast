@@ -154,6 +154,10 @@ pub struct BanEntry {
     /// Who banned them: a mod's name, or `None` for the streamer or an automatic rule.
     #[serde(default)]
     pub by: Option<String>,
+    /// Banned from a phone while this PC was off (the cloud bot did it, Pro M10): the PC
+    /// recorded it when it came back.
+    #[serde(default)]
+    pub offline: bool,
 }
 
 /// The shared ban list across platforms.
@@ -271,6 +275,7 @@ mod tests {
             display_name: login.into(),
             everywhere: false,
             by: None,
+            offline: false,
         }
     }
 

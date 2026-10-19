@@ -21,19 +21,26 @@ use crate::billing::store::Synced;
 use crate::{Config, Db, router};
 
 const DAY: i64 = 86_400_000;
-const ES_SECRET: &str = "eventsub-secret-SECRET-123";
-const BOT_ID: &str = "500000001";
-const STREAMER_ID: &str = "141981764";
-const KICK_STREAMER: &str = "668";
-const KICK_BOT: &str = "9001";
+pub(crate) const ES_SECRET: &str = "eventsub-secret-SECRET-123";
+pub(crate) const BOT_ID: &str = "500000001";
+pub(crate) const STREAMER_ID: &str = "141981764";
+pub(crate) const KICK_STREAMER: &str = "668";
+pub(crate) const KICK_BOT: &str = "9001";
 /// The desktop app's token for the streamer's account (what the PC sends with `connect`).
-const DESK: &str = "desk-token";
-const DESKTOP_APP: &str = "desktop-client";
+pub(crate) const DESK: &str = "desk-token";
+pub(crate) const DESKTOP_APP: &str = "desktop-client";
 
 // ── Fakes ────────────────────────────────────────────────────────────────────────────
 
+/// A Twitch moderation call: (what, user token, broadcaster, moderator, user or message,
+/// seconds, reason).
+pub(crate) type TwitchMod = (String, String, String, String, String, Option<u32>, Option<String>);
+/// A Kick moderation call: (what, access token, broadcaster or "", user or message, minutes,
+/// reason).
+pub(crate) type KickMod = (String, String, String, String, Option<u32>, Option<String>);
+
 #[derive(Debug, Default)]
-struct Tw {
+pub(crate) struct Tw {
     /// code → (tokens, who)
     codes: HashMap<String, (UserTokens, TokenInfo)>,
     /// access token → who (for validate)
@@ -46,7 +53,7 @@ struct Tw {
     conduits: u32,
     /// The conduit Twitch hands back (`conduit-1` unless set).
     conduit_id: Option<String>,
-    refresh_fails: bool,
+    pub(crate) refresh_fails: bool,
     send_fails: Option<TwitchError>,
     /// Send Chat Message gives no message id.
     no_ids: bool,
@@ -57,13 +64,22 @@ struct Tw {
     /// Get Streams: live since.
     live: Option<i64>,
     app_tokens: u32,
+    /// Moderation calls (M10): (what, user token, broadcaster, moderator, user or message,
+    /// seconds, reason).
+    pub(crate) mods: Vec<TwitchMod>,
+    /// The next moderation calls fail with this.
+    pub(crate) mod_fails: Option<TwitchError>,
+    /// Refreshes asked for.
+    pub(crate) refreshes: u32,
+    /// How long a refresh takes (0: at once), so refreshes at the same time overlap.
+    pub(crate) refresh_delay_ms: u64,
 }
 
 #[derive(Debug, Default)]
-struct FakeTwitch(Mutex<Tw>);
+pub(crate) struct FakeTwitch(Mutex<Tw>);
 
 impl FakeTwitch {
-    fn with<T>(&self, f: impl FnOnce(&mut Tw) -> T) -> T {
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&mut Tw) -> T) -> T {
         f(&mut self.0.lock().unwrap())
     }
     fn sent(&self) -> Vec<String> {
@@ -86,7 +102,12 @@ impl TwitchCloud for FakeTwitch {
     }
     fn refresh<'a>(&'a self, refresh_token: &'a str) -> Fut<'a, UserTokens, TwitchError> {
         Box::pin(async move {
+            let delay = self.with(|t| t.refresh_delay_ms);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             self.with(|t| {
+                t.refreshes += 1;
                 if t.refresh_fails {
                     return Err(TwitchError::Unauthorized);
                 }
@@ -187,10 +208,56 @@ impl TwitchCloud for FakeTwitch {
     fn stream_started<'a>(&'a self, _app: &'a str, _broadcaster: &'a str) -> Fut<'a, Option<i64>, TwitchError> {
         Box::pin(async move { Ok(self.with(|t| t.live)) })
     }
+    fn ban<'a>(&'a self, user: &'a str, target: ModTarget<'a>, seconds: Option<u32>) -> Fut<'a, (), TwitchError> {
+        Box::pin(async move {
+            assert_ne!(user, "app-token", "moderation needs the bot account's own token");
+            self.with(|t| {
+                if let Some(e) = t.mod_fails.clone() {
+                    return Err(e);
+                }
+                let what = if seconds.is_some() { "timeout" } else { "ban" };
+                t.mods.push((
+                    what.into(),
+                    user.into(),
+                    target.broadcaster.into(),
+                    target.moderator.into(),
+                    target.user_id.into(),
+                    seconds,
+                    target.reason.map(String::from),
+                ));
+                Ok(())
+            })
+        })
+    }
+    fn delete_message<'a>(
+        &'a self,
+        user: &'a str,
+        target: ModTarget<'a>,
+        message_id: &'a str,
+    ) -> Fut<'a, (), TwitchError> {
+        Box::pin(async move {
+            assert_ne!(user, "app-token", "moderation needs the bot account's own token");
+            self.with(|t| {
+                if let Some(e) = t.mod_fails.clone() {
+                    return Err(e);
+                }
+                t.mods.push((
+                    "delete".into(),
+                    user.into(),
+                    target.broadcaster.into(),
+                    target.moderator.into(),
+                    message_id.into(),
+                    None,
+                    None,
+                ));
+                Ok(())
+            })
+        })
+    }
 }
 
 #[derive(Debug, Default)]
-struct Kk {
+pub(crate) struct Kk {
     sent: Vec<(String, String, String, Option<String>)>,
     refreshed: u32,
     /// Refreshes started (before any wait).
@@ -201,13 +268,17 @@ struct Kk {
     wait: Option<Arc<tokio::sync::Notify>>,
     revoked: Vec<String>,
     send_fails: Option<KickError>,
+    /// Moderation calls (M10): (what, access token, broadcaster or "", user or message,
+    /// minutes, reason).
+    pub(crate) mods: Vec<KickMod>,
+    pub(crate) mod_fails: Option<KickError>,
 }
 
 #[derive(Debug, Default)]
-struct FakeKick(Mutex<Kk>);
+pub(crate) struct FakeKick(Mutex<Kk>);
 
 impl FakeKick {
-    fn with<T>(&self, f: impl FnOnce(&mut Kk) -> T) -> T {
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&mut Kk) -> T) -> T {
         f(&mut self.0.lock().unwrap())
     }
 }
@@ -263,10 +334,47 @@ impl KickBot for FakeKick {
             Ok(())
         })
     }
+    fn ban<'a>(
+        &'a self,
+        access: &'a str,
+        broadcaster: &'a str,
+        user: &'a str,
+        minutes: Option<u32>,
+        reason: Option<&'a str>,
+    ) -> Fut<'a, (), KickError> {
+        Box::pin(async move {
+            self.with(|k| {
+                if let Some(e) = k.mod_fails.clone() {
+                    return Err(e);
+                }
+                let what = if minutes.is_some() { "timeout" } else { "ban" };
+                k.mods.push((
+                    what.into(),
+                    access.into(),
+                    broadcaster.into(),
+                    user.into(),
+                    minutes,
+                    reason.map(String::from),
+                ));
+                Ok(())
+            })
+        })
+    }
+    fn delete_message<'a>(&'a self, access: &'a str, message_id: &'a str) -> Fut<'a, (), KickError> {
+        Box::pin(async move {
+            self.with(|k| {
+                if let Some(e) = k.mod_fails.clone() {
+                    return Err(e);
+                }
+                k.mods.push(("delete".into(), access.into(), String::new(), message_id.into(), None, None));
+                Ok(())
+            })
+        })
+    }
 }
 
 /// Kick's own OAuth and users endpoints, on loopback (the relay's existing broker calls them).
-async fn fake_kick_web() -> String {
+pub(crate) async fn fake_kick_web() -> String {
     use axum::routing::{get, post};
     let app = axum::Router::new()
         .route(
@@ -285,18 +393,18 @@ async fn fake_kick_web() -> String {
     base
 }
 
-fn twitch_cfg() -> TwitchConfig {
+pub(crate) fn twitch_cfg() -> TwitchConfig {
     TwitchConfig::from_values(Some("cloud-client".into()), Some("cloud-secret-SECRET".into()), Some(ES_SECRET.into()))
         .unwrap()
         .unwrap()
         .with_desktop_client_id(Some(DESKTOP_APP.into()))
 }
 
-fn vault() -> crate::vault::Vault {
+pub(crate) fn vault() -> crate::vault::Vault {
     crate::vault::Vault::from_base64(&base64::engine::general_purpose::STANDARD.encode([9u8; 32])).unwrap()
 }
 
-fn who(id: &str, login: &str, client: &str) -> TokenInfo {
+pub(crate) fn who(id: &str, login: &str, client: &str) -> TokenInfo {
     TokenInfo { user_id: id.into(), login: login.into(), scopes: vec![], client_id: client.into() }
 }
 
@@ -1806,4 +1914,77 @@ fn migration_10_has_the_kv_table() {
     db.bot_put_kv("k", "v2").unwrap();
     assert_eq!(db.bot_kv("k").unwrap().as_deref(), Some("v2"));
     assert_eq!(db.bot_kv("missing").unwrap(), None);
+}
+
+// ── The moderation opt-in (M10) ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_moderation_opt_in_signs_the_twitch_bot_in_again_and_keeps_the_channel() {
+    let w = world().await;
+    let auth = w.pro("i1", "sub_1");
+    let sub = w.sub_of("i1");
+    w.connect_twitch(&auth).await;
+    w.enable(&auth, true).await;
+    assert!(!w.channel(&sub, "twitch").moderation);
+    // Without the opt-in another bot sign-in is still refused.
+    let a = w.post("/v1/pro/bot/twitch/connect", &auth, json!({ "account": "bot", "owner_token": DESK })).await;
+    assert_eq!((a.status, a.code().as_str()), (409, "already_connected"));
+    let a = w
+        .post("/v1/pro/bot/twitch/connect", &auth, json!({ "account": "bot", "moderation": true, "owner_token": DESK }))
+        .await;
+    assert_eq!(a.status, 201, "{}", a.text);
+    let url = url::Url::parse(a.json()["auth_url"].as_str().unwrap()).unwrap();
+    let scope = url.query_pairs().find(|(k, _)| k == "scope").unwrap().1.to_string();
+    for s in twitch::BOT_SCOPES.iter().chain(twitch::MOD_SCOPES) {
+        assert!(scope.split(' ').any(|x| x == *s), "{s} in {scope}");
+    }
+    let state = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
+    let scopes: Vec<&str> = twitch::BOT_SCOPES.iter().chain(twitch::MOD_SCOPES).copied().collect();
+    let a = w.finish(&state, "rt-bot-mod", (BOT_ID, "ashabot"), &scopes).await;
+    assert_eq!(a.status, 200, "{}", a.text);
+    let ch = w.channel(&sub, "twitch");
+    assert!(ch.moderation, "the moderator scopes were granted");
+    assert_eq!(ch.channel_id.as_deref(), Some(STREAMER_ID), "the channel stays allowed");
+    assert!(ch.scopes.contains("moderator:manage:chat_messages"));
+    assert!(ch.ready());
+    assert!(w.tw.with(|t| t.revoked.contains(&format!("at-from-rt-bot-{BOT_ID}"))), "the old sign-in is revoked");
+    assert_eq!(open_token(&w.state, &sub, "twitch", "bot").as_deref(), Some("rt-bot-mod"));
+    assert_eq!(w.view(&auth).await["channels"][0]["moderation"], true);
+    // Once it's on, asking again is the usual 409.
+    let a = w
+        .post("/v1/pro/bot/twitch/connect", &auth, json!({ "account": "bot", "moderation": true, "owner_token": DESK }))
+        .await;
+    assert_eq!((a.status, a.code().as_str()), (409, "already_connected"));
+    // Declining the extra scopes changes nothing.
+    let w2 = world().await;
+    let auth2 = w2.pro("i2", "sub_2");
+    w2.connect_twitch(&auth2).await;
+    let state = w2.start(&auth2, json!({ "account": "bot", "moderation": true, "owner_token": DESK })).await;
+    let a = w2.finish(&state, "rt-x", (BOT_ID, "ashabot"), twitch::BOT_SCOPES).await;
+    assert_eq!(a.status, 400, "{}", a.text);
+    assert!(!w2.channel(&w2.sub_of("i2"), "twitch").moderation);
+}
+
+#[tokio::test]
+async fn the_moderation_opt_in_signs_the_kick_bot_in_again() {
+    let w = world().await;
+    let auth = w.pro("i1", "sub_1");
+    let sub = w.sub_of("i1");
+    let a = w.connect_kick(&auth, "i1").await;
+    assert_eq!(a.status, 200, "{}", a.text);
+    assert!(!w.channel(&sub, "kick").moderation);
+    let a = w.post("/v1/pro/bot/kick/connect", &auth, json!({})).await;
+    assert_eq!((a.status, a.code().as_str()), (409, "already_connected"));
+    let a = w.post("/v1/pro/bot/kick/connect", &auth, json!({ "moderation": true })).await;
+    assert_eq!(a.status, 201, "{}", a.text);
+    let url = url::Url::parse(a.json()["auth_url"].as_str().unwrap()).unwrap();
+    let scope = url.query_pairs().find(|(k, _)| k == "scope").unwrap().1.to_string();
+    assert!(scope.contains("moderation:ban") && scope.contains("moderation:chat_message:manage"), "{scope}");
+    let state = url.query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
+    let a = w.page(&format!("/v1/kick/callback?code=kc&state={}", enc(&state))).await;
+    assert_eq!(a.status, 200, "{}", a.text);
+    let ch = w.channel(&sub, "kick");
+    assert!(ch.moderation);
+    assert!(ch.scopes.split(' ').any(|s| s == "moderation:chat_message:manage"), "{}", ch.scopes);
+    assert_eq!(ch.channel_id.as_deref(), Some(KICK_STREAMER));
 }

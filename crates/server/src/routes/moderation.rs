@@ -154,6 +154,8 @@ pub async fn bans(State(app): State<AppState>) -> Json<Value> {
                 "banned_at": e.at.0,
                 "everywhere": e.everywhere,
                 "by": e.by,
+                // Done from a phone through the cloud bot while this PC was off (M10).
+                "offline": e.offline,
             })
         })
         .collect();

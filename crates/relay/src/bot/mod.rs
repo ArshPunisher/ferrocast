@@ -20,10 +20,11 @@
 
 pub(crate) mod kick;
 mod lease;
+pub(crate) mod moderate;
 pub(crate) mod store;
 #[cfg(test)]
-mod tests;
-mod twitch;
+pub(crate) mod tests;
+pub(crate) mod twitch;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -51,7 +52,7 @@ use tokio::time::Instant;
 pub use kick::{HttpKick, KickBot, KickError, KickTokens};
 pub use lease::{Lease, TAKEOVER_AFTER, Who};
 pub(crate) use store::SCHEMA;
-pub use twitch::{HttpTwitch, TokenInfo, TwitchCloud, TwitchError, UserTokens};
+pub use twitch::{HttpTwitch, ModTarget, TokenInfo, TwitchCloud, TwitchError, UserTokens};
 
 use crate::billing::gate::{ProCtx, require_pro};
 use crate::db::Db;
@@ -172,12 +173,15 @@ pub(crate) enum SendErr {
     Unavailable(String),
 }
 
-/// One chat line in memory (R-51: never written anywhere).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One chat line in memory (R-51: never written anywhere). `event` is the line as the
+/// dashboard's chat shows it (without the platform's raw payload), for the phone's offline
+/// chat (M10).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ChatLine {
     pub at: i64,
     pub user: String,
     pub text: String,
+    pub event: Arc<Event>,
 }
 
 /// What the cloud sent on a channel lately: message ids, and texts with when (for an echo
@@ -276,8 +280,12 @@ pub struct Runtime {
     app_token: tokio::sync::Mutex<Option<(String, Instant)>>,
     conduit: tokio::sync::Mutex<Option<String>>,
     kick_access: Mutex<HashMap<String, (String, i64)>>,
+    /// The Twitch bot account's own access token per subscription, for moderation (M10).
+    twitch_user: Mutex<HashMap<String, (String, i64)>>,
     /// One Kick refresh at a time per subscription.
     kick_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One Twitch user-token refresh at a time per subscription (moderation, M10).
+    twitch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     twitch_work: Work,
     kick_work: Work,
     /// Bad EventSub signatures: (the minute of the last warning, how many since).
@@ -317,7 +325,9 @@ impl Runtime {
             app_token: tokio::sync::Mutex::default(),
             conduit: tokio::sync::Mutex::default(),
             kick_access: Mutex::default(),
+            twitch_user: Mutex::default(),
             kick_locks: Mutex::default(),
+            twitch_locks: Mutex::default(),
             twitch_work: Work::default(),
             kick_work: Work::default(),
             bad_sig: Mutex::default(),
@@ -460,6 +470,33 @@ impl Runtime {
         }
     }
 
+    /// The bot account's cached Twitch access token (for moderation), if it lasts a minute more.
+    pub(crate) fn twitch_user(&self, sub: &str, now: i64) -> Option<String> {
+        let m = self.twitch_user.lock().unwrap_or_else(|p| p.into_inner());
+        m.get(sub).filter(|(_, until)| now < until - 60_000).map(|(t, _)| t.clone())
+    }
+
+    pub(crate) fn cache_twitch_user(&self, sub: &str, token: &str, until: i64) {
+        self.twitch_user.lock().unwrap_or_else(|p| p.into_inner()).insert(sub.to_string(), (token.to_string(), until));
+    }
+
+    pub(crate) fn forget_twitch_user(&self, sub: &str) {
+        self.twitch_user.lock().unwrap_or_else(|p| p.into_inner()).remove(sub);
+    }
+
+    /// Forgets the cached token only if it's still `token` (Twitch refused it; a newer one
+    /// another request got meanwhile stays).
+    pub(crate) fn forget_twitch_user_if(&self, sub: &str, token: &str) {
+        let mut m = self.twitch_user.lock().unwrap_or_else(|p| p.into_inner());
+        if m.get(sub).is_some_and(|(t, _)| t == token) {
+            m.remove(sub);
+        }
+    }
+
+    pub(crate) fn twitch_lock(&self, sub: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.twitch_locks.lock().unwrap_or_else(|p| p.into_inner()).entry(sub.to_string()).or_default().clone()
+    }
+
     pub(crate) fn kick_lock(&self, sub: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.kick_locks.lock().unwrap_or_else(|p| p.into_inner()).entry(sub.to_string()).or_default().clone()
     }
@@ -480,8 +517,12 @@ impl Runtime {
         match platform {
             None => {
                 m.remove(sub);
+                self.forget_twitch_user(sub);
             }
             Some(p) => {
+                if p == Platform::Twitch {
+                    self.forget_twitch_user(sub);
+                }
                 if let Some(s) = m.get_mut(sub) {
                     s.brains.remove(&p);
                     s.ring.remove(&p);
@@ -951,6 +992,26 @@ async fn put_enabled(
 ) -> Result<Response, ApiError> {
     let ctx = pro(&st, &headers).await?;
     let b: EnabledIn = json_body(&headers, &body, true)?;
+    Ok(no_store(set_enabled(&st, &ctx, b.enabled).await?))
+}
+
+/// `PUT /r/api/v1/pro/bot/enabled` from a phone while the PC is off (M10): the same switch,
+/// answered by the relay itself (the bot's own rate, then the body).
+pub(crate) async fn phone_set_enabled(
+    st: &AppState,
+    ctx: &ProCtx,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Value, ApiError> {
+    take_rate(st, &ctx.sub_id)?;
+    let b: EnabledIn = json_body(headers, body, true)?;
+    set_enabled(st, ctx, b.enabled).await
+}
+
+/// Switches the cloud bot on or off for `ctx`'s subscription; the view.
+async fn set_enabled(st: &AppState, ctx: &ProCtx, enabled: bool) -> Result<Value, ApiError> {
+    let st = st.clone();
+    let b = EnabledIn { enabled };
     let channels = st.db.bot_channels(&ctx.sub_id).map_err(ApiError::db)?;
     if b.enabled {
         if !channels.iter().any(store::Channel::ready) {
@@ -985,7 +1046,79 @@ async fn put_enabled(
             });
         }
     }
-    Ok(no_store(view(&st, &ctx.sub_id, &ctx.install)?))
+    // Phones of a PC that's off hear whether chat and bans still work.
+    crate::remote::cloud_changed(&st, &ctx.sub_id);
+    view(&st, &ctx.sub_id, &ctx.install)
+}
+
+/// Whether the cloud bot can stand in for a PC that's off (M10): `on` when it's switched on
+/// with a ready channel and Pro, `paused` when a ready channel is there but it's switched off;
+/// `moderation`: per platform, whether it can ban, time out and delete there (only while
+/// `on`, with the opt-in and every moderator scope granted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CloudState {
+    pub on: bool,
+    pub paused: bool,
+    pub moderation: ModCaps,
+}
+
+/// Where the cloud bot can moderate (`cloud_moderation` on `/r/v1/me` and the `remote` frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ModCaps {
+    pub twitch: bool,
+    pub kick: bool,
+}
+
+impl ModCaps {
+    /// Bans work on at least one platform.
+    pub(crate) fn any(self) -> bool {
+        self.twitch || self.kick
+    }
+
+    pub(crate) fn json(self) -> Value {
+        json!({ "twitch": self.twitch, "kick": self.kick })
+    }
+}
+
+/// The opt-in with every moderator scope the platform needs (bans, timeouts and deletes).
+pub(crate) fn can_moderate(c: &store::Channel, platform: Platform) -> bool {
+    let needed: &[&str] = match platform {
+        Platform::Twitch => twitch::MOD_SCOPES,
+        Platform::Kick => kick::MOD_SCOPES,
+        _ => return false,
+    };
+    c.moderation && needed.iter().all(|n| c.scopes.split_whitespace().any(|s| s == *n))
+}
+
+pub(crate) fn cloud_state(st: &AppState, sub: &str) -> CloudState {
+    if !available(st) || !sub_is_pro(&st.db, sub) {
+        return CloudState::default();
+    }
+    let channels = st.db.bot_channels(sub).unwrap_or_default();
+    let usable: Vec<(Platform, &store::Channel)> = channels
+        .iter()
+        .filter(|c| c.ready())
+        .filter_map(|c| platform_from_key(&c.platform).filter(|p| st.bot.has(*p)).map(|p| (p, c)))
+        .collect();
+    let ready = !usable.is_empty();
+    let enabled = st.db.bot_config(sub).ok().flatten().is_some_and(|r| r.enabled);
+    let on = ready && enabled;
+    let can = |want: Platform| on && usable.iter().any(|(p, c)| *p == want && can_moderate(c, want));
+    CloudState {
+        on,
+        paused: ready && !enabled,
+        moderation: ModCaps { twitch: can(Platform::Twitch), kick: can(Platform::Kick) },
+    }
+}
+
+/// The last chat lines the cloud kept for `sub` (every platform, oldest first, at most
+/// `limit`), as the dashboard's chat shows them: the phone's chat while the PC is off.
+pub(crate) fn recent_events(st: &AppState, sub: &str, limit: usize) -> Vec<Arc<Event>> {
+    let mut all: Vec<(i64, Arc<Event>)> =
+        st.bot.mem(sub, |m| m.ring.values().flat_map(|r| r.iter().map(|l| (l.at, l.event.clone()))).collect());
+    all.sort_by_key(|(at, _)| *at);
+    let skip = all.len().saturating_sub(limit);
+    all.into_iter().skip(skip).map(|(_, e)| e).collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -1032,7 +1165,9 @@ async fn connect(
             let cfg = st.bot.twitch_cfg().ok_or_else(|| platform_unavailable("twitch"))?;
             let step = match b.account.as_deref().unwrap_or("bot") {
                 "bot" => {
-                    if existing.as_ref().is_some_and(|c| c.bot_id.is_some()) {
+                    // Signing the bot account in again with the moderator scopes (the opt-in,
+                    // M10) keeps the channel; anything else needs a disconnect first.
+                    if existing.as_ref().is_some_and(|c| c.bot_id.is_some() && !(b.moderation && !c.moderation)) {
                         return Err(already_connected(p));
                     }
                     twitch::Step::Bot { moderation: b.moderation }
@@ -1060,7 +1195,9 @@ async fn connect(
         }
         _ => {
             st.bot.kick()?;
-            if existing.is_some() {
+            // Signing in again with the moderation scopes (the opt-in, M10) is the one way to
+            // connect over an existing Kick sign-in.
+            if existing.as_ref().is_some_and(|c| !(b.moderation && !c.moderation)) {
                 return Err(already_connected(p));
             }
             if b.account.as_deref().is_some_and(|a| a != "bot") {
@@ -1193,13 +1330,15 @@ pub(crate) fn recent_chat(st: &AppState, sub: &str, platform: Platform) -> Vec<C
     st.bot.mem(sub, |m| m.ring.get(&platform).map(|r| r.iter().cloned().collect()).unwrap_or_default())
 }
 
-/// Remembers a line (ring and id). `false` when this message id was already seen.
-fn remember(st: &AppState, sub: &str, platform: Platform, e: &Event, user: &str, text: &str) -> bool {
+/// Remembers a line (ring and id): the line as kept, `None` when this message id was
+/// already seen. A line gets an id of its own here (`cl-<platform>-<message id>`, the PC
+/// gives its own when it takes events in), so the phone's chat can tell lines apart.
+fn remember(st: &AppState, sub: &str, platform: Platform, e: &Event, user: &str, text: &str) -> Option<Arc<Event>> {
     st.bot.mem(sub, |m| {
         if let Some(id) = e.source_id.as_deref().filter(|s| !s.is_empty()) {
             let (order, set) = m.seen.entry(platform).or_default();
             if !set.insert(id.to_string()) {
-                return false;
+                return None;
             }
             order.push_back(id.to_string());
             while order.len() > DEDUPE_KEEP {
@@ -1209,15 +1348,25 @@ fn remember(st: &AppState, sub: &str, platform: Platform, e: &Event, user: &str,
             }
         }
         let ring = m.ring.entry(platform).or_default();
+        let mut kept = e.clone();
+        kept.raw = None;
+        if kept.id.is_empty() {
+            kept.id = match e.source_id.as_deref().filter(|s| !s.is_empty()) {
+                Some(id) => format!("cl-{}-{}", key(platform), id.chars().take(128).collect::<String>()),
+                None => format!("cl-{}-{}", key(platform), crate::random(12)),
+            };
+        }
+        let kept = Arc::new(kept);
         ring.push_back(ChatLine {
             at: e.occurred_at.0,
             user: user.to_string(),
             text: text.chars().take(500).collect(),
+            event: kept.clone(),
         });
         while ring.len() > RING {
             ring.pop_front();
         }
-        true
+        Some(kept)
     })
 }
 
@@ -1253,9 +1402,11 @@ pub(crate) async fn on_chat(st: &AppState, ch: &store::Channel, platform: Platfo
     if !matches!(db(st, move |db| sub_is_on(db, &s2)).await, Ok(true)) {
         return;
     }
-    if !remember(st, sub, platform, &e, &actor.display_name, &content.text) {
+    let Some(kept) = remember(st, sub, platform, &e, &actor.display_name, &content.text) else {
         return; // a retry of a message already handled
-    }
+    };
+    // Phones of a PC that's off see the line as the PC would have sent it (M10).
+    crate::remote::cloud_chat(st, sub, &kept);
     // Shared Chat from a partner channel, the cloud's own lines: never answered (R-11).
     if e.channel.is_some() || own_message(st, ch, platform, &e, actor.id.as_deref(), &content.text) || !ch.ready() {
         return;

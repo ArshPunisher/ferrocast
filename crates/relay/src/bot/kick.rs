@@ -22,9 +22,10 @@ use super::{Fut, SendErr};
 use crate::billing::gate::ProCtx;
 use crate::{ApiError, AppState, now_ms};
 
-/// The cloud bot's Kick scopes; `moderation:ban` only with the opt-in.
+/// The cloud bot's Kick scopes; the moderation ones only with the opt-in (bans and timeouts,
+/// deleting messages: offline moderation, M10).
 pub const SCOPES: &[&str] = &["user:read", "chat:write"];
-pub const MOD_SCOPES: &[&str] = &["moderation:ban"];
+pub const MOD_SCOPES: &[&str] = &["moderation:ban", "moderation:chat_message:manage"];
 /// States from the cloud bot's Kick sign-in start with this (base64url never has a `.`).
 pub const STATE_PREFIX: &str = "bot.";
 const TIMEOUT: Duration = Duration::from_secs(8);
@@ -69,6 +70,17 @@ pub trait KickBot: Send + Sync + std::fmt::Debug {
         reply_to: Option<&'a str>,
     ) -> Fut<'a, Option<String>, KickError>;
     fn revoke<'a>(&'a self, token: &'a str) -> Fut<'a, (), KickError>;
+    /// Bans `user` in the channel, or times them out for `minutes` (Kick counts whole minutes).
+    fn ban<'a>(
+        &'a self,
+        access: &'a str,
+        broadcaster: &'a str,
+        user: &'a str,
+        minutes: Option<u32>,
+        reason: Option<&'a str>,
+    ) -> Fut<'a, (), KickError>;
+    /// Deletes one chat message.
+    fn delete_message<'a>(&'a self, access: &'a str, message_id: &'a str) -> Fut<'a, (), KickError>;
 }
 
 /// The production client (the relay's Kick app).
@@ -171,6 +183,52 @@ impl KickBot for HttpKick {
                     .query(&[("token", token), ("token_hint_type", "refresh_token")])
                     .send()
                     .await,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn ban<'a>(
+        &'a self,
+        access: &'a str,
+        broadcaster: &'a str,
+        user: &'a str,
+        minutes: Option<u32>,
+        reason: Option<&'a str>,
+    ) -> Fut<'a, (), KickError> {
+        Box::pin(async move {
+            let num = |s: &str| s.parse::<u64>().map_err(|_| KickError::Dropped("that isn't a Kick user id".into()));
+            let mut body = json!({ "broadcaster_user_id": num(broadcaster)?, "user_id": num(user)? });
+            if let Some(m) = minutes {
+                body["duration"] = json!(m.clamp(1, 10_080));
+            }
+            if let Some(r) = reason.filter(|r| !r.is_empty()) {
+                body["reason"] = json!(r.chars().take(100).collect::<String>());
+            }
+            Self::status(
+                self.http
+                    .post(format!("{}/public/v1/moderation/bans", self.api_url))
+                    .bearer_auth(access)
+                    .json(&body)
+                    .send()
+                    .await,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_message<'a>(&'a self, access: &'a str, message_id: &'a str) -> Fut<'a, (), KickError> {
+        Box::pin(async move {
+            // The id goes in the path: only the characters Kick's ids use.
+            let id: String =
+                message_id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+            if id.is_empty() || id.len() != message_id.len() {
+                return Err(KickError::Dropped("that isn't a Kick message id".into()));
+            }
+            Self::status(
+                self.http.delete(format!("{}/public/v1/chat/{id}", self.api_url)).bearer_auth(access).send().await,
             )
             .await?;
             Ok(())
@@ -377,7 +435,7 @@ pub(crate) async fn on_webhook(
 /// subscription (Kick's refresh tokens are single use): the cache is checked again under the
 /// lock, the new refresh token sealed before the lock goes, and a failed refresh is retried
 /// once when the sealed token changed meanwhile (another refresh won the race).
-async fn access(st: &AppState, sub: &str) -> Result<String, SendErr> {
+pub(crate) async fn access(st: &AppState, sub: &str) -> Result<String, SendErr> {
     if let Some(t) = st.bot.kick_access(sub, now_ms()) {
         return Ok(t);
     }

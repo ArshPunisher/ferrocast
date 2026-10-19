@@ -670,14 +670,22 @@ async fn live_frames_reach_each_phone_by_role() {
     let moder = w.device(&pro, "mod").await;
     // Offline first: the phone hears "PC offline" and stays connected.
     let o = phone(&w, &owner).await;
-    assert_eq!(phone_next(&o).await.unwrap()["data"], json!({ "pc_online": false, "role": "owner" }));
+    assert_eq!(
+        phone_next(&o).await.unwrap()["data"],
+        json!({ "pc_online": false, "role": "owner", "cloud": false, "cloud_paused": false,
+                "cloud_moderation": { "twitch": false, "kick": false }, "history": true })
+    );
     let mut pc = connect_pc(&w, &pro, PcMode::Echo).await;
     // The PC came: the phone hears it, and the PC is asked for that phone's frames.
     assert_eq!(phone_next(&o).await.unwrap()["data"]["pc_online"], true);
     let open_o = pc.next_of("live_open").await;
     assert_eq!(open_o["role"], "owner");
     let m = phone(&w, &moder).await;
-    assert_eq!(phone_next(&m).await.unwrap()["data"], json!({ "pc_online": true, "role": "mod" }));
+    assert_eq!(
+        phone_next(&m).await.unwrap()["data"],
+        json!({ "pc_online": true, "role": "mod", "cloud": false, "cloud_paused": false,
+                "cloud_moderation": { "twitch": false, "kick": false }, "history": false })
+    );
     let open_m = pc.next_of("live_open").await;
     assert_eq!(open_m["device_id"], World::device_id(&moder));
     // A hello for one socket only.

@@ -62,6 +62,8 @@ pub(crate) const CLOSE_TOO_MANY: u16 = 4409;
 pub(crate) struct Phone {
     pub sock: u64,
     pub device_id: String,
+    /// The device's subscription: the cloud bot's chat lines reach it while its PC is off.
+    pub sub_id: String,
     pub role: Role,
     tx: mpsc::Sender<Arc<str>>,
     kill: oneshot::Sender<u16>,
@@ -110,6 +112,16 @@ fn unauthorized() -> ApiError {
         .hint("Ask for a new link: Settings › Dashboard anywhere on the streaming PC.")
 }
 
+/// 401 `device_moved`: the PC's Pro now runs on another subscription than this phone's.
+fn device_moved() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "device_moved",
+        "The streaming PC's Pro moved to another subscription since this phone was paired.",
+    )
+    .hint("Pair this phone again: Settings › Dashboard anywhere on the streaming PC.")
+}
+
 fn query_value(raw: Option<&str>, key: &str) -> Option<String> {
     raw?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -154,8 +166,10 @@ fn device_by_id(st: &AppState, id: &str) -> Result<(Device, Role), ApiError> {
     device_ok(st, d)
 }
 
-/// Not expired (401), its PC still Pro (402). Slides the expiry forward (once a minute at
-/// most).
+/// Not expired (401), its PC still Pro (402), and the PC still on the subscription it was
+/// paired under (401 `device_moved`: Pro was restored onto another subscription since, and
+/// that one's history, cloud bot and audit aren't this phone's to reach). Slides the expiry
+/// forward (once a minute at most).
 fn device_ok(st: &AppState, d: Device) -> Result<(Device, Role), ApiError> {
     let now = now_ms();
     if d.expires_at <= now {
@@ -164,7 +178,11 @@ fn device_ok(st: &AppState, d: Device) -> Result<(Device, Role), ApiError> {
     }
     let role = Role::parse(&d.role).ok_or_else(unauthorized)?;
     match st.db.pro_sub_for_install(&d.install_id).map_err(ApiError::db)? {
-        Some(s) if crate::billing::access::is_pro(&s.access(), now) => {}
+        Some(s) if crate::billing::access::is_pro(&s.access(), now) => {
+            if s.id != d.sub_id {
+                return Err(device_moved());
+            }
+        }
         _ => {
             return Err(pro_required().hint(
                 "The streamer's Ferrocast Pro is paused. This phone stays paired and works again once it's back.",
@@ -293,15 +311,22 @@ fn hex16() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// `GET /r/v1/me` → `{device_id, name, role, expires_at, pc_online}`.
+/// `GET /r/v1/me` → `{device_id, name, role, expires_at, pc_online, cloud, cloud_paused,
+/// cloud_moderation, history}`.
 pub(crate) async fn me(State(st): State<AppState>, headers: HeaderMap) -> Response {
     done((|| -> Result<Response, ApiError> {
         gate(&st, &headers)?;
         let (d, role) = device_for(&st, bearer(&headers))?;
+        let cloud = crate::bot::cloud_state(&st, &d.sub_id);
         Ok(axum::Json(json!({
             "device_id": d.id, "name": d.name, "role": role.as_str(),
             "expires_at": d.expires_at,
             "pc_online": st.remote.pc_online(&d.install_id),
+            // While the PC is off: the cloud bot answers chat and (with the opt-in) bans (M10).
+            "cloud": cloud.on, "cloud_paused": cloud.paused,
+            "cloud_moderation": cloud.moderation.json(),
+            // Stream history (Pro F7) for an owner's phone, online or off.
+            "history": history_shown(&st, role),
         }))
         .into_response())
     })())
@@ -431,15 +456,24 @@ async fn api_inner(
         }
     };
     rate(st, &device)?;
-    let audit = |status: u16, known: bool| {
+    let audit_from = |status: u16, known: bool, source: &str| {
         let action = scope::action(method.as_str(), &path, known);
         // Refusals: one line per device and route a minute, however often it's tried.
         if status == 403 && !st.remote.allow("audit", &format!("{}|{action}", device.id), 1, 60_000) {
             return;
         }
-        let _ =
-            st.db.remote_audit(&device.sub_id, &device.install_id, &device.id, &device.name, &action, status, now_ms());
+        let _ = st.db.remote_audit_from(
+            &device.sub_id,
+            &device.install_id,
+            &device.id,
+            &device.name,
+            &action,
+            status,
+            now_ms(),
+            source,
+        );
     };
+    let audit = |status: u16, known: bool| audit_from(status, known, "pc");
     if !scope::allowed(role, method.as_str(), &path) {
         // A refused read changes nothing: only refused changes are worth a line.
         if method != Method::GET {
@@ -466,7 +500,18 @@ async fn api_inner(
     let body = unread.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let body = read_capped(body, MAX_BODY).await.map_err(|_| too_big())?;
     let Some(tunnel) = st.remote.tunnel(&device.install_id) else {
-        return Err(pc_offline());
+        // The PC is off: the relay answers chat, moderation, history and the cloud bot's
+        // switch itself (M10); everything else is 503 `pc_offline`.
+        let (res, answered) =
+            super::offline::answer(st, &device, role, &method, &path, query.as_deref(), &headers, &body).await;
+        if answered && method != Method::GET {
+            let status = match &res {
+                Ok(r) => r.status().as_u16(),
+                Err(e) => e.status().as_u16(),
+            };
+            audit_from(status, true, "cloud");
+        }
+        return res;
     };
     let pass = |name: HeaderName| headers.get(&name).and_then(|v| v.to_str().ok()).map(|v| json!([name.as_str(), v]));
     // `Range` lets a video preview come in parts, each under the 8 MB answer limit.
@@ -540,9 +585,26 @@ pub(crate) fn pc_busy() -> ApiError {
 
 // ── Live sockets ─────────────────────────────────────────────────────────────────────
 
-/// The relay's own frame on a phone's live socket: whether the PC is reachable.
-fn remote_frame(online: bool, role: Role) -> Arc<str> {
-    Arc::from(json!({ "v": 1, "type": "remote", "data": { "pc_online": online, "role": role.as_str() } }).to_string())
+/// The relay's own frame on a phone's live socket: whether the PC is reachable, and while
+/// it's off whether the cloud bot stands in (chat, bans and history still work, M10).
+pub(crate) fn remote_frame(st: &AppState, online: bool, role: Role, cloud: crate::bot::CloudState) -> Arc<str> {
+    Arc::from(
+        json!({ "v": 1, "type": "remote", "data": {
+            "pc_online": online, "role": role.as_str(), "cloud": cloud.on, "cloud_paused": cloud.paused,
+            "cloud_moderation": cloud.moderation.json(), "history": history_shown(st, role),
+        } })
+        .to_string(),
+    )
+}
+
+/// Whether a phone of `role` gets stream history (Pro F7): owners, while the relay has it.
+fn history_shown(st: &AppState, role: Role) -> bool {
+    role == Role::Owner && crate::history::available(st)
+}
+
+/// Asks a phone to fetch chat again (the PC went off and the cloud's chat takes over).
+pub(crate) fn resync_frame() -> Arc<str> {
+    Arc::from(json!({ "v": 1, "type": "resync", "data": { "missed": 0 } }).to_string())
 }
 
 /// `GET /r/api/v1/live?ticket=<live ticket>&since=<seq>` (WebSocket). The ticket comes from
@@ -573,6 +635,15 @@ pub(crate) async fn live(
 /// with [`CLOSE_TOO_MANY`].
 fn register(st: &AppState, install: &str, phone: Phone) {
     let mut m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
+    // `phones` first, then `phone_subs` (the documented order), so `sub_installs` never sees
+    // the index entry without the phone and drops it.
+    st.remote
+        .phone_subs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(phone.sub_id.clone())
+        .or_default()
+        .insert(install.to_string());
     let list = m.entry(install.to_string()).or_default();
     while list.iter().filter(|p| p.device_id == phone.device_id).count() >= MAX_LIVE_PER_DEVICE {
         let Some(i) = list
@@ -594,12 +665,23 @@ async fn phone_loop(st: AppState, device: Device, role: Role, since: Option<u64>
     let (kill, mut killed) = oneshot::channel::<u16>();
     let sock = st.remote.next_id();
     let install = device.install_id.clone();
-    register(&st, &install, Phone { sock, device_id: device.id.clone(), role, tx: tx_q, kill });
+    let cloud = crate::bot::cloud_state(&st, &device.sub_id);
+    register(
+        &st,
+        &install,
+        Phone { sock, device_id: device.id.clone(), sub_id: device.sub_id.clone(), role, tx: tx_q, kill },
+    );
     let (mut tx, mut rx) = socket.split();
     let tunnel = st.remote.tunnel(&install);
-    let first = remote_frame(tunnel.is_some(), role);
+    let first = remote_frame(&st, tunnel.is_some(), role, cloud);
     let close = |code: u16| Message::Close(Some(CloseFrame { code, reason: "".into() }));
-    if tx.send(Message::Text(Utf8Bytes::from(first.as_ref()))).await.is_ok() {
+    let mut opened = tx.send(Message::Text(Utf8Bytes::from(first.as_ref()))).await.is_ok();
+    if opened && tunnel.is_none() && cloud.on {
+        // The PC is off and the cloud's chat stands in: the phone fetches it (`GET /chat`)
+        // after this, so a line that came while the socket opened isn't missed.
+        opened = tx.send(Message::Text(Utf8Bytes::from(resync_frame().as_ref()))).await.is_ok();
+    }
+    if opened {
         if let Some(t) = &tunnel {
             t.send(&open_frame(sock, &device.id, role, since));
         }
@@ -632,7 +714,10 @@ async fn phone_loop(st: AppState, device: Device, role: Role, since: Option<u64>
                     // Still paired and still Pro? (A removed device's socket is closed at once;
                     // this catches expiry and a lapse.)
                     let paired = matches!(st.db.remote_device(&device.id), Ok(Some(d)) if d.expires_at > now_ms());
-                    let pro = matches!(st.db.pro_sub_for_install(&install), Ok(Some(s)) if crate::billing::access::is_pro(&s.access(), now_ms()));
+                    let sub = st.db.pro_sub_for_install(&install);
+                    let pro = matches!(&sub, Ok(Some(s)) if crate::billing::access::is_pro(&s.access(), now_ms()));
+                    // Pro restored onto another subscription: this phone pairs again.
+                    let paired = paired && !matches!(&sub, Ok(Some(s)) if pro && s.id != device.sub_id);
                     if !paired || !pro {
                         let _ = tx.send(close(if paired { CLOSE_PRO } else { CLOSE_REVOKED })).await;
                         break;
@@ -666,19 +751,97 @@ fn open_frame(sock: u64, device_id: &str, role: Role, since: Option<u64>) -> Val
 
 /// A new tunnel: tell its phones the PC is back, and ask the PC for their live frames.
 pub(crate) fn tunnel_up(st: &AppState, install: &str, tunnel: &Tunnel) {
+    let cloud = phones_sub(st, install).map(|s| crate::bot::cloud_state(st, &s)).unwrap_or_default();
     let m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
     for p in m.get(install).into_iter().flatten() {
-        let _ = p.tx.try_send(remote_frame(true, p.role));
+        let _ = p.tx.try_send(remote_frame(st, true, p.role, cloud));
         // The phone's seq is unknown here: the PC sends `hello` and `resync`, so it refetches.
         tunnel.send(&open_frame(p.sock, &p.device_id, p.role, Some(0)));
     }
 }
 
-/// The tunnel closed: the phones show "PC offline" (their sockets stay open).
+/// The tunnel closed: the phones show "PC offline" (their sockets stay open), and when the
+/// cloud bot stands in, they switch to its chat (a `resync` makes them fetch it).
 pub(crate) fn tunnel_down(st: &AppState, install: &str) {
+    let cloud = phones_sub(st, install).map(|s| crate::bot::cloud_state(st, &s)).unwrap_or_default();
     let m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
     for p in m.get(install).into_iter().flatten() {
-        let _ = p.tx.try_send(remote_frame(false, p.role));
+        let _ = p.tx.try_send(remote_frame(st, false, p.role, cloud));
+        if cloud.on {
+            let _ = p.tx.try_send(resync_frame());
+        }
+    }
+}
+
+/// Whether any phone of `sub` has its live socket open.
+pub(crate) fn has_phones(st: &AppState, sub: &str) -> bool {
+    !sub_installs(st, sub).is_empty()
+}
+
+/// The installs with an open phone socket of `sub` (from the index; stale entries dropped).
+fn sub_installs(st: &AppState, sub: &str) -> Vec<String> {
+    let listed: Vec<String> = {
+        let m = st.remote.phone_subs.lock().unwrap_or_else(|p| p.into_inner());
+        match m.get(sub) {
+            Some(set) => set.iter().cloned().collect(),
+            None => return Vec::new(),
+        }
+    };
+    let (live, gone): (Vec<String>, Vec<String>) = {
+        let m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
+        listed.into_iter().partition(|i| m.get(i).is_some_and(|l| l.iter().any(|p| p.sub_id == sub)))
+    };
+    if !gone.is_empty() {
+        let phones = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = st.remote.phone_subs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(set) = m.get_mut(sub) {
+            // Checked again under both locks: a phone that opened meanwhile keeps its entry.
+            for i in &gone {
+                if !phones.get(i).is_some_and(|l| l.iter().any(|p| p.sub_id == sub)) {
+                    set.remove(i);
+                }
+            }
+            if set.is_empty() {
+                m.remove(sub);
+            }
+        }
+    }
+    live
+}
+
+/// The subscription of an install's open phones (they all share their PC's).
+fn phones_sub(st: &AppState, install: &str) -> Option<String> {
+    let m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
+    m.get(install).and_then(|l| l.first()).map(|p| p.sub_id.clone())
+}
+
+/// Frames the relay itself sends while a PC is off (M10): to every open phone of `sub`
+/// whose PC has no tunnel, `frames(role)` for each phone's role (the caller leaves out what
+/// a role may not get). A phone that can't keep up closes with [`CLOSE_LAGGED`].
+pub(crate) fn fan_out_offline(st: &AppState, sub: &str, frames: impl Fn(Role) -> Vec<Arc<str>>) {
+    let (for_owner, for_mod) = (frames(Role::Owner), frames(Role::Mod));
+    for install in sub_installs(st, sub) {
+        if st.remote.tunnel(&install).is_some() {
+            continue; // the PC sends its own frames
+        }
+        let mut m = st.remote.phones.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(list) = m.get_mut(&install) else { continue };
+        let mut behind = Vec::new();
+        for (i, p) in list.iter().enumerate() {
+            if p.sub_id != sub {
+                continue;
+            }
+            let frames = if p.role == Role::Owner { &for_owner } else { &for_mod };
+            for f in frames {
+                if let Err(mpsc::error::TrySendError::Full(_)) = p.tx.try_send(f.clone()) {
+                    behind.push(i);
+                    break;
+                }
+            }
+        }
+        for i in behind.into_iter().rev() {
+            list.remove(i).close(CLOSE_LAGGED);
+        }
     }
 }
 
@@ -718,6 +881,17 @@ pub(crate) fn close_device(st: &AppState, install: &str, device_id: &str) {
             i += 1;
         }
     }
+}
+
+/// The installs the index lists for `sub` (before any clean-up).
+#[cfg(test)]
+pub(crate) fn tests_indexed_installs(st: &AppState, sub: &str) -> usize {
+    st.remote.phone_subs.lock().unwrap_or_else(|p| p.into_inner()).get(sub).map_or(0, |s| s.len())
+}
+
+#[cfg(test)]
+pub(crate) fn tests_has_phones(st: &AppState, sub: &str) -> bool {
+    has_phones(st, sub)
 }
 
 #[cfg(test)]

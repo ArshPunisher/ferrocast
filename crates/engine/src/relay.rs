@@ -179,6 +179,8 @@ impl Engine {
             }
             // The cloud bot changed a counter while this PC was off (cloud_bot.rs).
             "bot_counter" => self.apply_cloud_counter(payload).await,
+            // A phone banned or timed out someone through the cloud bot while this PC was off.
+            "cloud_moderation" => self.apply_cloud_moderation(payload).await,
             other => tracing::debug!(kind = other, "ignored a relay item"),
         }
     }

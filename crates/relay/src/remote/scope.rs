@@ -68,6 +68,8 @@ pub const MOD_ALLOWED: &[Rule] = &[
 /// email's state (the address only as a hint). Changing the address stays on the PC.
 pub const OWNER_ALLOWED: &[Rule] = &[
     ("GET", "/pro/history/email"),
+    // Stream history (Pro F7): read it from the phone; the relay answers it while the PC is off.
+    ("GET", "/pro/history"),
     // The cloud bot (Pro F1): look at it and switch it on or off; connecting stays on the PC.
     ("GET", "/pro/bot"),
     ("PUT", "/pro/bot/enabled"),
@@ -366,6 +368,8 @@ mod tests {
             ("POST", "/backups"),
             ("GET", "/updates"),
             ("PUT", "/designs/d1"),
+            // Stream history (the relay answers it while the PC is off, M10).
+            ("GET", "/pro/history"),
         ] {
             assert!(allowed(Role::Owner, m, p), "{m} {p}");
         }
@@ -379,6 +383,8 @@ mod tests {
             ("POST", "/pro/remote/codes"),
             ("DELETE", "/pro/remote/devices/d1"),
             ("GET", "/pro/backups/key"),
+            ("GET", "/pro/history/export.csv"),
+            ("POST", "/pro/history/streams"),
             ("PUT", "/tips"),
             ("DELETE", "/tips"),
             ("PUT", "/tips/brand/avatar"),

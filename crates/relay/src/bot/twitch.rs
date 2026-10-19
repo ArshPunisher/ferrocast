@@ -123,6 +123,26 @@ pub trait TwitchCloud: Send + Sync + std::fmt::Debug {
     ) -> Fut<'a, Option<String>, TwitchError>;
     /// When the channel's stream started (ms), or `None` while it's offline (Get Streams).
     fn stream_started<'a>(&'a self, app: &'a str, broadcaster: &'a str) -> Fut<'a, Option<i64>, TwitchError>;
+    /// Ban User with the bot account's own token (`moderator:manage:banned_users`): a ban, or
+    /// a timeout of `seconds` (offline moderation, M10).
+    fn ban<'a>(&'a self, user: &'a str, target: ModTarget<'a>, seconds: Option<u32>) -> Fut<'a, (), TwitchError>;
+    /// Delete Chat Messages with the bot account's own token (`moderator:manage:chat_messages`).
+    fn delete_message<'a>(
+        &'a self,
+        user: &'a str,
+        target: ModTarget<'a>,
+        message_id: &'a str,
+    ) -> Fut<'a, (), TwitchError>;
+}
+
+/// Where a moderation call acts: the channel, the bot account acting as its moderator, and
+/// (for bans) the viewer and the reason.
+#[derive(Debug, Clone, Copy)]
+pub struct ModTarget<'a> {
+    pub broadcaster: &'a str,
+    pub moderator: &'a str,
+    pub user_id: &'a str,
+    pub reason: Option<&'a str>,
 }
 
 /// The production client.
@@ -420,6 +440,49 @@ impl TwitchCloud for HttpTwitch {
                 return Ok(None);
             }
             Ok(Some(s["started_at"].as_str().and_then(parse_time).unwrap_or_else(now_ms)))
+        })
+    }
+
+    fn ban<'a>(&'a self, user: &'a str, target: ModTarget<'a>, seconds: Option<u32>) -> Fut<'a, (), TwitchError> {
+        Box::pin(async move {
+            let mut data = json!({ "user_id": target.user_id });
+            if let Some(s) = seconds {
+                data["duration"] = json!(s);
+            }
+            if let Some(r) = target.reason.filter(|r| !r.is_empty()) {
+                data["reason"] = json!(r);
+            }
+            Self::check(
+                self.helix(reqwest::Method::POST, "/moderation/bans", user)
+                    .query(&[("broadcaster_id", target.broadcaster), ("moderator_id", target.moderator)])
+                    .json(&json!({ "data": data }))
+                    .send()
+                    .await,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        user: &'a str,
+        target: ModTarget<'a>,
+        message_id: &'a str,
+    ) -> Fut<'a, (), TwitchError> {
+        Box::pin(async move {
+            Self::check(
+                self.helix(reqwest::Method::DELETE, "/moderation/chat", user)
+                    .query(&[
+                        ("broadcaster_id", target.broadcaster),
+                        ("moderator_id", target.moderator),
+                        ("message_id", message_id),
+                    ])
+                    .send()
+                    .await,
+            )
+            .await?;
+            Ok(())
         })
     }
 }

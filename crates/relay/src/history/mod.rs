@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 pub(crate) use store::SCHEMA;
 use store::{Sampled, Upserted};
@@ -498,15 +498,34 @@ pub fn weekly(streams: &[StreamOut], from: i64, to: i64, now: i64) -> Vec<Week> 
 /// `GET /v1/pro/history?from&to&platform` → `{from, to, streams, truncated, weekly}`.
 async fn list(State(st): State<AppState>, headers: HeaderMap, RawQuery(q): RawQuery) -> Result<Response, ApiError> {
     let ctx = gate(&st, &headers).await?;
+    Ok(axum::Json(listed(&st, &ctx.sub_id, q.as_deref())?).into_response())
+}
+
+/// `GET /r/api/v1/pro/history` from an owner's phone while the PC is off (M10): the same
+/// answer as `GET /v1/pro/history`, with the same per-subscription rate, only while this
+/// relay has the feature (`features.history`; 503 `history_unavailable` otherwise).
+pub(crate) fn phone_list(st: &AppState, sub: &str, query: Option<&str>) -> Result<Value, ApiError> {
+    if !available(st) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "history_unavailable",
+            "Stream history isn't available on Ferrocast's servers right now.",
+        )
+        .hint("Open History on the streaming PC, or try again later."));
+    }
+    take_rate(st, sub)?;
+    listed(st, sub, query)
+}
+
+fn listed(st: &AppState, sub: &str, query: Option<&str>) -> Result<Value, ApiError> {
     let now = now_ms();
-    let r = range(q.as_deref(), now, None)?;
+    let r = range(query, now, None)?;
     let mut streams =
-        st.db.list_streams(&ctx.sub_id, r.from, r.to, r.platform.as_deref(), MAX_LISTED + 1).map_err(ApiError::db)?;
+        st.db.list_streams(sub, r.from, r.to, r.platform.as_deref(), MAX_LISTED + 1).map_err(ApiError::db)?;
     let truncated = streams.len() > MAX_LISTED;
     streams.truncate(MAX_LISTED);
     let weekly = weekly(&streams, r.from, r.to, now);
-    Ok(axum::Json(json!({ "from": r.from, "to": r.to, "streams": streams, "truncated": truncated, "weekly": weekly }))
-        .into_response())
+    Ok(json!({ "from": r.from, "to": r.to, "streams": streams, "truncated": truncated, "weekly": weekly }))
 }
 
 /// `GET /v1/pro/history/export.csv?from&to&platform` (all kept history by default). Open

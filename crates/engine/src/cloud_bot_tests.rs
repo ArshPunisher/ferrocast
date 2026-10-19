@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use ferrocast_core::chatbot::CounterDef;
 use ferrocast_core::command::{Access, Command};
+use ferrocast_core::event::Platform;
 use ferrocast_store::repo;
 use serde_json::{Value, json};
 
@@ -364,6 +365,45 @@ async fn counters_changed_in_the_cloud_are_applied_once_and_reported_back() {
     assert_eq!(e.counter_view("deaths").unwrap().value, 3);
     e.apply_cloud_counter(&json!({ "id": 11, "name": "deaths", "value": 30, "at": 5 })).await;
     assert_eq!(e.counter_view("deaths").unwrap().value, 30);
+}
+
+#[tokio::test]
+async fn bans_made_from_a_phone_while_the_pc_was_off_join_the_ban_list_once() {
+    let (relay, fake) = fake_relay().await;
+    let ban = json!({ "kind": "cloud_moderation", "payload": {
+        "platform": "twitch", "action": "ban", "target_id": "77", "target_login": "viewer77",
+        "target_name": "Viewer 77", "duration": null, "reason": "spam", "by_device": "Meera",
+        "by_role": "mod", "at": 1_700_000_000_000_i64 } });
+    fake.lock().unwrap().items = vec![
+        ban.clone(),
+        // Resent before the ack landed: not listed twice.
+        ban,
+        json!({ "kind": "cloud_moderation", "payload": {
+            "platform": "kick", "action": "ban", "target_id": "4242", "by_device": "My phone",
+            "by_role": "owner", "at": 1_700_000_000_001_i64 } }),
+        json!({ "kind": "cloud_moderation", "payload": {
+            "platform": "twitch", "action": "timeout", "target_id": "78", "duration": 600,
+            "by_device": "Meera", "by_role": "mod", "at": 1 } }),
+        json!({ "kind": "cloud_moderation", "payload": { "platform": "youtube", "action": "ban", "target_id": "x" } }),
+    ];
+    fake.lock().unwrap().enabled = true;
+    let (e, _d) = engine(&relay).await;
+    remember_pro(&e, true).await;
+    e.cloud_bot_set_enabled_for_tests(true);
+    eventually(|| fake.lock().unwrap().acks.len() == 5).await;
+    let bans = e.bans().entries;
+    assert_eq!(bans.len(), 2, "{bans:?}");
+    let tw = bans.iter().find(|b| b.platform == Platform::Twitch).unwrap();
+    assert_eq!(
+        (tw.user_id.as_deref(), tw.login.as_str(), tw.display_name.as_str(), tw.reason.as_deref()),
+        (Some("77"), "viewer77", "Viewer 77", Some("spam"))
+    );
+    assert_eq!((tw.by.as_deref(), tw.offline, tw.at.0), (Some("Meera"), true, 1_700_000_000_000));
+    let kk = bans.iter().find(|b| b.platform == Platform::Kick).unwrap();
+    assert_eq!((kk.login.as_str(), kk.by.as_deref(), kk.offline), ("4242", None, true), "the streamer's own phone");
+    // Kept like any ban: on disk, and Unban takes it off (no Twitch connected here to ask).
+    e.unban(Platform::Twitch, "77").await.unwrap();
+    assert_eq!(e.bans().entries.len(), 1);
 }
 
 #[tokio::test]
