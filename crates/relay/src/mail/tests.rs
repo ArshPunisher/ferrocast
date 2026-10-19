@@ -277,6 +277,18 @@ async fn brevo_gets_the_key_in_a_header_and_the_whole_email() {
     );
 }
 
+/// Finding (live, 2026-10-19): Brevo refused every confirm email with "headers is blank",
+/// because an email without extra headers still sent `"headers": {}`.
+#[tokio::test]
+async fn an_email_without_headers_sends_no_headers_field() {
+    let (url, b) = fake_brevo().await;
+    let m = BrevoMailer::new("k".into(), url);
+    let from = Sender::parse(DEFAULT_FROM).unwrap();
+    m.send(&from, &Email { headers: vec![], tag: "confirm", ..sample_email() }).await.unwrap();
+    let (_, _, body) = b.lock().unwrap().seen[0].clone();
+    assert!(body.get("headers").is_none(), "{body}");
+}
+
 #[tokio::test]
 async fn brevos_errors_map_to_what_the_relay_can_do_and_never_carry_the_address() {
     let (url, b) = fake_brevo().await;

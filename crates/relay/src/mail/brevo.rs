@@ -66,15 +66,19 @@ impl BrevoMailer {
     pub fn body(from: &Sender, e: &Email) -> Value {
         let headers: Map<String, Value> =
             e.headers.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-        json!({
+        let mut body = json!({
             "sender": { "name": from.name, "email": from.email },
             "to": [{ "email": e.to }],
             "subject": e.subject,
             "htmlContent": e.html,
             "textContent": e.text,
-            "headers": headers,
             "tags": [e.tag],
-        })
+        });
+        // Brevo refuses an empty `headers` ("headers is blank"); a confirm email has none.
+        if !headers.is_empty() {
+            body["headers"] = Value::Object(headers);
+        }
+        body
     }
 
     async fn call(&self, from: &Sender, e: &Email) -> Result<(), MailError> {
