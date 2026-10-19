@@ -26,7 +26,8 @@ services:
     security_opt: ["no-new-privileges:true"]
     deploy:
       resources:
-        limits: { memory: 256m }
+        # Phones through the relay can have answers up to 8 MB in flight (Pro F2); the server has 24 GB.
+        limits: { memory: 1g }
 
   cloudflared:
     image: cloudflare/cloudflared:2026.10.0
