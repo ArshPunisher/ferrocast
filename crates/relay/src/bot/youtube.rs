@@ -1424,12 +1424,11 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
     let until = now_ms() + tokens.expires_in.clamp(0, 86_400) * 1000;
     st.bot.yt(&ctx.sub_id, |m| m.access = Some((tokens.access_token.clone(), until)));
     let code = super::pc_code(&st, &ctx.install);
-    page(
-        StatusCode::OK,
-        &format!(
-            "The cloud bot (beta) can now answer in {}'s YouTube chat. This is for the Ferrocast PC with the code {code}; the Bot page there shows the same code. If it doesn't, remove Ferrocast Cloud at myaccount.google.com/permissions. You can close this tab.",
-            channel.title
-        ),
+    crate::done_page(
+        &format!("The cloud bot (beta) can now answer in {}'s YouTube chat.", channel.title),
+        "Go back to Ferrocast and press Check again.",
+        &code,
+        "Didn't start this, or the code doesn't match? Remove Ferrocast Cloud in your Google account's third-party connections.",
     )
 }
 

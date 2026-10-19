@@ -532,13 +532,51 @@ struct Callback {
     error: Option<String>,
 }
 
-fn page(status: StatusCode, text: &str) -> Response {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Ferrocast</title>\
-         <body style=\"font:17px system-ui;background:#0c0e12;color:#e9e9ee;display:grid;place-items:center;min-height:100vh;margin:0;padding:24px;text-align:center\"><p>{}</p>",
-        text.replace('&', "&amp;").replace('<', "&lt;")
+/// The look shared by the sign-in result pages: one card, light and dark, no scripts.
+/// `body` is already-escaped HTML.
+pub(crate) fn card(status: StatusCode, title: &str, body: &str) -> Response {
+    let html = format!(
+        "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <meta name=robots content=noindex><title>{t} · Ferrocast</title>\
+         <style>:root{{color-scheme:dark light;--bg:#0a0b0d;--card:#101216;--line:#252a31;--text:#eef0f4;--muted:#b3b9c4;--chip:#1a1d23}}\
+         @media (prefers-color-scheme:light){{:root{{--bg:#f2f3f6;--card:#fff;--line:#dfe2e8;--text:#0e1014;--muted:#424854;--chip:#f2f3f6}}}}\
+         body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:16px;box-sizing:border-box;background:var(--bg);color:var(--text);font:17px/1.5 system-ui,sans-serif}}\
+         main{{width:100%;max-width:460px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px;box-sizing:border-box}}\
+         h1{{font-size:1.6rem;line-height:1.2;margin:0 0 12px;letter-spacing:-.02em;overflow-wrap:anywhere}}p{{margin:0 0 12px;overflow-wrap:anywhere}}\
+         .next{{font-weight:600}}.code{{display:inline-block;margin:4px 0 16px;padding:6px 12px;border:1px solid var(--line);border-radius:10px;background:var(--chip);font:600 1.05rem ui-monospace,monospace;letter-spacing:.06em}}\
+         .muted{{color:var(--muted);font-size:.9rem;margin:16px 0 0;padding-top:12px;border-top:1px solid var(--line)}}</style>\
+         <main><h1>{t}</h1>{body}</main></html>",
+        t = mail::report::esc(title),
     );
-    (status, Html(body)).into_response()
+    let mut r = (status, Html(html)).into_response();
+    let h = r.headers_mut();
+    h.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    h.insert(axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer"));
+    h.insert(axum::http::header::CONTENT_SECURITY_POLICY, axum::http::HeaderValue::from_static(mail::pages::CSP));
+    r
+}
+
+/// A sign-in that worked: what happened, what to press next in Ferrocast, the PC's code,
+/// and a quiet footnote for someone who didn't start it. Plain text in, escaped here.
+pub(crate) fn done_page(what: &str, next: &str, code: &str, footnote: &str) -> Response {
+    let e = mail::report::esc;
+    card(
+        StatusCode::OK,
+        "Done",
+        &format!(
+            "<p>{}</p><p class=next>{}</p><p>This is for the Ferrocast PC with the code</p><span class=code>{}</span>\
+             <p>The Bot page there shows the same code.</p><p class=muted>{}</p>",
+            e(what),
+            e(next),
+            e(code),
+            e(footnote)
+        ),
+    )
+}
+
+fn page(status: StatusCode, text: &str) -> Response {
+    let title = if status.is_success() { "Ferrocast" } else { "Something went wrong" };
+    card(status, title, &format!("<p>{}</p>", mail::report::esc(text)))
 }
 
 /// Kick sends the streamer back here. Trades the code (with the secret), learns whose

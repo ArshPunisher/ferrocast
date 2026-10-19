@@ -27,7 +27,7 @@
 mod brevo;
 mod fake;
 mod mailer;
-mod pages;
+pub(crate) mod pages;
 pub mod report;
 mod store;
 #[cfg(test)]

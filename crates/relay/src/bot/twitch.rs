@@ -1145,9 +1145,7 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
     }
     let code = super::pc_code(&st, &ctx.install);
     let ch = st.db.bot_channel(&ctx.sub_id, "twitch").ok().flatten();
-    let check = format!(
-        "This is for the Ferrocast PC with the code {code}; the Bot page there shows the same code. If it doesn't, or you didn't start this from your own Ferrocast, remove Ferrocast Cloud at twitch.tv/settings/connections."
-    );
+    let footnote = "Didn't start this, or the code doesn't match? Remove Ferrocast Cloud in your Twitch connections.";
     match (s.step, ch) {
         (Step::Bot { .. }, Some(ch)) if ch.channel_id.is_none() => {
             let where_ = if info.user_id == s.owner {
@@ -1158,24 +1156,26 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
                     info.login, info.login
                 )
             };
-            page(
-                StatusCode::OK,
-                &format!(
-                    "{where_} {check} Back in Ferrocast, press \"Allow it in your channel\" and sign in as {owner_login}."
-                ),
+            crate::done_page(
+                &where_,
+                &format!("Go back to Ferrocast, press \"Allow it in your channel\" and sign in as {owner_login}."),
+                &code,
+                footnote,
             )
         }
         (_, Some(ch)) => {
             let enabled = st.db.bot_config(&ctx.sub_id).ok().flatten().is_some_and(|r| r.enabled);
             let problem = if enabled { subscribe_channel(&st, &ch).await.err() } else { None };
             match problem {
-                None => page(
-                    StatusCode::OK,
+                None => crate::done_page(
                     &format!(
-                        "The cloud bot is set up in {}'s chat as {}. {check} You can close this tab.",
+                        "The cloud bot is set up in {}'s chat as {}.",
                         ch.channel_login.as_deref().unwrap_or(""),
                         ch.bot_login.as_deref().unwrap_or("")
                     ),
+                    "Go back to Ferrocast and press Check again.",
+                    &code,
+                    footnote,
                 ),
                 Some(m) => page(StatusCode::BAD_GATEWAY, &m),
             }

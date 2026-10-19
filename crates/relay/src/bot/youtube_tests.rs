@@ -600,7 +600,8 @@ async fn connecting_youtube_proves_the_pcs_channel_and_seals_the_sign_in() {
     let (s, page) = w.finish(&state, "1//refresh-owner", OWNER, &[FORCE_SSL]).await;
     assert_eq!(s, 200, "{page}");
     assert!(page.contains(&pc_code(&w.st, "i1")), "{page}");
-    assert!(page.contains("myaccount.google.com/permissions"));
+    assert!(page.contains("press Check again") && page.contains("<h1>Done</h1>"), "{page}");
+    assert!(page.contains("third-party connections") && !page.contains(DESK_TOKEN), "{page}");
     let ch = chan(&w.st, "sub_1");
     assert_eq!((ch.bot_id.as_deref(), ch.channel_id.as_deref()), (Some(OWNER), Some(OWNER)));
     assert!(ch.ready() && !ch.moderation);

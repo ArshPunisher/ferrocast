@@ -862,6 +862,14 @@ async fn twitch_connects_in_two_steps_with_sealed_sign_ins() {
     let a = w.twitch_step(&auth, "channel", (STREAMER_ID, "asha_live"), twitch::CHANNEL_SCOPES).await;
     assert_eq!(a.status, 200, "{}", a.text);
     assert!(a.text.contains(&pc_code(&w.state, "i1")), "the PC code on the page: {}", a.text);
+    // A clear result card: Done, what to press next, and the safety line only as a footnote.
+    assert!(a.text.contains("<h1>Done</h1>") && a.text.contains("press Check again"), "{}", a.text);
+    assert!(
+        a.text.contains("<p class=muted>Didn&#39;t start this") && !a.text.contains("twitch.tv/settings"),
+        "{}",
+        a.text
+    );
+    assert!(!a.text.contains(DESK), "no secret on the page");
     let v = w.view(&auth).await;
     assert_eq!(v["channels"][0]["state"], "ready");
     assert_eq!(v["channels"][0]["channel"], json!({ "id": STREAMER_ID, "login": "asha_live" }));

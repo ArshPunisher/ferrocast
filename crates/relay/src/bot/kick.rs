@@ -381,11 +381,11 @@ pub(crate) async fn finish(
     } else {
         format!(" {name} will post in this PC's Kick channel as a bot.")
     };
-    page(
-        StatusCode::OK,
-        &format!(
-            "The cloud bot can now answer in Kick chat as {name}.{note} This is for the Ferrocast PC with the code {code}; the Bot page there shows the same code. You can close this tab."
-        ),
+    crate::done_page(
+        &format!("The cloud bot can now answer in Kick chat as {name}.{note}"),
+        "Go back to Ferrocast and press Check again.",
+        &code,
+        "Didn't start this, or the code doesn't match? Remove Ferrocast from the connected apps in your Kick settings.",
     )
 }
 
