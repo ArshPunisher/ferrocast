@@ -37,6 +37,9 @@ pub="$(printf 'ab%.0s' {1..32})"
 secret="Abc_def-ghijklmnopqrstuvwxyz0123"
 # A made-up token in the right shape, built in parts so it never looks like a real one.
 bot="$(printf 'f%.0s' {1..24}).$(printf 'g%.0s' {1..6}).$(printf 'h%.0s' {1..38})"
+# A made-up Brevo key in the right shape, built in parts (prefix, 64 hex, suffix).
+brevo="xkey""sib-$(printf 'a1%.0s' {1..32})-$(printf 'Zq%.0s' {1..8})"
+smtp="xsmtp""sib-$(printf 'a1%.0s' {1..32})-$(printf 'Zq%.0s' {1..8})"
 
 echo "pro-keys.sh"
 fresh_relay
@@ -44,13 +47,14 @@ run "" --status
 is "status works with nothing set" "$code" 0
 has "status says missing" "$out" "GOOGLE_TTS_KEY: *missing"
 
-run "\n\n\n\n\n"
+run "\n\n\n\n\n\n"
 is "Enter everywhere changes nothing" "$code" 0
 has "says nothing changed" "$out" "as it was"
 is "no backup for nothing" "$(backups)" 0
 
-run "$tts\n$app\n$pub\n$secret\n$bot\n"
-is "saves all five" "$code" 0
+run "$tts\n$app\n$pub\n$secret\n$bot\n$brevo\n"
+is "saves all six" "$code" 0
+is "brevo key saved" "$(v BREVO_API_KEY)" "$brevo"
 is "tts key saved" "$(v GOOGLE_TTS_KEY)" "$tts"
 is "app id saved" "$(v DISCORD_APP_ID)" "$app"
 is "public key saved" "$(v DISCORD_PUBLIC_KEY)" "$pub"
@@ -59,9 +63,9 @@ is "bot token saved" "$(v DISCORD_BOT_TOKEN)" "$bot"
 is "other settings kept" "$(v RELAY_VAULT_KEY)" keep
 is "relay.env stays 0600" "$(stat -c %a "$tmp/relay/relay.env" 2>/dev/null || stat -f %Lp "$tmp/relay/relay.env")" 600
 is "a backup was taken" "$(backups)" 1
-for s in "$tts" "$pub" "$secret" "$bot"; do hasnt "never prints a key" "$out" "$s"; done
+for s in "$tts" "$pub" "$secret" "$bot" "$brevo"; do hasnt "never prints a key" "$out" "$s"; done
 
-run "\n\n\n\n\n"
+run "\n\n\n\n\n\n"
 is "running again with Enter keeps them" "$(v DISCORD_BOT_TOKEN)" "$bot"
 has "says they're set" "$out" "set; paste a new one"
 
@@ -84,6 +88,39 @@ fresh_relay
 run "$app\n\n\n\n" --discord
 is "part of the Discord keys works" "$code" 0
 has "warns the bot stays off" "$out" "stays off until all four"
+
+fresh_relay
+run "$smtp\nxkeysib-short\nnope\n" --mail
+is "the SMTP key or a short one is refused" "$code" 1
+has "says what it should look like" "$out" "not the SMTP key"
+is "nothing saved for mail" "$(v BREVO_API_KEY)" ""
+run "$brevo\n" --mail
+is "--mail saves the Brevo key" "$code" 0
+is "only the Brevo key is asked" "$(grep -c '^BREVO_API_KEY=' "$tmp/relay/relay.env")" 1
+hasnt "the mail key isn't printed" "$out" "$brevo"
+run "" --status
+has "status lists the mail key" "$out" "BREVO_API_KEY: *set"
+
+# The cloud bot's Twitch app (made-up values in the right shape).
+tw_id="$(printf 'a1b2c%.0s' {1..6})"
+tw_secret="$(printf 'z9y8x%.0s' {1..6})"
+tw_es="$(printf 'e5%.0s' {1..32})"
+fresh_relay
+run "UPPERCASE_NOT_ALLOWED_xxxxxxxx\nshort\nnope\n" --twitch
+is "a bad Twitch client id is refused" "$code" 1
+is "nothing saved for Twitch" "$(v TWITCH_CLOUD_CLIENT_ID)" ""
+run "$tw_id\n$tw_secret\n$tw_es\n" --twitch
+is "--twitch saves all three" "$code" 0
+is "client id saved" "$(v TWITCH_CLOUD_CLIENT_ID)" "$tw_id"
+is "client secret saved" "$(v TWITCH_CLOUD_CLIENT_SECRET)" "$tw_secret"
+is "eventsub secret saved" "$(v TWITCH_CLOUD_EVENTSUB_SECRET)" "$tw_es"
+for s in "$tw_secret" "$tw_es"; do hasnt "never prints a Twitch secret" "$out" "$s"; done
+run "" --status
+has "status lists the Twitch keys" "$out" "TWITCH_CLOUD_EVENTSUB_SECRET: *set"
+fresh_relay
+run "$tw_id\n\n\n" --twitch
+is "part of the Twitch keys works" "$code" 0
+has "warns the cloud bot stays off" "$out" "stays off until all three"
 
 fresh_relay
 run "x\n" --nope

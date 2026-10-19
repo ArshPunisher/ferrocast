@@ -30,7 +30,7 @@ summary says what went live, or that the previous version was put back.
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
-| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot) with typing hidden, never showing them (below) |
+| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app) with typing hidden, never showing them (below) |
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 
 ## One-time setup for GitHub deploys
@@ -163,3 +163,56 @@ ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   # s
 With all four set, `features.discord` is true and Settings › Discord shows "Ferrocast bot".
 Missing or partial, the relay logs which and the bot stays off; the free webhook posts keep
 working. `deploy-relay.sh` keeps the lines when it rewrites `relay.env`.
+
+## Ferrocast Pro: the weekly email (Brevo)
+
+The sending domain `mail.clearcraftlabs.com` is already authenticated in Brevo (SPF, DKIM,
+DMARC). In Brevo: **SMTP & API → API keys → Generate a new API key** (it starts `xkeysib-`;
+the SMTP key that starts `xsmtpsib-` doesn't work with the API). Type it on the server:
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --mail'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'
+```
+
+With `BREVO_API_KEY` and the vault key set, `features.weekly_email` is true and `#/history`
+shows the Weekly email card. Optional, by hand in `relay.env`: `MAIL_FROM` (default
+`Ferrocast <reports@mail.clearcraftlabs.com>`) and `MAIL_TOKEN_KEY` (signs confirm and
+unsubscribe links; default: derived from `RELAY_VAULT_KEY`; changing it breaks links in emails
+already sent) and `MAIL_DAILY_BUDGET` (emails a UTC day, relay-wide, confirms and reports
+together; default 270, under Brevo's free 300; raise it only with a bigger Brevo plan).
+`deploy-relay.sh` keeps all four. Reports go out at 04:00 UTC (the relay checks hourly) on
+each subscription's day; past the budget (or when Brevo says its limit is reached) the rest
+wait for the next day, up to 2 days late, and confirm emails answer "Try again tomorrow."
+Watch the count before many subscriptions (a paid plan or a second sender is a follow-up).
+
+## Ferrocast Pro: the 24/7 cloud bot (Twitch and Kick)
+
+**Twitch** needs a second app, separate from the desktop's public one. At
+[dev.twitch.tv/console](https://dev.twitch.tv/console) → Applications → Register Your Application:
+
+| Field | Value |
+|---|---|
+| Name | `Ferrocast Cloud` (Twitch names are global; if it's taken, `Ferrocast Cloud Bot`) |
+| OAuth Redirect URLs | `https://ferrocast-relay.clearcraftlabs.com/v1/bot/twitch/callback` |
+| Category | Chat Bot |
+| Client Type | Confidential |
+
+Then Manage → copy the Client ID and press New Secret. The EventSub callback isn't typed in
+the console: the relay makes one conduit and points its webhook shard at
+`https://ferrocast-relay.clearcraftlabs.com/v1/bot/twitch/eventsub` itself (Twitch sends a
+challenge there at once, which the relay answers). Make the EventSub secret with
+`openssl rand -hex 32` and type all three on the server:
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --twitch'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'
+```
+
+**Kick** uses the relay's existing Kick app and its redirect (`/v1/kick/callback`); nothing
+new to register (the app already has the `chat:write` scope).
+
+With the vault key and Twitch's three (or Kick's app) set, `features.cloud_bot` is true and
+the Bot page shows "Keep the bot on when this PC is off". Missing or partial, the relay logs
+which and that platform stays off; the bot on the PC keeps working. `deploy-relay.sh` keeps the
+lines when it rewrites `relay.env`.

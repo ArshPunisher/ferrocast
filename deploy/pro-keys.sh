@@ -6,6 +6,8 @@
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh'            all of them
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --tts'      Ferrocast voices only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --discord'  the Discord bot only
+#   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --mail'     the weekly email only
+#   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --twitch'   the cloud bot's Twitch app only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   set or missing
 #
 # Each key is asked for with typing hidden (paste it, then Enter); Enter alone keeps what's
@@ -19,6 +21,12 @@
 #   DISCORD_PUBLIC_KEY     same page, Public Key (64 hex characters)
 #   DISCORD_CLIENT_SECRET  OAuth2 → Client Secret (Reset Secret)
 #   DISCORD_BOT_TOKEN      Bot → Reset Token
+#   BREVO_API_KEY          app.brevo.com → SMTP & API → API keys → Generate (starts xkeysib-;
+#                          not the SMTP key, which starts xsmtpsib-) (the weekly email)
+#   TWITCH_CLOUD_CLIENT_ID      dev.twitch.tv/console → Applications → Ferrocast Cloud → Client ID
+#   TWITCH_CLOUD_CLIENT_SECRET  same page → New Secret (a Confidential client)
+#   TWITCH_CLOUD_EVENTSUB_SECRET  made by you: `openssl rand -hex 32` (10 to 100 characters;
+#                          signs EventSub's webhooks to the relay, never sent anywhere else)
 set -euo pipefail
 
 DIR="${RELAY_DIR:-/opt/ferrocast-relay}"
@@ -145,6 +153,8 @@ ask() {
 
 TTS_KEYS=(GOOGLE_TTS_KEY)
 DISCORD_KEYS=(DISCORD_APP_ID DISCORD_PUBLIC_KEY DISCORD_CLIENT_SECRET DISCORD_BOT_TOKEN)
+MAIL_KEYS=(BREVO_API_KEY)
+TWITCH_KEYS=(TWITCH_CLOUD_CLIENT_ID TWITCH_CLOUD_CLIENT_SECRET TWITCH_CLOUD_EVENTSUB_SECRET)
 pattern() {
   case "$1" in
     GOOGLE_TTS_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
@@ -152,6 +162,12 @@ pattern() {
     DISCORD_PUBLIC_KEY) echo '^[0-9a-fA-F]{64}$' ;;
     DISCORD_CLIENT_SECRET) echo '^[A-Za-z0-9_-]{16,64}$' ;;
     DISCORD_BOT_TOKEN) echo '^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}$' ;;
+    # Brevo's v3 keys: xkeysib-, 64 hex, a dash, a short suffix (its length isn't documented,
+    # so 8 to 32 letters and digits are taken).
+    BREVO_API_KEY) echo '^xkeysib-[0-9a-fA-F]{64}-[A-Za-z0-9]{8,32}$' ;;
+    # Twitch's client ids and secrets are 30 lowercase letters and digits.
+    TWITCH_CLOUD_CLIENT_ID | TWITCH_CLOUD_CLIENT_SECRET) echo '^[a-z0-9]{30}$' ;;
+    TWITCH_CLOUD_EVENTSUB_SECRET) echo '^[A-Za-z0-9_-]{10,100}$' ;;
   esac
 }
 what() {
@@ -161,6 +177,10 @@ what() {
     DISCORD_PUBLIC_KEY) echo "64 hex characters" ;;
     DISCORD_CLIENT_SECRET) echo "OAuth2 client secret" ;;
     DISCORD_BOT_TOKEN) echo "three parts with dots" ;;
+    BREVO_API_KEY) echo "an API key starting xkeysib-, not the SMTP key" ;;
+    TWITCH_CLOUD_CLIENT_ID) echo "the Ferrocast Cloud app's Client ID, 30 characters" ;;
+    TWITCH_CLOUD_CLIENT_SECRET) echo "the Ferrocast Cloud app's secret, 30 characters" ;;
+    TWITCH_CLOUD_EVENTSUB_SECRET) echo "10 to 100 letters, digits, - or _ (openssl rand -hex 32)" ;;
   esac
 }
 status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi; }
@@ -168,13 +188,15 @@ status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi;
 keys=()
 case "${1:-}" in
   --status)
-    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}"; do printf '%-22s %s\n' "$k:" "$(status_of "$k")"; done
+    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}"; do printf '%-22s %s\n' "$k:" "$(status_of "$k")"; done
     exit 0
     ;;
   --tts) keys=("${TTS_KEYS[@]}") ;;
   --discord) keys=("${DISCORD_KEYS[@]}") ;;
-  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}") ;;
-  *) die "Unknown option '$1'. Use no option, --tts, --discord or --status." ;;
+  --mail) keys=("${MAIL_KEYS[@]}") ;;
+  --twitch) keys=("${TWITCH_KEYS[@]}") ;;
+  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}") ;;
+  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch or --status." ;;
 esac
 
 names=()
@@ -206,6 +228,11 @@ missing=()
 for k in "${DISCORD_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
 if ((${#missing[@]} > 0 && ${#missing[@]} < ${#DISCORD_KEYS[@]})); then
   echo "Still missing for the Discord bot: ${missing[*]}. It stays off until all four are set."
+fi
+missing=()
+for k in "${TWITCH_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
+if ((${#missing[@]} > 0 && ${#missing[@]} < ${#TWITCH_KEYS[@]})); then
+  echo "Still missing for the cloud bot on Twitch: ${missing[*]}. It stays off until all three are set."
 fi
 echo "Restarting the relay so it reads them…"
 restart || put_back "$BACKUP" "The relay didn't come back healthy with the new keys."
