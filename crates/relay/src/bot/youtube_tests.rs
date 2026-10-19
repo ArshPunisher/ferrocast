@@ -52,9 +52,9 @@ pub(crate) struct Script {
 /// issued so far (`dead`), and a refresh with a dead token is refused.
 #[derive(Debug, Default)]
 pub(crate) struct Yt {
-    codes: HashMap<String, GoogleTokens>,
+    pub(crate) codes: HashMap<String, GoogleTokens>,
     /// Token → whose grant (the channel).
-    grants: HashMap<String, String>,
+    pub(crate) grants: HashMap<String, String>,
     /// Tokens whose grant was revoked.
     dead: HashSet<String>,
     /// Calls in flight / at most at once (live checks), and how long each takes.
@@ -65,8 +65,8 @@ pub(crate) struct Yt {
     open_fails: VecDeque<YoutubeError>,
     /// The next send is refused with 401 once.
     send_401_once: bool,
-    infos: HashMap<String, GoogleTokenInfo>,
-    channels: HashMap<String, ChannelInfo>,
+    pub(crate) infos: HashMap<String, GoogleTokenInfo>,
+    pub(crate) channels: HashMap<String, ChannelInfo>,
     pub(crate) revoked: Vec<String>,
     refresh_fails: bool,
     refreshes: u32,

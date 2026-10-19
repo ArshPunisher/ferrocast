@@ -16,39 +16,39 @@ use crate::billing::store::Synced;
 use crate::{Config, Db, router};
 
 const DAY: i64 = 86_400_000;
-const GUILD: &str = "900000000000000001";
+pub(crate) const GUILD: &str = "900000000000000001";
 const OTHER_GUILD: &str = "900000000000000002";
 const CH_TEXT: &str = "900000000000000010";
 const CH_NEWS: &str = "900000000000000011";
 const CH_VOICE: &str = "900000000000000012";
 const ROLE_VIP: &str = "900000000000000020";
-const ROLE_SUB: &str = "900000000000000021";
+pub(crate) const ROLE_SUB: &str = "900000000000000021";
 const ROLE_ADMIN: &str = "900000000000000022";
 const ROLE_BOT: &str = "900000000000000023";
-const VIEWER: &str = "800000000000000001";
+pub(crate) const VIEWER: &str = "800000000000000001";
 const VIEWER_2: &str = "800000000000000002";
-const TWITCH_ID: &str = "141981764";
+pub(crate) const TWITCH_ID: &str = "141981764";
 const YT_ID: &str = "UCabcdefghijklmnopqrstuv";
 const APP_ID: &str = "1561463863197835294";
 
 // ── A fake Discord ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
-struct Fake {
+pub(crate) struct Fake {
     channels: Vec<Channel>,
     roles: Vec<Role>,
     bot_roles: Vec<String>,
     /// Members of `GUILD` and their roles.
-    members: HashMap<String, BTreeSet<String>>,
+    pub(crate) members: HashMap<String, BTreeSet<String>>,
     /// Servers the bot is in.
-    joined: BTreeSet<String>,
+    pub(crate) joined: BTreeSet<String>,
     /// message id → (channel, body)
     messages: HashMap<String, (String, Value)>,
     next_message: u64,
     /// OAuth code → token; token → (user id, connections).
-    codes: HashMap<String, Token>,
-    users: HashMap<String, (String, Vec<Connection>)>,
-    revoked: Vec<String>,
+    pub(crate) codes: HashMap<String, Token>,
+    pub(crate) users: HashMap<String, (String, Vec<Connection>)>,
+    pub(crate) revoked: Vec<String>,
     /// method → the error it fails with.
     fail: HashMap<&'static str, DiscordError>,
     /// `add_role` for this role fails with 50013 (it's above Ferrocast's).
@@ -57,10 +57,10 @@ struct Fake {
 }
 
 #[derive(Debug, Default)]
-struct FakeDiscord(Mutex<Fake>);
+pub(crate) struct FakeDiscord(Mutex<Fake>);
 
 impl FakeDiscord {
-    fn standard() -> FakeDiscord {
+    pub(crate) fn standard() -> FakeDiscord {
         let f = FakeDiscord::default();
         {
             let mut d = f.0.lock().unwrap();
@@ -91,7 +91,7 @@ impl FakeDiscord {
         f
     }
 
-    fn with<T>(&self, f: impl FnOnce(&mut Fake) -> T) -> T {
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&mut Fake) -> T) -> T {
         f(&mut self.0.lock().unwrap())
     }
 
@@ -106,11 +106,11 @@ impl FakeDiscord {
         });
     }
 
-    fn roles_of(&self, user: &str) -> BTreeSet<String> {
+    pub(crate) fn roles_of(&self, user: &str) -> BTreeSet<String> {
         self.with(|d| d.members.get(user).cloned().unwrap_or_default())
     }
 
-    fn calls(&self, prefix: &str) -> usize {
+    pub(crate) fn calls(&self, prefix: &str) -> usize {
         self.with(|d| d.calls.iter().filter(|c| c.starts_with(prefix)).count())
     }
 
@@ -259,7 +259,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn config() -> DiscordConfig {
+pub(crate) fn config() -> DiscordConfig {
     DiscordConfig::from_values(
         Some(APP_ID.into()),
         Some("bot-token-SECRET".into()),

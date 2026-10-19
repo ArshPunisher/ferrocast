@@ -29,7 +29,7 @@ pub(crate) mod tests;
 pub(crate) mod twitch;
 pub(crate) mod youtube;
 #[cfg(test)]
-mod youtube_tests;
+pub(crate) mod youtube_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;

@@ -42,14 +42,14 @@ pub(crate) type KickMod = (String, String, String, String, Option<u32>, Option<S
 #[derive(Debug, Default)]
 pub(crate) struct Tw {
     /// code → (tokens, who)
-    codes: HashMap<String, (UserTokens, TokenInfo)>,
+    pub(crate) codes: HashMap<String, (UserTokens, TokenInfo)>,
     /// access token → who (for validate)
-    tokens: HashMap<String, TokenInfo>,
-    sent: Vec<(String, String, String, Option<String>)>,
-    revoked: Vec<String>,
+    pub(crate) tokens: HashMap<String, TokenInfo>,
+    pub(crate) sent: Vec<(String, String, String, Option<String>)>,
+    pub(crate) revoked: Vec<String>,
     /// (kind, condition, conduit)
-    subscribed: Vec<(String, Value, String)>,
-    unsubscribed: Vec<String>,
+    pub(crate) subscribed: Vec<(String, Value, String)>,
+    pub(crate) unsubscribed: Vec<String>,
     conduits: u32,
     /// The conduit Twitch hands back (`conduit-1` unless set).
     conduit_id: Option<String>,
@@ -258,7 +258,7 @@ impl TwitchCloud for FakeTwitch {
 
 #[derive(Debug, Default)]
 pub(crate) struct Kk {
-    sent: Vec<(String, String, String, Option<String>)>,
+    pub(crate) sent: Vec<(String, String, String, Option<String>)>,
     refreshed: u32,
     /// Refreshes started (before any wait).
     entered: u32,
@@ -266,7 +266,7 @@ pub(crate) struct Kk {
     valid: Option<HashSet<String>>,
     /// The next refresh waits for this first.
     wait: Option<Arc<tokio::sync::Notify>>,
-    revoked: Vec<String>,
+    pub(crate) revoked: Vec<String>,
     send_fails: Option<KickError>,
     /// Moderation calls (M10): (what, access token, broadcaster or "", user or message,
     /// minutes, reason).
@@ -406,6 +406,15 @@ pub(crate) fn vault() -> crate::vault::Vault {
 
 pub(crate) fn who(id: &str, login: &str, client: &str) -> TokenInfo {
     TokenInfo { user_id: id.into(), login: login.into(), scopes: vec![], client_id: client.into() }
+}
+
+/// The PCs went quiet long ago: the cloud is on duty on every platform of `sub` (for tests
+/// outside this module, e.g. `crate::lapse_tests`).
+pub(crate) fn cloud_takes_over_all(st: &AppState, sub: &str) {
+    let past = Instant::now().checked_sub(TAKEOVER_AFTER + Duration::from_secs(1)).unwrap();
+    for p in PLATFORMS {
+        st.bot.lease(sub, p, |l| *l = Lease::new(past, now_ms() - 91_000));
+    }
 }
 
 // ── The world ────────────────────────────────────────────────────────────────────────
