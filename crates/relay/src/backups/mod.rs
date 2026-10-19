@@ -515,7 +515,7 @@ fn kept(st: &AppState, sub: &str, now: i64) -> rusqlite::Result<bool> {
         Some(s) => {
             let access = s.access();
             crate::billing::access::is_pro(&access, now) || {
-                let stopped = crate::billing::access::access_until(&access).or(s.refunded_at).unwrap_or(s.synced_at);
+                let stopped = s.stopped_at();
                 now < stopped.saturating_add(KEEP_AFTER_LAPSE_MS)
             }
         }

@@ -45,6 +45,19 @@ impl SubRow {
             refunded: self.refunded_at.is_some(),
         }
     }
+
+    /// When this subscription stopped granting Pro (ms), for the "kept 30 days after Pro
+    /// ended" rules: the end of its access; a refund's moment; for one that lost access
+    /// without an end (`halted`, `paused`) the paid period plus the late-renewal grace, the
+    /// longest a renewal being retried could have kept it. Never the last sync time: the daily
+    /// re-check syncs halted subscriptions every day, which would keep their data forever.
+    /// Only a subscription that was never charged (no period) falls back to that.
+    pub fn stopped_at(&self) -> i64 {
+        super::access::access_until(&self.access())
+            .or(self.refunded_at)
+            .or(self.current_end.map(|end| end.saturating_add(super::access::GRACE_MS)))
+            .unwrap_or(self.synced_at)
+    }
 }
 
 /// Razorpay's view of a subscription, as the relay copies it.

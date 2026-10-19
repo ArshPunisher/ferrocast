@@ -228,10 +228,8 @@ impl Db {
                     if crate::billing::access::is_pro(&access, now) {
                         true
                     } else {
-                        // When Pro stopped: the end of access, else the refund, else the
-                        // last time the relay heard about it.
-                        let stopped =
-                            crate::billing::access::access_until(&access).or(s.refunded_at).unwrap_or(s.synced_at);
+                        // When Pro stopped (see `SubRow::stopped_at`).
+                        let stopped = s.stopped_at();
                         now < stopped.saturating_add(super::KEEP_AFTER_LAPSE_MS)
                     }
                 }

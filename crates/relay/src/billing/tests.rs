@@ -133,6 +133,29 @@ fn config_debug_never_shows_secrets() {
     assert!(!c.sales_open, "sales are closed unless switched on");
 }
 
+#[test]
+fn pro_stops_at_the_end_of_access_never_at_the_last_sync() {
+    let row = |status: &str, end: Option<i64>, refunded_at: Option<i64>, synced_at: i64| store::SubRow {
+        id: "sub_1".into(),
+        plan: "monthly".into(),
+        email_hash: "e".into(),
+        status: status.into(),
+        current_end: end,
+        cancel_at_end: false,
+        refunded_at,
+        synced_at,
+    };
+    let (end, g) = (1_000_000_000_000, access::GRACE_MS);
+    assert_eq!(row("cancelled", Some(end), None, end + 99).stopped_at(), end, "the paid period");
+    assert_eq!(row("active", Some(end), None, end + 99).stopped_at(), end + g, "a late renewal's grace");
+    assert_eq!(row("active", Some(end), Some(end - 5), end + 99).stopped_at(), end - 5, "refunded");
+    // Halted or paused: the daily re-check moves `synced_at` every day; the end must not move.
+    for status in ["halted", "paused"] {
+        assert_eq!(row(status, Some(end), None, end + 40 * 86_400_000).stopped_at(), end + g, "{status}");
+    }
+    assert_eq!(row("created", None, None, 7).stopped_at(), 7, "never charged: the last sync");
+}
+
 // ── Unit: idempotency in the database ────────────────────────────────────────────────
 
 #[test]

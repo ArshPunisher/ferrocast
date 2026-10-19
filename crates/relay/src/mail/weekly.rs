@@ -339,7 +339,7 @@ pub async fn sweep(st: &AppState, now: i64) {
                     Ok(Some(s)) => {
                         let a = s.access();
                         access::is_pro(&a, now) || {
-                            let stopped = access::access_until(&a).or(s.refunded_at).unwrap_or(s.synced_at);
+                            let stopped = s.stopped_at();
                             now < stopped.saturating_add(KEEP_AFTER_LAPSE_MS)
                         }
                     }
