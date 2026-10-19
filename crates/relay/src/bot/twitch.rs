@@ -84,6 +84,31 @@ pub struct TokenInfo {
     pub client_id: String,
 }
 
+/// One shard of a conduit as Twitch reports it (`bot-check`, the shard check).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardInfo {
+    pub id: String,
+    /// `enabled`, `webhook_callback_verification_pending`, `…_failed`, `notification_failures_exceeded` …
+    pub status: String,
+    pub method: String,
+    pub callback: Option<String>,
+}
+
+/// One EventSub subscription as Twitch reports it (`bot-check`). Ids only, no secrets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubInfo {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub condition: Value,
+    /// The conduit it delivers to (`None`: another transport).
+    pub conduit: Option<String>,
+}
+
+fn not_supported<'a, T: Send + 'a>() -> Fut<'a, T, TwitchError> {
+    Box::pin(async { Err(TwitchError::Unavailable("not supported by this client".into())) })
+}
+
 /// Twitch's REST for the cloud bot.
 pub trait TwitchCloud: Send + Sync + std::fmt::Debug {
     fn exchange_code<'a>(&'a self, code: &'a str, redirect_uri: &'a str) -> Fut<'a, UserTokens, TwitchError>;
@@ -112,6 +137,18 @@ pub trait TwitchCloud: Send + Sync + std::fmt::Debug {
         condition: &'a Value,
     ) -> Fut<'a, Option<String>, TwitchError>;
     fn unsubscribe<'a>(&'a self, app: &'a str, id: &'a str) -> Fut<'a, (), TwitchError>;
+    /// The app's conduit ids (read only).
+    fn conduits<'a>(&'a self, _app: &'a str) -> Fut<'a, Vec<String>, TwitchError> {
+        not_supported()
+    }
+    /// A conduit's shards (read only).
+    fn shards<'a>(&'a self, _app: &'a str, _conduit: &'a str) -> Fut<'a, Vec<ShardInfo>, TwitchError> {
+        not_supported()
+    }
+    /// Every subscription that names `user` (read only, a few pages at most).
+    fn subscriptions<'a>(&'a self, _app: &'a str, _user: &'a str) -> Fut<'a, Vec<SubInfo>, TwitchError> {
+        not_supported()
+    }
     /// Send Chat Message with the app token (`sender` is the bot account); the message id.
     fn send_chat<'a>(
         &'a self,
@@ -218,6 +255,27 @@ impl HttpTwitch {
 
     fn helix(&self, method: reqwest::Method, path: &str, app: &str) -> reqwest::RequestBuilder {
         self.http.request(method, format!("{}{path}", self.helix)).bearer_auth(app).header("Client-Id", &self.client_id)
+    }
+}
+
+pub(crate) fn shard_info(s: &Value) -> ShardInfo {
+    let text = |p: &str| s.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
+    ShardInfo {
+        id: text("/id"),
+        status: text("/status"),
+        method: text("/transport/method"),
+        callback: s.pointer("/transport/callback").and_then(Value::as_str).map(String::from),
+    }
+}
+
+pub(crate) fn sub_info(s: &Value) -> SubInfo {
+    let text = |p: &str| s.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
+    SubInfo {
+        id: text("/id"),
+        kind: text("/type"),
+        status: text("/status"),
+        condition: s.get("condition").cloned().unwrap_or(Value::Null),
+        conduit: s.pointer("/transport/conduit_id").and_then(Value::as_str).map(String::from),
     }
 }
 
@@ -403,6 +461,52 @@ impl TwitchCloud for HttpTwitch {
             )
             .await?;
             Ok(())
+        })
+    }
+
+    fn conduits<'a>(&'a self, app: &'a str) -> Fut<'a, Vec<String>, TwitchError> {
+        Box::pin(async move {
+            let v = Self::check(self.helix(reqwest::Method::GET, "/eventsub/conduits", app).send().await).await?;
+            Ok(v["data"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c["id"].as_str()).map(String::from).collect())
+                .unwrap_or_default())
+        })
+    }
+
+    fn shards<'a>(&'a self, app: &'a str, conduit: &'a str) -> Fut<'a, Vec<ShardInfo>, TwitchError> {
+        Box::pin(async move {
+            let v = Self::check(
+                self.helix(reqwest::Method::GET, "/eventsub/conduits/shards", app)
+                    .query(&[("conduit_id", conduit)])
+                    .send()
+                    .await,
+            )
+            .await?;
+            Ok(v["data"].as_array().map(|a| a.iter().map(shard_info).collect()).unwrap_or_default())
+        })
+    }
+
+    fn subscriptions<'a>(&'a self, app: &'a str, user: &'a str) -> Fut<'a, Vec<SubInfo>, TwitchError> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            let mut after: Option<String> = None;
+            for _ in 0..5 {
+                let mut q = vec![("user_id", user.to_string())];
+                if let Some(a) = &after {
+                    q.push(("after", a.clone()));
+                }
+                let v = Self::check(
+                    self.helix(reqwest::Method::GET, "/eventsub/subscriptions", app).query(&q).send().await,
+                )
+                .await?;
+                out.extend(v["data"].as_array().into_iter().flatten().map(sub_info));
+                match v.pointer("/pagination/cursor").and_then(Value::as_str) {
+                    Some(c) if !c.is_empty() => after = Some(c.to_string()),
+                    _ => break,
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -736,6 +840,7 @@ pub(crate) async fn eventsub(State(st): State<AppState>, headers: HeaderMap, bod
                 .into_response();
         }
         Err(Refusal::Stale) => {
+            st.bot.note_stale(now_ms());
             return ApiError::new(StatusCode::FORBIDDEN, "stale_message", "The message is too old or from the future.")
                 .into_response();
         }
@@ -743,6 +848,16 @@ pub(crate) async fn eventsub(State(st): State<AppState>, headers: HeaderMap, bod
     let Ok(v) = serde_json::from_slice::<Value>(&body) else {
         return ApiError::new(StatusCode::BAD_REQUEST, "bad_json", "The message body isn't JSON.").into_response();
     };
+    // The challenge is answered every time, before the dedupe: it's signed and harmless to
+    // repeat, and a 204 to a verification Twitch retries (the relay restarted while it was
+    // in flight) would leave the shard disabled, so no chat would ever arrive.
+    if ty == "webhook_callback_verification" {
+        let challenge = v["challenge"].as_str().unwrap_or("").to_string();
+        tracing::info!("answered Twitch's EventSub callback check: the shard can be enabled");
+        let mut r = (StatusCode::OK, challenge).into_response();
+        r.headers_mut().insert(header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/plain"));
+        return r;
+    }
     // One look in the `seen` table: `false` means a replay or a retry already handled.
     let key = format!("tw:{id}");
     let db = st.db.clone();
@@ -753,13 +868,10 @@ pub(crate) async fn eventsub(State(st): State<AppState>, headers: HeaderMap, bod
         Err(_) => return super::storage_busy().into_response(),
     }
     match ty.as_str() {
-        "webhook_callback_verification" => {
-            let challenge = v["challenge"].as_str().unwrap_or("").to_string();
-            let mut r = (StatusCode::OK, challenge).into_response();
-            r.headers_mut().insert(header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/plain"));
-            r
-        }
         "revocation" => {
+            let status = v.pointer("/subscription/status").and_then(Value::as_str).unwrap_or("");
+            let kind = v.pointer("/subscription/type").and_then(Value::as_str).unwrap_or("");
+            tracing::info!(status, kind, "Twitch revoked a cloud bot EventSub subscription");
             let st2 = st.clone();
             st.bot.work_twitch(Box::pin(async move { revoked(&st2, &v).await }));
             StatusCode::NO_CONTENT.into_response()
@@ -830,9 +942,15 @@ pub(crate) async fn unbind(st: &AppState, ch: &super::store::Channel, err: &Valu
 async fn notification(st: &AppState, message_id: &str, v: &Value) {
     let kind = v.pointer("/subscription/type").and_then(Value::as_str).unwrap_or("");
     let Some(b) = broadcaster_of(v) else { return };
+    let b2 = b.clone();
     let ch = match super::db(st, move |db| db.bot_channel_by_channel("twitch", &b)).await {
         Ok(Some(ch)) => ch,
-        Ok(None) => return,
+        Ok(None) => {
+            if st.bot.note(&format!("unbound:{b2}"), Platform::Twitch, "unbound", now_ms()) {
+                tracing::info!(kind, broadcaster = %b2, "an EventSub notification for a channel no cloud bot is bound to (ignored)");
+            }
+            return;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "couldn't look up a cloud bot channel");
             return;
@@ -842,10 +960,17 @@ async fn notification(st: &AppState, message_id: &str, v: &Value) {
     match kind {
         "stream.online" => {
             let at = event["started_at"].as_str().and_then(parse_time).unwrap_or_else(now_ms);
+            tracing::info!(sub = %ch.sub_id, "a cloud bot's Twitch channel went live");
             super::set_live(st, &ch.sub_id, Platform::Twitch, Some(at));
         }
-        "stream.offline" => super::set_live(st, &ch.sub_id, Platform::Twitch, None),
+        "stream.offline" => {
+            tracing::info!(sub = %ch.sub_id, "a cloud bot's Twitch channel went offline");
+            super::set_live(st, &ch.sub_id, Platform::Twitch, None);
+        }
         "channel.chat.message" => {
+            if st.bot.note(&ch.sub_id, Platform::Twitch, "arrived", now_ms()) {
+                tracing::info!(sub = %ch.sub_id, "Twitch chat is reaching the cloud bot (first line this hour)");
+            }
             let e = ferrocast_twitch::map::map(kind, message_id, &event, Millis(now_ms()));
             super::on_chat(st, &ch, Platform::Twitch, e).await;
         }

@@ -53,6 +53,10 @@ pub(crate) struct Tw {
     conduits: u32,
     /// The conduit Twitch hands back (`conduit-1` unless set).
     conduit_id: Option<String>,
+    /// The callback shard 0 was last pointed at.
+    callback: Option<String>,
+    /// Shard 0's status (`enabled` unless set).
+    pub(crate) shard_status: Option<String>,
     pub(crate) refresh_fails: bool,
     send_fails: Option<TwitchError>,
     /// Send Chat Message gives no message id.
@@ -143,8 +147,42 @@ impl TwitchCloud for FakeTwitch {
             assert_eq!(secret, ES_SECRET);
             self.with(|t| {
                 t.conduits += 1;
+                t.callback = Some(callback.to_string());
                 Ok(t.conduit_id.clone().unwrap_or_else(|| "conduit-1".into()))
             })
+        })
+    }
+    fn conduits<'a>(&'a self, _app: &'a str) -> Fut<'a, Vec<String>, TwitchError> {
+        Box::pin(async move { Ok(vec![self.with(|t| t.conduit_id.clone().unwrap_or_else(|| "conduit-1".into()))]) })
+    }
+    fn shards<'a>(&'a self, _app: &'a str, _conduit: &'a str) -> Fut<'a, Vec<ShardInfo>, TwitchError> {
+        Box::pin(async move {
+            Ok(self.with(|t| {
+                vec![ShardInfo {
+                    id: "0".into(),
+                    status: t.shard_status.clone().unwrap_or_else(|| "enabled".into()),
+                    method: "webhook".into(),
+                    callback: t.callback.clone(),
+                }]
+            }))
+        })
+    }
+    fn subscriptions<'a>(&'a self, _app: &'a str, user: &'a str) -> Fut<'a, Vec<SubInfo>, TwitchError> {
+        Box::pin(async move {
+            Ok(self.with(|t| {
+                t.subscribed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, c, _))| c["broadcaster_user_id"] == user || c["user_id"] == user)
+                    .map(|(i, (k, c, conduit))| SubInfo {
+                        id: format!("es-{}", i + 1),
+                        kind: k.clone(),
+                        status: "enabled".into(),
+                        condition: c.clone(),
+                        conduit: Some(conduit.clone()),
+                    })
+                    .collect()
+            }))
         })
     }
     fn subscribe<'a>(
@@ -1692,6 +1730,55 @@ async fn the_conduit_shard_is_patched_only_when_it_needs_it() {
     let api = HttpTwitch::with_bases(&twitch_cfg(), &base, &base);
     api.conduit("app", &format!("{base}/cb"), ES_SECRET).await.unwrap();
     assert_eq!(*patches.lock().unwrap(), 1, "disabled: switched on again");
+}
+
+/// The 2026-10-19 outage: Twitch retried the callback check with the same message id after
+/// the relay restarted mid-check. A 204 ("already handled") left the shard failed and the
+/// cloud bot deaf; the challenge must be answered every time.
+#[tokio::test]
+async fn the_callback_check_is_answered_even_when_its_id_was_seen() {
+    let w = world().await;
+    let now = rfc3339(now_ms());
+    let verify = json!({ "challenge": "c-1", "subscription": { "type": "channel.chat.message" } });
+    let a = w.eventsub("m-v", "webhook_callback_verification", &now, &verify, None).await;
+    assert_eq!((a.status, a.text.as_str()), (200, "c-1"));
+    let a = w.eventsub("m-v", "webhook_callback_verification", &now, &verify, None).await;
+    assert_eq!((a.status, a.text.as_str()), (200, "c-1"), "a retried check is answered again");
+    // A bad signature is still refused.
+    let a = w.eventsub("m-v2", "webhook_callback_verification", &now, &verify, Some("sha256=00".into())).await;
+    assert_eq!(a.status, 403);
+}
+
+/// Shard 0 failing Twitch's callback check after the conduit was set up is seen 20 s later:
+/// a warning, the set-up again (a PATCH makes Twitch check again), a few times in a row.
+#[tokio::test(start_paused = true)]
+async fn a_shard_that_failed_its_callback_check_is_set_up_again() {
+    let tw = Arc::new(FakeTwitch::default());
+    let (st, _dir) = bare(tw.clone());
+    tw.with(|t| t.shard_status = Some("webhook_callback_verification_failed".into()));
+    assert_eq!(st.bot.conduit(&st).await.unwrap(), "conduit-1");
+    assert_eq!(tw.with(|t| t.conduits), 1);
+    tokio::time::sleep(SHARD_CHECK_AFTER + Duration::from_secs(1)).await;
+    assert_eq!(tw.with(|t| t.conduits), 2, "set up again after the failed check");
+    tokio::time::sleep((SHARD_CHECK_AFTER + Duration::from_secs(1)) * 5).await;
+    assert_eq!(tw.with(|t| t.conduits), SHARD_CHECK_TRIES, "then left to the hourly sweep");
+    // Enabled: nothing more.
+    tw.with(|t| t.shard_status = None);
+    *st.bot.conduit.lock().await = None;
+    st.bot.conduit(&st).await.unwrap();
+    tokio::time::sleep((SHARD_CHECK_AFTER + Duration::from_secs(1)) * 3).await;
+    assert_eq!(tw.with(|t| t.conduits), SHARD_CHECK_TRIES + 1);
+}
+
+#[test]
+fn rare_events_are_logged_once_an_hour_per_channel_and_reason() {
+    let rt = Runtime::default();
+    assert!(rt.note("s1", Platform::Twitch, "no_config", 0));
+    assert!(!rt.note("s1", Platform::Twitch, "no_config", 1_000));
+    assert!(rt.note("s1", Platform::Twitch, "own_message", 1_000), "another reason");
+    assert!(rt.note("s2", Platform::Twitch, "no_config", 1_000), "another channel");
+    assert!(rt.note("s1", Platform::Kick, "no_config", 1_000), "another platform");
+    assert!(rt.note("s1", Platform::Twitch, "no_config", NOTE_EVERY_MS), "an hour later");
 }
 
 // ── Kick ─────────────────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@
 //! `YOUTUBE_CLOUD_CLIENT_SECRET` (both, or YouTube is off), `YOUTUBE_CLOUD_DESKTOP_CLIENT_ID`,
 //! `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (1,500) and `YOUTUBE_CLOUD_DAILY_UNITS` (9,000).
 
+pub mod check;
 pub(crate) mod kick;
 mod lease;
 pub(crate) mod moderate;
@@ -57,7 +58,7 @@ use tokio::time::Instant;
 pub use kick::{HttpKick, KickBot, KickError, KickTokens};
 pub use lease::{Lease, TAKEOVER_AFTER, Who};
 pub(crate) use store::SCHEMA;
-pub use twitch::{HttpTwitch, ModTarget, TokenInfo, TwitchCloud, TwitchError, UserTokens};
+pub use twitch::{HttpTwitch, ModTarget, ShardInfo, SubInfo, TokenInfo, TwitchCloud, TwitchError, UserTokens};
 pub use youtube::{HttpYoutube, YoutubeCloud, YoutubeConfig, YoutubeError};
 
 use crate::billing::gate::{ProCtx, require_pro};
@@ -95,6 +96,15 @@ pub const QUEUE_CAP: usize = 1_024;
 pub const WORKERS: usize = 16;
 /// Channels whose timers run at once.
 pub const TIMER_CONCURRENCY: usize = 16;
+/// After the conduit is set up, shard 0 is looked at again this much later: Twitch checks
+/// the callback after the PATCH answered, so a failed check would otherwise go unseen.
+pub const SHARD_CHECK_AFTER: Duration = Duration::from_secs(20);
+/// Set-ups in a row when shard 0 doesn't come up enabled (then the hourly sweep tries).
+pub const SHARD_CHECK_TRIES: u32 = 3;
+/// A rare cloud bot event (a skip reason, chat arriving) is logged at info once per this
+/// long per channel; the rest at debug.
+pub const NOTE_EVERY_MS: i64 = 3_600_000;
+
 /// The chat platforms a lease covers (a plain `bot_seen` covers all of them).
 pub const PLATFORMS: [Platform; 3] = [Platform::Twitch, Platform::Kick, Platform::Youtube];
 
@@ -298,6 +308,10 @@ pub struct Runtime {
     kick_work: Work,
     /// Bad EventSub signatures: (the minute of the last warning, how many since).
     bad_sig: Mutex<(i64, u64)>,
+    /// Stale EventSub timestamps: the same.
+    stale: Mutex<(i64, u64)>,
+    /// When each rare event was last logged at info: (subscription, platform, what) → ms.
+    notes: Mutex<HashMap<(String, Platform, &'static str), i64>>,
     youtube_cfg: Option<YoutubeConfig>,
     pub(crate) youtube: Option<Arc<dyn YoutubeCloud>>,
     /// Per subscription: YouTube's access token, live chat, reader, cadence (memory only).
@@ -346,6 +360,8 @@ impl Runtime {
             twitch_work: Work::default(),
             kick_work: Work::default(),
             bad_sig: Mutex::default(),
+            stale: Mutex::default(),
+            notes: Mutex::default(),
             youtube_cfg: None,
             youtube: None,
             yt: Mutex::default(),
@@ -428,12 +444,51 @@ impl Runtime {
         if b.0 != minute {
             let before = b.1;
             *b = (minute, 0);
-            tracing::warn!(refused_before = before, "refused an EventSub message with a bad signature");
+            tracing::warn!(
+                refused_before = before,
+                "refused an EventSub message with a bad signature (if this repeats, TWITCH_CLOUD_EVENTSUB_SECRET may differ from the secret on the conduit's shard: run bot-check)"
+            );
             true
         } else {
             b.1 += 1;
             tracing::debug!("refused an EventSub message with a bad signature");
             false
+        }
+    }
+
+    /// A refused EventSub timestamp (too old or from the future): like a bad signature.
+    pub(crate) fn note_stale(&self, now: i64) -> bool {
+        let mut b = self.stale.lock().unwrap_or_else(|p| p.into_inner());
+        let minute = now.div_euclid(60_000);
+        if b.0 != minute {
+            let before = b.1;
+            *b = (minute, 0);
+            tracing::warn!(
+                refused_before = before,
+                "refused an EventSub message with a stale timestamp (is the server's clock right?)"
+            );
+            true
+        } else {
+            b.1 += 1;
+            tracing::debug!("refused an EventSub message with a stale timestamp");
+            false
+        }
+    }
+
+    /// Whether a rare event (`what`) on `sub`'s `platform` should be logged at info now:
+    /// the first time, then once per [`NOTE_EVERY_MS`].
+    pub(crate) fn note(&self, sub: &str, platform: Platform, what: &'static str, now: i64) -> bool {
+        let mut m = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+        if m.len() > 10_000 {
+            m.retain(|_, at| now - *at < NOTE_EVERY_MS);
+        }
+        let key = (sub.to_string(), platform, what);
+        match m.get(&key) {
+            Some(at) if now - at < NOTE_EVERY_MS => false,
+            _ => {
+                m.insert(key, now);
+                true
+            }
         }
     }
 
@@ -459,11 +514,15 @@ impl Runtime {
     /// kept in `bot_kv`: when Twitch hands back another one (the old one was deleted), every
     /// bound Twitch channel is subscribed again on it, or chat would stop arriving.
     pub(crate) fn conduit<'a>(&'a self, st: &'a AppState) -> Fut<'a, String, TwitchError> {
-        // Boxed: setting it up may subscribe channels again, which asks for the conduit.
-        Box::pin(self.conduit_inner(st))
+        self.conduit_try(st, 1)
     }
 
-    async fn conduit_inner(&self, st: &AppState) -> Result<String, TwitchError> {
+    fn conduit_try<'a>(&'a self, st: &'a AppState, attempt: u32) -> Fut<'a, String, TwitchError> {
+        // Boxed: setting it up may subscribe channels again, which asks for the conduit.
+        Box::pin(self.conduit_inner(st, attempt))
+    }
+
+    async fn conduit_inner(&self, st: &AppState, attempt: u32) -> Result<String, TwitchError> {
         let (id, changed) = {
             let mut slot = self.conduit.lock().await;
             if let Some(c) = slot.as_ref() {
@@ -485,6 +544,8 @@ impl Runtime {
             let changed = before.is_some_and(|b| b != id);
             (id, changed)
         };
+        // Twitch checks the callback after the PATCH answered: look again a little later.
+        tokio::spawn(check_shard(st.clone(), id.clone(), attempt));
         if changed {
             tracing::info!("Twitch's EventSub conduit changed: subscribing the cloud bot's channels again");
             resubscribe_all(st).await;
@@ -1506,6 +1567,17 @@ fn own_message(
     })
 }
 
+/// Why the cloud didn't answer a chat line: logged at info the first time per reason,
+/// channel and hour, at debug after, so a quiet bot is never a mystery and chat never
+/// floods the log.
+pub(crate) fn quiet(st: &AppState, sub: &str, platform: Platform, why: &'static str) {
+    if st.bot.note(sub, platform, why, now_ms()) {
+        tracing::info!(sub, platform = key(platform), why, "the cloud bot didn't answer a chat line (first this hour)");
+    } else {
+        tracing::debug!(sub, platform = key(platform), why, "the cloud bot didn't answer a chat line");
+    }
+}
+
 /// A chat line for a channel the cloud bot is bound to (from EventSub or Kick's webhook).
 pub(crate) async fn on_chat(st: &AppState, ch: &store::Channel, platform: Platform, e: Event) {
     let EventKind::ChatMessage { actor, content, .. } = &e.kind else { return };
@@ -1516,6 +1588,7 @@ pub(crate) async fn on_chat(st: &AppState, ch: &store::Channel, platform: Platfo
     // Switched off or Pro ended: nothing is kept or answered.
     let s2 = sub.to_string();
     if !matches!(db(st, move |db| sub_is_on(db, &s2)).await, Ok(true)) {
+        quiet(st, sub, platform, "switched_off_or_no_pro");
         return;
     }
     let Some(kept) = remember(st, sub, platform, &e, &actor.display_name, &content.text) else {
@@ -1524,14 +1597,28 @@ pub(crate) async fn on_chat(st: &AppState, ch: &store::Channel, platform: Platfo
     // Phones of a PC that's off see the line as the PC would have sent it (M10).
     crate::remote::cloud_chat(st, sub, &kept);
     // Shared Chat from a partner channel, the cloud's own lines: never answered (R-11).
-    if e.channel.is_some() || own_message(st, ch, platform, &e, actor.id.as_deref(), &content.text) || !ch.ready() {
+    if e.channel.is_some() {
+        quiet(st, sub, platform, "shared_chat");
         return;
     }
-    let Some(since) = cloud_since(st, sub, platform) else { return };
+    if own_message(st, ch, platform, &e, actor.id.as_deref(), &content.text) {
+        quiet(st, sub, platform, "own_message");
+        return;
+    }
+    if !ch.ready() {
+        quiet(st, sub, platform, "channel_not_ready");
+        return;
+    }
+    let Some(since) = cloud_since(st, sub, platform) else {
+        quiet(st, sub, platform, "desktop_on_duty");
+        return;
+    };
     if load_config(st, sub).is_none() {
+        quiet(st, sub, platform, "no_config");
         return;
     }
     let now = now_ms();
+    let mut why: &'static str = "no_config";
     let answer = st.bot.mem(sub, |m| {
         let mut extra = Vars::new();
         cloudbot::uptime_vars(&mut extra, ch.live_since.map(Millis), Millis(now));
@@ -1540,14 +1627,21 @@ pub(crate) async fn on_chat(st: &AppState, ch: &store::Channel, platform: Platfo
         let (_, cfg) = config.as_mut()?;
         let brain = brains.entry(platform).or_default();
         brain.takeover(cfg, Millis(since));
-        brain.on_chat(
+        let answer = brain.on_chat(
             cfg,
             Chat { platform, actor, text: &content.text, live: ch.live_since.is_some() },
             &extra,
             Millis(now),
-        )
+        );
+        if answer.is_none() {
+            why = cloudbot::why_quiet(cfg, &content.text);
+        }
+        answer
     });
-    let Some(answer) = answer else { return };
+    let Some(answer) = answer else {
+        quiet(st, sub, platform, why);
+        return;
+    };
     if let Some(change) = &answer.counter {
         counter_changed(st, sub, change, now);
     }
@@ -1584,7 +1678,7 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
     match st.db.try_take(&ch.sub_id, &format!("bot_messages_{p}"), Period::Minute, 1, MESSAGES_PER_MINUTE) {
         Ok(()) => {}
         Err(TakeErr::Over(_)) => {
-            tracing::debug!(platform = p, "the cloud bot's minute is used up");
+            quiet(st, &ch.sub_id, platform, "messages_per_minute_used_up");
             return false;
         }
         Err(TakeErr::Db(e)) => {
@@ -1594,6 +1688,9 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
     }
     // Remembered before it goes: Twitch's echo can arrive before its answer.
     st.bot.mem(&ch.sub_id, |m| m.sent.entry(platform).or_default().text(text, now_ms()));
+    if st.bot.note(&ch.sub_id, platform, "answering", now_ms()) {
+        tracing::info!(sub = %ch.sub_id, platform = p, "the cloud bot is answering chat (first reply this hour)");
+    }
     let sent = match platform {
         Platform::Twitch => twitch::send(st, ch, text, reply_to).await,
         Platform::Kick => kick::send(st, ch, text, reply_to).await,
@@ -1613,6 +1710,7 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
             true
         }
         Err(SendErr::RateLimited(s)) => {
+            quiet(st, &ch.sub_id, platform, "platform_rate_limited");
             st.bot.mem(&ch.sub_id, |m| m.brains.entry(platform).or_default().rate_limited(platform, s, Millis(now)));
             false
         }
@@ -1648,9 +1746,16 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
             }
             false
         }
-        Err(SendErr::NotReady) => false,
+        Err(SendErr::NotReady) => {
+            quiet(st, &ch.sub_id, platform, "send_not_ready");
+            false
+        }
         Err(SendErr::Unavailable(m)) => {
-            tracing::debug!(platform = p, why = %m, "couldn't send a cloud bot message");
+            if st.bot.note(&ch.sub_id, platform, "send_failed", now) {
+                tracing::warn!(platform = p, why = %m, "couldn't send a cloud bot message");
+            } else {
+                tracing::debug!(platform = p, why = %m, "couldn't send a cloud bot message");
+            }
             false
         }
     }
@@ -1728,6 +1833,49 @@ pub async fn run(st: AppState) {
     loop {
         tokio::time::sleep(TIMER_TICK).await;
         timer_tick(&st).await;
+    }
+}
+
+/// Shard 0 of `conduit`, looked at [`SHARD_CHECK_AFTER`] after it was set up: enabled at this
+/// relay's callback, or a warning and the set-up again (at most [`SHARD_CHECK_TRIES`] in a
+/// row; the hourly sweep after that). Without this a failed callback check (the relay was
+/// restarting, a proxy wasn't ready) would leave chat silently off for up to an hour.
+pub(crate) async fn check_shard(st: AppState, conduit: String, attempt: u32) {
+    tokio::time::sleep(SHARD_CHECK_AFTER).await;
+    let Some(api) = st.bot.twitch.clone() else { return };
+    let Ok(app) = st.bot.app_token().await else { return };
+    let shards = match api.shards(&app, &conduit).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "couldn't look at Twitch's EventSub shard");
+            return;
+        }
+    };
+    let want = twitch::callback_url(&st);
+    let shard = shards.iter().find(|s| s.id == "0");
+    if shard.is_some_and(|s| s.status == "enabled" && s.callback.as_deref() == Some(want.as_str())) {
+        tracing::info!("Twitch's EventSub shard is enabled at this relay");
+        return;
+    }
+    let status = shard.map_or("missing", |s| s.status.as_str());
+    let here = shard.is_some_and(|s| s.callback.as_deref() == Some(want.as_str()));
+    tracing::warn!(
+        status,
+        callback_is_this_relay = here,
+        attempt,
+        "Twitch's EventSub shard isn't enabled at this relay: Twitch chat isn't reaching the cloud bot"
+    );
+    if attempt >= SHARD_CHECK_TRIES {
+        return;
+    }
+    {
+        let mut slot = st.bot.conduit.lock().await;
+        if slot.as_deref() == Some(conduit.as_str()) {
+            *slot = None;
+        }
+    }
+    if let Err(e) = st.bot.conduit_try(&st, attempt + 1).await {
+        tracing::warn!(error = %e, "couldn't point Twitch's EventSub conduit at the relay");
     }
 }
 

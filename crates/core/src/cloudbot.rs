@@ -380,6 +380,33 @@ impl Brain {
     }
 }
 
+/// Why [`Brain::on_chat`] gave no answer to `text`, in a word for the relay's log (never
+/// the text itself): the desktop's bot switch is off, a built-in word only the PC answers,
+/// a command that's switched off, one held by its cooldown, access or platforms, no command
+/// by that name, or a line no auto-reply took.
+pub fn why_quiet(cfg: &BotConfig, text: &str) -> &'static str {
+    if !cfg.bot_on {
+        return "bot_switched_off_on_the_pc";
+    }
+    let Some(inv) = command::parse(text) else { return "no_auto_reply_matched" };
+    let word = inv.word.to_lowercase();
+    let named: Vec<&Command> = cfg.commands.iter().filter(|c| c.answers_to(&word)).collect();
+    if named.is_empty() {
+        if cfg.counters.iter().any(|c| c.enabled && c.command.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(&word)))
+        {
+            return "counter_cooldown";
+        }
+        if chatbot::module_for(&word).is_some() || matches!(word.as_str(), "!scene" | "!brb" | "!back" | "!clip") {
+            return "built_in_command_answered_by_the_pc_only";
+        }
+        return "no_such_command";
+    }
+    if named.iter().all(|c| !c.enabled) {
+        return "command_switched_off";
+    }
+    "command_cooldown_access_or_platform"
+}
+
 /// Counter values by name (for overlaying newer cloud changes on a pushed config).
 pub fn counter_values(cfg: &BotConfig) -> BTreeMap<String, i64> {
     cfg.counters.iter().map(|c| (c.name.clone(), c.value)).collect()
@@ -489,6 +516,19 @@ mod tests {
             b.on_chat(&mut cfg, chat(&other, "!nothing discord"), &extra, Millis(60_000)).is_some(),
             "not a command"
         );
+    }
+
+    #[test]
+    fn why_quiet_names_the_reason() {
+        let mut cfg = config();
+        assert_eq!(why_quiet(&cfg, "!nope"), "no_such_command");
+        assert_eq!(why_quiet(&cfg, "hello"), "no_auto_reply_matched");
+        assert_eq!(why_quiet(&cfg, "!uptime"), "built_in_command_answered_by_the_pc_only");
+        assert_eq!(why_quiet(&cfg, "!lurk"), "command_cooldown_access_or_platform");
+        cfg.commands[0].enabled = false;
+        assert_eq!(why_quiet(&cfg, "!LURK"), "command_switched_off");
+        cfg.bot_on = false;
+        assert_eq!(why_quiet(&cfg, "!lurk"), "bot_switched_off_on_the_pc");
     }
 
     #[test]

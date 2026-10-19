@@ -4,6 +4,10 @@
 //! `ferrocast-relay pro-grant <install-id> <days> | --revoke <install-id> | --list`: the
 //! owner's test Pro (billing::comp) on the same `RELAY_DATA` database, then exits. Safe
 //! while the server runs (WAL, busy timeout). Run on the server by `deploy/pro-grant.sh`.
+//!
+//! `ferrocast-relay bot-check [<install-id>]`: the owner's look at the Twitch cloud bot
+//! (bot::check): the conduit, shard 0, EventSub subscriptions and each channel's row, with
+//! no tokens or secrets, then exits. Run on the server by `deploy/bot-check.sh`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -35,6 +39,33 @@ async fn main() {
             Ok(out) => println!("{out}"),
             Err(e) => {
                 eprintln!("ferrocast-relay pro-grant: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.first().map(String::as_str) == Some("bot-check") {
+        let install = match ferrocast_relay::bot::check::parse_args(&args[1..]) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("ferrocast-relay bot-check: {e}");
+                std::process::exit(2);
+            }
+        };
+        let cfg = Config::from_env();
+        let api = match ferrocast_relay::bot::TwitchConfig::from_env() {
+            Ok(Some(c)) => Some(ferrocast_relay::bot::HttpTwitch::new(&c)),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("ferrocast-relay bot-check: the Twitch cloud bot settings are incomplete: {e}");
+                std::process::exit(1);
+            }
+        };
+        let api = api.as_ref().map(|a| a as &dyn ferrocast_relay::bot::TwitchCloud);
+        match ferrocast_relay::bot::check::report(&db, api, &cfg.public_url, install).await {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("ferrocast-relay bot-check: {e}");
                 std::process::exit(1);
             }
         }
@@ -253,12 +284,6 @@ async fn main() {
     // The cloud bot: timers while it's on duty, and the hourly sign-in check and lapse sweep.
     tokio::spawn(ferrocast_relay::bot::run(bot_timers));
     let bot_sweep = state.clone();
-    tokio::spawn(async move {
-        loop {
-            ferrocast_relay::bot::sweep(&bot_sweep).await;
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-        }
-    });
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -266,6 +291,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // After the bind: the first sweep may point Twitch's shard here, and Twitch checks the
+    // callback at once, so the relay must already take connections.
+    tokio::spawn(async move {
+        loop {
+            ferrocast_relay::bot::sweep(&bot_sweep).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     tracing::info!(%bind, "relay listening");
     let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
