@@ -51,7 +51,7 @@ ssh "$host" "sudo test -f $dir/docker-compose.yml" || {
 ssh "$host" "sudo grep -q ghcr.io ~deploy/.docker/config.json 2>/dev/null" ||
   echo "WARNING: 'deploy' is not logged in to ghcr.io; deploys can't pull images until it is (DEPLOY.md §6)." >&2
 
-echo "Installing the deploy, Razorpay-keys and vault-key scripts and the current compose file, and handing the relay files to 'deploy'..."
+echo "Installing the deploy, Razorpay-keys, vault-key, pro-keys and pro-grant scripts and the current compose file, and handing the relay files to 'deploy'..."
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/deploy.sh" <"$repo/deploy/relay-server-deploy.sh"
 # Pro's Razorpay keys are typed on the server with this (deploy/razorpay-keys.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/razorpay-keys.sh" <"$repo/deploy/razorpay-keys.sh"
@@ -59,6 +59,8 @@ ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/razorpay-keys.s
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/vault-key.sh" <"$repo/deploy/vault-key.sh"
 # Pro's service keys (Google voices, the Discord bot) are typed on the server with this (deploy/pro-keys.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/pro-keys.sh" <"$repo/deploy/pro-keys.sh"
+# The owner's test Pro for one install, without Razorpay (deploy/pro-grant.sh).
+ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/pro-grant.sh" <"$repo/deploy/pro-grant.sh"
 # The compose file must read RELAY_IMAGE/RELAY_TAG; older installs don't. Containers keep
 # running: compose only reads it on the next deploy.
 ssh "$host" "sudo install -m 644 -o deploy -g deploy /dev/stdin $dir/docker-compose.yml" <"$repo/deploy/docker-compose.yml"

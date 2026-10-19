@@ -49,6 +49,7 @@ jobs:
           deploy/tests/razorpay-keys.test.sh
           deploy/tests/vault-key.test.sh
           deploy/tests/pro-keys.test.sh
+          deploy/tests/pro-grant.test.sh
           deploy/tests/deploy-relay-env.test.sh
           deploy/tests/dashboard-swap.test.sh
 
