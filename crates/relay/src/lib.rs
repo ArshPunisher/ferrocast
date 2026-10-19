@@ -709,4 +709,6 @@ async fn kick_webhook(State(st): State<AppState>, headers: HeaderMap, body: axum
 #[cfg(test)]
 mod lapse_tests;
 #[cfg(test)]
+mod load_tests;
+#[cfg(test)]
 mod tests;
