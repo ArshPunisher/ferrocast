@@ -72,7 +72,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Tests
-        run: cargo nextest run --workspace --locked --no-tests=pass
+        run: cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast
 
   commits:
     name: Commit messages
