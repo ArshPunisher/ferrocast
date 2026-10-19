@@ -57,6 +57,8 @@ ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/deploy.sh" <"$r
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/razorpay-keys.sh" <"$repo/deploy/razorpay-keys.sh"
 # The vault key for Pro's stored secrets is made on the server with this (deploy/vault-key.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/vault-key.sh" <"$repo/deploy/vault-key.sh"
+# Pro's service keys (Google voices, the Discord bot) are typed on the server with this (deploy/pro-keys.sh).
+ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/pro-keys.sh" <"$repo/deploy/pro-keys.sh"
 # The compose file must read RELAY_IMAGE/RELAY_TAG; older installs don't. Containers keep
 # running: compose only reads it on the next deploy.
 ssh "$host" "sudo install -m 644 -o deploy -g deploy /dev/stdin $dir/docker-compose.yml" <"$repo/deploy/docker-compose.yml"
