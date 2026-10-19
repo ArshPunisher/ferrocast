@@ -15,7 +15,7 @@
 # the vault key (RELAY_VAULT_KEY), made on the server by vault-key.sh, and the Ferrocast
 # voices key and cap (GOOGLE_TTS_KEY, TTS_GLOBAL_MONTHLY_CHARS) and the Ferrocast bot's
 # Discord app (DISCORD_APP_ID, DISCORD_BOT_TOKEN, DISCORD_PUBLIC_KEY, DISCORD_CLIENT_SECRET),
-# added on the server by hand.
+# typed on the server with pro-keys.sh.
 #
 # Pro "Dashboard anywhere": the dashboard build phones get (../ferrocast-web/dist/dashboard,
 # run `pnpm build:embed` there first) goes to $dir/dashboard/releases/<date> and the

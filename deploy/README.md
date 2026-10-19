@@ -25,11 +25,13 @@ summary says what went live, or that the previous version was put back.
 | `docker-compose.yml` | server | Relay + `cloudflared`; the relay's image comes from `RELAY_IMAGE`/`RELAY_TAG` |
 | `relay-server-deploy.sh` | server (`/opt/ferrocast-relay/deploy.sh`) | Pull, switch, health check, rollback; the only thing the deploy key can run |
 | `deploy-relay.sh` | your Mac | First install, and changing config or secrets (`../secrets/relay.env`). Once GitHub deploys, it keeps the live version and never swaps in a local build |
-| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh` and `vault-key.sh` |
+| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh` and `pro-keys.sh` |
 | `razorpay-keys.sh` | server (`/opt/ferrocast-relay/razorpay-keys.sh`) | Ferrocast Pro's Razorpay keys, plans, webhook secret, and the `PRO_SALES_OPEN` switch (below) |
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
+| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot) with typing hidden, never showing them (below) |
+| `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 
 ## One-time setup for GitHub deploys
 
@@ -99,13 +101,14 @@ rewrites `relay.env`. Keep the server's `state/env-backup-*` files as safe as `r
 In the Google Cloud console (a project with billing, which the free tier needs): enable the
 Cloud Text-to-Speech API, make an API key, and restrict it to that API only (APIs & Services ›
 Credentials › the key › API restrictions). Also set a budget alert of ₹1 on the project. Then
-add it on the server by hand, so it never passes through this Mac:
+type it on the server, so it never passes through this Mac (typing is hidden; it backs up
+relay.env and restarts the relay):
 
 ```bash
-ssh -t <server> 'sudo -u deploy sh -c "cp /opt/ferrocast-relay/relay.env /opt/ferrocast-relay/state/env-backup-tts && \
-  nano /opt/ferrocast-relay/relay.env"'      # add GOOGLE_TTS_KEY=AIza… (and TTS_GLOBAL_MONTHLY_CHARS if not 800000)
-ssh <server> 'cd /opt/ferrocast-relay && sudo docker compose up -d'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --tts'
 ```
+
+`TTS_GLOBAL_MONTHLY_CHARS` (default 800000) is still set by hand in relay.env if it should differ.
 
 The relay checks two caps before it ever calls Google: 20,000 characters a month per
 subscription, and `TTS_GLOBAL_MONTHLY_CHARS` (default 800,000) for everyone together, never
@@ -150,12 +153,11 @@ The app "Ferrocast" (id 1561463863197835294) at discord.com/developers. In the p
 4. **Installation**: Install Link "None" (the relay makes its own invite with the state it
    checks), Guild Install only.
 
-Then add the four values on the server by hand, so they never pass through this Mac:
+Then type the four values on the server, so they never pass through this Mac:
 
 ```bash
-ssh -t <server> 'sudo -u deploy sh -c "cp /opt/ferrocast-relay/relay.env /opt/ferrocast-relay/state/env-backup-discord && \
-  nano /opt/ferrocast-relay/relay.env"'   # DISCORD_APP_ID=…, DISCORD_PUBLIC_KEY=…, DISCORD_CLIENT_SECRET=…, DISCORD_BOT_TOKEN=…
-ssh <server> 'cd /opt/ferrocast-relay && sudo docker compose up -d'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --discord'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   # set or missing, never the keys
 ```
 
 With all four set, `features.discord` is true and Settings › Discord shows "Ferrocast bot".
