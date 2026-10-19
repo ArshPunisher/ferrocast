@@ -59,7 +59,11 @@ setup() {
   echo
   read -r -s -p "Secret Access Key (hidden): " secret
   echo
-  [[ ${#key} -ge 20 && ${#secret} -ge 40 ]] || die "Those don't look like R2 S3 keys (Access Key ID and Secret)."
+  if [[ ${#key} -eq 64 && ${#secret} -eq 32 ]]; then
+    die "Those look swapped: the Access Key ID is the shorter one (32 characters), the Secret the longer (64). Run --setup again."
+  fi
+  [[ ${#key} -eq 32 ]] || die "The Access Key ID should be 32 characters (got ${#key}). Run --setup again."
+  [[ ${#secret} -eq 64 ]] || die "The Secret Access Key should be 64 characters (got ${#secret}). Run --setup again."
   pass="$(openssl rand -base64 33 | tr -d '/+=\n' | cut -c1-40)"
   local tmp
   tmp="$(mktemp "$STATE/rclone.conf.XXXXXX")"
@@ -71,9 +75,13 @@ setup() {
     # Through stdin: never on a command line, where any account could see it in `ps`.
     printf 'password = %s\n' "$(printf '%s' "$pass" | docker run -i --rm "$RCLONE_IMAGE" obscure -)"
   } >"$tmp"
-  mv "$tmp" "$CONF"
   echo "Checking the bucket..."
-  rclone lsd r2:"$BUCKET" >/dev/null || die "R2 refused the keys or the bucket '$BUCKET' doesn't exist. Nothing was scheduled."
+  # Checked before it replaces anything, so a bad paste never leaves a broken config behind.
+  if ! docker run --rm -v "$tmp:/config/rclone/rclone.conf:ro" "$RCLONE_IMAGE" lsd r2:"$BUCKET" >/dev/null; then
+    rm -f "$tmp"
+    die "R2 refused the keys or the bucket '$BUCKET' doesn't exist. Nothing was saved or scheduled."
+  fi
+  mv "$tmp" "$CONF"
   local line="30 21 * * * $DIR/relay-backup.sh >>$LOG 2>&1"
   { crontab -l 2>/dev/null | grep -v 'relay-backup.sh' || true; echo "$line"; } | crontab -
   echo "✓ Saved the R2 keys ($CONF, readable by deploy only)."
