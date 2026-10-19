@@ -68,6 +68,8 @@ impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Db> {
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // The server and `ferrocast-relay pro-grant` can write at once: wait, don't fail.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         crate::migrate::run(&mut conn, path)?;
         Ok(Db { conn: Mutex::new(conn) })

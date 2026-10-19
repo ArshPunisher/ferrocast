@@ -94,7 +94,7 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubRow> {
 
 /// Links `install` to `sub` (moving it off any other), keeping at most [`MAX_INSTALLS`]:
 /// the ones linked longest ago drop off first.
-fn link(tx: &rusqlite::Transaction<'_>, install: &str, sub: &str, now: i64) -> rusqlite::Result<()> {
+pub(super) fn link(tx: &rusqlite::Transaction<'_>, install: &str, sub: &str, now: i64) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO pro_installs(install_id, sub_id, linked_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(install_id) DO UPDATE SET sub_id = excluded.sub_id, linked_at = excluded.linked_at",
@@ -280,7 +280,7 @@ impl Db {
         let c = self.c();
         let mut st = c.prepare(
             "SELECT id FROM pro_subs WHERE status IN ('created','authenticated','active','pending','halted','paused')
-               AND refunded_at IS NULL",
+               AND refunded_at IS NULL AND id NOT LIKE 'comp\\_%' ESCAPE '\\'",
         )?;
         let rows = st.query_map([], |r| r.get(0))?;
         rows.collect()

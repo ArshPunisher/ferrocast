@@ -940,3 +940,82 @@ async fn without_an_email_key_checkout_and_restore_say_billing_isnt_set_up() {
         b.post("/v1/pro/restore", Some(&auth), Some(json!({ "subscription_id": "sub_Abc123", "email": EMAIL }))).await;
     assert_eq!(s, 503);
 }
+
+// ── Owner's test Pro (comp grants): never sent to Razorpay ───────────────────────────
+
+impl Billing {
+    /// A second connection to the relay's database, as `ferrocast-relay pro-grant` opens it
+    /// while the server runs.
+    fn cli_db(&self) -> Db {
+        Db::open(&self._dir.path().join("relay.db")).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_test_grant_is_pro_and_never_asks_razorpay() {
+    let b = billing(true).await;
+    let auth = b.install().await;
+    let install = auth.split('.').next().unwrap().to_string();
+    let out = comp::cli(&b.cli_db(), &[install.clone(), "7".into()]).unwrap();
+    assert!(out.contains("granted"), "{out}");
+    let v = b.status(&auth, true).await;
+    assert_eq!(
+        (v["pro"].as_bool(), v["status"].as_str(), v["plan"].as_str()),
+        (Some(true), Some("active"), Some("comp"))
+    );
+    assert!(v["subscription_id"].as_str().unwrap().starts_with("comp_"));
+    assert!(v.get("warning").is_none(), "{v}");
+    let (s, _) = b.probe(Some(&auth)).await;
+    assert_eq!(s, 200, "the Pro gate lets it through");
+
+    let (s, v) = b.post("/v1/pro/cancel", Some(&auth), None).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("test_grant")), "{v}");
+    assert!(v["error"]["hint"].as_str().is_some());
+    let (s, v) = b.post("/v1/pro/manage-link", Some(&auth), None).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("test_grant")), "{v}");
+    let (s, v) = b.checkout(&auth, "monthly").await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("already_pro")));
+    assert_eq!(b.rzp.requests().len(), 0, "no Razorpay call for a test grant: {:?}", b.rzp.requests());
+
+    comp::cli(&b.cli_db(), &["--revoke".into(), install]).unwrap();
+    let v = b.status(&auth, true).await;
+    assert_eq!((v["pro"].as_bool(), v["status"].as_str()), (Some(false), Some("cancelled")));
+    let (s, _) = b.probe(Some(&auth)).await;
+    assert_ne!(s, 200, "the Pro gate is closed again");
+}
+
+#[tokio::test]
+async fn restore_never_attaches_a_test_grant() {
+    let b = billing(true).await;
+    let owner = b.install().await;
+    let id = comp::cli(&b.cli_db(), &[owner.split('.').next().unwrap().into(), "7".into()]).unwrap();
+    let sub = id.split('(').nth(1).unwrap().split(')').next().unwrap().to_string();
+    let other = b.install().await;
+    for email in [EMAIL, ""] {
+        let (s, v) =
+            b.post("/v1/pro/restore", Some(&other), Some(json!({ "subscription_id": sub, "email": email }))).await;
+        assert!((400..500).contains(&s), "{s} {v}");
+    }
+    assert_eq!(b.status(&other, false).await["pro"], false);
+    assert_eq!(b.rzp.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn the_daily_recheck_and_webhooks_skip_test_grants() {
+    let rzp = FakeRazorpay::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("relay.db")).unwrap();
+    db.add_install("i1", "h").unwrap();
+    db.comp_grant("i1", 7).unwrap();
+    let st = crate::AppState::new(crate::Config::from_env(), db).with_billing(cfg(&rzp, true));
+    assert_eq!(reconcile(&st).await, 0);
+    assert_eq!(rzp.requests().len(), 0);
+    // A webhook naming one (Razorpay never would) is ignored: its id isn't a `sub_` one.
+    let b = billing(true).await;
+    b.cli_db().add_install("i1", "h").unwrap();
+    let g = b.cli_db().comp_grant("i1", 7).unwrap();
+    let (s, v) = b.hook("evt_comp", &sub_event("subscription.cancelled", &g.sub_id), None).await;
+    assert_eq!((s, v["status"].as_str()), (200, Some("ignored")));
+    assert_eq!(b.cli_db().pro_sub(&g.sub_id).unwrap().unwrap().status, "active");
+    assert_eq!(b.rzp.requests().len(), 0);
+}

@@ -1,5 +1,9 @@
 //! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` (and optionally `RELAY_BLOB_DIR`,
 //! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`, `BREVO_API_KEY`, `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR`) and the settings in `deploy/relay.env.example`.
+//!
+//! `ferrocast-relay pro-grant <install-id> <days> | --revoke <install-id> | --list`: the
+//! owner's test Pro (billing::comp) on the same `RELAY_DATA` database, then exits. Safe
+//! while the server runs (WAL, busy timeout). Run on the server by `deploy/pro-grant.sh`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,6 +29,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("pro-grant") {
+        match billing::comp::cli(&db, &args[1..]) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("ferrocast-relay pro-grant: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let cfg = Config::from_env();
     if cfg.kick_client_id.is_none() || cfg.kick_client_secret.is_none() {
         tracing::warn!("KICK_CLIENT_ID / KICK_CLIENT_SECRET not set: Kick sign-in is off");

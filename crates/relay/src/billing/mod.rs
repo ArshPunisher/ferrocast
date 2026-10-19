@@ -18,6 +18,7 @@
 //! `PRO_SALES_OPEN` is off by default: checkout answers 409 until Pro's features exist.
 
 pub mod access;
+pub mod comp;
 pub(crate) mod gate;
 mod pages;
 pub mod razorpay;
@@ -193,6 +194,16 @@ fn err(status: StatusCode, code: &'static str, message: impl Into<String>) -> Ap
     ApiError::new(status, code, message)
 }
 
+/// Cancel and manage are Razorpay's; a test Pro grant has nothing there.
+fn comp_refused(what: &str) -> ApiError {
+    err(
+        StatusCode::CONFLICT,
+        "test_grant",
+        format!("This install's Pro is an owner's test grant, so there's nothing to {what}."),
+    )
+    .hint("It ends by itself; the owner can end it early with pro-grant --revoke on the relay.")
+}
+
 fn not_set_up() -> ApiError {
     err(StatusCode::SERVICE_UNAVAILABLE, "billing_unavailable", "Ferrocast Pro billing isn't set up on this relay yet.")
         .hint("Nothing to do on your side; try again later.")
@@ -261,6 +272,10 @@ fn synced(v: &Value, cancel_at_end: Option<bool>) -> Result<Synced, ApiError> {
 
 /// Re-reads one subscription from Razorpay and stores it.
 async fn refresh(st: &AppState, id: &str) -> Result<Option<SubRow>, ApiError> {
+    // Test Pro grants aren't Razorpay's: the relay's copy is the whole truth.
+    if comp::is_comp(id) {
+        return st.db.pro_sub(id).map_err(ApiError::db);
+    }
     let v = client(st)?.fetch_subscription(id).await.map_err(|e| upstream(&e))?;
     let s = synced(&v, None)?;
     st.db.sync_pro_sub(None, id, &s).map_err(ApiError::db)?;
@@ -531,6 +546,9 @@ async fn check_plan(st: &AppState, rzp: &Razorpay, plan: Plan, id: &str) -> Resu
 
 /// Stops renewing (Pro lasts until the end of the paid period).
 async fn cancel_sub(st: &AppState, s: &SubRow) -> Result<SubRow, ApiError> {
+    if comp::is_comp(&s.id) {
+        return Err(comp_refused("cancel at Razorpay"));
+    }
     if !access::BLOCKING.contains(&s.status.as_str()) || s.refunded_at.is_some() {
         return Err(err(StatusCode::NOT_FOUND, "no_subscription", "There's no renewing Pro subscription to cancel."));
     }
@@ -570,6 +588,9 @@ pub async fn manage_link(State(st): State<AppState>, headers: HeaderMap) -> Resu
         return Err(err(StatusCode::NOT_FOUND, "no_subscription", "This install has no Pro subscription to manage.")
             .hint("Buy Pro, or restore it with your subscription id, in Settings › Pro."));
     };
+    if comp::is_comp(&s.id) {
+        return Err(comp_refused("manage at Razorpay"));
+    }
     if !st.billing.allow("manage", &install, 20, 3_600_000) {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many manage links. Wait a while."));
     }
