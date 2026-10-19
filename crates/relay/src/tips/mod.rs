@@ -634,7 +634,7 @@ fn shell_with(title: &str, body: &str, p: &brand::Palette, head: &str, overlay: 
          .lead{{color:var(--muted);margin:0 0 28px;overflow-wrap:anywhere}}.buttons{{display:grid;gap:12px;margin-bottom:28px}}\
          .btn{{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-radius:14px;background:var(--surface);border:1px solid var(--line);color:var(--fg);text-decoration:none;font-weight:600}}\
          .btn:hover,.btn:focus-visible{{border-color:var(--accent);outline:none}}.btn small{{color:var(--muted);font-weight:400}}\
-         .btn.primary{{justify-content:center;background:var(--accent);border-color:var(--accent);color:var(--on-accent)}}\
+         .btn.primary{{justify-content:center;background:var(--accent-fill);border-color:var(--accent-fill);color:var(--on-accent)}}\
          .btn.primary:focus-visible{{outline:2px solid var(--fg);outline-offset:2px}}\
          .banner{{display:block;width:100%;height:auto;aspect-ratio:3/1;object-fit:cover;border-radius:16px;margin:0 0 20px;background:var(--surface)}}\
          .avatar{{display:block;width:96px;height:96px;border-radius:50%;object-fit:cover;margin:0 auto 16px;background:var(--surface);border:3px solid var(--bg)}}\

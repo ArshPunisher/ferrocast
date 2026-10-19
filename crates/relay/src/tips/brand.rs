@@ -148,6 +148,34 @@ pub fn contrast(a: Rgb, b: Rgb) -> f64 {
 }
 
 const WHITE: Rgb = Rgb(255, 255, 255);
+
+/// Orange or amber: a hue of about 15-45 degrees with clear saturation.
+fn is_orange(c: Rgb) -> bool {
+    let (r, g, b) = (f64::from(c.0), f64::from(c.1), f64::from(c.2));
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max - min < 60.0 || max != r || g < b {
+        return false;
+    }
+    let hue = 60.0 * (g - b) / (max - min);
+    (15.0..=45.0).contains(&hue)
+}
+
+/// A filled button's background and label. On orange the label is always white, with the
+/// fill darkened (same hue) until white meets WCAG AA (4.5:1); otherwise the better of
+/// white and black on the accent itself.
+fn button_colours(accent: Rgb) -> (Rgb, Rgb) {
+    if is_orange(accent) {
+        let mut fill = accent;
+        let mut t = 0.0;
+        while contrast(WHITE, fill) < TEXT_CONTRAST && t < 1.0 {
+            t += 0.02;
+            fill = accent.mix(BLACK, t);
+        }
+        return (fill, WHITE);
+    }
+    let on = if contrast(WHITE, accent) >= contrast(BLACK, accent) { WHITE } else { BLACK };
+    (accent, on)
+}
 const BLACK: Rgb = Rgb(0, 0, 0);
 
 /// `fg` as close to what was picked as possible with at least `min` contrast on `bg`:
@@ -237,7 +265,10 @@ pub struct Palette {
     pub fg: String,
     pub muted: String,
     pub accent: String,
-    /// Label on an accent fill.
+    /// A filled button's colour: the accent, or for an orange accent a darker shade of it
+    /// that white text reads on (Ferrocast's rule: text on orange is always white).
+    pub accent_fill: String,
+    /// Label on `accent_fill`.
     pub on_accent: String,
     pub surface: String,
     pub line: String,
@@ -253,6 +284,7 @@ impl Default for Palette {
             fg: "#eef0f4".into(),
             muted: "#9aa3b2".into(),
             accent: "#3461f5".into(),
+            accent_fill: "#3461f5".into(),
             on_accent: "#ffffff".into(),
             surface: "#151a24".into(),
             line: "#263047".into(),
@@ -268,7 +300,7 @@ impl Palette {
             let m = c.text.mix(bg, 0.3);
             if contrast(m, bg) >= TEXT_CONTRAST { m } else { c.text }
         };
-        let on_accent = if contrast(WHITE, c.accent) >= contrast(BLACK, c.accent) { WHITE } else { BLACK };
+        let (accent_fill, on_accent) = button_colours(c.accent);
         Palette {
             scheme: if bg.luminance() < 0.4 { "dark" } else { "light" },
             bg: bg.hex(),
@@ -276,6 +308,7 @@ impl Palette {
             fg: c.text.hex(),
             muted: muted.hex(),
             accent: c.accent.hex(),
+            accent_fill: accent_fill.hex(),
             on_accent: on_accent.hex(),
             surface: bg.mix(c.text, 0.06).hex(),
             line: bg.mix(c.text, 0.16).hex(),
@@ -285,8 +318,17 @@ impl Palette {
     /// The CSS custom properties for `:root`.
     pub fn css_vars(&self) -> String {
         format!(
-            "color-scheme:{};--bg:{};--glow:{};--fg:{};--muted:{};--accent:{};--on-accent:{};--surface:{};--line:{}",
-            self.scheme, self.bg, self.glow, self.fg, self.muted, self.accent, self.on_accent, self.surface, self.line
+            "color-scheme:{};--bg:{};--glow:{};--fg:{};--muted:{};--accent:{};--accent-fill:{};--on-accent:{};--surface:{};--line:{}",
+            self.scheme,
+            self.bg,
+            self.glow,
+            self.fg,
+            self.muted,
+            self.accent,
+            self.accent_fill,
+            self.on_accent,
+            self.surface,
+            self.line
         )
     }
 }
@@ -697,6 +739,18 @@ mod tests {
     }
 
     #[test]
+    fn orange_buttons_get_white_text_on_a_dark_enough_fill() {
+        for hex in ["#ffa424", "#ff5a1f", "#cf7400", "#f97316", "#b35900"] {
+            let (fill, on) = button_colours(Rgb::parse(hex).unwrap());
+            assert_eq!(on, WHITE, "{hex}");
+            assert!(contrast(WHITE, fill) >= TEXT_CONTRAST, "{hex} -> {}", fill.hex());
+        }
+        assert_eq!(button_colours(Rgb::parse("#b35900").unwrap()).0.hex(), "#b35900", "already dark enough");
+        let yellow = Rgb::parse("#ffe14d").unwrap();
+        assert_eq!(button_colours(yellow), (yellow, BLACK), "not orange: unchanged");
+    }
+
+    #[test]
     fn contrast_matches_wcag() {
         assert!((contrast(WHITE, BLACK) - 21.0).abs() < 1e-9);
         assert!((contrast(Rgb(0x77, 0x77, 0x77), WHITE) - 4.48).abs() < 0.01);
@@ -739,7 +793,8 @@ mod tests {
         let (bg, fg, muted) = (Rgb::parse(&p.bg).unwrap(), Rgb::parse(&p.fg).unwrap(), Rgb::parse(&p.muted).unwrap());
         assert!(contrast(fg, bg) >= TEXT_CONTRAST && contrast(muted, bg) >= TEXT_CONTRAST);
         let on = Rgb::parse(&p.on_accent).unwrap();
-        assert!(contrast(on, Rgb::parse(&p.accent).unwrap()) >= 3.0);
+        assert_eq!(on, WHITE, "text on orange is white");
+        assert!(contrast(on, Rgb::parse(&p.accent_fill).unwrap()) >= TEXT_CONTRAST);
         assert_eq!(Palette::default().scheme, "dark");
     }
 
