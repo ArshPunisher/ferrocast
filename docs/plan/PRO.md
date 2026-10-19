@@ -74,6 +74,63 @@ M0 as built (19 Oct 2026):
   /v1/pro/bot/{platform}/connect` → 201 `{auth_url}` (404, 409, 503 `platform_unavailable`);
   `DELETE /v1/pro/bot/{platform}` (revokes); `PUT /v1/pro/bot/enabled` (422 with no platform).
 - Quotas: one channel per platform, 20 messages/min per channel, 50 timers.
+- M7 as built (19 Oct 2026, API.md §9.7), Twitch and Kick: relay `bot/{mod,twitch,kick,lease,store,tests}.rs`,
+  migration 10; core `cloudbot.rs` (the cloud answers with the desktop's own `command::run`, counters via the
+  now-shared `chatbot::counter_op_for` + `KeyedCooldowns`, `autoreply::run` with the same `SendBudget`, `Timer::due`
+  with the shared `cloudbot::timer_text`; built-in modules, points, quotes and OBS commands stay on the PC); engine
+  `cloud_bot.rs`; server `routes/cloud_bot.rs`. **Twitch:** "Ferrocast Cloud" (`TWITCH_CLOUD_CLIENT_ID`,
+  `TWITCH_CLOUD_CLIENT_SECRET`, `TWITCH_CLOUD_EVENTSUB_SECRET`; all three or off; optional
+  `TWITCH_CLOUD_DESKTOP_CLIENT_ID`), two sign-in steps (the bot account, then the streamer's `channel:bot`; the same
+  account twice is fine), **both tied to the PC's own Twitch account**: `connect` carries the desktop app's token
+  (`owner_token`, added by the engine), the relay checks it with `oauth2/validate` (and that it's the desktop app's),
+  signs that account into the state, and the channel step's callback refuses and revokes any other account. State:
+  HMAC with an HKDF key derived from the cloud secret (never the secret itself), 10 minutes, single use (nonce in
+  `pending_oauth`). A proven owner takes a channel another subscription still has (theirs unbound, subscriptions
+  deleted, sign-in revoked, `twitch_channel_taken`). EventSub `authorization_revoked` / `user_removed` unbind the
+  channel (subscriptions deleted, channel sign-in dropped). Pages show the PC code (HMAC of the install id, like M8's)
+  and the bot page names whose chat it will speak in, with a warning when it isn't its own. One Conduit per relay with
+  webhook shard 0 at `/v1/bot/twitch/eventsub` (checked hourly: GET, PATCH only when disabled or pointed elsewhere;
+  its id kept in `bot_kv`, a new id subscribes every channel again), subscriptions `channel.chat.message` (bot as
+  reader) + `stream.online/offline` (each id saved as made; a 409 is looked up), made when switched on and deleted
+  when switched off or Pro lapses, replies with the app token. EventSub ids go in the relay's `seen` table (`tw:`
+  prefix, a day, one `first_time`); webhook work runs in a bounded queue (1,024 waiting, 16 at once, drops counted),
+  DB lookups off the async threads. Moderator scopes only with `moderation: true` (kept for M10). **Kick:** the
+  existing broker with a `bot.` (or `bot.m.` with `moderation:ban`) state, so tokens stay sealed on the relay and the
+  channel's owner mapping is untouched; needs Kick connected in Accounts (`kick_not_linked`) and the channel is the
+  one the install owns in `kick_owners` (checked again at the callback; a stale binding of another subscription is
+  removed and revoked); webhooks are handed over from `kick_webhook` into the same kind of bounded queue; refreshes
+  one at a time per subscription (re-read and one retry when another refresh replaced the sealed token). **Errors:**
+  only `*_signed_out` / `twitch_revoked` block a channel; refusals and Twitch being unreachable show with "Try again"
+  (`connect {retry: true}`; the sweep retries `twitch_unavailable`) and a sent message clears them; dropped messages
+  (`is_sent: false`, Kick 400) are kept as `last_drop`. **Own messages:** recognised by the sent message ids (256 per
+  channel) or the exact text from the bot account within 5 s; the streamer's own lines are answered when the bot is
+  their account. **Live:** `live_since` on the channel (Get Streams at switch-on and hourly), so timers and `{uptime}`
+  survive a restart. **Lease:** in memory per subscription and platform, counted from relay start (a restart never
+  jumps in front of a PC), switching on starts the 90 s again; `bot_seen {platforms}` names the PC's connected chat
+  platforms (a plain `bot_seen` means all), so the cloud covers the others; every PC of the subscription follows the
+  relay's switch every 5 minutes so a PC that never opened the panel still says `bot_seen`. A takeover seeds each
+  timer's last post (no double post at handover); timers run as a task per channel, 16 at once. **Counters:** cloud
+  changes become `bot_counter_changes` rows (`op` add/set with `delta`) + link items to each PC, which applies the op
+  (a change on the PC meanwhile isn't overwritten); pushes carry `counters_seen` and newer rows are applied over a
+  push in order. **Pushes:** definitions hashed (values ride along once a minute), 2 s debounce, 2 s to 5 min
+  backoff, one re-push on `stale_version`. Rates: 120 requests/min per subscription (`bot_rate`), 20 messages/min per
+  channel (`bot_messages_<platform>` minute counters).
+  **Stored (privacy, R-51):** per platform the bot and channel account ids and logins, granted scopes, EventSub
+  subscription ids, connected/last-reply times, the last error, the last dropped reply's reason and time, when the
+  channel went live (the relay's Twitch conduit id in `bot_kv`); the refresh tokens sealed (AES-256-GCM, AAD
+  `<sub>|bot_<platform>_<bot|channel>`), revoked at the platform on disconnect; the pushed config (commands, timers,
+  auto-replies, counter names and values) and version; counter changes until a PC applied them (30 days at most).
+  **Never stored:** chat. The last 200 lines per channel live in the relay's memory only (for M10) and the message ids
+  for dedupe (2,048 per channel). Everything goes on disconnect or 30 days after Pro ends.
+  **Threat model:** a forged or replayed EventSub call is refused (HMAC in constant time, 10-minute window, ids kept a
+  day); the callback's account comes from Twitch, never the URL; a channel can belong to one subscription only (unique
+  index) and only its proven owner binds it (the PC's own Twitch token, checked with Twitch; Kick's `kick_owners`); a
+  state is used once; someone tricked into finishing another person's "bot" link sees whose chat it will speak in and
+  the PC code, and is told to remove Ferrocast Cloud in Twitch's connections. Follow-ups:
+  register the Twitch app (deploy/README.md); the cloud's own go-live and perk
+  events to Discord (M8 follow-up); offline dashboard reads of the ring and moderation with the opt-in scopes (M10);
+  YouTube (M12); the lease and ring are per relay process (fine for one relay); privacy/terms pages must list these
+  items before sales open.
 
 ### F2. Dashboard from anywhere
 - Proxy to the PC when online; limited cloud mode (F1-backed) when offline.
@@ -296,6 +353,46 @@ M0 as built (19 Oct 2026):
 - Weekly email (Brevo): `mail/{mod,fake,brevo}.rs`, `trait Mailer`, double opt-in, encrypted
   address, one-click unsubscribe, spread by `hash(sub) % 7`.
 - UI `#/history`: range chips, plain-SVG charts, per-stream table, weekly email toggle.
+- M11 as built (19 Oct 2026, API.md §9.8): relay `mail/{mod,mailer,brevo,fake,report,pages,weekly,
+  store,tests}.rs`, migration 9 (`mail_addresses`, `mail_sent`, `mail_budget`). `BrevoMailer` (transactional API,
+  `api-key` header, 10 s) behind `trait Mailer`; `features.weekly_email` needs `BREVO_API_KEY`, the
+  vault and a link key (`MAIL_TOKEN_KEY`, else from `RELAY_VAULT_KEY`). Double opt-in: the confirm
+  email is sent first and the address saved only once it went (a failure never replaces a working
+  address); the link (`c1.…`, HMAC, 24 h, single use, a resend replaces it) opens a script-free page
+  whose button POSTs the confirm, so mail scanners confirm nothing; 3 confirm emails per
+  subscription per day. A new address waits in its own (pending) columns while the confirmed one
+  keeps getting the report; confirming swaps them; the sweep drops only the pending part; Stop
+  removes both; GET shows both (`address_hint`, `pending_hint`). Each report carries
+  `List-Unsubscribe` + `List-Unsubscribe-Post` (RFC 8058); the unsubscribe link carries the
+  address's tag (HMAC of the normalized address with the link key), so saving the same address
+  again keeps old links working and another address never matches ("This link is out of date",
+  still 200). Relay-wide daily budget `MAIL_DAILY_BUDGET` (default 270, Brevo free is 300) shared
+  by confirms and reports: a confirm over it is 503 `mail_busy` "Try again tomorrow."; the run
+  stops at it and gives claims back for the next day. **Schedule:** day `SHA-256(sub_id) % 7` (stable, unlike std's seeded
+  hasher), 04:00 UTC (09:30 IST), up to 2 days late after an outage (last week's moment counts
+  early in the next week), only to addresses confirmed before that moment and only with Pro;
+  **weeks without a stream send nothing** (decided: skip, not a "no streams" email; re-checked
+  until 2 days after the moment so late uploads count). `mail_sent` is claimed before each send
+  and the row re-read after the claim (at most once, even across restarts). Brevo: no connection
+  / 503 gives the claim back; a read timeout / other 5xx keeps it (counts as sent); a 400 about
+  the recipient pauses the address, but two different refused in a row stop the run (second not
+  paused); other 4xx (our account or request) stop the run, give back, log; 402 / 403-limit / 429
+  stop for the day. A vault that opens nothing pauses nothing (give back, log, stop); only a row
+  that alone fails is paused `unreadable`. The dashboard shows the day in the viewer's time zone.
+  **Stored (privacy, R-51):** the addresses only sealed (AES-256-GCM, AAD `sub_id|mail_address`)
+  plus each one's tag (keyed HMAC, for unsubscribe links), never plain, never logged (`Email`'s `Debug` and every error leave it out; Brevo's error text is
+  dropped, only its code kept); status, saved/confirmed times, the confirm nonce's SHA-256 and
+  expiry; per (subscription, week) when the report went (120 days); emails per UTC day (7 days).
+  Deleted on Stop emails or
+  unsubscribe, a week after an unconfirmed link expired, 30 days after Pro ended (hourly sweep).
+  The report itself is built from the history already kept (§9.1) and never stored. Remote: an
+  owner's phone may `GET /pro/history/email` (`OWNER_ALLOWED` on the relay and the PC). Deploy:
+  `pro-keys.sh --mail`, carried by `deploy-relay.sh`. Follow-ups: Brevo hard-bounce/complaint
+  webhook (pauses addresses Brevo blocks later); Brevo's free plan sends 300 a day (spread over 7
+  days that's ~2,100 subscriptions; plan or second sender before then); a "no streams" email if
+  streamers ask; per-streamer time zone for the send hour; privacy/terms pages must list the
+  address before sales open; the History screen is hidden on phones, so the owner-phone read is
+  only reachable from the API today.
 
 ## Milestones (A and B can run in parallel after M0)
 
