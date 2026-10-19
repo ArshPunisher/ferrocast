@@ -23,7 +23,7 @@ pub mod obs_tools;
 pub mod show;
 pub mod stream_info;
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
@@ -58,7 +58,7 @@ pub(crate) struct Studio {
     pub show_cfg: RwLock<ShowConfig>,
     pub duels: Mutex<Duels>,
     /// Last use of a command, by `word:platform:user` (and `word` for the global one).
-    pub cooldowns: Mutex<HashMap<String, i64>>,
+    pub cooldowns: Mutex<ferrocast_core::chatbot::KeyedCooldowns>,
     /// Accounts that chatted since the last watch-time tick.
     pub watching: Mutex<HashSet<(Platform, String)>>,
     pub lane: Mutex<VecDeque<moments::LaneItem>>,
@@ -148,16 +148,7 @@ impl Engine {
 
     /// Whether `key` (a command and who used it) is past its cooldown; records the use.
     pub(crate) fn studio_cooldown(&self, key: &str, seconds: i64) -> bool {
-        let t = now().0;
-        let mut cd = self.studio().cooldowns.lock().unwrap_or_else(|p| p.into_inner());
-        if cd.get(key).is_some_and(|last| t - last < seconds * 1000) {
-            return false;
-        }
-        if cd.len() > 20_000 {
-            cd.retain(|_, last| t - *last < 3_600_000);
-        }
-        cd.insert(key.to_string(), t);
-        true
+        self.studio().cooldowns.lock().unwrap_or_else(|p| p.into_inner()).take(key, seconds, now().0)
     }
 
     /// Replies in the chat a command came from (as a reply where the platform has them).

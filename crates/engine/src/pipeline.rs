@@ -408,17 +408,8 @@ impl Engine {
         }
         let mut extra = Vars::new();
         let live = self.state().live.values().any(|l| *l);
-        match self.state().session.started_at.filter(|_| live) {
-            Some(started) => {
-                let mins = now().seconds_since(started) / 60;
-                let up = format!("{}h {}m", mins / 60, mins % 60);
-                extra.insert("uptime_text".into(), format!("We've been live for {up}."));
-                extra.insert("uptime".into(), up);
-            }
-            None => {
-                extra.insert("uptime_text".into(), "We're not live right now.".into());
-            }
-        }
+        let started = self.state().session.started_at.filter(|_| live);
+        ferrocast_core::cloudbot::uptime_vars(&mut extra, started, now()); // shared with the cloud bot
         self.shoutout_vars(e.platform, actor, &content.text, &mut extra).await;
         self.counter_vars(&mut extra); // `{count:deaths}` (Studio counters)
         let result = {

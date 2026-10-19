@@ -155,6 +155,44 @@ pub fn parse_counter_args(args: &[&str]) -> Result<CounterOp, BadCounterArgs> {
     }
 }
 
+/// Viewers wait this long between uses of one counter or module command (desktop and cloud bot).
+pub const VIEWER_COOLDOWN_S: i64 = 10;
+/// One answer per counter or module command per this long, whoever asks.
+pub const GLOBAL_COOLDOWN_S: i64 = 3;
+
+/// What a counter command does for this person: only mods change a counter, viewers see it.
+/// `Err` (show the usage) only for a mod's typo like `!deaths set lots`; a viewer's odd
+/// arguments just show it. The desktop bot and the cloud bot both decide with this.
+pub fn counter_op_for(args: &[&str], is_mod: bool) -> Result<CounterOp, BadCounterArgs> {
+    match parse_counter_args(args) {
+        Ok(op) if is_mod => Ok(op),
+        Ok(_) => Ok(CounterOp::Show),
+        Err(e) if is_mod => Err(e),
+        Err(_) => Ok(CounterOp::Show),
+    }
+}
+
+/// "Once per N seconds per key" for counter and module commands (`!deaths:*`,
+/// `!deaths:<user>`). Bounded: past 20,000 keys the ones older than an hour go.
+#[derive(Debug, Default, Clone)]
+pub struct KeyedCooldowns {
+    last: std::collections::HashMap<String, i64>,
+}
+
+impl KeyedCooldowns {
+    /// Whether `key` may run now (`now_ms`); records the use when it may.
+    pub fn take(&mut self, key: &str, seconds: i64, now_ms: i64) -> bool {
+        if self.last.get(key).is_some_and(|last| now_ms - last < seconds * 1000) {
+            return false;
+        }
+        if self.last.len() > 20_000 {
+            self.last.retain(|_, last| now_ms - *last < 3_600_000);
+        }
+        self.last.insert(key.to_string(), now_ms);
+        true
+    }
+}
+
 /// Applies an op, clamped to ±[`MAX_COUNTER_VALUE`].
 pub fn apply_counter(value: i64, op: CounterOp) -> i64 {
     let next = match op {

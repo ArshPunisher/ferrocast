@@ -9,6 +9,7 @@ mod macros;
 pub mod alert;
 pub mod autoreply;
 pub mod chatbot;
+pub mod cloudbot;
 pub mod command;
 pub mod dedupe;
 pub mod design;

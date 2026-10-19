@@ -23,10 +23,9 @@ use super::{COUNTERS_KEY, MODULES_KEY, save_setting};
 use crate::frames::{Audience, OverlayFrame};
 use crate::{Engine, EngineError, now, platform_key};
 
-/// Viewers wait this long between uses of one module or counter command.
-const VIEWER_COOLDOWN_S: i64 = 10;
-/// One answer per command per this long, whoever asks (a counter shown by ten people).
-const GLOBAL_COOLDOWN_S: i64 = 3;
+// Viewers wait `VIEWER_COOLDOWN_S` between uses of one module or counter command, and one
+// answer goes out per command per `GLOBAL_COOLDOWN_S` (shared with the cloud bot in core).
+use ferrocast_core::chatbot::{GLOBAL_COOLDOWN_S, VIEWER_COOLDOWN_S};
 
 /// A counter as the dashboard sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -388,16 +387,14 @@ impl Engine {
         user_key: &str,
     ) {
         let command = def.command.clone().unwrap_or_default();
-        let op = match chatbot::parse_counter_args(args) {
+        // Only mods change a counter; viewers see it (with a cooldown). Same rule as the cloud bot.
+        let op = match chatbot::counter_op_for(args, is_mod) {
             Ok(op) => op,
-            Err(chatbot::BadCounterArgs) if is_mod => {
+            Err(chatbot::BadCounterArgs) => {
                 self.studio_reply(e, &counter_usage(&command));
                 return;
             }
-            Err(chatbot::BadCounterArgs) => CounterOp::Show,
         };
-        // Only mods change a counter; viewers see it (with a cooldown).
-        let op = if is_mod { op } else { CounterOp::Show };
         if !is_mod
             && (!self.studio_cooldown(&format!("{command}:*"), GLOBAL_COOLDOWN_S)
                 || !self.studio_cooldown(&format!("{command}:{user_key}"), VIEWER_COOLDOWN_S))

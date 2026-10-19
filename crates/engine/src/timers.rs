@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ferrocast_core::event::{Millis, Platform};
-use ferrocast_core::template::{Template, Vars};
+use ferrocast_core::template::Vars;
 
 use crate::{Engine, now};
 
@@ -44,9 +44,8 @@ pub(crate) fn tick(engine: &Engine, last: &mut LastPost, t: Millis) -> Vec<(Stri
             }
             let mut vars = Vars::new();
             engine.counter_vars(&mut vars); // `{count:deaths}` (Studio counters)
-            vars.insert("platform".into(), p.label().into());
-            let text = Template::parse(&timer.message).map(|tpl| tpl.render(&vars)).unwrap_or_default();
-            let msg = ferrocast_core::command::safe_reply(&text);
+            // The same text the cloud bot posts (ferrocast_core::cloudbot).
+            let msg = ferrocast_core::cloudbot::timer_text(&timer, &vars, p);
             if msg.is_empty() {
                 continue;
             }
