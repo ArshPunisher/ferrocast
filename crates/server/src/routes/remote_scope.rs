@@ -69,6 +69,9 @@ pub const MOD_ALLOWED: &[Rule] = &[
 /// email's state (the address only as a hint). Changing the address stays on the PC.
 pub const OWNER_ALLOWED: &[Rule] = &[
     ("GET", "/pro/history/email"),
+    // The cloud bot (Pro F1): look at it and switch it on or off; connecting stays on the PC.
+    ("GET", "/pro/bot"),
+    ("PUT", "/pro/bot/enabled"),
 ];
 
 /// What an owner's phone may never do (`*` as the method: any method).
@@ -222,6 +225,8 @@ mod tests {
             ("GET", "/accounts"),
             ("GET", "/pro"),
             ("GET", "/pro/history/email"),
+            ("GET", "/pro/bot"),
+            ("PUT", "/pro/bot/enabled"),
             ("DELETE", "/mod/ban"),
             ("GET", "/mod/held/ev_1/drop"),
             ("POST", "/mod/held/a/b/drop"),
@@ -251,6 +256,9 @@ mod tests {
             ("GET", "/updates"),
             ("PUT", "/designs/d1"),
             ("GET", "/pro/history/email"),
+            // The cloud bot: look at it and switch it.
+            ("GET", "/pro/bot"),
+            ("PUT", "/pro/bot/enabled"),
         ] {
             assert!(allowed(Role::Owner, m, p), "{m} {p}");
         }
@@ -268,6 +276,14 @@ mod tests {
             ("DELETE", "/pro/history/email"),
             ("POST", "/pro/history/email"),
             ("GET", "/pro/history/email/x"),
+            // The cloud bot's sign-ins and settings stay on the PC.
+            ("POST", "/pro/bot/twitch/connect"),
+            ("POST", "/pro/bot/kick/connect"),
+            ("DELETE", "/pro/bot/kick"),
+            ("DELETE", "/pro/bot/twitch"),
+            ("PUT", "/pro/bot/config"),
+            ("PUT", "/pro/bot"),
+            ("GET", "/pro/bot/enabled"),
             ("PUT", "/tips"),
             ("DELETE", "/tips"),
             ("PUT", "/tips/brand/avatar"),

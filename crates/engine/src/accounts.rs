@@ -197,6 +197,8 @@ impl Engine {
 
     /// Registers the connector, marks the account in the status strip, and runs EventSub.
     fn start_twitch(&self, auth: Arc<Auth>, account: repo::settings::Account) {
+        // Its token proves the channel when connecting the cloud bot (cloud_bot.rs).
+        self.cloud_bot_set_twitch(Some(auth.clone()));
         let helix = ferrocast_twitch::helix::Helix::new(auth);
         self.register_connector(Arc::new(TwitchConnector { helix: helix.clone(), user_id: account.user_id.clone() }));
         {
@@ -276,7 +278,10 @@ impl Engine {
         }
         self.unregister_connector(platform);
         let key = match platform {
-            Platform::Twitch => Some(TWITCH_TOKENS),
+            Platform::Twitch => {
+                self.cloud_bot_set_twitch(None);
+                Some(TWITCH_TOKENS)
+            }
             Platform::Youtube => {
                 *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 Some(YOUTUBE_TOKENS)

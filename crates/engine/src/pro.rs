@@ -215,6 +215,22 @@ fn code(c: &str) -> &'static str {
         "mail_rate",
         "mail_busy",
         "already_on",
+        // The 24/7 cloud bot (API.md §9.7).
+        "stale_version",
+        "too_many_commands",
+        "too_many_timers",
+        "invalid_config",
+        "platform_not_found",
+        "platform_unavailable",
+        "bot_account_first",
+        "kick_not_linked",
+        "no_platform",
+        "bot_rate",
+        "twitch_not_linked",
+        "wrong_twitch_app",
+        "twitch_unreachable",
+        "twitch_rate",
+        "connect_again",
     ];
     KNOWN.iter().copied().find(|k| *k == c).unwrap_or("relay_error")
 }

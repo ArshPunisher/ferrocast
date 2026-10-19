@@ -120,14 +120,30 @@ impl Engine {
         };
         self.set_relay_state("connected", None);
         let (mut tx, mut rx) = ws.split();
+        // `bot_seen` every 30 s while the cloud bot is on: the cloud stands by (cloud_bot.rs).
+        let mut beat = tokio::time::interval(crate::cloud_bot::HEARTBEAT);
+        let mut heard = tokio::time::Instant::now();
         loop {
             // The relay pings every 30 s; silence for 90 s means the link is dead.
-            let msg = match tokio::time::timeout(Duration::from_secs(90), rx.next()).await {
-                Err(_) => return Err("the relay went quiet".into()),
-                Ok(None) => return Err("the relay closed the link".into()),
-                Ok(Some(Err(e))) => return Err(e.to_string()),
-                Ok(Some(Ok(m))) => m,
+            let next = tokio::select! {
+                _ = beat.tick() => {
+                    if self.cloud_bot_on().await {
+                        // The chat platforms this PC answers: the cloud covers the others.
+                        let seen = json!({ "type": "bot_seen", "platforms": self.cloud_bot_platforms() }).to_string();
+                        tx.send(Message::text(seen)).await.map_err(|e| e.to_string())?;
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep_until(heard + Duration::from_secs(90)) => None,
+                m = rx.next() => Some(m),
             };
+            let msg = match next {
+                None => return Err("the relay went quiet".into()),
+                Some(None) => return Err("the relay closed the link".into()),
+                Some(Some(Err(e))) => return Err(e.to_string()),
+                Some(Some(Ok(m))) => m,
+            };
+            heard = tokio::time::Instant::now();
             let Message::Text(text) = msg else { continue };
             let Ok(item) = serde_json::from_str::<Value>(&text) else { continue };
             if item["type"] != "item" {
@@ -161,6 +177,8 @@ impl Engine {
                     let _ = self.submit(e).await;
                 }
             }
+            // The cloud bot changed a counter while this PC was off (cloud_bot.rs).
+            "bot_counter" => self.apply_cloud_counter(payload).await,
             other => tracing::debug!(kind = other, "ignored a relay item"),
         }
     }

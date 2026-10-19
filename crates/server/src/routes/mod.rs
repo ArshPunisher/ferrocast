@@ -4,6 +4,7 @@ mod app;
 mod autoreplies;
 mod bot;
 mod cloud_backups;
+mod cloud_bot;
 mod core;
 mod designs;
 mod discord;
@@ -157,6 +158,11 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/history/export.csv", get(history::export))
         // Pro: the weekly email (see routes/weekly_email.rs)
         .route("/pro/history/email", get(weekly_email::view).put(weekly_email::save).delete(weekly_email::stop))
+        // Pro: the 24/7 cloud bot (see routes/cloud_bot.rs)
+        .route("/pro/bot", get(cloud_bot::view))
+        .route("/pro/bot/enabled", put(cloud_bot::enabled))
+        .route("/pro/bot/{platform}/connect", post(cloud_bot::connect))
+        .route("/pro/bot/{platform}", delete(cloud_bot::disconnect))
         // Pro: the Ferrocast bot for Discord (see routes/discord.rs)
         .route("/pro/discord", get(discord::bot).delete(discord::bot_disconnect))
         .route("/pro/discord/connect", post(discord::bot_connect))

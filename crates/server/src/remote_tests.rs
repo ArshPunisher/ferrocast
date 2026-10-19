@@ -434,6 +434,11 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/pro/remote",
         "/pro/history",
         "/pro/history/email",
+        "/pro/bot",
+        "/pro/bot/enabled",
+        "/pro/bot/twitch",
+        "/pro/bot/twitch/connect",
+        "/pro/bot/config",
         "/tips",
         "/tips/brand",
         "/tips/brand/avatar",
@@ -515,4 +520,39 @@ async fn a_phone_streams_a_big_video_in_parts() {
     assert_eq!(res.status, 413);
     let v: Value = serde_json::from_slice(&res.body).unwrap();
     assert_eq!(v["error"]["code"], "too_large");
+}
+
+#[tokio::test]
+async fn a_phone_may_look_at_and_switch_the_cloud_bot_but_never_connect_it() {
+    let (h, _dir) = handler().await;
+    // An owner's phone reaches the two routes (the PC then asks the relay: no relay here, so
+    // not 403 but the engine's own answer).
+    for (method, path, body) in
+        [("GET", "/api/v1/pro/bot", ""), ("PUT", "/api/v1/pro/bot/enabled", r#"{"enabled":false}"#)]
+    {
+        let (s, v) = ask(&h, "owner", method, path, body).await;
+        assert_ne!(v["error"]["code"].as_str(), Some("not_allowed_for_role"), "owner {method} {path}: {s} {v}");
+    }
+    // Connecting, disconnecting and the rest of /pro stay on the PC.
+    for (method, path) in [
+        ("POST", "/api/v1/pro/bot/twitch/connect"),
+        ("POST", "/api/v1/pro/bot/kick/connect"),
+        ("DELETE", "/api/v1/pro/bot/twitch"),
+        ("PUT", "/api/v1/pro/bot"),
+        ("GET", "/api/v1/pro/bot/enabled"),
+        ("PUT", "/api/v1/pro/bot/config"),
+    ] {
+        let (s, v) = ask(&h, "owner", method, path, "{}").await;
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "owner {method} {path}");
+    }
+    // A mod: nothing.
+    for (method, path) in [("GET", "/api/v1/pro/bot"), ("PUT", "/api/v1/pro/bot/enabled")] {
+        let (s, v) = ask(&h, "mod", method, path, r#"{"enabled":true}"#).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "mod {method} {path}");
+    }
+    use ferrocast_relay::remote::scope as relay;
+    assert!(relay::allowed(relay::Role::Owner, "GET", "/pro/bot"));
+    assert!(relay::allowed(relay::Role::Owner, "PUT", "/pro/bot/enabled"));
+    assert!(!relay::allowed(relay::Role::Owner, "POST", "/pro/bot/twitch/connect"));
+    assert!(!relay::allowed(relay::Role::Mod, "GET", "/pro/bot"));
 }

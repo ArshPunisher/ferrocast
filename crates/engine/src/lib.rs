@@ -11,6 +11,7 @@ mod accounts;
 mod actions;
 mod backups;
 mod cloud_backup;
+mod cloud_bot;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod designs;
 mod discord;
@@ -159,6 +160,8 @@ struct Inner {
     cloud_tts: speech::CloudTts,
     /// Pro dashboard from anywhere: the tunnel to the relay and the server's handler.
     remote: remote::Remote,
+    /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
+    cloud_bot: cloud_bot::CloudBot,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -278,6 +281,7 @@ impl Engine {
                 cloud_backup: Default::default(),
                 cloud_tts: Default::default(),
                 remote: Default::default(),
+                cloud_bot: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -295,6 +299,8 @@ impl Engine {
         tokio::spawn(cloud_backup::run(engine.clone()));
         engine.load_discord_pro().await;
         tokio::spawn(discord::run(engine.clone()));
+        engine.load_cloud_bot().await;
+        tokio::spawn(cloud_bot::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)
