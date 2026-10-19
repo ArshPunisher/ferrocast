@@ -25,13 +25,15 @@ summary says what went live, or that the previous version was put back.
 | `docker-compose.yml` | server | Relay + `cloudflared`; the relay's image comes from `RELAY_IMAGE`/`RELAY_TAG` |
 | `relay-server-deploy.sh` | server (`/opt/ferrocast-relay/deploy.sh`) | Pull, switch, health check, rollback; the only thing the deploy key can run |
 | `deploy-relay.sh` | your Mac | First install, and changing config or secrets (`../secrets/relay.env`). Once GitHub deploys, it keeps the live version and never swaps in a local build |
-| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh` and `pro-keys.sh` |
+| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh`, `pro-keys.sh` and `pro-grant.sh` |
 | `razorpay-keys.sh` | server (`/opt/ferrocast-relay/razorpay-keys.sh`) | Ferrocast Pro's Razorpay keys, plans, webhook secret, and the `PRO_SALES_OPEN` switch (below) |
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
 | `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app and Google client, custom tip addresses' Cloudflare token and zone) with typing hidden, never showing them (below) |
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
+| `pro-grant.sh` | server (`/opt/ferrocast-relay/pro-grant.sh`) | The owner's test Pro for one install, without Razorpay (below) |
+| `tests/pro-grant.test.sh` | CI, your Mac | Tests `pro-grant.sh` |
 
 ## One-time setup for GitHub deploys
 
@@ -334,3 +336,23 @@ hourly sweep deletes it from Cloudflare and the relay. A wrong zone id, a refuse
 Cloudflare for SaaS switched off is logged once (`Cloudflare for SaaS isn't usable: …`) and
 streamers see 503 `domains_unavailable`, never Cloudflare's words.
 `deploy-relay.sh` keeps both lines when it rewrites `relay.env`.
+
+## Test Pro for your own install (no Razorpay)
+
+To try Pro end to end on your own desktop, grant it to that install from the server:
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-grant.sh <install-id> 30'      # grant or extend (1-90 days, capped at 90 from now)
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-grant.sh --revoke <install-id>' # end it now
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-grant.sh --list'
+```
+
+It runs `ferrocast-relay pro-grant …` in the relay container on the live database (no HTTP
+route; safe while the relay serves). The grant is a `comp_…` subscription with plan `comp`:
+`/v1/pro/status` shows it as Pro, and nothing about it is ever sent to Razorpay (daily
+re-check, refresh, cancel, manage and restore skip or refuse it with 409 `test_grant`). It's
+refused for an install that still has a real subscription granting or renewing Pro. Revoking
+keeps the row, ended now, so the usual 30-day lapse rules tidy its data. The install id is the
+part before the dot of `relay-install` in the app's `secrets.json`
+(macOS: `~/Library/Application Support/Ferrocast/secrets.json`; never share the part after the dot).
+

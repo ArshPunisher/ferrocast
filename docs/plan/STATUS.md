@@ -26,6 +26,9 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-19 (owner's test Pro)
+- `ferrocast-relay pro-grant <install> <days> | --revoke | --list` (`billing/comp.rs`) and `deploy/pro-grant.sh` (+ test, CI, `relay-ci-setup.sh`): a `comp_` grant is Pro without Razorpay; reconcile/refresh skip it, cancel/manage answer 409 `test_grant`, restore can't attach it. Relay DB gets a 5 s busy timeout.
+
 ### 2026-10-19 (Pro gates: load test and lapse end to end)
 - Two pre-sales gates run locally against fakes (docs/plan/LOAD-TEST.md). **Load test, passed**: 200 subscriptions (399 installs) made Pro through signed fake Razorpay webhooks, a busy hour at ≈ 280 requests/s (150 phone requests/s through 50 tunnels, 100 EventSub + 25 Kick webhooks/s, tip pages, history, TTS, 20 MB backups, the weekly email, sweeps every minute) for 10 and 30 minutes: 0 5xx, worst API p95 16.9 ms, RSS 166 MB after 30 min (limit 700), 0 "database is locked". `crates/relay/src/load_tests.rs` (ignored; the relay runs as a child process so `ps` sees only it). Follow-ups: rerun on the server's hardware, a 24 h soak for memory, cheaper per-request writes if the disk is slow.
 - **Lapse end to end, passed** (`crates/relay/src/lapse_tests.rs`, in CI): every Pro feature set up, then halted/cancelled → 402s with the right words, phones paused not unpaired, exports open, cloud bot stopped at the next sweep, custom address removed after 7 days, everything deleted and revoked after 30 days, recovery within the grace, a new purchase after deletion starts clean. **Bug fixed:** a halted or paused subscription's data was never deleted (the daily re-check moved `synced_at`, which the 30-day rules counted from); now `SubRow::stopped_at()`. Open: a new checkout within the 30 days gets a new subscription id and loses history, backups, bot, Discord and email.
