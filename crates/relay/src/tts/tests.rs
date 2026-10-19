@@ -260,7 +260,7 @@ impl World {
 /// Starts a test well inside a UTC minute, so per-minute counts can't roll over midway.
 async fn early_in_a_minute() {
     let into = now_ms().rem_euclid(60_000);
-    if into > 45_000 {
+    if into > 30_000 {
         tokio::time::sleep(std::time::Duration::from_millis(u64::try_from(60_100 - into).unwrap())).await;
     }
 }
@@ -433,27 +433,41 @@ async fn the_relay_wide_cap_rests_the_voices_and_never_calls_the_provider() {
 
 #[tokio::test]
 async fn request_rates_stop_runaway_loops() {
-    early_in_a_minute().await;
-    let w = world().await;
-    let subs: Vec<String> = (0..4).map(|i| w.pro(&format!("i{i}"), &format!("sub_{i}"))).collect();
-    // One subscription: 20 a minute.
-    for _ in 0..SUB_RATE.limit {
-        assert_eq!(w.speak(&subs[0], "hi", HINDI).await.status, 200);
-    }
-    let a = w.speak(&subs[0], "hi", HINDI).await;
-    assert_eq!((a.status, a.code().as_str()), (429, "tts_rate"));
-    let wait: i64 = a.headers["retry-after"].to_str().unwrap().parse().unwrap();
-    assert!((1..=60).contains(&wait), "{wait}");
-    // Everyone together: 60 a minute.
-    for s in &subs[1..3] {
+    // The windows are whole clock minutes, and 82 requests can take most of one on a slow CI
+    // runner: a run that crosses a minute boundary proves nothing, so it starts over.
+    for _ in 0..3 {
+        early_in_a_minute().await;
+        let minute = now_ms().div_euclid(60_000);
+        let w = world().await;
+        let subs: Vec<String> = (0..4).map(|i| w.pro(&format!("i{i}"), &format!("sub_{i}"))).collect();
+        // One subscription: 20 a minute.
+        let mut first = Vec::new();
         for _ in 0..SUB_RATE.limit {
-            assert_eq!(w.speak(s, "hi", HINDI).await.status, 200);
+            first.push(w.speak(&subs[0], "hi", HINDI).await.status);
         }
+        let over = w.speak(&subs[0], "hi", HINDI).await;
+        // Everyone together: 60 a minute.
+        let mut rest = Vec::new();
+        for s in &subs[1..3] {
+            for _ in 0..SUB_RATE.limit {
+                rest.push(w.speak(s, "hi", HINDI).await.status);
+            }
+        }
+        let global = w.speak(&subs[3], "hi", HINDI).await;
+        if now_ms().div_euclid(60_000) != minute {
+            continue;
+        }
+        assert!(first.iter().all(|s| *s == 200), "{first:?}");
+        assert_eq!((over.status, over.code().as_str()), (429, "tts_rate"));
+        let wait: i64 = over.headers["retry-after"].to_str().unwrap().parse().unwrap();
+        assert!((1..=60).contains(&wait), "{wait}");
+        assert!(rest.iter().all(|s| *s == 200), "{rest:?}");
+        assert_eq!((global.status, global.code().as_str()), (429, "tts_rate"), "the 61st request this minute");
+        assert_eq!(w.fake.calls().len(), 60);
+        assert_eq!(w.used("sub_3"), 0);
+        return;
     }
-    let a = w.speak(&subs[3], "hi", HINDI).await;
-    assert_eq!((a.status, a.code().as_str()), (429, "tts_rate"), "the 61st request this minute");
-    assert_eq!(w.fake.calls().len(), 60);
-    assert_eq!(w.used("sub_3"), 0);
+    panic!("three runs in a row crossed a minute boundary");
 }
 
 #[tokio::test]
