@@ -122,6 +122,32 @@ run "$tw_id\n\n\n" --twitch
 is "part of the Twitch keys works" "$code" 0
 has "warns the cloud bot stays off" "$out" "stays off until all three"
 
+# Custom tip addresses: Cloudflare's token and zone (made-up values in the right shape, built
+# in pieces so nothing here looks like a real token).
+cf_token="$(printf 'Ab3_%.0s' {1..10})"
+cf_zone="$(printf '0123456789abcdef%.0s' {1..2})"
+fresh_relay
+run "short-token\nUPPER0123456789ABCDEF0123456789AB\nnope\n" --domains
+is "a short Cloudflare token is refused" "$code" 1
+has "says what the token should look like" "$out" "not the Global API Key"
+is "nothing saved for domains" "$(v CF_SAAS_TOKEN)" ""
+run "$cf_token\nZONE\n0123456789ABCDEF0123456789ABCDEF\nnot-hex-not-hex-not-hex-not-hex!\n" --domains
+is "a zone id that isn't 32 lowercase hex is refused" "$code" 1
+is "the token isn't saved either (all or nothing)" "$(v CF_SAAS_TOKEN)" ""
+run "$cf_token\n$cf_zone\n" --domains
+is "--domains saves both" "$code" 0
+is "token saved" "$(v CF_SAAS_TOKEN)" "$cf_token"
+is "zone id saved" "$(v CF_ZONE_ID)" "$cf_zone"
+hasnt "never prints the Cloudflare token" "$out" "$cf_token"
+run "" --status
+has "status lists the Cloudflare token" "$out" "CF_SAAS_TOKEN: *set"
+has "status lists the zone id" "$out" "CF_ZONE_ID: *set"
+hasnt "status hides the token" "$out" "$cf_token"
+fresh_relay
+run "$cf_token\n\n" --domains
+is "the token alone works" "$code" 0
+has "warns addresses stay off" "$out" "stay off until both are set"
+
 fresh_relay
 run "x\n" --nope
 is "unknown option fails" "$code" 1

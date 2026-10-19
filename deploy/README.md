@@ -30,7 +30,7 @@ summary says what went live, or that the previous version was put back.
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
-| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app) with typing hidden, never showing them (below) |
+| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app, custom tip addresses' Cloudflare token and zone) with typing hidden, never showing them (below) |
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 
 ## One-time setup for GitHub deploys
@@ -216,3 +216,77 @@ With the vault key and Twitch's three (or Kick's app) set, `features.cloud_bot` 
 the Bot page shows "Keep the bot on when this PC is off". Missing or partial, the relay logs
 which and that platform stays off; the bot on the PC keeps working. `deploy-relay.sh` keeps the
 lines when it rewrites `relay.env`.
+
+## Ferrocast Pro: custom tip addresses (Cloudflare for SaaS)
+
+A streamer types `tips.mychannel.com` on the Tips screen; the relay adds it as a **custom
+hostname** on the `clearcraftlabs.com` zone (no `custom_metadata`, which is Enterprise only)
+and shows them **two records** to add: a CNAME
+(`tips` → `tip.clearcraftlabs.com`) and a TXT record `_ferrocast.tips` with a value only this
+relay makes for that install and hostname (an HMAC keyed from `RELAY_VAULT_KEY`). Cloudflare
+checks the CNAME, gets a certificate (HTTP validation, DV, TLS 1.2+) and sends the address's
+traffic to the zone's fallback origin, the tip host, so the relay sees `Host: tips.mychannel.com`.
+The relay reads the TXT record itself over DNS-over-HTTPS (`https://cloudflare-dns.com/dns-query`,
+so the server needs outbound HTTPS to it) and answers with that streamer's tip page (`/`), goal
+page (`/goal`) and images **only when Cloudflare says active and the TXT value matches**: a CNAME
+someone left pointing at us can't be claimed by anyone else. The hourly sweep checks every
+address again; one whose TXT record is gone three sweeps running stops (`proof_missing`) until
+it's back. One address per subscription, 100 on the relay (Cloudflare for SaaS includes 100
+custom hostnames free; only live addresses and unfinished ones younger than 7 days count), 10
+changes a day. An address that isn't live 7 days after it was added (or last worked) is removed
+from Cloudflare and the relay, and one that isn't live after 24 hours can be claimed by another
+tip page.
+
+Once, in the Cloudflare dashboard (clearcraftlabs.com):
+
+1. **SSL/TLS → Custom Hostnames → Enable Cloudflare for SaaS** (free plan; it may ask for a
+   payment method on file for hostnames past the free 100; the relay never makes more than 100).
+2. **Fallback Origin**: `tip.clearcraftlabs.com`. It must be a **proxied** (orange cloud) DNS
+   record in the zone; the tunnel's public hostname for `tip.clearcraftlabs.com` already is
+   (a CNAME to the tunnel). Wait until the fallback origin shows **Active**.
+3. **The tunnel must hand unknown hostnames to the relay.** Cloudflare sends a custom
+   hostname's requests through the tunnel with the streamer's own `Host`, which no public
+   hostname rule matches, so the tunnel's **catch-all rule** must be
+   `http://ferrocast-relay:8787` (not the default `http_status:404`). The relay is safe to
+   receive any host: Ferrocast's own hosts behave as before, a live address gets only its tip
+   pages, anything else gets a 404 "not set up yet" page. If the dashboard doesn't let you edit
+   the catch-all, set it with the API (`PUT /accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations`,
+   keeping every existing rule and making the last one `{"service": "http://ferrocast-relay:8787"}`).
+   Check it after the first address is live: `curl -sI https://tips.<test-domain>/` answers
+   200 with the tip page's `content-security-policy`.
+4. **API token**: My Profile → API Tokens → Create Token → Custom token. Permissions:
+   **Zone → SSL and Certificates → Edit** (this covers custom hostnames; if the list also
+   shows **Zone → Custom Hostnames → Edit**, add it too). Zone Resources: **Include → Specific
+   zone → clearcraftlabs.com**. No account permissions, no IP filter needed (the relay calls
+   from the server). Never use the Global API Key.
+5. **Zone ID**: clearcraftlabs.com → Overview → API → Zone ID.
+6. **The TXT proof needs `RELAY_VAULT_KEY`** (`vault-key.sh`, above): its values are keyed
+   from it, so without it the feature stays off (the relay logs
+   "RELAY_VAULT_KEY not set: custom tip addresses are off"). Changing the vault key changes
+   every value: live addresses stop after three hourly checks until their streamers update the
+   TXT record, so don't rotate it while addresses are live.
+7. **An address Cloudflare already has** (left over after a crash, or set up elsewhere) is
+   taken over only when its `_ferrocast` TXT record holds that streamer's value: the dashboard
+   shows the record with the 409 and a Try again button. Nothing to do on the zone for this.
+8. **Test it once** with a domain you own: add the address on Tips, add both records (CNAME
+   **DNS only** if that domain is on Cloudflare, and the TXT record exactly as shown), wait for
+   **Live**, then `curl -sI https://tips.<test-domain>/` answers 200. Remove the TXT record: the
+   address keeps working through two hourly sweeps and stops at the third. `curl -sI -H 'Host:
+   nobody.example.com' https://tip.clearcraftlabs.com/health` answers 404 (unknown hosts fail
+   closed); `curl -s http://127.0.0.1:8787/health` on the server still answers 200.
+
+Then type both on the server:
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --domains'
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'
+```
+
+With both set (and the vault key), `features.tip_domain` is true and Tips shows "Your own
+address". A streamer on Cloudflare DNS must set their CNAME to **DNS only** (grey cloud). The
+relay checks an address (Cloudflare and the TXT record) at most once a minute when the streamer
+looks, and every address hourly; a lapsed subscription's address keeps working 7 days, then the
+hourly sweep deletes it from Cloudflare and the relay. A wrong zone id, a refused token or
+Cloudflare for SaaS switched off is logged once (`Cloudflare for SaaS isn't usable: …`) and
+streamers see 503 `domains_unavailable`, never Cloudflare's words.
+`deploy-relay.sh` keeps both lines when it rewrites `relay.env`.
