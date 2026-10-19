@@ -26,6 +26,7 @@ use crate::db::Saved;
 use crate::{ApiError, AppState, authed, now_ms};
 
 pub(crate) mod brand;
+pub mod domains;
 pub(crate) mod goal;
 #[cfg(test)]
 mod pro_tests;
@@ -45,6 +46,7 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         // The image is read with its own cap (1 MB / 3 MB), not the 256 KB JSON limit.
         .route("/v1/pro/tips/brand/{kind}", put(brand::put_image).delete(brand::delete_image))
         .route("/v1/pro/tips/goal", get(goal::get_goal).put(goal::put_goal).delete(goal::delete_goal))
+        .route("/v1/pro/tips/domain", get(domains::get_domain).put(domains::put_domain).delete(domains::delete_domain))
         .route("/t/a/{file}", get(brand::asset))
         .route("/t/{handle}", get(page))
         .route("/t/{handle}/goal", get(goal::page))
@@ -60,7 +62,12 @@ pub(crate) fn brand_available(st: &AppState) -> bool {
 }
 
 /// Pro's tip page counters, listed in `/v1/pro/status` `quotas`.
-pub(crate) const QUOTAS: &[crate::quota::Limit] = &[brand::IMAGES_PER_DAY];
+pub(crate) const QUOTAS: &[crate::quota::Limit] = &[brand::IMAGES_PER_DAY, domains::CHANGES_PER_DAY];
+
+/// `features.tip_domain` in `/v1/pro/status`: Pro's own tip address (Cloudflare for SaaS).
+pub(crate) fn domain_available(st: &AppState) -> bool {
+    domains::available(st)
+}
 
 /// Whether an install has Pro right now (the same rule as the gate and `/v1/pro/status`).
 pub(crate) fn install_is_pro(st: &AppState, install: &str) -> bool {
@@ -97,6 +104,8 @@ pub async fn sweep(st: &AppState) {
         }
     }
     brand::forget_images(st, images).await;
+    // Custom addresses: lapsed ones go after 7 days, unfinished ones are checked again.
+    domains::sweep(st).await;
 }
 
 impl crate::Db {
@@ -525,6 +534,12 @@ pub async fn tip_host_page(State(st): State<AppState>, headers: HeaderMap, path:
 /// `GET /t/{handle}`: the public tip page. Static HTML, no scripts, no trackers. A Pro
 /// install's page has its colours, avatar, banner and goal.
 pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Response {
+    page_html(&st, &handle, None)
+}
+
+/// The tip page for `handle`; `goal_href` is where the goal card links (default: the goal
+/// page next to it, `<handle>/goal`; `/goal` on a custom address).
+pub(crate) fn page_html(st: &AppState, handle: &str, goal_href: Option<&str>) -> Response {
     let found = st
         .db
         .tip_install_by_handle(&handle.to_lowercase())
@@ -538,7 +553,7 @@ pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Res
         page_headers(&mut res);
         return res;
     };
-    let pro = install_is_pro(&st, &install);
+    let pro = install_is_pro(st, &install);
     let brand =
         if pro { st.db.tip_brand(&install).ok().flatten().unwrap_or_default() } else { brand::Brand::default() };
     let mut buttons = String::new();
@@ -570,7 +585,8 @@ pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Res
             format!("<img class=\"{cls}\" src=\"{}\" alt=\"\" width=96 height=96>", brand::asset_path(a))
         })
         .unwrap_or_default();
-    let goal = if pro { goal_card(&st, &install, &cfg.handle) } else { String::new() };
+    let goal_href = goal_href.map_or_else(|| format!("{}/goal", cfg.handle), str::to_string);
+    let goal = if pro { goal_card(st, &install, &goal_href) } else { String::new() };
     let body = format!(
         "{banner}{avatar}<h1>{}</h1>{}<div class=buttons>{buttons}</div>{goal}\
          <p class=fine>Your name and message can show on stream. Payments go straight to the streamer through the provider you pick; Ferrocast never sees your card or bank details.</p>",
@@ -584,11 +600,12 @@ pub async fn page(State(st): State<AppState>, Path(handle): Path<String>) -> Res
 }
 
 /// The goal's progress on the tip page, linking to the goal page.
-fn goal_card(st: &AppState, install: &str, handle: &str) -> String {
+fn goal_card(st: &AppState, install: &str, href: &str) -> String {
     let Some(g) = st.db.tip_goal(install).ok().flatten() else { return String::new() };
     let Some(p) = goal::progress(st, &g) else { return String::new() };
     format!(
-        "<a class=goal href=\"{handle}/goal\"><span class=goal-head><span>{}</span><span class=muted>{} of {}</span></span>{}</a>",
+        "<a class=goal href=\"{}\"><span class=goal-head><span>{}</span><span class=muted>{} of {}</span></span>{}</a>",
+        esc(href),
         esc(&g.title),
         esc(&p.raised),
         esc(&p.target),

@@ -73,6 +73,8 @@ pub const OWNER_ALLOWED: &[Rule] = &[
     // The cloud bot (Pro F1): look at it and switch it on or off; connecting stays on the PC.
     ("GET", "/pro/bot"),
     ("PUT", "/pro/bot/enabled"),
+    // The tip page's own address (Pro F6): its status only; adding or removing stays on the PC.
+    ("GET", "/pro/tips/domain"),
 ];
 
 /// What an owner's phone may never do (`*` as the method: any method).

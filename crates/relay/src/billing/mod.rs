@@ -279,6 +279,7 @@ fn features(st: &AppState) -> Value {
         "tip_brand": crate::tips::brand_available(st),
         "history": crate::history::available(st),
         "weekly_email": crate::mail::available(st),
+        "tip_domain": crate::tips::domain_available(st),
     })
 }
 

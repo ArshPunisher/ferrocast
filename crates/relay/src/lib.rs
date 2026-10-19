@@ -113,6 +113,8 @@ pub struct AppState {
     pub(crate) mail: Arc<mail::Runtime>,
     /// The 24/7 cloud bot (Twitch off without `TWITCH_CLOUD_*`, Kick with the Kick app).
     pub(crate) bot: Arc<bot::Runtime>,
+    /// Pro's custom tip addresses (off without `CF_SAAS_TOKEN` / `CF_ZONE_ID`).
+    pub(crate) tip_domains: Arc<tips::domains::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -137,6 +139,7 @@ impl AppState {
             discord: Arc::default(),
             mail: Arc::default(),
             bot: Arc::default(),
+            tip_domains: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -193,6 +196,22 @@ impl AppState {
     /// production, fake platforms in tests).
     pub fn with_bot(mut self, rt: bot::Runtime) -> AppState {
         self.bot = Arc::new(rt);
+        self
+    }
+
+    /// Custom tip addresses: Cloudflare for SaaS (`tips::domains::CloudflareHostnames::from_env()`
+    /// in production, a `FakeHostnames` in tests), the DNS the TXT proof is read with (`None`:
+    /// Cloudflare's DNS-over-HTTPS; a `FakeDns` in tests), the secret its values are keyed
+    /// with (the decoded `RELAY_VAULT_KEY`; without one the feature stays off) and how many
+    /// addresses the relay takes in all.
+    pub fn with_tip_domains(
+        mut self,
+        cf: Option<Arc<dyn tips::domains::CustomHostnames>>,
+        dns: Option<Arc<dyn tips::domains::ProofDns>>,
+        secret: Option<&[u8]>,
+        cap: usize,
+    ) -> AppState {
+        self.tip_domains = Arc::new(tips::domains::Runtime::new(cf, dns, secret, cap));
         self
     }
 
@@ -300,6 +319,8 @@ pub fn router(state: AppState) -> Router {
         .merge(discord::routes())
         .merge(mail::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
         .with_state(state)
 }
 

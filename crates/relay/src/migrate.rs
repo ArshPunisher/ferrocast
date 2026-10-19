@@ -42,6 +42,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         sql: &[crate::bot::SCHEMA],
     },
     Migration { version: 11, name: "Pro offline remote mode: audit source", sql: &[crate::remote::SCHEMA_SOURCE] },
+    Migration { version: 12, name: "Pro custom tip addresses", sql: &[crate::tips::domains::SCHEMA] },
 ];
 
 pub(crate) fn latest() -> i64 {

@@ -399,12 +399,12 @@ pub async fn tip_host_goal(
     if !super::on_tip_host(&st, &headers) {
         return super::not_found();
     }
-    page_for(&st, &handle, q.overlay.is_some_and(|o| o == "1"))
+    page_for(&st, &handle, q.overlay.is_some_and(|o| o == "1"), None)
 }
 
 /// `GET /t/{handle}/goal`: the public goal page (`?overlay=1` for OBS). No scripts.
 pub async fn page(State(st): State<AppState>, Path(handle): Path<String>, Query(q): Query<PageQuery>) -> Response {
-    page_for(&st, &handle, q.overlay.is_some_and(|o| o == "1"))
+    page_for(&st, &handle, q.overlay.is_some_and(|o| o == "1"), None)
 }
 
 /// The progress numbers for a page: percent (0–100), raised and target as text.
@@ -427,7 +427,9 @@ pub(crate) fn bar(pct: i64, label: &str) -> String {
     )
 }
 
-fn page_for(st: &AppState, handle: &str, overlay: bool) -> Response {
+/// The goal page for `handle`; `tip_href` is where its Tip button goes (default: the tip
+/// page next to it, `../<handle>`; `/` on a custom address).
+pub(crate) fn page_for(st: &AppState, handle: &str, overlay: bool, tip_href: Option<&str>) -> Response {
     let handle = handle.to_lowercase();
     let found = st.db.tip_install_by_handle(&handle).ok().flatten().and_then(|(install, cfg)| {
         let cfg = serde_json::from_str::<TipConfig>(&cfg).ok()?;
@@ -472,10 +474,11 @@ fn page_for(st: &AppState, handle: &str, overlay: bool) -> Response {
             .unwrap_or_default();
         format!(
             "{avatar}<p class=eyebrow>{name}'s goal</p><h1>{title}</h1>{}{numbers}{when}\
-             <div class=buttons><a class=\"btn primary\" href=\"../{handle}\">Tip {name}</a></div>\
+             <div class=buttons><a class=\"btn primary\" href=\"{tip}\">Tip {name}</a></div>\
              <p class=fine>Counts verified tips in {cur} since {since}. Tips in other currencies aren't counted. Refunds come off.</p>",
             bar(p.pct, &goal.title),
             name = esc(&cfg.display_name),
+            tip = esc(&tip_href.map_or_else(|| format!("../{handle}"), str::to_string)),
             cur = esc(&goal.currency),
             since = crate::billing::date(goal.starts_at),
         )

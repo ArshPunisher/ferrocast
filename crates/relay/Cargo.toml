@@ -32,6 +32,11 @@ subtle = "2"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 hmac = "0.12"
 url = "2"
+# Custom tip addresses (Pro F6): the Public Suffix List (ICANN and private entries, built in),
+# punycode to Unicode, and UTS #39 mixed-script and confusable checks.
+psl = "2"
+idna = "1"
+unicode-security = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Tip page images (Pro F6): decode PNG/JPEG/WebP, re-encode as WebP. Pure Rust, no C codecs.

@@ -128,6 +128,28 @@ async fn main() {
         }
     };
     let state = state.with_mail(mailer, ferrocast_relay::mail::MailConfig::from_env());
+    let tip_domains: Option<Arc<dyn ferrocast_relay::tips::domains::CustomHostnames>> =
+        match ferrocast_relay::tips::domains::CloudflareHostnames::from_env() {
+            Some(cf) => {
+                tracing::info!("custom tip addresses are on (Cloudflare for SaaS)");
+                Some(Arc::new(cf))
+            }
+            None => {
+                tracing::warn!("CF_SAAS_TOKEN / CF_ZONE_ID not set: custom tip addresses are off");
+                None
+            }
+        };
+    // The TXT proof's values are keyed with RELAY_VAULT_KEY.
+    let proof_secret = std::env::var("RELAY_VAULT_KEY")
+        .ok()
+        .and_then(|k| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, k.trim()).ok())
+        .filter(|k| k.len() >= 16);
+    if tip_domains.is_some() && proof_secret.is_none() {
+        tracing::warn!("RELAY_VAULT_KEY not set: custom tip addresses are off (it keys their TXT proof)");
+    }
+    let state =
+        state.with_tip_domains(tip_domains, None, proof_secret.as_deref(), ferrocast_relay::tips::domains::MAX_DOMAINS);
+    ferrocast_relay::tips::domains::warm_up(&state);
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.
