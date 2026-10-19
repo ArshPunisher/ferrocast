@@ -386,3 +386,95 @@ async fn no_live_or_scheduled_broadcast_is_a_clear_refusal() {
     assert!(err.unwrap_err().to_string().contains("live or scheduled stream"));
     assert!(puts.lock().unwrap().is_empty());
 }
+
+/// A chat server that sends one page, then keeps the stream open without a word.
+struct QuietChat;
+
+#[tonic::async_trait]
+impl V3DataLiveChatMessageService for QuietChat {
+    type StreamListStream = tokio_stream::wrappers::ReceiverStream<Result<LiveChatMessageListResponse, Status>>;
+
+    async fn stream_list(
+        &self,
+        _req: Request<LiveChatMessageListRequest>,
+    ) -> Result<Response<Self::StreamListStream>, Status> {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(page(vec![text("q-1", "hello")], "p1", false))).await;
+            std::future::pending::<()>().await; // never closes
+            drop(tx);
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+/// Copies bytes both ways until `frozen`; then holds both sockets open and silent (a dead
+/// network path that never closes).
+async fn freezing_proxy(to: std::net::SocketAddr, frozen: Arc<std::sync::atomic::AtomicBool>) -> String {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = l.accept().await {
+            let server = tokio::net::TcpStream::connect(to).await.unwrap();
+            let (mut cr, mut cw) = client.into_split();
+            let (mut sr, mut sw) = server.into_split();
+            let f1 = frozen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 16_384];
+                while let Ok(n) = cr.read(&mut buf).await {
+                    if n == 0 || f1.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if sw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                std::future::pending::<()>().await;
+                drop((cr, sw));
+            });
+            let f2 = frozen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 16_384];
+                while let Ok(n) = sr.read(&mut buf).await {
+                    if n == 0 || f2.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if cw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                std::future::pending::<()>().await;
+                drop((sr, cw));
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_stream_on_a_dead_connection_ends_through_keepalive_instead_of_hanging() {
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(V3DataLiveChatMessageServiceServer::new(QuietChat))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
+            .await
+    });
+    let frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let url = freezing_proxy(grpc_addr, frozen.clone()).await;
+    let quick = (Duration::from_millis(500), Duration::from_millis(500));
+    let mut feed = crate::feed::open_tuned(&url, "access-0", "chat-1", None, quick).await.unwrap();
+    assert_eq!(feed.next().await.unwrap().unwrap().events.len(), 1);
+    // The path goes dead: no close, no answer to pings. Without keepalive this waits forever.
+    frozen.store(true, std::sync::atomic::Ordering::SeqCst);
+    let ended = tokio::time::timeout(Duration::from_secs(10), feed.next()).await.expect("keepalive ends it");
+    assert!(matches!(ended, Err(crate::feed::FeedError::Lost(_))), "{ended:?}");
+    // The production values.
+    assert_eq!(
+        (crate::feed::KEEPALIVE_INTERVAL, crate::feed::KEEPALIVE_TIMEOUT),
+        (Duration::from_secs(30), Duration::from_secs(10))
+    );
+}

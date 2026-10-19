@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod connector;
+pub mod feed;
 pub mod map;
 pub mod oauth;
 pub mod stream;
