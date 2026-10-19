@@ -79,7 +79,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | GET | `/api/v1/stats/session` | → `{ live, started_at (kept after the stream ends), follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
-| GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta", blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
+| GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta" /* read-only: a prerelease build is "beta" */, blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
 | POST | `/api/v1/updates/install` | → 202 `{ installing }`; the desktop app downloads it, checks its signature, installs and restarts. 404 `no_update` when nothing newer was found, 409 while live with "never update while live" on (R-60) |
 
 ```ts
@@ -548,7 +548,7 @@ Matching folds both sides: Unicode NFKC (`ＤＩＳＣＯＲＤ` matches `discor
 | GET | `/api/v1/autoreplies/starters` | → the examples an empty list offers ("discord" → link, "what game" → `{game}`, "hello" → welcome) |
 
 ### Settings and data
-GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), update_channel: "stable" | "beta", never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored); 400 names a bad field (`lan_access: must be true or false.`).
+GET/PUT `/api/v1/settings`: `{ theme: "system" | "dark" | "light", reduced_motion: "system" | "on" | "off", low_motion_overlays, lan_access (next start), never_update_while_live, launch_at_login, close_to_tray, language, currency (ISO 4217, the main currency), keep_chat_days, test_alerts, bot_enabled, auto_ban_on_sight }`. PUT saves only the fields sent (unknown ones are ignored, including the retired `update_channel`); 400 names a bad field (`lan_access: must be true or false.`).
 POST `/api/v1/export` → a streamed `.ferropack` download (this install's own settings rows, `pro_status` and `history_upload`, are never in it, and an import never replaces them). POST `/api/v1/import` (multipart `file`, up to 2 GB) → `{ imported, media_files, backup }`; a backup is taken first. 415 `bad_pack` / `damaged_pack`, 422 `pack_too_new`, 413 `too_large`. GET `/api/v1/backups` → `Backup[]`, newest first; POST `/api/v1/backups` → 201 `Backup[]` (takes one now); POST `/api/v1/backups/{id}/restore` → `{ restart_needed, message }` (it's swapped in at the next start, keeping the current data as one more backup).
 
 ```ts
