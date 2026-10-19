@@ -437,3 +437,122 @@ pub(crate) async fn sweep_grants(st: &AppState, due: Vec<super::store::GrantRow>
         tracing::info!(removed, later, gave_up, restored, "Discord perk sweep done");
     }
 }
+
+/// Whether a round of pausing or giving back roles got through, or Discord's rate limit
+/// stopped it (then the sweep stops for this hour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Round {
+    Done,
+    RateLimited,
+}
+
+/// Pro ended: the roles the bot gave in `guild` come off now (not 30 days later), a few
+/// hundred per sweep. The grants are kept, paused, so they can come back with Pro. A member
+/// who left or a deleted role counts as off. Any other failure is per member: the rest go on
+/// and that one is tried again later (1 h, 2 h … up to a day, at most 5 times, then the role
+/// is left on). Discord's rate limit stops the round.
+pub(crate) async fn pause_guild(st: &AppState, guild: &str, now: i64) -> Round {
+    let Ok(api) = st.discord.api() else { return Round::Done };
+    let grants = match st.db.discord_grants_to_pause(guild, now, SWEEP_BATCH) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list Discord perks to take off");
+            return Round::Done;
+        }
+    };
+    let (mut off, mut later, mut gave_up) = (0, 0, 0);
+    let mut round = Round::Done;
+    for g in grants {
+        match api.remove_role(&g.guild_id, &g.discord_user_id, &g.role_id).await {
+            Ok(()) | Err(DiscordError::NotFound(_)) => match st.db.discord_pause_grant(&g, now) {
+                Ok(()) => off += 1,
+                Err(e) => tracing::warn!(error = %e, "couldn't note a Discord perk taken off"),
+            },
+            Err(DiscordError::RateLimited { retry_after_s }) => {
+                tracing::info!(retry_after_s, "Discord is rate limiting; the other perks come off later");
+                round = Round::RateLimited;
+                break;
+            }
+            Err(e) => {
+                later += 1;
+                tracing::debug!(error = %e, attempts = g.attempts + 1, "a Discord perk couldn't be taken off yet");
+                let wait = SWEEP_RETRY_MS.saturating_mul(1 << g.attempts.clamp(0, 10)).min(SWEEP_RETRY_MAX_MS);
+                match st.db.discord_pause_failed(&g, now, now + wait, SWEEP_MAX_ATTEMPTS) {
+                    Ok(true) => gave_up += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(error = %e, "couldn't note a failed Discord perk removal"),
+                }
+            }
+        }
+        if !st.discord.sweep_pause.is_zero() {
+            tokio::time::sleep(st.discord.sweep_pause).await;
+        }
+    }
+    if off + later > 0 {
+        tracing::info!(off, later, gave_up, "Discord perks taken off because Pro ended");
+    }
+    round
+}
+
+/// Pro is back: the paused roles in `guild` that haven't ended go back on. A member who left
+/// or a deleted role drops the grant; any other failure is per member and backs off like
+/// taking roles off (1 h … a day; forgotten after 5 tries), so it can't hold the rest back.
+pub(crate) async fn resume_guild(st: &AppState, guild: &str, now: i64) -> Round {
+    let Ok(api) = st.discord.api() else { return Round::Done };
+    let grants = match st.db.discord_paused_grants(guild, now, SWEEP_BATCH) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't list paused Discord perks");
+            return Round::Done;
+        }
+    };
+    let (mut back, mut dropped, mut later) = (0, 0, 0);
+    let mut round = Round::Done;
+    for g in grants {
+        match api.add_role(&g.guild_id, &g.discord_user_id, &g.role_id).await {
+            Ok(()) => match st.db.discord_unpause_grant(&g) {
+                Ok(()) => back += 1,
+                Err(e) => tracing::warn!(error = %e, "couldn't note a Discord perk given back"),
+            },
+            Err(DiscordError::NotFound(_)) => match st.db.discord_drop_grant(&g) {
+                Ok(()) => dropped += 1,
+                Err(e) => tracing::warn!(error = %e, "couldn't forget a Discord perk that can't come back"),
+            },
+            Err(DiscordError::RateLimited { retry_after_s }) => {
+                tracing::info!(retry_after_s, "Discord is rate limiting; the other perks come back later");
+                round = Round::RateLimited;
+                break;
+            }
+            Err(e) => {
+                later += 1;
+                tracing::debug!(error = %e, attempts = g.attempts + 1, "a paused Discord perk couldn't be given back yet");
+                let wait = SWEEP_RETRY_MS.saturating_mul(1 << g.attempts.clamp(0, 10)).min(SWEEP_RETRY_MAX_MS);
+                if let Err(e) = st.db.discord_resume_failed(&g, now + wait, SWEEP_MAX_ATTEMPTS) {
+                    tracing::warn!(error = %e, "couldn't note a failed Discord perk give-back");
+                }
+            }
+        }
+        if !st.discord.sweep_pause.is_zero() {
+            tokio::time::sleep(st.discord.sweep_pause).await;
+        }
+    }
+    if back + dropped + later > 0 {
+        tracing::info!(back, dropped, later, "paused Discord perks given back with Pro");
+    }
+    round
+}
+
+/// Right after a subscription grants Pro again (webhook, refresh): its server's paused roles
+/// go back on without waiting for the hourly sweep.
+pub(crate) async fn resume_for_sub(st: &AppState, sub: &str) {
+    if st.discord.api().is_err() {
+        return;
+    }
+    match st.db.discord_guild(sub) {
+        Ok(Some(g)) => {
+            resume_guild(st, &g.guild_id, now_ms()).await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "couldn't look up a Discord server to give perks back"),
+    }
+}

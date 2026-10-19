@@ -10,7 +10,7 @@
 //! ones go first. Unfinished uploads go after a day; everything goes 30 days after Pro
 //! ends, and until then the list, download and delete stay open (R-04).
 
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 mod tests;
 
@@ -72,7 +72,7 @@ pub(crate) const QUOTAS: &[Limit] = &[UPLOADS];
 // ── Keys and checks ──────────────────────────────────────────────────────────────────
 
 /// The finished file.
-fn blob_key(sub: &str, id: &str) -> String {
+pub(crate) fn blob_key(sub: &str, id: &str) -> String {
     format!("backups/{sub}/{id}")
 }
 

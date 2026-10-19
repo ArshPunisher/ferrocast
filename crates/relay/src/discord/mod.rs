@@ -39,8 +39,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use api::{Channel, Connection, DiscordApi, DiscordError, Fut, Guild, HttpDiscord, Role, Token};
+pub(crate) use perks::resume_for_sub;
 pub use perks::sweep;
-pub(crate) use store::SCHEMA;
+pub(crate) use store::{SCHEMA, SCHEMA_PAUSED};
 
 use crate::billing::gate::{ProCtx, require_pro};
 use crate::quota::{Limit, Period, TakeErr};
@@ -784,8 +785,9 @@ async fn live_report(
     Ok(no_store(live::report(&st, &ctx.sub_id, b).await?))
 }
 
-/// Part of the hourly sweep: a subscription whose Pro ended over 30 days ago loses its server
-/// (the bot leaves); go-live posts older than 30 days are forgotten.
+/// Part of the hourly sweep: a subscription whose Pro ended has the perk roles its bot gave
+/// taken off (paused, given back if Pro returns); one whose Pro ended over 30 days ago loses
+/// its server (the bot leaves); go-live posts older than 30 days are forgotten.
 pub(crate) async fn sweep_lapsed(st: &AppState, now: i64) {
     let guilds = match st.db.discord_guilds() {
         Ok(g) => g,
@@ -794,15 +796,13 @@ pub(crate) async fn sweep_lapsed(st: &AppState, now: i64) {
             return;
         }
     };
+    let mut limited = false;
     for g in guilds {
-        let kept = match st.db.pro_sub(&g.sub_id) {
-            Ok(None) => false,
+        let (pro, kept) = match st.db.pro_sub(&g.sub_id) {
+            Ok(None) => (false, false),
             Ok(Some(s)) => {
-                let access = s.access();
-                crate::billing::access::is_pro(&access, now) || {
-                    let stopped = s.stopped_at();
-                    now < stopped.saturating_add(KEEP_AFTER_LAPSE_MS)
-                }
+                let pro = crate::billing::access::is_pro(&s.access(), now);
+                (pro, pro || now < s.stopped_at().saturating_add(KEEP_AFTER_LAPSE_MS))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't check a Discord server's subscription");
@@ -815,7 +815,18 @@ pub(crate) async fn sweep_lapsed(st: &AppState, now: i64) {
                 Ok(()) => tracing::info!("a Discord server was disconnected 30 days after Pro ended"),
                 Err(e) => tracing::warn!(error = %e, "couldn't forget a lapsed Discord server"),
             }
+            continue;
         }
+        // Rate limited once: the other servers' roles wait for the next sweep.
+        if limited {
+            continue;
+        }
+        let round = if pro {
+            perks::resume_guild(st, &g.guild_id, now).await
+        } else {
+            perks::pause_guild(st, &g.guild_id, now).await
+        };
+        limited = round == perks::Round::RateLimited;
     }
     if let Err(e) = st.db.discord_prune_posts(now - KEEP_AFTER_LAPSE_MS) {
         tracing::warn!(error = %e, "couldn't prune old go-live posts");

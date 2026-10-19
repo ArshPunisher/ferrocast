@@ -8,6 +8,9 @@
 //! - `discord_grants`: which role went to which Discord user and when it ends (and, once it
 //!   has ended, how often taking it back failed and when to try again);
 //! - `discord_posts`: the last go-live message per platform (to edit it at the end).
+//!
+//! A grant whose role was taken off because the subscription's Pro ended is kept with
+//! `paused_at` set, so the role goes back on if Pro comes back before it would have ended.
 
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -22,6 +25,11 @@ CREATE INDEX IF NOT EXISTS discord_links_account ON discord_links(guild_id, plat
 CREATE TABLE IF NOT EXISTS discord_grants (guild_id TEXT NOT NULL, discord_user_id TEXT NOT NULL, role_id TEXT NOT NULL, rule_id TEXT NOT NULL, granted_at INTEGER NOT NULL, expires_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER, PRIMARY KEY (guild_id, discord_user_id, role_id));
 CREATE INDEX IF NOT EXISTS discord_grants_expiry ON discord_grants(expires_at);
 CREATE TABLE IF NOT EXISTS discord_posts (sub_id TEXT NOT NULL, platform TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT NOT NULL, started_at INTEGER NOT NULL, posted_at INTEGER NOT NULL, ended_at INTEGER, post TEXT NOT NULL, PRIMARY KEY (sub_id, platform));
+";
+
+/// Migration 13: when a grant's role was taken off because Pro ended (`NULL`: it's on).
+pub(crate) const SCHEMA_PAUSED: &str = "
+ALTER TABLE discord_grants ADD COLUMN paused_at INTEGER;
 ";
 
 /// A subscription's connected server.
@@ -385,7 +393,7 @@ impl Db {
             "INSERT INTO discord_grants(guild_id, discord_user_id, role_id, rule_id, granted_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(guild_id, discord_user_id, role_id) DO UPDATE SET rule_id = excluded.rule_id,
-               granted_at = excluded.granted_at, attempts = 0, retry_at = NULL,
+               granted_at = excluded.granted_at, attempts = 0, retry_at = NULL, paused_at = NULL,
                expires_at = CASE WHEN discord_grants.expires_at IS NULL OR excluded.expires_at IS NULL THEN NULL
                                  ELSE MAX(discord_grants.expires_at, excluded.expires_at) END",
             params![guild, user, role, rule, now, expires_at],
@@ -460,6 +468,111 @@ impl Db {
             params![g.guild_id, g.discord_user_id, g.role_id, end, retry_at],
         )?;
         Ok(false)
+    }
+
+    // ── Pausing grants while Pro is off ──────────────────────────────────────────────
+
+    /// Roles still on in `guild` that haven't ended, whose next try at taking them off (Pro
+    /// ended) is due.
+    pub(crate) fn discord_grants_to_pause(&self, guild: &str, now: i64, limit: i64) -> rusqlite::Result<Vec<GrantRow>> {
+        let c = self.c();
+        let mut q = c.prepare(&format!(
+            "SELECT {GRANT_COLS} FROM discord_grants
+             WHERE guild_id = ?1 AND paused_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)
+               AND (retry_at IS NULL OR retry_at <= ?2)
+             ORDER BY granted_at, discord_user_id, role_id LIMIT ?3"
+        ))?;
+        q.query_map(params![guild, now, limit], grant_row)?.collect()
+    }
+
+    /// The role came off because Pro ended (or, `gave_up`, it can't be taken off): the grant
+    /// waits for Pro to come back.
+    pub(crate) fn discord_pause_grant(&self, g: &GrantRow, now: i64) -> rusqlite::Result<()> {
+        self.c().execute(
+            "UPDATE discord_grants SET paused_at = ?4, attempts = 0, retry_at = NULL
+             WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3 AND paused_at IS NULL",
+            params![g.guild_id, g.discord_user_id, g.role_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Taking the role off failed: try again at `retry_at`, or after `max` tries leave it on
+    /// and count the grant as paused (so it isn't tried every hour). True when it gave up.
+    pub(crate) fn discord_pause_failed(
+        &self,
+        g: &GrantRow,
+        now: i64,
+        retry_at: i64,
+        max: i64,
+    ) -> rusqlite::Result<bool> {
+        if g.attempts + 1 >= max {
+            self.discord_pause_grant(g, now)?;
+            return Ok(true);
+        }
+        self.c().execute(
+            "UPDATE discord_grants SET attempts = attempts + 1, retry_at = ?4
+             WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3 AND paused_at IS NULL",
+            params![g.guild_id, g.discord_user_id, g.role_id, retry_at],
+        )?;
+        Ok(false)
+    }
+
+    /// Paused grants in `guild` that haven't ended: their roles go back on with Pro.
+    pub(crate) fn discord_paused_grants(&self, guild: &str, now: i64, limit: i64) -> rusqlite::Result<Vec<GrantRow>> {
+        let c = self.c();
+        let mut q = c.prepare(&format!(
+            "SELECT {GRANT_COLS} FROM discord_grants
+             WHERE guild_id = ?1 AND paused_at IS NOT NULL AND (expires_at IS NULL OR expires_at > ?2)
+               AND (retry_at IS NULL OR retry_at <= ?2)
+             ORDER BY COALESCE(retry_at, granted_at), discord_user_id, role_id LIMIT ?3"
+        ))?;
+        q.query_map(params![guild, now, limit], grant_row)?.collect()
+    }
+
+    /// Giving a paused role back failed: try again at `retry_at`, or after `max` tries forget
+    /// the grant (the role stays off). True when it was forgotten.
+    pub(crate) fn discord_resume_failed(&self, g: &GrantRow, retry_at: i64, max: i64) -> rusqlite::Result<bool> {
+        if g.attempts + 1 >= max {
+            self.discord_drop_grant(g)?;
+            return Ok(true);
+        }
+        self.c().execute(
+            "UPDATE discord_grants SET attempts = attempts + 1, retry_at = ?4
+             WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3 AND paused_at IS NOT NULL",
+            params![g.guild_id, g.discord_user_id, g.role_id, retry_at],
+        )?;
+        Ok(false)
+    }
+
+    /// The role is back on (Pro is back).
+    pub(crate) fn discord_unpause_grant(&self, g: &GrantRow) -> rusqlite::Result<()> {
+        self.c().execute(
+            "UPDATE discord_grants SET paused_at = NULL, attempts = 0, retry_at = NULL
+             WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3",
+            params![g.guild_id, g.discord_user_id, g.role_id],
+        )?;
+        Ok(())
+    }
+
+    /// A paused grant that can't come back (the member left, the role was deleted).
+    pub(crate) fn discord_drop_grant(&self, g: &GrantRow) -> rusqlite::Result<()> {
+        self.c().execute(
+            "DELETE FROM discord_grants WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3
+               AND paused_at IS NOT NULL",
+            params![g.guild_id, g.discord_user_id, g.role_id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discord_grant_paused(&self, guild: &str, user: &str, role: &str) -> rusqlite::Result<Option<bool>> {
+        self.c()
+            .query_row(
+                "SELECT paused_at IS NOT NULL FROM discord_grants WHERE guild_id = ?1 AND discord_user_id = ?2 AND role_id = ?3",
+                params![guild, user, role],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     // ── Go-live posts ────────────────────────────────────────────────────────────────

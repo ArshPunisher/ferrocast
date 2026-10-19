@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS billing_events (event_id TEXT PRIMARY KEY, at INTEGER
 CREATE TABLE IF NOT EXISTS pro_manage (token_hash TEXT PRIMARY KEY, sub_id TEXT NOT NULL REFERENCES pro_subs(id), expires_at INTEGER NOT NULL);
 ";
 
+/// Every subscription an install was ever linked to (`pro_installs` keeps only the current
+/// one), so a new subscription bought from the same install can take over a lapsed one's data
+/// within the keep window (`carry`). Filled from `pro_installs` when it's created.
+pub(crate) const SCHEMA_LINKS: &str = "
+CREATE TABLE IF NOT EXISTS pro_install_subs (install_id TEXT NOT NULL, sub_id TEXT NOT NULL, linked_at INTEGER NOT NULL, PRIMARY KEY (install_id, sub_id)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS pro_install_subs_sub ON pro_install_subs(sub_id);
+INSERT OR IGNORE INTO pro_install_subs(install_id, sub_id, linked_at) SELECT install_id, sub_id, linked_at FROM pro_installs;
+";
+
 /// Installs that can share one subscription (a streaming PC, a laptop, a spare).
 pub const MAX_INSTALLS: i64 = 3;
 /// Handled webhook ids are kept this long (Razorpay retries for about a day).
@@ -93,8 +102,13 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubRow> {
 }
 
 /// Links `install` to `sub` (moving it off any other), keeping at most [`MAX_INSTALLS`]:
-/// the ones linked longest ago drop off first.
+/// the ones linked longest ago drop off first. The link is also kept in `pro_install_subs`.
 pub(super) fn link(tx: &rusqlite::Transaction<'_>, install: &str, sub: &str, now: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO pro_install_subs(install_id, sub_id, linked_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(install_id, sub_id) DO UPDATE SET linked_at = excluded.linked_at",
+        params![install, sub, now],
+    )?;
     tx.execute(
         "INSERT INTO pro_installs(install_id, sub_id, linked_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(install_id) DO UPDATE SET sub_id = excluded.sub_id, linked_at = excluded.linked_at",
@@ -300,6 +314,12 @@ impl Db {
         let c = self.c();
         c.execute("DELETE FROM billing_events WHERE at < ?1", [now - EVENT_KEEP_MS])?;
         c.execute("DELETE FROM pro_manage WHERE expires_at < ?1", [now])?;
+        // Link history for installs or subscriptions that are gone.
+        c.execute(
+            "DELETE FROM pro_install_subs WHERE install_id NOT IN (SELECT id FROM installs)
+               OR sub_id NOT IN (SELECT id FROM pro_subs)",
+            [],
+        )?;
         // Checkouts nobody paid for (Razorpay expires them after `expire_by`).
         c.execute(
             "DELETE FROM pro_installs WHERE sub_id IN (SELECT id FROM pro_subs WHERE status = 'created' AND created_at < ?1)",

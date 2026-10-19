@@ -18,6 +18,7 @@
 //! `PRO_SALES_OPEN` is off by default: checkout answers 409 until Pro's features exist.
 
 pub mod access;
+pub(crate) mod carry;
 pub mod comp;
 pub(crate) mod gate;
 mod pages;
@@ -279,6 +280,7 @@ async fn refresh(st: &AppState, id: &str) -> Result<Option<SubRow>, ApiError> {
     let v = client(st)?.fetch_subscription(id).await.map_err(|e| upstream(&e))?;
     let s = synced(&v, None)?;
     st.db.sync_pro_sub(None, id, &s).map_err(ApiError::db)?;
+    carry::after_sync(st, id).await;
     st.db.pro_sub(id).map_err(ApiError::db)
 }
 
@@ -740,6 +742,9 @@ async fn subscription_event(st: &AppState, event_id: &str, event: &str, v: &Valu
         st.db.sync_pro_sub(Some(event_id), id, &s).map_err(ApiError::db)?
     };
     tracing::info!(subscription = %id, event, status = %s.status, "Pro subscription synced");
+    if applied == Applied::Done {
+        carry::after_sync(st, id).await;
+    }
     Ok(if applied == Applied::Duplicate { "duplicate" } else { "ok" })
 }
 

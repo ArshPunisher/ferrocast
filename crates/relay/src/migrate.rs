@@ -43,6 +43,17 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     },
     Migration { version: 11, name: "Pro offline remote mode: audit source", sql: &[crate::remote::SCHEMA_SOURCE] },
     Migration { version: 12, name: "Pro custom tip addresses", sql: &[crate::tips::domains::SCHEMA] },
+    Migration {
+        version: 13,
+        name: "Pro carry-over link history, Discord perks paused while Pro is off",
+        // The tables it changes, if missing (`IF NOT EXISTS`), so it stands on its own.
+        sql: &[
+            crate::billing::store::SCHEMA,
+            crate::billing::store::SCHEMA_LINKS,
+            crate::discord::SCHEMA,
+            crate::discord::SCHEMA_PAUSED,
+        ],
+    },
 ];
 
 pub(crate) fn latest() -> i64 {
