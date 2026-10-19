@@ -279,6 +279,15 @@ async fn start(State(st): State<AppState>, headers: HeaderMap, RawJson(body): Ra
         .into_response())
 }
 
+fn too_big(part_size: i64) -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too_large",
+        format!("Each part can be up to {} ({} bytes).", human_bytes(part_size as u64), part_size),
+    )
+    .hint("Split the backup into parts of part_size bytes.")
+}
+
 /// `PUT /v1/pro/backups/{id}/parts/{n}`: one part, `application/octet-stream`, numbered
 /// from 0. Sending a part again replaces it.
 async fn put_part(
@@ -287,41 +296,46 @@ async fn put_part(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let ctx = gate_write(&st, &headers).await?;
-    if content_type(&headers) != "application/octet-stream" {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_type",
-            "Backup parts are sent as application/octet-stream.",
-        ));
+    // Every refusal before the body is read drains it first, so the sender gets the answer
+    // instead of a connection reset partway through sending.
+    let checked = async {
+        let ctx = gate_write(&st, &headers).await?;
+        if content_type(&headers) != "application/octet-stream" {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_type",
+                "Backup parts are sent as application/octet-stream.",
+            ));
+        }
+        if !id_ok(&id) {
+            return Err(not_found());
+        }
+        let b = st.db.backup(&ctx.sub_id, &id).map_err(ApiError::db)?.ok_or_else(not_found)?;
+        if b.state != UPLOADING {
+            return Err(ApiError::new(StatusCode::CONFLICT, "already_complete", "That backup is already complete."));
+        }
+        let n: i64 = n.parse().ok().filter(|n| (0..b.parts()).contains(n)).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_part",
+                format!("Parts are numbered 0 to {}.", b.parts() - 1),
+            )
+        })?;
+        let declared =
+            headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+        if declared.is_some_and(|d| d > b.part_size) {
+            return Err(too_big(b.part_size));
+        }
+        Ok((b, n))
     }
-    if !id_ok(&id) {
-        return Err(not_found());
-    }
-    let b = st.db.backup(&ctx.sub_id, &id).map_err(ApiError::db)?.ok_or_else(not_found)?;
-    if b.state != UPLOADING {
-        return Err(ApiError::new(StatusCode::CONFLICT, "already_complete", "That backup is already complete."));
-    }
-    let n: i64 = n.parse().ok().filter(|n| (0..b.parts()).contains(n)).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_part",
-            format!("Parts are numbered 0 to {}.", b.parts() - 1),
-        )
-    })?;
-    let too_big = || {
-        ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_large",
-            format!("Each part can be up to {} ({} bytes).", human_bytes(b.part_size as u64), b.part_size),
-        )
-        .hint("Split the backup into parts of part_size bytes.")
+    .await;
+    let (b, n) = match checked {
+        Ok(v) => v,
+        Err(e) => {
+            crate::blob::drain(body).await;
+            return Err(e);
+        }
     };
-    let declared =
-        headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
-    if declared.is_some_and(|d| d > b.part_size) {
-        return Err(too_big());
-    }
     let blobs = st.blobs()?;
     let key = part_key(&b.sub_id, &b.id, n);
     // Tells a body that broke off (the PC lost its connection) from a disk problem here.
@@ -336,7 +350,7 @@ async fn put_part(
         .boxed();
     let got = match blobs.put_stream(&key, stream, b.part_size as u64).await {
         Ok(got) => i64::try_from(got).unwrap_or(i64::MAX),
-        Err(BlobError::TooLarge(_)) => return Err(too_big()),
+        Err(BlobError::TooLarge(_)) => return Err(too_big(b.part_size)),
         Err(BlobError::Io(_)) if broke.load(std::sync::atomic::Ordering::Relaxed) => {
             return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_part", "The part arrived cut off.")
                 .hint("Send it again."));

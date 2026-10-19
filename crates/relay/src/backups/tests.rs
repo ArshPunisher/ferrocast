@@ -195,7 +195,8 @@ impl World {
                 if e.path().is_dir() {
                     stack.push(e.path());
                 } else {
-                    out.push(e.path().strip_prefix(&root).unwrap().to_string_lossy().into_owned());
+                    // `/` on every OS, so the expected paths read the same on Windows.
+                    out.push(e.path().strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"));
                 }
             }
         }

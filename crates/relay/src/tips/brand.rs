@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 
 use super::Body as JsonBody;
 use crate::billing::gate::require_pro;
-use crate::blob::human_bytes;
+use crate::blob::{drain, drain_stream, human_bytes};
 use crate::db::Db;
 use crate::quota::{Limit, Period};
 use crate::{ApiError, AppState, now_ms};
@@ -642,25 +642,6 @@ async fn read_capped(body: Body, max: u64) -> Result<Vec<u8>, bool> {
         out.extend_from_slice(&chunk);
     }
     Ok(out)
-}
-
-/// Reads and drops what's left of a refused upload (up to 16 MB, 10 s), so the sender gets the
-/// 413 instead of a connection reset partway through sending.
-async fn drain(body: Body) {
-    drain_stream(body.into_data_stream()).await;
-}
-
-async fn drain_stream(mut stream: axum::body::BodyDataStream) {
-    let mut left: usize = 16 * 1024 * 1024;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(Ok(chunk)) = stream.next().await {
-            left = left.saturating_sub(chunk.len());
-            if left == 0 {
-                break;
-            }
-        }
-    })
-    .await;
 }
 
 /// `DELETE /v1/pro/tips/brand/{avatar|banner}`

@@ -78,6 +78,25 @@ pub fn human_bytes(n: u64) -> String {
 }
 
 /// A body to store, read as it arrives.
+/// Reads and drops what's left of a refused upload (up to 16 MB, 10 s), so the sender gets the
+/// 413 instead of a connection reset partway through sending.
+pub(crate) async fn drain(body: axum::body::Body) {
+    drain_stream(body.into_data_stream()).await;
+}
+
+pub(crate) async fn drain_stream(mut stream: axum::body::BodyDataStream) {
+    let mut left: usize = 16 * 1024 * 1024;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            left = left.saturating_sub(chunk.len());
+            if left == 0 {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 pub type Body<'a> = BoxStream<'a, io::Result<Bytes>>;
 
 pub trait BlobStore: Send + Sync + std::fmt::Debug {
