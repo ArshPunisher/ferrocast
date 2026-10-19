@@ -376,17 +376,48 @@ pub(crate) fn pc_offline() -> ApiError {
     )
 }
 
+/// The body, up to `max` bytes; over that, the rest is drained so the 413 gets through.
+async fn read_capped(body: Body, max: usize) -> Result<axum::body::Bytes, ()> {
+    use futures_util::StreamExt;
+    let mut stream = body.into_data_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if out.len() + chunk.len() > max {
+            crate::blob::drain_stream(stream).await;
+            return Err(());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.into())
+}
+
 /// `ANY /r/api/v1/*`.
 pub(crate) async fn api(State(st): State<AppState>, RawQuery(query): RawQuery, req: Request) -> Response {
-    let res = api_inner(&st, query, req).await;
+    let (parts, body) = req.into_parts();
+    let unread = std::sync::Mutex::new(Some(body));
+    let res = api_inner(&st, query, parts, &unread).await;
+    // A refusal before the body was read drains it first, so the phone gets the answer
+    // instead of a connection reset partway through sending.
+    let left = unread.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if res.is_err()
+        && let Some(body) = left
+    {
+        crate::blob::drain(body).await;
+    }
     done(res)
 }
 
-async fn api_inner(st: &AppState, query: Option<String>, req: Request) -> Result<Response, ApiError> {
-    let headers = req.headers().clone();
+async fn api_inner(
+    st: &AppState,
+    query: Option<String>,
+    req: axum::http::request::Parts,
+    unread: &std::sync::Mutex<Option<Body>>,
+) -> Result<Response, ApiError> {
+    let headers = req.headers.clone();
     gate(st, &headers)?;
-    let method = req.method().clone();
-    let path = req.uri().path().strip_prefix("/r/api/v1").unwrap_or("").to_string();
+    let method = req.method.clone();
+    let path = req.uri.path().strip_prefix("/r/api/v1").unwrap_or("").to_string();
     let (device, role) = match bearer(&headers) {
         Some(token) => device_for(st, Some(token))?,
         None => {
@@ -432,7 +463,8 @@ async fn api_inner(st: &AppState, query: Option<String>, req: Request) -> Result
     if declared.is_some_and(|n| n > MAX_BODY as u64) {
         return Err(too_big());
     }
-    let body = axum::body::to_bytes(req.into_body(), MAX_BODY).await.map_err(|_| too_big())?;
+    let body = unread.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let body = read_capped(body, MAX_BODY).await.map_err(|_| too_big())?;
     let Some(tunnel) = st.remote.tunnel(&device.install_id) else {
         return Err(pc_offline());
     };
