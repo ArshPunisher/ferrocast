@@ -128,6 +128,8 @@ pub(crate) fn api() -> Router<AppState> {
         // Pro: tip page branding and goal (the images are in `uploads`)
         .route("/tips/brand", get(tip_pro::brand).put(tip_pro::save_brand).delete(tip_pro::reset_brand))
         .route("/tips/goal", get(tip_pro::goal).put(tip_pro::save_goal).delete(tip_pro::delete_goal))
+        // Pro: the tip page's own address (Cloudflare for SaaS on the relay)
+        .route("/pro/tips/domain", get(tip_pro::domain).put(tip_pro::save_domain).delete(tip_pro::delete_domain))
         // Discord go-live posts
         .route("/discord", get(discord::get).put(discord::save))
         .route("/discord/test", post(discord::test))

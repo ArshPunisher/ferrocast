@@ -117,6 +117,36 @@ pub async fn delete_goal(State(app): State<AppState>) -> ApiResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /pro/tips/domain`: the custom address and its status (404 `not_found` without one).
+pub async fn domain(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.tip_domain().await?))
+}
+
+/// `PUT /pro/tips/domain {hostname}` → 201 with the DNS records to add, 200 when it's the
+/// address the tip page already has, or 409 `domain_taken` with `proof` (the relay's status
+/// and record, passed on).
+pub async fn save_domain(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResult<(StatusCode, Json<Value>)> {
+    if !b["hostname"].is_string() {
+        return Err(
+            ApiError::invalid("Send { hostname }.").hint("For example { \"hostname\": \"tips.yourchannel.com\" }.")
+        );
+    }
+    let (status, v) = app.engine.save_tip_domain(b).await?;
+    // 409 here is `domain_taken` with the TXT record to add (`proof`), in the usual error shape.
+    let status = match status {
+        201 => StatusCode::CREATED,
+        409 => StatusCode::CONFLICT,
+        _ => StatusCode::OK,
+    };
+    Ok((status, Json(v)))
+}
+
+/// `DELETE /pro/tips/domain`
+pub async fn delete_domain(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.delete_tip_domain().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// End to end: dashboard API → engine → a real relay (with a file store).
 #[cfg(test)]
 mod tests {
@@ -140,6 +170,7 @@ mod tests {
         token: String,
         http: reqwest::Client,
         relay: ferrocast_relay::AppState,
+        cf: std::sync::Arc<ferrocast_relay::tips::domains::FakeHostnames>,
         secrets: std::sync::Arc<ferrocast_secrets::MemorySecrets>,
         _keep: (Engine, tempfile::TempDir, tempfile::TempDir),
     }
@@ -157,8 +188,15 @@ mod tests {
             kick_api_url: url.clone(),
         };
         let blobs = ferrocast_relay::blob::FsBlobStore::new(rdir.path().join("blobs")).unwrap();
+        let cf = std::sync::Arc::new(ferrocast_relay::tips::domains::FakeHostnames::new());
         let relay = ferrocast_relay::AppState::new(cfg, ferrocast_relay::Db::open(&rdir.path().join("r.db")).unwrap())
-            .with_blobs(Some(std::sync::Arc::new(blobs)));
+            .with_blobs(Some(std::sync::Arc::new(blobs)))
+            .with_tip_domains(
+                Some(cf.clone() as std::sync::Arc<dyn ferrocast_relay::tips::domains::CustomHostnames>),
+                Some(std::sync::Arc::new(ferrocast_relay::tips::domains::FakeDns::new())),
+                Some(&[7u8; 32]),
+                100,
+            );
         let app = ferrocast_relay::router(relay.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
         if relay_up {
             tokio::spawn(async move { axum::serve(rl, app).await });
@@ -175,6 +213,7 @@ mod tests {
             token: server.sessions.desktop_token().to_string(),
             http: reqwest::Client::new(),
             relay,
+            cf,
             secrets,
             _keep: (engine, dir, rdir),
         }
@@ -270,11 +309,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_own_address_goes_through_to_the_relay() {
+        let w = world(true).await;
+        let host = json!({ "hostname": "tips.mychannel.com" });
+        let (s, v) = w.call(M::GET, "/pro/tips/domain", None).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (402, Some("pro_required")), "{v}");
+        assert_eq!(w.call(M::PUT, "/pro/tips/domain", Some(json!({ "host": 1 }))).await.0, 400);
+        w.make_pro();
+        let (s, v) = w.call(M::PUT, "/pro/tips/domain", Some(host.clone())).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (422, Some("no_tip_page")), "{v}");
+        let tips = json!({ "handle": "novadomain", "display_name": "Nova", "message": "",
+                           "razorpay": { "page_url": "https://razorpay.me/@nova", "secret": "rzp-secret-123" } });
+        assert_eq!(w.call(M::PUT, "/tips", Some(tips)).await.0, 200);
+        let (s, v) = w.call(M::PUT, "/pro/tips/domain", Some(json!({ "hostname": "mychannel.com" }))).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (422, Some("apex_not_supported")), "{v}");
+        assert!(v["error"]["hint"].is_string());
+        let (s, v) = w.call(M::PUT, "/pro/tips/domain", Some(host.clone())).await;
+        assert_eq!(s, 201, "{v}");
+        assert_eq!(v["dns"][0]["type"], "CNAME");
+        assert_eq!(v["proof"]["type"], "TXT");
+        assert_eq!(v["proof"]["name"], "_ferrocast.tips.mychannel.com");
+        assert_eq!(v["status"], "pending");
+        // Finding 11: the same address again is the relay's 200, passed on (not a second 201).
+        let (s, v) = w.call(M::PUT, "/pro/tips/domain", Some(host)).await;
+        assert_eq!((s, v["hostname"].as_str()), (200, Some("tips.mychannel.com")), "{v}");
+        let (s, v) = w.call(M::GET, "/pro/tips/domain", None).await;
+        assert_eq!((s, v["hostname"].as_str()), (200, Some("tips.mychannel.com")));
+        assert_eq!(w.call(M::DELETE, "/pro/tips/domain", None).await.0, 204);
+        // A hostname Cloudflare already has, without this PC's TXT proof: 409 with the record
+        // to add, passed on whole.
+        w.cf.insert("tips.elsewhere.com");
+        let (s, v) = w.call(M::PUT, "/pro/tips/domain", Some(json!({ "hostname": "tips.elsewhere.com" }))).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (409, Some("domain_taken")), "{v}");
+        assert!(v["error"]["hint"].as_str().unwrap().contains("TXT record"), "{v}");
+        assert_eq!(v["proof"]["name"], "_ferrocast.tips.elsewhere.com");
+        assert!(v["proof"]["value"].as_str().unwrap().starts_with("ferrocast-proof-"), "{v}");
+        let (s, v) = w.call(M::GET, "/pro/tips/domain", None).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+    }
+
+    #[tokio::test]
     async fn with_the_relay_down_branding_says_why() {
         let w = world(false).await;
         let (s, v) = w.call(M::GET, "/tips/brand", None).await;
         assert_eq!((s, v["error"]["code"].as_str()), (502, Some("relay_unreachable")), "{v}");
         let (s, _) = w.upload("avatar", "image/png", PNG.to_vec()).await;
         assert_eq!(s, 502);
+        let (s, v) = w.call(M::GET, "/pro/tips/domain", None).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (502, Some("relay_unreachable")), "{v}");
     }
 }

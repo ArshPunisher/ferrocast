@@ -231,6 +231,15 @@ fn code(c: &str) -> &'static str {
         "twitch_unreachable",
         "twitch_rate",
         "connect_again",
+        // The tip page's own address (API.md §9.2).
+        "domains_unavailable",
+        "invalid_hostname",
+        "apex_not_supported",
+        "domain_limit",
+        "domain_taken",
+        "domains_full",
+        "cloudflare_unavailable",
+        "tip_domain_quota",
     ];
     KNOWN.iter().copied().find(|k| *k == c).unwrap_or("relay_error")
 }
@@ -245,6 +254,12 @@ pub(crate) async fn relay_error(res: reqwest::Response) -> EngineError {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
     let v: Value = res.json().await.unwrap_or(Value::Null);
+    relay_error_parts(status.as_u16(), wait, &v)
+}
+
+/// [`relay_error`] from an answer already read: its status, `Retry-After` and body.
+pub(crate) fn relay_error_parts(status: u16, wait: Option<u64>, v: &Value) -> EngineError {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let text = |k: &str| v.pointer(&format!("/error/{k}")).and_then(Value::as_str).unwrap_or("").to_string();
     let message = text("message");
     if status == StatusCode::UNAUTHORIZED {
@@ -292,6 +307,30 @@ impl Engine {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, EngineError> {
+        self.pro_call_status(method, path, body).await.map(|(_, v)| v)
+    }
+
+    /// [`Engine::pro_call`], with the relay's success status (200 or 201) for a caller that
+    /// passes it on.
+    pub(crate) async fn pro_call_status(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), EngineError> {
+        self.pro_call_passing(method, path, body, |_, _| false).await
+    }
+
+    /// [`Engine::pro_call_status`], except that an error answer `pass` accepts comes back as
+    /// `Ok((status, body))` for the caller to pass on whole (a 409 that carries the DNS record
+    /// to add, say). Its code is still checked against the known list.
+    pub(crate) async fn pro_call_passing(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        pass: fn(u16, &Value) -> bool,
+    ) -> Result<(u16, Value), EngineError> {
         let url = self.relay_url()?;
         let auth = self.relay_auth().await.map_err(unreachable)?;
         let mut req = self.relay_http().request(method, format!("{url}{path}")).bearer_auth(auth);
@@ -307,9 +346,22 @@ impl Engine {
             }
         }
         if !res.status().is_success() {
-            return Err(relay_error(res).await);
+            let status = res.status().as_u16();
+            let wait = res
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let v: Value = res.json().await.unwrap_or(Value::Null);
+            if pass(status, &v) && code(v.pointer("/error/code").and_then(Value::as_str).unwrap_or("")) != "relay_error"
+            {
+                return Ok((status, v));
+            }
+            return Err(relay_error_parts(status, wait, &v));
         }
-        res.json().await.map_err(|_| unreachable("it sent an answer Ferrocast can't read"))
+        let status = res.status().as_u16();
+        let v = res.json().await.map_err(|_| unreachable("it sent an answer Ferrocast can't read"))?;
+        Ok((status, v))
     }
 
     /// Pro for this install. Uses the remembered answer when it's recent (unless

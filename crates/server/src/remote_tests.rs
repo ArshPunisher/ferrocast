@@ -442,6 +442,8 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/tips",
         "/tips/brand",
         "/tips/brand/avatar",
+        "/pro/tips/domain",
+        "/pro/tips/domainx",
         "/media",
         "/media/m1",
         "/a/../b",
@@ -555,4 +557,20 @@ async fn a_phone_may_look_at_and_switch_the_cloud_bot_but_never_connect_it() {
     assert!(relay::allowed(relay::Role::Owner, "PUT", "/pro/bot/enabled"));
     assert!(!relay::allowed(relay::Role::Owner, "POST", "/pro/bot/twitch/connect"));
     assert!(!relay::allowed(relay::Role::Mod, "GET", "/pro/bot"));
+}
+
+#[tokio::test]
+async fn a_phone_may_look_at_the_tip_address_but_never_change_it() {
+    let (h, _dir) = handler().await;
+    let (s, v) = ask(&h, "owner", "GET", "/api/v1/pro/tips/domain", "").await;
+    assert_ne!(v["error"]["code"].as_str(), Some("not_allowed_for_role"), "owner GET: {s} {v}");
+    for (role, method) in [("owner", "PUT"), ("owner", "DELETE"), ("mod", "GET"), ("mod", "PUT")] {
+        let (s, v) = ask(&h, role, method, "/api/v1/pro/tips/domain", r#"{"hostname":"tips.x.com"}"#).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{role} {method}");
+    }
+    use ferrocast_relay::remote::scope as relay;
+    assert!(relay::allowed(relay::Role::Owner, "GET", "/pro/tips/domain"));
+    assert!(!relay::allowed(relay::Role::Owner, "PUT", "/pro/tips/domain"));
+    assert!(!relay::allowed(relay::Role::Owner, "DELETE", "/pro/tips/domain"));
+    assert!(!relay::allowed(relay::Role::Mod, "GET", "/pro/tips/domain"));
 }
