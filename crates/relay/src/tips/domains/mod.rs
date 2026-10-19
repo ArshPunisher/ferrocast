@@ -13,8 +13,8 @@
 //! (the relay, the tip host, the remote page, anything under their registrable domains, any
 //! IP, `localhost` or machine name) pass untouched; a live address gets that install's tip
 //! page (`/`), goal page (`/goal`) and images (`/t/a/…`), nothing else; every other host
-//! gets a small "not set up yet" page on every path, and a request without a readable
-//! `Host` gets a plain 400.
+//! gets a small "not set up yet" page on every path, and a `Host` that can't be read gets a
+//! plain 400. A request with no `Host` at all (the container's health check) passes untouched.
 //!
 //! One address per subscription (per install: its tip page), 100 on the relay (Cloudflare's
 //! free allowance: only live addresses and unfinished ones younger than 7 days count), 10
@@ -522,12 +522,12 @@ fn not_set_up() -> Response {
     res
 }
 
-/// A request without a readable `Host`: nothing can be answered for it.
+/// A request whose `Host` can't be read: nothing can be answered for it.
 fn bad_host() -> Response {
     (
         StatusCode::BAD_REQUEST,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "Bad request: the Host header is missing or unreadable. Send the address you're visiting in Host.\n",
+        "Bad request: the Host header can't be read. Send the address you're visiting in Host.\n",
     )
         .into_response()
 }
@@ -543,7 +543,12 @@ pub async fn route_custom_hosts(State(st): State<AppState>, req: Request, next: 
     // HTTP/1.1 sends `Host`; HTTP/2 may send only the `:authority` (the URI's).
     let raw = match req.headers().get(header::HOST) {
         Some(h) => h.to_str().ok().map(str::to_string),
-        None => req.uri().authority().map(|a| a.as_str().to_string()),
+        None => match req.uri().authority() {
+            Some(a) => Some(a.as_str().to_string()),
+            // No Host at all: only something on the server itself sends that (the container's
+            // HTTP/1.0 health check; Cloudflare always sends one), so it's answered as ours.
+            None => return next.run(req).await,
+        },
     };
     let Some(host) = raw.as_deref().and_then(hostname::normalize_host) else {
         return bad_host();

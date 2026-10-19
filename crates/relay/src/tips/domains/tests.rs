@@ -733,15 +733,14 @@ async fn unknown_hosts_fail_closed_and_ours_behave_as_before() {
     }
     let res = w.http.post(format!("{}/v1/installs", w.base)).header("host", "tips.nobody.com").send().await.unwrap();
     assert_eq!(res.status(), 404);
-    // No Host at all, or one that can't be read: a plain 400.
-    for raw in [
-        &b"GET /health HTTP/1.0\r\n\r\n"[..],
-        &b"GET /health HTTP/1.1\r\nHost: \xff\xfe\r\nConnection: close\r\n\r\n"[..],
-    ] {
-        let (s, body) = raw_request(&w.base, raw).await;
-        assert!(s.starts_with("HTTP/1.") && s.contains(" 400"), "{s}");
-        assert!(body.contains("Host"), "{body}");
-    }
+    // No Host at all is the container's own health check (relay.Dockerfile): answered as ours.
+    let (s, body) = raw_request(&w.base, b"GET /health HTTP/1.0\r\n\r\n").await;
+    assert!(s.starts_with("HTTP/1.") && s.contains(" 200"), "{s}");
+    assert!(body.ends_with("ok"), "{body}");
+    // A Host that can't be read: a plain 400.
+    let (s, body) = raw_request(&w.base, b"GET /health HTTP/1.1\r\nHost: \xff\xfe\r\nConnection: close\r\n\r\n").await;
+    assert!(s.starts_with("HTTP/1.") && s.contains(" 400"), "{s}");
+    assert!(body.contains("Host"), "{body}");
 }
 
 async fn raw_request(base: &str, raw: &[u8]) -> (String, String) {

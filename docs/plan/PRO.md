@@ -411,7 +411,7 @@ M0 as built (19 Oct 2026):
   `route_custom_hosts`, a `from_fn_with_state` layer on the whole router, fails closed: Ferrocast's hosts (relay, tip,
   remote and their registrable domains, `*.clearcraftlabs.com`, IPs, single labels, `localhost`; computed once, `OnceLock`
   in `Runtime`, warmed in `main.rs`) pass untouched; a live address gets `/`, `/goal`, `/t/a/*` only; every other host gets
-  "Not set up yet" (404, script-free) on every path; no/unreadable `Host` (HTTP/2 `:authority` used) → plain 400. Host
+  "Not set up yet" (404, script-free) on every path; an unreadable `Host` (HTTP/2 `:authority` used) → plain 400; no `Host` at all (only the container's own HTTP/1.0 health check sends that) is answered as ours. Host
   cache: generation counter (a lookup stores only if no change came in between), addresses 30 s in one bounded map
   (pending evicted before live), unknown hosts 5 s in another. The sweep re-checks every row, live ones too.
   Validation: punycode via `url::Host`, apex by the full PSL (`psl` crate, ICANN + private: `github.io`, `pages.dev`,
