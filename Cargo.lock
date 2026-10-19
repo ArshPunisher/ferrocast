@@ -1736,6 +1736,7 @@ dependencies = [
  "ferrocast-kick",
  "ferrocast-testkit",
  "ferrocast-twitch",
+ "ferrocast-youtube",
  "futures-util",
  "getrandom 0.4.3",
  "hmac 0.12.1",

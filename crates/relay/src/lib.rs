@@ -468,7 +468,7 @@ async fn link_loop(st: AppState, install: String, socket: WebSocket) {
                             let _ = st.db.ack(&install, id);
                         } else if v["type"] == "bot_seen" {
                             // The PC's bot is on: the cloud bot stands by (bot::lease).
-                            bot::desktop_seen(&st, &install, &bot::seen_platforms(&v));
+                            bot::seen_frame(&st, &install, &v);
                         }
                     }
                 }

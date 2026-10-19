@@ -627,11 +627,11 @@ impl World {
     }
 }
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-fn config() -> Value {
+pub(crate) fn config() -> Value {
     json!({
         "bot_on": true,
         "commands": [
@@ -684,7 +684,7 @@ async fn the_view_starts_empty_and_lists_what_this_relay_has() {
     assert_eq!(v["enabled"], false);
     assert_eq!(v["duty"]["who"], "off");
     assert_eq!((v["version"].as_i64(), v["channels"].as_array().map(Vec::len)), (Some(0), Some(0)));
-    assert_eq!(v["available"], json!({ "twitch": true, "kick": false }));
+    assert_eq!(v["available"], json!({ "twitch": true, "kick": false, "youtube": false }));
     assert_eq!(v["limits"]["timers"], 50);
     assert_eq!(v["limits"]["commands"], 500);
     assert_eq!(v["limits"]["messages_per_minute"], 20);
@@ -1076,7 +1076,7 @@ fn chat_note(msg_id: &str, text: &str) -> Value {
     })
 }
 
-async fn eventually(mut f: impl FnMut() -> bool) {
+pub(crate) async fn eventually(mut f: impl FnMut() -> bool) {
     for _ in 0..300 {
         if f() {
             return;
@@ -1317,7 +1317,7 @@ async fn the_lease_is_per_platform_so_the_cloud_covers_what_the_pc_isnt_connecte
         .unwrap();
     // The PC is connected to Twitch only.
     for _ in 0..4 {
-        desktop_seen(&st, "i1", &seen_platforms(&json!({ "type": "bot_seen", "platforms": ["twitch"] })));
+        desktop_seen(&st, "i1", &seen_platforms(&json!({ "type": "bot_seen", "platforms": ["twitch"], "lease": 2 })));
         tokio::time::advance(Duration::from_secs(30)).await;
     }
     assert!(!cloud_on_duty(&st, "sub_1", Platform::Twitch), "the PC answers Twitch");
@@ -1335,7 +1335,8 @@ async fn the_lease_is_per_platform_so_the_cloud_covers_what_the_pc_isnt_connecte
     assert_eq!(seen_platforms(&json!({ "type": "bot_seen" })), PLATFORMS.to_vec());
     desktop_seen(&st, "i1", &seen_platforms(&json!({ "type": "bot_seen" })));
     assert!(!cloud_on_duty(&st, "sub_1", Platform::Kick));
-    assert!(seen_platforms(&json!({ "platforms": ["youtube", 3] })).is_empty());
+    assert_eq!(seen_platforms(&json!({ "platforms": ["youtube", 3] })), vec![Platform::Youtube]);
+    assert!(seen_platforms(&json!({ "platforms": ["tiktok", 3], "lease": 2 })).is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1361,7 +1362,7 @@ async fn link_sends_bot_seen() {
     let mut req = format!("{}/v1/link", w.base.replacen("http", "ws", 1)).into_client_request().unwrap();
     req.headers_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws.send(Message::text(json!({ "type": "bot_seen", "platforms": ["kick"] }).to_string())).await.unwrap();
+    ws.send(Message::text(json!({ "type": "bot_seen", "platforms": ["kick"], "lease": 2 }).to_string())).await.unwrap();
     eventually(|| w.state.bot.lease("sub_1", Platform::Kick, |l| l.seen_at()).is_some()).await;
     assert!(w.state.bot.lease("sub_1", Platform::Twitch, |l| l.seen_at()).is_none(), "only what it named");
     let _ = ws.close(None).await;

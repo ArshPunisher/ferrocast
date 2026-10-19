@@ -115,7 +115,30 @@ async fn main() {
             None
         }
     };
-    let bot_rt = ferrocast_relay::bot::Runtime::from_config(twitch_cloud, &state.cfg);
+    let youtube_cloud = match ferrocast_relay::bot::YoutubeConfig::from_env() {
+        Ok(Some(c)) => {
+            tracing::info!(
+                client_id = %c.client_id, units_per_sub = c.units_per_sub, units = c.units,
+                "the cloud bot for YouTube (beta) is on"
+            );
+            Some(c)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "YOUTUBE_CLOUD_CLIENT_ID / YOUTUBE_CLOUD_CLIENT_SECRET not set: the YouTube cloud bot is off"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "the YouTube cloud bot settings are wrong: it's off");
+            None
+        }
+    };
+    let youtube_api = youtube_cloud
+        .as_ref()
+        .map(|c| Arc::new(ferrocast_relay::bot::HttpYoutube::new(c)) as Arc<dyn ferrocast_relay::bot::YoutubeCloud>);
+    let bot_rt =
+        ferrocast_relay::bot::Runtime::from_config(twitch_cloud, &state.cfg).with_youtube(youtube_cloud, youtube_api);
     let state = state.with_bot(bot_rt);
     let mailer: Option<Arc<dyn ferrocast_relay::mail::Mailer>> = match ferrocast_relay::mail::BrevoMailer::from_env() {
         Some(b) => {

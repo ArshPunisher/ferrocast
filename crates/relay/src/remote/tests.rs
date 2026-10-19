@@ -673,7 +673,7 @@ async fn live_frames_reach_each_phone_by_role() {
     assert_eq!(
         phone_next(&o).await.unwrap()["data"],
         json!({ "pc_online": false, "role": "owner", "cloud": false, "cloud_paused": false,
-                "cloud_moderation": { "twitch": false, "kick": false }, "history": true })
+                "cloud_moderation": { "twitch": false, "kick": false, "youtube": false }, "history": true })
     );
     let mut pc = connect_pc(&w, &pro, PcMode::Echo).await;
     // The PC came: the phone hears it, and the PC is asked for that phone's frames.
@@ -684,7 +684,7 @@ async fn live_frames_reach_each_phone_by_role() {
     assert_eq!(
         phone_next(&m).await.unwrap()["data"],
         json!({ "pc_online": true, "role": "mod", "cloud": false, "cloud_paused": false,
-                "cloud_moderation": { "twitch": false, "kick": false }, "history": false })
+                "cloud_moderation": { "twitch": false, "kick": false, "youtube": false }, "history": false })
     );
     let open_m = pc.next_of("live_open").await;
     assert_eq!(open_m["device_id"], World::device_id(&moder));

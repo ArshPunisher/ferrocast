@@ -7,14 +7,18 @@
 //! Twitch: Ban User / Delete Chat Messages with the bot account's user token
 //! (`moderator:manage:banned_users`, `moderator:manage:chat_messages`; the bot must be a
 //! moderator there, or the streamer's own account). Kick: its moderation API with the
-//! sign-in's `moderation:ban` / `moderation:chat_message:manage`. Every call sits behind the
-//! platform traits (fakes in tests).
+//! sign-in's `moderation:ban` / `moderation:chat_message:manage`. YouTube (M12): the
+//! channel's own sign-in (`youtube.force-ssl`, with the opt-in): `liveChatMessages.delete`
+//! and `liveChatBans.insert` (bans and timeouts need the live chat, so they work while
+//! live), 50 quota units each from the same daily budget as replies. Every call sits behind
+//! the platform traits (fakes in tests).
 
 use axum::http::{HeaderName, StatusCode, header};
 use ferrocast_core::event::Platform;
 
 use super::kick::KickError;
 use super::twitch::{ModTarget, TwitchError};
+use super::youtube::YoutubeError;
 use super::{MESSAGES_PER_MINUTE, SendErr, key, store};
 use crate::quota::{Period, TakeErr};
 use crate::{ApiError, AppState, now_ms};
@@ -39,6 +43,7 @@ pub(crate) fn scope_for(platform: Platform, action: &Action<'_>) -> &'static str
     match (platform, action) {
         (Platform::Kick, Action::Delete { .. }) => "moderation:chat_message:manage",
         (Platform::Kick, _) => "moderation:ban",
+        (Platform::Youtube, _) => super::youtube::FORCE_SSL,
         (_, Action::Delete { .. }) => "moderator:manage:chat_messages",
         (_, _) => "moderator:manage:banned_users",
     }
@@ -134,13 +139,14 @@ fn from_send(platform: Platform, e: SendErr) -> ApiError {
         SendErr::NotReady => super::platform_unavailable(key(platform)),
         SendErr::Refused(m) | SendErr::Dropped(m) => refused(platform, &m),
         SendErr::Unavailable(_) => unreachable(platform),
+        SendErr::Quota(s) => super::youtube::spent_api(s),
     }
 }
 
 /// A ban, timeout or delete in `sub`'s `platform` channel, by the cloud bot.
 pub(crate) async fn run(st: &AppState, sub: &str, platform: Platform, action: Action<'_>) -> Result<(), ApiError> {
     let p = key(platform);
-    if !matches!(platform, Platform::Twitch | Platform::Kick) {
+    if !matches!(platform, Platform::Twitch | Platform::Kick | Platform::Youtube) {
         return Err(not_connected(platform));
     }
     if !st.bot.has(platform) {
@@ -175,6 +181,7 @@ pub(crate) async fn run(st: &AppState, sub: &str, platform: Platform, action: Ac
     }
     match platform {
         Platform::Twitch => twitch(st, &ch, action).await,
+        Platform::Youtube => youtube(st, &ch, action).await,
         _ => kick(st, &ch, action).await,
     }
 }
@@ -330,5 +337,64 @@ async fn kick(st: &AppState, ch: &store::Channel, action: Action<'_>) -> Result<
             Ok(())
         }
         Err(e) => Err(kick_err(&action, e)),
+    }
+}
+
+/// YouTube's ban, timeout or delete: bans need the live chat (only while live); the units
+/// are counted before the call (50 each, the same budget as replies).
+async fn youtube(st: &AppState, ch: &store::Channel, action: Action<'_>) -> Result<(), ApiError> {
+    let p = Platform::Youtube;
+    let api = st.bot.youtube()?;
+    let chat = super::youtube::live_chat(st, &ch.sub_id);
+    if !matches!(action, Action::Delete { .. }) && chat.is_none() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "youtube_not_live",
+            "YouTube bans from the cloud work while you're live.",
+        )
+        .hint("Ban them in YouTube Studio, or once your PC is on."));
+    }
+    let chat = chat.unwrap_or_default();
+    let call = |token: String| {
+        let chat = chat.clone();
+        async move {
+            match action {
+                Action::Delete { message_id } => api.delete_message(&token, message_id).await,
+                Action::Timeout { user_id, seconds, .. } => api.ban(&token, &chat, user_id, Some(seconds)).await,
+                Action::Ban { user_id, .. } => api.ban(&token, &chat, user_id, None).await,
+            }
+        }
+    };
+    // Counted once the sign-in is at hand; a 401 keeps one unit and the retry counts again.
+    let token = super::youtube::access(st, &ch.sub_id).await.map_err(|e| from_send(p, e))?;
+    super::youtube::take_moderation(st, &ch.sub_id)?;
+    let res = match call(token.clone()).await {
+        Err(YoutubeError::Unauthorized) => {
+            super::youtube::refund_401(st, &ch.sub_id, super::youtube::Call::Moderate);
+            st.bot.yt(&ch.sub_id, |m| m.forget_access(&token));
+            let token = super::youtube::access(st, &ch.sub_id).await.map_err(|e| from_send(p, e))?;
+            super::youtube::take_moderation(st, &ch.sub_id)?;
+            call(token).await
+        }
+        r => r,
+    };
+    match res {
+        Ok(()) => Ok(()),
+        Err(YoutubeError::BadRequest(m) | YoutubeError::Forbidden(m))
+            if !matches!(action, Action::Delete { .. }) && already(&m) =>
+        {
+            Ok(())
+        }
+        Err(YoutubeError::Unauthorized) => Err(signed_out(p)),
+        // The channel's own sign-in: a refusal is YouTube's rule, never a missing moderator.
+        Err(YoutubeError::Forbidden(m) | YoutubeError::BadRequest(m)) => Err(refused(p, &m)),
+        Err(YoutubeError::NotFound) => Err(gone(&action)),
+        Err(YoutubeError::ChatEnded) => {
+            Err(ApiError::new(StatusCode::CONFLICT, "youtube_not_live", "Your YouTube live chat has ended.")
+                .hint("Ban them in YouTube Studio instead."))
+        }
+        Err(YoutubeError::Quota) => Err(super::youtube::note_google_quota(st)),
+        Err(YoutubeError::RateLimited { retry_after_s }) => Err(platform_rate(p, retry_after_s)),
+        Err(YoutubeError::Unavailable(_)) => Err(unreachable(p)),
     }
 }

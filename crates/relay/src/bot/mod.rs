@@ -1,5 +1,5 @@
 //! Ferrocast Pro F1, the 24/7 cloud bot (docs/plan/PRO.md F1, milestone M7; API.md §9.7):
-//! Twitch and Kick (YouTube is M12).
+//! Twitch and Kick (M7), YouTube as a beta (M12, `youtube`).
 //!
 //! - The PC pushes its bot config (`PUT /v1/pro/bot/config`, versioned); the cloud answers
 //!   with the same rules as the desktop (`ferrocast_core::cloudbot`).
@@ -16,7 +16,9 @@
 //! Env: `TWITCH_CLOUD_CLIENT_ID`, `TWITCH_CLOUD_CLIENT_SECRET`, `TWITCH_CLOUD_EVENTSUB_SECRET`
 //! (all three, or Twitch is off), `TWITCH_CLOUD_DESKTOP_CLIENT_ID` (the desktop app's public
 //! client id, defaulting to the one this relay was built with); Kick uses the relay's
-//! `KICK_CLIENT_ID` / `KICK_CLIENT_SECRET`.
+//! `KICK_CLIENT_ID` / `KICK_CLIENT_SECRET`; YouTube `YOUTUBE_CLOUD_CLIENT_ID` and
+//! `YOUTUBE_CLOUD_CLIENT_SECRET` (both, or YouTube is off), `YOUTUBE_CLOUD_DESKTOP_CLIENT_ID`,
+//! `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (1,500) and `YOUTUBE_CLOUD_DAILY_UNITS` (9,000).
 
 pub(crate) mod kick;
 mod lease;
@@ -25,11 +27,14 @@ pub(crate) mod store;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod twitch;
+pub(crate) mod youtube;
+#[cfg(test)]
+mod youtube_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -53,6 +58,7 @@ pub use kick::{HttpKick, KickBot, KickError, KickTokens};
 pub use lease::{Lease, TAKEOVER_AFTER, Who};
 pub(crate) use store::SCHEMA;
 pub use twitch::{HttpTwitch, ModTarget, TokenInfo, TwitchCloud, TwitchError, UserTokens};
+pub use youtube::{HttpYoutube, YoutubeCloud, YoutubeConfig, YoutubeError};
 
 use crate::billing::gate::{ProCtx, require_pro};
 use crate::db::Db;
@@ -90,7 +96,7 @@ pub const WORKERS: usize = 16;
 /// Channels whose timers run at once.
 pub const TIMER_CONCURRENCY: usize = 16;
 /// The chat platforms a lease covers (a plain `bot_seen` covers all of them).
-pub const PLATFORMS: [Platform; 2] = [Platform::Twitch, Platform::Kick];
+pub const PLATFORMS: [Platform; 3] = [Platform::Twitch, Platform::Kick, Platform::Youtube];
 
 /// The Twitch "Ferrocast Cloud" app. `Debug` never shows the secrets.
 #[derive(Clone)]
@@ -171,6 +177,8 @@ pub(crate) enum SendErr {
     Dropped(String),
     RateLimited(u64),
     Unavailable(String),
+    /// YouTube's daily units for the cloud bot are spent (whose, until when).
+    Quota(youtube::Spent),
 }
 
 /// One chat line in memory (R-51: never written anywhere). `event` is the line as the
@@ -290,6 +298,13 @@ pub struct Runtime {
     kick_work: Work,
     /// Bad EventSub signatures: (the minute of the last warning, how many since).
     bad_sig: Mutex<(i64, u64)>,
+    youtube_cfg: Option<YoutubeConfig>,
+    pub(crate) youtube: Option<Arc<dyn YoutubeCloud>>,
+    /// Per subscription: YouTube's access token, live chat, reader, cadence (memory only).
+    yt: Mutex<HashMap<String, youtube::YtMem>>,
+    yt_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Google said the project's quota is used up until then (ms, midnight Pacific).
+    pub(crate) yt_google_out: AtomicI64,
 }
 
 impl Default for Runtime {
@@ -331,7 +346,34 @@ impl Runtime {
             twitch_work: Work::default(),
             kick_work: Work::default(),
             bad_sig: Mutex::default(),
+            youtube_cfg: None,
+            youtube: None,
+            yt: Mutex::default(),
+            yt_locks: Mutex::default(),
+            yt_google_out: AtomicI64::new(0),
         }
+    }
+
+    /// YouTube needs its config and its client together (M12).
+    pub fn with_youtube(mut self, cfg: Option<YoutubeConfig>, client: Option<Arc<dyn YoutubeCloud>>) -> Runtime {
+        (self.youtube_cfg, self.youtube) = match (cfg, client) {
+            (Some(c), Some(y)) => (Some(c), Some(y)),
+            _ => (None, None),
+        };
+        if self.youtube_cfg.as_ref().is_some_and(|c| c.desktop_client_id.is_none()) {
+            tracing::warn!(
+                "YOUTUBE_CLOUD_DESKTOP_CLIENT_ID is empty: the cloud bot accepts any app's YouTube token as the PC's"
+            );
+        }
+        self
+    }
+
+    pub(crate) fn youtube_cfg(&self) -> Option<&YoutubeConfig> {
+        self.youtube_cfg.as_ref()
+    }
+
+    pub(crate) fn youtube(&self) -> Result<&dyn YoutubeCloud, ApiError> {
+        self.youtube.as_deref().ok_or_else(|| platform_unavailable("youtube"))
     }
 
     /// The production clients for the relay's settings.
@@ -357,6 +399,7 @@ impl Runtime {
         match platform {
             Platform::Twitch => self.twitch.is_some(),
             Platform::Kick => self.kick.is_some(),
+            Platform::Youtube => self.youtube.is_some(),
             _ => false,
         }
     }
@@ -518,10 +561,14 @@ impl Runtime {
             None => {
                 m.remove(sub);
                 self.forget_twitch_user(sub);
+                self.forget_yt(sub);
             }
             Some(p) => {
                 if p == Platform::Twitch {
                     self.forget_twitch_user(sub);
+                }
+                if p == Platform::Youtube {
+                    self.forget_yt(sub);
                 }
                 if let Some(s) = m.get_mut(sub) {
                     s.brains.remove(&p);
@@ -543,11 +590,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/pro/bot/{platform}", delete(disconnect))
         .route("/v1/bot/twitch/callback", get(twitch::callback))
         .route("/v1/bot/twitch/eventsub", post(twitch::eventsub))
+        .route("/v1/bot/youtube/callback", get(youtube::callback))
 }
 
 /// `features.cloud_bot`: a vault for the sign-ins and at least one platform set up.
 pub(crate) fn available(st: &AppState) -> bool {
-    st.vault().is_ok() && (st.bot.twitch.is_some() || st.bot.kick.is_some())
+    st.vault().is_ok() && (st.bot.twitch.is_some() || st.bot.kick.is_some() || st.bot.youtube.is_some())
 }
 
 /// Its per-subscription counters in `/v1/pro/status` `quotas`: none per day or month (one
@@ -579,6 +627,7 @@ pub(crate) fn pc_code(st: &AppState, install: &str) -> String {
         .twitch_cfg()
         .map(|c| c.client_secret.clone())
         .or_else(|| st.cfg.kick_client_secret.clone())
+        .or_else(|| st.bot.youtube_cfg().map(|c| c.client_secret.clone()))
         .unwrap_or_default();
     let key = derive_key(secret.as_bytes(), "cloud bot pc code v1");
     #[allow(clippy::expect_used)] // HMAC takes a key of any length
@@ -606,6 +655,7 @@ pub(crate) fn platform_unavailable(platform: &str) -> ApiError {
     let name = match platform {
         "twitch" => "Twitch",
         "kick" => "Kick",
+        "youtube" => "YouTube",
         _ => "This platform",
     };
     ApiError::new(
@@ -617,21 +667,16 @@ pub(crate) fn platform_unavailable(platform: &str) -> ApiError {
 }
 
 fn platform_not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "platform_not_found", "The cloud bot runs on Twitch and Kick.")
-        .hint("Use twitch or kick.")
+    ApiError::new(StatusCode::NOT_FOUND, "platform_not_found", "The cloud bot runs on Twitch, Kick and YouTube.")
+        .hint("Use twitch, kick or youtube.")
 }
 
-/// The platform in a path: Twitch or Kick; YouTube comes later (M12).
+/// The platform in a path: Twitch, Kick or YouTube (a beta, M12).
 fn platform_of(raw: &str) -> Result<(Platform, &'static str), ApiError> {
     match raw {
         "twitch" => Ok((Platform::Twitch, "twitch")),
         "kick" => Ok((Platform::Kick, "kick")),
-        "youtube" => Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "platform_unavailable",
-            "The cloud bot for YouTube comes later.",
-        )
-        .hint("The bot on this PC keeps answering YouTube chat.")),
+        "youtube" => Ok((Platform::Youtube, "youtube")),
         _ => Err(platform_not_found()),
     }
 }
@@ -649,6 +694,7 @@ fn platform_from_key(k: &str) -> Option<Platform> {
     match k {
         "twitch" => Some(Platform::Twitch),
         "kick" => Some(Platform::Kick),
+        "youtube" => Some(Platform::Youtube),
         _ => None,
     }
 }
@@ -810,7 +856,7 @@ fn load_config(st: &AppState, sub: &str) -> Option<i64> {
 
 // ── The view ─────────────────────────────────────────────────────────────────────────
 
-fn channel_view(ch: &store::Channel, duty: &str) -> Value {
+fn channel_view(st: &AppState, ch: &store::Channel, duty: &str) -> Value {
     let bound = ch.bot_id.is_some() && ch.channel_id.is_some();
     let state = if bound && ch.blocked() {
         "error"
@@ -828,12 +874,18 @@ fn channel_view(ch: &store::Channel, duty: &str) -> Value {
         e["retry"] = json!(bound && !ch.blocked());
         e
     });
-    json!({
+    let mut v = json!({
         "platform": ch.platform, "state": state,
         "bot": acct(&ch.bot_id, &ch.bot_login), "channel": acct(&ch.channel_id, &ch.channel_login),
         "moderation": ch.moderation, "connected_at": ch.connected_at, "last_reply_at": ch.last_reply_at,
         "error": error, "last_drop": ch.last_drop, "live": ch.live_since.is_some(), "duty": duty,
-    })
+    });
+    if ch.platform == "youtube" {
+        // A beta with a daily budget of YouTube's quota units (M12).
+        v["beta"] = json!(true);
+        v["quota"] = youtube::quota_view(st, &ch.sub_id);
+    }
+    v
 }
 
 /// Who's on duty on one platform now: (`desktop`|`cloud`, since).
@@ -881,7 +933,7 @@ fn view(st: &AppState, sub: &str, install: &str) -> Result<Value, ApiError> {
             }
             _ => "off",
         };
-        views.push(channel_view(ch, duty));
+        views.push(channel_view(st, ch, duty));
     }
     if seen.is_none() {
         seen = PLATFORMS.iter().filter_map(|p| platform_duty(st, sub, *p, now).2).max();
@@ -905,12 +957,14 @@ fn view(st: &AppState, sub: &str, install: &str) -> Result<Value, ApiError> {
         "config_updated_at": row.as_ref().filter(|r| r.version > 0).map(|r| r.updated_at),
         "counts": counts,
         "channels": views,
-        "available": { "twitch": st.bot.has(Platform::Twitch), "kick": st.bot.has(Platform::Kick) },
+        "available": { "twitch": st.bot.has(Platform::Twitch), "kick": st.bot.has(Platform::Kick),
+                       "youtube": st.bot.has(Platform::Youtube) },
         "pc_code": pc_code(st, install),
         "limits": {
             "commands": cloudbot::MAX_COMMANDS, "timers": cloudbot::MAX_TIMERS,
             "config_bytes": cloudbot::MAX_CONFIG_BYTES, "messages_per_minute": MESSAGES_PER_MINUTE,
             "channels_per_platform": 1, "takeover_after_s": TAKEOVER_AFTER.as_secs(),
+            "youtube_daily_units": st.bot.youtube_cfg().map(|c| c.units_per_sub),
         },
     }))
 }
@@ -1018,7 +1072,7 @@ async fn set_enabled(st: &AppState, ctx: &ProCtx, enabled: bool) -> Result<Value
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "no_platform",
-                "Connect Twitch or Kick for the cloud bot first.",
+                "Connect Twitch, Kick or YouTube for the cloud bot first.",
             )
             .hint("Press Connect next to a platform below."));
         }
@@ -1039,6 +1093,8 @@ async fn set_enabled(st: &AppState, ctx: &ProCtx, enabled: bool) -> Result<Value
         }
     }
     if !b.enabled {
+        // YouTube is never asked anything while it's off.
+        st.bot.yt(&ctx.sub_id, youtube::YtMem::stop);
         // Nothing of the chat is kept while it's off.
         for p in PLATFORMS {
             st.bot.mem(&ctx.sub_id, |m| {
@@ -1067,16 +1123,17 @@ pub(crate) struct CloudState {
 pub(crate) struct ModCaps {
     pub twitch: bool,
     pub kick: bool,
+    pub youtube: bool,
 }
 
 impl ModCaps {
     /// Bans work on at least one platform.
     pub(crate) fn any(self) -> bool {
-        self.twitch || self.kick
+        self.twitch || self.kick || self.youtube
     }
 
     pub(crate) fn json(self) -> Value {
-        json!({ "twitch": self.twitch, "kick": self.kick })
+        json!({ "twitch": self.twitch, "kick": self.kick, "youtube": self.youtube })
     }
 }
 
@@ -1085,6 +1142,7 @@ pub(crate) fn can_moderate(c: &store::Channel, platform: Platform) -> bool {
     let needed: &[&str] = match platform {
         Platform::Twitch => twitch::MOD_SCOPES,
         Platform::Kick => kick::MOD_SCOPES,
+        Platform::Youtube => youtube::MOD_SCOPES,
         _ => return false,
     };
     c.moderation && needed.iter().all(|n| c.scopes.split_whitespace().any(|s| s == *n))
@@ -1107,7 +1165,11 @@ pub(crate) fn cloud_state(st: &AppState, sub: &str) -> CloudState {
     CloudState {
         on,
         paused: ready && !enabled,
-        moderation: ModCaps { twitch: can(Platform::Twitch), kick: can(Platform::Kick) },
+        moderation: ModCaps {
+            twitch: can(Platform::Twitch),
+            kick: can(Platform::Kick),
+            youtube: can(Platform::Youtube),
+        },
     }
 }
 
@@ -1126,15 +1188,19 @@ pub(crate) fn recent_events(st: &AppState, sub: &str, limit: usize) -> Vec<Arc<E
 struct ConnectIn {
     account: Option<String>,
     moderation: bool,
-    /// The PC's own desktop-app Twitch token (Twitch only): proves whose channel it is. Only
-    /// checked with Twitch, never kept or logged.
+    /// The PC's own desktop-app Twitch or YouTube token: proves whose channel it is. Only
+    /// checked with the platform, never kept or logged.
     owner_token: Option<String>,
     /// Try a connected channel's retryable error again (re-subscribes) instead of signing in.
     retry: bool,
 }
 
 fn already_connected(platform: &str) -> ApiError {
-    let name = if platform == "twitch" { "Twitch" } else { "Kick" };
+    let name = match platform {
+        "twitch" => "Twitch",
+        "youtube" => "YouTube",
+        _ => "Kick",
+    };
     ApiError::new(StatusCode::CONFLICT, "already_connected", format!("{name} is already connected for the cloud bot."))
         .hint("Disconnect it first to use another account.")
 }
@@ -1151,7 +1217,7 @@ async fn connect(
     let (_, p) = platform_of(&platform)?;
     let b: ConnectIn = json_body(&headers, &body, false)?;
     // Not set up here first (the more useful answer), then the vault for the sign-ins.
-    if !st.bot.has(if p == "twitch" { Platform::Twitch } else { Platform::Kick }) {
+    if !st.bot.has(platform_from_key(p).unwrap_or(Platform::Kick)) {
         return Err(platform_unavailable(p));
     }
     st.vault()?;
@@ -1192,6 +1258,19 @@ async fn connect(
             // Both steps are tied to the Twitch account this PC is signed in to.
             let (owner_id, owner_login) = twitch::owner_of(&st, cfg, b.owner_token.as_deref()).await?;
             twitch::auth_url(&st, cfg, step, &ctx.install, (&owner_id, &owner_login), now)?
+        }
+        "youtube" => {
+            let cfg = st.bot.youtube_cfg().ok_or_else(|| platform_unavailable("youtube"))?;
+            // One step, the channel itself; again only to add the moderation opt-in.
+            if existing.as_ref().is_some_and(|c| c.bot_id.is_some() && !(b.moderation && !c.moderation)) {
+                return Err(already_connected(p));
+            }
+            if b.account.as_deref().is_some_and(|a| a != "bot" && a != "channel") {
+                return Err(invalid("account: YouTube has one step, your channel."));
+            }
+            // Tied to the channel this PC is signed in to.
+            let owner = youtube::owner_of(&st, cfg, b.owner_token.as_deref()).await?;
+            youtube::auth_url(&st, cfg, b.moderation, &ctx.install, &owner, now)?
         }
         _ => {
             st.bot.kick()?;
@@ -1238,13 +1317,18 @@ async fn retry(
         // The outcome is on the channel (cleared, or the new error with its hint).
         let _ = twitch::subscribe_channel(st, &ch).await;
         twitch::reconcile_live(st, &ch).await;
+    } else if p == "youtube" {
+        // Looked at again on the next pass (if the budget allows).
+        st.db.bot_clear_transient_error(&ch.sub_id, p).map_err(ApiError::db)?;
+        st.bot.yt(&ch.sub_id, |m| m.retry_now());
     } else {
         st.db.bot_clear_transient_error(&ch.sub_id, p).map_err(ApiError::db)?;
     }
     Ok(no_store(view(st, &ctx.sub_id, &ctx.install)?))
 }
 
-/// Revokes a platform's sign-ins there, deletes Twitch's subscriptions and the rows.
+/// Revokes a platform's sign-ins there, deletes Twitch's subscriptions and the rows (a
+/// Disconnect, the lapse sweep).
 pub(crate) async fn disconnect_platform(st: &AppState, sub: &str, platform: Platform) {
     let p = key(platform);
     if let Ok(Some(ch)) = st.db.bot_channel(sub, p) {
@@ -1256,9 +1340,17 @@ pub(crate) async fn disconnect_platform(st: &AppState, sub: &str, platform: Plat
                 }
             }
             Platform::Kick => kick::revoke_stored(st, sub).await,
+            Platform::Youtube => youtube::revoke_stored(st, sub).await,
             _ => {}
         }
     }
+    forget_platform(st, sub, platform);
+}
+
+/// Deletes a platform's rows and memory without revoking anything (YouTube: a binding whose
+/// Google grant is the same as a newer sign-in for that channel, which a revoke would end).
+pub(crate) fn forget_platform(st: &AppState, sub: &str, platform: Platform) {
+    let p = key(platform);
     if let Err(e) = st.db.bot_forget_channel(sub, p) {
         tracing::warn!(error = %e, "couldn't forget a cloud bot channel");
     }
@@ -1285,16 +1377,36 @@ async fn disconnect(
 
 // ── The lease from the link ──────────────────────────────────────────────────────────
 
-/// The platforms a `bot_seen` frame names: `{platforms: ["twitch", …]}` → those (the chat
-/// platforms that PC is connected to); without the field, all of them (older PCs).
+/// The `bot_seen` lease version a PC that names YouTube sends (`"lease": 2`, M12).
+pub const LEASE_VERSION: i64 = 2;
+
+/// The platforms a `bot_seen` frame names: `{platforms: ["twitch", …], lease: 2}` → those
+/// (the chat platforms that PC is connected to); without `platforms`, all of them (older
+/// PCs); with `platforms` but no `lease` (a PC from before M12, which never names YouTube
+/// although it may answer there), those plus YouTube.
 pub(crate) fn seen_platforms(frame: &Value) -> Vec<Platform> {
     match frame.get("platforms").and_then(Value::as_array) {
         Some(list) => {
             let mut out: Vec<Platform> = list.iter().filter_map(Value::as_str).filter_map(platform_from_key).collect();
+            if frame.get("lease").and_then(Value::as_i64).is_none_or(|v| v < LEASE_VERSION) {
+                out.push(Platform::Youtube);
+            }
+            out.sort_by_key(|p| PLATFORMS.iter().position(|q| q == p));
             out.dedup();
             out
         }
         None => PLATFORMS.to_vec(),
+    }
+}
+
+/// A `bot_seen` frame from `install`'s link: the lease for the platforms it names, and
+/// whether its YouTube was live (`youtube_live`), which sets how soon the cloud looks.
+pub(crate) fn seen_frame(st: &AppState, install: &str, frame: &Value) {
+    desktop_seen(st, install, &seen_platforms(frame));
+    if let Some(live) = frame.get("youtube_live").and_then(Value::as_bool)
+        && let Ok(Some(s)) = st.db.pro_sub_for_install(install)
+    {
+        youtube::hint(st, &s.id, live);
     }
 }
 
@@ -1321,6 +1433,10 @@ pub(crate) fn desktop_seen(st: &AppState, install: &str, platforms: &[Platform])
 pub(crate) fn set_live(st: &AppState, sub: &str, platform: Platform, at: Option<i64>) {
     if let Err(e) = st.db.bot_set_live(sub, key(platform), at) {
         tracing::warn!(error = %e, "couldn't record a channel going live or offline");
+    }
+    // Live on Twitch or Kick: likely live on YouTube too, so the cloud looks now (free).
+    if at.is_some() && platform != Platform::Youtube {
+        youtube::wake(st, sub);
     }
 }
 
@@ -1481,6 +1597,7 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
     let sent = match platform {
         Platform::Twitch => twitch::send(st, ch, text, reply_to).await,
         Platform::Kick => kick::send(st, ch, text, reply_to).await,
+        Platform::Youtube => youtube::send(st, ch, text).await,
         _ => Err(SendErr::NotReady),
     };
     let now = now_ms();
@@ -1524,6 +1641,13 @@ async fn say(st: &AppState, ch: &store::Channel, platform: Platform, text: &str,
             let _ = st.db.bot_set_drop(&ch.sub_id, p, &json!({ "reason": reason, "at": now }));
             false
         }
+        Err(SendErr::Quota(s)) => {
+            // Shown once (the channel keeps it until the reset, or a reply goes out).
+            if ch.error_code() != Some("youtube_quota") {
+                let _ = st.db.bot_set_error(&ch.sub_id, p, Some(&youtube::spent_error(s)));
+            }
+            false
+        }
         Err(SendErr::NotReady) => false,
         Err(SendErr::Unavailable(m)) => {
             tracing::debug!(platform = p, why = %m, "couldn't send a cloud bot message");
@@ -1550,6 +1674,11 @@ async fn timers_for(st: &AppState, ch: &store::Channel, platform: Platform, sinc
         }
     });
     for text in due {
+        // YouTube: at most one timer post per `timer_gap` (each is 50 units); the rest wait
+        // for their next turn.
+        if platform == Platform::Youtube && !youtube::timer_slot(st, &ch.sub_id) {
+            break;
+        }
         say(st, ch, platform, &text, None).await;
     }
 }
@@ -1590,8 +1719,12 @@ pub(crate) async fn timer_tick(st: &AppState) {
     while tasks.join_next().await.is_some() {}
 }
 
-/// The timer loop (spawned in `main.rs`).
+/// The timer loop (spawned in `main.rs`); YouTube's live checks run in a loop of their own
+/// so a slow Google call never holds up a Twitch or Kick timer.
 pub async fn run(st: AppState) {
+    if st.bot.youtube.is_some() {
+        tokio::spawn(youtube::run(st.clone()));
+    }
     loop {
         tokio::time::sleep(TIMER_TICK).await;
         timer_tick(&st).await;
@@ -1627,6 +1760,9 @@ pub async fn sweep(st: &AppState) {
     for ch in &all {
         if ch.platform == "twitch" && ch.bot_id.is_some() && !ch.blocked() {
             twitch::check_signins(st, ch).await;
+        }
+        if ch.platform == "youtube" && ch.bot_id.is_some() && !ch.blocked() {
+            youtube::check_signin(st, ch).await;
         }
     }
     for ch in st.db.bot_all_channels().unwrap_or_default() {

@@ -133,19 +133,25 @@ fn platform(raw: &str) -> Result<Platform, ApiError> {
     match raw {
         "twitch" => Ok(Platform::Twitch),
         "kick" => Ok(Platform::Kick),
-        "youtube" => Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "cloud_platform",
-            "The cloud bot doesn't moderate YouTube yet.",
-        )
-        .hint("Do this once your PC is on.")),
-        _ => Err(invalid("platform: twitch or kick.")),
+        "youtube" => Ok(Platform::Youtube),
+        _ => Err(invalid("platform: twitch, kick or youtube.")),
     }
 }
 
 /// A platform id (a user or a message): letters, digits, `-` and `_`, at most `max`.
 fn id_ok(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// A platform's message id: YouTube's have dots (`LCC.…`) and can be longer.
+fn message_id_ok(p: Platform, s: &str) -> bool {
+    if p == Platform::Youtube {
+        !s.is_empty()
+            && s.len() <= 256
+            && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+    } else {
+        id_ok(s, 128)
+    }
 }
 
 /// A reason as passed on: control and direction characters out, at most 500 characters.
@@ -213,7 +219,7 @@ async fn moderation(
                 )
                 .hint("Send the message's source_id. A line without one can't be deleted."));
             }
-            if !id_ok(message_id, 128) {
+            if !message_id_ok(p, message_id) {
                 return Err(invalid("message_id: the platform's message id."));
             }
             moderate::run(st, sub, p, Action::Delete { message_id }).await?;
@@ -287,7 +293,11 @@ async fn moderation(
 }
 
 fn key(p: Platform) -> &'static str {
-    if p == Platform::Kick { "kick" } else { "twitch" }
+    match p {
+        Platform::Kick => "kick",
+        Platform::Youtube => "youtube",
+        _ => "twitch",
+    }
 }
 
 /// A ban or timeout the cloud bot made for a phone.

@@ -202,7 +202,7 @@ fn ids_platforms_and_reasons_are_checked() {
     assert!(!offline::tests_id_ok(&"9".repeat(65), 64));
     assert_eq!(offline::tests_platform("twitch"), Ok(Platform::Twitch));
     assert_eq!(offline::tests_platform("kick"), Ok(Platform::Kick));
-    assert_eq!(offline::tests_platform("youtube"), Err(422));
+    assert_eq!(offline::tests_platform("youtube"), Ok(Platform::Youtube));
     assert_eq!(offline::tests_platform("tiktok"), Err(400));
     assert_eq!(offline::tests_reason("  spam\u{202e}links\n "), Some("spamlinks".into()));
     assert_eq!(offline::tests_reason("   "), None);
@@ -492,8 +492,8 @@ async fn bad_bodies_and_missing_channels_say_what_is_wrong() {
         (
             "/r/api/v1/mod/timeout",
             json!({ "platform": "youtube", "user_id": "1", "seconds": 60 }),
-            422,
-            "cloud_platform",
+            503,
+            "platform_unavailable",
         ),
         ("/r/api/v1/mod/ban", json!({ "user": { "platform": "tiktok", "user_id": "1" } }), 400, "invalid"),
         ("/r/api/v1/mod/ban", json!({ "user": { "platform": "kick", "user_id": "1" } }), 422, "cloud_not_connected"),
@@ -643,7 +643,7 @@ async fn the_capability_and_the_words_follow_role_and_opt_in() {
     // Connected without the opt-in: chat only.
     w.twitch_ready("s1", "i1", false);
     let me = w.get("/r/v1/me", &moder).await;
-    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": false, "kick": false }));
+    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": false, "kick": false, "youtube": false }));
     assert_eq!(
         (me.json["history"].clone(), w.get("/r/v1/me", &owner).await.json["history"].clone()),
         (json!(false), json!(true))
@@ -653,7 +653,7 @@ async fn the_capability_and_the_words_follow_role_and_opt_in() {
     // With it: bans too.
     w.twitch_ready("s1", "i1", true);
     let me = w.get("/r/v1/me", &moder).await;
-    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": true, "kick": false }));
+    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": true, "kick": false, "youtube": false }));
     assert_eq!(w.get("/r/api/v1/status", &moder).await.message(), "Your PC is off. Chat and bans still work.");
     assert_eq!(w.get("/r/api/v1/status", &owner).await.message(), "Your PC is off. Chat, bans and history still work.");
     // A partial grant (bans but not deletes) isn't "can moderate".
@@ -662,7 +662,7 @@ async fn the_capability_and_the_words_follow_role_and_opt_in() {
     // Switched off: nothing works on the cloud's side.
     w.db.bot_set_enabled("s1", false, now_ms()).unwrap();
     let me = w.get("/r/v1/me", &owner).await;
-    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": false, "kick": false }));
+    assert_eq!(me.json["cloud_moderation"], json!({ "twitch": false, "kick": false, "youtube": false }));
     assert_eq!(w.get("/r/api/v1/status", &owner).await.message(), PLAIN);
 }
 
@@ -860,7 +860,7 @@ async fn the_live_socket_streams_cloud_chat_while_the_pc_is_off_and_hands_over()
         let f = next(p).await;
         assert_eq!(f["type"], "remote");
         assert_eq!((f["data"]["pc_online"].clone(), f["data"]["cloud"].clone()), (json!(false), json!(true)));
-        assert_eq!(f["data"]["cloud_moderation"], json!({ "twitch": true, "kick": false }));
+        assert_eq!(f["data"]["cloud_moderation"], json!({ "twitch": true, "kick": false, "youtube": false }));
         // Fetch the cloud's chat now (a line may have come while the socket opened).
         assert_eq!(next(p).await["type"], "resync");
     }

@@ -17,6 +17,7 @@ path = "src/main.rs"
 ferrocast-core.workspace = true
 ferrocast-twitch.workspace = true
 ferrocast-kick.workspace = true
+ferrocast-youtube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
