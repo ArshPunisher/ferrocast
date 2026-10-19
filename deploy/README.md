@@ -30,7 +30,7 @@ summary says what went live, or that the previous version was put back.
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
-| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app, custom tip addresses' Cloudflare token and zone) with typing hidden, never showing them (below) |
+| `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app and Google client, custom tip addresses' Cloudflare token and zone) with typing hidden, never showing them (below) |
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 
 ## One-time setup for GitHub deploys
@@ -186,7 +186,7 @@ each subscription's day; past the budget (or when Brevo says its limit is reache
 wait for the next day, up to 2 days late, and confirm emails answer "Try again tomorrow."
 Watch the count before many subscriptions (a paid plan or a second sender is a follow-up).
 
-## Ferrocast Pro: the 24/7 cloud bot (Twitch and Kick)
+## Ferrocast Pro: the 24/7 cloud bot (Twitch, Kick and YouTube)
 
 **Twitch** needs a second app, separate from the desktop's public one. At
 [dev.twitch.tv/console](https://dev.twitch.tv/console) → Applications → Register Your Application:
@@ -216,6 +216,50 @@ With the vault key and Twitch's three (or Kick's app) set, `features.cloud_bot` 
 the Bot page shows "Keep the bot on when this PC is off". Missing or partial, the relay logs
 which and that platform stays off; the bot on the PC keeps working. `deploy-relay.sh` keeps the
 lines when it rewrites `relay.env`.
+
+### YouTube (beta, M12)
+
+YouTube needs its own Google OAuth client, separate from the desktop app's ("Desktop app"
+type, public). Use the same Google Cloud project as the desktop app only if you accept that
+both share its 10,000 units a day; a **separate project** ("Ferrocast Cloud") gives the cloud
+bot its own 10,000 and is recommended. In [console.cloud.google.com](https://console.cloud.google.com):
+
+1. Create (or pick) the project, then APIs & Services → Library → enable **YouTube Data API v3**.
+2. APIs & Services → **OAuth consent screen** (Google Auth Platform → Branding / Audience /
+   Data access): app name `Ferrocast Cloud`, support email, the app home page
+   `https://ferrocast.clearcraftlabs.com`, privacy policy and terms links, authorised domain
+   `clearcraftlabs.com`. User type **External**. Under Data access add exactly one scope:
+   `https://www.googleapis.com/auth/youtube.force-ssl` (reading, posting and moderating live
+   chat all need it; `youtube.readonly` adds nothing, so it isn't asked).
+3. Credentials → Create credentials → **OAuth client ID** → type **Web application**, name
+   `Ferrocast Cloud`, Authorised redirect URI
+   `https://ferrocast-relay.clearcraftlabs.com/v1/bot/youtube/callback` (no JavaScript origins).
+   Copy the Client ID (`…apps.googleusercontent.com`) and the Client secret (`GOCSPX-…`).
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --youtube'
+```
+
+**Verification.** `youtube.force-ssl` is a *sensitive* scope. While the consent screen is in
+**Testing**, only the test users you list (at most **100** Google accounts) can sign in, they
+see an "unverified app" warning, and their sign-ins **expire after 7 days** (the cloud bot then
+shows "Google signed the cloud bot out of YouTube"). For everyone, press **Publish app** and
+submit it for Google's verification (a privacy policy that lists what the relay keeps, a demo
+video of the sign-in and the scope in use, domain ownership in Search Console); it is not a
+restricted scope, so no paid security assessment. Separately, the 10,000 units a day can be
+raised with the **YouTube API Services audit and quota extension** form once the beta is used.
+
+Budget: `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (default 1,500) and `YOUTUBE_CLOUD_DAILY_UNITS`
+(default 9,000, under Google's 10,000 so the relay's own checks keep a margin), counted per
+Pacific day (YouTube's quota resets at midnight Pacific time); set them by hand in
+`relay.env` only after a quota increase. `YOUTUBE_CLOUD_DESKTOP_CLIENT_ID` defaults to the
+official desktop app's public client id (the PC proves its channel with a token of that app).
+`YOUTUBE_CLOUD_TIMER_GAP_MIN` (default 15, 0 = off) spaces cloud timer posts on YouTube; of
+each budget, replies, timers and moderation leave a reserve for reading (300 a subscription,
+10% relay-wide) and live checks are capped (150 a subscription, 30% relay-wide).
+Both id and secret, plus `RELAY_VAULT_KEY`, or YouTube stays off (`available.youtube` false).
+The relay calls `oauth2.googleapis.com`, `www.googleapis.com` and the gRPC
+`youtube.googleapis.com:443` (outbound HTTPS).
 
 ## Ferrocast Pro: custom tip addresses (Cloudflare for SaaS)
 

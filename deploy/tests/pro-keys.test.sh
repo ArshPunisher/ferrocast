@@ -148,6 +148,32 @@ run "$cf_token\n\n" --domains
 is "the token alone works" "$code" 0
 has "warns addresses stay off" "$out" "stay off until both are set"
 
+# The cloud bot's Google client (made-up values in the right shape, built in pieces so nothing
+# here looks like a real client or secret).
+yt_id="4815162342-$(printf 'q7w8e9r0%.0s' {1..4}).apps.$(printf 'google')usercontent.com"
+yt_secret="GOC$(printf 'SPX')-$(printf 'Zz9_%.0s' {1..7})"
+fresh_relay
+run "not-a-google-client\nnope\nstill-no\n" --youtube
+is "a bad Google client id is refused" "$code" 1
+has "says what the id should look like" "$out" "apps.googleusercontent.com"
+is "nothing saved for YouTube" "$(v YOUTUBE_CLOUD_CLIENT_ID)" ""
+run "$yt_id\nshort\nAIza-not-it\nGOCSPX-x\n" --youtube
+is "a bad Google secret is refused" "$code" 1
+is "the id isn't saved either (all or nothing)" "$(v YOUTUBE_CLOUD_CLIENT_ID)" ""
+run "$yt_id\n$yt_secret\n" --youtube
+is "--youtube saves both" "$code" 0
+is "google client id saved" "$(v YOUTUBE_CLOUD_CLIENT_ID)" "$yt_id"
+is "google client secret saved" "$(v YOUTUBE_CLOUD_CLIENT_SECRET)" "$yt_secret"
+hasnt "never prints the Google secret" "$out" "$yt_secret"
+is "only the Google keys are asked" "$(grep -c '^TWITCH_CLOUD_CLIENT_ID=' "$tmp/relay/relay.env")" 0
+run "" --status
+has "status lists the Google client" "$out" "YOUTUBE_CLOUD_CLIENT_SECRET: *set"
+hasnt "status hides the Google secret" "$out" "$yt_secret"
+fresh_relay
+run "$yt_id\n\n" --youtube
+is "the id alone works" "$code" 0
+has "warns YouTube stays off" "$out" "cloud bot on YouTube"
+
 fresh_relay
 run "x\n" --nope
 is "unknown option fails" "$code" 1

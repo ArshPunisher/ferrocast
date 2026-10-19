@@ -8,6 +8,7 @@
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --discord'  the Discord bot only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --mail'     the weekly email only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --twitch'   the cloud bot's Twitch app only
+#   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --youtube'  the cloud bot's Google client only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --domains'  custom tip addresses only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   set or missing
 #
@@ -28,6 +29,10 @@
 #   TWITCH_CLOUD_CLIENT_SECRET  same page → New Secret (a Confidential client)
 #   TWITCH_CLOUD_EVENTSUB_SECRET  made by you: `openssl rand -hex 32` (10 to 100 characters;
 #                          signs EventSub's webhooks to the relay, never sent anywhere else)
+#   YOUTUBE_CLOUD_CLIENT_ID     console.cloud.google.com → APIs & Services → Credentials → OAuth
+#                          client "Ferrocast Cloud" (type Web application) → Client ID
+#                          (…apps.googleusercontent.com); see deploy/README.md
+#   YOUTUBE_CLOUD_CLIENT_SECRET same client → Client secret (starts GOCSPX-)
 #   CF_SAAS_TOKEN          dash.cloudflare.com → My Profile → API Tokens → Create Token (Custom):
 #                          Zone → SSL and Certificates → Edit, on clearcraftlabs.com only (it
 #                          covers custom hostnames; see deploy/README.md)
@@ -161,6 +166,7 @@ DISCORD_KEYS=(DISCORD_APP_ID DISCORD_PUBLIC_KEY DISCORD_CLIENT_SECRET DISCORD_BO
 MAIL_KEYS=(BREVO_API_KEY)
 TWITCH_KEYS=(TWITCH_CLOUD_CLIENT_ID TWITCH_CLOUD_CLIENT_SECRET TWITCH_CLOUD_EVENTSUB_SECRET)
 DOMAIN_KEYS=(CF_SAAS_TOKEN CF_ZONE_ID)
+YOUTUBE_KEYS=(YOUTUBE_CLOUD_CLIENT_ID YOUTUBE_CLOUD_CLIENT_SECRET)
 pattern() {
   case "$1" in
     GOOGLE_TTS_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
@@ -177,6 +183,10 @@ pattern() {
     # Cloudflare API tokens: 40 or more letters, digits, - or _ (newer ones are longer).
     CF_SAAS_TOKEN) echo '^[A-Za-z0-9_-]{40,128}$' ;;
     CF_ZONE_ID) echo '^[0-9a-f]{32}$' ;;
+    # Google OAuth clients: <project number>-<32 letters and digits>.apps.googleusercontent.com;
+    # secrets GOCSPX- and 28 more (older ones 24 characters).
+    YOUTUBE_CLOUD_CLIENT_ID) echo '^[0-9]{6,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com$' ;;
+    YOUTUBE_CLOUD_CLIENT_SECRET) echo '^(GOCSPX-[A-Za-z0-9_-]{28}|[A-Za-z0-9_-]{24})$' ;;
   esac
 }
 what() {
@@ -192,6 +202,8 @@ what() {
     TWITCH_CLOUD_EVENTSUB_SECRET) echo "10 to 100 letters, digits, - or _ (openssl rand -hex 32)" ;;
     CF_SAAS_TOKEN) echo "a Cloudflare API token, 40 or more characters, not the Global API Key" ;;
     CF_ZONE_ID) echo "clearcraftlabs.com's Zone ID, 32 lowercase hex characters" ;;
+    YOUTUBE_CLOUD_CLIENT_ID) echo "the Ferrocast Cloud Google client's ID, ending .apps.googleusercontent.com" ;;
+    YOUTUBE_CLOUD_CLIENT_SECRET) echo "the Ferrocast Cloud Google client's secret, starting GOCSPX-" ;;
   esac
 }
 status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi; }
@@ -199,7 +211,7 @@ status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi;
 keys=()
 case "${1:-}" in
   --status)
-    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}"; do printf '%-22s %s\n' "$k:" "$(status_of "$k")"; done
+    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}"; do printf '%-22s %s\n' "$k:" "$(status_of "$k")"; done
     exit 0
     ;;
   --tts) keys=("${TTS_KEYS[@]}") ;;
@@ -207,8 +219,9 @@ case "${1:-}" in
   --mail) keys=("${MAIL_KEYS[@]}") ;;
   --twitch) keys=("${TWITCH_KEYS[@]}") ;;
   --domains) keys=("${DOMAIN_KEYS[@]}") ;;
-  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}") ;;
-  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains or --status." ;;
+  --youtube) keys=("${YOUTUBE_KEYS[@]}") ;;
+  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}") ;;
+  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains, --youtube or --status." ;;
 esac
 
 names=()
@@ -250,6 +263,11 @@ missing=()
 for k in "${DOMAIN_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
 if ((${#missing[@]} > 0 && ${#missing[@]} < ${#DOMAIN_KEYS[@]})); then
   echo "Still missing for custom tip addresses: ${missing[*]}. They stay off until both are set."
+fi
+missing=()
+for k in "${YOUTUBE_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
+if ((${#missing[@]} > 0 && ${#missing[@]} < ${#YOUTUBE_KEYS[@]})); then
+  echo "Still missing for the cloud bot on YouTube: ${missing[*]}. It stays off until both are set."
 fi
 echo "Restarting the relay so it reads them…"
 restart || put_back "$BACKUP" "The relay didn't come back healthy with the new keys."
