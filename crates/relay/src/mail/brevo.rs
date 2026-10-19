@@ -106,8 +106,8 @@ impl BrevoMailer {
     }
 }
 
-/// What Brevo's error answer means for the relay. `message` is only looked at, never kept
-/// (it can quote the address).
+/// What Brevo's error answer means for the relay. `message` is kept only for our own setup
+/// errors, with addresses blanked out (it can quote one); never for the recipient's.
 pub(crate) fn classify(status: u16, code: &str, message: &str) -> MailError {
     // Brevo's `code` (`invalid_parameter`, `unauthorized`, …) is safe to keep.
     let code: String = code.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect();
@@ -118,10 +118,26 @@ pub(crate) fn classify(status: u16, code: &str, message: &str) -> MailError {
         400 if about_recipient(&code, &msg) => MailError::Rejected(why),
         402 | 429 => MailError::Limited(why),
         403 if code == "not_enough_credits" || limit_words.iter().any(|w| msg.contains(w)) => MailError::Limited(why),
-        400..=499 => MailError::Misconfigured(why),
+        // Our own setup: Brevo's message names the field at fault ("sender is missing"), so
+        // it's kept for the log, with any address blanked out.
+        400..=499 => MailError::Misconfigured(with_said(why, message)),
         503 => MailError::Unavailable(why),
         _ => MailError::Uncertain(why),
     }
+}
+
+/// `why` plus Brevo's message with every word holding an `@` blanked, at most 160 characters.
+fn with_said(why: String, message: &str) -> String {
+    let said: String = message
+        .split_whitespace()
+        .map(|w| if w.contains('@') { "[address]" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(160)
+        .collect();
+    if said.is_empty() { why } else { format!("{why}: {said}") }
 }
 
 /// A 400 that is clearly about the recipient: a blocked contact, or a bad parameter naming

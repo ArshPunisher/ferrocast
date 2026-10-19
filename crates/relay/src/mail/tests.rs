@@ -338,6 +338,17 @@ fn brevo_400s_pause_only_when_they_are_about_the_recipient() {
     }
 }
 
+/// Finding: a 400 from Brevo logged only its code, so a missing field couldn't be found.
+/// The log keeps the message, with any address blanked out.
+#[test]
+fn brevos_message_is_kept_without_addresses() {
+    use super::brevo::classify;
+    let e = classify(400, "missing_parameter", "sender is missing for viewer@example.com");
+    let said = e.to_string();
+    assert!(said.contains("missing_parameter: sender is missing for [address]"), "{said}");
+    assert!(!said.contains("example.com"), "{said}");
+}
+
 /// Finding: the provider's daily limit was treated as an outage or our account. It stops
 /// the day; a lost answer counts as sent; only a request never accepted is retried.
 #[test]
@@ -352,11 +363,14 @@ fn brevos_limits_and_lost_answers_are_told_apart() {
     for status in [500, 502, 504, 520] {
         assert_eq!(kind(&classify(status, "", "")), "uncertain", "{status}");
     }
-    // Only Brevo's code is kept, cleaned; its message (it can quote the address) never is.
+    // A recipient error keeps only Brevo's code, cleaned; its message can quote the address.
     let e = classify(400, "invalid_parameter", "a@b.co is not valid in to");
     assert_eq!(e.to_string(), "the mail provider refused the recipient: Brevo answered 400 invalid_parameter");
     let e = classify(400, "invalid<script>", "a@b.co");
-    assert_eq!(e.to_string(), "the mail provider refused the relay's account: Brevo answered 400 invalidscript");
+    assert_eq!(
+        e.to_string(),
+        "the mail provider refused the relay's account: Brevo answered 400 invalidscript: [address]"
+    );
 }
 
 /// Finding: a read timeout (Brevo got the request, the answer was lost) was given back and
