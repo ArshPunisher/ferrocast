@@ -106,7 +106,7 @@ if [[ -f "$dashboard/index.html" ]]; then
   # switches with one rename, so phones never see half a build (dashboard-swap.sh).
   release="$(date -u +%Y%m%d%H%M%S)"
   ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/dashboard-swap.sh" < "$repo/deploy/dashboard-swap.sh"
-  tar -C "$dashboard" -czf - . | ssh "$host" "sudo bash $dir/dashboard-swap.sh $dir/dashboard $release $owner"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$dashboard" -czf - . | ssh "$host" "sudo bash $dir/dashboard-swap.sh $dir/dashboard $release $owner"
 else
   echo "No dashboard build at $dashboard (run 'pnpm build:embed' in ferrocast-web): phones keep the copy the server has."
 fi
