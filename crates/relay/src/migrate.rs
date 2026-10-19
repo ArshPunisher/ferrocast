@@ -35,6 +35,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration { version: 6, name: "Pro voices: relay-wide character count", sql: &[crate::tts::SCHEMA] },
     Migration { version: 7, name: "Pro dashboard from anywhere", sql: &[crate::remote::SCHEMA] },
     Migration { version: 8, name: "Pro Discord bot: servers, rules, links, grants", sql: &[crate::discord::SCHEMA] },
+    Migration { version: 9, name: "Pro weekly email: sealed addresses, sends", sql: &[crate::mail::SCHEMA] },
 ];
 
 pub(crate) fn latest() -> i64 {
@@ -132,6 +133,9 @@ mod tests {
             "discord_links",
             "discord_grants",
             "discord_posts",
+            "mail_addresses",
+            "mail_sent",
+            "mail_budget",
         ] {
             let n: i64 =
                 db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [t], |r| r.get(0)).unwrap();

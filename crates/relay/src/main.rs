@@ -1,5 +1,5 @@
 //! `ferrocast-relay`: run with `RELAY_BIND`, `RELAY_DATA` (and optionally `RELAY_BLOB_DIR`,
-//! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`, `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR`) and the settings in `deploy/relay.env.example`.
+//! `RELAY_VAULT_KEY`, `GOOGLE_TTS_KEY`, `BREVO_API_KEY`, `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR`) and the settings in `deploy/relay.env.example`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -99,6 +99,17 @@ async fn main() {
         }
     };
     let state = state.with_discord(ferrocast_relay::discord::Runtime::from_config(discord_cfg));
+    let mailer: Option<Arc<dyn ferrocast_relay::mail::Mailer>> = match ferrocast_relay::mail::BrevoMailer::from_env() {
+        Some(b) => {
+            tracing::info!("the weekly email is on (Brevo)");
+            Some(Arc::new(b))
+        }
+        None => {
+            tracing::warn!("BREVO_API_KEY not set: the weekly email is off");
+            None
+        }
+    };
+    let state = state.with_mail(mailer, ferrocast_relay::mail::MailConfig::from_env());
     let daily = state.clone();
     tokio::spawn(async move {
         // The safety net for lost webhooks, a while after start and then daily.
@@ -147,6 +158,16 @@ async fn main() {
         // Discord perks: ended roles taken back; servers of lapsed subscriptions after 30 days.
         loop {
             ferrocast_relay::discord::sweep(&discord).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+    let mail = state.clone();
+    tokio::spawn(async move {
+        // The weekly email: reports due this hour, then lapsed and unconfirmed addresses.
+        loop {
+            let now = ferrocast_relay::now_ms();
+            ferrocast_relay::mail::run_weekly(&mail, now).await;
+            ferrocast_relay::mail::sweep(&mail, now).await;
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });

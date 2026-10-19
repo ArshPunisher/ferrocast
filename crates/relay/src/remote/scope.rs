@@ -64,6 +64,12 @@ pub const MOD_ALLOWED: &[Rule] = &[
     ("GET", "/viewers/*/*/note"),
 ];
 
+/// Exceptions inside [`OWNER_DENIED`] an owner's phone may still use: reading the weekly
+/// email's state (the address only as a hint). Changing the address stays on the PC.
+pub const OWNER_ALLOWED: &[Rule] = &[
+    ("GET", "/pro/history/email"),
+];
+
 /// What an owner's phone may never do (`*` as the method: any method).
 pub const OWNER_DENIED: &[Rule] = &[
     // Accounts and sign-ins, and pairing more browsers.
@@ -234,7 +240,10 @@ pub fn allowed(role: Role, method: &str, path: &str) -> bool {
     }
     match role {
         Role::Mod => MOD_ALLOWED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)),
-        Role::Owner => !OWNER_DENIED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)),
+        Role::Owner => {
+            OWNER_ALLOWED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs))
+                || !OWNER_DENIED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs))
+        }
     }
 }
 

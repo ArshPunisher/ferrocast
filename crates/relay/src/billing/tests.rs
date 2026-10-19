@@ -375,7 +375,7 @@ async fn status_lists_which_pro_features_this_server_has() {
         assert_eq!(
             v["features"],
             json!({ "cloud_bot": false, "remote": false, "tts": false, "discord": false, "backups": false,
-                    "tip_brand": false, "history": true }),
+                    "tip_brand": false, "history": true, "weekly_email": false }),
             "{v}"
         );
         assert!(v["quotas"].get("history_requests").is_none(), "a request rate, not a quota: {v}");

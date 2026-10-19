@@ -19,7 +19,7 @@ pub mod db;
 pub mod discord;
 mod history;
 pub mod kick;
-mod mail;
+pub mod mail;
 mod migrate;
 pub mod quota;
 pub mod remote;
@@ -109,6 +109,8 @@ pub struct AppState {
     pub(crate) remote: Arc<remote::Runtime>,
     /// The Ferrocast bot for Discord (off without the `DISCORD_*` settings).
     pub(crate) discord: Arc<discord::Runtime>,
+    /// The weekly email (off without `BREVO_API_KEY`).
+    pub(crate) mail: Arc<mail::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -131,6 +133,7 @@ impl AppState {
             tts: Arc::default(),
             remote: Arc::default(),
             discord: Arc::default(),
+            mail: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -173,6 +176,13 @@ impl AppState {
     /// in production, a fake Discord in tests).
     pub fn with_discord(mut self, rt: discord::Runtime) -> AppState {
         self.discord = Arc::new(rt);
+        self
+    }
+
+    /// The weekly email: the sender (`mail::BrevoMailer::from_env()` in production, a
+    /// `mail::FakeMailer` in tests) and its settings (`mail::MailConfig::from_env()`).
+    pub fn with_mail(mut self, mailer: Option<Arc<dyn mail::Mailer>>, cfg: mail::MailConfig) -> AppState {
+        self.mail = Arc::new(mail::Runtime::new(mailer, cfg));
         self
     }
 
@@ -278,6 +288,7 @@ pub fn router(state: AppState) -> Router {
         .merge(bot::routes())
         .merge(tts::routes())
         .merge(discord::routes())
+        .merge(mail::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
