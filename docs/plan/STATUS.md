@@ -26,6 +26,9 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-19 (Pro carry-over and Discord perks at lapse)
+- A new subscription bought within 30 days of a lapse (same install in `pro_install_subs`, same checkout email, never a `comp_` grant) takes over the old one's history, finished backups (files copied), cloud bot (sign-ins re-sealed), Discord server, weekly email (address re-sealed) and phones, in one transaction (`billing/carry.rs`, migration 13); perk roles now come off at the first hourly sweep after Pro ends (grants kept as `paused_at`) and go back on when Pro returns.
+
 ### 2026-10-19 (owner's test Pro)
 - `ferrocast-relay pro-grant <install> <days> | --revoke | --list` (`billing/comp.rs`) and `deploy/pro-grant.sh` (+ test, CI, `relay-ci-setup.sh`): a `comp_` grant is Pro without Razorpay; reconcile/refresh skip it, cancel/manage answer 409 `test_grant`, restore can't attach it. Relay DB gets a 5 s busy timeout.
 

@@ -24,6 +24,16 @@ Shared pieces (M0):
   401 `unauthorized`, **402 `pro_required`** ("This runs on Ferrocast's servers and is part of
   Pro."). A lapsed subscription stops cloud work at the next hourly sweep, keeps data 30 days,
   export stays open (R-04).
+- Carry-over (`relay/src/billing/carry.rs`, decided 19 Oct 2026): when a new subscription starts
+  granting Pro (webhook, refresh, daily re-check), a lapsed subscription still inside its 30 days
+  hands it everything keyed by its id (history, finished backups with their files, cloud bot with
+  its sign-ins re-sealed for the new id, Discord server with rules/links/grants, weekly email with
+  the address re-sealed, paired phones and audit) in one transaction. Only the same owner's: an
+  install linked to the new subscription was linked to the old one (`pro_install_subs`, migration
+  13) and the checkout email hash matches. `comp_` test grants are never a source or target. A
+  feature moves only when the new subscription has none of its own; a value that doesn't open, a
+  backup file that can't be copied or an unfinished upload stays behind and expires with the old
+  id. Running again moves nothing. Over 30 days, nothing moves.
 - `relay/src/vault.rs`: AES-256-GCM with `RELAY_VAULT_KEY` (32 bytes, `deploy/vault-key.sh` like
   `razorpay-keys.sh`), AAD `install|purpose`, rows `(key_v, nonce, ct)`, redacted `Debug`, never
   logged. Platform tokens are opt-in; removing one deletes the row and revokes it.
@@ -385,7 +395,11 @@ M0 as built (19 Oct 2026):
   one. Grants carry `attempts`/`retry_at` (migration 8): backoff 1 h to a day, forgotten after 5
   failures, renewals put the role back. Live reports are serialised per subscription+platform and a
   post Discord accepted counts even if saving fails. The bot leaves a server it can't keep (no Pro,
-  one server already). Install phishing: the "connected" page and the view show a PC code (HMAC of
+  one server already). When Pro ends (19 Oct 2026 decision) the first hourly sweep takes off every
+  perk role the bot gave (`discord_grants.paused_at`, migration 13; 500 a sweep, a rate limit stops
+  the round, per-member failures back off and after 5 the role is left on); the grants that haven't
+  ended go back on when Pro returns (activation webhook or the next sweep); the bot itself still
+  leaves 30 days after Pro ended. Install phishing: the "connected" page and the view show a PC code (HMAC of
   the install id). The perk queue removes by sequence number. Interactions hex is strict. Web:
   currency exponents mirror `money.rs`; the Pro section is hidden in remote mode.
 
