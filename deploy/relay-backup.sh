@@ -68,7 +68,8 @@ setup() {
     printf '[r2]\ntype = s3\nprovider = Cloudflare\nendpoint = https://%s.r2.cloudflarestorage.com\n' "$account"
     printf 'access_key_id = %s\nsecret_access_key = %s\nno_check_bucket = true\n\n' "$key" "$secret"
     printf '[box]\ntype = crypt\nremote = r2:%s\nfilename_encryption = standard\n' "$BUCKET"
-    printf 'password = %s\n' "$(docker run --rm "$RCLONE_IMAGE" obscure "$pass")"
+    # Through stdin: never on a command line, where any account could see it in `ps`.
+    printf 'password = %s\n' "$(printf '%s' "$pass" | docker run -i --rm "$RCLONE_IMAGE" obscure -)"
   } >"$tmp"
   mv "$tmp" "$CONF"
   echo "Checking the bucket..."
