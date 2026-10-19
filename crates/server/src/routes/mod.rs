@@ -22,6 +22,7 @@ pub(crate) mod remote_scope;
 mod studio;
 mod tip_pro;
 mod tts;
+mod weekly_email;
 mod welcome;
 
 use axum::Router;
@@ -154,6 +155,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/restore", post(pro::restore))
         .route("/pro/history", get(history::list))
         .route("/pro/history/export.csv", get(history::export))
+        // Pro: the weekly email (see routes/weekly_email.rs)
+        .route("/pro/history/email", get(weekly_email::view).put(weekly_email::save).delete(weekly_email::stop))
         // Pro: the Ferrocast bot for Discord (see routes/discord.rs)
         .route("/pro/discord", get(discord::bot).delete(discord::bot_disconnect))
         .route("/pro/discord/connect", post(discord::bot_connect))

@@ -420,6 +420,7 @@ fn the_relay_and_the_pc_have_the_same_rules() {
     use ferrocast_relay::remote::scope as relay;
     assert_eq!(remote_scope::MOD_ALLOWED, relay::MOD_ALLOWED);
     assert_eq!(remote_scope::OWNER_DENIED, relay::OWNER_DENIED);
+    assert_eq!(remote_scope::OWNER_ALLOWED, relay::OWNER_ALLOWED);
     assert_eq!(remote_scope::MOD_EVENT_KINDS, relay::MOD_EVENT_KINDS);
     assert_eq!(remote_scope::MOD_FRAMES, relay::MOD_FRAMES);
     let paths = [
@@ -431,6 +432,8 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/settings",
         "/accounts",
         "/pro/remote",
+        "/pro/history",
+        "/pro/history/email",
         "/tips",
         "/tips/brand",
         "/tips/brand/avatar",

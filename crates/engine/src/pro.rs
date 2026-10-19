@@ -34,6 +34,7 @@ pub struct ProFeatures {
     pub backups: bool,
     pub tip_brand: bool,
     pub history: bool,
+    pub weekly_email: bool,
 }
 
 /// One of the subscription's usage counters (API.md §9).
@@ -135,7 +136,7 @@ pub(crate) fn unreachable(e: impl std::fmt::Display) -> EngineError {
 
 /// The relay's error codes the dashboard can act on, kept as they are.
 fn code(c: &str) -> &'static str {
-    const KNOWN: [&str; 66] = [
+    const KNOWN: &[&str] = &[
         "pro_required",
         "vault_unavailable",
         "storage_unavailable",
@@ -208,8 +209,14 @@ fn code(c: &str) -> &'static str {
         "too_many_events",
         "discord_rate",
         "discord_unavailable",
+        // The weekly email (API.md §9.8).
+        "mail_unavailable",
+        "mail_failed",
+        "mail_rate",
+        "mail_busy",
+        "already_on",
     ];
-    KNOWN.into_iter().find(|k| *k == c).unwrap_or("relay_error")
+    KNOWN.iter().copied().find(|k| *k == c).unwrap_or("relay_error")
 }
 
 /// Turns a relay error answer into the same status, code, message and hint.

@@ -42,6 +42,7 @@ mod updates;
 pub use updates::AvailableUpdate;
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
+mod weekly_email;
 mod welcome;
 
 pub mod frames;

@@ -65,6 +65,12 @@ pub const MOD_ALLOWED: &[Rule] = &[
     ("GET", "/viewers/*/*/note"),
 ];
 
+/// Exceptions inside [`OWNER_DENIED`] an owner's phone may still use: reading the weekly
+/// email's state (the address only as a hint). Changing the address stays on the PC.
+pub const OWNER_ALLOWED: &[Rule] = &[
+    ("GET", "/pro/history/email"),
+];
+
 /// What an owner's phone may never do (`*` as the method: any method).
 pub const OWNER_DENIED: &[Rule] = &[
     // Accounts and sign-ins, and pairing more browsers.
@@ -158,7 +164,10 @@ pub fn allowed(role: Role, method: &str, path: &str) -> bool {
     }
     match role {
         Role::Mod => MOD_ALLOWED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)),
-        Role::Owner => !OWNER_DENIED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)),
+        Role::Owner => {
+            OWNER_ALLOWED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs))
+                || !OWNER_DENIED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs))
+        }
     }
 }
 
@@ -212,6 +221,7 @@ mod tests {
             ("PUT", "/viewers/twitch/123/note"),
             ("GET", "/accounts"),
             ("GET", "/pro"),
+            ("GET", "/pro/history/email"),
             ("DELETE", "/mod/ban"),
             ("GET", "/mod/held/ev_1/drop"),
             ("POST", "/mod/held/a/b/drop"),
@@ -240,6 +250,7 @@ mod tests {
             ("POST", "/backups"),
             ("GET", "/updates"),
             ("PUT", "/designs/d1"),
+            ("GET", "/pro/history/email"),
         ] {
             assert!(allowed(Role::Owner, m, p), "{m} {p}");
         }
@@ -253,6 +264,10 @@ mod tests {
             ("POST", "/pro/remote/codes"),
             ("DELETE", "/pro/remote/devices/d1"),
             ("GET", "/pro/backups/key"),
+            ("PUT", "/pro/history/email"),
+            ("DELETE", "/pro/history/email"),
+            ("POST", "/pro/history/email"),
+            ("GET", "/pro/history/email/x"),
             ("PUT", "/tips"),
             ("DELETE", "/tips"),
             ("PUT", "/tips/brand/avatar"),
