@@ -384,15 +384,18 @@ async fn bans_made_from_a_phone_while_the_pc_was_off_join_the_ban_list_once() {
         json!({ "kind": "cloud_moderation", "payload": {
             "platform": "twitch", "action": "timeout", "target_id": "78", "duration": 600,
             "by_device": "Meera", "by_role": "mod", "at": 1 } }),
-        json!({ "kind": "cloud_moderation", "payload": { "platform": "youtube", "action": "ban", "target_id": "x" } }),
+        // YouTube (M12) is recorded too; a platform the PC doesn't know is skipped.
+        json!({ "kind": "cloud_moderation", "payload": { "platform": "youtube", "action": "ban", "target_id": "UCx" } }),
+        json!({ "kind": "cloud_moderation", "payload": { "platform": "tiktok", "action": "ban", "target_id": "x" } }),
     ];
     fake.lock().unwrap().enabled = true;
     let (e, _d) = engine(&relay).await;
     remember_pro(&e, true).await;
     e.cloud_bot_set_enabled_for_tests(true);
-    eventually(|| fake.lock().unwrap().acks.len() == 5).await;
+    eventually(|| fake.lock().unwrap().acks.len() == 6).await;
     let bans = e.bans().entries;
-    assert_eq!(bans.len(), 2, "{bans:?}");
+    assert_eq!(bans.len(), 3, "{bans:?}");
+    assert!(bans.iter().any(|b| b.platform == Platform::Youtube && b.user_id.as_deref() == Some("UCx")));
     let tw = bans.iter().find(|b| b.platform == Platform::Twitch).unwrap();
     assert_eq!(
         (tw.user_id.as_deref(), tw.login.as_str(), tw.display_name.as_str(), tw.reason.as_deref()),
@@ -403,7 +406,7 @@ async fn bans_made_from_a_phone_while_the_pc_was_off_join_the_ban_list_once() {
     assert_eq!((kk.login.as_str(), kk.by.as_deref(), kk.offline), ("4242", None, true), "the streamer's own phone");
     // Kept like any ban: on disk, and Unban takes it off (no Twitch connected here to ask).
     e.unban(Platform::Twitch, "77").await.unwrap();
-    assert_eq!(e.bans().entries.len(), 1);
+    assert_eq!(e.bans().entries.len(), 2);
 }
 
 #[tokio::test]
@@ -460,6 +463,7 @@ async fn the_link_says_bot_seen_while_the_cloud_bot_is_on() {
     eventually(|| fake.lock().unwrap().link_frames.iter().any(|f| f["type"] == "bot_seen")).await;
     let beat = fake.lock().unwrap().link_frames.iter().find(|f| f["type"] == "bot_seen").cloned().unwrap();
     assert_eq!(beat["platforms"], json!([]), "no chat platform connected here: the cloud covers all");
+    assert_eq!(beat["lease"], 2, "names YouTube when it answers there (a relay reads an older frame as covering it)");
     assert_eq!(HEARTBEAT, Duration::from_secs(30));
     // Connected (or reconnecting for a moment) counts; signed out or off doesn't.
     {
@@ -470,7 +474,53 @@ async fn the_link_says_bot_seen_while_the_cloud_bot_is_on() {
             st.connectors.insert(p.into(), v);
         }
     }
-    assert_eq!(e.cloud_bot_platforms(), ["twitch"]);
+    assert_eq!(e.cloud_bot_platforms(), ["twitch", "youtube"]);
     e.state_mut().connectors.get_mut("kick").unwrap().state = "reconnecting".into();
-    assert_eq!(e.cloud_bot_platforms(), ["twitch", "kick"]);
+    assert_eq!(e.cloud_bot_platforms(), ["twitch", "kick", "youtube"]);
+    // Without YouTube signed in here, `bot_seen` says nothing about its live state.
+    assert!(e.cloud_bot_seen_frame().get("youtube_live").is_none());
+    let yt = desktop_youtube();
+    e.cloud_bot_set_youtube(Some(yt.clone()));
+    assert_eq!(e.cloud_bot_seen_frame()["youtube_live"], false);
+    *yt.live.write().unwrap() = Some("chat-1".into());
+    let f = e.cloud_bot_seen_frame();
+    assert_eq!((f["type"].as_str(), f["youtube_live"].as_bool()), (Some("bot_seen"), Some(true)));
+}
+
+/// A YouTube sign-in with a fresh token (no network needed to read it).
+fn desktop_youtube() -> crate::cloud_bot::DesktopYoutube {
+    let tokens = ferrocast_youtube::Tokens {
+        access_token: "yt-desk-at".into(),
+        refresh_token: "yt-desk-rt".into(),
+        expires_at: now().0 + 3_600_000,
+    };
+    let api = ferrocast_youtube::Api::new(
+        reqwest::Client::new(),
+        ferrocast_youtube::Endpoints::default(),
+        ferrocast_youtube::AppCredentials {
+            client_id: "desk.apps.googleusercontent.com".into(),
+            client_secret: "s".into(),
+        },
+        tokens,
+        Arc::new(|_| Ok(())),
+    );
+    crate::cloud_bot::DesktopYoutube { api: Arc::new(api), live: Arc::default() }
+}
+
+#[tokio::test]
+async fn connect_sends_this_pcs_own_youtube_token_and_never_one_from_the_request() {
+    let (relay, fake) = fake_relay().await;
+    let (e, _d) = engine(&relay).await;
+    remember_pro(&e, true).await;
+    e.cloud_bot_connect("youtube", json!({ "owner_token": "forged", "moderation": true })).await.unwrap();
+    let sent = fake.lock().unwrap().connects.last().cloned().unwrap();
+    assert_eq!(sent, json!({ "moderation": true }), "{sent}");
+    e.cloud_bot_set_youtube(Some(desktop_youtube()));
+    e.cloud_bot_connect("youtube", json!({})).await.unwrap();
+    let sent = fake.lock().unwrap().connects.last().cloned().unwrap();
+    assert_eq!(sent["owner_token"], "yt-desk-at");
+    // Signed out of YouTube here: nothing goes along.
+    e.cloud_bot_set_youtube(None);
+    e.cloud_bot_connect("youtube", json!({})).await.unwrap();
+    assert!(fake.lock().unwrap().connects.last().unwrap().get("owner_token").is_none());
 }

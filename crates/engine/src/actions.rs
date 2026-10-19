@@ -337,6 +337,7 @@ impl Engine {
         let platform = match payload["platform"].as_str() {
             Some("twitch") => Platform::Twitch,
             Some("kick") => Platform::Kick,
+            Some("youtube") => Platform::Youtube,
             _ => return,
         };
         let Some(user_id) = payload["target_id"].as_str().filter(|s| !s.is_empty()) else { return };

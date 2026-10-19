@@ -111,7 +111,7 @@ mod tests {
         let (s, v) = call(Method::GET, "/pro/bot", None).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!((v["enabled"].as_bool(), v["duty"]["who"].as_str()), (Some(false), Some("off")));
-        assert_eq!(v["available"], json!({ "twitch": false, "kick": false }));
+        assert_eq!(v["available"], json!({ "twitch": false, "kick": false, "youtube": false }));
         assert_eq!(v["sync"]["state"], "off");
         assert!(v["pro_available"].is_boolean());
         // Not set up on that relay: 503 with the hint; unknown platforms never reach it.

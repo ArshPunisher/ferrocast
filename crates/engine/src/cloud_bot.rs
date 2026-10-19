@@ -141,6 +141,17 @@ pub(crate) struct CloudBot {
     /// The connected Twitch account's sign-in (set by `accounts.rs`): its token proves the
     /// channel when connecting the cloud bot.
     pub desktop_twitch: Mutex<Option<Arc<ferrocast_twitch::Auth>>>,
+    /// The connected YouTube channel's sign-in and its live chat (set by `accounts.rs`): its
+    /// token proves the channel when connecting YouTube's cloud bot (M12), and `bot_seen`
+    /// says whether this PC sees the stream live.
+    pub desktop_youtube: Mutex<Option<DesktopYoutube>>,
+}
+
+/// This PC's YouTube: the API (its sign-in) and the live chat its reader follows.
+#[derive(Debug, Clone)]
+pub(crate) struct DesktopYoutube {
+    pub api: Arc<ferrocast_youtube::Api>,
+    pub live: ferrocast_youtube::stream::LiveChat,
 }
 
 /// The config as the relay takes it, and its two hashes (definitions; values).
@@ -311,11 +322,34 @@ impl Engine {
         *self.cbot().desktop_twitch.lock().unwrap_or_else(|p| p.into_inner()) = auth;
     }
 
+    /// The YouTube sign-in of the channel this PC is connected to (or none after Disconnect).
+    pub(crate) fn cloud_bot_set_youtube(&self, yt: Option<DesktopYoutube>) {
+        *self.cbot().desktop_youtube.lock().unwrap_or_else(|p| p.into_inner()) = yt;
+    }
+
+    /// Whether this PC's YouTube reader is in a live chat now (`None` without YouTube): the
+    /// relay looks for the stream at once, or waits, when it takes over (`youtube_live`).
+    pub(crate) fn cloud_bot_youtube_live(&self) -> Option<bool> {
+        let yt = self.cbot().desktop_youtube.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        Some(yt.live.read().unwrap_or_else(|p| p.into_inner()).is_some())
+    }
+
+    /// The `bot_seen` frame: the platforms this PC answers, and its YouTube live state.
+    pub(crate) fn cloud_bot_seen_frame(&self) -> Value {
+        // `lease: 2`: `platforms` names YouTube too (a relay treats a frame without it as an
+        // older PC's, which may answer YouTube without naming it).
+        let mut f = json!({ "type": "bot_seen", "platforms": self.cloud_bot_platforms(), "lease": 2 });
+        if let Some(live) = self.cloud_bot_youtube_live() {
+            f["youtube_live"] = json!(live);
+        }
+        f
+    }
+
     /// The chat platforms this PC answers right now (said with `bot_seen`): connected, or
     /// reconnecting for a moment. The cloud covers the rest.
     pub(crate) fn cloud_bot_platforms(&self) -> Vec<&'static str> {
         let st = self.state();
-        ["twitch", "kick"]
+        ["twitch", "kick", "youtube"]
             .into_iter()
             .filter(|p| st.connectors.get(*p).is_some_and(|c| matches!(c.state.as_str(), "connected" | "reconnecting")))
             .collect()
@@ -402,9 +436,10 @@ impl Engine {
         Ok(v)
     }
 
-    /// `POST /api/v1/pro/bot/{platform}/connect` → `{auth_url, expires_at}`. Twitch gets this
-    /// PC's own Twitch token added (`owner_token`): the relay checks with Twitch that the
-    /// channel is this PC's. Without a connected Twitch the relay answers `twitch_not_linked`.
+    /// `POST /api/v1/pro/bot/{platform}/connect` → `{auth_url, expires_at}`. Twitch and YouTube
+    /// get this PC's own token added (`owner_token`): the relay checks with the platform that
+    /// the channel is this PC's. Without one the relay answers `twitch_not_linked` /
+    /// `youtube_not_linked`.
     pub async fn cloud_bot_connect(&self, platform: &str, body: Value) -> Result<Value, EngineError> {
         let p = platform_path(platform)?;
         let mut body = if body.is_object() { body } else { json!({}) };
@@ -419,6 +454,15 @@ impl Engine {
                 match auth.access().await {
                     Ok(token) => body["owner_token"] = json!(token),
                     Err(e) => tracing::debug!(error = %e, "no Twitch token for the cloud bot's check"),
+                }
+            }
+        }
+        if p == "youtube" {
+            let yt = self.cbot().desktop_youtube.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(yt) = yt {
+                match yt.api.access().await {
+                    Ok(token) => body["owner_token"] = json!(token),
+                    Err(e) => tracing::debug!(error = %e, "no YouTube token for the cloud bot's check"),
                 }
             }
         }
@@ -468,8 +512,8 @@ fn platform_path(p: &str) -> Result<&'static str, EngineError> {
         _ => Err(EngineError::Refused {
             status: 404,
             code: "platform_not_found",
-            message: "The cloud bot runs on Twitch and Kick.".into(),
-            hint: "Use twitch or kick.".into(),
+            message: "The cloud bot runs on Twitch, Kick and YouTube.".into(),
+            hint: "Use twitch, kick or youtube.".into(),
             retry_after: None,
         }),
     }

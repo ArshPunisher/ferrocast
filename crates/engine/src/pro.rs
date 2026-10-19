@@ -231,6 +231,13 @@ fn code(c: &str) -> &'static str {
         "twitch_unreachable",
         "twitch_rate",
         "connect_again",
+        // The YouTube cloud bot (M12, API.md §9.7).
+        "youtube_not_linked",
+        "wrong_youtube_app",
+        "youtube_unreachable",
+        "youtube_rate",
+        "youtube_quota",
+        "youtube_no_channel",
         // The tip page's own address (API.md §9.2).
         "domains_unavailable",
         "invalid_hostname",

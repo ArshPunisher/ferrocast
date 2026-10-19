@@ -129,7 +129,7 @@ impl Engine {
                 _ = beat.tick() => {
                     if self.cloud_bot_on().await {
                         // The chat platforms this PC answers: the cloud covers the others.
-                        let seen = json!({ "type": "bot_seen", "platforms": self.cloud_bot_platforms() }).to_string();
+                        let seen = self.cloud_bot_seen_frame().to_string();
                         tx.send(Message::text(seen)).await.map_err(|e| e.to_string())?;
                     }
                     continue;

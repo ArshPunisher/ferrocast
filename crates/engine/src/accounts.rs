@@ -284,6 +284,7 @@ impl Engine {
             }
             Platform::Youtube => {
                 *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                self.cloud_bot_set_youtube(None);
                 Some(YOUTUBE_TOKENS)
             }
             Platform::Kick => {
@@ -376,6 +377,8 @@ impl Engine {
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
         let live: ferrocast_youtube::stream::LiveChat = Arc::default();
+        // Its token proves the channel when connecting YouTube's cloud bot (cloud_bot.rs).
+        self.cloud_bot_set_youtube(Some(crate::cloud_bot::DesktopYoutube { api: api.clone(), live: live.clone() }));
         self.register_connector(Arc::new(ferrocast_youtube::YoutubeConnector { api: api.clone(), live: live.clone() }));
         {
             let mut st = self.state_mut();
