@@ -51,7 +51,7 @@ ssh "$host" "sudo test -f $dir/docker-compose.yml" || {
 ssh "$host" "sudo grep -q ghcr.io ~deploy/.docker/config.json 2>/dev/null" ||
   echo "WARNING: 'deploy' is not logged in to ghcr.io; deploys can't pull images until it is (DEPLOY.md §6)." >&2
 
-echo "Installing the deploy, Razorpay-keys, vault-key, pro-keys, pro-grant and relay-backup scripts and the current compose file, and handing the relay files to 'deploy'..."
+echo "Installing the deploy, Razorpay-keys, vault-key, pro-keys, pro-grant, bot-check and relay-backup scripts and the current compose file, and handing the relay files to 'deploy'..."
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/deploy.sh" <"$repo/deploy/relay-server-deploy.sh"
 # Pro's Razorpay keys are typed on the server with this (deploy/razorpay-keys.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/razorpay-keys.sh" <"$repo/deploy/razorpay-keys.sh"
@@ -61,6 +61,8 @@ ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/vault-key.sh" <
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/pro-keys.sh" <"$repo/deploy/pro-keys.sh"
 # The owner's test Pro for one install, without Razorpay (deploy/pro-grant.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/pro-grant.sh" <"$repo/deploy/pro-grant.sh"
+# The owner's read-only look at the Twitch cloud bot (deploy/bot-check.sh).
+ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/bot-check.sh" <"$repo/deploy/bot-check.sh"
 # The nightly encrypted backup to Cloudflare R2 and its restore drill (deploy/relay-backup.sh).
 ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/relay-backup.sh" <"$repo/deploy/relay-backup.sh"
 # The compose file must read RELAY_IMAGE/RELAY_TAG; older installs don't. Containers keep

@@ -25,7 +25,7 @@ summary says what went live, or that the previous version was put back.
 | `docker-compose.yml` | server | Relay + `cloudflared`; the relay's image comes from `RELAY_IMAGE`/`RELAY_TAG` |
 | `relay-server-deploy.sh` | server (`/opt/ferrocast-relay/deploy.sh`) | Pull, switch, health check, rollback; the only thing the deploy key can run |
 | `deploy-relay.sh` | your Mac | First install, and changing config or secrets (`../secrets/relay.env`). Once GitHub deploys, it keeps the live version and never swaps in a local build |
-| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh`, `pro-keys.sh` and `pro-grant.sh` |
+| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh`, `pro-keys.sh`, `pro-grant.sh` and `bot-check.sh` |
 | `razorpay-keys.sh` | server (`/opt/ferrocast-relay/razorpay-keys.sh`) | Ferrocast Pro's Razorpay keys, plans, webhook secret, and the `PRO_SALES_OPEN` switch (below) |
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
@@ -34,6 +34,8 @@ summary says what went live, or that the previous version was put back.
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 | `pro-grant.sh` | server (`/opt/ferrocast-relay/pro-grant.sh`) | The owner's test Pro for one install, without Razorpay (below) |
 | `tests/pro-grant.test.sh` | CI, your Mac | Tests `pro-grant.sh` |
+| `bot-check.sh` | server (`/opt/ferrocast-relay/bot-check.sh`) | Read-only look at the Twitch cloud bot: conduit, shard, EventSub, channel rows (below) |
+| `tests/bot-check.test.sh` | CI, your Mac | Tests `bot-check.sh` |
 
 ## One-time setup for GitHub deploys
 
@@ -336,6 +338,23 @@ hourly sweep deletes it from Cloudflare and the relay. A wrong zone id, a refuse
 Cloudflare for SaaS switched off is logged once (`Cloudflare for SaaS isn't usable: …`) and
 streamers see 503 `domains_unavailable`, never Cloudflare's words.
 `deploy-relay.sh` keeps both lines when it rewrites `relay.env`.
+
+## Checking the Twitch cloud bot
+
+When the cloud bot doesn't answer, look from the server (read only, no tokens printed):
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/bot-check.sh'               # every bound channel
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/bot-check.sh <install-id>'  # one install
+```
+
+It shows the conduit (saved vs Twitch's), shard 0's status and callback (`enabled` at this
+relay's `/v1/bot/twitch/eventsub` or chat never arrives), the EventSub subscriptions per
+channel (chat, online, offline; MISSING ones named), and each channel's row (accounts,
+ready/blocked, last error, the switch, Pro, config version, the desktop bot switch and the
+commands with the switched-off ones marked). It's a separate process: who's on duty (the
+in-memory lease) isn't visible; the Bot page shows that, and `docker logs` shows the relay's
+"didn't answer a chat line" reasons (once per reason, channel and hour).
 
 ## Test Pro for your own install (no Razorpay)
 
