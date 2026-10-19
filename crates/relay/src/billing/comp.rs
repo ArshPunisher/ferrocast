@@ -176,7 +176,8 @@ pub fn cli(db: &Db, args: &[String]) -> Result<String, String> {
             let g = db.comp_revoke(install)?;
             Ok(format!("Test Pro on {install} ended now ({}).", g.sub_id))
         }
-        [install, days] if !install.starts_with('-') => {
+        // Install ids can start with '-' (URL-safe base64), so only the two flags above are flags.
+        [install, days] => {
             let days: i64 = days.parse().map_err(|_| format!("'{days}' isn't a number of days.\n{USAGE}"))?;
             let g = db.comp_grant(install, days)?;
             let verb = if g.extended { "extended" } else { "granted" };
@@ -267,6 +268,13 @@ mod tests {
     }
 
     #[test]
+    fn an_install_id_starting_with_a_dash_is_an_id_not_a_flag() {
+        let (_d, db) = db_with(&["-dash1"]);
+        assert!(cli(&db, &args(&["-dash1", "7"])).unwrap().contains("granted"));
+        assert!(cli(&db, &args(&["--revoke", "-dash1"])).unwrap().contains("ended now"));
+    }
+
+    #[test]
     fn the_command_line_answers_every_form() {
         let (_d, db) = db_with(&["i1"]);
         assert_eq!(cli(&db, &args(&["--list"])).unwrap(), "No test Pro grants.");
@@ -276,7 +284,7 @@ mod tests {
         assert!(cli(&db, &args(&["i1", "seven"])).unwrap_err().contains("isn't a number"));
         assert!(cli(&db, &args(&["--revoke", "i1"])).unwrap().contains("ended now"));
         assert!(cli(&db, &args(&["--list"])).unwrap().contains("ended"));
-        for bad in [&[][..], &["i1"], &["--revoke"], &["--nope", "1"], &["a", "b", "c"]] {
+        for bad in [&[][..], &["i1"], &["--revoke"], &["a", "b", "c"]] {
             assert!(cli(&db, &args(bad)).unwrap_err().starts_with("Usage:"), "{bad:?}");
         }
     }

@@ -31,7 +31,7 @@ case "${1:-}" in
     [[ $# -eq 2 ]] || die "Use: pro-grant.sh --revoke <install-id>"
     id_ok "$2" || die "'$2' doesn't look like an install id (only the part before the dot)."
     ;;
-  "" | -*)
+  "" | --help | -h)
     die "Use: pro-grant.sh <install-id> <days> | --revoke <install-id> | --list"
     ;;
   *)
