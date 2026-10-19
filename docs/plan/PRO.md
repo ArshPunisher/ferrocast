@@ -61,8 +61,8 @@ M0 as built (19 Oct 2026):
   `/v1/bot/twitch/eventsub` (HMAC + replay check); replies with the app token. Moderation scopes
   only with a separate opt-in, refresh token in the vault.
 - Kick: webhooks already reach the relay; replies need an opt-in `chat:write` refresh token.
-- YouTube: last (M12); refresh token in vault, gRPC `streamList` only while live; shared 10k/day
-  quota: 1,500 units per subscription per day, bring-your-own-key option, apply for quota audit.
+- YouTube: last (M12, built as a beta: "M12 as built" below); refresh token in vault, gRPC `streamList` only while
+  live; shared 10k/day quota: 1,500 units per subscription per day, bring-your-own-key a follow-up, apply for quota audit.
 - Lease (R-11): a desktop with the cloud bot on and a live link refreshes `desktop_seen`; the
   cloud stands by, takes over after 90 s of silence, hands back on reconnect. The free desktop
   bot never waits for the relay. Replies deduped per platform message id.
@@ -131,6 +131,57 @@ M0 as built (19 Oct 2026):
   events to Discord (M8 follow-up); offline dashboard reads of the ring and moderation with the opt-in scopes (M10);
   YouTube (M12); the lease and ring are per relay process (fine for one relay); privacy/terms pages must list these
   items before sales open.
+
+- M12 as built (19 Oct 2026, API.md §9.7 YouTube, a beta): relay `bot/youtube.rs` (+ `youtube_tests.rs`), no migration
+  (units in `quota_usage`, period `p<Pacific date>`, owner `*relay` for the relay-wide count); `ferrocast_youtube::feed` (one
+  `streamList` as batches of mapped events, shared gRPC + mapping with the desktop). Env `YOUTUBE_CLOUD_CLIENT_ID` +
+  `YOUTUBE_CLOUD_CLIENT_SECRET` (both or off; a Google OAuth client "Ferrocast Cloud", type Web, redirect
+  `/v1/bot/youtube/callback`), `YOUTUBE_CLOUD_DESKTOP_CLIENT_ID` (default the official desktop id),
+  `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (1,500), `YOUTUBE_CLOUD_DAILY_UNITS` (9,000); `pro-keys.sh --youtube`, carried by
+  `deploy-relay.sh`. **Decisions:** one sign-in step, the streamer's own channel (the cloud speaks as the channel, like the
+  desktop; a separate bot account is a follow-up); scope `youtube.force-ssl` only (readonly adds nothing; posting needs it);
+  the moderation opt-in is a flag on the same scope; the channel is proven by the PC's desktop token (`tokeninfo` client id
+  = desktop app, `channels?mine=true` id = the callback's channel), state HKDF-signed, single use. Google's revoke ends the
+  whole grant of that Google account for the client (a newer sign-in included), so the relay revokes only on Disconnect,
+  the lapse sweep, or a sign-in for another channel: the moderation opt-in / connecting again for the same channel
+  overwrites, a reclaim drops the other subscription's row without revoking, and a refusal revokes only a grant whose
+  channel YouTube named and no subscription has bound (else it's left to expire).
+  Chat read with the desktop's gRPC `streamList` (5 units per opened stream; `liveChatMessages.list` polling at 5 units per
+  call would spend 1,500 in well under an hour), so "the polling interval" is the reopen wait: 30 s doubling to 5 min while
+  streams keep closing within 5 minutes, from the last page token; HTTP/2 keepalive (30 s ping, 10 s timeout, while idle
+  too) and a 90 s idle timeout on the stream (reopened from the page token; a second silence in a row is a failure);
+  failed opens back off 30 s doubling to 1 h, the streak kept in `YtMem` across reader restarts, 6 in a row →
+  `youtube_unavailable` (retryable) and no reading until "Try again" or a live check 1 h later. Live detection
+  `liveBroadcasts.list?broadcastStatus=active` (1 unit) only while the cloud holds YouTube's lease, in its own loop
+  (JoinSet, 8 at once, never blocking Twitch/Kick timers): at once on takeover (after 2 min when the PC's `bot_seen` said
+  `youtube_live: false`); offline it slows down: 2 min for 30 min after the takeover or the last live (or while the PC
+  last saw it live), 5 until 2 h, 15 until 6 h, then hourly (about 65 units for an idle day); free wakes (at most every
+  30 s): the PC's `youtube_live` turning true, Twitch/Kick going live for the same subscription, "Check now". Caps: live
+  checks 150 units a sub a day and 30% relay-wide. Units counted once the sign-in is at hand, before each call, in one
+  transaction (sub and relay-wide, totals and per call); a 401 keeps 1 unit and the retry counts again; over budget: no
+  call. Reserves: replies, timers and moderation stop at `limit − reserve` (300 a sub, or a fifth of a smaller budget;
+  10% relay-wide), reading and checks may use it; `youtube_quota` (non-blocking, `reset_at`, `relay_wide`) clears on the
+  first pass after the reset; Google's own `quotaExceeded` stops every call until midnight Pacific (US DST rules, computed
+  by hand), kept in `bot_kv` `yt_google_out` across restarts. Timers on YouTube: at most one post per 15 min
+  (`YOUTUBE_CLOUD_TIMER_GAP_MIN`, 0 = off). Lease: the engine sends `lease: 2`; a frame with `platforms` but no `lease`
+  (a PC before M12) covers YouTube too. WebSub (PubSubHubbub push on the channel's uploads feed) is not built: it fires
+  on a new or scheduled video, not the go-live moment, and needs a public callback route, hub verification, an HMAC
+  secret and 5-day lease renewal per channel; a follow-up as one more free wake signal. Replies, timers, dedupe, echo, 20/min, counters
+  and the ring are the Twitch/Kick path (`say` → `youtube::send`, 200 characters). Offline moderation: delete any time, ban /
+  timeout only while the relay has the live chat (409 `youtube_not_live`), 50 units each (429 `youtube_quota`);
+  `cloud_moderation.youtube`; the engine records YouTube's `cloud_moderation` items. Hourly sweep refreshes the sign-in (no
+  quota; refusal → `youtube_signed_out`, blocking); lapse revokes and forgets; refresh locks of subs without YouTube are
+  pruned each pass. Engine: `DesktopYoutube` (the Accounts sign-in
+  and live chat), `owner_token` for YouTube, `bot_seen {platforms incl. youtube, youtube_live}`. **Stored (privacy, R-51):**
+  the channel's id and title, the scope, the sealed refresh token (AAD `<sub>|bot_youtube_bot`), units per Pacific day per
+  call type (62 days); access token, live chat id and page token in memory only; chat never stored (the same 200-line ring).
+  **Follow-ups (owner):** create the Google project/OAuth client and consent screen (deploy/README.md); `youtube.force-ssl`
+  is sensitive: until Google verifies the app only up to 100 listed test users can sign in and their sign-ins expire after
+  7 days; submit for verification (privacy policy listing these items, demo video, domain in Search Console) and later the
+  YouTube API quota audit/extension. **Follow-ups (code):** bring-your-own Google project (not built: it needs per-sub
+  client credentials sealed and a second callback flow); a separate YouTube bot account; WebSub push as a wake signal
+  (above); the lease, ring and live chat id are per relay process; privacy/terms pages must list the new items before
+  sales open.
 
 ### F2. Dashboard from anywhere
 - Proxy to the PC when online; limited cloud mode (F1-backed) when offline.
@@ -496,7 +547,7 @@ M0 as built (19 Oct 2026):
 | M9 | Custom tip domain | B |
 | M10 | Offline remote mode (built 19 Oct) | A |
 | M11 | Weekly email | B |
-| M12 | YouTube cloud bot | A |
+| M12 | YouTube cloud bot (beta, built 19 Oct) | A |
 
 Ownership after M0: A owns `relay/src/{history,backups,remote,bot}`, `server/src/remote*`,
 `engine/{history,cloud_backup,cloud_bot,relay}.rs`; B owns `relay/src/{tips,tts,discord,mail}`,
