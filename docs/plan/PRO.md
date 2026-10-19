@@ -215,6 +215,51 @@ M0 as built (19 Oct 2026):
   dashboard (a version mismatch between the PC's engine and the phone's page is possible until the
   page is versioned); memory limit of the relay container (8 MB answers in flight); privacy/terms
   pages must list these items before sales open; offline mode (M10).
+- M10 as built (19 Oct 2026, API.md §9.5 Offline): relay `remote/offline.rs` (+ `offline_tests.rs`), `bot/moderate.rs`,
+  migration 11 (`remote_audit.source`, `pc`/`cloud`). With no tunnel, `proxy::api` hands the request (after the same
+  401/402/429/403/413 checks) to `offline::answer`: `GET /chat` from the cloud ring (`bot::recent_events`; each kept line
+  is now the mapped `Event` without `raw`, id `cl-<platform>-<message id>`, `seq` 0), `POST /mod/delete|timeout|ban` (the
+  PC's bodies; ban is this platform only) via `bot::moderate::run`, `GET /pro/history` (`history::phone_list`, owners;
+  added to `OWNER_ALLOWED` on the relay, the PC and in `packages/api`), `PUT /pro/bot/enabled` (`bot::phone_set_enabled`,
+  the same switch). Chat and moderation need `bot::cloud_state(sub).on` (switched on, Pro, a ready channel the relay has);
+  else 503 with the M6 message. Anything else: 503 `pc_offline` "Your streaming PC is off. Chat, bans and history still
+  work." when the cloud is on. **Moderation:** the opt-in is now real: `connect {account:"bot", moderation:true}` over a
+  channel without it re-runs the bot account's consent with the moderator scopes and keeps the channel (Twitch callback's
+  COALESCE; Kick's broker with `bot.m.`); Kick's opt-in asks `moderation:ban moderation:chat_message:manage` (an older
+  grant without the second can't delete: 403). Each action needs the scope for it (403 `needs_moderation_scope` with the
+  hint to turn the opt-in on), counts in the channel's 20 a minute (`bot_messages_<p>`, 429 `cloud_rate`) and in the
+  device's 20/s, and goes out behind the traits (`TwitchCloud::ban/delete_message` with the bot account's user token,
+  refreshed from the sealed refresh token, a rotated one sealed again, cached in memory an hour, one retry on 401;
+  `KickBot::ban/delete_message` with `kick::access`). Platform errors map to 403 `bot_not_moderator`, 422
+  `platform_refused`, 404 `message_not_found`/`viewer_not_found`, 409 `platform_busy`/`cloud_signed_out`, 429
+  `platform_rate`, 502 `platform_unreachable`, each with a hint; never a 500. Answered changes are audited with source
+  `cloud` (refusals once a minute, as online). **Live socket:** `remote {pc_online, role, cloud, cloud_paused}` on open,
+  tunnel up/down and when the switch changes (`remote::cloud_changed` from `set_enabled`); with the cloud on, a `resync`
+  after it; `bot::on_chat` hands each kept line to `remote::cloud_chat`, which sends it as the PC's `event` frame to the
+  subscription's phones whose PC has no tunnel (role-checked; a full queue closes 4408); a successful offline delete
+  sends `message_deleted`. Phone sockets now carry their subscription. Handover: the PC's return sends `remote
+  {pc_online:true}` and `live_open since 0` (the PC answers `hello` + `resync`), cloud lines stop; its loss sends `remote
+  {pc_online:false, cloud:true}` + `resync`. `/r/v1/me` adds `cloud`, `cloud_paused`, `cloud_moderation {twitch, kick}`
+  (on, opted in, every mod scope; `bot::can_moderate`) and `history`; so does the `remote` frame. Review fixes (19 Oct):
+  offline bans/timeouts are queued for the device's PC as link items `cloud_moderation` and recorded by the engine
+  (`Engine::apply_cloud_moderation`: ban list with `BanEntry.offline`, timeout count; no platform call; acked); 503
+  words by role and capability (`offline::offline_message`); `device_ok` refuses a device whose PC's Pro moved to
+  another subscription (401 `device_moved`, the socket closes 4401); one Twitch user-token refresh at a time per
+  subscription (`Runtime::twitch_lock`, cache re-checked under it), a fresh token refused too → `twitch_signed_out`;
+  "already banned/timed out" → success; field-only validation messages (≤ 200); `cl-` ids → 422 `invalid_message`;
+  phone sockets indexed by subscription (`remote::Runtime::phone_subs`, cleaned lazily); `history::phone_list` checks
+  `features.history`. Web: chat lines offer only what works (`lineActions`: Delete needs `source_id`, bans only where
+  `cloud_moderation`), `remoteConnect` keeps `cloudPaused`/`cloudModeration`/`history`, the gate reloads on any change,
+  limited → full runs `loadFull` (boot's load), History nav needs `history`, the strip's live region is the words only,
+  Chat's height from the measured header (`--fc-top`), e2e 375 px vertical-fit check. **Dashboard:** `boot.ts` opens a
+  limited connection when `me.cloud` (no gate), a module-level `remoteLink` (set at connect and by `remote` frames) drives
+  the client's new `guard` (`remoteOfflineGuard`: the relay's 503 words without a request), modes switch in place, the
+  gate gets "Switch cloud bot on" for owners when paused. **Stored (privacy, R-51):** nothing new about chat: the ring is
+  memory only (200 lines per channel, the mapped events without the platform payload, gone on restart, on switch-off and
+  on disconnect); the Twitch bot's access token for moderation lives in memory only (an hour); moderation bodies (ids,
+  reasons) are never stored or logged; audit lines gain only `source`. Follow-ups: unban, the ban list, held messages and
+  panic offline (need a cloud-side moderation log); `everywhere` bans offline would need linked identities on the relay;
+  YouTube moderation with M12; the ring and the Twitch user token are per relay process.
 
 ### F3. Premium TTS (Google Cloud TTS)
 - Relay `tts/{mod,fake,google}.rs`: `trait TtsProvider { fn voices(); async fn synthesize(text,
@@ -342,6 +387,47 @@ M0 as built (19 Oct 2026):
   (`tip_images`), one decode at a time, ≤ 4096 × 4096 pixels. Goal page `?overlay=1` for OBS.
   Follow-ups: lossless WebP keeps photos large (a 1500 × 500 banner can be ~1 MB; lossy WebP needs
   libwebp); privacy/terms pages must list the new stored items before sales open.
+- M9 as built (19 Oct 2026, API.md §9.2 "Your own address"): relay `tips/domains/{mod,hostname,cloudflare,proof,tests}.rs`,
+  migration 12 (`tip_domains`; M10 took 11, committed first; 12 has no dependency on M10's code). `trait CustomHostnames`
+  (boxed futures, like `Mailer`): `CloudflareHostnames` (`CF_SAAS_TOKEN` + `CF_ZONE_ID`, both or off; 10 s; HTTP DCV, DV,
+  TLS 1.2+, no `custom_metadata` (Enterprise only); 409/1406 → duplicate, hostname-specific 14xx 400/422 →
+  `Refused` (logged, streamer gets our words), zone-level (401/403, 7000/7003/1001/1003/auth codes, "not entitled/enabled",
+  404 on create) → `Zone` → 503 `domains_unavailable` logged once until a call works, 429/5xx/other → 502; token in `Debug`
+  redacted) and `FakeHostnames`. **Per-claim proof:** TXT `_ferrocast.<hostname>` = `ferrocast-proof-` + HMAC(install,
+  hostname) keyed by HKDF(`RELAY_VAULT_KEY`, own label; `bot::derive_key`), read over DNS-over-HTTPS (`trait ProofDns`:
+  `DohResolver` on `cloudflare-dns.com` JSON, 5 s; `FakeDns`), answers cached 30 s; live = Cloudflare active + TXT matches;
+  only the hourly sweep counts misses, 3 → `proof_missing` (not served) until found again. Without the vault key the
+  feature is off. Per install (its tip page), one per subscription, 100 on the relay (`Runtime` cap; only live + unfinished
+  younger than 7 days count), adds serialised by one async lock; a Cloudflare duplicate (found by exact name) is adopted
+  only when `_ferrocast.<hostname>` holds this install's proof right now, read fresh (only the DNS owner can publish
+  it); else 409 `domain_taken` "set up somewhere else on Cloudflare" with `proof {type,name,host,value}` in the body,
+  passed whole through the engine (`Engine::pro_call_passing`) and server, kept on the web `ApiError.body`, and shown
+  by the dashboard with copy buttons and Try again;
+  a failed DB save deletes the new hostname again. **Squatting:** a row not live 7 days after added/last live is deleted
+  (Cloudflare + DB) by the sweep; a PUT takes over a hostname whose row isn't live and is over 24 h old (the other's
+  Cloudflare hostname and row deleted; they just see no address). `quotas.tip_domain_changes` 10/day (adds refused over
+  it, removals counted but never refused). Status `pending | verifying | live | failed | proof_missing`; GET checks at most
+  once a minute (a claim on `claimed_at`; `checked_at` moves only when Cloudflare answers). **Serving:**
+  `route_custom_hosts`, a `from_fn_with_state` layer on the whole router, fails closed: Ferrocast's hosts (relay, tip,
+  remote and their registrable domains, `*.clearcraftlabs.com`, IPs, single labels, `localhost`; computed once, `OnceLock`
+  in `Runtime`, warmed in `main.rs`) pass untouched; a live address gets `/`, `/goal`, `/t/a/*` only; every other host gets
+  "Not set up yet" (404, script-free) on every path; no/unreadable `Host` (HTTP/2 `:authority` used) → plain 400. Host
+  cache: generation counter (a lookup stores only if no change came in between), addresses 30 s in one bounded map
+  (pending evicted before live), unknown hosts 5 s in another. The sweep re-checks every row, live ones too.
+  Validation: punycode via `url::Host`, apex by the full PSL (`psl` crate, ICANN + private: `github.io`, `pages.dev`,
+  wildcard rules), each Unicode label single-script and not confusable (UTS #39 skeleton, `unicode-security`) with our
+  domains' names (`clearcraftlabs`); `hostname_unicode` shown. **Lapse:** 7 days after the hourly `tips::sweep` first sees
+  it, then deleted from Cloudflare (kept on a Cloudflare error) and the DB; shorter than the 30 days for other data because
+  a hostname is a shared, capped slot and keeps serving a page. Engine/server `/api/v1/pro/tips/domain` pass the relay's
+  200/201 through (`Engine::pro_call_status`; new codes added to the engine's known list); remote: owner phones may GET
+  only (`OWNER_ALLOWED` on relay, PC and web). Web: the dashboard polls every 15 s while pending/verifying and the panel is
+  visible, shows both records with copy buttons (the TXT as a required step), "Checked … ago" at every width, and only
+  warns for an obvious bare domain (the relay judges). Deploy: `pro-keys.sh --domains`, carried by `deploy-relay.sh`;
+  README has the owner's Cloudflare steps incl. the TXT proof. **Stored (privacy, R-51):** hostname, Cloudflare id and
+  statuses, optional TXT records and messages, the proof's last-seen time and miss count, dates; nothing about visitors. Follow-ups: the tunnel's catch-all must point at the relay (deploy/README.md)
+  and be checked with a real address; a stuck `failed` address can only be removed and re-added
+  (a Cloudflare "retry validation" PATCH could come later); rotating `RELAY_VAULT_KEY` changes every TXT value;
+  privacy/terms pages must list the hostname before sales open.
 
 ### F7. Stream history and reports
 - Engine `history.rs` uploads recap totals at stream end and a 5-minute viewer sample while
@@ -408,7 +494,7 @@ M0 as built (19 Oct 2026):
 | M7 | Cloud bot Twitch + Kick + lease | A |
 | M8 | Discord go-live + perks | B |
 | M9 | Custom tip domain | B |
-| M10 | Offline remote mode | A |
+| M10 | Offline remote mode (built 19 Oct) | A |
 | M11 | Weekly email | B |
 | M12 | YouTube cloud bot | A |
 
