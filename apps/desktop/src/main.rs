@@ -333,6 +333,26 @@ async fn start(dir: &std::path::Path) -> Result<Running, String> {
     Ok(Running { engine, base: server.base_url(), token: server.sessions.desktop_token().to_string() })
 }
 
+/// Only web pages leave the app; `file:`, `javascript:` and custom schemes never do.
+fn is_web(u: &tauri::Url) -> bool {
+    matches!(u.scheme(), "http" | "https")
+}
+
+/// What the window does with a navigation: `(load it here, open it in the browser)`.
+/// The window only ever shows our dashboard; links to the web open in the browser. A pair
+/// link links a browser, never this window: "Open in browser" makes one.
+fn navigation(u: &tauri::Url, origin: &str) -> (bool, bool) {
+    let ours = u.as_str().starts_with(&format!("{origin}/"));
+    let pair = ours && u.fragment().is_some_and(|f| f.starts_with("pair="));
+    (ours && !pair, (!ours || pair) && is_web(u))
+}
+
+fn open_in_browser(app: &AppHandle, u: &tauri::Url) {
+    if let Err(e) = app.opener().open_url(u.as_str(), None::<&str>) {
+        tracing::warn!(error = %e, "couldn't open the browser");
+    }
+}
+
 /// Shows the main window, creating it if it was never opened.
 fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -352,20 +372,27 @@ fn show_window(app: &AppHandle) {
     let script = format!("window.__FERROCAST__ = Object.freeze({{ api: {api}, token: {token}, desktop: true }});");
     let origin = running.base.clone();
     let opener = app.clone();
+    let popup_opener = app.clone();
     let built = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
         .title("Ferrocast")
         .inner_size(1240.0, 800.0)
         .min_inner_size(380.0, 600.0)
         .initialization_script(&script)
         .on_navigation(move |u| {
-            // The window only ever shows our dashboard; links to the web open in the browser.
-            let ours = u.as_str().starts_with(&format!("{origin}/"));
-            // A pair link links a browser, never this window: "Open in browser" makes one.
-            let pair = ours && u.fragment().is_some_and(|f| f.starts_with("pair="));
-            if (!ours || pair) && matches!(u.scheme(), "http" | "https") {
-                let _ = opener.opener().open_url(u.as_str(), None::<&str>);
+            let (allow, browser) = navigation(u, &origin);
+            if browser {
+                open_in_browser(&opener, u);
             }
-            ours && !pair
+            allow
+        })
+        // `target="_blank"` links and `window.open` ask for a new window. The webview makes
+        // none on its own (the click simply did nothing, 1.0.0), so web pages go to the
+        // browser and the window stays the dashboard.
+        .on_new_window(move |u, _features| {
+            if is_web(&u) {
+                open_in_browser(&popup_opener, &u);
+            }
+            tauri::webview::NewWindowResponse::Deny
         })
         .build();
     if let Err(e) = built {
@@ -449,4 +476,44 @@ fn show_startup_error(app: &AppHandle, message: &str) {
         .inner_size(520.0, 220.0)
         .initialization_script(format!("window.addEventListener('DOMContentLoaded', () => {{ {html} }});"))
         .build();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "http://127.0.0.1:7878";
+
+    fn nav(u: &str) -> (bool, bool) {
+        navigation(&u.parse().unwrap(), BASE)
+    }
+
+    #[test]
+    fn the_dashboard_loads_in_the_window() {
+        assert_eq!(nav("http://127.0.0.1:7878/app/"), (true, false));
+        assert_eq!(nav("http://127.0.0.1:7878/app/#/alerts"), (true, false));
+    }
+
+    #[test]
+    fn web_pages_go_to_the_browser() {
+        assert_eq!(nav("https://www.twitch.tv/activate"), (false, true));
+        assert_eq!(nav("https://rzp.io/rzp/abc"), (false, true));
+        // Another port on the same host is not ours.
+        assert_eq!(nav("http://127.0.0.1:7879/app/"), (false, true));
+        // A look-alike that starts with our origin but goes to another host.
+        assert_eq!(nav("http://127.0.0.1:7878@evil.test/app/"), (false, true));
+    }
+
+    #[test]
+    fn a_pair_link_opens_in_the_browser() {
+        assert_eq!(nav("http://127.0.0.1:7878/app/?browser=1#pair=abc"), (false, true));
+    }
+
+    #[test]
+    fn other_schemes_never_leave_the_app() {
+        assert_eq!(nav("file:///etc/passwd"), (false, false));
+        assert_eq!(nav("javascript:alert(1)"), (false, false));
+        assert!(!is_web(&"mailto:a@b.c".parse().unwrap()));
+        assert!(is_web(&"https://example.com".parse().unwrap()));
+    }
 }
