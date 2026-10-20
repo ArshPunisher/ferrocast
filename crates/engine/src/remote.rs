@@ -140,12 +140,24 @@ impl Engine {
         v.detail = detail;
     }
 
-    async fn remote_wanted(&self) -> bool {
+    pub(crate) async fn remote_wanted(&self) -> bool {
         let saved = self.db(|s| repo::settings::get::<Saved>(s, SAVE_KEY)).await.ok().flatten().unwrap_or_default();
-        saved.wanted && self.pro_has(|f| f.remote).await
+        saved.wanted && self.remote_allowed().await
     }
 
-    async fn set_remote_wanted(&self, wanted: bool) {
+    /// Whether this PC may open the tunnel: Pro with the feature, or signed in to any
+    /// Ferrocast account (free accounts get the web dashboard, ACCOUNTS.md §7). The relay
+    /// checks again (402 otherwise).
+    pub(crate) async fn remote_allowed(&self) -> bool {
+        self.account_signed_in() || self.pro_has(|f| f.remote).await
+    }
+
+    /// Look again at whether the tunnel should be open (signed in or out, Pro changed).
+    pub(crate) fn remote_wake(&self) {
+        self.inner.remote.wake.notify_one();
+    }
+
+    pub(crate) async fn set_remote_wanted(&self, wanted: bool) {
         let saved = Saved { wanted };
         if let Err(e) = self.db(move |s| repo::settings::set(s, SAVE_KEY, &saved)).await {
             tracing::warn!(error = %e, "couldn't save the remote tunnel setting");
@@ -364,7 +376,7 @@ impl Engine {
             self.set_remote_wanted(true).await;
         }
         v["tunnel"] = json!(self.remote_tunnel_view());
-        v["available"] = json!(self.pro_has(|f| f.remote).await);
+        v["available"] = json!(self.remote_allowed().await);
         Ok(v)
     }
 

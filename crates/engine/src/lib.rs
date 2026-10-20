@@ -315,6 +315,7 @@ impl Engine {
         tokio::spawn(discord::run(engine.clone()));
         engine.load_cloud_bot().await;
         tokio::spawn(cloud_bot::run(engine.clone()));
+        tokio::spawn(ferro_account::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)

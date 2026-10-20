@@ -155,7 +155,7 @@ impl Engine {
         }
     }
 
-    async fn handle_relay_item(&self, kind: &str, payload: &Value) {
+    pub(crate) async fn handle_relay_item(&self, kind: &str, payload: &Value) {
         match kind {
             "kick_event" => {
                 // Queued before a disconnect: Kick is gone now, so drop it.
@@ -181,6 +181,13 @@ impl Engine {
             "bot_counter" => self.apply_cloud_counter(payload).await,
             // A phone banned or timed out someone through the cloud bot while this PC was off.
             "cloud_moderation" => self.apply_cloud_moderation(payload).await,
+            // The web dashboard asked for this PC (ACCOUNTS.md §7): open the tunnel, without
+            // Pro too while signed in to an account.
+            "remote_wanted" => {
+                if self.remote_allowed().await {
+                    self.set_remote_wanted(true).await;
+                }
+            }
             other => tracing::debug!(kind = other, "ignored a relay item"),
         }
     }

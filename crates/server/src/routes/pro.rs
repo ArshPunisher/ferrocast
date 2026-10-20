@@ -25,6 +25,8 @@ pub async fn refresh(State(app): State<AppState>) -> Json<Value> {
 #[derive(Debug, Deserialize)]
 pub struct Checkout {
     plan: String,
+    /// Optional while signed in to a Ferrocast account (its email is used).
+    #[serde(default)]
     email: String,
     /// A discount code (optional).
     #[serde(default)]
@@ -39,6 +41,12 @@ pub async fn checkout(State(app): State<AppState>, Body(b): Body<Checkout>) -> A
             "invalid_plan",
             "Pick the monthly or the yearly plan.",
         ));
+    }
+    let mut b = b;
+    if b.email.trim().is_empty()
+        && let Some(e) = app.engine.account_email().await
+    {
+        b.email = e;
     }
     if b.email.trim().is_empty() || b.email.len() > 254 {
         return Err(ApiError::new(
@@ -108,10 +116,14 @@ pub struct SignIn {
     label: Option<String>,
 }
 
-/// `GET /pro/account`: the Ferrocast account on this PC (ACCOUNTS.md §5): `state` is
+/// `GET /pro/account?refresh=1`: the Ferrocast account on this PC (ACCOUNTS.md §5): `state` is
 /// `signed_out`, `pending` (the browser is open), `signed_in` or `disabled`.
-pub async fn account(State(app): State<AppState>) -> Json<Value> {
-    Json(app.engine.account_status().await)
+pub async fn account(
+    State(app): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let refresh = q.get("refresh").is_some_and(|v| v == "1" || v == "true");
+    Json(app.engine.account_status(refresh).await)
 }
 
 /// `POST /pro/account/sign-in {label?}` → 201 `{url, expires_at}` to open in the browser.
@@ -343,7 +355,8 @@ mod tests {
             .await;
         assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (422, Some("invalid_plan")));
         let (s, v) = w.call(reqwest::Method::POST, "/pro/checkout", Some(json!({ "plan": "monthly" }))).await;
-        assert_eq!(s, 400, "a missing field: {v}");
+        // Not signed in to an account: the email is needed (422, not a bare 400).
+        assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (422, Some("invalid_email")), "{v}");
         let (s, v) = w
             .call(
                 reqwest::Method::POST,

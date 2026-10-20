@@ -413,11 +413,17 @@ impl Engine {
             return view(cached.unwrap_or_else(ProStatus::none), false, Some("This build has no relay set up.".into()));
         }
         let path = if refresh { "/v1/pro/status?refresh=1" } else { "/v1/pro/status" };
+        if refresh {
+            self.account_refresh_soon();
+        }
         match self.pro_call(reqwest::Method::GET, path, None).await {
             Ok(v) => match serde_json::from_value::<ProStatus>(v.clone()) {
                 Ok(s) => {
                     let warning = v["warning"].as_str().map(String::from);
-                    view(self.pro_remember(s).await, false, warning)
+                    let out = view(self.pro_remember(s).await, false, warning);
+                    // Pro changed may open or close the tunnel.
+                    self.remote_wake();
+                    out
                 }
                 Err(_) => self.pro_offline(cached, "the relay sent an answer Ferrocast can't read"),
             },
@@ -500,6 +506,8 @@ impl Engine {
             body["code"] = json!(c);
         }
         let v = self.pro_call(reqwest::Method::POST, "/v1/pro/checkout", Some(body)).await?;
+        // Signed in: the relay attached the subscription to the account (its install link).
+        self.account_refresh_soon();
         let url = v["checkout_url"].as_str().unwrap_or("");
         if !url.starts_with("https://") {
             return Err(unreachable("it sent no checkout link"));
@@ -514,6 +522,7 @@ impl Engine {
     /// the checkout that follows.
     pub async fn pro_redeem(&self, code: &str) -> Result<Value, EngineError> {
         let v = self.pro_call(reqwest::Method::POST, "/v1/pro/redeem", Some(json!({ "code": code.trim() }))).await?;
+        self.account_refresh_soon();
         if v["kind"] == "discount" {
             return Ok(json!({ "kind": "discount", "code": v["code"], "percent_off": v["percent_off"],
                               "applies_period": v["applies_period"], "prices": v["prices"] }));
