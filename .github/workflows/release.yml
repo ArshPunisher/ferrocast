@@ -134,6 +134,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           OS_NAME: ${{ matrix.name }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          # The bundler skips the Finder step on CI (CI=true), and that step is what sets
+          # the DMG's background and icon places: 1.0.0 opened as a plain white window.
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
         working-directory: apps/desktop
         # Updater bundles are signed only here, where the key exists; local builds skip them.
         # RPM refuses a '-' in the version, so betas (0.1.0-beta.1) ship AppImage and .deb only.
@@ -142,6 +145,21 @@ jobs:
           if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           cargo tauri build ${{ matrix.args }} $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
+      - name: Check the install window
+        if: matrix.name == 'macOS'
+        shell: bash
+        # Finder writes .DS_Store (background, window size, icon places) only when its
+        # step ran; without it the DMG opens as a plain white window.
+        run: |
+          dmg=$(ls ${{ matrix.out }}/dmg/*.dmg)
+          mnt=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+          ok=true
+          for f in .background/background.tiff .DS_Store; do
+            if [[ ! -s "$mnt/$f" ]]; then echo "::error::the DMG has no $f"; ok=false; fi
+          done
+          hdiutil detach "$mnt" >/dev/null
+          $ok
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ferrocast-${{ matrix.name }}
