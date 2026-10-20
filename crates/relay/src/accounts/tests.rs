@@ -516,10 +516,41 @@ async fn forms_need_the_cookie_and_token_and_the_same_origin() {
         )
         .await;
     assert_eq!(r.status, 403, "another site");
+    let r = w
+        .req(
+            &mut b,
+            Method::POST,
+            "/login/email",
+            Some(&[("csrf", &token), ("email", "a@b.co")]),
+            &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+        )
+        .await;
+    assert_eq!(r.status, 403, "a null origin from another site");
+    let r = w
+        .req(
+            &mut b,
+            Method::POST,
+            "/login/email",
+            Some(&[("csrf", &token), ("email", "a@b.co")]),
+            &[("origin", "null")],
+        )
+        .await;
+    assert_eq!(r.status, 403, "a null origin nothing vouches for");
+    let r = w
+        .req(
+            &mut b,
+            Method::POST,
+            "/login/email",
+            Some(&[("csrf", &token), ("email", "a@b.co")]),
+            &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+        )
+        .await;
+    assert_eq!(r.status, 200, "our own page under no-referrer: Chrome posts Origin: null");
+    assert_eq!(w.mail.tried(), 1);
     let mut fresh = Browser::default();
     let r = w.req(&mut fresh, Method::POST, "/login/email", Some(&[("csrf", &token), ("email", "a@b.co")]), &[]).await;
     assert_eq!(r.status, 400, "no cookie");
-    assert_eq!(w.mail.tried(), 0);
+    assert_eq!(w.mail.tried(), 1, "only the good one sent");
 }
 
 #[tokio::test]

@@ -210,12 +210,16 @@ pub(crate) fn set_cookie(name: &str, value: &str, max_age_s: i64) -> HeaderValue
 
 /// A cross-site request is refused: `Origin`, when sent, must be the web host's, and
 /// `Sec-Fetch-Site`, when sent, same-origin (or `none`: typed in the address bar).
+/// Our pages send `Referrer-Policy: no-referrer`, so browsers post `Origin: null` from them:
+/// then `Sec-Fetch-Site: same-origin` must vouch for the request instead.
 pub(crate) fn same_origin(st: &AppState, headers: &HeaderMap) -> bool {
+    let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
     let origin_ok = match headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
         None => true,
+        Some("null") => site == Some("same-origin"),
         Some(o) => st.remote.cfg.origin.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(o)),
     };
-    let site_ok = match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+    let site_ok = match site {
         None => true,
         Some(s) => matches!(s, "same-origin" | "none"),
     };
