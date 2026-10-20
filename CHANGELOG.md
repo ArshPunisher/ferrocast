@@ -5,6 +5,16 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.3.0
+
+- Ferrocast accounts, free and optional. Sign in with Google or an email link from the bottom
+  of the sidebar. The app still works without one.
+- With an account, the web dashboard works from your phone or any browser, free.
+- Pro now belongs to your account: sign in on another PC and it's there (up to 3 PCs).
+- Get Pro opens a plans page inside the app; you pay in your browser and Pro turns on here.
+- A new Account page: your plan and renewal, billing, signed-in devices (sign out any of
+  them) and "Have a code?".
+
 ## 1.2.0
 
 - Have a Pro code? Enter it in Settings › Pro. A free-Pro code turns Pro on right away; a
