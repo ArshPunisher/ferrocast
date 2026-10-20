@@ -25,7 +25,7 @@ summary says what went live, or that the previous version was put back.
 | `docker-compose.yml` | server | Relay + `cloudflared`; the relay's image comes from `RELAY_IMAGE`/`RELAY_TAG` |
 | `relay-server-deploy.sh` | server (`/opt/ferrocast-relay/deploy.sh`) | Pull, switch, health check, rollback; the only thing the deploy key can run |
 | `deploy-relay.sh` | your Mac | First install, and changing config or secrets (`../secrets/relay.env`). Once GitHub deploys, it keeps the live version and never swaps in a local build |
-| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh`, `pro-keys.sh`, `pro-grant.sh` and `bot-check.sh` |
+| `relay-ci-setup.sh` | your Mac, once | Lets GitHub deploy (below), and installs `razorpay-keys.sh`, `vault-key.sh`, `pro-keys.sh`, `pro-grant.sh`, `bot-check.sh`, `relay-backup.sh` and `control-center-key.sh` |
 | `razorpay-keys.sh` | server (`/opt/ferrocast-relay/razorpay-keys.sh`) | Ferrocast Pro's Razorpay keys, plans, webhook secret, and the `PRO_SALES_OPEN` switch (below) |
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
@@ -36,6 +36,8 @@ summary says what went live, or that the previous version was put back.
 | `tests/pro-grant.test.sh` | CI, your Mac | Tests `pro-grant.sh` |
 | `bot-check.sh` | server (`/opt/ferrocast-relay/bot-check.sh`) | Read-only look at the Twitch cloud bot: conduit, shard, EventSub, channel rows (below) |
 | `tests/bot-check.test.sh` | CI, your Mac | Tests `bot-check.sh` |
+| `control-center-key.sh` | server (`/opt/ferrocast-relay/control-center-key.sh`) | The token the Control Center reads `/admin/v1/stats` with, in `relay.env` and TransformX's `.env.prod`, never shown (below) |
+| `tests/control-center-key.test.sh` | CI, your Mac | Tests `control-center-key.sh` |
 
 ## One-time setup for GitHub deploys
 
@@ -375,3 +377,25 @@ keeps the row, ended now, so the usual 30-day lapse rules tidy its data. The ins
 part before the dot of `relay-install` in the app's `secrets.json`
 (macOS: `~/Library/Application Support/Ferrocast/secrets.json`; never share the part after the dot).
 
+## The Control Center (ops.transformx.site)
+
+The owner's admin panel shows Ferrocast's numbers (installs, Pro subscriptions and MRR, Pro
+feature use, relay health, the last nightly backup) from `GET /admin/v1/stats`: aggregate
+counts only, never an install id, email, handle or tip amount (docs/API.md §9.9). It answers
+only inside the server, to a container on the relay's Docker network
+(`ferrocast-relay_ferrocast`, which the Control Center API joins in TransformX's
+`docker-compose.prod.yml`), with a bearer token:
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/control-center-key.sh'           # set it up (safe to run again)
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/control-center-key.sh --status'  # set, missing or different
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/control-center-key.sh --rotate'  # a new token on both sides
+```
+
+It makes 64 random hex characters on the server, writes them as `RELAY_ADMIN_TOKEN` in
+`relay.env` and as `FERROCAST_ADMIN_TOKEN` in `/opt/transformx/.env.prod` (both 0600, backed up
+first), restarts the relay and the Control Center API only if their file changed, then checks
+from inside the Control Center container that the relay answers 200. `deploy-relay.sh` keeps
+`RELAY_ADMIN_TOKEN`. Without it the endpoint answers 503 `admin_off` and the panel says so.
+The nightly backup writes its last good time into the relay's volume (`/data/backup-last-ok`),
+which the panel shows.

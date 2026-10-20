@@ -713,7 +713,7 @@ Data kept (R-51): subscription id, plan, status, period end, cancel/refund flags
 
 ## 9. Relay: Pro features
 
-Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. This is the contract each one follows as it ships; its routes are added as §9.x (§9.1 stream history, §9.2 tip branding, §9.3 cloud backups, §9.4 voices, §9.5 the dashboard from anywhere (online and, M10, offline), §9.6 the Discord bot, §9.7 the cloud bot and §9.8 the weekly email are built).
+Every Pro feature (docs/plan/PRO.md F1–F7) runs on the relay under `/v1/pro/<feature>/…` with the same install `Authorization` and error shape as §8. This is the contract each one follows as it ships; its routes are added as §9.x (§9.1 stream history, §9.2 tip branding, §9.3 cloud backups, §9.4 voices, §9.5 the dashboard from anywhere (online and, M10, offline), §9.6 the Discord bot, §9.7 the cloud bot and §9.8 the weekly email are built; §9.9 is the owner's stats, not a Pro feature).
 
 **The gate.** Every Pro feature route checks, first:
 
@@ -1200,3 +1200,54 @@ Data kept (R-51): the addresses only sealed with the vault (AES-256-GCM, AAD `su
 The relay's status, code, message and hint pass through (429 with `Retry-After`, 503 `mail_busy`), plus 502 `relay_unreachable`. A paired phone (§9.5): an owner may `GET` it (`OWNER_ALLOWED`); changing the address stays on the PC; a mod nothing.
 
 The dashboard (`#/history`, at the end of the history panel, shown when `features.weekly_email`): the day and time in the viewer's own time zone (from `next_at`, or the next 04:00 UTC on `day`); no address: "Your week, in your inbox", the address field and Save (a typo is caught before sending); pending: "Check your inbox", the hint, until when the link works (or that it expired), Resend (same session) and Change address, and it looks again every 10 s while visible; on: "Weekly email is on", "Every Sunday to a•••@gmail.com", the next date, Change address and Stop emails, plus "Waiting for n•••@… to be confirmed. Until then, reports keep going to a•••@…" with a new address pending; paused: "Emails paused" saying why (refused by the mail server, or "couldn't read the saved address") with Use another address / Save your address again. A hint the relay couldn't read shows as "your address". Errors show inline with their hint.
+
+### 9.9 The Control Center's stats (owner only)
+
+`crates/relay/src/admin.rs`. The owner's admin panel (ops.transformx.site, the separate Control Center repo) reads one route, server to server. **Aggregate counts only**: never an install id, subscription id, email or its hash, handle, server or channel name, token, or any tip amount.
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/admin/v1/stats` | `Authorization: Bearer <RELAY_ADMIN_TOKEN>` → `AdminStats`, `Cache-Control: no-store` |
+
+```ts
+interface AdminStats {
+  relay: { version: string; started_at: number /* ms */; uptime_seconds: number; now: number }
+  billing: { mode: "live" | "test" | null; sales_open: boolean }
+  features: Features                      // as /v1/pro/status features
+  installs: { total: number; active_7d: number; active_30d: number; new_7d: number; new_30d: number }
+  pro: {
+    active: number; monthly: number; yearly: number; other: number  // paying subscriptions with Pro now
+    cancelling: number                    // of those, set to stop at the period end
+    currency: "INR"; mrr_paise: number    // monthly × ₹199 + yearly × ₹1,999 / 12, rounded once
+    prices: { monthly: number; yearly: number }
+    new_this_month: number                // first charge in this UTC month
+    ended_this_month: number              // paid once, Pro stopped this UTC month (cancelled, refunded, renewals failed)
+    installs: number                      // installs on those subscriptions
+    comp: { active: number; installs: number }  // owner's test grants (pro-grant.sh), never in the numbers above
+  }
+  usage: {                                // only subscriptions with Pro now (test grants included)
+    tts: { month: string /* "2026-10" */; chars: number; requests: number; cap: number }
+    cloud_bot: { on: number; channels: number; twitch: number; kick: number; youtube: number }
+    discord: { guilds: number }
+    weekly_email: { opted_in: number }    // addresses confirmed and on
+    cloud_backups: { subscriptions: number }  // with a finished backup
+    remote: { devices: number }           // paired phones not expired
+    tips: { pages: number; branded: number; goals: number; goal_tips: number }  // counts, never amounts
+  }
+  backup: { last_ok_at: string | null }   // the nightly R2 backup's last good run (UTC), from /data/backup-last-ok
+}
+```
+
+Active installs: seen (any signed request) in the last 7 or 30 days, after the day they signed up. Pro uses the same rule as `/v1/pro/status` `pro` (§9).
+
+Errors, in the order they're checked:
+
+| Status | Code | When |
+|---|---|---|
+| 403 | `internal_only` | The request came through Cloudflare or another proxy (`CF-Connecting-IP`, `CF-Ray`, `CDN-Loop`, `X-Forwarded-For`, `Forwarded`), or from an address outside the server: the route answers only on the relay's Docker network (`http://ferrocast-relay:8787`). Doesn't count against the limit |
+| 429 | `rate_limited` | More than 60 requests in a minute, relay-wide. `Retry-After` (seconds) |
+| 503 | `admin_off` | `RELAY_ADMIN_TOKEN` isn't set, or is shorter than 32 characters; the hint names `control-center-key.sh` |
+| 401 | `unauthorized` | No bearer token, or the wrong one (SHA-256 of both compared in constant time). `WWW-Authenticate: Bearer` |
+| 503 | `storage` | The database couldn't be read |
+
+The token is made on the server by `deploy/control-center-key.sh` (deploy/README.md), which gives the Control Center the same value.
