@@ -40,10 +40,13 @@ Always `{"error": {"code": "...", "message": "...", "hint": "..." | null}}`, nev
 
 ## Privacy
 
-Ferrocast has no accounts. The relay never stores an email, only a keyed hash of the checkout
-email, so `email` is always `null` (with `email_on_file: true|false`). Install ids are shown
-masked (`"AbC1…"`); search accepts a full install id. A "user" is one Pro subscription
-(paid `sub_…` or free grant `comp_…`).
+The Pro tabs below are about subscriptions: the relay keeps only a keyed hash of the checkout
+email, so there `email` is always `null` (with `email_on_file: true|false`). Install ids are
+shown masked (`"AbC1…"`); search accepts a full install id. A "user" there is one Pro
+subscription (paid `sub_…` or free grant `comp_…`).
+
+Since 1.3 people may also have an **account** (free, Google or email sign-in, docs/ACCOUNTS.md).
+Accounts have a verified email, shown in the Accounts tab (§ Accounts at the end).
 
 ---
 
@@ -390,3 +393,87 @@ Optional `code` (a discount code). Answers as before plus `list_amount`, `sale`,
 Nothing new to configure: no new env vars. The relay's database migrates itself to v14 on
 start (a copy is taken first). Deploy as usual: after the "Build relay" workflow passes,
 `gh workflow run relay-deploy.yml` in the ferrocast repo.
+
+## Accounts (1.3)
+
+Code: `crates/relay/src/accounts/admin.rs`. Same access rules as everything above (Docker
+network only, bearer token, 60 a minute, `X-Admin-Email` on writes, every write in
+`admin_audit` as `account.grant`, `account.revoke`, `account.sign_out`, `account.disable`,
+`account.enable`). An account's id looks like `ac_0123…` (35 characters).
+
+### `GET /admin/v1/accounts?q=&plan=&status=&page=1&per_page=50`
+
+`q`: part of the email or name, or a full account id. `plan`: `pro` | `free` (Pro right now,
+paid or free grant). `status`: `active` | `disabled`. Newest first.
+
+```json
+{ "total": 1, "page": 1, "per_page": 50, "items": [ {
+  "id": "ac_…", "email": "asha@example.com", "name": "Asha", "avatar_url": "https://…" ,
+  "created_at": "2026-10-21T10:00:00Z", "last_seen_at": "2026-10-21T11:00:00Z",
+  "disabled": false, "disabled_at": null,
+  "plan": "pro", "pro_source": "subscription",
+  "providers": ["google", "email"], "pcs": 1, "sessions": 2 } ] }
+```
+
+`pro_source`: `subscription` | `grant` | `null`. `pcs`: signed-in PCs now; `sessions`: active sessions.
+
+### `GET /admin/v1/accounts/{id}`
+
+The list row plus:
+
+- `identities`: `[{ provider: "google"|"email", email, created_at, last_used_at }]`
+- `sessions` (last 50, newest use first): `[{ id, kind: "app"|"web", label, install: "AbC1…"|null,
+  created_at, last_used_at, expires_at, revoked_at, revoked_by: "user"|"admin:<email>"|null, active }]`
+- `installs` (PCs ever signed in): `[{ install: "AbC1…", first_at, last_at, signed_in }]`
+- `subscriptions` (paid, belonging to the account): `[{ id: "sub_…", plan, status, pro, current_end,
+  access_until, cancel_at_period_end, refunded_at, linked_by: "checkout"|"email_match", linked_at }]`
+- `grants` (free Pro given to the account): same fields plus `history` (as in Give Pro)
+- `codes_used`: `[{ code, kind, used_at }]` (by the account, its subscriptions or its PCs)
+
+404 `not_found` for an unknown id.
+
+### `POST /admin/v1/accounts/{id}/grant` `{ "days": 1..90, "note"? }` → 201
+
+Gives (or extends) free Pro to the account, capped at 90 days from now (like Give Pro on an
+install). It reaches the account's 3 most recently signed-in PCs and the web dashboard.
+
+```json
+{ "id": "comp_…", "account_id": "ac_…", "plan": "pro", "starts_at": "…", "ends_at": "…", "extended": false }
+```
+
+409 `has_subscription` when the account pays for Pro; 422 `invalid_days`, `invalid_text`.
+
+### `POST /admin/v1/accounts/{id}/revoke` → 200
+
+Ends the account's free Pro now: `{ "account_id", "revoked": ["comp_…"], "revoked_at" }`.
+409 `already_ended` when none is running (paid subscriptions are cancelled or refunded in Razorpay).
+
+### `POST /admin/v1/accounts/{id}/sign-out` → 200
+
+Ends every session (app and web) now: `{ "account_id", "sessions_ended": 2 }`. The account's
+PCs lose account Pro until they sign in again; their own subscriptions are untouched.
+
+### `POST /admin/v1/accounts/{id}/disable` `{ "reason"? }` / `POST …/enable` → 200
+
+Disable: signed out everywhere, sign-in refused (403 `account_disabled`), no account Pro on its
+PCs, the web dashboard refused. The app keeps working without the account. Enable undoes it
+(sessions stay ended). Both answer the list row.
+
+### `GET /admin/v1/accounts/stats?days=30`
+
+`days` 1..365 (the sign-up window).
+
+```json
+{
+  "accounts": { "total": 120, "active_7d": 40, "active_30d": 75, "disabled": 1 },
+  "signups": { "days": 30, "per_day": [ { "date": "2026-10-21", "count": 4 } ], "in_window": 37 },
+  "pro": { "accounts_pro_now": 12, "accounts_paying_now": 9 },
+  "conversion": { "paid_ever": 11, "rate_all_time": 0.0917, "window_signups": 37, "window_paid": 3,
+                  "rate_window": 0.0811 },
+  "now": "2026-10-21T12:00:00Z"
+}
+```
+
+`active_*`: used the app or the web within the days. `paid_ever`: accounts with a Razorpay
+subscription that was charged at least once. `rate_*`: a fraction (0..1, 4 decimals) or `null`
+with nothing to divide by. `per_day` has one entry per UTC day, oldest first, zeros included.

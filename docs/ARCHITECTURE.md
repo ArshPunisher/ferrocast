@@ -109,6 +109,8 @@ The same `server` + `engine` run multi-tenant behind the relay later (Pro). The 
 
 **Identity is the install, not an account.** The desktop already has a relay identity (`install_id` + `install_secret`, registered once, kept in the secret store). Pro hangs off that: no Ferrocast account, no password, no email login, no mail server to run. Checkout asks for one email, which goes to Razorpay's page for receipts and is kept by the relay only as an HMAC-SHA256 keyed with the server's `PRO_EMAIL_KEY` (also in the subscription's Razorpay notes, so a rebuilt relay database can still recover). Moving Pro to a new PC or a reinstall is **Restore**: the subscription id from Razorpay's email plus that email; both must match (one 404 for every mismatch, 5 tries an hour). Up to 3 installs share one subscription; restoring on a 4th drops the oldest. We chose this over email magic links because it needs no outgoing mail, stores no address, and works the same for streamers who never sign in anywhere (R-51); the cost is that a lost subscription id means asking support, who can find it in the Razorpay dashboard.
 
+**Since 1.3: optional accounts** (docs/ACCOUNTS.md). The app still needs none and an install that never signs in works exactly as above. An account (Google or an email link, no password) keeps a verified email address, a name and picture from Google, and hashed session tokens; it is needed for the web dashboard, and Pro bought while signed in (or whose checkout email matches) belongs to it and reaches the account's PCs.
+
 ```
 Settings › Pro ──/api/v1/pro──▶ engine (pro.rs) ──Bearer install──▶ relay /v1/pro/*
                                  remembers the last answer            │ create / fetch / cancel

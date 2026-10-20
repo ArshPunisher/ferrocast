@@ -87,8 +87,8 @@ Loopback redirect with PKCE (RFC 8252), on Mac, Windows and Linux alike, no deep
      "code_challenge_method": "S256", "state": "…", "label": "Studio PC" }
    ```
 
-   `redirect_uri` must be `http://127.0.0.1:<port>/…` or `http://[::1]:<port>/…` (or
-   `http://localhost:<port>/…`), no userinfo, no fragment, ≤ 512 chars; else 422
+   `redirect_uri` must be `http://127.0.0.1:<port>/…` or `http://localhost:<port>/…` (an
+   explicit port; no `[::1]`), no userinfo, no fragment, ≤ 512 chars; else 422
    `invalid_redirect`. `state` 8–128 URL-safe chars. `label` optional, ≤ 40 chars (default
    "Ferrocast app"). 10 starts an hour per install.
    → 201 `{ "flow_id": "af_…", "url": "https://remote.clearcraftlabs.com/login?flow=af_…", "expires_at": ms }`
