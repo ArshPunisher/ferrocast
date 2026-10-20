@@ -158,6 +158,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/manage", post(pro::manage))
         .route("/pro/cancel", post(pro::cancel))
         .route("/pro/restore", post(pro::restore))
+        .route("/pro/redeem", post(pro::redeem))
         .route("/pro/history", get(history::list))
         .route("/pro/history/export.csv", get(history::export))
         // Pro: the weekly email (see routes/weekly_email.rs)

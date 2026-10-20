@@ -68,6 +68,12 @@ pub struct ProStatus {
     pub sales_open: bool,
     #[serde(default)]
     pub prices: Option<Value>,
+    /// The prices without a sale (`{currency, monthly, yearly}`), when the relay says.
+    #[serde(default)]
+    pub list_prices: Option<Value>,
+    /// The live sale (`{name, headline, ends_at, was: {monthly?, yearly?}, …}`), if one is on.
+    #[serde(default)]
+    pub sale: Option<Value>,
     /// When the relay said this, by this computer's clock (ms).
     #[serde(default)]
     pub checked_at: i64,
@@ -92,6 +98,8 @@ impl ProStatus {
             installs: 0,
             sales_open: false,
             prices: None,
+            list_prices: None,
+            sale: None,
             checked_at: 0,
             features: ProFeatures::default(),
             quotas: Default::default(),
@@ -156,6 +164,15 @@ fn code(c: &str) -> &'static str {
         "billing_unavailable",
         "billing_misconfigured",
         "bad_json",
+        // Pro codes (ADMIN-API.md: /v1/pro/redeem and checkout's code).
+        "invalid_code",
+        "code_not_found",
+        "code_expired",
+        "code_used_up",
+        "already_redeemed",
+        "grant_code",
+        "code_not_for_plan",
+        "code_unusable",
         // Stream history (API.md §9.1).
         "invalid",
         "invalid_range",
@@ -468,16 +485,35 @@ impl Engine {
     }
 
     /// Starts checkout: the link to Razorpay's page, to open in the browser.
-    pub async fn pro_checkout(&self, plan: &str, email: &str) -> Result<Value, EngineError> {
-        let v = self
-            .pro_call(reqwest::Method::POST, "/v1/pro/checkout", Some(json!({ "plan": plan, "email": email })))
-            .await?;
+    pub async fn pro_checkout(&self, plan: &str, email: &str, code: Option<&str>) -> Result<Value, EngineError> {
+        let mut body = json!({ "plan": plan, "email": email });
+        if let Some(c) = code.map(str::trim).filter(|c| !c.is_empty()) {
+            body["code"] = json!(c);
+        }
+        let v = self.pro_call(reqwest::Method::POST, "/v1/pro/checkout", Some(body)).await?;
         let url = v["checkout_url"].as_str().unwrap_or("");
         if !url.starts_with("https://") {
             return Err(unreachable("it sent no checkout link"));
         }
         Ok(json!({ "checkout_url": url, "subscription_id": v["subscription_id"], "plan": v["plan"],
-                   "amount": v["amount"], "currency": v["currency"] }))
+                   "amount": v["amount"], "list_amount": v["list_amount"], "currency": v["currency"],
+                   "code_applied": v["code_applied"].as_bool().unwrap_or(false) }))
+    }
+
+    /// Redeems a Pro code. A grant code gives free Pro: `{kind: "grant", status, redeemed}`.
+    /// A discount code changes nothing yet: `{kind: "discount", code, percent_off, prices}`, for
+    /// the checkout that follows.
+    pub async fn pro_redeem(&self, code: &str) -> Result<Value, EngineError> {
+        let v = self.pro_call(reqwest::Method::POST, "/v1/pro/redeem", Some(json!({ "code": code.trim() }))).await?;
+        if v["kind"] == "discount" {
+            return Ok(json!({ "kind": "discount", "code": v["code"], "percent_off": v["percent_off"],
+                              "applies_period": v["applies_period"], "prices": v["prices"] }));
+        }
+        let redeemed = v["redeemed"].clone();
+        let s: ProStatus =
+            serde_json::from_value(v).map_err(|_| unreachable("it sent an answer Ferrocast can't read"))?;
+        let view = view(self.pro_remember(s).await, false, None);
+        Ok(json!({ "kind": "grant", "status": view, "redeemed": redeemed }))
     }
 
     /// A short-lived link to the relay's manage page (status, stop renewing).

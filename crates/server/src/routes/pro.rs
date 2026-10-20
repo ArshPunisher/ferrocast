@@ -26,6 +26,9 @@ pub async fn refresh(State(app): State<AppState>) -> Json<Value> {
 pub struct Checkout {
     plan: String,
     email: String,
+    /// A discount code (optional).
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// `POST /pro/checkout {plan, email}` → 201 `{checkout_url, …}` to open in the browser.
@@ -44,7 +47,10 @@ pub async fn checkout(State(app): State<AppState>, Body(b): Body<Checkout>) -> A
             "Add the email for Razorpay's receipts.",
         ));
     }
-    let v = app.engine.pro_checkout(&b.plan, &b.email).await?;
+    if b.code.as_ref().is_some_and(|c| c.len() > 64) {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_code", "That code is too long."));
+    }
+    let v = app.engine.pro_checkout(&b.plan, &b.email, b.code.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
 
@@ -57,6 +63,23 @@ pub async fn manage(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<
 pub async fn cancel(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     let v = app.engine.pro_cancel().await?;
     Ok(Json(serde_json::to_value(v).unwrap_or(Value::Null)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Redeem {
+    code: String,
+}
+
+/// `POST /pro/redeem {code}`: a grant code gives free Pro; a discount code says what it
+/// takes off, for checkout.
+pub async fn redeem(State(app): State<AppState>, Body(b): Body<Redeem>) -> ApiResult<Json<Value>> {
+    if b.code.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_code", "Type the code first."));
+    }
+    if b.code.len() > 64 {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_code", "That code is too long."));
+    }
+    Ok(Json(app.engine.pro_redeem(&b.code).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +121,7 @@ mod tests {
         http: reqwest::Client,
         rzp: FakeRazorpay,
         engine: Engine,
+        relay_db: std::sync::Arc<ferrocast_relay::Db>,
         _dirs: (tempfile::TempDir, tempfile::TempDir),
     }
 
@@ -126,6 +150,7 @@ mod tests {
         };
         let state = ferrocast_relay::AppState::new(cfg, ferrocast_relay::Db::open(&rdir.path().join("r.db")).unwrap())
             .with_billing(billing);
+        let relay_db = state.db.clone();
         let rapp = ferrocast_relay::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
         if relay_up {
             tokio::spawn(async move { axum::serve(rl, rapp).await });
@@ -146,6 +171,7 @@ mod tests {
             http: reqwest::Client::new(),
             rzp,
             engine,
+            relay_db,
             _dirs: (dir, rdir),
         }
     }
@@ -179,6 +205,49 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), 200);
         }
+    }
+
+    fn add_code(w: &World, code: &str, kind: &str) {
+        use ferrocast_relay::billing::codes::CodeRow;
+        let grant = kind == "grant";
+        w.relay_db
+            .add_code(&CodeRow {
+                code: code.into(),
+                kind: kind.into(),
+                days: grant.then_some(7),
+                percent_off: (!grant).then_some(30),
+                applies_period: None,
+                max_uses: None,
+                valid_until: None,
+                active: true,
+                note: None,
+                created_by: "owner@example.com".into(),
+                created_at: 1,
+                used: 0,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn codes_redeem_through_the_dashboard_and_a_discount_reaches_checkout() {
+        let w = world(true, true).await;
+        add_code(&w, "FRIENDS", "grant");
+        add_code(&w, "SAVE30", "discount");
+        let (s, v) = w.call(reqwest::Method::POST, "/pro/redeem", Some(json!({ "code": "save30" }))).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!((v["kind"].as_str(), v["prices"]["monthly"]["amount"].as_i64()), (Some("discount"), Some(13_900)));
+        let body = json!({ "plan": "monthly", "email": "a@b.co", "code": "SAVE30" });
+        let (s, v) = w.call(reqwest::Method::POST, "/pro/checkout", Some(body)).await;
+        assert_eq!(s, 201, "{v}");
+        assert_eq!((v["amount"].as_i64(), v["code_applied"].as_bool()), (Some(13_900), Some(true)));
+        let (s, v) = w.call(reqwest::Method::POST, "/pro/redeem", Some(json!({ "code": "NOPE1" }))).await;
+        assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (404, Some("code_not_found")), "{v}");
+        let (s, v) = w.call(reqwest::Method::POST, "/pro/redeem", Some(json!({ "code": "FRIENDS" }))).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!((v["kind"].as_str(), v["status"]["active"].as_bool()), (Some("grant"), Some(true)));
+        let (_, v) = w.call(reqwest::Method::GET, "/pro", None).await;
+        assert_eq!(v["active"], true, "the redeemed Pro is remembered");
+        assert_eq!(v["prices"]["monthly"], 19_900);
     }
 
     #[tokio::test]
