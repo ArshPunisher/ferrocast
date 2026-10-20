@@ -26,6 +26,11 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-20 (built-in sounds for 1.1)
+- `BuiltinSound` gains the owner-approved Crystal (Sparkle, Glint, Cascade, Bloom, Lift, Tally, Halo, Droplet) and Felt (Kalimba, Marimba, Glow, Ember, Pebble, Feather, Hearth, Wink) sets and `sparkle_classic`; Chime, Coin, Whoosh, Boing and Bass stay valid so saved designs load (the overlay plays Glint, Tally, Lift, Droplet, Ember for them).
+- A rule variation's `sound` may be `builtin:<id>` (`alert::BUILTIN_SOUND_PREFIX`), passed through to the overlay. New installs' default rules start with their kind's sound (`alert::default_sound`, owner's decision); saved rules never change (`alert_rules_seeded`).
+- Tests: every sound id round-trips, `airhorn` is refused; default rules carry their sounds into the rendered alert. API.md §3 and §4 updated.
+
 ### 2026-10-20 (1.0.0 bug fixes from the owner's Mac test)
 - Links to the web did nothing in the Mac app (Open twitch.tv/activate, Open Razorpay checkout, tip and goal pages): the webview makes no window for `target="_blank"`/`window.open`, and the window had no new-window handler. `on_new_window` now opens http(s) pages in the default browser through the opener and denies the window; the navigation rule is a tested function (`navigation`, `is_web`). The dashboard opens every web link through one helper (ferrocast-web `lib/external.ts`).
 - The DMG opened as a plain white window: tauri-bundler skips the Finder AppleScript (background, window size, icon places) when `CI=true`. The release job sets `TAURI_BUNDLER_DMG_IGNORE_CI=true` and fails the macOS build when the DMG lacks `.background/background.tiff` or Finder's `.DS_Store`. Checked locally by running the bundler's `bundle_dmg` with our settings (background fits the 660×448 window); the next tagged build confirms it on GitHub's runner.
