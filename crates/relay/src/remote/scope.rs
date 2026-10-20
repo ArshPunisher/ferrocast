@@ -103,8 +103,8 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Media uploads (the tip page's avatar and banner too).
     ("POST", "/media"),
     ("*", "/tips/brand/*"),
-    // Installing an update from a phone.
-    ("*", "/updates/install"),
+    // Checking, installing or restarting for an update from a phone (reading it is fine).
+    ("*", "/updates/*"),
     // The live socket has its own route on the relay, never a request frame.
     ("*", "/live"),
 ];
@@ -403,6 +403,8 @@ mod tests {
             ("POST", "/backups/b1/restore"),
             ("POST", "/media"),
             ("POST", "/updates/install"),
+            ("POST", "/updates/check"),
+            ("POST", "/updates/restart"),
             ("GET", "/live"),
             ("PATCH", "/settings"),
         ] {
