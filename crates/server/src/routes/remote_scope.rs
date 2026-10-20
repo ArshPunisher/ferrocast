@@ -186,11 +186,15 @@ pub const MOD_FRAMES: &[&str] = &["hello", "resync", "status", "event", "held", 
 
 /// Whether a live frame (`{ v, type, data }`, as text) may go to `role`.
 pub fn live_frame_allowed(role: Role, frame: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else { return role == Role::Owner };
+    let ty = v["type"].as_str().unwrap_or("");
+    // The Ferrocast account (email, sessions) stays on the PC, like its `/pro/account` routes.
+    if ty == "account" {
+        return false;
+    }
     if role == Role::Owner {
         return true;
     }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else { return false };
-    let ty = v["type"].as_str().unwrap_or("");
     match ty {
         "event" => v.pointer("/data/kind/type").and_then(|t| t.as_str()).is_some_and(|k| MOD_EVENT_KINDS.contains(&k)),
         // Only the panic notice; others can name accounts, files or settings.
@@ -350,6 +354,9 @@ mod tests {
         assert!(live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"panic"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"account:twitch"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"queue","data":{}}"#));
+        // The Ferrocast account (an email) never leaves the PC, not even to the owner's phone.
+        assert!(!live_frame_allowed(Role::Owner, r#"{"v":1,"type":"account","data":{"state":"signed_in"}}"#));
+        assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"account","data":{}}"#));
         assert!(!live_frame_allowed(Role::Mod, "not json"));
     }
 }
