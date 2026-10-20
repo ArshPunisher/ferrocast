@@ -26,6 +26,10 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-20 (1.0.0 bug fixes from the owner's Mac test)
+- Links to the web did nothing in the Mac app (Open twitch.tv/activate, Open Razorpay checkout, tip and goal pages): the webview makes no window for `target="_blank"`/`window.open`, and the window had no new-window handler. `on_new_window` now opens http(s) pages in the default browser through the opener and denies the window; the navigation rule is a tested function (`navigation`, `is_web`). The dashboard opens every web link through one helper (ferrocast-web `lib/external.ts`).
+- The DMG opened as a plain white window: tauri-bundler skips the Finder AppleScript (background, window size, icon places) when `CI=true`. The release job sets `TAURI_BUNDLER_DMG_IGNORE_CI=true` and fails the macOS build when the DMG lacks `.background/background.tiff` or Finder's `.DS_Store`. Checked locally by running the bundler's `bundle_dmg` with our settings (background fits the 660×448 window); the next tagged build confirms it on GitHub's runner.
+
 ### 2026-10-19 (Pro carry-over and Discord perks at lapse)
 - A new subscription bought within 30 days of a lapse (same install in `pro_install_subs`, same checkout email, never a `comp_` grant) takes over the old one's history, finished backups (files copied), cloud bot (sign-ins re-sealed), Discord server, weekly email (address re-sealed) and phones, in one transaction (`billing/carry.rs`, migration 13); perk roles now come off at the first hourly sweep after Pro ends (grants kept as `paused_at`) and go back on when Pro returns.
 
