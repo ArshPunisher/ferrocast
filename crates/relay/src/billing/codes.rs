@@ -330,9 +330,11 @@ mod tests {
     #[test]
     fn discount_uses_count_paid_and_recent_checkouts_only() {
         let (_d, db) = db_with(&["i1", "i2"]);
-        let now = now_ms();
         db.add_code(&code("SAVE20", "discount", Some(5), None)).unwrap();
         db.add_pro_sub("sub_A", "monthly", "eh", "created", "i1").unwrap();
+        // Read after the checkout is stamped: on Windows the clock moves in ~15 ms steps, so a
+        // `now` taken first can fall before the checkout's own time.
+        let now = now_ms();
         db.note_code_use("SAVE20", "i1", "sub_A", now).unwrap();
         assert_eq!(db.code("SAVE20", now).unwrap().unwrap().used, 1, "a fresh checkout holds a use");
         let later = now + super::super::CHECKOUT_EXPIRES_S * 1000 + 1;
