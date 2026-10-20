@@ -72,6 +72,11 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// The relay-wide monthly character cap.
+    pub(crate) fn global_cap(&self) -> i64 {
+        self.global_monthly
+    }
+
     pub(crate) fn new(provider: Option<Arc<dyn TtsProvider>>, global_monthly: i64) -> Runtime {
         Runtime { provider, global_monthly: global_monthly.clamp(0, MAX_GLOBAL_MONTHLY), ..Runtime::default() }
     }

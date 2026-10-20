@@ -286,7 +286,7 @@ async fn refresh(st: &AppState, id: &str) -> Result<Option<SubRow>, ApiError> {
 
 /// Which Pro features work on this server: built and configured (the dashboard shows a Pro
 /// panel only for these). Each feature module answers for itself.
-fn features(st: &AppState) -> Value {
+pub(crate) fn features(st: &AppState) -> Value {
     json!({
         "cloud_bot": crate::bot::available(st),
         "remote": crate::remote::available(st),

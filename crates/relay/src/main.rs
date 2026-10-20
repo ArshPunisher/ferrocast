@@ -117,8 +117,21 @@ async fn main() {
             None
         }
     };
-    let state =
-        AppState::new(cfg, db).with_billing(billing_cfg).with_vault(vault).with_blobs(blobs).with_tts(tts, tts_cap);
+    let admin = ferrocast_relay::admin::AdminConfig::from_env(&data);
+    match admin.state() {
+        "on" => tracing::info!("the Control Center's admin stats are on"),
+        "too_short" => tracing::error!(
+            min = ferrocast_relay::admin::MIN_TOKEN_LEN,
+            "RELAY_ADMIN_TOKEN is too short: the admin stats are off (run control-center-key.sh --rotate)"
+        ),
+        _ => tracing::warn!("RELAY_ADMIN_TOKEN not set: the Control Center's admin stats are off"),
+    }
+    let state = AppState::new(cfg, db)
+        .with_billing(billing_cfg)
+        .with_vault(vault)
+        .with_blobs(blobs)
+        .with_tts(tts, tts_cap)
+        .with_admin(admin);
     let remote_cfg = ferrocast_relay::remote::RemoteConfig::from_env();
     match (&remote_cfg.origin, remote_cfg.dashboard_dir.is_some()) {
         (Some(o), true) => tracing::info!(origin = %o, "the dashboard from anywhere is on"),

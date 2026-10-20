@@ -11,6 +11,7 @@
 //! `billing::gate` (402 without Pro), `vault` (encrypted secrets), `quota` (per-subscription
 //! counters) and `blob` (files).
 
+pub mod admin;
 pub mod backups;
 pub mod billing;
 pub mod blob;
@@ -115,6 +116,8 @@ pub struct AppState {
     pub(crate) bot: Arc<bot::Runtime>,
     /// Pro's custom tip addresses (off without `CF_SAAS_TOKEN` / `CF_ZONE_ID`).
     pub(crate) tip_domains: Arc<tips::domains::Runtime>,
+    /// The owner's read-only stats for the Control Center (`admin`; off without `RELAY_ADMIN_TOKEN`).
+    pub(crate) admin: Arc<admin::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -140,6 +143,7 @@ impl AppState {
             mail: Arc::default(),
             bot: Arc::default(),
             tip_domains: Arc::default(),
+            admin: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -212,6 +216,12 @@ impl AppState {
         cap: usize,
     ) -> AppState {
         self.tip_domains = Arc::new(tips::domains::Runtime::new(cf, dns, secret, cap));
+        self
+    }
+
+    /// The admin stats' token and backup marker (`admin::AdminConfig::from_env()` in production).
+    pub fn with_admin(mut self, cfg: admin::AdminConfig) -> AppState {
+        self.admin = Arc::new(admin::Runtime::new(cfg));
         self
     }
 
@@ -318,6 +328,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tts::routes())
         .merge(discord::routes())
         .merge(mail::routes())
+        .merge(admin::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
@@ -351,7 +362,7 @@ pub fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> std::net::I
     peer.ip()
 }
 
-fn is_private(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_private(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
         std::net::IpAddr::V6(v6) => {
