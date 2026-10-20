@@ -369,8 +369,22 @@ pub enum AnimIn {
     Flip,
     Wipe,
     Magnet,
+    // The motion designer's entrances (1.1): springs, impacts and particles, tuned by `Motion`.
+    Slam,
+    Elastic,
+    Bolt,
+    Glitch,
+    Portal,
+    Shatter,
+    Pour,
+    FlipShine,
+    ConfettiPop,
+    Dash,
+    Neon,
 }
 
+/// The entrances a scene layer can use (`config.anim.in`): the simple ones only. Alert looks
+/// also take the motion designer's (`AnimIn`).
 pub const ANIM_IN_NAMES: [&str; 12] =
     ["none", "fade", "rise", "drop", "slide_left", "slide_right", "zoom", "pop", "bounce", "flip", "wipe", "magnet"];
 
@@ -387,6 +401,16 @@ pub enum AnimOut {
     Shrink,
     Flip,
     Wipe,
+    // The motion designer's exits (1.1).
+    Dissolve,
+    BlackHole,
+    Zip,
+    Fold,
+    Shatter,
+    TvOff,
+    Fall,
+    Iris,
+    Glitch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,8 +421,18 @@ pub enum TextAnim {
     Wiggle,
     Bounce,
     Pop,
+    /// Typewriter: the letters type out behind a cursor (1.0's "type", now with the cursor).
     Type,
     Glow,
+    // The motion designer's text effects (1.1).
+    Cascade,
+    PopWave,
+    Decode,
+    Shine,
+    Neon,
+    Rgb,
+    Stretch,
+    Spin,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -413,6 +447,164 @@ pub struct Anim {
     /// The text appears this long after the alert starts coming in.
     #[serde(default)]
     pub text_delay_ms: u32,
+}
+
+/// What the alert does while it's on screen, between its entrance and its exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Idle {
+    #[default]
+    None,
+    Breathe,
+    Float,
+    Shimmer,
+    Glow,
+    Jelly,
+    Heartbeat,
+}
+
+/// The particles that fly when the alert lands. `Auto` uses the entrance's own (the simple
+/// entrances have none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Particles {
+    #[default]
+    Auto,
+    None,
+    Confetti,
+    Sparks,
+    Petals,
+    Coins,
+    Embers,
+    Stars,
+}
+
+/// The particles' colours. `Brand` takes the look's own colours; `Custom` uses `custom_color`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticleColors {
+    #[default]
+    Brand,
+    Rainbow,
+    Gold,
+    White,
+    Custom,
+}
+
+/// Where the card sits on the alert canvas: rows top, middle, bottom × columns left, centre,
+/// right. `mc` is the middle, where every 1.0 alert sat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Spot {
+    Tl,
+    Tc,
+    Tr,
+    Ml,
+    #[default]
+    Mc,
+    Mr,
+    Bl,
+    Bc,
+    Br,
+}
+
+/// The side a directional entrance (Elastic drop, Dash in, Flip and shine) or the Slide and
+/// blur exit uses. `Auto` lets each one pick its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    #[default]
+    Auto,
+    Top,
+    Left,
+    Right,
+    Bottom,
+}
+
+/// The recipe the motion came from, so the designer can show it; any change clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recipe {
+    Heavy,
+    Arcade,
+    Cyber,
+    Molten,
+    Storm,
+    Party,
+    Clean,
+}
+
+pub const MOTION_BOUNCE_MAX: u8 = 100;
+pub const MOTION_SPEED: (u16, u16) = (60, 160);
+pub const MOTION_STAGGER_MAX: u16 = 90;
+pub const MOTION_BPM: (u16, u16) = (70, 170);
+
+/// The motion designer's settings for a look (1.1). Looks saved before it have none and read
+/// as `Motion::default()`, which changes nothing about how they play: no idle loop, the card
+/// in the middle, and the 1.0 entrances carry no impacts or particles. Every field has a
+/// default, so a partial object from a newer build still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Motion {
+    pub idle: Idle,
+    pub particles: Particles,
+    pub colors: ParticleColors,
+    pub custom_color: String,
+    /// Spring bounce, 0 (firm) to 100 (springy).
+    pub bounce: u8,
+    /// Playback speed in percent, 60 (relaxed) to 160 (snappy).
+    pub speed: u16,
+    /// Milliseconds between letters for the per-letter text effects, 0 to 90.
+    pub stagger: u16,
+    pub shake: bool,
+    pub flash: bool,
+    pub vignette: bool,
+    pub zoom_punch: bool,
+    /// Bigger amounts shake harder, throw more particles and hit louder (`intensity`).
+    pub by_amount: bool,
+    pub position: Spot,
+    pub direction: Direction,
+    /// Short synthesised hits on each landing, at the look's sound volume. Off by default.
+    pub impact_sounds: bool,
+    /// Start a little later so the entrance's hit lands on a downbeat of the alert's sound.
+    pub beat: bool,
+    pub bpm: u16,
+    pub recipe: Option<Recipe>,
+}
+
+impl Default for Motion {
+    fn default() -> Self {
+        Motion {
+            idle: Idle::None,
+            particles: Particles::Auto,
+            colors: ParticleColors::Brand,
+            custom_color: "#ff5aa5".into(),
+            bounce: 45,
+            speed: 100,
+            stagger: 34,
+            shake: true,
+            flash: true,
+            vignette: true,
+            zoom_punch: true,
+            by_amount: true,
+            position: Spot::Mc,
+            direction: Direction::Auto,
+            impact_sounds: false,
+            beat: false,
+            bpm: 120,
+            recipe: None,
+        }
+    }
+}
+
+impl Motion {
+    fn validate(&self, path: &str) -> Check {
+        color(&format!("{path}.custom_color"), &self.custom_color)?;
+        within(&format!("{path}.bounce"), u32::from(self.bounce), 0, u32::from(MOTION_BOUNCE_MAX), "")?;
+        within(&format!("{path}.speed"), u32::from(self.speed), MOTION_SPEED.0.into(), MOTION_SPEED.1.into(), "%")?;
+        within(&format!("{path}.stagger"), u32::from(self.stagger), 0, u32::from(MOTION_STAGGER_MAX), " ms")?;
+        within(&format!("{path}.bpm"), u32::from(self.bpm), MOTION_BPM.0.into(), MOTION_BPM.1.into(), " BPM")
+    }
 }
 
 /// The overlay's built-in alert sounds (files in the overlay bundle). Chime, Coin, Whoosh,
@@ -499,6 +691,9 @@ pub struct AlertLook {
     #[serde(default)]
     pub outline: f32,
     pub anim: Anim,
+    /// Missing on looks saved before 1.1: they read as the default, which plays as before.
+    #[serde(default)]
+    pub motion: Motion,
     pub sound: Sound,
     pub duration_ms: u32,
     #[serde(default)]
@@ -843,6 +1038,7 @@ impl AlertLook {
         within(&format!("{path}.anim.in_ms"), self.anim.in_ms, 0, 3000, " ms")?;
         within(&format!("{path}.anim.out_ms"), self.anim.out_ms, 0, 3000, " ms")?;
         within(&format!("{path}.anim.text_delay_ms"), self.anim.text_delay_ms, 0, 10_000, " ms")?;
+        self.motion.validate(&format!("{path}.motion"))?;
         if let Some(r) = &self.sound.media_ref {
             media_ref(&format!("{path}.sound.ref"), r)?;
         }
@@ -962,6 +1158,67 @@ pub struct AlertDesignView {
     pub look: AlertLook,
     pub title_parts: Vec<TextPart>,
     pub body_parts: Vec<TextPart>,
+    /// How hard the alert lands when the look's `motion.by_amount` is on (`intensity_of`).
+    #[serde(default = "one")]
+    pub intensity: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+/// How hard a "Bigger tips hit harder" alert lands: 1 for a usual amount, down to 0.6 for a
+/// tenth of it and up to 2 for a hundred times it. Money is compared with a usual tip in its
+/// own currency, Bits, KICKs and Jewels with 500, a batch of gifts with 5. Other events
+/// (follows, subs, raids) are 1.
+pub fn intensity_of(event: &Event) -> f32 {
+    let (amount, usual) = match &event.kind {
+        EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } => {
+            (money.major(), usual_tip(&money.currency))
+        }
+        EventKind::PlatformGift { value, .. } => (value.amount as f64, 500.0),
+        EventKind::GiftBatch { count, .. } => (f64::from(*count), 5.0),
+        _ => return 1.0,
+    };
+    intensity_for(amount / usual)
+}
+
+/// `intensity_of` for an amount `ratio` times the usual one.
+pub fn intensity_for(ratio: f64) -> f32 {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return 1.0;
+    }
+    let l = ratio.log10();
+    let k = if l >= 0.0 { 1.0 + 0.5 * l } else { 1.0 + 0.4 * l };
+    k.clamp(0.6, 2.0) as f32
+}
+
+/// A usual tip in major units: about five US dollars, rounded to what people send.
+fn usual_tip(currency: &str) -> f64 {
+    match currency.to_ascii_uppercase().as_str() {
+        "INR" => 500.0,
+        "JPY" => 700.0,
+        "KRW" => 7000.0,
+        "IDR" => 80_000.0,
+        "VND" => 120_000.0,
+        "PHP" => 250.0,
+        "PKR" => 1400.0,
+        "BDT" => 600.0,
+        "THB" => 170.0,
+        "TWD" => 160.0,
+        "HUF" => 1800.0,
+        "CZK" => 110.0,
+        "TRY" => 170.0,
+        "RUB" => 450.0,
+        "MXN" => 90.0,
+        "BRL" => 25.0,
+        "ARS" => 5000.0,
+        "CLP" => 4500.0,
+        "COP" => 20_000.0,
+        "ZAR" => 90.0,
+        "NGN" => 7500.0,
+        _ => 5.0,
+    }
 }
 
 /// Variables shown in the highlight colour.
@@ -1033,6 +1290,7 @@ pub fn render_onto(alert: &mut RenderedAlert, design: &Design, key: EventKey, v:
         look: look.clone(),
         title_parts,
         body_parts,
+        intensity: intensity_of(event),
     });
 }
 
@@ -1115,6 +1373,7 @@ pub(crate) mod tests {
                 out_ms: 450,
                 text_delay_ms: 300,
             },
+            motion: Motion::default(),
             sound: Sound { media_ref: None, builtin: BuiltinSound::Chime, volume: 70 },
             duration_ms: 6000,
             tts: Tts { enabled: true, min_amount: 0.0 },
@@ -1355,6 +1614,13 @@ pub(crate) mod tests {
             (Box::new(|l| l.duration_ms = 1000), "look.duration_ms"),
             (Box::new(|l| l.tts.min_amount = -1.0), "look.tts.min_amount"),
             (Box::new(|l| l.css = "@import url(x);".into()), "look.css"),
+            (Box::new(|l| l.motion.bounce = 101), "look.motion.bounce"),
+            (Box::new(|l| l.motion.speed = 59), "look.motion.speed"),
+            (Box::new(|l| l.motion.speed = 161), "look.motion.speed"),
+            (Box::new(|l| l.motion.stagger = 91), "look.motion.stagger"),
+            (Box::new(|l| l.motion.bpm = 69), "look.motion.bpm"),
+            (Box::new(|l| l.motion.bpm = 171), "look.motion.bpm"),
+            (Box::new(|l| l.motion.custom_color = "url(x)".into()), "look.motion.custom_color"),
         ];
         for (f, field) in cases {
             let m = err(&with_tip_look(f));
@@ -1583,5 +1849,211 @@ pub(crate) mod tests {
         let a = render("a", &rule, &rule.variations[0], &e);
         assert!(a.design.is_none());
         assert!(!serde_json::to_string(&a).unwrap().contains("\"design\""), "the wire shape is unchanged");
+    }
+
+    // ------------------------------------------------------------- motion (1.1)
+
+    /// A look as 1.0 saved it: no `motion` key.
+    fn look_1_0() -> serde_json::Value {
+        let mut v = serde_json::to_value(look("{name} tipped")).unwrap();
+        v.as_object_mut().unwrap().remove("motion");
+        v
+    }
+
+    #[test]
+    fn a_1_0_look_reads_with_motion_that_changes_nothing() {
+        let v = look_1_0();
+        assert!(v.get("motion").is_none());
+        let l: AlertLook = serde_json::from_value(v).unwrap();
+        assert_eq!(l.motion, Motion::default());
+        assert_eq!(l.motion.idle, Idle::None, "no loop that 1.0 didn't have");
+        assert_eq!(l.motion.position, Spot::Mc, "the card stays in the middle");
+        assert!(!l.motion.impact_sounds, "impact hits are off by default");
+        assert!(!l.motion.beat);
+        assert_eq!(l.anim.enter, AnimIn::Magnet, "the entrance keeps its own id");
+        // Saved again it carries the motion block, and reads back the same.
+        let again = serde_json::to_value(&l).unwrap();
+        assert_eq!(again["motion"]["position"], "mc");
+        assert_eq!(serde_json::from_value::<AlertLook>(again).unwrap(), l);
+        let mut d = alert_design("d");
+        if let DesignContent::Alert(a) = &mut d.content {
+            a.events.get_mut(&EventKey::Tip).unwrap().variations[0].look = l;
+        }
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn the_shipped_fixture_from_1_0_still_reads_and_validates() {
+        let d: Design = serde_json::from_str(include_str!("../fixtures/designs/alert-design.json")).unwrap();
+        d.validate().unwrap();
+        let DesignContent::Alert(a) = &d.content else { panic!("alert") };
+        for looks in a.events.values() {
+            for v in &looks.variations {
+                assert_eq!(v.look.motion, Motion::default());
+            }
+        }
+    }
+
+    #[test]
+    fn every_1_0_animation_id_maps_to_itself() {
+        let ins = [
+            "none",
+            "fade",
+            "rise",
+            "drop",
+            "slide_left",
+            "slide_right",
+            "zoom",
+            "pop",
+            "bounce",
+            "flip",
+            "wipe",
+            "magnet",
+        ];
+        let outs = ["none", "fade", "sink", "lift", "slide_left", "slide_right", "zoom", "shrink", "flip", "wipe"];
+        let texts = ["none", "wave", "wiggle", "bounce", "pop", "type", "glow"];
+        for id in ins {
+            let a: AnimIn = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        for id in outs {
+            let a: AnimOut = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        for id in texts {
+            let a: TextAnim = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        assert_eq!(ANIM_IN_NAMES, ins, "scene layers keep the simple entrances only");
+    }
+
+    #[test]
+    fn the_motion_designers_ids_read_and_write() {
+        let ins = [
+            "slam",
+            "elastic",
+            "bolt",
+            "glitch",
+            "portal",
+            "shatter",
+            "pour",
+            "flip_shine",
+            "confetti_pop",
+            "dash",
+            "neon",
+        ];
+        let outs = ["dissolve", "black_hole", "zip", "fold", "shatter", "tv_off", "fall", "iris", "glitch"];
+        let texts = ["cascade", "pop_wave", "decode", "shine", "neon", "rgb", "stretch", "spin"];
+        for id in ins {
+            let a: AnimIn = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        for id in outs {
+            let a: AnimOut = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        for id in texts {
+            let a: TextAnim = serde_json::from_value(json!(id)).unwrap();
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(id));
+        }
+        for bad in ["Slam", "slam ", "", "flip-shine"] {
+            assert!(serde_json::from_value::<AnimIn>(json!(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_partial_motion_block_fills_the_rest_with_defaults() {
+        let mut v = look_1_0();
+        v["motion"] = json!({ "idle": "jelly", "position": "br", "recipe": "arcade" });
+        let l: AlertLook = serde_json::from_value(v).unwrap();
+        assert_eq!(l.motion.idle, Idle::Jelly);
+        assert_eq!(l.motion.position, Spot::Br);
+        assert_eq!(l.motion.recipe, Some(Recipe::Arcade));
+        assert_eq!(l.motion.bpm, 120);
+        assert_eq!(l.motion.speed, 100);
+        // Wrong types and unknown names are refused, not half-read.
+        for bad in [
+            json!({ "idle": "spin" }),
+            json!({ "position": "middle" }),
+            json!({ "bounce": -1 }),
+            json!({ "bpm": "fast" }),
+            json!({ "speed": 1e9 }),
+        ] {
+            let mut v = look_1_0();
+            v["motion"] = bad.clone();
+            assert!(serde_json::from_value::<AlertLook>(v).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn motion_edges_are_allowed() {
+        let d = with_tip_look(|l| {
+            l.motion = Motion {
+                bounce: 100,
+                speed: 160,
+                stagger: 90,
+                bpm: 170,
+                custom_color: "#ABCDEF".into(),
+                ..Motion::default()
+            };
+        });
+        d.validate().unwrap();
+        let d = with_tip_look(|l| {
+            l.motion = Motion { bounce: 0, speed: 60, stagger: 0, bpm: 70, ..Motion::default() };
+        });
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn intensity_follows_the_amount_on_a_log_scale() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        assert!(close(intensity_for(1.0), 1.0));
+        assert!(close(intensity_for(10.0), 1.5));
+        assert!(close(intensity_for(100.0), 2.0));
+        assert!(close(intensity_for(10_000.0), 2.0), "capped");
+        assert!(close(intensity_for(0.1), 0.6));
+        assert!(close(intensity_for(0.0001), 0.6), "floored");
+        for odd in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert!(close(intensity_for(odd), 1.0), "{odd}");
+        }
+        assert!(close(intensity_of(&live("follow", Platform::Twitch)), 1.0));
+    }
+
+    #[test]
+    fn tips_compare_with_a_usual_tip_in_their_own_currency() {
+        let tip = |minor: i64, cur: &str| {
+            let mut e = live("tip", Platform::Twitch);
+            if let EventKind::Tip { money, .. } = &mut e.kind {
+                *money = Money::new(minor, cur);
+            }
+            intensity_of(&e)
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(close(tip(50_000, "INR"), 1.0), "₹500");
+        assert!(close(tip(5_000_000, "INR"), 2.0), "₹50,000");
+        assert!(close(tip(5_000, "INR"), 0.6), "₹50");
+        assert!(close(tip(500, "USD"), 1.0), "$5");
+        assert!(close(tip(500, "usd"), 1.0), "case doesn't matter");
+        assert!(close(tip(700, "JPY"), 1.0), "¥700 (no minor unit)");
+    }
+
+    #[test]
+    fn the_overlay_gets_the_intensity_and_old_views_read_as_one() {
+        let d = alert_design("d");
+        let mut e = live("tip", Platform::Twitch);
+        if let EventKind::Tip { money, .. } = &mut e.kind {
+            *money = Money::new(5_000_000, "INR");
+        }
+        let (key, v) = pick(&d, &e).unwrap();
+        let rules = crate::alert::default_rules();
+        let (rule, var) = select(&rules, &e).unwrap();
+        let mut a = render("a1", rule, var, &e);
+        render_onto(&mut a, &d, key, v, &e);
+        let view = a.design.clone().unwrap();
+        assert!((view.intensity - 2.0).abs() < 1e-3);
+        let mut j = serde_json::to_value(&view).unwrap();
+        j.as_object_mut().unwrap().remove("intensity");
+        let back: AlertDesignView = serde_json::from_value(j).unwrap();
+        assert!((back.intensity - 1.0).abs() < f32::EPSILON);
     }
 }
