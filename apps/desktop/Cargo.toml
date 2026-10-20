@@ -34,5 +34,10 @@ tauri-plugin-updater = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 
+[dev-dependencies]
+# A mock app runs the real updater plugin against local feeds (main.rs tests).
+tauri = { version = "2", features = ["tray-icon", "test"] }
+base64 = "0.22"
+
 [lints]
 workspace = true

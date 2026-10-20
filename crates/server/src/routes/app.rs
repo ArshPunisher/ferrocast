@@ -45,24 +45,30 @@ pub async fn session_stats(State(app): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// Update state (API-REQUESTS R9): what the desktop found in the signed update feed. The
-/// dashboard must never offer an update while `blocked_while_live` (R-60).
-pub async fn updates(State(app): State<AppState>) -> Json<Value> {
-    let found = app.engine.available_update();
-    Json(json!({
-        "current": env!("CARGO_PKG_VERSION"),
-        "latest": found.as_ref().map(|u| u.version.clone()),
-        // Read-only: the installed build decides (a prerelease reads the beta feed).
-        "channel": ferrocast_engine::update_channel(env!("CARGO_PKG_VERSION")),
-        "blocked_while_live": app.engine.update_blocked(),
-        "notes_url": found.and_then(|u| u.notes_url),
-    }))
+/// Update state (API-REQUESTS R9): what the desktop found in the signed update feed, when
+/// it last looked, what went wrong and how an install is going. The dashboard must never
+/// offer an update while `blocked_while_live` (R-60).
+pub async fn updates(State(app): State<AppState>) -> Json<ferrocast_engine::UpdateView> {
+    Json(app.engine.update_view())
 }
 
-/// `POST /updates/install`: the desktop downloads, verifies and installs it, then restarts.
+/// `POST /updates/check`: "Check for updates". Answers with the result once the desktop
+/// has it (or, after a while, `checking: true`; the live `update` frame brings the rest).
+pub async fn check_updates(State(app): State<AppState>) -> ApiResult<Json<ferrocast_engine::UpdateView>> {
+    Ok(Json(app.engine.check_for_updates(ferrocast_engine::CHECK_WAIT).await?))
+}
+
+/// `POST /updates/install`: the desktop downloads it, checks its signature and installs it;
+/// the restart waits for `POST /updates/restart`.
 pub async fn install_update(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
     let update = app.engine.request_update_install().await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "installing": update.version }))))
+}
+
+/// `POST /updates/restart`: "Restart to finish", never while live (R-60).
+pub async fn restart_for_update(State(app): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
+    let version = app.engine.request_update_restart()?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "restarting": version }))))
 }
 
 /// First run is finished: the dashboard stops showing onboarding (API-REQUESTS R10).

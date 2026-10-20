@@ -1211,41 +1211,54 @@ async fn starter_commands_are_added_once() {
     assert_eq!(all.as_array().unwrap().len(), 4);
 }
 
+async fn go_live(r: &Running, on: bool) {
+    use ferrocast_core::event::{Event, EventKind, Millis, Platform};
+    let kind = if on { EventKind::StreamOnline { title: None } } else { EventKind::StreamOffline };
+    r.engine.ingest(Event::live(Platform::Twitch, Some(format!("live-{on}")), Millis(i64::from(on)), kind)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while r.engine.is_live() != on && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(r.engine.is_live(), on);
+}
+
+fn found(version: &str) -> ferrocast_engine::AvailableUpdate {
+    ferrocast_engine::AvailableUpdate {
+        version: version.into(),
+        notes_url: Some("https://example.com/notes".into()),
+        notes: Some("- Faster alerts".into()),
+        published_at: Some("2026-10-20T11:16:05Z".into()),
+    }
+}
+
 #[tokio::test]
 async fn updates_are_offered_only_when_found_and_never_while_live() {
-    use ferrocast_core::event::{Event, EventKind, Millis, Platform};
     let r = start().await;
     let none: Value = r.get("/api/v1/updates").await.json().await.unwrap();
     assert_eq!(none["latest"], Value::Null);
+    assert_eq!(none["checked_at"], Value::Null, "not checked yet is not the same as up to date");
+    assert_eq!((none["checking"].as_bool(), none["can_install"].as_bool()), (Some(false), Some(false)));
+    assert_eq!(none["install"]["phase"], "idle");
     let nothing = r.post("/api/v1/updates/install", json!({})).await;
     assert_eq!(error_code(nothing).await, (StatusCode::NOT_FOUND, "no_update".into()));
 
-    r.engine.set_available_update(Some(ferrocast_engine::AvailableUpdate {
-        version: "9.9.9".into(),
-        notes_url: Some("https://example.com/notes".into()),
-    }));
+    r.engine.attach_updater();
+    r.engine.set_available_update(Some(found("9.9.9")));
     let found: Value = r.get("/api/v1/updates").await.json().await.unwrap();
     assert_eq!((found["latest"].as_str(), found["blocked_while_live"].as_bool()), (Some("9.9.9"), Some(false)));
+    assert_eq!((found["notes"].as_str(), found["can_install"].as_bool()), (Some("- Faster alerts"), Some(true)));
+    assert!(found["checked_at"].as_i64().is_some());
     let no_token = r.client.post(format!("{}/api/v1/updates/install", r.base)).send().await.unwrap();
     assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
 
     // Live, with "never update while live" on by default: the update waits.
-    r.engine
-        .ingest(Event::live(Platform::Twitch, Some("on".into()), Millis(0), EventKind::StreamOnline { title: None }))
-        .await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !r.engine.is_live() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    go_live(&r, true).await;
     let live: Value = r.get("/api/v1/updates").await.json().await.unwrap();
     assert_eq!(live["blocked_while_live"], true);
     let blocked = r.post("/api/v1/updates/install", json!({})).await;
-    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    assert_eq!(error_code(blocked).await, (StatusCode::CONFLICT, "live".into()));
 
-    r.engine.ingest(Event::live(Platform::Twitch, Some("off".into()), Millis(1), EventKind::StreamOffline)).await;
-    while r.engine.is_live() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    go_live(&r, false).await;
     let ok = r.post("/api/v1/updates/install", json!({})).await;
     assert_eq!(ok.status(), StatusCode::ACCEPTED);
     let v: Value = ok.json().await.unwrap();
@@ -1255,6 +1268,112 @@ async fn updates_are_offered_only_when_found_and_never_while_live() {
     let before =
         backups.as_array().unwrap().iter().find(|b| b["reason"] == "update").expect("a backup before the update");
     assert_eq!(before["version"], env!("CARGO_PKG_VERSION"));
+    // A second click while it downloads starts nothing.
+    let twice = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(error_code(twice).await, (StatusCode::CONFLICT, "update_busy".into()));
+}
+
+#[tokio::test]
+async fn an_install_shows_progress_then_waits_for_the_restart_never_while_live() {
+    let r = start().await;
+    let mut live = r.engine.subscribe_live();
+    let early = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(error_code(early).await, (StatusCode::CONFLICT, "no_updater".into()));
+    r.engine.attach_updater();
+    let not_ready = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(error_code(not_ready).await, (StatusCode::CONFLICT, "not_ready".into()));
+
+    r.engine.set_available_update(Some(found("9.9.9")));
+    assert_eq!(r.post("/api/v1/updates/install", json!({})).await.status(), StatusCode::ACCEPTED);
+    r.engine.update_progress("9.9.9", 512, Some(2048));
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(
+        v["install"],
+        json!({ "phase": "downloading", "version": "9.9.9", "downloaded": 512, "total": 2048, "error": null })
+    );
+    r.engine.update_installing("9.9.9");
+    r.engine.update_ready("9.9.9");
+    // A check after the install doesn't take the "restart" away.
+    r.engine.set_available_update(None);
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!((v["install"]["phase"].as_str(), v["latest"].as_str()), (Some("ready"), Some("9.9.9")));
+    let again = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(error_code(again).await, (StatusCode::CONFLICT, "restart_needed".into()));
+
+    go_live(&r, true).await;
+    let while_live = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(error_code(while_live).await, (StatusCode::CONFLICT, "live".into()));
+    go_live(&r, false).await;
+    let restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(restart.status(), StatusCode::ACCEPTED);
+    assert_eq!(restart.json::<Value>().await.unwrap()["restarting"], "9.9.9");
+    // The shell's wait wakes up.
+    tokio::time::timeout(std::time::Duration::from_secs(1), r.engine.update_restart_requested()).await.unwrap();
+
+    // Every change went out on the live socket as an `update` frame.
+    let mut phases = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        let v: Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "update" {
+            phases.push(v["data"]["install"]["phase"].as_str().unwrap().to_string());
+        }
+    }
+    phases.dedup();
+    assert_eq!(phases, ["idle", "downloading", "installing", "ready"]);
+}
+
+#[tokio::test]
+async fn check_for_updates_asks_the_desktop_and_says_what_went_wrong() {
+    let r = start().await;
+    // The headless app has no updater: say where to download instead.
+    let headless = r.post("/api/v1/updates/check", json!({})).await;
+    let (status, body) = (headless.status(), headless.json::<Value>().await.unwrap());
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("no_updater")));
+    assert!(body["error"]["hint"].as_str().unwrap().contains("ferrocast.clearcraftlabs.com"));
+
+    r.engine.attach_updater();
+    // A fake desktop shell: offline the first time, then it finds 9.9.9.
+    let shell = r.engine.clone();
+    tokio::spawn(async move {
+        shell.update_check_requested().await;
+        shell.update_check_started();
+        shell.update_checked(Err(ferrocast_engine::UpdateProblem::new(
+            "offline",
+            "Ferrocast couldn't reach the update server.",
+            "Check that this computer is online.",
+        )));
+        shell.update_check_requested().await;
+        shell.update_checked(Ok(Some(found("9.9.9"))));
+    });
+    let first: Value = r.post("/api/v1/updates/check", json!({})).await.json().await.unwrap();
+    assert_eq!(first["error"]["code"], "offline");
+    assert_eq!((first["latest"].as_str(), first["checking"].as_bool()), (None, Some(false)));
+    assert!(first["checked_at"].as_i64().is_some());
+    let second: Value = r.post("/api/v1/updates/check", json!({})).await.json().await.unwrap();
+    assert_eq!((second["latest"].as_str(), second["error"].is_null()), (Some("9.9.9"), true));
+    // An offline check later keeps the release it found, and says why this one failed.
+    r.engine.update_checked(Err(ferrocast_engine::UpdateProblem::new("offline", "x", "y")));
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!((v["latest"].as_str(), v["error"]["code"].as_str()), (Some("9.9.9"), Some("offline")));
+}
+
+#[tokio::test]
+async fn a_failed_install_says_why_and_can_be_tried_again() {
+    let r = start().await;
+    r.engine.attach_updater();
+    r.engine.set_available_update(Some(found("9.9.9")));
+    assert_eq!(r.post("/api/v1/updates/install", json!({})).await.status(), StatusCode::ACCEPTED);
+    r.engine.update_install_failed(ferrocast_engine::UpdateProblem::new(
+        "bad_signature",
+        "The download failed its signature check, so it was not installed.",
+        "Try again later.",
+    ));
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(
+        (v["install"]["phase"].as_str(), v["install"]["error"]["code"].as_str()),
+        (Some("failed"), Some("bad_signature"))
+    );
+    assert_eq!(r.post("/api/v1/updates/install", json!({})).await.status(), StatusCode::ACCEPTED, "try again");
 }
 
 #[tokio::test]

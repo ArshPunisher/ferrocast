@@ -40,7 +40,10 @@ mod starter;
 pub mod studio;
 mod timers;
 mod updates;
-pub use updates::{AvailableUpdate, update_channel};
+pub use updates::{
+    AvailableUpdate, CHECK_WAIT, CURRENT_VERSION, DOWNLOAD_URL, InstallPhase, InstallState, UpdateProblem, UpdateView,
+    update_channel,
+};
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
 mod weekly_email;
@@ -132,8 +135,12 @@ struct Inner {
     /// One stream-end flush at a time (never behind a perk upload).
     discord_ends_io: tokio::sync::Mutex<()>,
     /// What the update feed offers, as the desktop shell last saw it.
-    update: Mutex<Option<updates::AvailableUpdate>>,
+    update: Mutex<updates::UpdateState>,
+    /// Finished update checks, for `POST /updates/check` to wait on.
+    update_checks: tokio::sync::watch::Sender<u64>,
     install_update: Notify,
+    check_update: Notify,
+    restart_update: Notify,
     /// The import preview that can be applied, and one import step at a time.
     import: Mutex<import::Slot>,
     import_busy: tokio::sync::Mutex<()>,
@@ -264,8 +271,11 @@ impl Engine {
                 discord_pro: Mutex::new(Default::default()),
                 discord_pro_io: tokio::sync::Mutex::new(()),
                 discord_ends_io: tokio::sync::Mutex::new(()),
-                update: Mutex::new(None),
+                update: Mutex::new(Default::default()),
+                update_checks: tokio::sync::watch::Sender::new(0),
                 install_update: Notify::new(),
+                check_update: Notify::new(),
+                restart_update: Notify::new(),
                 import: Mutex::new(None),
                 import_busy: tokio::sync::Mutex::new(()),
                 streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),

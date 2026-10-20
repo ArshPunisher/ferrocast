@@ -1,0 +1,31 @@
+{
+  "version": "1.0.1",
+  "notes": "See the release notes on GitHub.",
+  "pub_date": "2026-10-20T11:16:05Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ21vMk8vNnlIZ0FHZUV2d05wd2tDSXhtcWRLWDcwbHlVQkVXSHk0bURYNndCZTB4eUlPQjJyUDNjZ1ZMMGVFWk91ODBkVmRjY0FuV3NxTnpHT0p2V3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0ODYzCWZpbGU6RmVycm9jYXN0LmFwcC50YXIuZ3oJdmVyc2lvbjoxLjAuMQozeDJkQmtmaW9GdG9ER1g3dGwwNlE0citrQjhFd2YvbksxUTZnNVlienk0MDlBeFFmaWlSams5Vzl1aGI4d1ZDd0UzdHF2RnBxTDJOSDBaaHFhOUNBUT09Cg==",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ21vMk8vNnlIZ0FHZUV2d05wd2tDSXhtcWRLWDcwbHlVQkVXSHk0bURYNndCZTB4eUlPQjJyUDNjZ1ZMMGVFWk91ODBkVmRjY0FuV3NxTnpHT0p2V3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0ODYzCWZpbGU6RmVycm9jYXN0LmFwcC50YXIuZ3oJdmVyc2lvbjoxLjAuMQozeDJkQmtmaW9GdG9ER1g3dGwwNlE0citrQjhFd2YvbksxUTZnNVlienk0MDlBeFFmaWlSams5Vzl1aGI4d1ZDd0UzdHF2RnBxTDJOSDBaaHFhOUNBUT09Cg==",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ294ejVRc2dRK0FTMSt0TVROU3loTCtyaEkrb2pHL1BtMkMwWWYzVTFkdVUzdmpKMnZjakovcmV4NEozOHdFMUt6SFNscDNzZUxXalFLN05Wa1VtbndBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0NTQyCWZpbGU6RmVycm9jYXN0XzEuMC4xX3g2NC1zZXR1cC5leGUJdmVyc2lvbjoxLjAuMQpwNzhiaXFhbXVLcS9qeHc4Sk5BL0R5MWQrZ3JHenhsRjdNTXdQaWdROForR0dPbUlCb08rVVMybDNPNVY1aVQxakplTzdWQ0JTdGU4c2E2cVUxbzZEQT09Cg==",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast_1.0.1_x64-setup.exe"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ3NScEFVVHlobnhVdStpMm5iSFBLZmlvcGZadHJycVFTZFE5TTZ1eHJsNEowUEVEL244TjFZSmhUYW5hd1BEcmJDczN4YlRzYVNCMm12N2ZldW1Cb3dBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0MjI0CWZpbGU6RmVycm9jYXN0XzEuMC4xX2FtZDY0LkFwcEltYWdlCXZlcnNpb246MS4wLjEKeW0xejJLK1dGendBL0c1WjdjaFAxKzh2RVlLcUFWd1dTTitsMElkVnRoVEU2T1Q2MlUyS2ZFLzJtcXNxTzk1MFlpV2UzbDhEK2xZUkxyVnFpbGlxQ3c9PQo=",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast_1.0.1_amd64.AppImage"
+    },
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ2tsQ2RVS3hueU5BbHFKQ3kzdHZFVk52TE1mNU5SdUY2c0Z2RHpQOC9MU0lxVFlMTG9WTHdNMHFyTDhFVUV5YnAyM0xWSE1JT2V4WmhJSDVTYVJuSUFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0MjI0CWZpbGU6RmVycm9jYXN0XzEuMC4xX2FtZDY0LmRlYgl2ZXJzaW9uOjEuMC4xClBleEFBbitUdEIvU2JzTDk4MkdFaXRoYzN3eVdaQXZSTFI4YW5mcitkTmlSaVRlRTQxemJSVUc5ZmlpdGpRRitoV1lsb3lQNEdzTU9NQWxVUzlLQ0RRPT0K",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast_1.0.1_amd64.deb"
+    },
+    "linux-x86_64-rpm": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSaFVMeEJUQjNLZ3VqUngyWVNaTHliL3BzdCtXVFFTNW9nN005WkltM2xMbVA4bFdIUDVtc2RQLzVObTRsWkxyY0VlTWt3VHN2UjU2ODJmbE1RZEZoTmxWRThEenFuU2d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDk0MjI0CWZpbGU6RmVycm9jYXN0LTEuMC4xLTEueDg2XzY0LnJwbQl2ZXJzaW9uOjEuMC4xCmFZSHlKeGJyM1Yvak5rNFZrK0plaEY0SWkzUHZmclhQejU5WmVOeHBsZDJsT2ZGTmFSSXR1bkhtd3R0Qm5SaVBmZS8xS0tLQ0NqMU1uNE1GQ3FlaEJBPT0K",
+      "url": "https://github.com/ArshPunisher/ferrocast/releases/download/v1.0.1/Ferrocast-1.0.1-1.x86_64.rpm"
+    }
+  }
+}

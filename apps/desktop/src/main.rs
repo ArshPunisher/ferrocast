@@ -109,7 +109,9 @@ fn main() {
             }
             tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
             tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
-            tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone()));
+            let pending = Pending::default();
+            tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
+            tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
             if !minimized {
                 show_window(app.handle());
@@ -156,13 +158,19 @@ fn shortcut_of(s: &str) -> Shortcut {
     s.parse().unwrap_or_else(|_| Shortcut::new(None, tauri_plugin_global_shortcut::Code::F24))
 }
 
-/// Applies the settings the shell owns whenever the dashboard changes them: launch at
-/// login, close to tray, and the panic hotkey (PanicConfig.hotkey).
-/// First check shortly after start, then every few hours.
-const UPDATE_FIRST: Duration = Duration::from_secs(90);
+/// The first check soon after start (the dashboard shows "checking" until then), then every
+/// few hours; a check that failed (offline at login, say) tries again sooner.
+const UPDATE_FIRST: Duration = Duration::from_secs(15);
 const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+const UPDATE_RETRY: Duration = Duration::from_secs(15 * 60);
+/// Download progress reaches the dashboard at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 /// Where to read about a release.
 const RELEASES_URL: &str = "https://github.com/ArshPunisher/ferrocast/releases";
+/// What latest.json says when a release has no notes of its own.
+const PLACEHOLDER_NOTES: &str = "See the release notes on GitHub.";
+/// Release notes longer than this are cut (the full text is on the release page).
+const NOTES_MAX: usize = 6_000;
 
 /// The signed feed for this build: a prerelease version reads the beta feed (betas and newer
 /// stable releases), a stable version only the stable one, so the installed build decides.
@@ -173,82 +181,262 @@ fn update_feed() -> Option<String> {
     }
 }
 
-async fn check_update(app: &AppHandle) -> Option<tauri_plugin_updater::Update> {
+/// A check gives up after this; a download after the long one (the plugin uses the same
+/// timeout for the whole download, body included).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+async fn check_update<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    timeout: Duration,
+) -> Result<Option<tauri_plugin_updater::Update>, tauri_plugin_updater::Error> {
     let mut builder = app.updater_builder();
-    if let Some(feed) = update_feed()
-        && let Ok(url) = feed.parse()
-    {
-        builder = match builder.endpoints(vec![url]) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "bad update feed");
-                return None;
-            }
-        };
+    if let Some(feed) = update_feed() {
+        let url = feed.parse().map_err(tauri_plugin_updater::Error::UrlParse)?;
+        builder = builder.endpoints(vec![url])?;
     }
-    match builder.build() {
-        Ok(updater) => match updater.check().await {
-            Ok(found) => found,
-            // No feed yet, offline, or a release without a manifest: nothing to offer.
-            Err(e) => {
-                tracing::debug!(error = %e, "update check failed");
-                None
+    builder.timeout(timeout).build()?.check().await
+}
+
+/// What the feed's notes say, as plain text, without the "see GitHub" placeholder.
+fn release_notes(body: Option<&str>) -> Option<String> {
+    let text = body?.trim();
+    if text.is_empty() || text == PLACEHOLDER_NOTES {
+        return None;
+    }
+    let mut out: String = text.chars().take(NOTES_MAX).collect();
+    if out.len() < text.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+fn found_update(u: &tauri_plugin_updater::Update) -> ferrocast_engine::AvailableUpdate {
+    ferrocast_engine::AvailableUpdate {
+        notes_url: Some(format!("{RELEASES_URL}/tag/v{}", u.version)),
+        notes: release_notes(u.body.as_deref()),
+        published_at: u.raw_json["pub_date"].as_str().map(str::to_string),
+        version: u.version.clone(),
+    }
+}
+
+/// An updater error in words the streamer can act on (never a raw Rust error alone).
+fn update_problem(e: &tauri_plugin_updater::Error) -> ferrocast_engine::UpdateProblem {
+    use ferrocast_engine::UpdateProblem as P;
+    use tauri_plugin_updater::Error as E;
+    const LATER: &str = "Try again in a few minutes. If it keeps happening, download the newest version from ferrocast.clearcraftlabs.com/download.";
+    match e {
+        E::Reqwest(r) if r.is_connect() || r.is_timeout() || r.is_request() => P::new(
+            "offline",
+            "Ferrocast couldn't reach the update server.",
+            "Check that this computer is online (and that a firewall or VPN allows github.com), then press Check for updates.",
+        ),
+        E::Reqwest(r) if r.is_decode() || r.is_body() => {
+            P::new("download_failed", "The download stopped part way.", "Check your connection, then try again.")
+        }
+        E::Reqwest(_) | E::Network(_) => P::new("download_failed", "The update server refused the download.", LATER),
+        E::ReleaseNotFound | E::Serialization(_) | E::Semver(_) | E::EmptyEndpoints | E::UrlParse(_) => {
+            P::new("feed_unavailable", "The update feed isn't available right now.", LATER)
+        }
+        E::TargetNotFound(_) | E::TargetsNotFound(_) | E::UnsupportedOs | E::UnsupportedArch => P::new(
+            "no_build",
+            "The newest release has no automatic update for this computer.",
+            "Download it from ferrocast.clearcraftlabs.com/download instead.",
+        ),
+        E::Minisign(_)
+        | E::Base64(_)
+        | E::SignatureUtf8(_)
+        | E::SignedVersionMismatch { .. }
+        | E::MissingSignedVersion => P::new(
+            "bad_signature",
+            "The download failed its signature check, so it was not installed. Nothing on this computer changed.",
+            "It may have been damaged on the way. Try again later; if it keeps happening, download from ferrocast.clearcraftlabs.com/download.",
+        ),
+        E::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => P::new(
+            "no_permission",
+            "Ferrocast isn't allowed to replace itself where it's installed.",
+            if cfg!(target_os = "macos") {
+                "Move Ferrocast into Applications (and open it from there), then try again."
+            } else {
+                "Install the update from ferrocast.clearcraftlabs.com/download with an account that may change the app."
+            },
+        ),
+        E::AuthenticationFailed => P::new(
+            "install_failed",
+            "The password prompt was cancelled, so the update wasn't installed.",
+            "Press Update now again and enter your computer's password.",
+        ),
+        other => P::new(
+            "install_failed",
+            format!("Something went wrong while installing ({other})."),
+            "Ferrocast keeps running the current version. Try again, or download from ferrocast.clearcraftlabs.com/download.",
+        ),
+    }
+}
+
+/// A failed check: an answer that isn't a feed means the feed is unavailable, not a broken
+/// download.
+fn check_problem(e: &tauri_plugin_updater::Error) -> ferrocast_engine::UpdateProblem {
+    match e {
+        tauri_plugin_updater::Error::Reqwest(r) if r.is_decode() || r.status().is_some() => {
+            update_problem(&tauri_plugin_updater::Error::ReleaseNotFound)
+        }
+        other => update_problem(other),
+    }
+}
+
+/// One check: tells the engine it started and what it found (or why it failed). `true`
+/// when the feed answered.
+async fn run_check<R: tauri::Runtime>(app: &AppHandle<R>, engine: &Engine) -> bool {
+    engine.update_check_started();
+    match check_update(app, CHECK_TIMEOUT).await {
+        Ok(found) => {
+            if let Some(u) = &found {
+                tracing::info!(version = %u.version, "an update is available");
             }
-        },
+            engine.update_checked(Ok(found.as_ref().map(found_update)));
+            true
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't set up the updater");
-            None
+            tracing::warn!(error = %e, "update check failed");
+            engine.update_checked(Err(check_problem(&e)));
+            false
         }
     }
 }
 
-/// Checks the signed update feed and tells the engine what it found, so the dashboard can
-/// offer it (R-60). Signatures are checked against the public key in tauri.conf.json.
+/// Checks the signed update feed on a timer and whenever the dashboard asks, and tells the
+/// engine what it found, so the dashboard can offer it (R-60). Signatures are checked
+/// against the public key in tauri.conf.json when it downloads.
 async fn keep_updated(app: AppHandle, engine: Engine) {
-    tokio::time::sleep(UPDATE_FIRST).await;
+    engine.attach_updater();
+    tokio::select! {
+        () = tokio::time::sleep(UPDATE_FIRST) => {}
+        () = engine.update_check_requested() => {}
+    }
     loop {
-        let found = check_update(&app).await.map(|u| ferrocast_engine::AvailableUpdate {
-            notes_url: Some(format!("{RELEASES_URL}/tag/v{}", u.version)),
-            version: u.version,
-        });
-        engine.set_available_update(found);
-        tokio::time::sleep(UPDATE_EVERY).await;
+        let wait = if run_check(&app, &engine).await { UPDATE_EVERY } else { UPDATE_RETRY };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = engine.update_check_requested() => {}
+        }
     }
 }
 
-/// Installs when the dashboard asks (the engine already refused it while live), then
-/// restarts into the new version.
-async fn install_when_asked(app: AppHandle, engine: Engine) {
+/// A downloaded, verified update waiting for "Restart to finish" (Windows: the installer
+/// runs then, because it closes Ferrocast).
+type Pending = Arc<Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>>;
+
+/// Downloads (with progress), checks the signature and installs when the dashboard asks
+/// (the engine already refused it while live). The new version runs after "Restart to
+/// finish", never before: on macOS and Linux it is put in place now; on Windows the
+/// installer would close Ferrocast at once, so it waits for the restart.
+async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
     loop {
         engine.update_install_requested().await;
-        let Some(update) = check_update(&app).await else {
-            engine.update_failed("the update is no longer available");
-            engine.set_available_update(None);
-            continue;
-        };
-        let bytes = match update.download(|_, _| {}, || {}).await {
-            Ok(b) => b,
+        let update = match check_update(&app, DOWNLOAD_TIMEOUT).await {
+            Ok(Some(u)) => u,
+            Ok(None) => {
+                engine.update_checked(Ok(None));
+                engine.update_install_failed(ferrocast_engine::UpdateProblem::new(
+                    "gone",
+                    "That update is no longer offered.",
+                    "You're on the newest version; nothing changed.",
+                ));
+                continue;
+            }
             Err(e) => {
-                tracing::error!(error = %e, "update download failed");
-                engine.update_failed(&e.to_string());
+                tracing::warn!(error = %e, "update check before installing failed");
+                engine.update_install_failed(check_problem(&e));
                 continue;
             }
         };
+        let version = update.version.clone();
+        let mut got = 0u64;
+        let mut last: Option<std::time::Instant> = None;
+        let progress = engine.clone();
+        let v = version.clone();
+        // The plugin checks the signature as part of the download.
+        let downloaded = update
+            .download(
+                move |chunk, total| {
+                    got += chunk as u64;
+                    if last.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                        last = Some(std::time::Instant::now());
+                        progress.update_progress(&v, got, total);
+                    }
+                },
+                || {},
+            )
+            .await;
+        let bytes = match downloaded {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "update download failed");
+                engine.update_install_failed(update_problem(&e));
+                continue;
+            }
+        };
+        let size = bytes.len() as u64;
+        engine.update_progress(&version, size, Some(size));
         // A stream may have started during the download: check again right before applying.
         if engine.update_blocked() {
-            engine.update_failed("you went live, so it waits until the stream ends; press Update again after");
+            engine.update_install_failed(ferrocast_engine::UpdateProblem::new(
+                "went_live",
+                "You went live during the download, so it waits.",
+                "Press Update now again after your stream.",
+            ));
             continue;
         }
-        match update.install(bytes) {
-            Ok(()) => app.restart(),
-            Err(e) => {
+        engine.update_installing(&version);
+        if cfg!(windows) {
+            *pending.lock().unwrap_or_else(|p| p.into_inner()) = Some((update, bytes));
+            engine.update_ready(&version);
+            continue;
+        }
+        // Unpacking and moving the app takes a moment: off the async workers.
+        let installed = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        match installed {
+            Ok(Ok(())) => {
+                tracing::info!(%version, "update installed; waiting for the restart");
+                engine.update_ready(&version);
+            }
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "update install failed");
-                engine.update_failed(&e.to_string());
+                engine.update_install_failed(update_problem(&e));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "the install task stopped");
+                engine.update_failed("the install stopped unexpectedly");
             }
         }
     }
 }
 
+/// "Restart to finish" (the engine refuses it while live; checked again here). On Windows
+/// this is when the installer runs: it closes Ferrocast and opens the new version.
+async fn restart_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
+    loop {
+        engine.update_restart_requested().await;
+        if engine.update_blocked() {
+            continue;
+        }
+        let _ = app.save_window_state(StateFlags::all());
+        let waiting = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some((update, bytes)) = waiting {
+            // Returns only if the installer couldn't start (it exits the app otherwise).
+            if let Err(e) = update.install(bytes) {
+                tracing::error!(error = %e, "update install failed");
+                engine.update_install_failed(update_problem(&e));
+                continue;
+            }
+        }
+        app.restart();
+    }
+}
+
+/// Applies the settings the shell owns whenever the dashboard changes them: launch at
+/// login, close to tray, and the panic hotkey (PanicConfig.hotkey).
 async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
     let mut login: Option<bool> = None;
     let mut hotkey: Option<String> = None;
@@ -515,5 +703,173 @@ mod tests {
         assert_eq!(nav("javascript:alert(1)"), (false, false));
         assert!(!is_web(&"mailto:a@b.c".parse().unwrap()));
         assert!(is_web(&"https://example.com".parse().unwrap()));
+    }
+}
+
+/// The real updater plugin in a mock app, against feeds served on this computer: the
+/// published 1.0.1 feed is a fixture, so a feed or plugin change that hides updates fails here.
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use tauri::test::{MockRuntime, mock_builder, mock_context, noop_assets};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FEED: &str = include_str!("../tests/fixtures/latest-1.0.1.json");
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    fn pubkey() -> String {
+        let conf: serde_json::Value = serde_json::from_str(CONF).unwrap();
+        conf["plugins"]["updater"]["pubkey"].as_str().unwrap().to_string()
+    }
+
+    fn app(version: &str, endpoint: &str) -> tauri::App<MockRuntime> {
+        let mut ctx = mock_context(noop_assets());
+        ctx.config_mut().plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({
+                "pubkey": pubkey(),
+                "endpoints": [endpoint],
+                // Only here: the test feeds are plain http on 127.0.0.1.
+                "dangerousInsecureTransportProtocol": true,
+            }),
+        );
+        ctx.package_info_mut().version = version.parse().unwrap();
+        mock_builder().plugin(tauri_plugin_updater::Builder::new().build()).build(ctx).unwrap()
+    }
+
+    /// Serves one answer to every request; returns its address.
+    async fn serve(status: &'static str, body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/latest.json")
+    }
+
+    async fn check(version: &str, endpoint: &str) -> Result<Option<tauri_plugin_updater::Update>, String> {
+        let app = app(version, endpoint);
+        // The stable feed is the configured one; a beta build would swap it for the beta feed.
+        let updater = app.handle().updater_builder().timeout(CHECK_TIMEOUT).build().map_err(|e| e.to_string())?;
+        updater.check().await.map_err(|e| check_problem(&e).code)
+    }
+
+    /// The problem's code from a check that should have failed.
+    async fn problem(version: &str, endpoint: &str) -> String {
+        match check(version, endpoint).await {
+            Ok(found) => panic!("expected a problem, found {:?}", found.map(|u| u.version)),
+            Err(code) => code,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_published_feed_offers_1_0_1_to_1_0_0_and_older_betas() {
+        let url = serve("200 OK", FEED.into()).await;
+        for installed in ["1.0.0", "0.1.0-beta.10", "0.1.0-beta.11"] {
+            let found = check(installed, &url).await.unwrap().unwrap_or_else(|| panic!("{installed} saw nothing"));
+            assert_eq!(found.version, "1.0.1", "{installed}");
+            let shown = found_update(&found);
+            assert_eq!(
+                shown.notes_url.as_deref(),
+                Some("https://github.com/ArshPunisher/ferrocast/releases/tag/v1.0.1")
+            );
+            assert_eq!(shown.notes, None, "the placeholder isn't release notes");
+            assert_eq!(shown.published_at.as_deref(), Some("2026-10-20T11:16:05Z"));
+        }
+        assert!(check("1.0.1", &url).await.unwrap().is_none(), "up to date");
+        assert!(check("1.1.0", &url).await.unwrap().is_none(), "never a downgrade");
+    }
+
+    #[test]
+    fn every_signature_in_the_feed_is_from_our_key() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key_id = |text: &str| {
+            let raw = b64.decode(text.lines().nth(1).unwrap()).unwrap();
+            raw[2..10].to_vec()
+        };
+        let pk = String::from_utf8(b64.decode(pubkey()).unwrap()).unwrap();
+        let ours = key_id(&pk);
+        let feed: serde_json::Value = serde_json::from_str(FEED).unwrap();
+        let platforms = feed["platforms"].as_object().unwrap();
+        for (target, entry) in platforms {
+            let sig = String::from_utf8(b64.decode(entry["signature"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(key_id(&sig), ours, "{target} is signed with another key than tauri.conf.json's");
+            assert!(sig.contains("version:1.0.1"), "{target}: the signature names its version");
+        }
+        // What the updater asks for on each computer we ship (`{os}-{arch}`): one universal
+        // Mac build serves both chips, and deb/rpm installs find their own entry.
+        for target in [
+            "darwin-aarch64",
+            "darwin-x86_64",
+            "windows-x86_64",
+            "linux-x86_64",
+            "linux-x86_64-deb",
+            "linux-x86_64-rpm",
+        ] {
+            assert!(platforms.contains_key(target), "the feed has no {target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_feed_says_so_instead_of_up_to_date() {
+        let url = serve("404 Not Found", "Not Found".into()).await;
+        assert_eq!(problem("1.0.0", &url).await, "feed_unavailable");
+        let url = serve("200 OK", "<html>not json</html>".into()).await;
+        assert_eq!(problem("1.0.0", &url).await, "feed_unavailable");
+    }
+
+    #[tokio::test]
+    async fn offline_says_so() {
+        // A port nothing listens on.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        assert_eq!(problem("1.0.0", &format!("http://{free}/latest.json")).await, "offline");
+    }
+
+    #[tokio::test]
+    async fn a_release_without_this_computer_says_so() {
+        let mut feed: serde_json::Value = serde_json::from_str(FEED).unwrap();
+        feed["platforms"] = serde_json::json!({ "plan9-mips": feed["platforms"]["linux-x86_64"].clone() });
+        let url = serve("200 OK", feed.to_string()).await;
+        assert_eq!(problem("1.0.0", &url).await, "no_build");
+        assert!(check("1.0.1", &url).await.unwrap().is_none(), "not an update: no error either");
+    }
+
+    #[test]
+    fn signature_and_permission_problems_have_their_own_words() {
+        use tauri_plugin_updater::Error as E;
+        let sig = update_problem(&E::SignatureUtf8("x".into()));
+        assert_eq!(sig.code, "bad_signature");
+        assert!(sig.message.contains("signature"));
+        let mismatch = update_problem(&E::SignedVersionMismatch { signed: "1.0.0".into(), announced: "9.0.0".into() });
+        assert_eq!(mismatch.code, "bad_signature");
+        let perm = update_problem(&E::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert_eq!(perm.code, "no_permission");
+        assert_eq!(update_problem(&E::Network("502".into())).code, "download_failed");
+        let other = update_problem(&E::BinaryNotFoundInArchive);
+        assert_eq!(other.code, "install_failed");
+        for p in [sig, perm, other] {
+            assert!(!p.message.is_empty() && !p.hint.is_empty(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn release_notes_skip_the_placeholder_and_stay_short() {
+        assert_eq!(release_notes(None), None);
+        assert_eq!(release_notes(Some("  ")), None);
+        assert_eq!(release_notes(Some(PLACEHOLDER_NOTES)), None);
+        assert_eq!(release_notes(Some("\n- Faster alerts\n")).as_deref(), Some("- Faster alerts"));
+        let long = "é".repeat(NOTES_MAX + 10);
+        let cut = release_notes(Some(&long)).unwrap();
+        assert_eq!(cut.chars().count(), NOTES_MAX + 1);
+        assert!(cut.ends_with('…'));
     }
 }
