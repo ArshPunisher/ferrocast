@@ -15,7 +15,8 @@
 # so a blob the relay deletes under its own 30-day rules is deleted there too. Everything goes
 # through an rclone "crypt" remote: R2 only ever holds encrypted names and contents. The
 # encryption password is shown once at --setup; keep it in a password manager, because a
-# backup can't be opened without it.
+# backup can't be opened without it. After a good run the time also goes into the relay's volume
+# (/data/backup-last-ok), so the Control Center can show it.
 set -euo pipefail
 
 DIR="${RELAY_DIR:-/opt/ferrocast-relay}"
@@ -121,8 +122,20 @@ assert ok == "ok", ok
   fi
   rclone delete box:db --min-age "${KEEP_DAYS}d"
   rclone rmdirs box:db --leave-root
-  date -u +%FT%TZ >"$LAST"
-  echo "$(date -u +%FT%TZ) ✓ backed up relay.db, relay.env and blobs to R2 (db/$day)."
+  local ok_at
+  ok_at="$(date -u +%FT%TZ)"
+  printf '%s\n' "$ok_at" >"$LAST"
+  # The same time next to relay.db, where the relay reads it for the Control Center
+  # (GET /admin/v1/stats → backup.last_ok_at). Written whole, then renamed into place.
+  docker run --rm -e "OK_AT=$ok_at" -v "$vol:/data" "$PY_IMAGE" python -c '
+import os
+tmp = "/data/backup-last-ok.tmp"
+with open(tmp, "w") as f:
+    f.write(os.environ["OK_AT"] + "\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, "/data/backup-last-ok")
+' || echo "note: the backup is fine, but the relay couldn't be told when it ran (backup-last-ok)." >&2
+  echo "$ok_at ✓ backed up relay.db, relay.env and blobs to R2 (db/$day)."
 }
 
 restore_test() {

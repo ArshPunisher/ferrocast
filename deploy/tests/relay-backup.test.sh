@@ -51,6 +51,7 @@ has "uploads the copy and relay.env under today's date" "$c" "copy /src box:db/$
 has "mirrors the blobs" "$c" "sync /data/blobs box:blobs"
 has "drops copies older than 30 days" "$c" "delete box:db --min-age 30d"
 is "records the last good run" "$(test -s "$tmp/relay/state/backup-last-ok" && echo yes)" yes
+has "tells the relay when it ran (for the Control Center)" "$c" "-e OK_AT=$(cat "$tmp/relay/state/backup-last-ok") -v relay_data:/data python:3.13-alpine python -c"
 hasnt "never sends to R2 unencrypted" "$c" " r2:"
 is "leaves no work folder behind" "$(find "$tmp/relay/state" -name 'backup.*' | wc -l | tr -d ' ')" 0
 
