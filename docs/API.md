@@ -442,6 +442,42 @@ Show a Pro feature's panel only when `features.<name>` is true and `active || sa
 
 Errors pass the relay's code, message and hint through: 409 `pro_not_on_sale` (hint: launches after version 1), 409 `already_pro`, 409 `already_cancelled`, 409 `not_cancellable`, 404 `no_subscription`, 404 `not_found` (restore: id and email don't match, always the same answer), 422 `invalid_plan` / `invalid_email` / `invalid_subscription`, 429 `rate_limited`, 502 `razorpay_unavailable`, 503 `billing_unavailable` (no keys on the relay yet) / `billing_misconfigured`, 503 `relay_unrecognised` (the relay forgot this install; it re-registers by itself), 502 `relay_unreachable`. Pro feature calls (§9) also pass through 402 `pro_required`, 413 `too_large`, 415 `unsupported_type`, 429 with the relay's `Retry-After`, 503 `vault_unavailable` / `storage_unavailable`. 400 for a body that isn't JSON or misses a field, 415 without `Content-Type: application/json`.
 
+### Ferrocast account (optional, 1.3)
+The app works the same without an account. Signing in (Google or an email link, in the browser) ties Pro to the account, so it follows the streamer to up to 3 PCs, and lets the web dashboard (`https://remote.clearcraftlabs.com/app/`) reach this PC without Pro. Relay contract: `docs/ACCOUNTS.md`. The routes live under `/pro`, so a paired phone can never sign the PC in or out (owner phones are denied `/pro/*`, §9.5) and `account` live frames never go to phones.
+
+```ts
+type AccountView =
+  | { state: "signed_out"; error: AccountProblem | null }          // error: why (revoked elsewhere, the last sign-in failed or was cancelled)
+  | { state: "pending"; started_at: number; expires_at: number | null; url: string | null }   // waiting for the browser (10 minutes)
+  | { state: "signed_in"; stale: boolean; checked_at: number;   // stale: the relay couldn't be reached, this is the remembered answer
+      account: { id: string; email: string; name: string | null; avatar_url: string | null; created_at: number; providers: ("google" | "email")[] } | null;
+      plan: "free" | "pro";
+      pro: { active: boolean; source: "subscription" | "grant" | null; plan: "monthly" | "yearly" | "comp" | null; status: string | null;
+             subscription_id: string | null; current_end: number | null; access_until: number | null; renews: boolean; cancel_at_period_end: boolean };
+      session: { id: string; kind: "app"; label: string; expires_at: number };
+      pcs: number;                                               // the account's signed-in PCs
+      error?: AccountProblem }                                  // only with stale: true
+  | { state: "disabled"; error: AccountProblem }                 // the owner disabled the account (hint: write to support)
+type AccountProblem = { message: string; hint: string }
+type AccountSession = { id: string; kind: "app" | "web"; label: string; created_at: number; last_used_at: number; expires_at: number; current: boolean }
+```
+`account.pro` is the **account's** Pro. Whether this PC has Pro is still `GET /pro` (`ProView.active`): the relay counts the install's own subscription **or** its account's, and the engine re-reads it after every sign-in and sign-out. The session token (`fca_…`) stays in the OS keychain (the engine's secret store, like the install secret); it is never sent to the dashboard, written to settings or logged.
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/pro/account` | `?refresh=1` asks the relay now → `AccountView`. Never an error. Without `refresh` a relay answer from the last 15 minutes is reused; the engine also refreshes at start, every 4 hours, after sign-in, checkout, redeem and `POST /pro/refresh` |
+| POST | `/api/v1/pro/account/sign-in` | `{ label? }` (this PC's name in the account's device list, ≤ 40 characters; default the relay's "Ferrocast app") → 201 `{ url, expires_at }`. **Open `url` in the browser** (`window.open(url)` / a `target="_blank"` link: the desktop window sends web pages to the system browser). The engine waits on `127.0.0.1:<random port>/auth/callback` for up to 10 minutes, then `account` frames say how it went. Show "Finish signing in in your browser…" with a Cancel button while `state` is `pending` |
+| POST | `/api/v1/pro/account/sign-in/cancel` | → 204. Stops waiting (the browser tab, if finished later, shows an error). `state` goes back to `signed_out` |
+| POST | `/api/v1/pro/account/sign-out` | `{ everywhere?: false }` → 204. This PC only, or every app and browser of the account. Forgets the session here even when the relay can't be reached (then only `everywhere: true` fails, 503) |
+| GET | `/api/v1/pro/account/sessions` | → `{ sessions: AccountSession[] }` (active ones, newest use first) |
+| DELETE | `/api/v1/pro/account/sessions/{id}` | → 204. Signs that app or browser out; revoking `current` signs this PC out too. An app session's PC loses the account's Pro at once |
+
+**Checkout while signed in.** `POST /api/v1/pro/checkout` is unchanged and the relay attaches the new subscription to the account by itself (the install is linked to it). While signed in, `email` may be left out or empty: the account's email is used. Redeeming a code and checkout refresh the account too.
+
+**Dashboard anywhere.** A PC signed in to any account (free too) may open the tunnel (§9.5): it opens when a phone is paired or a pairing link waits (as with Pro), and when the web dashboard asks for this PC (the relay's `remote_wanted` item on the relay link). Signed-in PCs keep the relay link open for that.
+
+Errors (always `{ error: { code, message, hint } }`): 409 `already_signed_in` (sign out first to switch accounts), 401 `signed_out` (sessions, revoke: not signed in, or the session ended elsewhere; the PC is then signed out here too), 403 `account_disabled`, 404 `not_found` (no such session), 400 `invalid` (a session id that can't be one), 422 `invalid` (label too long), 429 `rate_limited` (`Retry-After`; 10 sign-ins an hour per PC), 410 `flow_expired`, 422 `invalid_challenge` / `invalid_redirect`, 502 `relay_error` (the relay answered something Ferrocast can't use), **503 `relay_unreachable`** (no internet or the relay is down; hint: check the connection, everything else keeps working), 503 `relay_unrecognised`, 503 `no_relay` (this build has no relay set up), 503 `keychain_unavailable` (the OS keychain refused; hint: unlock it and try again). Problems that end a sign-in in the background (`state: "signed_out"` with `error`): the browser came back with another sign-in's `state` (that request is answered 400 and ignored; the real one keeps waiting), the person cancelled at Google, no code came, the code was refused (wrong or expired), 10 minutes passed.
+
 ### Media
 | Method | Path | Body → Response |
 |---|---|---|
@@ -659,6 +695,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
+- `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
 The client sends nothing but pings.
