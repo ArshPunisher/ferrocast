@@ -174,6 +174,27 @@ run "$yt_id\n\n" --youtube
 is "the id alone works" "$code" 0
 has "warns YouTube stays off" "$out" "cloud bot on YouTube"
 
+# Google sign-in for accounts: the id is shown as typed, the secret hidden.
+g_id="27182818-$(printf 'a1b2c3d4%.0s' {1..4}).apps.$(printf 'google')usercontent.com"
+g_secret="GOC$(printf 'SPX')-$(printf 'Yy8_%.0s' {1..7})"
+fresh_relay
+run "$g_id\nGOCSPX-short\nnope\nAIza\n" --google
+is "a bad sign-in secret is refused" "$code" 1
+is "nothing saved for sign-in" "$(v RELAY_GOOGLE_CLIENT_ID)" ""
+run "$g_id\n$g_secret\n" --google
+is "--google saves both" "$code" 0
+is "sign-in client id saved" "$(v RELAY_GOOGLE_CLIENT_ID)" "$g_id"
+is "sign-in secret saved" "$(v RELAY_GOOGLE_CLIENT_SECRET)" "$g_secret"
+hasnt "never prints the sign-in secret" "$out" "$g_secret"
+is "only the sign-in keys are asked" "$(grep -c '^YOUTUBE_CLOUD_CLIENT_ID=' "$tmp/relay/relay.env")" 0
+run "" --status
+has "status lists the sign-in client" "$out" "RELAY_GOOGLE_CLIENT_SECRET: *set"
+hasnt "status hides the sign-in secret" "$out" "$g_secret"
+fresh_relay
+run "$g_id\n\n" --google
+is "the sign-in id alone works" "$code" 0
+has "warns Google sign-in stays off" "$out" "Google sign-in"
+
 fresh_relay
 run "x\n" --nope
 is "unknown option fails" "$code" 1

@@ -22,7 +22,9 @@
 # YOUTUBE_CLOUD_CLIENT_SECRET, plus YOUTUBE_CLOUD_DAILY_UNITS / _PER_SUB / _DESKTOP_CLIENT_ID /
 # _TIMER_GAP_MIN if
 # set by hand), typed on the server with pro-keys.sh, and the Control Center's admin-stats
-# token (RELAY_ADMIN_TOKEN), made on the server by control-center-key.sh.
+# token (RELAY_ADMIN_TOKEN), made on the server by control-center-key.sh, and Google sign-in
+# for accounts (RELAY_GOOGLE_CLIENT_ID, RELAY_GOOGLE_CLIENT_SECRET, pro-keys.sh --google) and
+# RELAY_REMOTE_LOGIN if set by hand.
 #
 # Pro "Dashboard anywhere": the dashboard build phones get (../ferrocast-web/dist/dashboard,
 # run `pnpm build:embed` there first) goes to $dir/dashboard/releases/<date> and the
@@ -98,7 +100,7 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
 } | ssh "$host" "sudo sh -c 'umask 077 && cat > $dir/relay.env.new &&
-    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS|DISCORD_[A-Z_]+|BREVO_API_KEY|MAIL_FROM|MAIL_TOKEN_KEY|MAIL_DAILY_BUDGET|TWITCH_CLOUD_[A-Z_]+|YOUTUBE_CLOUD_[A-Z_]+|CF_SAAS_TOKEN|CF_ZONE_ID|RELAY_ADMIN_TOKEN)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
+    { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS|DISCORD_[A-Z_]+|BREVO_API_KEY|MAIL_FROM|MAIL_TOKEN_KEY|MAIL_DAILY_BUDGET|TWITCH_CLOUD_[A-Z_]+|YOUTUBE_CLOUD_[A-Z_]+|CF_SAAS_TOKEN|CF_ZONE_ID|RELAY_ADMIN_TOKEN|RELAY_GOOGLE_CLIENT_ID|RELAY_GOOGLE_CLIENT_SECRET|RELAY_REMOTE_LOGIN)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
     chown $owner:$owner $dir/relay.env.new && chmod 600 $dir/relay.env.new && mv $dir/relay.env.new $dir/relay.env'"
 dashboard="$repo/../ferrocast-web/dist/dashboard"
 if [[ -f "$dashboard/index.html" ]]; then

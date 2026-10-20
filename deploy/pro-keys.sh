@@ -10,9 +10,10 @@
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --twitch'   the cloud bot's Twitch app only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --youtube'  the cloud bot's Google client only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --domains'  custom tip addresses only
+#   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --google'   Google sign-in for accounts only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   set or missing
 #
-# Each key is asked for with typing hidden (paste it, then Enter); Enter alone keeps what's
+# Each key is asked for with typing hidden (a client ID, which isn't secret, is shown as typed) (paste it, then Enter); Enter alone keeps what's
 # there. A key that doesn't look right is asked for again, three tries, and nothing is
 # changed until every answer is good. Backs up relay.env first and restarts the relay so it
 # reads them; anything failing puts relay.env back as it was. deploy-relay.sh keeps them.
@@ -37,6 +38,10 @@
 #                          Zone → SSL and Certificates → Edit, on clearcraftlabs.com only (it
 #                          covers custom hostnames; see deploy/README.md)
 #   CF_ZONE_ID             clearcraftlabs.com → Overview → API → Zone ID (32 hex characters)
+#   RELAY_GOOGLE_CLIENT_ID      console.cloud.google.com (project ferrocast-clearcraft) → APIs &
+#                          Services → Credentials → OAuth client "Ferrocast accounts (web)" →
+#                          Client ID (…apps.googleusercontent.com; shown as you type it)
+#   RELAY_GOOGLE_CLIENT_SECRET  same client → Client secret (starts GOCSPX-); see docs/ACCOUNTS.md
 set -euo pipefail
 
 DIR="${RELAY_DIR:-/opt/ferrocast-relay}"
@@ -136,7 +141,8 @@ put_back() {
 # ask <name> <pattern> <what>: reads one key with typing hidden; sets ANSWER ("" keeps it).
 ANSWER=""
 ask() {
-  local name="$1" pattern="$2" what="$3" now try got
+  local name="$1" pattern="$2" what="$3" now try got shown=0
+  [[ "$name" == *_CLIENT_ID && "$name" == RELAY_GOOGLE_* ]] && shown=1
   now="$(value "$name")"
   for try in 1 2 3; do
     if [[ -n "$now" ]]; then
@@ -145,7 +151,7 @@ ask() {
       printf '%s (%s), missing; paste it or Enter to skip: ' "$name" "$what" >&2
     fi
     got=""
-    IFS= read -rs got || true
+    if [[ "$shown" == 1 ]]; then IFS= read -r got || true; else IFS= read -rs got || true; fi
     printf '\n' >&2
     got="${got//[[:space:]]/}"
     if [[ -z "$got" ]]; then
@@ -167,6 +173,7 @@ MAIL_KEYS=(BREVO_API_KEY)
 TWITCH_KEYS=(TWITCH_CLOUD_CLIENT_ID TWITCH_CLOUD_CLIENT_SECRET TWITCH_CLOUD_EVENTSUB_SECRET)
 DOMAIN_KEYS=(CF_SAAS_TOKEN CF_ZONE_ID)
 YOUTUBE_KEYS=(YOUTUBE_CLOUD_CLIENT_ID YOUTUBE_CLOUD_CLIENT_SECRET)
+GOOGLE_KEYS=(RELAY_GOOGLE_CLIENT_ID RELAY_GOOGLE_CLIENT_SECRET)
 pattern() {
   case "$1" in
     GOOGLE_TTS_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
@@ -187,6 +194,8 @@ pattern() {
     # secrets GOCSPX- and 28 more (older ones 24 characters).
     YOUTUBE_CLOUD_CLIENT_ID) echo '^[0-9]{6,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com$' ;;
     YOUTUBE_CLOUD_CLIENT_SECRET) echo '^(GOCSPX-[A-Za-z0-9_-]{28}|[A-Za-z0-9_-]{24})$' ;;
+    RELAY_GOOGLE_CLIENT_ID) echo '^[0-9]{6,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com$' ;;
+    RELAY_GOOGLE_CLIENT_SECRET) echo '^GOCSPX-[A-Za-z0-9_-]{28}$' ;;
   esac
 }
 what() {
@@ -204,6 +213,8 @@ what() {
     CF_ZONE_ID) echo "clearcraftlabs.com's Zone ID, 32 lowercase hex characters" ;;
     YOUTUBE_CLOUD_CLIENT_ID) echo "the Ferrocast Cloud Google client's ID, ending .apps.googleusercontent.com" ;;
     YOUTUBE_CLOUD_CLIENT_SECRET) echo "the Ferrocast Cloud Google client's secret, starting GOCSPX-" ;;
+    RELAY_GOOGLE_CLIENT_ID) echo "the Ferrocast accounts (web) client's ID, ending .apps.googleusercontent.com" ;;
+    RELAY_GOOGLE_CLIENT_SECRET) echo "the Ferrocast accounts (web) client's secret, GOCSPX- and 28 more" ;;
   esac
 }
 status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi; }
@@ -211,7 +222,7 @@ status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi;
 keys=()
 case "${1:-}" in
   --status)
-    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}"; do printf '%-22s %s\n' "$k:" "$(status_of "$k")"; done
+    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}"; do printf '%-28s %s\n' "$k:" "$(status_of "$k")"; done
     exit 0
     ;;
   --tts) keys=("${TTS_KEYS[@]}") ;;
@@ -220,8 +231,9 @@ case "${1:-}" in
   --twitch) keys=("${TWITCH_KEYS[@]}") ;;
   --domains) keys=("${DOMAIN_KEYS[@]}") ;;
   --youtube) keys=("${YOUTUBE_KEYS[@]}") ;;
-  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}") ;;
-  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains, --youtube or --status." ;;
+  --google) keys=("${GOOGLE_KEYS[@]}") ;;
+  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}") ;;
+  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains, --youtube, --google or --status." ;;
 esac
 
 names=()
@@ -268,6 +280,11 @@ missing=()
 for k in "${YOUTUBE_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
 if ((${#missing[@]} > 0 && ${#missing[@]} < ${#YOUTUBE_KEYS[@]})); then
   echo "Still missing for the cloud bot on YouTube: ${missing[*]}. It stays off until both are set."
+fi
+missing=()
+for k in "${GOOGLE_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
+if ((${#missing[@]} > 0 && ${#missing[@]} < ${#GOOGLE_KEYS[@]})); then
+  echo "Still missing for Google sign-in: ${missing[*]}. It stays off (email sign-in works) until both are set."
 fi
 echo "Restarting the relay so it reads them…"
 restart || put_back "$BACKUP" "The relay didn't come back healthy with the new keys."
