@@ -159,6 +159,13 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/cancel", post(pro::cancel))
         .route("/pro/restore", post(pro::restore))
         .route("/pro/redeem", post(pro::redeem))
+        // The Ferrocast account (optional; ACCOUNTS.md). Under /pro so a phone never reaches it.
+        .route("/pro/account", get(pro::account))
+        .route("/pro/account/sign-in", post(pro::account_sign_in))
+        .route("/pro/account/sign-in/cancel", post(pro::account_sign_in_cancel))
+        .route("/pro/account/sign-out", post(pro::account_sign_out))
+        .route("/pro/account/sessions", get(pro::account_sessions))
+        .route("/pro/account/sessions/{id}", delete(pro::account_revoke))
         .route("/pro/history", get(history::list))
         .route("/pro/history/export.csv", get(history::export))
         // Pro: the weekly email (see routes/weekly_email.rs)

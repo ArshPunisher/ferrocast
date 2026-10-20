@@ -101,6 +101,62 @@ pub async fn restore(State(app): State<AppState>, Body(b): Body<Restore>) -> Api
     Ok(Json(serde_json::to_value(v).unwrap_or(Value::Null)))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SignIn {
+    /// What this PC is called in the account's device list (optional, at most 40 characters).
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `GET /pro/account`: the Ferrocast account on this PC (ACCOUNTS.md §5): `state` is
+/// `signed_out`, `pending` (the browser is open), `signed_in` or `disabled`.
+pub async fn account(State(app): State<AppState>) -> Json<Value> {
+    Json(app.engine.account_status().await)
+}
+
+/// `POST /pro/account/sign-in {label?}` → 201 `{url, expires_at}` to open in the browser.
+pub async fn account_sign_in(
+    State(app): State<AppState>,
+    Body(b): Body<SignIn>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    if b.label.as_ref().is_some_and(|l| l.chars().count() > 40) {
+        return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid", "Keep the PC's name to 40 characters."));
+    }
+    Ok((StatusCode::CREATED, Json(app.engine.account_sign_in(b.label).await?)))
+}
+
+/// `POST /pro/account/sign-in/cancel`: stop waiting for the browser.
+pub async fn account_sign_in_cancel(State(app): State<AppState>) -> StatusCode {
+    app.engine.account_sign_in_cancel();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SignOut {
+    #[serde(default)]
+    everywhere: bool,
+}
+
+/// `POST /pro/account/sign-out {everywhere}`.
+pub async fn account_sign_out(State(app): State<AppState>, Body(b): Body<SignOut>) -> ApiResult<StatusCode> {
+    app.engine.account_sign_out(b.everywhere).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /pro/account/sessions`: the account's signed-in apps and browsers.
+pub async fn account_sessions(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.account_sessions().await?))
+}
+
+/// `DELETE /pro/account/sessions/{id}`: sign one of them out.
+pub async fn account_revoke(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<StatusCode> {
+    app.engine.account_revoke(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// End to end: dashboard API → engine → a real relay → fake Razorpay.
 #[cfg(test)]
 mod tests {
