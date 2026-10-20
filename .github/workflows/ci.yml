@@ -54,6 +54,7 @@ jobs:
           deploy/tests/relay-backup.test.sh
           deploy/tests/deploy-relay-env.test.sh
           deploy/tests/dashboard-swap.test.sh
+          deploy/tests/control-center-key.test.sh
 
   test:
     name: Tests (${{ matrix.os }})
