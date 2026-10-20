@@ -10,6 +10,10 @@ ignore = [
   # age uses for its error messages. Nothing parses TOML at run time. Revisit when age moves
   # off it.
   { id = "RUSTSEC-2026-0374", reason = "unmaintained, build-time only via age's i18n proc macro" },
+  # The emSign roots: webpki-roots 0.26.11 (tokio-tungstenite's feature) is a re-export of
+  # webpki-roots 1, which is 1.0.10 here with those roots removed. The advisory's version range
+  # still names 0.26. Revisit when tokio-tungstenite moves to webpki-roots 1.
+  { id = "RUSTSEC-2026-0381", reason = "0.26.11 only re-exports webpki-roots 1.0.10, which drops the emSign roots" },
   # Build-time macro crate pulled in by gtk-rs 0.18 (Tauri's Linux webview stack). Not a
   # vulnerability; no maintained replacement upstream yet. Revisit when Tauri moves to gtk4.
   { id = "RUSTSEC-2024-0370", reason = "unmaintained, transitive via gtk 0.18 in Tauri on Linux" },
