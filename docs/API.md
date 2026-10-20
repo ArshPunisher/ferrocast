@@ -188,7 +188,8 @@ type AlertLook = {
   font: { family: FontFamily; source: "bundled" | "google" | "system"; size: 10–160; weight: 100–900; uppercase: boolean; italic: boolean; letter_spacing: -0.2…0.5 };
   colors: { text; highlight /* name and amount */; plate; accent; outline };
   plate: boolean; shadow: "none" | "soft" | "hard" | "glow"; outline: 0–12;
-  anim: { in: AnimIn; out: AnimOut; text: "none" | "wave" | "wiggle" | "bounce" | "pop" | "type" | "glow"; in_ms: 0–3000; out_ms: 0–3000; text_delay_ms: 0–10000 };
+  anim: { in: AlertIn; out: AlertOut; text: TextAnim; in_ms: 0–3000; out_ms: 0–3000; text_delay_ms: 0–10000 };
+  motion?: Motion /* 1.1; a look without it reads as the defaults below, which play exactly like 1.0 */;
   sound: { ref: MediaRef | null /* plays instead of builtin */; builtin: "none" | "sparkle" | "glint" | "cascade" | "bloom" | "lift" | "tally" | "halo" | "droplet" /* Crystal */ | "kalimba" | "marimba" | "glow" | "ember" | "pebble" | "feather" | "hearth" | "wink" /* Felt */ | "sparkle_classic" | "chime" | "coin" | "whoosh" | "boing" | "bass" /* retired in 1.1: still accepted, the overlay plays Glint, Tally, Lift, Droplet, Ember */; volume: 0–100 };
   duration_ms: 1000–60000 /* more than in_ms + out_ms */;
   tts: { enabled: boolean; min_amount: number /* major units; 0 reads all */ };
@@ -196,6 +197,24 @@ type AlertLook = {
   css: string /* ≤20,000; no @import, url() only for data:image/… */ }
 type AnimIn = "none" | "fade" | "rise" | "drop" | "slide_left" | "slide_right" | "zoom" | "pop" | "bounce" | "flip" | "wipe" | "magnet"
 type AnimOut = "none" | "fade" | "sink" | "lift" | "slide_left" | "slide_right" | "zoom" | "shrink" | "flip" | "wipe"
+// AnimIn is all a scene layer takes. Alert looks also take the motion designer's (1.1):
+type AlertIn = AnimIn | "slam" | "elastic" | "bolt" | "glitch" | "portal" | "shatter" | "pour" | "flip_shine" | "confetti_pop" | "dash" | "neon"
+type AlertOut = AnimOut | "dissolve" | "black_hole" | "zip" | "fold" | "shatter" | "tv_off" | "fall" | "iris" | "glitch"
+type TextAnim = "none" | "wave" | "wiggle" | "bounce" | "pop" | "type" /* Typewriter, with a cursor since 1.1 */ | "glow"
+              | "cascade" | "pop_wave" | "decode" | "shine" | "neon" | "rgb" | "stretch" | "spin"
+// Every 1.0 id keeps its meaning (they map to themselves); in_ms/out_ms are the motion's real lengths for the 1.1 ids.
+type Motion = { idle: "none" | "breathe" | "float" | "shimmer" | "glow" | "jelly" | "heartbeat" /* none */;
+  particles: "auto" | "none" | "confetti" | "sparks" | "petals" | "coins" | "embers" | "stars" /* auto: the entrance's own; the 1.0 ones have none */;
+  colors: "brand" | "rainbow" | "gold" | "white" | "custom" /* brand = the look's colours */; custom_color: Color /* #ff5aa5 */;
+  bounce: 0–100 /* 45 */; speed: 60–160 /* %, 100 */; stagger: 0–90 /* ms between letters, 34 */;
+  shake, flash, vignette, zoom_punch: boolean /* true; only the 1.1 entrances and exits have impacts */;
+  by_amount: boolean /* true: bigger amounts hit harder (AlertDesignView.intensity) */;
+  position: "tl" | "tc" | "tr" | "ml" | "mc" | "mr" | "bl" | "bc" | "br" /* mc, where 1.0 put it */;
+  direction: "auto" | "top" | "left" | "right" | "bottom" /* auto */;
+  impact_sounds: boolean /* false; synthesised hits at the look's sound volume */;
+  beat: boolean /* false; delays the entrance so its hit lands on a downbeat */; bpm: 70–170 /* 120 */;
+  recipe: "heavy" | "arcade" | "cyber" | "molten" | "storm" | "party" | "clean" | null }
+// Every Motion field has a default, so a partial object reads; a wrong type or unknown name is refused.
 
 type ThemeContent = { scenes: Scene[] /* 1–8, keys unique */; alert_design: string | null /* the alert design that goes with it */ }
 type Scene = { key: "in_game" | "just_chatting" | "starting_soon" | "brb" | "ending" | `custom_${number}`; name: string /* 1–40 */;
@@ -203,7 +222,10 @@ type Scene = { key: "in_game" | "just_chatting" | "starting_soon" | "brb" | "end
 type WidgetContent = { widget: WidgetKind /* not "layer" */; w: 40–1920; h: 20–1080; config: object /* starting settings, no style */; style: WidgetStyle }
 
 type AlertDesignView = { design_id: string; variation_id: string; event_key: EventKey; branded: boolean; look: AlertLook;
-                         title_parts: { text: string; hl: boolean }[]; body_parts: { text: string; hl: boolean }[] }
+                         title_parts: { text: string; hl: boolean }[]; body_parts: { text: string; hl: boolean }[];
+                         intensity: 0.6–2 /* 1.1, missing reads as 1: the amount against a usual one on a log scale (a usual tip
+                         in its own currency, e.g. ₹500 or $5, = 1; ×10 = 1.5; ×100 = 2; a tenth = 0.6); Bits/KICKs/Jewels against 500,
+                         gift batches against 5; other events 1 */ }
 // title/body already rendered; hl marks text from {name}, {amount}, {value}, {count}, {count_text}, {viewers}, {viewers_text}, {reward}.
 ```
 
