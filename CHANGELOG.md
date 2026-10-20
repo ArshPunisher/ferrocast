@@ -15,6 +15,10 @@ words. The Release workflow reads the section whose heading is the version being
 - The motion designer: 11 entrances, 9 text effects, 9 exits, idle loops, particles,
   punches and recipes for every alert look. Bigger tips can hit harder.
 - New built-in sounds (Crystal and Felt sets) in a picker that plays as you browse.
+  New alerts start with a suggested sound for their event.
+- Buy Pro in three clear steps in Settings › Pro, and Pro now looks and feels like Pro.
+- Fixed in 1.0.1: links to the browser, the Mac installer's background, alert previews
+  and uploaded pictures in the designer.
 
 ## 1.0.1
 
