@@ -297,6 +297,9 @@ impl Db {
         c.execute("DELETE FROM handle_changes WHERE at < ?1", [now - 86_400_000])?;
         c.execute("DELETE FROM released_handles WHERE released_at < ?1", [now - crate::tips::HANDLE_HOLD_MS])?;
         c.execute("DELETE FROM pending_oauth WHERE created_at < ?1", [now - 600_000])?;
+        drop(c);
+        self.prune_accounts(now)?;
+        let c = self.c();
         // Installs registered but never used again (a scripted sign-up flood, or an app that
         // was installed and removed) go after a week; anything with a tip page, a Kick
         // channel or Pro stays.

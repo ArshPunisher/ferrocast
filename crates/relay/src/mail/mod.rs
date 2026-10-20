@@ -254,6 +254,20 @@ impl Runtime {
     pub(crate) fn new(mailer: Option<Arc<dyn Mailer>>, cfg: MailConfig) -> Runtime {
         Runtime { mailer, cfg }
     }
+
+    /// The sender, for other kinds of email (account sign-in links).
+    pub(crate) fn mailer(&self) -> Option<Arc<dyn Mailer>> {
+        self.mailer.clone()
+    }
+
+    pub(crate) fn from(&self) -> Sender {
+        self.cfg.from.clone()
+    }
+
+    /// The relay-wide daily budget.
+    pub(crate) fn budget(&self) -> i64 {
+        self.cfg.budget
+    }
 }
 
 pub(crate) fn routes() -> Router<AppState> {

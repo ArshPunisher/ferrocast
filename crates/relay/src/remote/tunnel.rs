@@ -26,7 +26,6 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{AppState, MAX_IN_FLIGHT, MAX_RESPONSE, available, proxy, unavailable};
-use crate::billing::gate::require_pro;
 use crate::{ApiError, now_ms};
 
 /// The largest frame the PC may send: an 8 MB answer in base64 and its envelope.
@@ -118,11 +117,12 @@ pub(crate) async fn connect(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let pro = require_pro(&st, &headers).await?;
+    let install = crate::authed(&st, &headers)?;
+    super::access_key(&st, &install).map_err(ApiError::db)?.ok_or_else(super::access_required)?;
     if !available(&st) {
         return Err(unavailable());
     }
-    Ok(ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| run(st, pro.install, socket)))
+    Ok(ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| run(st, install, socket)))
 }
 
 async fn run(st: AppState, install: String, socket: WebSocket) {
@@ -190,9 +190,8 @@ fn is_current(st: &AppState, install: &str, id: u64) -> bool {
 }
 
 fn still_pro(st: &AppState, install: &str) -> bool {
-    match st.db.pro_sub_for_install(install) {
-        Ok(Some(s)) => crate::billing::access::is_pro(&s.access(), now_ms()),
-        Ok(None) => false,
+    match super::access_key(st, install) {
+        Ok(k) => k.is_some(),
         // A database hiccup isn't a reason to cut the streamer off.
         Err(_) => true,
     }

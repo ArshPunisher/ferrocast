@@ -141,6 +141,13 @@ async fn main() {
         (None, _) => tracing::warn!("RELAY_REMOTE_URL not set: the dashboard from anywhere is off"),
     }
     let state = state.with_remote(remote_cfg);
+    let accounts_cfg = ferrocast_relay::accounts::AccountsConfig::from_env();
+    if accounts_cfg.google.on() {
+        tracing::info!("Google sign-in for accounts is on");
+    } else {
+        tracing::warn!("RELAY_GOOGLE_CLIENT_ID / _SECRET not set: Google sign-in is off (email sign-in works)");
+    }
+    let state = state.with_accounts(accounts_cfg);
     let discord_cfg = match ferrocast_relay::discord::DiscordConfig::from_env() {
         Ok(Some(c)) => {
             tracing::info!(app_id = %c.app_id, "the Ferrocast bot for Discord is on");

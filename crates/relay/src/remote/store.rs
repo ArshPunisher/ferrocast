@@ -153,6 +153,12 @@ impl Db {
         Ok(())
     }
 
+    /// Moves a device between a free account's key and Pro on the same PC.
+    pub(crate) fn remote_set_sub(&self, id: &str, sub: &str) -> rusqlite::Result<()> {
+        self.c().execute("UPDATE remote_devices SET sub_id = ?2 WHERE id = ?1", params![id, sub])?;
+        Ok(())
+    }
+
     pub(crate) fn remote_device(&self, id: &str) -> rusqlite::Result<Option<Device>> {
         self.c().query_row(&format!("SELECT {DEVICE_COLS} FROM remote_devices WHERE id = ?1"), [id], device).optional()
     }

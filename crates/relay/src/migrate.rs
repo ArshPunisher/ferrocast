@@ -59,6 +59,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "Pro prices, sales, codes, grant history, refunds, admin audit",
         sql: &[crate::billing::pricing::SCHEMA],
     },
+    Migration {
+        version: 15,
+        name: "Accounts: identities, sessions, sign-ins, Pro and PCs",
+        sql: &[crate::accounts::SCHEMA],
+    },
 ];
 
 pub(crate) fn latest() -> i64 {

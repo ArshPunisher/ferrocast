@@ -154,11 +154,46 @@ impl Db {
         tx.commit()
     }
 
+    /// A checkout made on the web for an account: no install is linked yet.
+    pub(crate) fn add_pro_sub_unlinked(
+        &self,
+        id: &str,
+        plan: &str,
+        email_hash: &str,
+        status: &str,
+    ) -> rusqlite::Result<()> {
+        self.c().execute(
+            "INSERT INTO pro_subs(id, plan, email_hash, status, created_at, synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, plan, email_hash, status, now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn pro_sub(&self, id: &str) -> rusqlite::Result<Option<SubRow>> {
         self.c().query_row(&format!("SELECT {COLS} FROM pro_subs WHERE id = ?1"), [id], row).optional()
     }
 
+    /// The subscription that gives this install Pro: its own (as before accounts) while that
+    /// grants Pro, else its signed-in account's when that does (docs/ACCOUNTS.md §6), else its
+    /// own (lapsed, unpaid) or none. An install that never signs in gets exactly its own.
     pub fn pro_sub_for_install(&self, install: &str) -> rusqlite::Result<Option<SubRow>> {
+        let own = self.own_pro_sub(install)?;
+        let now = now_ms();
+        if own.as_ref().is_some_and(|s| super::access::is_pro(&s.access(), now)) {
+            return Ok(own);
+        }
+        if let Some(acct) = self.account_for_install(install, now)?
+            && let Some(s) = self.account_sub(&acct, now)?
+            && super::access::is_pro(&s.access(), now)
+        {
+            return Ok(Some(s));
+        }
+        Ok(own)
+    }
+
+    /// The install's own subscription (`pro_installs`), accounts left out.
+    pub fn own_pro_sub(&self, install: &str) -> rusqlite::Result<Option<SubRow>> {
         self.c()
             .query_row(
                 &format!(

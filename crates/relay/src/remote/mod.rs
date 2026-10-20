@@ -44,7 +44,6 @@ use serde_json::{Value, json};
 pub(crate) use offline::{cloud_changed, cloud_chat};
 pub(crate) use store::{SCHEMA, SCHEMA_SOURCE};
 
-use crate::billing::gate::require_pro;
 use crate::quota::Limit;
 use crate::{ApiError, AppState, authed, now_ms};
 use scope::Role;
@@ -289,6 +288,36 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/app/{*path}", get(app::file))
 }
 
+/// Whether the request came in on the web host (`RELAY_REMOTE_URL`), for accounts.
+pub(crate) fn on_web_host(st: &AppState, headers: &HeaderMap) -> bool {
+    proxy::on_remote_host(st, headers)
+}
+
+pub(crate) use proxy::connect_owner;
+
+/// What a PC's dashboard-from-anywhere data is kept under, if it may use it now: its Pro
+/// subscription (own or its account's), else `acct_<account>` for a PC signed in to a free
+/// account (docs/ACCOUNTS.md §7: free accounts get the web dashboard), else `None`.
+pub(crate) fn access_key(st: &AppState, install: &str) -> rusqlite::Result<Option<String>> {
+    let now = now_ms();
+    if let Some(s) = st.db.pro_sub_for_install(install)?
+        && crate::billing::access::is_pro(&s.access(), now)
+    {
+        return Ok(Some(s.id));
+    }
+    Ok(st.db.account_for_install(install, now)?.map(|a| format!("{ACCOUNT_KEY}{a}")))
+}
+
+/// The prefix of an [`access_key`] that is a free account's, not a subscription.
+pub(crate) const ACCOUNT_KEY: &str = "acct_";
+
+/// 402 for a PC with neither Pro nor a signed-in account.
+pub(crate) fn access_required() -> ApiError {
+    crate::billing::gate::pro_required().hint(
+        "See Settings › Pro, or sign in to a free Ferrocast account in the app, to use the dashboard from anywhere.",
+    )
+}
+
 /// `features.remote`: a remote host and a pepper are set.
 pub(crate) fn available(st: &AppState) -> bool {
     st.remote.cfg.origin.is_some() && st.remote.cfg.pepper.is_some()
@@ -379,7 +408,9 @@ async fn create_code(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let pro = require_pro(&st, &headers).await?;
+    let install = authed(&st, &headers)?;
+    let key = access_key(&st, &install).map_err(ApiError::db)?.ok_or_else(access_required)?;
+    let pro = crate::billing::gate::ProCtx { install, sub_id: key };
     if !available(&st) {
         return Err(unavailable());
     }

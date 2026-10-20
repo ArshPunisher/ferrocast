@@ -150,14 +150,17 @@ fn parse_token(t: &str) -> Option<(&str, &str)> {
 }
 
 /// The device behind a token: known, hash equal (constant time), then [`device_ok`].
-fn device_for(st: &AppState, token: Option<&str>) -> Result<(Device, Role), ApiError> {
-    let (id, secret) = token.and_then(parse_token).ok_or_else(unauthorized)?;
+fn device_for(st: &AppState, headers: &HeaderMap) -> Result<(Device, Role), ApiError> {
+    let (id, secret) = bearer(headers).and_then(parse_token).ok_or_else(unauthorized)?;
     let d = st.db.remote_device(id).map_err(ApiError::db)?.ok_or_else(unauthorized)?;
     let want = st.remote.cfg.hash(secret).ok_or_else(super::unavailable)?;
     if !bool::from(d.token_hash.as_bytes().ct_eq(want.as_bytes())) {
         return Err(unauthorized());
     }
-    device_ok(st, d)
+    let ok = device_ok(st, d)?;
+    // The web dashboard needs the account that paired this device (docs/ACCOUNTS.md §7).
+    crate::accounts::device_account_ok(st, headers, &ok.0.id)?;
+    Ok(ok)
 }
 
 /// The device a ticket was made for, if it's still paired (then [`device_ok`]).
@@ -177,13 +180,20 @@ fn device_ok(st: &AppState, d: Device) -> Result<(Device, Role), ApiError> {
         return Err(unauthorized());
     }
     let role = Role::parse(&d.role).ok_or_else(unauthorized)?;
-    match st.db.pro_sub_for_install(&d.install_id).map_err(ApiError::db)? {
-        Some(s) if crate::billing::access::is_pro(&s.access(), now) => {
-            if s.id != d.sub_id {
+    let mut d = d;
+    match super::access_key(st, &d.install_id).map_err(ApiError::db)? {
+        Some(key) if key != d.sub_id => {
+            // Between a free account and Pro on the same PC the phone stays paired (same
+            // owner); only a move between two subscriptions asks it to pair again.
+            if key.starts_with(super::ACCOUNT_KEY) || d.sub_id.starts_with(super::ACCOUNT_KEY) {
+                st.db.remote_set_sub(&d.id, &key).map_err(ApiError::db)?;
+                d.sub_id = key;
+            } else {
                 return Err(device_moved());
             }
         }
-        _ => {
+        Some(_) => {}
+        None => {
             return Err(pro_required().hint(
                 "The streamer's Ferrocast Pro is paused. This phone stays paired and works again once it's back.",
             ));
@@ -257,6 +267,7 @@ fn pair_inner(
             .hint(format!("Wait {mins} minute{}, then scan a fresh code.", if mins == 1 { "" } else { "s" }))
             .header(header::RETRY_AFTER, wait.to_string()));
     }
+    let account = crate::accounts::pairing_account(st, headers)?;
     let v = json_body(headers, body)?;
     let miss = || {
         ApiError::new(StatusCode::NOT_FOUND, "not_found", "That link has expired or was already used.")
@@ -269,15 +280,46 @@ fn pair_inner(
     let hash = st.remote.cfg.hash(&code).ok_or_else(super::unavailable)?;
     let now = now_ms();
     let taken = st.db.remote_take_code(&hash, now).map_err(ApiError::db)?.ok_or_else(miss)?;
-    let pro_ok = st
-        .db
-        .pro_sub_for_install(&taken.install_id)
-        .map_err(ApiError::db)?
-        .is_some_and(|s| crate::billing::access::is_pro(&s.access(), now));
-    let role = Role::parse(&taken.role).ok_or_else(miss)?;
-    if !pro_ok {
+    let pro_ok = super::access_key(st, &taken.install_id).map_err(ApiError::db)?.is_some();
+    if !pro_ok || Role::parse(&taken.role).is_none() {
         return Err(miss());
     }
+    let v = mint_device(st, taken, account.as_deref(), now)?;
+    Ok(axum::Json(v).into_response())
+}
+
+/// The web dashboard opens a PC of the signed-in account without a code (an owner device).
+pub(crate) fn connect_owner(st: &AppState, install: &str, account: &str, name: &str) -> Result<Value, ApiError> {
+    if !available(st) {
+        return Err(super::unavailable());
+    }
+    let key = super::access_key(st, install).map_err(ApiError::db)?.ok_or_else(super::access_required)?;
+    let now = now_ms();
+    // Through a short-lived code, so the owner-device cap is counted the same way as pairing.
+    let code = format!("connect-{}", crate::random(24));
+    let hash = st.remote.cfg.hash(&code).ok_or_else(super::unavailable)?;
+    let added = st
+        .db
+        .remote_add_code_capped(&hash, install, &key, "owner", name, now, now + 60_000, super::MAX_OWNER_DEVICES)
+        .map_err(ApiError::db)?;
+    if !added {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "too_many_devices",
+            format!("This PC already has {} of your own devices.", super::MAX_OWNER_DEVICES),
+        )
+        .hint("Remove one in Settings › Dashboard anywhere first."));
+    }
+    let taken = st.db.remote_take_code(&hash, now).map_err(ApiError::db)?.ok_or_else(super::unavailable)?;
+    let v = mint_device(st, taken, Some(account), now)?;
+    // Ask the PC to open its tunnel (it may have none open without a paired device).
+    let _ = st.enqueue(install, "remote_wanted", &json!({ "reason": "web_dashboard" }));
+    Ok(v)
+}
+
+/// Makes the device a taken code stands for; the pair answer.
+fn mint_device(st: &AppState, taken: super::store::Code, account: Option<&str>, now: i64) -> Result<Value, ApiError> {
+    let role = Role::parse(&taken.role).ok_or_else(unauthorized)?;
     let id = format!("dv_{}", hex16());
     let secret = crate::random(32);
     let d = Device {
@@ -292,16 +334,18 @@ fn pair_inner(
         expires_at: now + TOKEN_TTL_MS,
     };
     st.db.remote_add_device(&d).map_err(ApiError::db)?;
+    if let Some(a) = account {
+        st.db.account_bind_device(&d.id, a, now).map_err(ApiError::db)?;
+    }
     let _ = st.db.remote_audit(&d.sub_id, &d.install_id, &d.id, &d.name, "PAIR device", 200, now);
     super::tell_counts(st, &d.install_id);
-    Ok(axum::Json(json!({
+    Ok(json!({
         "token": format!("fcr_{id}.{secret}"),
         "device_id": id,
         "role": role.as_str(),
         "name": d.name,
         "expires_at": d.expires_at,
     }))
-    .into_response())
 }
 
 fn hex16() -> String {
@@ -316,7 +360,7 @@ fn hex16() -> String {
 pub(crate) async fn me(State(st): State<AppState>, headers: HeaderMap) -> Response {
     done((|| -> Result<Response, ApiError> {
         gate(&st, &headers)?;
-        let (d, role) = device_for(&st, bearer(&headers))?;
+        let (d, role) = device_for(&st, &headers)?;
         let cloud = crate::bot::cloud_state(&st, &d.sub_id);
         Ok(axum::Json(json!({
             "device_id": d.id, "name": d.name, "role": role.as_str(),
@@ -358,7 +402,7 @@ pub(crate) async fn forget(State(st): State<AppState>, headers: HeaderMap) -> Re
 pub(crate) async fn ticket(State(st): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     done((|| -> Result<Response, ApiError> {
         gate(&st, &headers)?;
-        let (d, _) = device_for(&st, bearer(&headers))?;
+        let (d, _) = device_for(&st, &headers)?;
         rate(&st, &d)?;
         let v = json_body(&headers, &body)?;
         let (ticket, ttl) = match v["for"].as_str() {
@@ -444,7 +488,7 @@ async fn api_inner(
     let method = req.method.clone();
     let path = req.uri.path().strip_prefix("/r/api/v1").unwrap_or("").to_string();
     let (device, role) = match bearer(&headers) {
-        Some(token) => device_for(st, Some(token))?,
+        Some(_) => device_for(st, &headers)?,
         None => {
             // `<img>` and `<video>` can't send headers: a media preview may carry a media
             // ticket (never the device token) in its query.
@@ -714,10 +758,11 @@ async fn phone_loop(st: AppState, device: Device, role: Role, since: Option<u64>
                     // Still paired and still Pro? (A removed device's socket is closed at once;
                     // this catches expiry and a lapse.)
                     let paired = matches!(st.db.remote_device(&device.id), Ok(Some(d)) if d.expires_at > now_ms());
-                    let sub = st.db.pro_sub_for_install(&install);
-                    let pro = matches!(&sub, Ok(Some(s)) if crate::billing::access::is_pro(&s.access(), now_ms()));
+                    let key = super::access_key(&st, &install);
+                    let pro = matches!(&key, Ok(Some(_)));
                     // Pro restored onto another subscription: this phone pairs again.
-                    let paired = paired && !matches!(&sub, Ok(Some(s)) if pro && s.id != device.sub_id);
+                    let paired = paired && !matches!(&key, Ok(Some(k)) if k != &device.sub_id
+                        && !k.starts_with(super::ACCOUNT_KEY) && !device.sub_id.starts_with(super::ACCOUNT_KEY));
                     if !paired || !pro {
                         let _ = tx.send(close(if paired { CLOSE_PRO } else { CLOSE_REVOKED })).await;
                         break;

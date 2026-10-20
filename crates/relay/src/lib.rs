@@ -11,6 +11,7 @@
 //! `billing::gate` (402 without Pro), `vault` (encrypted secrets), `quota` (per-subscription
 //! counters) and `blob` (files).
 
+pub mod accounts;
 pub mod admin;
 mod admin_pro;
 pub mod backups;
@@ -119,6 +120,8 @@ pub struct AppState {
     pub(crate) tip_domains: Arc<tips::domains::Runtime>,
     /// The owner's read-only stats for the Control Center (`admin`; off without `RELAY_ADMIN_TOKEN`).
     pub(crate) admin: Arc<admin::Runtime>,
+    /// Accounts: Google's client, the web dashboard's login rule, sign-in rate limits.
+    pub(crate) accounts: Arc<accounts::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -145,6 +148,7 @@ impl AppState {
             bot: Arc::default(),
             tip_domains: Arc::default(),
             admin: Arc::default(),
+            accounts: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -223,6 +227,12 @@ impl AppState {
     /// The admin stats' token and backup marker (`admin::AdminConfig::from_env()` in production).
     pub fn with_admin(mut self, cfg: admin::AdminConfig) -> AppState {
         self.admin = Arc::new(admin::Runtime::new(cfg));
+        self
+    }
+
+    /// Accounts (`accounts::AccountsConfig::from_env()` in production).
+    pub fn with_accounts(mut self, cfg: accounts::AccountsConfig) -> AppState {
+        self.accounts = Arc::new(accounts::Runtime::new(cfg));
         self
     }
 
@@ -331,6 +341,7 @@ pub fn router(state: AppState) -> Router {
         .merge(mail::routes())
         .merge(admin::routes())
         .merge(admin_pro::routes())
+        .merge(accounts::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))

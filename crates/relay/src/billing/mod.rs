@@ -425,16 +425,58 @@ pub async fn checkout(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let install = authed(&st, &headers)?;
+    checkout_as(&st, Owner::Install(install), peer, &headers, &body).await
+}
+
+/// Who a checkout is for: an install (the app, as before; it joins the install's account
+/// when it's signed in), or a signed-in account on the web (its verified email, no PC yet).
+#[derive(Debug, Clone)]
+pub(crate) enum Owner {
+    Install(String),
+    Account { id: String, email: String },
+}
+
+impl Owner {
+    /// The key rate limits, the checkout lock and code uses count under.
+    fn key(&self) -> String {
+        match self {
+            Owner::Install(i) => i.clone(),
+            Owner::Account { id, .. } => format!("acct:{id}"),
+        }
+    }
+
+    fn current_sub(&self, st: &AppState) -> Result<Option<SubRow>, ApiError> {
+        match self {
+            Owner::Install(i) => st.db.pro_sub_for_install(i).map_err(ApiError::db),
+            Owner::Account { id, .. } => st.db.account_sub(id, now_ms()).map_err(ApiError::db),
+        }
+    }
+}
+
+/// [`checkout`] for either kind of [`Owner`].
+pub(crate) async fn checkout_as(
+    st: &AppState,
+    owner: Owner,
+    peer: std::net::SocketAddr,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Response, ApiError> {
+    let st = st.clone();
+    let headers = headers.clone();
+    let install = owner.key();
     if !st.billing_cfg.sales_open {
         return Err(err(StatusCode::CONFLICT, "pro_not_on_sale", "Ferrocast Pro isn't on sale yet.")
             .hint("Pro launches after version 1. Everything Ferrocast does today is free, and stays free."));
     }
     let rzp = client(&st)?;
-    let b = json_body(&headers, &body)?;
+    let b = json_body(&headers, body)?;
     let Some(plan) = b["plan"].as_str().and_then(Plan::parse) else {
         return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "invalid_plan", "Pick the monthly or the yearly plan."));
     };
-    let email = b["email"].as_str().unwrap_or("").trim().to_string();
+    let email = match &owner {
+        Owner::Account { email, .. } => email.clone(),
+        Owner::Install(_) => b["email"].as_str().unwrap_or("").trim().to_string(),
+    };
     if !valid_email(&email) {
         return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email", "That email address doesn't look right.")
             .hint("Use the email you want Razorpay's receipts at; it also lets you move Pro to a new PC."));
@@ -463,7 +505,7 @@ pub async fn checkout(
     // One checkout at a time per install, so two quick clicks can't make two subscriptions.
     let lock = st.billing.checkout_lock(&install);
     let _held = lock.lock().await;
-    if let Some(s) = st.db.pro_sub_for_install(&install).map_err(ApiError::db)? {
+    if let Some(s) = owner.current_sub(&st)? {
         let a = s.access();
         if access::BLOCKING.contains(&s.status.as_str()) && s.refunded_at.is_none() {
             return Err(err(
@@ -510,8 +552,12 @@ pub async fn checkout(
     let plan_id = plan_for(&st, rzp, plan, quote.amount).await?;
     check_plan(&st, rzp, plan, quote.amount, &plan_id).await?;
     let hash = email_hash(email_key(&st)?, &email);
-    let mut notes = json!({ "product": PRODUCT, "plan": plan.key(), "install": install, "email_hash": hash,
+    let mut notes = json!({ "product": PRODUCT, "plan": plan.key(), "email_hash": hash,
                             "amount": quote.amount.to_string() });
+    match &owner {
+        Owner::Install(i) => notes["install"] = json!(i),
+        Owner::Account { id, .. } => notes["account"] = json!(id),
+    }
     if let Some(c) = &quote.code {
         notes["code"] = json!(c);
     }
@@ -534,7 +580,16 @@ pub async fn checkout(
         return Err(upstream(&RzpError::BadAnswer));
     }
     let status = v["status"].as_str().unwrap_or("created");
-    st.db.add_pro_sub(id, plan.key(), &hash, status, &install).map_err(ApiError::db)?;
+    match &owner {
+        Owner::Install(i) => {
+            st.db.add_pro_sub(id, plan.key(), &hash, status, i).map_err(ApiError::db)?;
+            crate::accounts::attach_checkout(&st, i, id);
+        }
+        Owner::Account { id: acct, .. } => {
+            st.db.add_pro_sub_unlinked(id, plan.key(), &hash, status).map_err(ApiError::db)?;
+            st.db.account_attach_sub(acct, id, "checkout", now).map_err(ApiError::db)?;
+        }
+    }
     st.db.put_sub_price(id, &quote, &plan_id, now).map_err(ApiError::db)?;
     if let Some(c) = &quote.code {
         st.db.note_code_use(c, &install, id, now).map_err(ApiError::db)?;
