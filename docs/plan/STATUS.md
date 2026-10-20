@@ -26,6 +26,9 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-20 (motion settings on alert looks)
+- `core::design`: 11 entrances, 9 exits and 8 text effects for the approved motion designer join the 1.0 ids (every 1.0 id keeps its meaning; `type` is the Typewriter). `AlertLook.motion` (`Motion`: idle loop, particles and colours, bounce, speed, stagger, shake/flash/vignette/zoom punch, `by_amount`, 3×3 position, direction, impact sounds (off), beat + BPM, recipe) is `#[serde(default)]`: a look saved before it reads as `Motion::default()`, which plays like 1.0. Ranges checked with named messages. `AlertDesignView.intensity` (`intensity_of`: amount against a usual tip in its own currency on a log scale, 0.6 to 2; Bits/KICKs/Jewels against 500, gift batches against 5; missing reads as 1). API.md §4 updated. Tests: 1.0 JSON and the shipped fixture read and validate, every id round-trips, partial blocks fill in, bad names/types refused, edges allowed, intensity table and render. `SCHEMA` stays 1: an older app refuses a file with the new ids as invalid instead of "update Ferrocast".
+
 ### 2026-10-20 (built-in sounds for 1.1)
 - `BuiltinSound` gains the owner-approved Crystal (Sparkle, Glint, Cascade, Bloom, Lift, Tally, Halo, Droplet) and Felt (Kalimba, Marimba, Glow, Ember, Pebble, Feather, Hearth, Wink) sets and `sparkle_classic`; Chime, Coin, Whoosh, Boing and Bass stay valid so saved designs load (the overlay plays Glint, Tally, Lift, Droplet, Ember for them).
 - A rule variation's `sound` may be `builtin:<id>` (`alert::BUILTIN_SOUND_PREFIX`), passed through to the overlay. New installs' default rules start with their kind's sound (`alert::default_sound`, owner's decision); saved rules never change (`alert_rules_seeded`).
