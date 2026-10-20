@@ -6,6 +6,10 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
+  # Unmaintained (not a vulnerability): read at build time by i18n-embed-fl, the proc macro
+  # age uses for its error messages. Nothing parses TOML at run time. Revisit when age moves
+  # off it.
+  { id = "RUSTSEC-2026-0374", reason = "unmaintained, build-time only via age's i18n proc macro" },
   # Build-time macro crate pulled in by gtk-rs 0.18 (Tauri's Linux webview stack). Not a
   # vulnerability; no maintained replacement upstream yet. Revisit when Tauri moves to gtk4.
   { id = "RUSTSEC-2024-0370", reason = "unmaintained, transitive via gtk 0.18 in Tauri on Linux" },
