@@ -264,6 +264,15 @@ fn code(c: &str) -> &'static str {
         "domains_full",
         "cloudflare_unavailable",
         "tip_domain_quota",
+        // Ferrocast accounts (ACCOUNTS.md §2).
+        "signed_out",
+        "account_disabled",
+        "flow_expired",
+        "invalid_redirect",
+        "invalid_challenge",
+        "google_off",
+        "mail_off",
+        "google_unavailable",
     ];
     KNOWN.iter().copied().find(|k| *k == c).unwrap_or("relay_error")
 }

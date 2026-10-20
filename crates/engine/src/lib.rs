@@ -17,6 +17,7 @@ pub mod designs;
 mod discord;
 mod dispatcher;
 mod error;
+mod ferro_account;
 mod giveaways;
 mod history;
 pub mod import;
@@ -119,6 +120,8 @@ struct Inner {
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
+    /// The Ferrocast account sign-in in progress (or its last problem).
+    account_flow: Mutex<ferro_account::Flow>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Who chatted this interval, for watch-time points.
     activity: Mutex<ferrocast_core::loyalty::Activity>,
@@ -261,6 +264,7 @@ impl Engine {
                 apps,
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
+                account_flow: Mutex::new(Default::default()),
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
