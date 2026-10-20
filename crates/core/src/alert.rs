@@ -298,15 +298,38 @@ pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) ->
     }
 }
 
+/// A variation's `sound` that names a built-in sound instead of a library file
+/// (`builtin:glint`); the overlay plays its own file. Passed through as is.
+pub const BUILTIN_SOUND_PREFIX: &str = "builtin:";
+
+/// The built-in sound each alert kind starts with on a new install (the owner's pre-matched
+/// set, 20 Oct 2026). Saved rules never change.
+pub fn default_sound(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "follow" => "glint",
+        "subscription" => "cascade",
+        "gift_batch" => "bloom",
+        "platform_gift" | "paid_message" | "tip" => "tally",
+        "raid" => "lift",
+        "reward_redemption" => "pebble",
+        _ => return None,
+    })
+}
+
 /// The rules a new install starts with, so alerts work the moment an account is connected.
+/// Each starts with its kind's built-in sound.
 pub fn default_rules() -> Vec<AlertRule> {
-    let rule = |id: &str, name: &str, kind: &str, title: &str| AlertRule {
-        id: id.into(),
-        name: name.into(),
-        enabled: true,
-        kinds: vec![kind.into()],
-        platforms: vec![],
-        variations: vec![Variation::new(&format!("{id}-default"), title)],
+    let rule = |id: &str, name: &str, kind: &str, title: &str| {
+        let mut v = Variation::new(&format!("{id}-default"), title);
+        v.sound = default_sound(kind).map(|s| format!("{BUILTIN_SOUND_PREFIX}{s}"));
+        AlertRule {
+            id: id.into(),
+            name: name.into(),
+            enabled: true,
+            kinds: vec![kind.into()],
+            platforms: vec![],
+            variations: vec![v],
+        }
     };
     vec![
         rule("follow", "Follows", "follow", "{name} followed!"),
@@ -415,6 +438,26 @@ mod tests {
         let mut r = sub_rule();
         r.kinds.clear();
         assert_eq!(r.validate(), Err(RuleError::NoKinds));
+    }
+
+    #[test]
+    fn default_rules_start_with_their_kinds_sound() {
+        let rules = default_rules();
+        let sound = |id: &str| {
+            rules.iter().find(|r| r.id == id).and_then(|r| r.variations[0].sound.clone()).unwrap_or_default()
+        };
+        assert_eq!(sound("follow"), "builtin:glint");
+        assert_eq!(sound("sub"), "builtin:cascade");
+        assert_eq!(sound("gift"), "builtin:bloom");
+        assert_eq!(sound("tip"), "builtin:tally");
+        assert_eq!(sound("raid"), "builtin:lift");
+        assert_eq!(sound("redeem"), "builtin:pebble");
+        assert!(rules.iter().all(|r| r.variations.iter().all(|v| v.sound.is_some())));
+        assert_eq!(default_sound("chat_message"), None);
+        // A rendered alert carries the sound for the overlay to play.
+        let r = rules.iter().find(|r| r.id == "follow").unwrap();
+        let a = render("a1", r, &r.variations[0], &sample("follow", Platform::Twitch, Millis(0)).unwrap());
+        assert_eq!(a.sound.as_deref(), Some("builtin:glint"));
     }
 
     #[test]

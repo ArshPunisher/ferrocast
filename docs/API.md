@@ -63,6 +63,9 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
                        title: string; body: string; image: string | null; sound: string | null; volume: number;
                        duration_ms: number; layout: string; css: string; tts_text: string | null; tts_audio: string | null; test: boolean;
                        design?: AlertDesignView /* only when an alert design dressed it (§4 Designs); layout is then "design" */ };
+// sound: a media id, or `builtin:<id>` for one of the overlay's built-in sounds (ids as in Sound.builtin below). A new install's
+//   default rules start with one each (core::alert::default_sound: follow glint, subscription cascade, gift_batch bloom,
+//   platform_gift / paid_message / tip tally, raid lift, reward_redemption pebble); saved rules never change.
 // tts_audio is a media id of a WAV made with the computer's own voices; it may be null even when tts_text is set
 // (synthesis still running or unavailable): then speak tts_text with speechSynthesis.
 ```
@@ -186,7 +189,7 @@ type AlertLook = {
   colors: { text; highlight /* name and amount */; plate; accent; outline };
   plate: boolean; shadow: "none" | "soft" | "hard" | "glow"; outline: 0–12;
   anim: { in: AnimIn; out: AnimOut; text: "none" | "wave" | "wiggle" | "bounce" | "pop" | "type" | "glow"; in_ms: 0–3000; out_ms: 0–3000; text_delay_ms: 0–10000 };
-  sound: { ref: MediaRef | null /* plays instead of builtin */; builtin: "none" | "chime" | "coin" | "whoosh" | "boing" | "bass" | "sparkle"; volume: 0–100 };
+  sound: { ref: MediaRef | null /* plays instead of builtin */; builtin: "none" | "sparkle" | "glint" | "cascade" | "bloom" | "lift" | "tally" | "halo" | "droplet" /* Crystal */ | "kalimba" | "marimba" | "glow" | "ember" | "pebble" | "feather" | "hearth" | "wink" /* Felt */ | "sparkle_classic" | "chime" | "coin" | "whoosh" | "boing" | "bass" /* retired in 1.1: still accepted, the overlay plays Glint, Tally, Lift, Droplet, Ember */; volume: 0–100 };
   duration_ms: 1000–60000 /* more than in_ms + out_ms */;
   tts: { enabled: boolean; min_amount: number /* major units; 0 reads all */ };
   brand: "corner" | "divider" | "watermark" | "notch" | "badge" | "edge" /* where the mark sits when the design is branded */;

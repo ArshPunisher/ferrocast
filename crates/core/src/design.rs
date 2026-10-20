@@ -415,16 +415,39 @@ pub struct Anim {
     pub text_delay_ms: u32,
 }
 
+/// The overlay's built-in alert sounds (files in the overlay bundle). Chime, Coin, Whoosh,
+/// Boing and Bass retired in 1.1 but stay valid: saved designs keep their id and the overlay
+/// plays the closest new sound (Glint, Tally, Lift, Droplet, Ember).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinSound {
     None,
+    // Retired in 1.1, kept so saved designs load.
     Chime,
     Coin,
     Whoosh,
     Boing,
     Bass,
+    // Crystal
     Sparkle,
+    Glint,
+    Cascade,
+    Bloom,
+    Lift,
+    Tally,
+    Halo,
+    Droplet,
+    // Felt
+    Kalimba,
+    Marimba,
+    Glow,
+    Ember,
+    Pebble,
+    Feather,
+    Hearth,
+    Wink,
+    /// The pre-1.1 Sparkle.
+    SparkleClassic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1021,6 +1044,40 @@ pub(crate) mod tests {
     use crate::money::{Money, PlatformValue};
     use crate::sample::{any_sample, sample};
     use serde_json::json;
+
+    #[test]
+    fn every_built_in_sound_id_reads_and_writes_back() {
+        for id in [
+            "none",
+            "sparkle",
+            "glint",
+            "cascade",
+            "bloom",
+            "lift",
+            "tally",
+            "halo",
+            "droplet",
+            "kalimba",
+            "marimba",
+            "glow",
+            "ember",
+            "pebble",
+            "feather",
+            "hearth",
+            "wink",
+            "sparkle_classic",
+            // retired in 1.1, still valid in saved designs
+            "chime",
+            "coin",
+            "whoosh",
+            "boing",
+            "bass",
+        ] {
+            let s: BuiltinSound = serde_json::from_value(serde_json::json!(id)).expect(id);
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(id));
+        }
+        assert!(serde_json::from_value::<BuiltinSound>(serde_json::json!("airhorn")).is_err());
+    }
 
     pub(crate) fn look(title: &str) -> AlertLook {
         AlertLook {
