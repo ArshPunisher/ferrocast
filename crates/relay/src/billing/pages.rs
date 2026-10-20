@@ -29,7 +29,7 @@ pub fn date(ms: i64) -> String {
     format!("{d} {month} {y}")
 }
 
-fn rupees(paise: i64) -> String {
+pub(crate) fn rupees(paise: i64) -> String {
     let r = paise / 100;
     // Indian grouping is the same as plain grouping below ₹1,00,000.
     if r >= 1000 { format!("₹{},{:03}", r / 1000, r % 1000) } else { format!("₹{r}") }
@@ -93,8 +93,13 @@ fn summary(s: &SubRow) -> String {
 
 pub fn manage(st: &AppState, s: &SubRow, token: &str, note: Option<Result<&str, String>>) -> Response {
     let plan = Plan::parse(&s.plan);
+    // The price this subscription was bought at (a sale or a code), else the plan's default.
+    let paid = st.db.sub_price(&s.id).ok().flatten().map(|p| p.amount);
     let price = plan
-        .map(|p| format!("{} a {}", rupees(p.amount_paise()), if p == Plan::Monthly { "month" } else { "year" }))
+        .map(|p| {
+            let amount = paid.unwrap_or(p.amount_paise());
+            format!("{} a {}", rupees(amount), if p == Plan::Monthly { "month" } else { "year" })
+        })
         .unwrap_or_default();
     let installs = st.db.pro_installs(&s.id).unwrap_or(0);
     let note = match note {

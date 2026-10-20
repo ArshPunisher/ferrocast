@@ -1,9 +1,9 @@
-//! Owner-only test Pro ("comp" grants): Pro for one install without Razorpay, so the owner
-//! can try Pro end to end on their own desktop. Only reachable from the relay's command line
-//! (`ferrocast-relay pro-grant …`, run on the server through `deploy/pro-grant.sh`); there's
-//! no HTTP route. A grant is an ordinary `pro_subs` row with a `comp_` id and plan `comp`,
-//! so every Pro feature sees it as Pro; everything that would ask Razorpay about a
-//! subscription skips it (see [`is_comp`]).
+//! Free Pro without Razorpay ("comp" grants): the owner's own testing, and Pro given away.
+//! Made from the relay's command line (`ferrocast-relay pro-grant …`, run on the server
+//! through `deploy/pro-grant.sh`), the Control Center (`POST /admin/v1/grants`) and grant
+//! codes redeemed in the app (`codes`); `pro_grants` keeps who gave each one. A grant is an
+//! ordinary `pro_subs` row with a `comp_` id and plan `comp`, so every Pro feature sees it
+//! as Pro; everything that would ask Razorpay about a subscription skips it (see [`is_comp`]).
 
 use rusqlite::{OptionalExtension, params};
 
@@ -34,86 +34,168 @@ pub struct Granted {
     pub extended: bool,
 }
 
+/// Why a grant didn't happen.
+#[derive(Debug, thiserror::Error)]
+pub enum CompError {
+    #[error("Days must be 1 to {MAX_DAYS}.")]
+    Days,
+    #[error(
+        "No install '{0}' on this relay. Check the id (the part before the dot in the app's relay-install secret)."
+    )]
+    UnknownInstall(String),
+    #[error(
+        "Install '{install}' has a real Razorpay subscription ({id}, {status}). Nothing was changed: cancel it and let it end first, or test on another install."
+    )]
+    RealSubscription { install: String, id: String, status: String },
+    #[error("The relay database refused: {0}")]
+    Db(#[from] rusqlite::Error),
+}
+
+/// Who gave a grant, kept in `pro_grants` with each grant and revoke.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantBy {
+    /// `cli` (pro-grant on the server), `admin` (the Control Center) or `code` (redeemed in the app).
+    pub source: &'static str,
+    pub code: Option<String>,
+    /// The admin's email (Control Center).
+    pub actor: Option<String>,
+    pub note: Option<String>,
+}
+
+impl GrantBy {
+    pub fn cli() -> GrantBy {
+        GrantBy { source: "cli", ..GrantBy::default() }
+    }
+}
+
+/// One line of a grant's history.
+#[allow(clippy::too_many_arguments)]
+fn log(
+    tx: &rusqlite::Transaction<'_>,
+    sub: &str,
+    install: &str,
+    kind: &str,
+    by: &GrantBy,
+    days: i64,
+    until: i64,
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO pro_grants(sub_id, install_id, kind, source, code, actor, note, days, until, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![sub, install, kind, by.source, by.code, by.actor, by.note, days, until, now],
+    )?;
+    Ok(())
+}
+
+/// Grants (or extends) comp Pro on `install` for `days` inside `tx` (see [`Db::comp_grant`]).
+pub(crate) fn grant_in(
+    tx: &rusqlite::Transaction<'_>,
+    install: &str,
+    days: i64,
+    now: i64,
+    by: &GrantBy,
+) -> Result<Granted, CompError> {
+    if !(1..=MAX_DAYS).contains(&days) {
+        return Err(CompError::Days);
+    }
+    let known = tx.query_row("SELECT 1 FROM installs WHERE id = ?1", [install], |_| Ok(())).optional()?.is_some();
+    if !known {
+        return Err(CompError::UnknownInstall(install.to_string()));
+    }
+    let linked: Option<(String, String, Option<i64>, bool, bool)> = tx
+        .query_row(
+            "SELECT s.id, s.status, s.current_end, s.cancel_at_end, s.refunded_at IS NOT NULL
+               FROM pro_installs p JOIN pro_subs s ON s.id = p.sub_id WHERE p.install_id = ?1",
+            [install],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0, r.get(4)?)),
+        )
+        .optional()?;
+    let cap = now + MAX_DAYS * DAY_MS;
+    let granted = match linked {
+        Some((id, status, end, _, _)) if is_comp(&id) => {
+            // Extend from what's left (or from now once it ran out).
+            let from = end.filter(|e| status == "active" && *e > now).unwrap_or(now);
+            let until = (from + days * DAY_MS).min(cap);
+            tx.execute(
+                "UPDATE pro_subs SET status = 'active', current_end = ?2, cancel_at_end = 1, refunded_at = NULL,
+                   synced_at = ?3 WHERE id = ?1",
+                params![id, until, now],
+            )?;
+            Granted { sub_id: id, until, extended: true }
+        }
+        Some((id, status, current_end, cancel_at_end, refunded)) => {
+            let a = access::SubState { status: status.clone(), current_end, cancel_at_end, refunded };
+            if (access::BLOCKING.contains(&status.as_str()) && !refunded) || access::is_pro(&a, now) {
+                return Err(CompError::RealSubscription { install: install.to_string(), id, status });
+            }
+            new_grant(tx, install, days, now)?
+        }
+        None => new_grant(tx, install, days, now)?,
+    };
+    log(tx, &granted.sub_id, install, "grant", by, days, granted.until, now)?;
+    Ok(granted)
+}
+
 impl Db {
     /// Grants (or extends) test Pro on `install` for `days` (1..=[`MAX_DAYS`]). Ends with the
     /// period, no renewal grace (`cancel_at_end`). Refuses an unknown install, and one whose
     /// real subscription still grants or renews Pro.
     pub fn comp_grant(&self, install: &str, days: i64) -> Result<Granted, String> {
-        if !(1..=MAX_DAYS).contains(&days) {
-            return Err(format!("Days must be 1 to {MAX_DAYS}."));
-        }
+        self.comp_grant_by(install, days, &GrantBy::cli()).map_err(|e| e.to_string())
+    }
+
+    /// [`Db::comp_grant`], saying who gave it.
+    pub fn comp_grant_by(&self, install: &str, days: i64, by: &GrantBy) -> Result<Granted, CompError> {
         let mut c = self.c();
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(db)?;
-        let known = tx
-            .query_row("SELECT 1 FROM installs WHERE id = ?1", [install], |_| Ok(()))
-            .optional()
-            .map_err(db)?
-            .is_some();
-        if !known {
-            return Err(format!(
-                "No install '{install}' on this relay. Check the id (the part before the dot in the app's relay-install secret)."
-            ));
-        }
-        let now = now_ms();
-        let linked: Option<(String, String, Option<i64>, bool, bool)> = tx
-            .query_row(
-                "SELECT s.id, s.status, s.current_end, s.cancel_at_end, s.refunded_at IS NOT NULL
-                   FROM pro_installs p JOIN pro_subs s ON s.id = p.sub_id WHERE p.install_id = ?1",
-                [install],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0, r.get(4)?)),
-            )
-            .optional()
-            .map_err(db)?;
-        let cap = now + MAX_DAYS * DAY_MS;
-        let granted = match linked {
-            Some((id, status, end, _, _)) if is_comp(&id) => {
-                // Extend from what's left (or from now once it ran out).
-                let from = end.filter(|e| status == "active" && *e > now).unwrap_or(now);
-                let until = (from + days * DAY_MS).min(cap);
-                tx.execute(
-                    "UPDATE pro_subs SET status = 'active', current_end = ?2, cancel_at_end = 1, refunded_at = NULL,
-                       synced_at = ?3 WHERE id = ?1",
-                    params![id, until, now],
-                )
-                .map_err(db)?;
-                Granted { sub_id: id, until, extended: true }
-            }
-            Some((id, status, current_end, cancel_at_end, refunded)) => {
-                let a = access::SubState { status: status.clone(), current_end, cancel_at_end, refunded };
-                if (access::BLOCKING.contains(&status.as_str()) && !refunded) || access::is_pro(&a, now) {
-                    return Err(format!(
-                        "Install '{install}' has a real Razorpay subscription ({id}, {status}). Nothing was changed: \
-                         cancel it and let it end first, or test on another install."
-                    ));
-                }
-                new_grant(&tx, install, days, now).map_err(db)?
-            }
-            None => new_grant(&tx, install, days, now).map_err(db)?,
-        };
-        tx.commit().map_err(db)?;
-        Ok(granted)
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let g = grant_in(&tx, install, days, now_ms(), by)?;
+        tx.commit()?;
+        Ok(g)
     }
 
     /// Ends the install's test Pro now. The row stays (as `cancelled`, ended now), so the
     /// usual "kept 30 days after Pro ended" rules clean up its data like any lapsed Pro,
     /// and a later grant extends the same id.
     pub fn comp_revoke(&self, install: &str) -> Result<Granted, String> {
-        let c = self.c();
-        let id: Option<String> = c
+        let id: Option<String> = self
+            .c()
             .query_row("SELECT sub_id FROM pro_installs WHERE install_id = ?1", [install], |r| r.get(0))
             .optional()
             .map_err(db)?;
         let Some(id) = id.filter(|id| is_comp(id)) else {
             return Err(format!("Install '{install}' has no test Pro grant. Nothing was changed."));
         };
+        self.comp_revoke_sub(&id, &GrantBy::cli()).map_err(db)?.ok_or_else(|| "The grant is gone.".to_string())
+    }
+
+    /// Ends one comp grant (by its `comp_…` id) now; `None` if there's no such grant.
+    pub fn comp_revoke_sub(&self, id: &str, by: &GrantBy) -> rusqlite::Result<Option<Granted>> {
+        if !is_comp(id) {
+            return Ok(None);
+        }
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_ms();
-        c.execute(
+        if tx.query_row("SELECT 1 FROM pro_subs WHERE id = ?1", [id], |_| Ok(())).optional()?.is_none() {
+            return Ok(None);
+        }
+        tx.execute(
             "UPDATE pro_subs SET status = 'cancelled', current_end = MIN(COALESCE(current_end, ?2), ?2),
                cancel_at_end = 1, synced_at = ?2 WHERE id = ?1",
             params![id, now],
-        )
-        .map_err(db)?;
-        Ok(Granted { sub_id: id, until: now, extended: false })
+        )?;
+        let install: String = tx
+            .query_row(
+                "SELECT install_id FROM pro_install_subs WHERE sub_id = ?1 ORDER BY linked_at DESC LIMIT 1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        log(&tx, id, &install, "revoke", by, 0, now, now)?;
+        tx.commit()?;
+        Ok(Some(Granted { sub_id: id.to_string(), until: now, extended: false }))
     }
 
     /// Every comp grant: (sub id, install or "", status, current_end).

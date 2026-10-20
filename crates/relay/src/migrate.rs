@@ -54,6 +54,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             crate::discord::SCHEMA_PAUSED,
         ],
     },
+    Migration {
+        version: 14,
+        name: "Pro prices, sales, codes, grant history, refunds, admin audit",
+        sql: &[crate::billing::pricing::SCHEMA],
+    },
 ];
 
 pub(crate) fn latest() -> i64 {

@@ -309,6 +309,20 @@ impl Db {
         rows.collect()
     }
 
+    /// Razorpay's refunds on one of Pro's payments, as last read: (refund id, amount, status, at ms).
+    pub fn put_refunds(&self, payment: &str, refunds: &[(String, i64, String, i64)]) -> rusqlite::Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for (id, amount, status, at) in refunds {
+            tx.execute(
+                "INSERT INTO pro_refunds(refund_id, payment_id, amount, status, at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(refund_id) DO UPDATE SET amount = excluded.amount, status = excluded.status",
+                params![id, payment, amount, status, at],
+            )?;
+        }
+        tx.commit()
+    }
+
     pub(crate) fn prune_billing(&self) -> rusqlite::Result<()> {
         let now = now_ms();
         let c = self.c();

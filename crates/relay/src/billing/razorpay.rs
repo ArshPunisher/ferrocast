@@ -1,5 +1,5 @@
 //! A small Razorpay API client and the webhook signature check. Only what Pro uses:
-//! plans, subscriptions, cancelling, and a payment's refunds.
+//! plans (reading and making them), subscriptions, cancelling, and a payment's refunds.
 //! Docs: <https://razorpay.com/docs/api/payments/subscriptions/>
 
 use std::time::Duration;
@@ -89,6 +89,11 @@ impl Razorpay {
             return Err(RzpError::Refused(status, d.chars().take(300).collect()));
         }
         Ok(v)
+    }
+
+    /// Makes a plan (free; Razorpay never deletes one). Body as in Razorpay's Create Plan.
+    pub async fn create_plan(&self, body: Value) -> Result<Value, RzpError> {
+        self.call(reqwest::Method::POST, "/plans", Some(body)).await
     }
 
     pub async fn fetch_plan(&self, id: &str) -> Result<Value, RzpError> {

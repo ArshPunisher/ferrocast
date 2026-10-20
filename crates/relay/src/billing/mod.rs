@@ -19,9 +19,11 @@
 
 pub mod access;
 pub(crate) mod carry;
+pub mod codes;
 pub mod comp;
 pub(crate) mod gate;
 mod pages;
+pub mod pricing;
 pub mod razorpay;
 pub mod store;
 
@@ -52,6 +54,8 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .route("/v1/pro/cancel", post(cancel))
         .route("/v1/pro/manage-link", post(manage_link))
         .route("/v1/pro/restore", post(restore))
+        .route("/v1/pro/redeem", post(redeem))
+        .route("/v1/pro/prices", get(public_prices).options(prices_preflight))
         .route("/pro/manage/{token}", get(manage_page))
         .route("/pro/manage/{token}/cancel", post(manage_cancel))
         .route("/billing/razorpay/webhook", post(webhook))
@@ -161,6 +165,8 @@ pub struct Runtime {
     plans_ok: Mutex<HashMap<String, bool>>,
     limits: Mutex<Limits>,
     checkouts: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// One Razorpay plan made at a time, so two checkouts can't make two for one amount.
+    plan_lock: tokio::sync::Mutex<()>,
 }
 
 impl Runtime {
@@ -210,13 +216,13 @@ fn not_set_up() -> ApiError {
         .hint("Nothing to do on your side; try again later.")
 }
 
-fn upstream(e: &RzpError) -> ApiError {
+pub(crate) fn upstream(e: &RzpError) -> ApiError {
     tracing::warn!(error = %e, "Razorpay call failed");
     err(StatusCode::BAD_GATEWAY, "razorpay_unavailable", "Razorpay, our payment provider, didn't answer properly.")
         .hint("Try again in a minute. You haven't been charged for anything that failed.")
 }
 
-fn client(st: &AppState) -> Result<&Razorpay, ApiError> {
+pub(crate) fn client(st: &AppState) -> Result<&Razorpay, ApiError> {
     st.billing
         .client
         .get_or_init(|| {
@@ -327,13 +333,17 @@ fn quotas(st: &AppState, sub: &str) -> Value {
 /// What the app and the manage page show.
 fn view(st: &AppState, sub: Option<&SubRow>) -> Value {
     let now = now_ms();
-    let prices =
-        json!({ "currency": "INR", "monthly": Plan::Monthly.amount_paise(), "yearly": Plan::Yearly.amount_paise() });
+    let p = pricing::public_prices(&st.db, now).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "couldn't read Pro's prices; showing the defaults");
+        json!({ "prices": { "currency": "INR", "monthly": Plan::Monthly.amount_paise(),
+                            "yearly": Plan::Yearly.amount_paise() }, "list_prices": null, "sale": null })
+    });
+    let (prices, list_prices, sale) = (p["prices"].clone(), p["list_prices"].clone(), p["sale"].clone());
     let Some(s) = sub else {
         return json!({ "pro": false, "status": "none", "plan": null, "subscription_id": null, "current_end": null,
                        "access_until": null, "cancel_at_period_end": false, "refunded": false, "installs": 0,
-                       "sales_open": st.billing_cfg.sales_open, "prices": prices, "checked_at": now,
-                       "features": features(st), "quotas": {} });
+                       "sales_open": st.billing_cfg.sales_open, "prices": prices, "list_prices": list_prices,
+                       "sale": sale, "checked_at": now, "features": features(st), "quotas": {} });
     };
     let a = s.access();
     json!({
@@ -348,6 +358,8 @@ fn view(st: &AppState, sub: Option<&SubRow>) -> Value {
         "installs": st.db.pro_installs(&s.id).unwrap_or(0),
         "sales_open": st.billing_cfg.sales_open,
         "prices": prices,
+        "list_prices": list_prices,
+        "sale": sale,
         "checked_at": now,
         "features": features(st),
         "quotas": quotas(st, &s.id),
@@ -403,10 +415,12 @@ pub async fn status(
     Ok(axum::Json(v).into_response())
 }
 
-/// `POST /v1/pro/checkout` `{plan: "monthly"|"yearly", email}` → 201 with Razorpay's
-/// checkout link for a new subscription.
+/// `POST /v1/pro/checkout` `{plan: "monthly"|"yearly", email, code?}` → 201 with Razorpay's
+/// checkout link for a new subscription, at today's price: the live sale's, or a discount
+/// code's when that's lower. The subscription keeps that price on every renewal.
 pub async fn checkout(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
@@ -425,7 +439,9 @@ pub async fn checkout(
         return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email", "That email address doesn't look right.")
             .hint("Use the email you want Razorpay's receipts at; it also lets you move Pro to a new PC."));
     }
-    let Some(plan_id) = st.billing_cfg.plan_id(plan).map(str::to_string) else { return Err(not_set_up()) };
+    if st.billing_cfg.plan_id(plan).is_none() {
+        return Err(not_set_up());
+    }
     if !st.billing.allow("checkout", &install, 10, 3_600_000) {
         return Err(err(
             StatusCode::TOO_MANY_REQUESTS,
@@ -434,6 +450,16 @@ pub async fn checkout(
         )
         .hint("Wait an hour, or finish the checkout page you already opened."));
     }
+    // A code tried here counts against the same limits as redeeming one, so checkout can't
+    // be used to guess codes.
+    let raw_code = b["code"].as_str().map(str::trim).filter(|c| !c.is_empty());
+    if raw_code.is_some() && !code_tries_left(&st, &install, peer, &headers) {
+        return Err(too_many_codes());
+    }
+    let code = match raw_code {
+        Some(c) => Some(discount_code(&st, c, plan)?),
+        None => None,
+    };
     // One checkout at a time per install, so two quick clicks can't make two subscriptions.
     let lock = st.billing.checkout_lock(&install);
     let _held = lock.lock().await;
@@ -479,15 +505,26 @@ pub async fn checkout(
             }
         }
     }
-    check_plan(&st, rzp, plan, &plan_id).await?;
+    let now = now_ms();
+    let quote = st.db.quote(plan, now, code.as_ref().map(|(c, pct)| (c.as_str(), *pct))).map_err(ApiError::db)?;
+    let plan_id = plan_for(&st, rzp, plan, quote.amount).await?;
+    check_plan(&st, rzp, plan, quote.amount, &plan_id).await?;
     let hash = email_hash(email_key(&st)?, &email);
+    let mut notes = json!({ "product": PRODUCT, "plan": plan.key(), "install": install, "email_hash": hash,
+                            "amount": quote.amount.to_string() });
+    if let Some(c) = &quote.code {
+        notes["code"] = json!(c);
+    }
+    if let Some(s) = &quote.sale {
+        notes["sale"] = json!(s);
+    }
     let req = json!({
         "plan_id": plan_id,
         "total_count": plan.total_count(),
         "quantity": 1,
         "customer_notify": 1,
-        "expire_by": now_ms() / 1000 + CHECKOUT_EXPIRES_S,
-        "notes": { "product": PRODUCT, "plan": plan.key(), "install": install, "email_hash": hash },
+        "expire_by": now / 1000 + CHECKOUT_EXPIRES_S,
+        "notes": notes,
     });
     let v = rzp.create_subscription(req).await.map_err(|e| upstream(&e))?;
     let id = v["id"].as_str().unwrap_or("");
@@ -498,7 +535,11 @@ pub async fn checkout(
     }
     let status = v["status"].as_str().unwrap_or("created");
     st.db.add_pro_sub(id, plan.key(), &hash, status, &install).map_err(ApiError::db)?;
-    tracing::info!(subscription = %id, plan = plan.key(), "Pro checkout started");
+    st.db.put_sub_price(id, &quote, &plan_id, now).map_err(ApiError::db)?;
+    if let Some(c) = &quote.code {
+        st.db.note_code_use(c, &install, id, now).map_err(ApiError::db)?;
+    }
+    tracing::info!(subscription = %id, plan = plan.key(), amount = quote.amount, "Pro checkout started");
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
@@ -506,8 +547,12 @@ pub async fn checkout(
             "checkout_url": url,
             "key_id": st.billing_cfg.key_id,
             "plan": plan.key(),
-            "amount": plan.amount_paise(),
+            "amount": quote.amount,
+            "list_amount": quote.list,
             "currency": "INR",
+            "sale": quote.sale,
+            "code": quote.code,
+            "code_applied": code.is_some() && quote.code.is_some(),
         })),
     )
         .into_response())
@@ -521,18 +566,52 @@ fn checkout_url_ok(u: &str) -> bool {
     })
 }
 
-/// The plan id in the config must be the price the relay means to charge: same amount,
-/// INR, the right period, one cycle at a time. Checked once per plan id.
-async fn check_plan(st: &AppState, rzp: &Razorpay, plan: Plan, id: &str) -> Result<(), ApiError> {
+/// The Razorpay plan that charges `amount` for `plan`: the configured one for the default
+/// price, else one the relay made before, else a new one (Razorpay's Plans API, free).
+pub(crate) async fn plan_for(st: &AppState, rzp: &Razorpay, plan: Plan, amount: i64) -> Result<String, ApiError> {
+    if amount == plan.amount_paise()
+        && let Some(id) = st.billing_cfg.plan_id(plan)
+    {
+        return Ok(id.to_string());
+    }
+    if let Some(id) = st.db.rzp_plan(plan, amount).map_err(ApiError::db)? {
+        return Ok(id);
+    }
+    let _one_at_a_time = st.billing.plan_lock.lock().await;
+    if let Some(id) = st.db.rzp_plan(plan, amount).map_err(ApiError::db)? {
+        return Ok(id);
+    }
+    if !pricing::amount_ok(amount) {
+        return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "invalid_amount", "That price can't be charged."));
+    }
+    let body = json!({
+        "period": plan.period(),
+        "interval": 1,
+        "item": { "name": plan.label(), "amount": amount, "currency": "INR",
+                  "description": format!("{} at {}", plan.label(), pages::rupees(amount)) },
+        "notes": { "product": PRODUCT, "plan": plan.key(), "amount": amount.to_string() },
+    });
+    let v = rzp.create_plan(body).await.map_err(|e| upstream(&e))?;
+    let Some(id) = v["id"].as_str().filter(|id| razorpay::is_id(id, "plan_")) else {
+        return Err(upstream(&RzpError::BadAnswer));
+    };
+    st.db.put_rzp_plan(plan, amount, id, now_ms()).map_err(ApiError::db)?;
+    tracing::info!(plan = plan.key(), amount, %id, "made a Razorpay plan for a new Pro price");
+    Ok(st.db.rzp_plan(plan, amount).map_err(ApiError::db)?.unwrap_or_else(|| id.to_string()))
+}
+
+/// The Razorpay plan must be the price the relay means to charge: same amount, INR, the
+/// right period, one cycle at a time. Checked once per plan id.
+async fn check_plan(st: &AppState, rzp: &Razorpay, plan: Plan, amount: i64, id: &str) -> Result<(), ApiError> {
     if st.billing.plans_ok.lock().unwrap_or_else(|p| p.into_inner()).get(id) == Some(&true) {
         return Ok(());
     }
     let v = rzp.fetch_plan(id).await.map_err(|e| upstream(&e))?;
-    let ok = v.pointer("/item/amount").and_then(Value::as_i64) == Some(plan.amount_paise())
+    let ok = v.pointer("/item/amount").and_then(Value::as_i64) == Some(amount)
         && v.pointer("/item/currency").and_then(Value::as_str) == Some("INR")
         && v["period"].as_str() == Some(plan.period())
         && v["interval"].as_i64() == Some(1)
-        && plan.amount_paise() < access::MANDATE_NO_OTP_LIMIT_PAISE;
+        && amount < access::MANDATE_NO_OTP_LIMIT_PAISE;
     if !ok {
         tracing::error!(plan = plan.key(), %id, "the configured Razorpay plan doesn't match Pro's price; checkout refused");
         return Err(err(
@@ -670,6 +749,179 @@ pub async fn restore(
     Ok(axum::Json(view(&st, Some(&fresh))).into_response())
 }
 
+/// A discount code for checkout: (code, percent off), or why it can't be used.
+fn discount_code(st: &AppState, raw: &str, plan: Plan) -> Result<(String, i64), ApiError> {
+    let now = now_ms();
+    let row = match codes::normalize(raw) {
+        Some(c) => st.db.code(&c, now).map_err(ApiError::db)?,
+        None => None,
+    };
+    let Some(row) = row else { return Err(code_refused(codes::CodeRefusal::NotFound)) };
+    if let Some(r) = row.refusal(now) {
+        return Err(code_refused(r));
+    }
+    if row.kind != "discount" {
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "grant_code",
+            "This code gives free Pro rather than a discount.",
+        )
+        .hint("Redeem it under \"Have a code?\" in Settings › Pro instead of paying."));
+    }
+    if !row.applies_to(plan.key()) {
+        let other = if plan == Plan::Monthly { "yearly" } else { "monthly" };
+        return Err(err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "code_not_for_plan",
+            format!("This code is for the {other} plan only."),
+        )
+        .hint(format!("Pick the {other} plan to use it.")));
+    }
+    Ok((row.code, row.percent_off.unwrap_or(0)))
+}
+
+/// Counts one code try: 10 an hour per install, 30 per address (redeem and checkout together).
+fn code_tries_left(st: &AppState, install: &str, peer: std::net::SocketAddr, headers: &HeaderMap) -> bool {
+    let ip = crate::client_ip(peer, headers).to_string();
+    st.billing.allow("redeem", install, 10, 3_600_000) && st.billing.allow("redeem-ip", &ip, 30, 3_600_000)
+}
+
+fn too_many_codes() -> ApiError {
+    err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many codes tried.")
+        .hint("Wait an hour, then check the code before trying again.")
+        .header(header::RETRY_AFTER, "3600")
+}
+
+fn code_refused(r: codes::CodeRefusal) -> ApiError {
+    match r {
+        codes::CodeRefusal::NotFound => err(StatusCode::NOT_FOUND, "code_not_found", "That code isn't valid.")
+            .hint("Check the spelling; codes are letters, digits and dashes."),
+        codes::CodeRefusal::Expired => err(StatusCode::GONE, "code_expired", "That code has expired."),
+        codes::CodeRefusal::UsedUp => {
+            err(StatusCode::CONFLICT, "code_used_up", "That code has been used as many times as it allows.")
+        }
+    }
+}
+
+/// `POST /v1/pro/redeem` `{code}`: a grant code gives (or extends) free Pro on this install
+/// and answers the new status with `redeemed`; a discount code answers what it takes off,
+/// for the app to pass to checkout.
+pub async fn redeem(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let install = authed(&st, &headers)?;
+    let b = json_body(&headers, &body)?;
+    let raw = b["code"].as_str().unwrap_or("").trim();
+    if raw.is_empty() {
+        return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "invalid_code", "Type the code first."));
+    }
+    if !code_tries_left(&st, &install, peer, &headers) {
+        return Err(too_many_codes());
+    }
+    let Some(code) = codes::normalize(raw) else { return Err(code_refused(codes::CodeRefusal::NotFound)) };
+    let now = now_ms();
+    match st.db.redeem_grant_code(&code, &install, now) {
+        Ok((g, row)) => {
+            tracing::info!(code = %code, subscription = %g.sub_id, "Pro code redeemed");
+            let sub = st.db.pro_sub(&g.sub_id).map_err(ApiError::db)?;
+            let mut v = view(&st, sub.as_ref());
+            v["redeemed"] = json!({ "code": row.code, "kind": "grant", "days": row.days, "until": g.until,
+                                    "extended": g.extended });
+            Ok(axum::Json(v).into_response())
+        }
+        Err(codes::RedeemError::Discount(row)) => {
+            let mut prices = serde_json::Map::new();
+            for p in Plan::ALL {
+                let pct = if row.applies_to(p.key()) { row.percent_off } else { None };
+                let q = st.db.quote(p, now, pct.map(|x| (row.code.as_str(), x))).map_err(ApiError::db)?;
+                prices.insert(
+                    p.key().into(),
+                    json!({ "list": q.list, "amount": q.amount, "code_applies": q.code.is_some() }),
+                );
+            }
+            Ok(axum::Json(json!({
+                "kind": "discount",
+                "code": row.code,
+                "percent_off": row.percent_off,
+                "applies_period": row.applies_period,
+                "valid_until": row.valid_until,
+                "currency": "INR",
+                "prices": prices,
+            }))
+            .into_response())
+        }
+        Err(codes::RedeemError::Refused(r)) => Err(code_refused(r)),
+        Err(codes::RedeemError::AlreadyRedeemed) => {
+            Err(err(StatusCode::CONFLICT, "already_redeemed", "This install has already used that code."))
+        }
+        Err(codes::RedeemError::Comp(comp::CompError::RealSubscription { .. })) => Err(err(
+            StatusCode::CONFLICT,
+            "already_pro",
+            "This install already pays for Pro, so a free-Pro code can't be added.",
+        )
+        .hint("Keep the code for another PC, or use it once this subscription has ended.")),
+        Err(codes::RedeemError::Comp(comp::CompError::Db(e))) => Err(ApiError::db(e)),
+        Err(codes::RedeemError::Comp(e)) => {
+            tracing::warn!(error = %e, code = %code, "a grant code couldn't be applied");
+            Err(err(StatusCode::UNPROCESSABLE_ENTITY, "code_unusable", "That code can't be used right now.")
+                .hint("Ask whoever gave it to you for a new one."))
+        }
+    }
+}
+
+/// Where the public prices may be read from in a browser.
+const PRICE_ORIGINS: [&str; 3] =
+    ["https://ferrocast.clearcraftlabs.com", "http://localhost:4321", "http://127.0.0.1:4321"];
+
+fn with_cors(mut res: Response, headers: &HeaderMap) -> Response {
+    let h = res.headers_mut();
+    if let Some(origin) =
+        headers.get(header::ORIGIN).filter(|o| PRICE_ORIGINS.iter().any(|a| o.as_bytes() == a.as_bytes()))
+    {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, axum::http::HeaderValue::from_static("GET, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, axum::http::HeaderValue::from_static("86400"));
+    }
+    h.insert(header::VARY, axum::http::HeaderValue::from_static("Origin"));
+    res
+}
+
+/// `GET /v1/pro/prices`: what Pro costs now, for the website (no install needed). Cached a
+/// minute by browsers and Cloudflare; readable from the site's origin (CORS).
+pub async fn public_prices(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = crate::client_ip(peer, &headers).to_string();
+    let res = if !st.billing.allow("prices-ip", &ip, 120, 60_000) {
+        err(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many requests for the prices.")
+            .hint("Try again in a minute.")
+            .header(header::RETRY_AFTER, "60")
+            .into_response()
+    } else {
+        match pricing::public_prices(&st.db, now_ms()) {
+            Ok(mut v) => {
+                v["sales_open"] = json!(st.billing_cfg.sales_open);
+                let mut r = axum::Json(v).into_response();
+                r.headers_mut()
+                    .insert(header::CACHE_CONTROL, axum::http::HeaderValue::from_static("public, max-age=60"));
+                r
+            }
+            Err(e) => ApiError::db(e).into_response(),
+        }
+    };
+    with_cors(res, &headers)
+}
+
+/// `OPTIONS /v1/pro/prices`: the browser's preflight (a plain GET doesn't need one).
+pub async fn prices_preflight(headers: HeaderMap) -> Response {
+    with_cors(StatusCode::NO_CONTENT.into_response(), &headers)
+}
+
 fn webhook_ok(status: &str) -> Response {
     (StatusCode::OK, axum::Json(json!({ "status": status }))).into_response()
 }
@@ -772,6 +1024,22 @@ async fn check_refunds(st: &AppState, payment: &str, event: Option<&str>) -> Res
     let Some((sub_id, amount)) = st.db.pro_payment(payment).map_err(ApiError::db)? else { return Ok(false) };
     let rzp = client(st)?;
     let refunds = rzp.payment_refunds(payment).await.map_err(|e| upstream(&e))?;
+    let seen: Vec<(String, i64, String, i64)> = refunds
+        .iter()
+        .filter_map(|r| {
+            let id = r["id"].as_str().filter(|id| razorpay::is_id(id, "rfnd_"))?;
+            let at = ms(&r["created_at"]).unwrap_or_else(now_ms);
+            Some((
+                id.to_string(),
+                r["amount"].as_i64()?,
+                r["status"].as_str().unwrap_or("").chars().take(32).collect(),
+                at,
+            ))
+        })
+        .collect();
+    if let Err(e) = st.db.put_refunds(payment, &seen) {
+        tracing::warn!(error = %e, %payment, "couldn't keep a copy of the payment's refunds");
+    }
     let refunded: i64 =
         refunds.iter().filter(|r| r["status"].as_str() != Some("failed")).filter_map(|r| r["amount"].as_i64()).sum();
     if refunded < amount {
