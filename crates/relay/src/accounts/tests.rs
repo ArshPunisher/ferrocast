@@ -27,6 +27,10 @@ fn email_key() -> String {
     format!("{}{}", "k".repeat(20), "e".repeat(20))
 }
 
+fn admin_token() -> String {
+    "a".repeat(40)
+}
+
 fn rsa_key() -> &'static RsaPrivateKey {
     static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
     KEY.get_or_init(|| RsaPrivateKey::new(&mut rand_core::OsRng, 1024).unwrap())
@@ -125,7 +129,8 @@ async fn world_with(google_on: bool, login: RemoteLogin) -> World {
         .with_remote(RemoteConfig::new(Some(&base), Some(PEPPER), None))
         .with_mail(Some(mail.clone()), crate::mail::MailConfig::new(None, None))
         .with_billing(billing)
-        .with_accounts(AccountsConfig { google: gcfg, remote_login: login });
+        .with_accounts(AccountsConfig { google: gcfg, remote_login: login })
+        .with_admin(crate::admin::AdminConfig::new(Some(&admin_token()), None));
     let db = state.db.clone();
     let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     tokio::spawn(async move { axum::serve(l, app).await });
@@ -931,4 +936,137 @@ fn user_agents_become_short_labels() {
     assert_eq!(ua_label(&h), "Chrome on macOS");
     h.insert(header::USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604"));
     assert_eq!(ua_label(&h), "Safari on iPhone");
+}
+
+// ── Admin ────────────────────────────────────────────────────────────────────────────
+
+impl World {
+    async fn admin(&self, method: Method, path: &str, body: Option<Value>, who: Option<&str>) -> (u16, Value) {
+        let mut r = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(admin_token());
+        if let Some(w) = who {
+            r = r.header("x-admin-email", w);
+        }
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        let res = r.send().await.unwrap();
+        let s = res.status().as_u16();
+        (s, res.json().await.unwrap_or(Value::Null))
+    }
+}
+
+#[tokio::test]
+async fn the_control_center_lists_and_manages_accounts() {
+    let w = world().await;
+    let auth = w.install("i1");
+    let app = w.app_sign_in(&auth, "asha@example.com").await;
+    w.app_sign_in(&w.install("i2"), "ravi@example.com").await;
+    let (s, v) = w.admin(Method::GET, "/admin/v1/accounts?q=asha", None, None).await;
+    assert_eq!((s, v["total"].as_i64()), (200, Some(1)), "{v}");
+    let id = v["items"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(v["items"][0]["plan"], "free");
+    let (_, v) = w.admin(Method::GET, "/admin/v1/accounts?plan=pro", None, None).await;
+    assert_eq!(v["total"], 0);
+    // Writes need X-Admin-Email.
+    let (s, v) =
+        w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/grant"), Some(json!({ "days": 7 })), None).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (400, Some("admin_email_required")));
+    for bad in [0, 91] {
+        let (s, _) = w
+            .admin(
+                Method::POST,
+                &format!("/admin/v1/accounts/{id}/grant"),
+                Some(json!({ "days": bad })),
+                Some("o@x.co"),
+            )
+            .await;
+        assert_eq!(s, 422, "{bad} days");
+    }
+    let (s, v) = w
+        .admin(
+            Method::POST,
+            &format!("/admin/v1/accounts/{id}/grant"),
+            Some(json!({ "days": 7, "note": "tester" })),
+            Some("o@x.co"),
+        )
+        .await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!(v["extended"], false);
+    assert!(w.db.pro_sub_for_install("i1").unwrap().is_some(), "the account's PC has Pro");
+    let (_, me) = w.api(Method::GET, "/v1/account", Some(&app), None).await;
+    assert_eq!((me["plan"].as_str(), me["pro"]["source"].as_str()), (Some("pro"), Some("grant")));
+    let (_, v) = w
+        .admin(Method::POST, &format!("/admin/v1/accounts/{id}/grant"), Some(json!({ "days": 3 })), Some("o@x.co"))
+        .await;
+    assert_eq!(v["extended"], true);
+    let (_, v) = w.admin(Method::GET, &format!("/admin/v1/accounts/{id}"), None, None).await;
+    assert_eq!(v["plan"], "pro");
+    assert_eq!(v["grants"].as_array().unwrap().len(), 1);
+    assert_eq!(v["grants"][0]["history"].as_array().unwrap().len(), 2);
+    assert_eq!(v["identities"][0]["provider"], "email");
+    assert_eq!(v["installs"][0]["signed_in"], true);
+    assert!(v["installs"][0]["install"].as_str().unwrap().ends_with('…'), "masked");
+    let (s, _) = w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/revoke"), None, Some("o@x.co")).await;
+    assert_eq!(s, 200);
+    let (s, v) = w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/revoke"), None, Some("o@x.co")).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("already_ended")));
+    assert!(w.db.pro_sub_for_install("i1").unwrap().is_none());
+    // Sign out everywhere, disable, enable.
+    let (s, v) = w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/sign-out"), None, Some("o@x.co")).await;
+    assert_eq!((s, v["sessions_ended"].as_i64()), (200, Some(1)));
+    let (s, _) = w.api(Method::GET, "/v1/account", Some(&app), None).await;
+    assert_eq!(s, 401);
+    let (s, v) = w
+        .admin(
+            Method::POST,
+            &format!("/admin/v1/accounts/{id}/disable"),
+            Some(json!({ "reason": "spam" })),
+            Some("o@x.co"),
+        )
+        .await;
+    assert_eq!((s, v["disabled"].as_bool()), (200, Some(true)));
+    let (_, v) = w.admin(Method::GET, "/admin/v1/accounts?status=disabled", None, None).await;
+    assert_eq!(v["total"], 1);
+    let (s, v) = w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/enable"), None, Some("o@x.co")).await;
+    assert_eq!((s, v["disabled"].as_bool()), (200, Some(false)));
+    let audited: i64 =
+        w.db.c().query_row("SELECT COUNT(*) FROM admin_audit WHERE action LIKE 'account.%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(audited, 6, "grant twice, revoke, sign-out, disable, enable");
+    let (s, _) = w.admin(Method::GET, "/admin/v1/accounts/ac_nope", None, None).await;
+    assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn a_paying_account_gets_no_free_grant_and_stats_count_conversion() {
+    let w = world().await;
+    let h = crate::billing::email_hash(&email_key(), "payer@example.com");
+    w.install("buyer");
+    w.db.add_pro_sub("sub_Pay00000000001", "monthly", &h, "created", "buyer").unwrap();
+    w.set_sub("sub_Pay00000000001", "active", Some(now_ms() + 10 * DAY));
+    w.db.c()
+        .execute(
+            "INSERT INTO pro_payments(payment_id, sub_id, amount, at) VALUES ('pay_1', 'sub_Pay00000000001', 19900, 1)",
+            [],
+        )
+        .unwrap();
+    w.app_sign_in(&w.install("i1"), "payer@example.com").await;
+    w.app_sign_in(&w.install("i2"), "free@example.com").await;
+    let (_, v) = w.admin(Method::GET, "/admin/v1/accounts?plan=pro", None, None).await;
+    assert_eq!(v["total"], 1);
+    let id = v["items"][0]["id"].as_str().unwrap().to_string();
+    let (s, v) = w
+        .admin(Method::POST, &format!("/admin/v1/accounts/{id}/grant"), Some(json!({ "days": 7 })), Some("o@x.co"))
+        .await;
+    assert_eq!((s, v["error"]["code"].as_str()), (409, Some("has_subscription")));
+    let (s, v) = w.admin(Method::GET, "/admin/v1/accounts/stats?days=7", None, None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["accounts"]["total"], 2);
+    assert_eq!(v["accounts"]["active_7d"], 2);
+    assert_eq!(v["signups"]["per_day"].as_array().unwrap().len(), 7);
+    assert_eq!(v["signups"]["per_day"][6]["count"], 2);
+    assert_eq!(v["pro"]["accounts_paying_now"], 1);
+    assert_eq!(v["conversion"]["paid_ever"], 1);
+    assert_eq!(v["conversion"]["rate_all_time"], 0.5);
+    let (s, _) = w.admin(Method::GET, "/admin/v1/accounts/stats?days=0", None, None).await;
+    assert_eq!(s, 400);
 }

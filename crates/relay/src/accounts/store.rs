@@ -451,7 +451,6 @@ impl Db {
         )
     }
 
-    #[allow(dead_code)] // the Control Center's account tabs (next)
     /// Disables (`Some(actor)`) or enables (`None`) an account. Disabling signs it out everywhere.
     pub(crate) fn account_set_disabled(&self, id: &str, by: Option<&str>, now: i64) -> rusqlite::Result<bool> {
         let n = match by {

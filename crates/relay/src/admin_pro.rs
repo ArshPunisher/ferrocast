@@ -43,20 +43,20 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .route("/admin/v1/audit", get(audit))
 }
 
-type Peer = ConnectInfo<std::net::SocketAddr>;
+pub(crate) type Peer = ConnectInfo<std::net::SocketAddr>;
 type Q = Query<HashMap<String, String>>;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────────
 
-fn e(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
+pub(crate) fn e(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
     ApiError::new(status, code, message)
 }
 
-fn bad(code: &'static str, message: impl Into<String>) -> ApiError {
+pub(crate) fn bad(code: &'static str, message: impl Into<String>) -> ApiError {
     e(StatusCode::UNPROCESSABLE_ENTITY, code, message)
 }
 
-fn not_found(what: &str) -> ApiError {
+pub(crate) fn not_found(what: &str) -> ApiError {
     e(StatusCode::NOT_FOUND, "not_found", format!("No {what} with that id."))
 }
 
@@ -65,14 +65,14 @@ fn db(err: rusqlite::Error) -> ApiError {
 }
 
 /// Guard for a read; the time now.
-fn reader(st: &AppState, peer: Peer, headers: &HeaderMap) -> Result<i64, ApiError> {
+pub(crate) fn reader(st: &AppState, peer: Peer, headers: &HeaderMap) -> Result<i64, ApiError> {
     let now = now_ms();
     crate::admin::guard(st, peer.0, headers, now)?;
     Ok(now)
 }
 
 /// Guard for a write; the time now and the admin's email.
-fn writer(st: &AppState, peer: Peer, headers: &HeaderMap) -> Result<(i64, String), ApiError> {
+pub(crate) fn writer(st: &AppState, peer: Peer, headers: &HeaderMap) -> Result<(i64, String), ApiError> {
     let now = reader(st, peer, headers)?;
     let actor = headers
         .get("x-admin-email")
@@ -96,7 +96,7 @@ fn writer(st: &AppState, peer: Peer, headers: &HeaderMap) -> Result<(i64, String
     Ok((now, actor))
 }
 
-fn body(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ApiError> {
+pub(crate) fn body(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ApiError> {
     if let Some(ct) = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
         && !ct.trim_start().to_ascii_lowercase().starts_with("application/json")
     {
@@ -112,13 +112,13 @@ fn body(headers: &HeaderMap, bytes: &[u8]) -> Result<Value, ApiError> {
         .ok_or_else(|| e(StatusCode::BAD_REQUEST, "bad_json", "The request body isn't a JSON object."))
 }
 
-fn reply(status: StatusCode, v: Value) -> Response {
+pub(crate) fn reply(status: StatusCode, v: Value) -> Response {
     let mut r = (status, axum::Json(v)).into_response();
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
 }
 
-fn ok(v: Value) -> Result<Response, ApiError> {
+pub(crate) fn ok(v: Value) -> Result<Response, ApiError> {
     Ok(reply(StatusCode::OK, v))
 }
 
@@ -129,7 +129,7 @@ pub(crate) fn iso(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, s % 3600 / 60, s % 60)
 }
 
-fn iso_opt(ms: Option<i64>) -> Value {
+pub(crate) fn iso_opt(ms: Option<i64>) -> Value {
     ms.map_or(Value::Null, |m| json!(iso(m)))
 }
 
@@ -159,12 +159,12 @@ fn time_in(v: &Value, date_end: bool) -> Result<Option<i64>, ()> {
 }
 
 /// `AbC1…`: enough to tell installs apart, not enough to use one.
-fn mask(install: &str) -> String {
+pub(crate) fn mask(install: &str) -> String {
     let head: String = install.chars().take(4).collect();
     if head.is_empty() { String::new() } else { format!("{head}…") }
 }
 
-fn int(
+pub(crate) fn int(
     v: &Value,
     field: &str,
     code: &'static str,
@@ -180,7 +180,7 @@ fn int(
     }
 }
 
-fn text(v: &Value, field: &str, max: usize) -> Result<Option<String>, ApiError> {
+pub(crate) fn text(v: &Value, field: &str, max: usize) -> Result<Option<String>, ApiError> {
     match v {
         Value::Null => Ok(None),
         Value::String(s) => {
@@ -194,7 +194,7 @@ fn text(v: &Value, field: &str, max: usize) -> Result<Option<String>, ApiError> 
     }
 }
 
-fn audit_log(st: &AppState, now: i64, actor: &str, action: &str, target: &str, detail: Value) {
+pub(crate) fn audit_log(st: &AppState, now: i64, actor: &str, action: &str, target: &str, detail: Value) {
     let r = st.db.c().execute(
         "INSERT INTO admin_audit(at, actor, action, target, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![now, actor, action, target, detail.to_string()],
@@ -295,7 +295,7 @@ impl Sub {
     }
 }
 
-fn page_arg(
+pub(crate) fn page_arg(
     q: &HashMap<String, String>,
     k: &str,
     default: i64,
@@ -343,7 +343,7 @@ async fn users(State(st): State<AppState>, peer: Peer, headers: HeaderMap, Query
                "items": items.iter().map(|s| s.user(now)).collect::<Vec<_>>() }))
 }
 
-fn grant_history(c: &rusqlite::Connection, sub: &str) -> rusqlite::Result<Vec<Value>> {
+pub(crate) fn grant_history(c: &rusqlite::Connection, sub: &str) -> rusqlite::Result<Vec<Value>> {
     let mut q = c.prepare(
         "SELECT kind, source, code, actor, note, days, until, at FROM pro_grants WHERE sub_id = ?1 ORDER BY at, id",
     )?;
