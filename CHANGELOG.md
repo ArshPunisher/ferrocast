@@ -5,6 +5,12 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.2.0
+
+- Have a Pro code? Enter it in Settings › Pro. A free-Pro code turns Pro on right away; a
+  discount code lowers the price at checkout, and you keep that price when it renews.
+- When Pro is on sale, Settings › Pro shows the sale price with the old price crossed out.
+
 ## 1.1.0
 
 - Updates you can see: when a new version is out, the sidebar says so. Read what's new,
