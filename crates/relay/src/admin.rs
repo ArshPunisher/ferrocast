@@ -145,21 +145,17 @@ fn unauthorized(message: &str) -> ApiError {
         .header(header::WWW_AUTHENTICATE, "Bearer")
 }
 
-/// `GET /admin/v1/stats`: the Control Center's numbers (see the module docs).
-async fn stats(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    if proxied(&headers) || !crate::is_private(peer.ip()) {
+/// The checks every admin route makes, in this order: only from the server's own network
+/// (403), within the allowance (429), the admin API switched on (503), the right token (401).
+pub(crate) fn guard(st: &AppState, peer: std::net::SocketAddr, headers: &HeaderMap, now: i64) -> Result<(), ApiError> {
+    if proxied(headers) || !crate::is_private(peer.ip()) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "internal_only",
-            "The admin stats are only served inside the server, not through a public address.",
+            "The admin API is only served inside the server, not through a public address.",
         )
-        .hint("Call http://ferrocast-relay:8787/admin/v1/stats from a container on the relay's Docker network."));
+        .hint("Call http://ferrocast-relay:8787/admin/v1/… from a container on the relay's Docker network."));
     }
-    let now = now_ms();
     if let Err(wait) = st.admin.take(now) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -172,12 +168,12 @@ async fn stats(
     let Some(want) = st.admin.cfg.token_hash else {
         let (message, hint) = if st.admin.cfg.too_short {
             (
-                format!("RELAY_ADMIN_TOKEN is shorter than {MIN_TOKEN_LEN} characters, so the admin stats are off."),
+                format!("RELAY_ADMIN_TOKEN is shorter than {MIN_TOKEN_LEN} characters, so the admin API is off."),
                 "Run control-center-key.sh --rotate on the server to make a proper one.",
             )
         } else {
             (
-                "The admin stats are off: RELAY_ADMIN_TOKEN isn't set on this relay.".to_string(),
+                "The admin API is off: RELAY_ADMIN_TOKEN isn't set on this relay.".to_string(),
                 "Run control-center-key.sh on the server; it sets the token for the relay and the Control Center.",
             )
         };
@@ -194,6 +190,17 @@ async fn stats(
     if !bool::from(digest(given).ct_eq(&want)) {
         return Err(unauthorized("The admin token is wrong."));
     }
+    Ok(())
+}
+
+/// `GET /admin/v1/stats`: the Control Center's numbers (see the module docs).
+async fn stats(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let now = now_ms();
+    guard(&st, peer, &headers, now)?;
     let read = st.clone();
     let body =
         tokio::task::spawn_blocking(move || collect(&read, now)).await.map_err(|_| unreadable())?.map_err(|e| {
@@ -205,7 +212,7 @@ async fn stats(
     Ok(res)
 }
 
-fn unreadable() -> ApiError {
+pub(crate) fn unreadable() -> ApiError {
     ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "storage", "The relay couldn't read its database just now.")
         .hint("Try again in a minute; if it keeps happening, check the relay's logs.")
 }

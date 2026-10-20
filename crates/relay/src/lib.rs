@@ -12,6 +12,7 @@
 //! counters) and `blob` (files).
 
 pub mod admin;
+mod admin_pro;
 pub mod backups;
 pub mod billing;
 pub mod blob;
@@ -329,6 +330,7 @@ pub fn router(state: AppState) -> Router {
         .merge(discord::routes())
         .merge(mail::routes())
         .merge(admin::routes())
+        .merge(admin_pro::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
