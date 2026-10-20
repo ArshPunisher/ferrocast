@@ -199,10 +199,19 @@ jobs:
           version="${TAG#v}"
           packaging/homebrew/update-cask.sh "$version" dist/Ferrocast_"${version}"_universal.dmg
           cp packaging/homebrew/Casks/ferrocast.rb dist/ferrocast.rb
+      - name: Release notes (CHANGELOG.md)
+        # The app shows them under "What's new" before updating; they're also the release's text.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! packaging/release-notes.sh "${TAG#v}" > release-notes.md; then
+            echo "::warning::CHANGELOG.md has no section for ${TAG#v}: the app will only link to GitHub."
+            : > release-notes.md
+          fi
       - name: Update feed (latest.json)
         env:
           TAG: ${{ github.ref_name }}
-        run: packaging/updater-manifest.sh "${TAG#v}" dist > dist/latest.json
+        run: packaging/updater-manifest.sh "${TAG#v}" dist release-notes.md > dist/latest.json
       - name: Checksums (SHA256SUMS.txt)
         working-directory: dist
         run: |
@@ -214,5 +223,6 @@ jobs:
           prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
           # A beta must never become "latest": stable users' update feed reads that one.
           make_latest: ${{ needs.version.outputs.prerelease == 'true' && 'false' || 'true' }}
+          body_path: release-notes.md
           generate_release_notes: true
           files: dist/*

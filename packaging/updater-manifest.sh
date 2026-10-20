@@ -2,13 +2,22 @@
 # Writes latest.json, the signed update feed the desktop app checks (R-60), from the
 # release's updater bundles and their .sig files in <dir>.
 #
-#   packaging/updater-manifest.sh <version> <dir> > latest.json
+#   packaging/updater-manifest.sh <version> <dir> [notes.md] > latest.json
+#
+# notes.md (packaging/release-notes.sh's output) becomes the feed's `notes`, which the app
+# shows under "What's new" before updating; without it the notes point at GitHub.
 #
 # Works the same for betas (0.1.0-beta.1): the URLs point at that tag's own release, and
 # the Release workflow publishes the beta feed separately (packaging/beta-feed.sh).
 set -euo pipefail
 version=${1:?usage: updater-manifest.sh <version> <dir>}
-dir=${2:?usage: updater-manifest.sh <version> <dir>}
+dir=${2:?usage: updater-manifest.sh <version> <dir> [notes.md]}
+notes_file=${3:-}
+notes="See the release notes on GitHub."
+if [[ -n "$notes_file" ]]; then
+  [[ -f "$notes_file" ]] || { echo "No notes file at $notes_file" >&2; exit 1; }
+  [[ -s "$notes_file" ]] && notes="$(cat "$notes_file")"
+fi
 "$(dirname "$0")/semver.sh" valid "$version" || {
   echo "'$version' isn't a version (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-beta.N)" >&2
   exit 1
@@ -40,5 +49,5 @@ if [[ -z "$platforms" ]]; then
   echo "No signed updater bundles in $dir (is TAURI_SIGNING_PRIVATE_KEY set?)" >&2
   exit 1
 fi
-jq -n --arg v "$version" --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "{$platforms}" \
-  '{version: $v, notes: "See the release notes on GitHub.", pub_date: $d, platforms: $p}'
+jq -n --arg v "$version" --arg n "$notes" --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "{$platforms}" \
+  '{version: $v, notes: $n, pub_date: $d, platforms: $p}'

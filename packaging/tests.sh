@@ -71,12 +71,40 @@ if command -v jq >/dev/null; then
   rm "$tmp/dist/"*.rpm "$tmp/dist/"*.rpm.sig
   is "a beta without an rpm" "$(jq -r '.platforms | keys | join(",")' <<<"$("$m" 0.1.0-beta.1 "$tmp/dist")")" \
     darwin-aarch64,darwin-x86_64,linux-x86_64,linux-x86_64-deb,windows-x86_64
+  is "no notes: a link to GitHub" "$(jq -r .notes <<<"$json")" "See the release notes on GitHub."
+  printf -- '- Faster alerts\n- "Quoted" words\n' >"$tmp/notes.md"
+  is "notes from the changelog" "$(jq -r .notes <<<"$("$m" 0.1.0-beta.1 "$tmp/dist" "$tmp/notes.md")")" \
+    "$(printf -- '- Faster alerts\n- "Quoted" words')"
+  refuse "refuses a notes file that isn't there" "$m" 0.1.0-beta.1 "$tmp/dist" "$tmp/nope.md"
   refuse "refuses a version that isn't one" "$m" "0.1 beta" "$tmp/dist"
   mkdir -p "$tmp/empty"
   refuse "refuses a folder without signed bundles" "$m" 0.1.0 "$tmp/empty"
 else
   echo "  (jq not installed, skipped)"
 fi
+
+echo "release-notes.sh"
+n="$here/release-notes.sh"
+cat >"$tmp/CHANGELOG.md" <<'MD'
+# What's new
+
+## 1.2.0
+
+- New thing
+
+- Second thing
+
+## 1.1.0
+- Old thing
+MD
+is "one version's section" "$("$n" 1.2.0 "$tmp/CHANGELOG.md")" "$(printf -- '- New thing\n\n- Second thing')"
+is "the last section" "$("$n" 1.1.0 "$tmp/CHANGELOG.md")" "- Old thing"
+printf '## 2.0.0\r\n- Windows line ends\r\n' >"$tmp/crlf.md"
+is "a changelog with Windows line ends" "$("$n" 2.0.0 "$tmp/crlf.md")" "- Windows line ends"
+refuse "refuses a version with no section" "$n" 1.3.0 "$tmp/CHANGELOG.md"
+refuse "refuses a heading prefix (1.2 is not 1.2.0)" "$n" 1.2 "$tmp/CHANGELOG.md"
+"$n" "$(sed -n 's/^version = "\(.*\)"/\1/p' "$here/../Cargo.toml" | head -1)" >/dev/null ||
+  { echo "  FAIL: CHANGELOG.md has no section for the version in Cargo.toml"; fails=$((fails + 1)); }
 
 if ((fails)); then
   echo "$fails failed"
