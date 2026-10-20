@@ -1070,3 +1070,35 @@ async fn a_paying_account_gets_no_free_grant_and_stats_count_conversion() {
     let (s, _) = w.admin(Method::GET, "/admin/v1/accounts/stats?days=0", None, None).await;
     assert_eq!(s, 400);
 }
+
+#[tokio::test]
+async fn login_pages_have_the_board_look_and_resend_works() {
+    let w = world().await;
+    let mut b = Browser::default();
+    let (page, _) = w.open_login(&mut b, "next=/app/").await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Continue with Google") && page.body.contains("Email me a link"));
+    assert!(page.body.contains("class=\"btn primary\"") && page.body.contains("prefers-color-scheme:light"));
+    let (sent, _, _, _) = w.ask_email(&mut b, "kabir@example.com", "").await;
+    assert_eq!(sent.status, 200);
+    assert!(sent.body.contains("Check your email") && sent.body.contains("Use another email"));
+    // Resend posts the same form again, with this browser's token and the address.
+    assert!(sent.body.contains("Resend link") && sent.body.contains("name=email value=\"kabir@example.com\""));
+    let token = b.cookies.get(LOGIN_COOKIE).map(|c| form_token(c)).unwrap();
+    let again = w
+        .req(
+            &mut b,
+            Method::POST,
+            "/login/email",
+            Some(&[("csrf", &token), ("email", "kabir@example.com"), ("flow", "")]),
+            &[],
+        )
+        .await;
+    assert_eq!(again.status, 200);
+    if let Ok(dir) = std::env::var("FC_DUMP_LOGIN_PAGES") {
+        std::fs::write(format!("{dir}/login.html"), &page.body).unwrap();
+        std::fs::write(format!("{dir}/check.html"), &sent.body).unwrap();
+        let gone = w.req(&mut b, Method::GET, "/login/link?t=nope", None, &[]).await;
+        std::fs::write(format!("{dir}/expired.html"), &gone.body).unwrap();
+    }
+}

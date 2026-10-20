@@ -37,30 +37,97 @@ pub(super) fn routes() -> axum::Router<AppState> {
 
 // ── Rendering ────────────────────────────────────────────────────────────────────────
 
-const STYLE: &str = "<style>:root{--err:#ff9b8f}@media (prefers-color-scheme:light){:root{--err:#b3261e}}\
-form{margin:0 0 18px}label{display:block;font-weight:600;margin:0 0 6px}\
-input{display:block;width:100%;box-sizing:border-box;padding:12px 14px;border:1px solid var(--line);border-radius:10px;\
-background:var(--bg);color:var(--text);font:inherit;font-size:1rem}\
-input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--text);outline-offset:2px}\
-button{display:block;width:100%;margin-top:10px;padding:12px 14px;border-radius:10px;border:1px solid var(--text);\
-background:var(--text);color:var(--bg);font:600 1rem system-ui,sans-serif;cursor:pointer;touch-action:manipulation}\
-button:active{transform:translateY(1px)}button.alt{background:var(--chip);color:var(--text);border-color:var(--line)}\
-.err{color:var(--err);font-weight:600}.help{color:var(--muted);font-size:.9rem;margin:6px 0 0}\
-.or{color:var(--muted);text-align:center;margin:4px 0 14px}a{color:var(--text)}\
-.code input{font:600 1.2rem ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}</style>";
+// Design board 2026-10-21-accounts, option A: the Spark over the title, Google as a quiet
+// button, the email form with one orange button (white text), light and dark by the system.
+const STYLE: &str = "<style>:root{color-scheme:dark light;--bg:#0a0b0d;--s1:#101216;--s2:#16191e;\
+--line:#252a31;--line2:#343a44;--text:#eef0f4;--text2:#b3b9c4;--text3:#8a919d;--molten:#ffa424;--arc:#33d4ff;\
+--arc-text:#33d4ff;--arc-soft:rgb(51 212 255/.12);--err:#ff5d6c;--btn:#b35900;--btn-hover:#9e4f00}\
+@media (prefers-color-scheme:light){:root{--bg:#f2f3f6;--s1:#fff;--s2:#f7f8fa;--line:#dfe2e8;\
+--line2:#c9ced7;--text:#0e1014;--text2:#424854;--text3:#5f6672;--molten:#cf7400;--arc:#0888b8;--arc-text:#05678c;\
+--arc-soft:rgb(8 136 184/.1);--err:#c42339}}\
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}\
+body{margin:0;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;background:var(--bg);color:var(--text);\
+font:16px/1.55 system-ui,-apple-system,'Segoe UI',sans-serif;-webkit-font-smoothing:antialiased}\
+.top{display:flex;align-items:center;height:56px;padding:0 16px;border-bottom:1px solid var(--line)}\
+.brand{display:inline-flex;align-items:center;gap:4px;color:var(--text);text-decoration:none;font-weight:800;font-size:19px;letter-spacing:-.02em}\
+.brand svg{width:24px;height:24px}\
+.wrap{flex:1;display:flex;justify-content:center;padding:32px 16px 48px}\
+main{width:100%;max-width:400px;display:grid;gap:18px;align-content:start}\
+.mark svg{display:block;width:40px;height:40px;color:var(--text)}\
+.tile{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--arc-soft);color:var(--arc-text)}\
+.tile svg{width:22px;height:22px}\
+h1{margin:0;font-size:24px;line-height:1.15;font-weight:700;letter-spacing:-.02em;overflow-wrap:anywhere}\
+p{margin:0;overflow-wrap:anywhere}.lead{color:var(--text2);font-size:14.5px}strong{color:var(--text)}\
+form{margin:0;display:grid;gap:6px}\
+label{font-size:13.5px;font-weight:600}\
+input{width:100%;height:44px;padding:0 12px;border:1px solid var(--line2);border-radius:10px;background:var(--s1);\
+color:var(--text);font:inherit;font-size:16px}\
+input::placeholder{color:var(--text3)}\
+input:focus{outline:none;border-color:var(--arc);box-shadow:0 0 0 3px var(--arc-soft)}\
+.hint{color:var(--text3);font-size:13px}\
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;width:100%;min-height:48px;padding:0 20px;\
+border-radius:10px;border:1px solid var(--line2);background:var(--s1);color:var(--text);font:600 15px system-ui,sans-serif;\
+text-decoration:none;cursor:pointer;touch-action:manipulation;white-space:nowrap}\
+.btn svg{width:18px;height:18px;flex:none}.btn:active{transform:scale(.98)}\
+.btn.primary{background:var(--btn);border-color:transparent;color:#fff;box-shadow:inset 0 1px 0 rgb(255 255 255/.18);margin-top:6px}\
+.btn.ghost{background:transparent;border-color:transparent;color:var(--text2)}\
+@media (hover:hover){.btn:hover{border-color:var(--text3)}.btn.primary:hover{background:var(--btn-hover)}\
+.btn.ghost:hover{background:var(--s2);color:var(--text)}}\
+.btn:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--arc-text);outline-offset:2px}\
+.or{display:flex;align-items:center;gap:12px;color:var(--text3);font-size:12.5px}\
+.or:before,.or:after{content:'';flex:1;height:1px;background:var(--line)}\
+.row{display:flex;flex-wrap:wrap;gap:10px}.row .btn{width:auto}\
+.err{color:var(--err);font-weight:600;font-size:14px}\
+.muted{color:var(--text3);font-size:12.5px;text-align:center}\
+.code input{font:600 1.2rem ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}\
+a{color:var(--arc-text);text-underline-offset:3px}\
+@media (prefers-reduced-motion:reduce){.btn:active{transform:none}}</style>";
 
-/// A page in the relay's card look, with this module's CSP.
-fn page(status: StatusCode, title: &str, body: &str) -> Response {
-    let mut r = crate::card(status, title, &format!("{STYLE}{body}"));
+/// The Spark (brand.ts, X1), its two shard halves in the theme's Molten and Arc.
+const SPARK: &str = "<svg viewBox=\"0 0 64 64\" aria-hidden=\"true\"><path fill=\"currentColor\" \
+d=\"M17.33 54.5V25A15.5 15.5 0 0 1 32.83 9.5H39.33V18.5H32.83A6.5 6.5 0 0 0 26.33 25V54.5ZM10.83 25.5H33.33V33.5H10.83Z\"/>\
+<path fill=\"var(--molten)\" d=\"M48.03 21.12L34.35 37.73L50.85 32.78L44.85 32.78Z\"/>\
+<path fill=\"var(--arc)\" d=\"M36.72 39.14L42.73 39.14L39.02 50.8L53.17 34.2Z\"/></svg>";
+/// Phosphor icons (MIT): Google's G and an envelope.
+const ICON_GOOGLE: &str = "<svg viewBox=\"0 0 256 256\" fill=\"currentColor\" aria-hidden=\"true\"><path \
+d=\"M224,128a96,96,0,1,1-21.95-61.09,8,8,0,1,1-12.33,10.18A80,80,0,1,0,207.6,136H128a8,8,0,0,1,0-16h88A8,8,0,0,1,224,128Z\"/></svg>";
+const ICON_MAIL: &str = "<svg viewBox=\"0 0 256 256\" fill=\"currentColor\" aria-hidden=\"true\"><path \
+d=\"M224,48H32a8,8,0,0,0-8,8V192a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A8,8,0,0,0,224,48ZM203.43,64,128,133.15,52.57,64ZM216,192H40V74.19l82.59,75.71a8,8,0,0,0,10.82,0L216,74.19V192Z\"/></svg>";
+
+/// A login page: the Ferrocast header, then the Spark (or `icon`), the title and `body`.
+fn page_with(status: StatusCode, title: &str, icon: Option<&str>, body: &str) -> Response {
+    let top = match icon {
+        Some(i) => format!("<span class=tile>{i}</span>"),
+        None => format!("<span class=mark>{SPARK}</span>"),
+    };
+    let html = format!(
+        "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <meta name=robots content=noindex><meta name=referrer content=no-referrer><title>{t} · Ferrocast</title>{STYLE}\
+         <header class=top><a class=brand href=\"/app/\">{SPARK}ferrocast</a></header>\
+         <div class=wrap><main>{top}<h1>{t}</h1>{body}</main></div></html>",
+        t = esc(title),
+    );
+    let mut r = (status, axum::response::Html(html)).into_response();
     let h = r.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     r
 }
 
+/// A page in this module's look, with the Spark on top.
+fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    page_with(status, title, None, body)
+}
+
 fn problem(status: StatusCode, title: &str, text: &str, again: &str) -> Response {
-    page(status, title, &format!("<p>{}</p><p><a href=\"{}\">Try again</a></p>", esc(text), esc(again)))
+    page(
+        status,
+        title,
+        &format!("<p class=lead>{}</p><a class=\"btn primary\" href=\"{}\">Try again</a>", esc(text), esc(again)),
+    )
 }
 
 fn not_here() -> Response {
@@ -194,22 +261,23 @@ async fn login_page(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw
     let lead = if flow.is_some() {
         "Sign in to link this Ferrocast app to your account. The app keeps working without one."
     } else {
-        "Sign in to open your Ferrocast dashboard. Accounts are free."
+        "The web dashboard needs an account. It’s free, and it’s the same one your app uses."
     };
     let google = if st.accounts.cfg.google.on() {
         format!(
-            "<form method=post action=/login/google>{keep}<button type=submit>Continue with Google</button></form>\
-             <p class=or>or</p>"
+            "<form method=post action=/login/google>{keep}<button class=btn type=submit>{ICON_GOOGLE}Continue with Google</button></form>\
+             <div class=or>or</div>"
         )
     } else {
         String::new()
     };
     let body = format!(
-        "<p>{lead}</p>{google}<form method=post action=/login/email>{keep}\
+        "<p class=lead>{lead}</p>{google}<form method=post action=/login/email>{keep}\
          <label for=email>Email</label><input id=email name=email type=email autocomplete=email \
-         inputmode=email required maxlength=254 spellcheck=false>\
-         <button class=alt type=submit>Email me a sign-in link</button></form>\
-         <p class=muted>No password. We send a link and a code that work once, for 15 minutes, in this browser.</p>",
+         inputmode=email required maxlength=254 spellcheck=false placeholder=\"you@example.com\" aria-describedby=email-hint>\
+         <p class=hint id=email-hint>We’ll email you a link and a code. No password to remember.</p>\
+         <button class=\"btn primary\" type=submit>{ICON_MAIL}Email me a link</button></form>\
+         <p class=muted>The link and code work once, for 15 minutes, in this browser.</p>",
         lead = esc(lead),
     );
     let r = page(StatusCode::OK, "Sign in to Ferrocast", &body);
@@ -247,7 +315,7 @@ fn code_form(token: &str, magic_id: &str, error: Option<&str>) -> String {
     format!(
         "{err}<form method=post action=/login/code class=code>{}{}<label for=code>Code from the email</label>\
          <input id=code name=code required autocomplete=one-time-code maxlength=12 spellcheck=false \
-         autocapitalize=characters><button type=submit>Sign in</button></form>",
+         autocapitalize=characters><button class=\"btn primary\" type=submit>Sign in</button></form>",
         hidden("csrf", token),
         hidden("m", magic_id)
     )
@@ -377,14 +445,22 @@ async fn email_start(
         }
         Err(_) => tracing::warn!("a sign-in email took too long; it may still arrive"),
     }
+    let resend = format!(
+        "<form method=post action=/login/email>{}{}{}{}<button class=btn type=submit>Resend link</button></form>",
+        hidden("csrf", &form_token(&c)),
+        hidden("flow", flow.as_deref().unwrap_or("")),
+        hidden("next", &next),
+        hidden("email", &email)
+    );
     let body = format!(
-        "<p>We sent a link and a code to <strong>{}</strong>. Open the link in this browser, or type the code here.</p>{}\
-         <p class=muted>Nothing came? Check spam, or <a href=\"{}\">start again</a>.</p>",
+        "<p class=lead>We sent a sign-in link to <strong>{}</strong>. Open it in this browser, or type the code \
+         from the email here.</p>{}<div class=row>{resend}<a class=\"btn ghost\" href=\"{}\">Use another email</a></div>\
+         <p class=muted>Nothing came? Check spam, then resend.</p>",
         esc(&email),
         code_form(&form_token(&c), &id, None),
         esc(&again)
     );
-    page(StatusCode::OK, "Check your email", &body)
+    page_with(StatusCode::OK, "Check your email", Some(ICON_MAIL), &body)
 }
 
 async fn email_code(State(st): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
@@ -470,14 +546,14 @@ async fn link_page(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw)
         return page(
             StatusCode::FORBIDDEN,
             "Open it where you asked",
-            "<p>For your safety this link only works in the browser where you asked for it.</p>\
+            "<p class=lead>For your safety this link only works in the browser where you asked for it.</p>\
              <p>Open it there, or type the code from the email on that sign-in page.</p>",
         );
     }
     // A GET never uses the link up (mail scanners open links); the button does.
     let body = format!(
-        "<p>Sign in to Ferrocast as <strong>{}</strong>?</p><form method=post action=/login/link>{}{}\
-         <button type=submit>Sign in</button></form><p class=muted>Didn't ask for this? Close this tab.</p>",
+        "<p class=lead>Sign in to Ferrocast as <strong>{}</strong>?</p><form method=post action=/login/link>{}{}\
+         <button class=\"btn primary\" type=submit>Sign in</button></form><p class=muted>Didn't ask for this? Close this tab.</p>",
         esc(&m.email),
         hidden("csrf", &form_token(c.as_deref().unwrap_or(""))),
         hidden("t", t)
