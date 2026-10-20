@@ -82,8 +82,10 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | GET | `/api/v1/stats/session` | → `{ live, started_at (kept after the stream ends), follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
-| GET | `/api/v1/updates` | → `{ current, latest: string \| null, channel: "stable" \| "beta" /* read-only: a prerelease build is "beta" */, blocked_while_live, notes_url }`; never offer an update while `blocked_while_live` (R-60) |
-| POST | `/api/v1/updates/install` | → 202 `{ installing }`; the desktop app downloads it, checks its signature, installs and restarts. 404 `no_update` when nothing newer was found, 409 while live with "never update while live" on (R-60) |
+| GET | `/api/v1/updates` | → `UpdateView` (below). Never offer an update while `blocked_while_live` (R-60). `checked_at: null` means not checked yet, which is not "up to date" |
+| POST | `/api/v1/updates/check` | "Check for updates": asks the desktop app to read the feed now and answers 200 `UpdateView` once it has (after 20 s still `checking: true`; the `update` frame brings the rest). A failed check is in `error`, not an HTTP error. 409 `no_updater` (with where to download) in the headless app |
+| POST | `/api/v1/updates/install` | → 202 `{ installing }`; takes a backup, then the desktop app downloads it (progress in `install`), checks its signature and installs it (on Windows the installer waits for the restart). It does **not** restart: the new version runs after `/updates/restart`. 404 `no_update` when nothing newer was found, 409 `live` while live with "never update while live" on (R-60), 409 `update_busy` while downloading or installing, 409 `restart_needed` once installed, 409 `no_updater` in the headless app, 422 when the backup fails |
+| POST | `/api/v1/updates/restart` | "Restart to finish": → 202 `{ restarting }` and the app restarts into the installed version. 409 `not_ready` before an install finished, 409 `live` while live with "never update while live" on, 409 `no_updater` in the headless app |
 
 ```ts
 type Recap = { started_at: number | null /* null: no stream on record yet */; ended_at: number | null; live: boolean;
@@ -159,6 +161,28 @@ PUT `/overlays/{id}` can't change `design`. An overlay made from a **built-in** 
 | POST | `/api/v1/events/{event_id}/replay` | → `{ event_id }` |
 | GET | `/api/v1/events?before=<seq>&limit=50&kinds=follow,tip` | → `{ events: Event[], next_before: number \| null }` |
 | GET | `/api/v1/events/{event_id}/why` | → `{ alerted: boolean, reasons: string[] }` ("No alert rule for Kick raids", "Twitch hid this follow", "Below the ₹100 minimum") |
+
+```ts
+type UpdateProblem = { code: string; message: string; hint: string }
+type UpdateView = {
+  current: string; latest: string | null
+  channel: "stable" | "beta" /* read-only: a prerelease build is "beta" */
+  blocked_while_live: boolean
+  notes_url: string | null /* the GitHub release page */
+  notes: string | null /* what's new, plain text ("- " lines are a list); null when the release has none */
+  published_at: string | null /* RFC 3339 */
+  can_install: boolean /* the desktop app; false in the headless app (and so in a browser on it) */
+  checking: boolean
+  checked_at: number | null /* ms; when the last check finished, whatever it found */
+  error: UpdateProblem | null /* the last check's problem: offline, feed_unavailable, no_build; an earlier find stays in latest */
+  install: {
+    phase: "idle" | "downloading" | "installing" | "ready" | "failed"
+    version: string | null; downloaded: number; total: number | null /* bytes */
+    error: UpdateProblem | null /* failed: offline, download_failed, bad_signature, no_permission, install_failed, went_live, gone */
+  }
+}
+```
+The desktop app checks 15 s after start, then every 6 hours (15 minutes after a failed check). On Windows `ready` means downloaded and verified: the installer runs at `/updates/restart` (it closes Ferrocast and opens the new version), because it can't run without closing the app.
 
 ### Designs
 Alert looks, full overlay themes, single scenes and widget styles: made in the dashboard's designer, shipped with the app (built-ins), or imported. Built-ins come with Ferrocast inside the overlay bundle (`designs/catalog.json`, `{ format: "ferrocast-designs", version: 1, designs: Design[] }`; the engine reads it at start, so new ones arrive with app updates and nothing needs a server). A built-in carries a small Ferrocast Spark mark (`branded`) and can't be edited, deleted or exported: **Duplicate** makes the streamer's own copy, with no branding, fully editable. Only built-ins are ever branded; every design the API creates or imports is the streamer's own.
@@ -634,6 +658,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `chatter { event_id, kind: "first" } | { event_id, kind: "returning", days }` (after that message's `event` frame; replayed with it on reconnect)
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
+- `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
 The client sends nothing but pings.
@@ -667,7 +692,7 @@ Build notes for `ferrocast-web`: the overlay bundle is served under `/o/<token>/
 
 ## 7. Not in this build yet
 
-`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself).
+`POST /accounts/{platform}/connect` answers 422 with a message when this build has no app registered for that platform (Twitch and YouTube need the build's client ids; Kick and tips need the relay). `POST /overlays/{id}/add-to-obs` answers 422 with a hint when OBS can't be reached. `/updates` has `latest: null` until a signed release is published (and always in the headless app, which doesn't update itself: `can_install: false`).
 
 ## 8. Relay: Ferrocast Pro billing
 
@@ -910,7 +935,7 @@ The dashboard (Settings › Text-to-speech): one Voice picker with a "Ferrocast 
 
 | Role | May |
 |---|---|
-| `owner` | Every dashboard route **except** `/accounts*`, `/session/*`, `/pro` and `/pro/*` (billing, Pro features, pairing more phones), `PUT\|DELETE /tips` (tip provider secrets), `/discord*` (the webhook), `PUT /obs` and `/obs/detect` (the OBS password), `/export`, `/import*`, `/designs/import`, `/designs/{id}/export`, `/backups/{id}/restore`, `POST /media` and `/tips/brand/{kind}` (uploads), `/updates/install`, and `/live` as a request. `PUT /settings` can't change `lan_access` (403). A new route is open to owners unless it's added to the deny list. Allowed although under `/pro` (`OWNER_ALLOWED`): `GET /pro/history/email` (§9.8), `GET /pro/history` (§9.1, M10), `GET /pro/bot` and `PUT /pro/bot/enabled` (§9.7). |
+| `owner` | Every dashboard route **except** `/accounts*`, `/session/*`, `/pro` and `/pro/*` (billing, Pro features, pairing more phones), `PUT\|DELETE /tips` (tip provider secrets), `/discord*` (the webhook), `PUT /obs` and `/obs/detect` (the OBS password), `/export`, `/import*`, `/designs/import`, `/designs/{id}/export`, `/backups/{id}/restore`, `POST /media` and `/tips/brand/{kind}` (uploads), `/updates/check`, `/updates/install` and `/updates/restart` (`/updates/*`; `GET /updates` is fine), and `/live` as a request. `PUT /settings` can't change `lan_access` (403). A new route is open to owners unless it's added to the deny list. Allowed although under `/pro` (`OWNER_ALLOWED`): `GET /pro/history/email` (§9.8), `GET /pro/history` (§9.1, M10), `GET /pro/bot` and `PUT /pro/bot/enabled` (§9.7). |
 | `mod` | Only `GET /status`, `GET /chat`, `POST /mod/delete\|timeout\|ban\|unban`, `GET /mod/bans`, `GET /mod/held`, `POST /mod/held/{id}/release\|drop`, `GET\|POST /mod/panic`, `GET /viewers/{platform}/{user_id}[/note]` |
 
 Live frames: owners get every frame; mods get `hello`, `resync`, `status`, `held`, `held_resolved`, `panic`, `chatter`, `notice` with key `panic`, and `event` only for `chat_message`, `message_deleted`, `user_messages_cleared`, `ban`. Checked on the PC and again on the relay.

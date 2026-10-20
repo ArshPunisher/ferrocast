@@ -23,6 +23,6 @@ Every batch of changes gets a review before it is committed: CodeRabbit (`codera
 
 ## Releases
 
-1. Bump `[workspace.package] version` in `Cargo.toml` (`0.1.0-beta.2`, or `0.1.0` for stable), run `cargo update --workspace` so `Cargo.lock` follows, commit.
+1. Bump `[workspace.package] version` in `Cargo.toml` (`0.1.0-beta.2`, or `0.1.0` for stable), run `cargo update --workspace` so `Cargo.lock` follows, and write its `## <version>` section in `CHANGELOG.md` (what changed for streamers, in plain words: the app shows it under "What's new" before updating, and it's the release's text). `packaging/tests.sh` fails while the version has no section. Commit.
 2. Tag and push the tag: `git tag v0.1.0-beta.2 && git push origin v0.1.0-beta.2`. The Release workflow fails at once if the tag and `Cargo.toml` differ.
 3. Review the draft on GitHub (a beta is marked *Pre-release*), then **Publish**. Publishing runs "Beta feed", which offers it to beta users; stable users get only stable releases (ARCHITECTURE.md §11).
