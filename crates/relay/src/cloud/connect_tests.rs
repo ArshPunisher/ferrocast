@@ -285,3 +285,122 @@ async fn an_unfinished_hand_over_is_revoked_by_the_sweep() {
     let left: i64 = w.db.c().query_row("SELECT COUNT(*) FROM cloud_pending", [], |r| r.get(0)).unwrap();
     assert_eq!(left, 0);
 }
+
+#[tokio::test]
+async fn the_bot_runs_from_the_web_with_the_engines_command_paths() {
+    let w = world().await;
+    let u = w.cloud_user("a@example.com").await;
+    // Commands and timers through the engine's own paths.
+    let (s, v) = w
+        .web(
+            &u,
+            Method::POST,
+            "/c/api/v1/commands",
+            Some(json!({ "name": "!discord", "aliases": [], "response": "discord.gg/x",
+            "roles": "everyone", "cooldown_s": 30, "user_cooldown_s": 0, "platforms": [], "enabled": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{v}");
+    let cid = v["id"].as_str().unwrap().to_string();
+    let (s, v) = w
+        .web(
+            &u,
+            Method::POST,
+            "/c/api/v1/commands",
+            Some(json!({ "name": "no bang", "aliases": [], "response": "x",
+            "roles": "everyone", "cooldown_s": 0, "user_cooldown_s": 0, "platforms": [], "enabled": true })),
+        )
+        .await;
+    assert_eq!((s, code(&v)), (422, "invalid"));
+    assert!(v["error"]["message"].as_str().unwrap().starts_with("name:"));
+    let (s, v) = w.web(&u, Method::POST, "/c/api/v1/commands/starter", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["added"].as_array().unwrap().len(), 4);
+    let (_, again) = w.web(&u, Method::POST, "/c/api/v1/commands/starter", None).await;
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 4, "two clicks never add a command twice");
+    let (_, list) = w.web(&u, Method::GET, "/c/api/v1/commands", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 5);
+    let mut edit = list[0].clone();
+    edit["response"] = json!("discord.gg/new");
+    let (s, v) = w.web(&u, Method::PUT, &format!("/c/api/v1/commands/{cid}"), Some(edit)).await;
+    assert_eq!((s, v["response"].as_str()), (200, Some("discord.gg/new")));
+    let (s, v) = w
+        .web(
+            &u,
+            Method::POST,
+            "/c/api/v1/timers",
+            Some(json!({ "name": "Hydrate", "message": "Drink water!",
+            "every_min": 30, "min_chat_lines": 5, "platforms": [], "enabled": true })),
+        )
+        .await;
+    assert_eq!(s, 201, "{v}");
+    let (s, v) = w
+        .web(
+            &u,
+            Method::POST,
+            "/c/api/v1/timers",
+            Some(json!({ "name": "Bad", "message": " ",
+            "every_min": 30, "min_chat_lines": 5, "platforms": [], "enabled": true })),
+        )
+        .await;
+    assert_eq!((s, code(&v)), (422, "invalid"));
+    let (s, v) = w.web(&u, Method::DELETE, "/c/api/v1/timers/nope", None).await;
+    assert_eq!((s, code(&v)), (404, "not_found"));
+
+    // Switching it on needs a channel; with Twitch connected it answers in chat.
+    let (s, v) = w.web(&u, Method::PUT, "/c/api/v1/pro/bot/enabled", Some(json!({ "enabled": true }))).await;
+    assert_eq!((s, code(&v)), (422, "no_platform"));
+    w.connect_twitch_for(&u, "c1").await;
+    let (s, v) = w.web(&u, Method::PUT, "/c/api/v1/pro/bot/enabled", Some(json!({ "enabled": true }))).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["enabled"], true);
+    assert!(v.get("pc_code").is_none());
+    crate::bot::tests::cloud_takes_over_all(&w.state, &u.account.id);
+    let chat = json!({
+        "broadcaster_user_id": STREAMER_ID, "chatter_user_id": "77", "chatter_user_login": "fan",
+        "chatter_user_name": "Fan", "message_id": "chat-77", "message": { "text": "!discord", "fragments": [] },
+        "badges": [], "color": "", "message_type": "text"
+    });
+    let body = json!({ "subscription": { "type": "channel.chat.message",
+        "condition": { "broadcaster_user_id": STREAMER_ID, "user_id": STREAMER_ID } }, "event": chat });
+    let text = body.to_string();
+    let ts = {
+        let ms = crate::now_ms();
+        let (y, mo, d) = crate::quota::civil(ms.div_euclid(86_400_000));
+        let s = ms.rem_euclid(86_400_000) / 1000;
+        format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
+    };
+    let sig = {
+        use hmac::Mac;
+        let mut m = hmac::Hmac::<rsa::sha2::Sha256>::new_from_slice(crate::bot::tests::ES_SECRET.as_bytes()).unwrap();
+        m.update(b"bot-1");
+        m.update(ts.as_bytes());
+        m.update(text.as_bytes());
+        format!("sha256={}", m.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
+    };
+    let res = w
+        .http
+        .post(format!("{}/v1/bot/twitch/eventsub", w.base))
+        .header("Twitch-Eventsub-Message-Id", "bot-1")
+        .header("Twitch-Eventsub-Message-Timestamp", ts)
+        .header("Twitch-Eventsub-Message-Signature", sig)
+        .header("Twitch-Eventsub-Message-Type", "notification")
+        .header("content-type", "application/json")
+        .body(text)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    let mut sent = Vec::new();
+    for _ in 0..50 {
+        sent = w.tw.with(|t| t.sent.iter().map(|s| s.2.clone()).collect::<Vec<_>>());
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(sent, ["discord.gg/new"]);
+    // Sleeping (or cloud mode off) is "not Pro" for the bot's gate.
+    w.db.c().execute("UPDATE cloud_accounts SET sleeping_at = 1", []).unwrap();
+    assert!(!super::bot_allowed(&w.db, &u.account.id));
+}
