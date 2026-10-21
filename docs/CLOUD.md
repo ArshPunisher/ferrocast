@@ -84,6 +84,17 @@ The web dashboard edits the cloud copy directly. A desktop app that is signed in
   against the 200 MB, §5), the cloud's files download on demand.
 - With sync off the app and the cloud are separate. The app never needs the cloud.
 
+How the app does it (M6, `crates/engine/src/cloud_sync.rs`; routes in API.md "Cloud sync"):
+`GET/PUT /api/v1/pro/cloud` and `POST /api/v1/pro/cloud/sync`, under `/pro` like the account so a
+phone never reaches them. Turning sync on calls `POST /v1/cloud/enable` (free) and syncs at once;
+then every 5 minutes and 10 s after an overlay or alert rule changes. The app keeps, per
+document, the version and a hash it last agreed on with the cloud (times and its own overlay
+token left out of the hash, so a save that changed nothing never counts). A document that
+exists on both sides with different content on the first sync is a conflict like any other
+(the cloud copy wins). "Use cloud overlays" needs sync: the dashboard's `Overlay.url` becomes
+the synced overlay's cloud URL (from `GET /v1/cloud/overlays`), and a pulled layout reaches
+pages open on the PC's own URL too.
+
 ### 1.2 What runs in the cloud in 1.4 and what stays in the app
 
 | In the cloud (free) | Stays in the app |

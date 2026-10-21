@@ -522,6 +522,23 @@ type AccountSession = { id: string; kind: "app" | "web"; label: string; created_
 
 Errors (always `{ error: { code, message, hint } }`): 409 `already_signed_in` (sign out first to switch accounts), 401 `signed_out` (sessions, revoke: not signed in, or the session ended elsewhere; the PC is then signed out here too), 403 `account_disabled`, 404 `not_found` (no such session), 400 `invalid` (a session id that can't be one), 422 `invalid` (label too long), 429 `rate_limited` (`Retry-After`; 10 sign-ins an hour per PC), 410 `flow_expired`, 422 `invalid_challenge` / `invalid_redirect`, 502 `relay_error` (the relay answered something Ferrocast can't use), **503 `relay_unreachable`** (no internet or the relay is down; hint: check the connection, everything else keeps working), 503 `relay_unrecognised`, 503 `no_relay` (this build has no relay set up), 503 `keychain_unavailable` (the OS keychain refused; hint: unlock it and try again), 503 `listener_unavailable` (couldn't listen on 127.0.0.1 for the browser; hint: allow Ferrocast in the firewall). Problems that end a sign-in in the background (`state: "signed_out"` with `error`): the browser came back with another sign-in's `state` (that request is answered 400 and ignored; the real one keeps waiting), the person cancelled at Google, no code came, the code was refused (wrong or expired), 10 minutes passed.
 
+### Cloud sync (1.4, optional)
+With a signed-in account the app can keep its overlays, alert rules, own designs and the alert design in use in sync with **cloud mode** (`docs/CLOUD.md` §1.1), and show the cloud overlays' URLs so OBS keeps working with this PC off. Both switches are **off by default**; the app works fully without them. Under `/pro`, like the account, so a phone never reaches them.
+
+```ts
+type CloudSyncView = { signed_in: boolean; sync: boolean; use_cloud_overlays: boolean; last_sync_at: number | null;
+                       error: { code, message, hint } | null /* the last sync that failed */; notes: string[] /* what the cloud replaced here, newest first */;
+                       synced: number; cloud_overlays: number; running: boolean }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/pro/cloud` | → `CloudSyncView` (never an error) |
+| PUT | `/api/v1/pro/cloud` | `{ sync?, use_cloud_overlays? }` → `CloudSyncView`. Turning sync on turns cloud mode on for the account (free) and syncs at once; turning it off turns cloud overlays off too. 409 `signed_out` without the account; the relay's errors as they come (503 `relay_unreachable`) |
+| POST | `/api/v1/pro/cloud/sync` | → `CloudSyncView` after a sync now. It also runs every 5 minutes, and 10 s after an overlay or alert rule changes here |
+
+The cloud copy wins a conflict: this PC's overlay or design is kept as "… (this PC)", an alert rule's change is named in a `notice` (`key: "cloud-sync"`). With `use_cloud_overlays`, `Overlay.url` is the cloud URL for synced overlays (`https://<overlay origin>/o/<token>/`), so Add to OBS and Copy use it.
+
 ### Media
 | Method | Path | Body → Response |
 |---|---|---|
