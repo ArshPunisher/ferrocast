@@ -191,7 +191,7 @@ pub(crate) fn account_required() -> ApiError {
         "account_required",
         "Stream history needs a free Ferrocast account on this PC.",
     )
-    .hint("Sign in in Settings › Account. Free accounts keep 30 days of stream history, Pro keeps a year.")
+    .hint("Sign in to Ferrocast on this PC (the account bar in the sidebar). Free accounts keep 30 days of stream history, Pro keeps a year.")
 }
 
 fn locked() -> ApiError {

@@ -207,7 +207,7 @@ async fn every_route_needs_a_known_install_with_pro_or_an_account() {
         assert_eq!(s, 401, "{path} unknown install: {v}");
         let (s, v) = w.send(m, path, Some(&free), body).await;
         assert_eq!((s, v["error"]["code"].as_str()), (403, Some("account_required")), "{path}");
-        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Account"));
+        assert!(v["error"]["hint"].as_str().unwrap().contains("Sign in to Ferrocast"));
     }
 }
 

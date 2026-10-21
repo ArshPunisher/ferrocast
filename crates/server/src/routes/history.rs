@@ -163,7 +163,7 @@ mod tests {
         // No Pro and no account yet: the relay's 403 and its words reach the dashboard.
         let (s, v) = w.json("/pro/history").await;
         assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (403, Some("account_required")), "{v}");
-        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Account"));
+        assert!(v["error"]["hint"].as_str().unwrap().contains("Sign in to Ferrocast"));
         let auth = w.make_pro();
         let start = ferrocast_relay::now_ms() - 2 * 3_600_000;
         let res = w
