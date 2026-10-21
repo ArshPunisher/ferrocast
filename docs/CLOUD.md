@@ -142,8 +142,9 @@ relay's Kick app (`KICK_CLIENT_*`). Both reuse the redirect URIs already registe
 (`cl.`), so nothing new has to be registered.
 
 1. Dashboard: `POST /c/api/v1/accounts/{twitch|kick}/connect` (cookie + CSRF) → `{ flow:
-   "browser", url }`. The state is single use (`pending_oauth`), 10 minutes, HMAC-signed, and
-   names the account.
+   "browser", url }`. The state is `cl.<random>` (24 random bytes), single use, kept server side
+   in `pending_oauth` for 10 minutes with the account it names (Kick: with its PKCE verifier),
+   so nothing in the URL needs signing.
 2. The platform redirects to the API host. The relay trades the code, reads whose account it
    is, seals the tokens into `cloud_pending` under a one-time code (5 minutes), and redirects
    (303) to `https://<web host>/c/v1/connect/finish?code=…`.
@@ -158,15 +159,27 @@ Scopes asked (once, R-22): Twitch `user:read:chat user:write:chat user:bot chann
 moderator:read:followers channel:read:subscriptions bits:read channel:read:redemptions`
 (the bot speaks as the streamer's own account, R-28); Kick the relay's `KICK_SCOPES`.
 
-Twitch subscriptions on the conduit: `channel.chat.message`, `stream.online`, `stream.offline`
-(the cloud bot's), plus `channel.follow` (v2, moderator = the streamer), `channel.subscribe`,
-`channel.subscription.gift`, `channel.subscription.message`, `channel.cheer`, `channel.raid`
-(to the channel), `channel.chat.message_delete`, `channel.chat.clear_user_messages`,
-`channel.chat.clear`. Kick: `chat.message.sent`, `channel.followed`,
-`channel.subscription.new|renewal|gifts`, `kicks.gifted`, `livestream.status.updated`,
-`moderation.banned`, created with the streamer's token. One channel per platform per account;
-a channel already bound to another account moves to the newer, proven owner (the old one is
-told "connected to another Ferrocast account").
+Twitch subscriptions on the conduit (12, each cost 0; ids in `cloud_channels.event_subs`, made by
+cloud mode only, so the cloud bot's own subscribe and unsubscribe leave an account's channel
+alone): `channel.chat.message`, `stream.online`, `stream.offline`, `channel.follow` (v2,
+moderator = the streamer), `channel.subscribe`, `channel.subscription.gift`,
+`channel.subscription.message`, `channel.cheer`, `channel.raid` (to the channel),
+`channel.channel_points_custom_reward_redemption.add`, `channel.chat.message_delete`,
+`channel.chat.clear_user_messages` (`channel.chat.clear` is left out: the mapper doesn't read
+it). Kick: `chat.message.sent`, `channel.followed`, `channel.subscription.new|renewal|gifts`,
+`kicks.gifted`, `livestream.status.updated`, `moderation.banned`, created with the streamer's
+token (`POST /public/v1/events/subscriptions`, method webhook). A failure is kept on the
+channel (`error`, shown on the Cloud page) and the hourly sweep tries again.
+
+The sign-in is sealed where the cloud bot reads it (`bot_tokens`, sub = the account id, purpose
+`bot`) and a `bot_channels` row is made with the streamer as both bot and channel (§6). One
+channel per platform per account; a channel already bound to another account (or to a Pro
+cloud bot) moves to the newer, proven owner: the old binding's subscriptions are deleted and
+its rows forgotten **without a revoke** (it's the same person at the platform, and a revoke
+could end the new sign-in too); the old account's Cloud page then shows it not connected. The
+hand-over from the API host to the web host is a one-time code (`cloud_pending`, the sign-in
+sealed with AAD `<account>|cloud_pending_<platform>`, 5 minutes); one never finished is revoked
+by the hourly sweep.
 
 Disconnect: subscriptions deleted, the sign-in revoked at the platform, rows deleted.
 
