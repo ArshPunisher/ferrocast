@@ -246,9 +246,30 @@ pub(crate) fn collect(st: &AppState, now: i64) -> rusqlite::Result<Value> {
             "tips": c.tips,
             "smart": crate::smart::admin_view(st),
             "history": { "free_accounts": c.history_free, "pro_subscriptions": c.history_pro },
+            "youtube": youtube_units(st, now)?,
+            "mail": mail_today(st, now)?,
         },
         "backup": { "last_ok_at": st.admin.cfg.backup_marker.as_deref().and_then(read_marker) },
     }))
+}
+
+/// The cloud bot's YouTube Data API units today, relay-wide (every subscription's calls
+/// together), against `YOUTUBE_CLOUD_DAILY_UNITS`. Google's quota day is Pacific, so it resets
+/// at Pacific midnight. `daily_cap` is null while YouTube from the cloud is off.
+fn youtube_units(st: &AppState, now: i64) -> rusqlite::Result<Value> {
+    use crate::bot::youtube::{RELAY_SUB, pacific_day};
+    let used = st.db.yt_units_used(RELAY_SUB, None, now)?;
+    let (_, resets_at) = pacific_day(now);
+    let cap = st.bot.youtube_cfg().map(|c| c.units);
+    Ok(json!({ "units_today": used, "daily_cap": cap, "resets_at": resets_at }))
+}
+
+/// Emails sent today (UTC), relay-wide (confirms and weekly reports together), against
+/// `MAIL_DAILY_BUDGET`.
+fn mail_today(st: &AppState, now: i64) -> rusqlite::Result<Value> {
+    let day = crate::mail::budget_day(now);
+    let sent = st.db.mail_budget_used(day)?;
+    Ok(json!({ "sent_today": sent, "daily_budget": st.mail.budget(), "resets_at": (day + 1) * 86_400_000 }))
 }
 
 /// The nightly backup's last good run, if the marker holds exactly one UTC time.

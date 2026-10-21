@@ -311,6 +311,52 @@ async fn counts_add_up() {
 }
 
 #[tokio::test]
+async fn youtube_units_and_mail_today_are_relay_wide() {
+    use std::sync::Arc;
+
+    use crate::bot::youtube::{Call, YoutubeCloud, YoutubeConfig};
+    use crate::bot::youtube_tests::FakeYoutube;
+    let r = relay(Some(&token())).await;
+    let now = now_ms();
+
+    // Off: nothing used, no YouTube cap, the default mail budget.
+    let v = collect(&r.st, now).unwrap();
+    let u = &v["usage"];
+    assert_eq!(u["youtube"]["units_today"], 0);
+    assert_eq!(u["youtube"]["daily_cap"], Value::Null);
+    assert!(u["youtube"]["resets_at"].as_i64().unwrap() > now);
+    assert_eq!(u["mail"]["sent_today"], 0);
+    assert_eq!(u["mail"]["daily_budget"], crate::mail::DAILY_BUDGET);
+    assert_eq!(u["mail"]["resets_at"], (crate::mail::budget_day(now) + 1) * DAY_MS);
+
+    // Two subscriptions' calls add up; yesterday's emails don't count.
+    r.st.db.yt_take_units("sub_a", Call::Send, None, now).unwrap();
+    r.st.db.yt_take_units("sub_b", Call::Read, None, now).unwrap();
+    let day = crate::mail::budget_day(now);
+    for _ in 0..3 {
+        assert!(r.st.db.mail_budget_take(day, 270).unwrap());
+    }
+    assert!(r.st.db.mail_budget_take(day - 1, 270).unwrap());
+    let cfg = YoutubeConfig::from_values(Some("id.apps.googleusercontent.com".into()), Some("s".into()))
+        .unwrap()
+        .unwrap()
+        .with_units(1_000, 9_000)
+        .unwrap();
+    let st =
+        r.st.clone()
+            .with_bot(
+                crate::bot::Runtime::new(None, None, None)
+                    .with_youtube(Some(cfg), Some(Arc::new(FakeYoutube::default()) as Arc<dyn YoutubeCloud>)),
+            )
+            .with_mail(None, crate::mail::MailConfig::new(None, None).with_budget(120));
+    let v = collect(&st, now).unwrap();
+    let u = &v["usage"];
+    assert_eq!(u["youtube"]["units_today"], Call::Send.units() + Call::Read.units());
+    assert_eq!(u["youtube"]["daily_cap"], 9_000);
+    assert_eq!(u["mail"], serde_json::json!({ "sent_today": 3, "daily_budget": 120, "resets_at": (day + 1) * DAY_MS }));
+}
+
+#[tokio::test]
 async fn an_empty_relay_counts_zero() {
     let r = relay(Some(&token())).await;
     let (status, _, v) = get(&r, &[("authorization", &bearer(&token()))]).await;

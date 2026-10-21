@@ -498,6 +498,13 @@ daily_cap, resting, resets_at }` (the free-tier model's calls today relay-wide; 
 cap or the provider's free allowance is used up until `resets_at`), and `history {
 free_accounts, pro_subscriptions }` (how many keep stream history). Counts only, as before.
 
+**Also in `usage`** (relay-wide, every subscription together): `youtube { units_today,
+daily_cap, resets_at }`, the YouTube Data API units the cloud bot spent today (Google's
+Pacific day, so `resets_at` is Pacific midnight) against `YOUTUBE_CLOUD_DAILY_UNITS`
+(default 9,000; `daily_cap` is `null` while YouTube from the cloud is off), and `mail {
+sent_today, daily_budget, resets_at }`, the emails sent through Brevo today (UTC; confirm
+emails and weekly reports) against `MAIL_DAILY_BUDGET` (default 270, under Brevo's free 300).
+
 **What the owner runs**: `deploy/pro-keys.sh --ai` on the server (deploy/README.md, "smart
 features"); Google verification for YouTube (docs/GOOGLE-VERIFICATION.md). No migration: 1.4's
 Pro features store only counters (`quota_usage`) and reuse existing tables.

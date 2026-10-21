@@ -335,7 +335,7 @@ impl Db {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Emails counted against the budget on a UTC day.
     pub(crate) fn mail_budget_used(&self, day: i64) -> rusqlite::Result<i64> {
         Ok(self
             .c()

@@ -1348,6 +1348,9 @@ interface AdminStats {
     tips: { pages: number; branded: number; goals: number; goal_tips: number }  // counts, never amounts
     smart: { provider: "cloudflare" | "gemini" | null; calls_today: number; daily_cap: number; resting: boolean; resets_at: number }
     history: { free_accounts: number; pro_subscriptions: number }   // with stream history kept
+    // Relay-wide, not only Pro: every subscription's calls and emails together.
+    youtube: { units_today: number; daily_cap: number | null; resets_at: number }  // YouTube Data API units the cloud bot used today (quota_usage yt_units, Pacific day, Google's); cap YOUTUBE_CLOUD_DAILY_UNITS (default 9,000), null while YouTube from the cloud is off
+    mail: { sent_today: number; daily_budget: number; resets_at: number }          // emails sent through Brevo today (UTC; confirms and weekly reports); budget MAIL_DAILY_BUDGET (default 270, Brevo's free plan is 300)
   }
   backup: { last_ok_at: string | null }   // the nightly R2 backup's last good run (UTC), from /data/backup-last-ok
 }
