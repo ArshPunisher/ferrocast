@@ -5,6 +5,18 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.4.0
+
+- Cloud mode, free with an account: run alerts, overlays and the chat bot from Ferrocast's
+  servers, set up from the web dashboard on any browser. Your PC can stay off.
+- On the PC, Settings › Cloud mode can sync your overlays, alerts and designs with your
+  account and use the cloud overlay links in OBS. Both are off until you turn them on.
+- Insights (was History): charts for each stream, the best times to stream, top supporters
+  and a CSV export. 30 days with a free account, a year with Pro.
+- New in Pro: smart moderation that understands Hinglish (every action can be undone),
+  smart replies from facts you approve, and a written recap after each stream.
+- New in Pro: YouTube chat and the bot from the cloud, without your PC.
+
 ## 1.3.1
 
 - Updates arrive on more networks: if one of GitHub's download servers doesn't answer,
