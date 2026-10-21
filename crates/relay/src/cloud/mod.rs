@@ -13,6 +13,7 @@
 // The parts the event pipeline, media and the sleep sweep use land with them (CLOUD.md §12).
 #![allow(dead_code)]
 
+mod admin;
 mod bot;
 pub(crate) mod bus;
 pub(crate) mod connect;
@@ -203,6 +204,7 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .merge(media::routes())
         .merge(live::routes())
         .merge(bot::routes())
+        .merge(admin::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────
@@ -339,10 +341,25 @@ fn rate(st: &AppState, account: &str, write: bool) -> Result<(), ApiError> {
 /// Cloud mode is on for the account (and this use wakes it if it slept).
 pub(crate) fn must_be_on(st: &AppState, account: &str) -> Result<store::CloudAccount, ApiError> {
     let c = st.db.cloud_account(account).map_err(ApiError::db)?.ok_or_else(cloud_off)?;
-    if c.sleeping_at.is_some() || now_ms() - c.last_active_at > 60_000 {
-        let _ = st.db.cloud_touch(account, now_ms());
-    }
+    touch(st, &c);
     Ok(c)
+}
+
+/// Use from the web dashboard or a synced app: a sleeping account wakes and its channels are
+/// subscribed again at once (docs/CLOUD.md §5: "within a minute"). At most one write a minute.
+pub(crate) fn touch(st: &AppState, c: &store::CloudAccount) {
+    if c.sleeping_at.is_none() && now_ms() - c.last_active_at <= 60_000 {
+        return;
+    }
+    if matches!(st.db.cloud_touch(&c.account_id, now_ms()), Ok(true)) {
+        tracing::info!("a sleeping cloud mode account woke up");
+        let (st2, account) = (st.clone(), c.account_id.clone());
+        tokio::spawn(async move {
+            for ch in st2.db.cloud_channels(&account).unwrap_or_default() {
+                let _ = connect::subscribe(&st2, &ch).await;
+            }
+        });
+    }
 }
 
 // ── Overlay URLs ─────────────────────────────────────────────────────────────────────
@@ -431,12 +448,41 @@ pub(crate) fn revoked_overlay(st: &AppState, account: &str, overlay: &str) {
 /// An account was disabled or put to sleep: its bus goes, and every open overlay page of it
 /// gets `revoked` and closes (a new one is refused until it's back).
 pub(crate) fn stop_account(st: &AppState, account: &str) {
+    stop_bus(st, account, "revoked");
+}
+
+/// Drops an account's bus; its open pages get `kind` (`revoked`: close with 4404 and stop;
+/// `asleep`: close with 4410 and try again later, never shown to the page).
+fn stop_bus(st: &AppState, account: &str, kind: &str) {
     if let Some(bus) = st.cloud.buses.drop_bus(account) {
         let open: Vec<String> = bus.state().sockets.keys().cloned().collect();
         for id in open {
-            bus.send_overlay(bus::Audience::Overlay(id), "revoked", &serde_json::json!({}));
+            bus.send_overlay(bus::Audience::Overlay(id), kind, &serde_json::json!({}));
         }
     }
+}
+
+/// Puts accounts unused for 30 days to sleep (docs/CLOUD.md §5): their subscriptions are
+/// deleted (ingest stops, the bot with it) and open overlays close with 4410. The rows stay,
+/// so the next use wakes everything as it was. The accounts put to sleep.
+pub(crate) async fn sleep_idle(st: &AppState, now: i64) -> Vec<String> {
+    let slept = match st.db.cloud_sleep_idle(now - SLEEP_AFTER_MS, now) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(error = %err, "couldn't put idle cloud accounts to sleep");
+            return Vec::new();
+        }
+    };
+    for account in &slept {
+        for ch in st.db.cloud_channels(account).unwrap_or_default() {
+            connect::unsubscribe(st, &ch).await;
+        }
+        stop_bus(st, account, "asleep");
+    }
+    if !slept.is_empty() {
+        tracing::info!(accounts = slept.len(), "idle cloud mode accounts went to sleep");
+    }
+    slept
 }
 
 /// An account's documents changed: its pipeline reads them again.
@@ -457,7 +503,22 @@ pub async fn sweep(st: &AppState) {
     if let Err(err) = st.db.cloud_prune_tombstones(now - store::TOMBSTONE_KEEP_MS) {
         tracing::warn!(error = %err, "couldn't prune cloud tombstones");
     }
+    sleep_idle(st, now).await;
+    let asleep: std::collections::HashSet<String> = st
+        .db
+        .cloud_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.sleeping_at.is_some())
+        .map(|c| c.account_id)
+        .collect();
+    let events = st.cloud.buses.events.load(std::sync::atomic::Ordering::Relaxed);
+    let before = st.cloud.buses.events_mark.swap(events, std::sync::atomic::Ordering::Relaxed);
+    st.cloud.buses.events_last_hour.store(events.saturating_sub(before), std::sync::atomic::Ordering::Relaxed);
     for ch in st.db.cloud_all_channels().unwrap_or_default() {
+        if asleep.contains(&ch.account_id) {
+            continue;
+        }
         // Only what may work now: a platform that was unreachable, or no subscriptions and no
         // error. A sign-in the platform refused waits for the streamer to connect again.
         let code = ch.error.as_deref().and_then(|e| serde_json::from_str::<Value>(e).ok()).map(|e| e["code"].clone());

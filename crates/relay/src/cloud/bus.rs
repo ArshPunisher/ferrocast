@@ -380,8 +380,11 @@ pub struct Buses {
     pub sockets: AtomicUsize,
     /// Events dropped (the ingest queue was full, or no bus could be had).
     pub dropped: AtomicU64,
-    /// Events taken in, for the admin numbers (reset by the hour).
+    /// Events taken in since the relay started, for the admin numbers.
     pub events: AtomicU64,
+    /// `events` at the last hourly sweep, and how many came in the hour before it.
+    pub events_mark: AtomicU64,
+    pub events_last_hour: AtomicU64,
 }
 
 impl Buses {

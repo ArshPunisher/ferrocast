@@ -429,6 +429,11 @@ async fn own_frame(st: &AppState, bus: &Bus, overlay: &mut Overlay, f: &Frame, t
         revoke(tx).await;
         return false;
     }
+    if v["type"] == "asleep" {
+        // The account went to sleep: the page tries again later (and clears nothing).
+        let _ = tx.send(Message::Close(Some(CloseFrame { code: CLOSE_ASLEEP, reason: "asleep".into() }))).await;
+        return false;
+    }
     match docs::overlay(st, &bus.account, &overlay.id) {
         Ok(fresh) => *overlay = fresh,
         Err(_) => {

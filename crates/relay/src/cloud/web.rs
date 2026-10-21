@@ -90,7 +90,13 @@ pub(crate) fn summary_json(st: &AppState, account: &str) -> Result<Value, ApiErr
 /// `GET /c/v1/cloud`
 async fn summary(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, false)?;
-    Ok(json(summary_json(&st, &a.account.id)?))
+    // Opening the dashboard is use: a sleeping account wakes (this answer still says it
+    // slept, so the Cloud page can say so once).
+    let v = summary_json(&st, &a.account.id)?;
+    if let Ok(Some(c)) = st.db.cloud_account(&a.account.id) {
+        super::touch(&st, &c);
+    }
+    Ok(json(v))
 }
 
 /// `POST /c/v1/cloud/enable`: free, idempotent; only the first time seeds the default rules
