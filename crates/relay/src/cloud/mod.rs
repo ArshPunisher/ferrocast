@@ -201,7 +201,8 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .merge(connect::routes())
         .merge(overlay::routes())
         .merge(media::routes())
-        .merge(live::routes()).merge(bot::routes())
+        .merge(live::routes())
+        .merge(bot::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────

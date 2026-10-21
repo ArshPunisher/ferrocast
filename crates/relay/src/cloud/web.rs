@@ -134,7 +134,8 @@ pub(crate) fn status_json(st: &AppState, account: &str) -> Result<Value, ApiErro
 
 /// `GET /c/api/v1/status`
 async fn status(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
-    let a = web_account(&st, &headers, &method, true)?;
+    // Also before cloud mode is on: the dashboard boots, then its Cloud page turns it on.
+    let a = web_account(&st, &headers, &method, false)?;
     Ok(json(status_json(&st, &a.account.id)?))
 }
 

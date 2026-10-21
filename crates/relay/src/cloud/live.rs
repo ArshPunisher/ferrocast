@@ -28,6 +28,9 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/c/api/v1/test", post(test))
         .route("/c/api/v1/queue", get(queue))
         .route("/c/api/v1/queue/{op}", post(queue_op))
+        .route("/c/api/v1/queue/{alert_id}/remove", post(queue_remove))
+        .route("/c/api/v1/themes", get(themes))
+        .route("/c/api/v1/goals", get(goals))
         .route("/c/api/v1/events", get(events))
         .route("/c/api/v1/chat", get(chat))
         .route("/c/api/v1/live", get(live))
@@ -118,6 +121,51 @@ async fn queue_op(
         }),
     };
     Ok(json(view))
+}
+
+/// `POST /c/api/v1/queue/{alert_id}/remove` → the queue (404 when it isn't waiting).
+async fn queue_remove(
+    State(st): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Path(alert_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let a = web_account(&st, &headers, &method, true)?;
+    let bus = bus_for(&st, &a.account.id)?;
+    let mut found = false;
+    let view = bus.queue_op(|q, _| {
+        found = q.remove(&alert_id);
+        vec![]
+    });
+    if !found {
+        return Err(super::not_found("waiting alert").hint("It may have played already."));
+    }
+    Ok(json(view))
+}
+
+/// The overlay looks every build ships (the engine's list), for the overlay editor.
+const THEMES: [(&str, &str, &str); 5] = [
+    ("molten", "Molten", "Liquid-metal cards with a cobalt edge. The default."),
+    ("daylight", "Daylight", "Clean white cards that read well on busy games."),
+    ("arcade", "Arcade", "Chunky pixel type and hard shadows."),
+    ("minimal", "Minimal", "Just the words, for streams that want quiet overlays."),
+    ("sticker", "Sticker", "Bright cut-out shapes that pop on camera."),
+];
+
+async fn themes(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
+    web_account(&st, &headers, &method, true)?;
+    let list: Vec<Value> = THEMES
+        .iter()
+        .map(|(id, name, description)| json!({ "id": id, "name": name, "description": description, "pro": false }))
+        .collect();
+    Ok(json(json!(list)))
+}
+
+/// Goals need the app on a PC in 1.4 (they're counted from its event log): none here, so the
+/// overlay editor's goal picker is simply empty.
+async fn goals(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
+    web_account(&st, &headers, &method, true)?;
+    Ok(json(json!([])))
 }
 
 #[derive(Deserialize)]
