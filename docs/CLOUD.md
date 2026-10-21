@@ -238,6 +238,8 @@ For a cloud account:
   (`cloud::bot_allowed`), so the bot's code paths stay one.
 - Lease: if the streamer's desktop app is signed in to the same account with its bot on, it
   sends `bot_seen` (as Pro PCs do) and the cloud stands by, so the two never answer twice.
+- The config's `bot_on` (the desktop's own switch) is always on for an account: the Bot page's
+  "Run the bot in the cloud" switch (`PUT …/pro/bot/enabled`) is the one switch.
 
 ## 7. Tips
 
@@ -305,7 +307,8 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 | `GET /c/api/v1/queue`, `POST …/queue/{pause\|resume\|skip\|clear}` | the cloud queue |
 | `GET /c/api/v1/events`, `GET /c/api/v1/chat` | from the bus (memory) |
 | `GET/POST /c/api/v1/media`, `GET/DELETE …/{id}` | uploads (§5) |
-| `GET /c/api/v1/bot/config`, `PUT …` · `GET /c/api/v1/pro/bot`, `PUT /c/api/v1/pro/bot/enabled` | the cloud bot (§6) |
+| `GET /c/api/v1/bot/config`, `PUT …` (`{ version, config }`) · `GET /c/api/v1/pro/bot`, `PUT /c/api/v1/pro/bot/enabled` | the cloud bot (§6) |
+| `GET/POST /c/api/v1/commands`, `PUT/DELETE …/{id}`, `POST …/starter` · `GET/POST /c/api/v1/timers`, `PUT/DELETE …/{id}` | the engine's command and timer paths, kept in the bot's config, so the Bot screen works unchanged |
 | `GET /c/api/v1/live` (WebSocket) | live frames for the dashboard: `hello`, `event`, `queue`, `status`; Origin must be the web host |
 | `GET /c/v1/connect/finish?code=` | §4 step 3 (a page, then a redirect to `/app/`) |
 
@@ -362,6 +365,26 @@ events, storage used (bytes, files), memory estimate. Same guard as every admin 
   the Pro card.
 - `cloud::bot_allowed` is the one gate for the bot keyed by an account; YouTube's own quota
   rules (API.md §9.7) apply on top.
+
+**What's built (Pro, 1.4).** YouTube from the cloud with no PC is in
+`crates/relay/src/bot/youtube/web.rs` (API.md §9.7 "YouTube from the web"): a Pro account
+connects on the web host (`/r/v1/pro/youtube/connect`, the same Google client and callback,
+finish only for the same signed-in account) and the channel is bound to the **account's Pro
+subscription**, so the cloud bot, its config and its YouTube budget are the same ones the
+account's PCs use. The budget is per subscription (one per account) with a fair share of
+Google's 10,000 a day across the streamers that used YouTube that day (never below 600). What
+cloud mode adds on top, when M3 lands:
+
+- `cloud::connect`'s YouTube branch: for an account with Pro, answer with
+  `crate::bot::youtube::web::auth_url(st, cfg, account, moderation)` instead of 402 (the finish
+  then binds as above); without Pro keep 402 `pro_required`.
+- The YouTube reader (`bot::youtube::read`) hands each chat line and event to
+  `cloud::ingest::publish(st, account, event)` for the account whose subscription it is, so
+  cloud overlays show YouTube chat and alerts too.
+- One bot config for the account: cloud mode keeps Twitch's and Kick's bot under the account
+  key (§6), YouTube's is under the subscription key. Until M4 decides, the YouTube bot answers
+  with the config the account's PCs pushed; the simplest fix is for M4's Bot page to write a
+  Pro account's config to both keys.
 
 ## 12. Milestones
 
