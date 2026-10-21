@@ -5,6 +5,11 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.4.1
+
+- Connecting YouTube or Kick opens the sign-in page in your browser by itself. If your
+  browser doesn't open, Ferrocast says so, and you can copy the link and paste it in.
+
 ## 1.4.0
 
 - Cloud mode, free with an account: run alerts, overlays and the chat bot from Ferrocast's
