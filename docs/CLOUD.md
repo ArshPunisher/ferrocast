@@ -100,15 +100,17 @@ pages open on the PC's own URL too.
 | In the cloud (free) | Stays in the app |
 |---|---|
 | Alerts for follows, subs, resubs, gift subs, Bits, Kick KICKs, raids, tips; alert rules and their variations | OBS control (scenes, sources, Add to OBS, auto-detect) |
+| Goals, chat polls and giveaways (free to enter) (§7.1, §7.2) | Points-priced giveaway entries |
 | Alert designs (built-in gallery + your own), the active design, test alerts | Local TTS voices, Ferrocast voices (Pro), held-TTS approval queue |
-| Overlays and their widgets: alerts, chat (multichat Twitch + Kick), event list, labels, viewers, layers | Loyalty points, polls, giveaways, quotes, duels (need the PC's viewer database) |
+| Overlays and their widgets: alerts, chat (multichat Twitch + Kick), event list, labels, viewers, layers | Loyalty points, quotes, duels (need the PC's viewer database) |
 | The bot: commands, counters, timers, auto-replies, through the existing cloud bot (§6) | Chat moderation filters, panic mode, ban-on-sight lists |
 | Tips through the account's tip page (§7) | Studio (markers, clips, the "Don't miss" lane), the recap, importers |
 | Chat in the web dashboard (read) | Sending chat as the streamer, viewer cards, Discord go-live webhook |
 | YouTube: Pro, separate (§11) | Export/import (`.ferropack`), local backups |
 
-Widgets that need the PC (`poll`, `giveaway`) render nothing in a cloud overlay (the snapshot
-says `poll: null`, `giveaway: null`); the overlay editor marks them "Needs the app".
+Since the cloud has goals, polls and giveaways (§7.1, §7.2), every widget works in a cloud
+overlay: the snapshot carries `goals`, and `poll` / `giveaway` for an overlay with that widget
+(the running or last one, else `null`).
 
 ### 1.3 How the live parts behave (M3)
 
@@ -139,7 +141,7 @@ New relay tables (one migration, `cloud::SCHEMA`):
 | Table | What |
 |---|---|
 | `cloud_accounts` | `account_id` PK, `enabled_at`, `last_active_at` (sign-in, dashboard or overlay use), `sleeping_at`, `next_version`, `bytes_used` |
-| `cloud_docs` | `(account_id, kind, id)` PK, `version`, `updated_at`, `deleted_at` (tombstone), `json` (≤ 256 KB). `kind`: `overlay`, `alert_rule`, `design`, `settings` (one document `main`: active alert design, test alerts on/off, queue tuning) |
+| `cloud_docs` | `(account_id, kind, id)` PK, `version`, `updated_at`, `deleted_at` (tombstone), `json` (≤ 256 KB). `kind`: `overlay`, `alert_rule`, `design`, `settings` (one document `main`: active alert design, test alerts on/off, queue tuning), `goal` (§7.1, cloud only, never synced) |
 | `cloud_overlay_tokens` | `token_hash` PK (SHA-256), `account_id`, `overlay_id`, `generation` |
 | `cloud_channels` | `(platform, channel_id)` PK → `account_id`, `login`, `scopes`, `event_subs` (JSON ids), `connected_at`, `error` |
 | `cloud_media` | `(account_id, id)` PK, `sha256`, `kind`, `mime`, `bytes`, `name`, `created_at` |
@@ -269,6 +271,83 @@ for the cloud install, or for any PC signed in to an account with cloud mode on,
 on the account's bus (alert + labels). The tip page and the provider set-up are edited in the
 web dashboard's Tips page (the same fields as the app).
 
+How it's built (`cloud/tips.rs`):
+
+- The cloud install is made on the **first save** of the Tips page (`PUT /c/api/v1/tips`),
+  never on a look: `installs` row (its secret hashed and thrown away, `last_seen` moved on so
+  the weekly sweep of never-used installs leaves it alone) and `cloud_accounts.install_id`, set
+  only while it's empty, so two first saves at once keep one install (the loser's row is
+  deleted). No new table, no migration.
+- `GET/PUT/DELETE /c/api/v1/tips` speak the engine's `TipSettings` (API.md "Tips"): the same
+  checks as a PC's save (`tips::save_for`: handle rules, provider hosts, secret shapes, a blank
+  secret keeps the saved one, name changes per day, names held 30 days), secrets never sent
+  back, `webhooks` naming the cloud install. Errors as the PC's: 400 `invalid` (the message
+  names the field), 409 `taken`, 429 `rate_limited`, plus cloud mode's 409 `cloud_off`.
+- A verified tip for a cloud install is **not queued** for delivery (no PC ever reads it); it
+  goes only to the account's bus (`ingest::tip`), deduped per provider payment as before, so
+  alerts, the latest/top tip labels and tips goals (§7.1) follow. Since nothing else holds it,
+  a tip the ingest queue can't take (full) is given back: its dedupe key is released and the
+  provider gets 503 `busy`, so its retry delivers it. A tip on a **sleeping** account's tip page
+  wakes the account (money arriving is use) and still alerts.
+- Pro's tip page extras (branding, goal page, own address) stay with a PC's Pro install in
+  1.4: a cloud install isn't linked to a subscription, so its page is the free look. The
+  dashboard's Tips page in cloud mode shows the page and the providers only.
+
+### 7.1 Goals
+
+Goals are account documents (`cloud_docs` kind `goal`, the core `Goal`: progress in minor
+units for tips), up to **20** an account (409 `cloud_limit`), never synced with the desktop app
+(the pull leaves them out, a push of one is 422): the app's goals count its own event log.
+`cloud/goals.rs`, the engine's paths and shapes (API.md "Goals"):
+
+- `GET/POST /c/api/v1/goals`, `PUT/DELETE /c/api/v1/goals/{id}`, `POST …/{id}/adjust { delta }`.
+  The engine's checks (`GoalView::into_goal`: a tips goal needs a currency, counts take whole
+  numbers, a title of 1 to 80 characters; 422 `invalid` naming it), `current` never taken
+  from a body, and a goal with progress keeps its kind and currency (409 `conflict` with a
+  hint). `starts_at` 0 means now. Each edit reads and writes the document in one transaction
+  (`Db::cloud_doc_edit`), so a tip counted during an edit is never lost.
+- Counting (worked out from the stored goal inside its write, so an edit in between never gets
+  another unit's amount; at most 20 goals, counted in the same transaction as a new one): every
+  **live** event through the pipeline (`goal::contribution`: follows, new subs
+  and gift batches, Bits, tips and paid messages in the goal's currency, captured only),
+  tests never. Progress is saved at once, so it outlives the bus and a relay restart. The
+  pipeline's dedupe (the platform's id) keeps a retry from counting twice while the bus is in
+  memory; a refund doesn't take a cloud tip back in 1.4 (tips arrive captured only, and a
+  later refund notice isn't an event).
+- Frames: `state { goals }` to every overlay of the account (as the engine sends it) and
+  `goals` to the dashboard's live socket; the overlay snapshot carries them. Goals are read
+  into the bus once and again after any change.
+
+### 7.2 Polls and giveaways
+
+`cloud/community.rs`: the engine's rules from core (`PollSpec::cleaned`, `Poll::vote`,
+`GiveawaySpec::cleaned`, `Giveaway::enter`, `pick_weighted` with the OS's randomness), held on
+the account's bus **in memory**, as the app holds them (a relay restart forgets a running one,
+like an app restart). A bus with an open poll, or a giveaway taking entries that started less
+than 24 hours ago, is never dropped as idle or pushed out for another account; a giveaway left
+open longer may go with its bus, so a forgotten one can't hold memory for good.
+
+- Routes, the engine's paths and answers (API.md "Polls", "Giveaways"):
+  `GET /c/api/v1/polls/current`, `POST /c/api/v1/polls`, `POST …/current/end`,
+  `DELETE …/current`; `GET /c/api/v1/giveaways/current`, `POST /c/api/v1/giveaways`,
+  `POST …/current/{close|draw|redraw|end}`, `DELETE …/current` (`{ refunded: 0 }`). Errors:
+  422 `invalid` naming the field, 404 `poll_not_found` / `giveaway_not_found`, 409 `conflict`
+  (another running, already ended, already drawn), 422 `nobody_entered` / `everyone_won`, 503
+  `cloud_busy`.
+- Viewers vote with `!vote N` and enter with the keyword in **live** chat on any connected
+  platform (Shared Chat from a partner channel and tests never count), once per person:
+  `platform:user id` (the cloud has no viewer database to link accounts, so one person on two
+  platforms is two). The streamer, bots and anonymous accounts can't enter (core's
+  `is_audience`). **Entry costs no points** in the cloud (the points live in the PC's
+  database): a `cost` above 0 is 422 with a hint.
+- Results go out at most every 250 ms while votes or entries come in: `state { poll }` /
+  `state { giveaway }` (the `GiveawayCard`) to overlays with that widget, `poll { poll }` /
+  `giveaway { giveaway }` to the dashboard. A poll closes itself at its end time.
+- Chat: the start, a poll's result and each winner are posted as the streamer by the cloud bot
+  (`bot::announce`), only where the bot is switched on and the cloud has that chat (no PC on
+  duty), counted against its 20 messages a minute, split to each platform's length (500, YouTube
+  200). With the bot off nothing is posted, and the Community page says so.
+
 ## 8. Resource budget (free Oracle ARM server, 4 OCPU, 24 GB; the relay container 1 GB)
 
 Per **active** streamer (bus in memory): rings and queue ≈ 100 KB, a bus channel ≈ 64 frames
@@ -282,6 +361,33 @@ Per **active** streamer (bus in memory): rings and queue ≈ 100 KB, a bus chann
 | Overlay sockets relay-wide | 4,000 | `CLOUD_MAX_SOCKETS` |
 | Ingest queue | 4,096 waiting, one worker (in order, in memory only) | fixed |
 | Memory for cloud mode | ≈ 120 MB at 400 active | |
+
+**Measured (load test, `cloud/load_tests.rs`).** N active accounts, each with its Twitch
+channel bound and **3 overlay pages open** (the Starter overlay: alerts, chat, events,
+labels), at a **busy peak of 5 events a second each** (9 in 10 chat lines, 1 in 10 a follow
+with its alert, acked by the pages), through the real signed EventSub webhook, the ingest
+queue, the bus and the sockets. The relay runs as its own process (release build) and is
+sampled with `ps`; 30 s runs on an Apple M4 (the Oracle Ampere cores are slower, so read the
+CPU with headroom):
+
+| Accounts | Sockets | Events in 30 s | Dropped | RSS idle → pages open → peak | Per account (pages open / peak) | CPU (one core) | Per account |
+|---|---|---|---|---|---|---|---|
+| 20 (10 s) | 60 | 1,020 | 0 | 19 → 28 → 32 MB | 488 / 673 KB | 4.8 % | 0.24 % |
+| 100 | 300 | 15,100 | 0 | 20 → 63 → 85 MB | 435 / 651 KB | 18.8 % | 0.19 % |
+| 300 | 900 | 45,300 | 0 | 21 → 150 → 210 MB | 431 / 632 KB | 42.7 % | 0.14 % |
+
+Every webhook answered 2xx, every page stayed open, nothing was dropped. CPU per account
+meets the ≤ 0.2 % target at a busy peak (and falls with scale); **memory is about twice the
+300 KB estimate**: ≈ 430 KB an account with 3 pages open (≈ 140 KB a socket: its buffers,
+the per-socket task and the broadcast receiver) and ≈ 630 KB at peak, with the allocator
+keeping freed pages. At the 400-account default that is ≈ 250 MB, inside the relay
+container's 1 GB but not the "≈ 120 MB" above; `memory_estimate_bytes` in the admin stats
+still uses 300 KB. Run it again with:
+
+```text
+CLOUDLOAD_ACCOUNTS=100 CLOUDLOAD_SECS=30 cargo test -p ferrocast-relay --release --lib \
+  -- --ignored cloudload_ --nocapture --test-threads=1
+```
 
 How it degrades:
 
@@ -315,10 +421,10 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 
 | Route | Notes |
 |---|---|
-| `GET /c/v1/cloud` | `{ enabled, sleeping, overlay_origin, usage: { bytes, bytes_limit, overlays, rules, designs }, limits, channels: [...], features }`. 404 when cloud mode isn't on this relay (the dashboard hides it) |
+| `GET /c/v1/cloud` | `{ enabled, sleeping, overlay_origin, usage: { bytes, bytes_limit, overlays, rules, designs, goals }, limits, channels: [...], features, youtube }`. 404 when cloud mode isn't on this relay (the dashboard hides it) |
 | `POST /c/v1/cloud/enable` | turns cloud mode on for the account (free, idempotent) → the same |
 | `GET /c/api/v1/status` | an engine-like `Status` with `cloud: true` and the connectors from the channels |
-| `GET /c/api/v1/accounts` · `POST …/{twitch\|kick}/connect` · `DELETE …/{platform}` | §4 |
+| `GET /c/api/v1/accounts` · `POST …/{twitch\|kick\|youtube}/connect` · `DELETE …/{platform}` | §4; YouTube is Pro (§11) |
 | `GET/POST /c/api/v1/overlays`, `GET/PUT/DELETE …/{id}`, `POST …/{id}/regenerate-url` | as API.md §4 Overlays; `url` is the cloud URL |
 | `GET/POST /c/api/v1/alert-rules`, `PUT/DELETE …/{id}` | as API.md |
 | `GET /c/api/v1/designs[?kind=]`, `GET/PUT/DELETE …/{id}`, `POST /c/api/v1/designs`, `POST …/{id}/duplicate`, `POST …/{id}/use`, `GET/PUT /c/api/v1/designs/active-alert` | built-ins from the overlay build's catalogue, read-only |
@@ -326,9 +432,12 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 | `GET /c/api/v1/queue`, `POST …/queue/{pause\|resume\|skip\|clear}` | the cloud queue |
 | `GET /c/api/v1/events`, `GET /c/api/v1/chat` | from the bus (memory) |
 | `GET/POST /c/api/v1/media`, `GET/DELETE …/{id}` | uploads (§5) |
+| `GET/PUT/DELETE /c/api/v1/tips` | the tip page on the account's cloud install (§7), the engine's `TipSettings` |
+| `GET/POST /c/api/v1/goals`, `PUT/DELETE …/{id}`, `POST …/{id}/adjust` | goals (§7.1) |
+| `GET/DELETE /c/api/v1/polls/current`, `POST /c/api/v1/polls`, `POST …/current/end` · `GET/DELETE /c/api/v1/giveaways/current`, `POST /c/api/v1/giveaways`, `POST …/current/{close\|draw\|redraw\|end}` | polls and giveaways (§7.2) |
 | `GET /c/api/v1/bot/config`, `PUT …` (`{ version, config }`) · `GET /c/api/v1/pro/bot`, `PUT /c/api/v1/pro/bot/enabled` | the cloud bot (§6) |
 | `GET/POST /c/api/v1/commands`, `PUT/DELETE …/{id}`, `POST …/starter` · `GET/POST /c/api/v1/timers`, `PUT/DELETE …/{id}` | the engine's command and timer paths, kept in the bot's config, so the Bot screen works unchanged |
-| `GET /c/api/v1/live` (WebSocket) | live frames for the dashboard: `hello`, `event`, `queue`, `status`; Origin must be the web host |
+| `GET /c/api/v1/live` (WebSocket) | live frames for the dashboard: `hello`, `event`, `queue`, `status`, `goals`, `poll`, `giveaway`; Origin must be the web host |
 | `GET /c/v1/connect/finish?code=` | §4 step 3 (a page, then a redirect to `/app/`) |
 
 ### 9.2 Overlay pages (overlay origin)
@@ -380,9 +489,9 @@ memory_estimate_bytes (300 KB per active streamer) }`. Same guard as every admin
 
 - `cloud::ingest::publish(st, account, Event)`: any producer (the YouTube reader) hands
   normalised events to an account's bus; alerts, chat overlays and labels follow.
-- `cloud_channels.platform = "youtube"` rows and `GET /c/v1/cloud` `channels` list them; the
-  connect route answers 402 `pro_required` for YouTube without Pro, so the dashboard can show
-  the Pro card.
+- `GET /c/v1/cloud` `channels` lists YouTube (bound to the account's Pro subscription, not a
+  `cloud_channels` row); the connect route answers 402 `pro_required` for YouTube without Pro,
+  so the dashboard can show the Pro card.
 - `cloud::bot_allowed` is the one gate for the bot keyed by an account; YouTube's own quota
   rules (API.md §9.7) apply on top.
 
@@ -392,19 +501,60 @@ connects on the web host (`/r/v1/pro/youtube/connect`, the same Google client an
 finish only for the same signed-in account) and the channel is bound to the **account's Pro
 subscription**, so the cloud bot, its config and its YouTube budget are the same ones the
 account's PCs use. The budget is per subscription (one per account) with a fair share of
-Google's 10,000 a day across the streamers that used YouTube that day (never below 600). What
-cloud mode adds on top, when M3 lands:
+Google's 10,000 a day across the streamers that used YouTube that day (never below 600).
 
-- `cloud::connect`'s YouTube branch: for an account with Pro, answer with
-  `crate::bot::youtube::web::auth_url(st, cfg, account, moderation)` instead of 402 (the finish
-  then binds as above); without Pro keep 402 `pro_required`.
-- The YouTube reader (`bot::youtube::read`) hands each chat line and event to
-  `cloud::ingest::publish(st, account, event)` for the account whose subscription it is, so
-  cloud overlays show YouTube chat and alerts too.
-- One bot config for the account: cloud mode keeps Twitch's and Kick's bot under the account
-  key (§6), YouTube's is under the subscription key. Until M4 decides, the YouTube bot answers
-  with the config the account's PCs pushed; the simplest fix is for M4's Bot page to write a
-  Pro account's config to both keys.
+**What cloud mode adds (built after 1.4.0).**
+
+- **Connect from the Cloud page.** `POST /c/api/v1/accounts/youtube/connect` answers
+  `{ flow: "browser", url }` for an account with Pro (`bot::youtube::web::connect_url`, the same
+  checks as the Account page's connect: 20 an hour), and the finish returns to
+  `/app/#/cloud?connected=youtube` (the nonce remembers which page started it). Without Pro:
+  402 `pro_required` with a hint. **Without the relay's "Ferrocast Cloud (YouTube)" client**
+  (`YOUTUBE_CLOUD_CLIENT_ID`/`_SECRET`, set with `pro-keys.sh --youtube`) or the vault: 503
+  `platform_unavailable` ("YouTube from the cloud isn't set up on Ferrocast's servers yet.",
+  hint: it keeps working in the app), and `GET /c/v1/cloud` says `features.youtube: false`, so
+  the Cloud page explains instead of offering a button that can't work. `DELETE
+  /c/api/v1/accounts/youtube` disconnects (revoked at Google), also after Pro ended (R-04).
+- **The Cloud page's view.** `GET /c/v1/cloud` gains `youtube: { available, pro, bot_on,
+  channel, quota }` (the Account page's view) and lists a bound channel in `channels`
+  (`platform: "youtube"`, `login` = the channel title; `error` says why it stopped, Pro ended
+  included). `GET /c/api/v1/status` reports its connector.
+- **YouTube on the bus.** The cloud bot's YouTube reader (`bot::youtube::read`) hands every
+  event it reads (chat, Super Chats, Super Stickers, memberships) to
+  `cloud::ingest::youtube(st, account, event)` for the account the subscription is attached
+  to, while that account has cloud mode on and awake; alerts, chat overlays, labels, goals and
+  polls follow like Twitch's and Kick's. The reader runs for a Pro subscription with a ready
+  YouTube channel whose bot is on **or** whose account uses cloud mode (`Db::cloud_youtube_subs`),
+  so overlays get YouTube with the bot switched off; the bot still answers only when on. The
+  **quota is unchanged**: the reader spends the subscription's own units (its fair share of the
+  day, `fair_limit`) exactly as before, publishing costs nothing, and a spent day stops the
+  reader as before (the channel's error says until when). While a PC holds YouTube's lease
+  (its bot on), the PC reads YouTube and the cloud reads nothing; cloud overlays then miss
+  YouTube until the PC goes quiet for 90 s (the same rule as the bot).
+- **Reading YouTube chat, and saying why it stops.** Every reason the reader pauses or
+  stops (stream refused, dropped, silent for 90 s, "chat over", no sign-in) is logged at info
+  the first time per subscription and hour (`the cloud bot's YouTube chat reader`, with
+  YouTube's own words), and the first batch of lines each hour too (how many, how many new),
+  so a quiet YouTube bot shows why in the relay log. YouTube ending the stream as "chat over"
+  within 20 s of opening while `liveBroadcasts` says live, **3 times in a row**, is a stream
+  YouTube won't let the cloud read: the channel gets `youtube_chat_unavailable` ("check that
+  live chat is on for the stream, then press Try again") and reading rests an hour, instead
+  of opening a stream every 2 minutes (6 units each round) and reading nothing. Those strikes
+  count only for one broadcast: a live check that finds it ended, a new chat id, a line read,
+  or Try again starts them over. An answer marked offline (YouTube's own end of the chat) is
+  never a strike. In a stream's
+  first answer only lines **published before the stream opened** (with 5 s of slack) are
+  history (`Origin::Backfill`, never answered); a line published after it is new, even in
+  that first answer (the same in the desktop's reader).
+- **One bot config for an account without a PC.** For a Pro account whose subscription has
+  **no PC linked** (`pro_installs` empty) and a YouTube channel, the cloud Bot page's saves are
+  copied to the subscription's config (`bot::youtube_follows_account`, `mirror_to_youtube`), and
+  its switch switches YouTube's bot too (with only YouTube connected it is YouTube's switch).
+  With a PC linked that **never pushed** a config (version 0), the YouTube bot reads the
+  Bot page's config without writing it under the subscription (`load_config` falls back to
+  the account's config, `bot_on`), so the first push from that PC takes over cleanly. With a
+  PC that pushed, its config stays YouTube's and the Bot page says so
+  (`youtube.follows_this_page: false` on `GET /c/api/v1/pro/bot`).
 
 ## 12. Milestones
 
