@@ -13,6 +13,9 @@
 // The parts the event pipeline, media and the sleep sweep use land with them (CLOUD.md §12).
 #![allow(dead_code)]
 
+pub(crate) mod connect;
+#[cfg(test)]
+mod connect_tests;
 pub(crate) mod docs;
 pub(crate) mod store;
 mod sync;
@@ -163,7 +166,7 @@ impl Runtime {
 }
 
 pub(crate) fn routes() -> axum::Router<AppState> {
-    web::routes().merge(sync::routes())
+    web::routes().merge(sync::routes()).merge(connect::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────
@@ -380,4 +383,31 @@ pub(crate) fn changed_overlay(st: &AppState, account: &str, o: &ferrocast_core::
 /// An overlay's URL was rotated or the overlay deleted: open pages on it stop at once.
 pub(crate) fn revoked_overlay(st: &AppState, account: &str, overlay: &str) {
     let _ = (st, account, overlay);
+}
+
+// ── The hourly sweep ─────────────────────────────────────────────────────────────────
+
+/// Once an hour: connect hand-overs that were never finished (their sign-ins revoked), old
+/// tombstones, and channels whose subscriptions failed (tried again).
+pub async fn sweep(st: &AppState) {
+    if !available(st) {
+        return;
+    }
+    connect::sweep_pending(st).await;
+    let now = now_ms();
+    if let Err(err) = st.db.cloud_prune_tombstones(now - store::TOMBSTONE_KEEP_MS) {
+        tracing::warn!(error = %err, "couldn't prune cloud tombstones");
+    }
+    for ch in st.db.cloud_all_channels().unwrap_or_default() {
+        // Only what may work now: a platform that was unreachable, or no subscriptions and no
+        // error. A sign-in the platform refused waits for the streamer to connect again.
+        let code = ch.error.as_deref().and_then(|e| serde_json::from_str::<Value>(e).ok()).map(|e| e["code"].clone());
+        let retry = match code.as_ref().and_then(Value::as_str) {
+            Some(c) => c.ends_with("_unavailable"),
+            None => ch.event_subs.is_empty(),
+        };
+        if retry {
+            let _ = connect::subscribe(st, &ch).await;
+        }
+    }
 }

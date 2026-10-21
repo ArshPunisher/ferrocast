@@ -307,6 +307,15 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
+    let cloud = state.clone();
+    tokio::spawn(async move {
+        // Cloud mode: unfinished connects, old tombstones, channels to subscribe again.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            ferrocast_relay::cloud::sweep(&cloud).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     let bot_timers = state.clone();
     // The cloud bot: timers while it's on duty, and the hourly sign-in check and lapse sweep.
     tokio::spawn(ferrocast_relay::bot::run(bot_timers));

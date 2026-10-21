@@ -810,6 +810,10 @@ pub(crate) fn pro_for_install(st: &AppState, install: &str) -> rusqlite::Result<
 }
 
 fn sub_is_pro(db: &Db, sub: &str) -> bool {
+    // A cloud mode account (docs/CLOUD.md §6): "Pro" means cloud mode on and awake.
+    if crate::cloud::is_account_key(sub) {
+        return crate::cloud::bot_allowed(db, sub);
+    }
     matches!(db.pro_sub(sub), Ok(Some(s)) if crate::billing::access::is_pro(&s.access(), now_ms()))
 }
 
@@ -1930,6 +1934,10 @@ pub async fn sweep(st: &AppState) {
         twitch::reconcile_live(st, &ch).await;
     }
     for sub in st.db.bot_subs().unwrap_or_default() {
+        // Cloud mode accounts aren't Pro subscriptions: cloud mode's own sweep looks after them.
+        if crate::cloud::is_account_key(&sub) {
+            continue;
+        }
         let kept = match st.db.pro_sub(&sub) {
             Ok(None) => false,
             Ok(Some(s)) => {

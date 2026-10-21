@@ -129,6 +129,18 @@ pub trait TwitchCloud: Send + Sync + std::fmt::Debug {
         kind: &'a str,
         condition: Value,
     ) -> Fut<'a, String, TwitchError>;
+    /// The same with the subscription type's version (`channel.follow` is "2"). Fakes that
+    /// don't care about versions keep the default.
+    fn subscribe_version<'a>(
+        &'a self,
+        app: &'a str,
+        conduit: &'a str,
+        kind: &'a str,
+        _version: &'a str,
+        condition: Value,
+    ) -> Fut<'a, String, TwitchError> {
+        self.subscribe(app, conduit, kind, condition)
+    }
     /// The id of an existing subscription of `kind` with exactly `condition` (after a `Conflict`).
     fn find_subscription<'a>(
         &'a self,
@@ -410,8 +422,19 @@ impl TwitchCloud for HttpTwitch {
         kind: &'a str,
         condition: Value,
     ) -> Fut<'a, String, TwitchError> {
+        self.subscribe_version(app, conduit, kind, "1", condition)
+    }
+
+    fn subscribe_version<'a>(
+        &'a self,
+        app: &'a str,
+        conduit: &'a str,
+        kind: &'a str,
+        version: &'a str,
+        condition: Value,
+    ) -> Fut<'a, String, TwitchError> {
         Box::pin(async move {
-            let body = json!({ "type": kind, "version": "1", "condition": condition,
+            let body = json!({ "type": kind, "version": version, "condition": condition,
                                "transport": { "method": "conduit", "conduit_id": conduit } });
             let v =
                 Self::check(self.helix(reqwest::Method::POST, "/eventsub/subscriptions", app).json(&body).send().await)
@@ -998,6 +1021,10 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
     if q.error.is_some() {
         return page(StatusCode::OK, "Twitch sign-in was cancelled. You can close this tab.");
     }
+    // Cloud mode's connect from the web dashboard shares this redirect (docs/CLOUD.md §4).
+    if let Some(state) = q.state.as_deref().filter(|s| s.starts_with(crate::cloud::connect::STATE_PREFIX)) {
+        return crate::cloud::connect::twitch_callback(&st, q.code, state).await;
+    }
     let (Some(code), Some(state)) = (q.code, q.state) else {
         return page(StatusCode::BAD_REQUEST, "This link is incomplete. Go back to Ferrocast and press Connect again.");
     };
@@ -1188,6 +1215,11 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
 /// Each id is saved as it's made, so a failure halfway leaves nothing unknown at Twitch; one
 /// that already exists is looked up. The error is also kept on the channel, for the dashboard.
 pub(crate) async fn subscribe_channel(st: &AppState, ch: &super::store::Channel) -> Result<(), String> {
+    // A cloud mode account's chat and live status come through cloud mode's own
+    // subscriptions (cloud::connect), which this must never delete or double.
+    if crate::cloud::is_account_key(&ch.sub_id) {
+        return Ok(());
+    }
     let (Some(bot), Some(channel)) = (&ch.bot_id, &ch.channel_id) else { return Ok(()) };
     let result = async {
         let api = st.bot.twitch().map_err(|_| TwitchError::Unavailable("not configured".into()))?;
@@ -1259,6 +1291,9 @@ fn known_ids(st: &AppState, ch: &super::store::Channel) -> Vec<String> {
 
 /// Deletes a channel's EventSub subscriptions (switched off, unbound, disconnected).
 pub(crate) async fn unsubscribe_all(st: &AppState, ch: &super::store::Channel) {
+    if crate::cloud::is_account_key(&ch.sub_id) {
+        return;
+    }
     let ids = known_ids(st, ch);
     if ids.is_empty() {
         return;

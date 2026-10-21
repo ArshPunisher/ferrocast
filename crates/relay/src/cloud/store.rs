@@ -556,9 +556,10 @@ impl Db {
     }
 
     /// Expired finishes (their sealed sign-ins with them).
-    pub(crate) fn cloud_prune_pending(&self, now: i64) -> rusqlite::Result<Vec<(String, String)>> {
+    pub(crate) fn cloud_prune_pending(&self, now: i64) -> rusqlite::Result<Vec<(String, String, String)>> {
         let c = self.c();
-        let mut s = c.prepare("DELETE FROM cloud_pending WHERE expires_at <= ?1 RETURNING platform, payload")?;
-        s.query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        let mut s =
+            c.prepare("DELETE FROM cloud_pending WHERE expires_at <= ?1 RETURNING account_id, platform, payload")?;
+        s.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect()
     }
 }

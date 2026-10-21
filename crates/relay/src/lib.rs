@@ -669,6 +669,11 @@ async fn kick_callback(State(st): State<AppState>, Query(q): Query<Callback>) ->
         Value::String(s) => s.clone(),
         _ => return page(StatusCode::BAD_GATEWAY, "Kick sent an account without an id."),
     };
+    if state.starts_with(cloud::connect::STATE_PREFIX) {
+        // Cloud mode's connect from the web dashboard (docs/CLOUD.md §4): `install` is the
+        // account that pressed Connect; the finish on the web host checks it's still that one.
+        return cloud::connect::kick_callback(&st, &install, &tokens, &broadcaster, &user).await;
+    }
     if state.starts_with(bot::kick::STATE_PREFIX) {
         // The cloud bot's opt-in sign-in: kept here (sealed), never sent to the PC, and the
         // channel's owner stays as it is.
