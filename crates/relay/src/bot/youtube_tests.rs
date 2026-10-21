@@ -1428,3 +1428,31 @@ async fn timers_on_youtube_post_at_most_one_every_fifteen_minutes() {
     assert!(yt_cfg(1_500, 9_000).with_timer_gap_min(2_000).is_err());
     assert_eq!(yt_cfg(1_500, 9_000).with_timer_gap_min(0).unwrap().timer_gap, Duration::ZERO);
 }
+
+#[test]
+fn a_busy_day_splits_googles_pot_fairly_but_never_below_the_floor() {
+    let cfg = yt_cfg(1_500, 9_000);
+    // Alone or a few: the subscription's own limit.
+    assert_eq!(fair_limit(&cfg, 1), 1_500);
+    assert_eq!(fair_limit(&cfg, 6), 1_500);
+    // Ten streamers today: 900 each; fifty: the floor.
+    assert_eq!(fair_limit(&cfg, 10), 900);
+    assert_eq!(fair_limit(&cfg, 50), FAIR_FLOOR);
+    // Replies keep the read reserve inside the fair share.
+    let r = fair_room(&cfg, Call::Send, 10);
+    assert_eq!(r.sub, 900 - cfg.read_reserve);
+    assert_eq!(fair_room(&cfg, Call::Read, 10).sub, 900);
+    assert_eq!(fair_room(&cfg, Call::Read, 1), Room::of(&cfg, Call::Read));
+}
+
+#[test]
+fn who_shares_today_counts_only_subscriptions_that_spent_units() {
+    let (st, _d) = bare(Arc::new(FakeYoutube::default()), 1_500, 9_000);
+    let now = utc(2026, 10, 19, 20, 0);
+    assert_eq!(st.db.yt_active_today("me", now).unwrap(), 1, "me, even before my first call");
+    for s in ["a", "b", "me"] {
+        st.db.yt_take_units(s, Call::Detect, None, now).unwrap();
+    }
+    assert_eq!(st.db.yt_active_today("me", now).unwrap(), 3, "a, b and me; the relay's own row isn't one");
+    assert_eq!(st.db.yt_active_today("me", utc(2026, 10, 20, 8, 0)).unwrap(), 1, "a new Pacific day");
+}

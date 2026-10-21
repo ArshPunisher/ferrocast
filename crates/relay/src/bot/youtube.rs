@@ -20,6 +20,11 @@
 //!   (5 units per opened stream, the desktop's own reader); a reply or moderation action is
 //!   50, and those stop [`YoutubeConfig::read_reserve`] units early (relay-wide too) so reading and
 //!   live checks always have room.
+//! - **Fair share** (1.4): Google's 10,000 units are one pot for every streamer, so on a busy
+//!   day nobody may take more than an even part of it: a subscription's room is at most the
+//!   relay's budget split over the subscriptions that used YouTube today (itself included),
+//!   never below [`FAIR_FLOOR`] (enough for a long stream's checks, chat and a few replies).
+//!   The dashboard shows it as `quota.limit` with `quota.fair_share: true`.
 //! - **Only while it matters**: nothing is asked of YouTube unless the cloud bot is on, Pro
 //!   is active and the cloud holds YouTube's lease (the PC quiet for 90 s); chat is read only
 //!   while the channel is live. The PC's `bot_seen` says whether it saw the stream live, so a
@@ -48,6 +53,9 @@ use tokio::time::Instant;
 pub use ferrocast_youtube::feed::Batch;
 
 use super::{Fut, SendErr, store};
+
+/// Connecting YouTube on the web, without a PC (Pro, 1.4).
+pub(crate) mod web;
 use crate::db::Db;
 use crate::quota::civil;
 use crate::{ApiError, AppState, now_ms};
@@ -75,6 +83,8 @@ pub const DESKTOP_YOUTUBE_CLIENT_ID: &str = "701866487620-p0npjp4t20ivffdcn89s5j
 pub const DEFAULT_UNITS_PER_SUB: i64 = 1_500;
 /// Units the whole relay may spend a day, unless set (Google gives a project 10,000).
 pub const DEFAULT_UNITS: i64 = 9_000;
+/// A subscription's fair share never goes below this many units a day.
+pub const FAIR_FLOOR: i64 = 600;
 
 /// Live detection while the cloud has just taken YouTube, was just live (or the PC saw it live).
 pub const CHECK_FAST: Duration = Duration::from_secs(120);
@@ -867,9 +877,41 @@ impl Db {
     }
 }
 
+impl Db {
+    /// Subscriptions that spent YouTube units today (Pacific), `sub` counted even if it hasn't.
+    pub(crate) fn yt_active_today(&self, sub: &str, now: i64) -> rusqlite::Result<i64> {
+        let (period, _) = pacific_day(now);
+        let others: i64 = self.c().query_row(
+            "SELECT COUNT(*) FROM quota_usage WHERE name = ?1 AND period = ?2 AND used > 0 AND sub_id != ?3 AND sub_id != ?4",
+            params![UNITS, period, RELAY_SUB, sub],
+            |r| r.get(0),
+        )?;
+        Ok(others + 1)
+    }
+}
+
+/// A subscription's daily limit today: its own, or less when `active` subscriptions share
+/// the relay's budget ([`FAIR_FLOOR`] at least).
+pub fn fair_limit(cfg: &YoutubeConfig, active: i64) -> i64 {
+    cfg.units_per_sub.min((cfg.units / active.max(1)).max(FAIR_FLOOR))
+}
+
+/// [`Room::of`] with the subscription's room cut to its fair share today.
+pub(crate) fn fair_room(cfg: &YoutubeConfig, call: Call, active: i64) -> Room {
+    let mut room = Room::of(cfg, call);
+    let limit = fair_limit(cfg, active);
+    let cut = match call {
+        Call::Send | Call::Moderate => limit - cfg.read_reserve,
+        _ => limit,
+    };
+    room.sub = room.sub.min(cut);
+    room
+}
+
 /// Takes a call's units for `sub` now: `Err(Some(spent))` over budget (or YouTube said so
 /// for today), `Err(None)` when the count couldn't be kept (no call then either). Replies,
-/// timers and moderation stop at the reserves; live checks at their caps.
+/// timers and moderation stop at the reserves; live checks at their caps; every call at the
+/// subscription's fair share.
 pub(crate) fn take(st: &AppState, sub: &str, call: Call) -> Result<(), Option<Spent>> {
     let now = now_ms();
     let out = st.bot.yt_google_out.load(Ordering::Relaxed);
@@ -877,7 +919,8 @@ pub(crate) fn take(st: &AppState, sub: &str, call: Call) -> Result<(), Option<Sp
         return Err(Some(Spent { relay_wide: true, reset_at: out, checks: false }));
     }
     let Some(cfg) = st.bot.youtube_cfg() else { return Err(None) };
-    match st.db.yt_take_units(sub, call, Some(Room::of(cfg, call)), now) {
+    let active = st.db.yt_active_today(sub, now).unwrap_or(1);
+    match st.db.yt_take_units(sub, call, Some(fair_room(cfg, call, active)), now) {
         Ok(()) => Ok(()),
         Err(UnitsErr::Spent(s)) => Err(Some(s)),
         Err(UnitsErr::Db(e)) => {
@@ -956,9 +999,13 @@ pub(crate) fn quota_view(st: &AppState, sub: &str) -> Value {
     for c in Call::ALL {
         by_call.insert(c.name().into(), json!(st.db.yt_units_used(sub, Some(c), now).unwrap_or(0)));
     }
-    let room = Room::of(cfg, Call::Send);
+    let active = st.db.yt_active_today(sub, now).unwrap_or(1);
+    let limit = fair_limit(cfg, active);
+    let room = fair_room(cfg, Call::Send, active);
     json!({
-        "used": used, "limit": cfg.units_per_sub, "reset_at": reset_at, "by_call": by_call,
+        "used": used, "limit": limit, "reset_at": reset_at, "by_call": by_call,
+        // Cut below the subscription's own limit because other streamers share Google's pot today.
+        "fair_share": limit < cfg.units_per_sub, "sharing_today": active,
         // Room for one more reply (above the reserve kept for reading)?
         "exhausted": used + Call::Send.units() > room.sub || relay + Call::Send.units() > room.relay || google,
     })
@@ -1278,6 +1325,10 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
     let Some(s) = check_state(cfg, &state, now_ms()) else {
         return page(StatusCode::BAD_REQUEST, "This sign-in link expired. Press Connect again in Ferrocast.");
     };
+    // Started on the web dashboard for an account, not from a PC.
+    if s.owner == web::WEB_OWNER {
+        return web::callback(&st, s, &code).await;
+    }
     // One use: the nonce is taken here, so a state can never be replayed.
     let owner_title = match st.db.take_oauth(&format!("{NONCE_PREFIX}{}", s.nonce)) {
         Ok(Some((install, title))) if install == s.install => title,

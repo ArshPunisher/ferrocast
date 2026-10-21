@@ -347,6 +347,7 @@ pub fn router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(bot::routes())
         .merge(tts::routes())
+        .merge(bot::youtube::web::routes())
         .merge(discord::routes())
         .merge(mail::routes())
         .merge(admin::routes())
