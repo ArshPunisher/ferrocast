@@ -123,6 +123,36 @@ and Ferrocast reads with each PC's own voice. Without the key, `features.tts` is
 dashboard doesn't offer the voices. `deploy-relay.sh` keeps both lines when it rewrites
 `relay.env`.
 
+## Ferrocast Pro: smart features (free tier only)
+
+Smart moderation, smart replies and the stream recap (docs/API.md §9.10) are **off until a key
+is set**. They use a language model's **free tier**, with hard daily caps on the relay, so
+nothing can be billed:
+
+- **Cloudflare Workers AI** (recommended). In the Cloudflare dashboard, on an account that is on
+  the **Workers Free** plan (then Workers AI stops at its free 10,000 Neurons a day instead of
+  billing): copy the **Account ID** from the account's home page, and make an API token: My
+  Profile → API Tokens → Create Token → Custom token → permission *Account → Workers AI → Read*,
+  that account only. Cloudflare doesn't train on what it's sent.
+- **Google Gemini** (only if not Cloudflare): [aistudio.google.com](https://aistudio.google.com)
+  → Get API key, in a Google project **without billing** (a project with billing, like the one
+  for voices, is charged). On the free tier Google may use prompts to improve its products, so
+  viewers' chat goes to Google; prefer Cloudflare.
+
+```bash
+ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --ai'
+```
+
+It asks for `CLOUDFLARE_AI_ACCOUNT_ID` (shown as typed), `CLOUDFLARE_AI_TOKEN` and, optionally,
+`GEMINI_API_KEY` (Enter skips; Cloudflare wins while both of its settings are there). Caps:
+`SMART_DAILY_CALLS` (default 140 model calls a day relay-wide, never above 1,000; 140 keeps
+Cloudflare under its free 10,000 Neurons even in the worst case), plus per subscription a day 30
+moderation checks, 20 replies and 3 recaps; set `SMART_DAILY_CALLS` (and `SMART_MODEL` /
+`SMART_GEMINI_MODEL`) by hand in relay.env only if needed. When the day's calls or the free
+allowance are used up the features rest until 00:00 UTC and the app says so; everything else
+keeps working. Check with `pro-keys.sh --status`; the Control Center shows calls used today
+(`usage.smart`). `deploy-relay.sh` keeps all of these.
+
 ## Ferrocast Pro: dashboard from anywhere
 
 Phones open the dashboard at `https://remote.clearcraftlabs.com/app/` and its API at `/r/…` on
@@ -264,6 +294,11 @@ official desktop app's public client id (the PC proves its channel with a token 
 each budget, replies, timers and moderation leave a reserve for reading (300 a subscription,
 10% relay-wide) and live checks are capped (150 a subscription, 30% relay-wide).
 Both id and secret, plus `RELAY_VAULT_KEY`, or YouTube stays off (`available.youtube` false).
+**Fair share** (1.4): on a busy day each subscription's limit is cut to an even part of the
+relay's budget among those who used YouTube that day (never below 600). **From the web** (1.4):
+a Pro account can connect its channel on the web dashboard's Account page with no PC; it uses
+the same client and the same redirect URI, so nothing new is registered in Google. For
+verification (the 100 test users, the 7-day sign-ins) see docs/GOOGLE-VERIFICATION.md.
 The relay calls `oauth2.googleapis.com`, `www.googleapis.com` and the gRPC
 `youtube.googleapis.com:443` (outbound HTTPS).
 

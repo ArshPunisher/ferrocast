@@ -195,6 +195,41 @@ run "$g_id\n\n" --google
 is "the sign-in id alone works" "$code" 0
 has "warns Google sign-in stays off" "$out" "Google sign-in"
 
+# Smart features: Cloudflare's account id (shown) and token, or a Gemini key (made-up values
+# in the right shape, built in pieces so nothing here looks like a real key).
+cf_acct="$(printf '0a1b2c3d%.0s' {1..4})"
+cf_ai="$(printf 'Wq7_%.0s' {1..11})"
+gem="AIza$(printf 'G%.0s' {1..35})"
+fresh_relay
+run "NOT-HEX\nnope\nstill\n" --ai
+is "a bad Cloudflare account id is refused" "$code" 1
+is "nothing saved for smart features" "$(v CLOUDFLARE_AI_ACCOUNT_ID)" ""
+run "$cf_acct\nshort\nGlobalKey\nnope\n" --ai
+is "a short Cloudflare token is refused" "$code" 1
+is "the account id isn't saved either (all or nothing)" "$(v CLOUDFLARE_AI_ACCOUNT_ID)" ""
+run "$cf_acct\n$cf_ai\n\n" --ai
+is "--ai saves Cloudflare's two" "$code" 0
+is "account id saved" "$(v CLOUDFLARE_AI_ACCOUNT_ID)" "$cf_acct"
+is "token saved" "$(v CLOUDFLARE_AI_TOKEN)" "$cf_ai"
+is "no Gemini key without one typed" "$(v GEMINI_API_KEY)" ""
+hasnt "never prints the Cloudflare AI token" "$out" "$cf_ai"
+is "only the smart keys are asked" "$(grep -c '^RELAY_GOOGLE_CLIENT_ID=' "$tmp/relay/relay.env")" 0
+run "" --status
+has "status lists the smart keys" "$out" "CLOUDFLARE_AI_TOKEN: *set"
+has "status lists Gemini as missing" "$out" "GEMINI_API_KEY: *missing"
+hasnt "status hides the AI token" "$out" "$cf_ai"
+run "\n\n$gem\n" --ai
+is "a Gemini key can be added too" "$(v GEMINI_API_KEY)" "$gem"
+has "says Cloudflare wins" "$out" "GEMINI_API_KEY is ignored"
+hasnt "never prints the Gemini key" "$out" "$gem"
+fresh_relay
+run "\n\n$gem\n" --ai
+is "Gemini alone works" "$code" 0
+fresh_relay
+run "$cf_acct\n\n\n" --ai
+is "the account id alone works" "$code" 0
+has "warns Cloudflare needs both" "$out" "need both CLOUDFLARE_AI_ACCOUNT_ID"
+
 fresh_relay
 run "x\n" --nope
 is "unknown option fails" "$code" 1

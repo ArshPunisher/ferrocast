@@ -11,9 +11,10 @@
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --youtube'  the cloud bot's Google client only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --domains'  custom tip addresses only
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --google'   Google sign-in for accounts only
+#   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --ai'       Pro smart features only (free tier)
 #   ssh -t <server> 'sudo -u deploy /opt/ferrocast-relay/pro-keys.sh --status'   set or missing
 #
-# Each key is asked for with typing hidden (a client ID, which isn't secret, is shown as typed) (paste it, then Enter); Enter alone keeps what's
+# Each key is asked for with typing hidden (a client or account ID, which isn't secret, is shown as typed) (paste it, then Enter); Enter alone keeps what's
 # there. A key that doesn't look right is asked for again, three tries, and nothing is
 # changed until every answer is good. Backs up relay.env first and restarts the relay so it
 # reads them; anything failing puts relay.env back as it was. deploy-relay.sh keeps them.
@@ -42,6 +43,17 @@
 #                          Services → Credentials → OAuth client "Ferrocast accounts (web)" →
 #                          Client ID (…apps.googleusercontent.com; shown as you type it)
 #   RELAY_GOOGLE_CLIENT_SECRET  same client → Client secret (starts GOCSPX-); see docs/ACCOUNTS.md
+#   CLOUDFLARE_AI_ACCOUNT_ID    Pro smart features (moderation suggestions, chat replies, recaps),
+#                          free tier: dash.cloudflare.com → the account's home → Account ID (32
+#                          hex characters; shown as you type it). Keep the account on the
+#                          Workers Free plan: Workers AI then stops at its free 10,000 Neurons a
+#                          day instead of billing. See docs/API.md §9.9.
+#   CLOUDFLARE_AI_TOKEN    My Profile → API Tokens → Create Token → Custom: Account → Workers AI →
+#                          Read, on that account only (40 or more characters)
+#   GEMINI_API_KEY         only if you don't use Cloudflare: aistudio.google.com → Get API key, in a
+#                          Google project WITHOUT billing (a project with billing is charged). On
+#                          the free tier Google may use what it's sent to improve its products, so
+#                          Cloudflare is the better choice. Ignored while both Cloudflare keys are set.
 set -euo pipefail
 
 DIR="${RELAY_DIR:-/opt/ferrocast-relay}"
@@ -143,6 +155,7 @@ ANSWER=""
 ask() {
   local name="$1" pattern="$2" what="$3" now try got shown=0
   [[ "$name" == *_CLIENT_ID && "$name" == RELAY_GOOGLE_* ]] && shown=1
+  [[ "$name" == CLOUDFLARE_AI_ACCOUNT_ID ]] && shown=1
   now="$(value "$name")"
   for try in 1 2 3; do
     if [[ -n "$now" ]]; then
@@ -174,6 +187,7 @@ TWITCH_KEYS=(TWITCH_CLOUD_CLIENT_ID TWITCH_CLOUD_CLIENT_SECRET TWITCH_CLOUD_EVEN
 DOMAIN_KEYS=(CF_SAAS_TOKEN CF_ZONE_ID)
 YOUTUBE_KEYS=(YOUTUBE_CLOUD_CLIENT_ID YOUTUBE_CLOUD_CLIENT_SECRET)
 GOOGLE_KEYS=(RELAY_GOOGLE_CLIENT_ID RELAY_GOOGLE_CLIENT_SECRET)
+AI_KEYS=(CLOUDFLARE_AI_ACCOUNT_ID CLOUDFLARE_AI_TOKEN GEMINI_API_KEY)
 pattern() {
   case "$1" in
     GOOGLE_TTS_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
@@ -196,6 +210,9 @@ pattern() {
     YOUTUBE_CLOUD_CLIENT_SECRET) echo '^(GOCSPX-[A-Za-z0-9_-]{28}|[A-Za-z0-9_-]{24})$' ;;
     RELAY_GOOGLE_CLIENT_ID) echo '^[0-9]{6,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com$' ;;
     RELAY_GOOGLE_CLIENT_SECRET) echo '^GOCSPX-[A-Za-z0-9_-]{28}$' ;;
+    CLOUDFLARE_AI_ACCOUNT_ID) echo '^[0-9a-f]{32}$' ;;
+    CLOUDFLARE_AI_TOKEN) echo '^[A-Za-z0-9_-]{40,128}$' ;;
+    GEMINI_API_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
   esac
 }
 what() {
@@ -215,6 +232,9 @@ what() {
     YOUTUBE_CLOUD_CLIENT_SECRET) echo "the Ferrocast Cloud Google client's secret, starting GOCSPX-" ;;
     RELAY_GOOGLE_CLIENT_ID) echo "the Ferrocast accounts (web) client's ID, ending .apps.googleusercontent.com" ;;
     RELAY_GOOGLE_CLIENT_SECRET) echo "the Ferrocast accounts (web) client's secret, GOCSPX- and 28 more" ;;
+    CLOUDFLARE_AI_ACCOUNT_ID) echo "the Cloudflare Account ID, 32 lowercase hex characters" ;;
+    CLOUDFLARE_AI_TOKEN) echo "a Cloudflare API token with Workers AI Read, not the Global API Key" ;;
+    GEMINI_API_KEY) echo "a Gemini API key from a project without billing, starts with AIza; Enter to skip" ;;
   esac
 }
 status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi; }
@@ -222,7 +242,7 @@ status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi;
 keys=()
 case "${1:-}" in
   --status)
-    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}"; do printf '%-28s %s\n' "$k:" "$(status_of "$k")"; done
+    for k in "${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}" "${AI_KEYS[@]}"; do printf '%-28s %s\n' "$k:" "$(status_of "$k")"; done
     exit 0
     ;;
   --tts) keys=("${TTS_KEYS[@]}") ;;
@@ -232,8 +252,9 @@ case "${1:-}" in
   --domains) keys=("${DOMAIN_KEYS[@]}") ;;
   --youtube) keys=("${YOUTUBE_KEYS[@]}") ;;
   --google) keys=("${GOOGLE_KEYS[@]}") ;;
-  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}") ;;
-  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains, --youtube, --google or --status." ;;
+  --ai) keys=("${AI_KEYS[@]}") ;;
+  "") keys=("${TTS_KEYS[@]}" "${DISCORD_KEYS[@]}" "${MAIL_KEYS[@]}" "${TWITCH_KEYS[@]}" "${DOMAIN_KEYS[@]}" "${YOUTUBE_KEYS[@]}" "${GOOGLE_KEYS[@]}" "${AI_KEYS[@]}") ;;
+  *) die "Unknown option '$1'. Use no option, --tts, --discord, --mail, --twitch, --domains, --youtube, --google, --ai or --status." ;;
 esac
 
 names=()
@@ -285,6 +306,14 @@ missing=()
 for k in "${GOOGLE_KEYS[@]}"; do [[ -n "$(value "$k")" ]] || missing+=("$k"); done
 if ((${#missing[@]} > 0 && ${#missing[@]} < ${#GOOGLE_KEYS[@]})); then
   echo "Still missing for Google sign-in: ${missing[*]}. It stays off (email sign-in works) until both are set."
+fi
+cf_ai=0
+for k in CLOUDFLARE_AI_ACCOUNT_ID CLOUDFLARE_AI_TOKEN; do [[ -n "$(value "$k")" ]] && cf_ai=$((cf_ai + 1)); done
+if ((cf_ai == 1)); then
+  echo "Smart features on Cloudflare need both CLOUDFLARE_AI_ACCOUNT_ID and CLOUDFLARE_AI_TOKEN; until then they use Gemini if its key is set, else stay off."
+fi
+if ((cf_ai == 2)) && [[ -n "$(value GEMINI_API_KEY)" ]]; then
+  echo "Both Cloudflare keys are set, so smart features use Cloudflare and GEMINI_API_KEY is ignored."
 fi
 echo "Restarting the relay so it reads them…"
 restart || put_back "$BACKUP" "The relay didn't come back healthy with the new keys."
