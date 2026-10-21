@@ -363,6 +363,8 @@ impl Engine {
         // Only now is the message known to be shown: hidden or held chat earns no points
         // and gets no public welcome.
         self.loyalty_saw(e);
+        // Pro smart moderation takes a second look at some of it (queued, never waits).
+        self.smart_saw(e);
         if let Some(mark) = *chatter {
             self.maybe_welcome(e, mark);
         }
@@ -389,8 +391,11 @@ impl Engine {
                     return Moderated::Shown;
                 }
             }
-            // Auto-replies only for chat no command handled (studio/autoreplies.rs).
-            self.answer_autoreply(e).await;
+            // Auto-replies only for chat no command handled (studio/autoreplies.rs), then a
+            // Pro smart reply for a question nothing answered (smart.rs).
+            if !self.answer_autoreply(e).await {
+                self.smart_reply_saw(e);
+            }
         }
         Moderated::Shown
     }

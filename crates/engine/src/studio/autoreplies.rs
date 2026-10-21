@@ -258,7 +258,7 @@ impl Engine {
     /// Whether this message comes from the bot itself or another bot (loop guard): the
     /// streamer's own account (the bot speaks as it, R-28), the connected account's name,
     /// a bot badge or a well-known bot, or text the bot just said on that platform.
-    fn is_bot_message(&self, platform: Platform, actor: &Actor, text: &str, at: Millis) -> bool {
+    pub(crate) fn is_bot_message(&self, platform: Platform, actor: &Actor, text: &str, at: Millis) -> bool {
         if actor.roles.contains(Roles::BROADCASTER) || actor.roles.contains(Roles::BOT) {
             return true;
         }

@@ -70,19 +70,25 @@ pub fn support_since(store: &Store, since: i64) -> Result<Vec<Event>> {
 /// Chat messages since `since`, and the people who sent the most (never the streamer or
 /// bots).
 pub fn chat_since(store: &Store, since: i64, top: u32) -> Result<(u64, Vec<Chatter>)> {
+    chat_between(store, since, i64::MAX, top)
+}
+
+/// [`chat_since`] for `[from, to)`.
+pub fn chat_between(store: &Store, from: i64, to: i64, top: u32) -> Result<(u64, Vec<Chatter>)> {
     store.read(|c| {
         let total: i64 = c.query_row(
-            "SELECT COUNT(*) FROM events WHERE kind = 'chat_message' AND origin = 'live' AND occurred_at >= ?1",
-            [since],
+            "SELECT COUNT(*) FROM events WHERE kind = 'chat_message' AND origin = 'live' AND occurred_at >= ?1
+               AND occurred_at < ?2",
+            params![from, to],
             |r| r.get(0),
         )?;
         let mut st = c.prepare(
             "SELECT platform, MAX(actor_name), COUNT(*) AS n FROM events
-             WHERE kind = 'chat_message' AND origin = 'live' AND occurred_at >= ?1 AND actor_id IS NOT NULL
-               AND (COALESCE(json_extract(data, '$.actor.roles'), 0) & 257) = 0
+             WHERE kind = 'chat_message' AND origin = 'live' AND occurred_at >= ?1 AND occurred_at < ?3
+               AND actor_id IS NOT NULL AND (COALESCE(json_extract(data, '$.actor.roles'), 0) & 257) = 0
              GROUP BY platform, actor_id ORDER BY n DESC, MAX(seq) DESC LIMIT ?2",
         )?;
-        let rows = st.query_map(params![since, top], |r| {
+        let rows = st.query_map(params![from, top, to], |r| {
             let platform: String = r.get(0)?;
             let n: i64 = r.get(2)?;
             Ok(Chatter {

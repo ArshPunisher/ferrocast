@@ -1,6 +1,8 @@
-//! Stream history for Ferrocast Pro (docs/plan/PRO.md F7, API.md §9.1).
+//! Stream history (docs/plan/PRO.md F7, API.md §9.1): Pro keeps a year, a free Ferrocast
+//! account the last 30 days (1.4).
 //!
-//! While Pro is active (the remembered status, never a network check) each platform's
+//! While Pro is active or the PC is signed in to an account (the remembered status and the
+//! keychain, never a network check) each platform's
 //! stream is counted here as events go by: viewers, chat lines, chatters, follows, subs,
 //! tips per currency, Bits/KICKs/Jewels. The stream is uploaded when it starts and again
 //! with its totals when it ends, and a viewer sample goes up every five minutes while
@@ -335,7 +337,7 @@ impl Engine {
                 Saved::default()
             }
         };
-        let on = self.pro_has(|f| f.history).await;
+        let on = self.history_allowed().await;
         let mut h = self.history();
         h.saved = saved;
         h.on = on;
@@ -382,9 +384,15 @@ impl Engine {
         }
     }
 
+    /// Whether streams are counted and uploaded: Pro, or a free account signed in here, on
+    /// a relay that keeps history (no network: the remembered status and the keychain).
+    pub(crate) async fn history_allowed(&self) -> bool {
+        self.pro_has(|f| f.history).await || (self.account_signed_in() && self.relay_has(|f| f.history).await)
+    }
+
     /// One round of the upload task: re-read Pro, take samples, send what's queued.
     pub(crate) async fn history_round(&self) {
-        let on = self.pro_has(|f| f.history).await;
+        let on = self.history_allowed().await;
         // The category last set from Ferrocast, for the next stream that starts.
         let category = self
             .stream_info_saved()
@@ -459,8 +467,9 @@ impl Engine {
         let status = res.status().as_u16();
         match status {
             200..=299 => Sent::Done,
-            // Bad data, an unknown or locked stream: sending it again can't help.
-            400 | 404 | 409 | 413 | 415 | 422 => {
+            // Bad data, an unknown or locked stream, or no account and no Pro any more (403
+            // `account_required`: nothing would keep it): sending it again can't help.
+            400 | 403 | 404 | 409 | 413 | 415 | 422 => {
                 let v: Value = res.json().await.unwrap_or(Value::Null);
                 tracing::warn!(status, code = %v["error"]["code"], "stream history upload refused; dropped");
                 Sent::Done
@@ -478,6 +487,15 @@ impl Engine {
         platform: Option<Platform>,
     ) -> Result<Value, EngineError> {
         self.pro_call(reqwest::Method::GET, &history_path("/v1/pro/history", from, to, platform), None).await
+    }
+
+    /// One stream's viewer samples (`GET /api/v1/pro/history/samples?platform&key`).
+    pub async fn stream_history_samples(&self, platform: Platform, key: &str) -> Result<Value, EngineError> {
+        if !key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.')) || key.is_empty() {
+            return Err(EngineError::Invalid("key: the stream's key from the list.".into()));
+        }
+        let path = format!("/v1/pro/history/samples?platform={}&key={key}", platform_key(platform));
+        self.pro_call(reqwest::Method::GET, &path, None).await
     }
 
     /// The CSV export (`GET /api/v1/pro/history/export.csv`).

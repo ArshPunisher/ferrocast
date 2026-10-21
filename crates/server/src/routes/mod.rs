@@ -20,6 +20,7 @@ mod polls;
 mod pro;
 mod recap;
 pub(crate) mod remote_scope;
+mod smart;
 mod studio;
 mod tip_pro;
 mod tts;
@@ -141,6 +142,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))
+        .route("/recap/summary", get(smart::recap_saved).post(smart::recap))
+        .route("/insights/supporters", get(smart::supporters))
         .route("/updates", get(app::updates))
         .route("/updates/check", post(app::check_updates))
         .route("/updates/install", post(app::install_update))
@@ -168,8 +171,16 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/account/sessions/{id}", delete(pro::account_revoke))
         .route("/pro/history", get(history::list))
         .route("/pro/history/export.csv", get(history::export))
+        .route("/pro/history/samples", get(history::samples))
         // Pro: the weekly email (see routes/weekly_email.rs)
         .route("/pro/history/email", get(weekly_email::view).put(weekly_email::save).delete(weekly_email::stop))
+        // Pro: smart moderation, smart replies (see routes/smart.rs)
+        .route("/pro/smart", get(smart::view).put(smart::save))
+        .route("/pro/smart/about/approve", post(smart::approve))
+        .route("/pro/smart/moderation", get(smart::log))
+        .route("/pro/smart/moderation/{id}/apply", post(smart::apply))
+        .route("/pro/smart/moderation/{id}/undo", post(smart::undo))
+        .route("/pro/smart/moderation/{id}/dismiss", post(smart::dismiss))
         // Pro: the 24/7 cloud bot (see routes/cloud_bot.rs)
         .route("/pro/bot", get(cloud_bot::view))
         .route("/pro/bot/enabled", put(cloud_bot::enabled))

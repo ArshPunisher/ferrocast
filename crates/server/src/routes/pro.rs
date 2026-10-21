@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(
             v["features"],
             json!({ "cloud_bot": false, "remote": false, "tts": false, "discord": false, "backups": false,
-                    "tip_brand": false, "history": true, "weekly_email": false })
+                    "tip_brand": false, "history": true, "weekly_email": false, "smart": false })
         );
         assert_eq!(v["quotas"], json!({}));
         let (s, v) =

@@ -322,3 +322,36 @@ async fn refusals_that_retrying_cant_fix_are_dropped_and_402_waits() {
     e2.history_round().await;
     assert_eq!(e2.history().saved.queue.len(), 3);
 }
+
+/// No Pro, as the relay last said, on a relay that keeps history.
+async fn remember_free(e: &Engine) {
+    let status = json!({
+        "pro": false, "status": "none", "plan": null, "subscription_id": null, "current_end": null,
+        "access_until": null, "checked_at": now().0, "features": { "history": true }, "quotas": {}
+    });
+    e.db(move |s| repo::settings::set(s, "pro_status", &status)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_free_pc_signed_in_to_an_account_uploads_too() {
+    let (relay, fake) = fake_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    let apps = PlatformApps { relay_url: Some(relay.clone()), ..Default::default() };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    remember_free(&e).await;
+    // Free and signed out: nothing.
+    e.history_round().await;
+    stream(&e).await;
+    e.history_round().await;
+    assert!(fake.lock().unwrap().calls.is_empty());
+    // Signed in to a free account: counted and sent (the relay keeps 30 days).
+    ferrocast_secrets::Secrets::set(&*secrets, crate::ferro_account::SESSION, "fca_x.y").unwrap();
+    assert!(e.history_allowed().await);
+    e.history_round().await;
+    stream(&e).await;
+    e.history_round().await;
+    let paths: Vec<String> = fake.lock().unwrap().calls.iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(paths.first().map(String::as_str), Some("/v1/pro/history/streams"), "{paths:?}");
+    assert!(e.history().saved.queue.is_empty());
+}

@@ -44,6 +44,17 @@ pub async fn list(State(app): State<AppState>, Query(q): Query<Q>) -> ApiResult<
     Ok(Json(app.engine.stream_history(from, to, platform).await?))
 }
 
+/// `GET /pro/history/samples?platform&key` → `{platform, key, samples: [{at, viewers}]}`.
+pub async fn samples(State(app): State<AppState>, Query(q): Query<Q>) -> ApiResult<Json<Value>> {
+    let platform = match q.get("platform").map(String::as_str).filter(|s| !s.is_empty()) {
+        Some(p) => super::platform(p)?,
+        None => return Err(ApiError::invalid("platform: twitch, youtube or kick.")),
+    };
+    let key = q.get("key").map(|k| k.trim()).filter(|k| !k.is_empty() && k.len() <= 64);
+    let key = key.ok_or_else(|| ApiError::invalid("key: the stream's key from the list."))?;
+    Ok(Json(app.engine.stream_history_samples(platform, key).await?))
+}
+
 /// `GET /pro/history/export.csv?from&to&platform`: the CSV to save.
 pub async fn export(State(app): State<AppState>, Query(q): Query<Q>) -> ApiResult<Response> {
     let (from, to, platform) = filter(&q)?;
@@ -149,10 +160,10 @@ mod tests {
     #[tokio::test]
     async fn history_comes_through_from_the_relay_with_its_errors() {
         let w = world(true).await;
-        // No Pro yet: the relay's 402 and its words reach the dashboard.
+        // No Pro and no account yet: the relay's 403 and its words reach the dashboard.
         let (s, v) = w.json("/pro/history").await;
-        assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (402, Some("pro_required")), "{v}");
-        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Pro"));
+        assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (403, Some("account_required")), "{v}");
+        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Account"));
         let auth = w.make_pro();
         let start = ferrocast_relay::now_ms() - 2 * 3_600_000;
         let res = w
@@ -171,6 +182,13 @@ mod tests {
         assert!(v["weekly"].as_array().unwrap().len() >= 4);
         let (s, v) = w.json("/pro/history?platform=twitch").await;
         assert_eq!((s.as_u16(), v["streams"].as_array().map(Vec::len)), (200, Some(0)));
+        assert_eq!(v["plan"], "pro");
+        // One stream's samples come through, and a missing one is the relay's 404.
+        let (s, v) = w.json("/pro/history/samples?platform=kick&key=kick:1").await;
+        assert_eq!((s.as_u16(), v["samples"].as_array().map(Vec::len)), (200, Some(0)), "{v}");
+        let (s, v) = w.json("/pro/history/samples?platform=kick&key=kick:404").await;
+        assert_eq!((s.as_u16(), v["error"]["code"].as_str()), (404, Some("stream_not_found")), "{v}");
+        assert_eq!(w.json("/pro/history/samples?platform=kick").await.0, 400);
         let csv = w.get("/pro/history/export.csv").await;
         assert_eq!(csv.status(), 200);
         assert!(csv.headers()["content-type"].to_str().unwrap().starts_with("text/csv"));

@@ -31,6 +31,7 @@ pub use pro::{ProStatus, ProView};
 mod recap;
 mod relay;
 mod remote;
+pub mod smart;
 pub use remote::{
     IN_FLIGHT as REMOTE_IN_FLIGHT, MAX_RESPONSE as REMOTE_MAX_RESPONSE, RemoteHandler, RemoteRequest, RemoteResponse,
     TunnelView,
@@ -172,6 +173,8 @@ struct Inner {
     remote: remote::Remote,
     /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
     cloud_bot: cloud_bot::CloudBot,
+    /// Pro smart features: settings, the moderation queue and log, reply limits.
+    smart: Mutex<smart::Smart>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -296,6 +299,7 @@ impl Engine {
                 cloud_tts: Default::default(),
                 remote: Default::default(),
                 cloud_bot: Default::default(),
+                smart: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -315,6 +319,8 @@ impl Engine {
         tokio::spawn(discord::run(engine.clone()));
         engine.load_cloud_bot().await;
         tokio::spawn(cloud_bot::run(engine.clone()));
+        engine.load_smart().await;
+        tokio::spawn(smart::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;

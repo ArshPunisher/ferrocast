@@ -35,6 +35,8 @@ pub struct ProFeatures {
     pub tip_brand: bool,
     pub history: bool,
     pub weekly_email: bool,
+    /// Smart moderation, smart replies and the written recap (a model is set up).
+    pub smart: bool,
 }
 
 /// One of the subscription's usage counters (API.md §9).
@@ -183,6 +185,15 @@ fn code(c: &str) -> &'static str {
         "ended_stream_locked",
         "too_many_samples",
         "history_rate",
+        "account_required",
+        "invalid_key",
+        // Smart features (API.md §9.10).
+        "smart_off",
+        "smart_resting",
+        "smart_rate",
+        "smart_quota",
+        "smart_unavailable",
+        "too_many_messages",
         // Tip page branding and goal (API.md §9.2).
         "image_unreadable",
         "tip_image_quota",
@@ -448,6 +459,26 @@ impl Engine {
     /// Pro right now and this relay has the feature, from memory only (no network).
     pub(crate) async fn pro_has(&self, feature: fn(&ProFeatures) -> bool) -> bool {
         self.pro_cached().await.is_some_and(|s| still_pro(&s, now().0) && feature(&s.features))
+    }
+
+    /// Whether the relay has a feature at all, Pro or not, from memory only (features open
+    /// to free accounts too, like 30 days of stream history).
+    pub(crate) async fn relay_has(&self, feature: fn(&ProFeatures) -> bool) -> bool {
+        self.pro_cached().await.is_some_and(|s| feature(&s.features))
+    }
+
+    /// These usage counters from the last Pro status (no network): `{name: {used, limit,
+    /// period, reset_at}}`, the ones it has.
+    pub(crate) async fn pro_quotas(&self, names: &[&str]) -> Value {
+        let mut out = serde_json::Map::new();
+        if let Some(s) = self.pro_cached().await {
+            for n in names {
+                if let Some(q) = s.quotas.get(*n) {
+                    out.insert((*n).to_string(), json!(q));
+                }
+            }
+        }
+        Value::Object(out)
     }
 
     /// A Pro file from the relay (a CSV export): its content type and bytes.
