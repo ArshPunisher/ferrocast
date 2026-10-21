@@ -244,6 +244,8 @@ pub(crate) fn collect(st: &AppState, now: i64) -> rusqlite::Result<Value> {
             "cloud_backups": { "subscriptions": c.backups },
             "remote": { "devices": c.remote_devices },
             "tips": c.tips,
+            "smart": crate::smart::admin_view(st),
+            "history": { "free_accounts": c.history_free, "pro_subscriptions": c.history_pro },
         },
         "backup": { "last_ok_at": st.admin.cfg.backup_marker.as_deref().and_then(read_marker) },
     }))
@@ -273,6 +275,9 @@ pub(crate) struct Counts {
     pro: Value,
     tts_month: String,
     tts_chars: i64,
+    /// Accounts and subscriptions with stream history kept (counts only).
+    history_free: i64,
+    history_pro: i64,
     tts_requests: i64,
     cloud_bot: Value,
     discord_guilds: usize,
@@ -451,6 +456,8 @@ impl Db {
         Ok(Counts {
             installs,
             pro,
+            history_free: one("SELECT COUNT(DISTINCT sub_id) FROM streams WHERE sub_id LIKE 'ac\\_%' ESCAPE '\\'")?,
+            history_pro: one("SELECT COUNT(DISTINCT sub_id) FROM streams WHERE sub_id NOT LIKE 'ac\\_%' ESCAPE '\\'")?,
             tts_month: key.trim_start_matches('m').to_string(),
             tts_chars,
             tts_requests,

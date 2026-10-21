@@ -27,6 +27,7 @@ pub mod mail;
 mod migrate;
 pub mod quota;
 pub mod remote;
+pub mod smart;
 pub mod tips;
 pub mod tts;
 pub mod vault;
@@ -109,6 +110,9 @@ pub struct AppState {
     blobs: Option<Arc<dyn blob::BlobStore>>,
     /// Pro voices: the provider (`None` without `GOOGLE_TTS_KEY`) and the relay-wide caps.
     pub(crate) tts: Arc<tts::Runtime>,
+    /// Pro smart features: the language model (`None` until `deploy/pro-keys.sh --ai`) and
+    /// the relay-wide caps.
+    pub(crate) smart: Arc<smart::Runtime>,
     /// The dashboard from anywhere: its settings, open tunnels and phone sockets.
     pub(crate) remote: Arc<remote::Runtime>,
     /// The Ferrocast bot for Discord (off without the `DISCORD_*` settings).
@@ -145,6 +149,7 @@ impl AppState {
             vault: None,
             blobs: None,
             tts: Arc::default(),
+            smart: Arc::default(),
             remote: Arc::default(),
             discord: Arc::default(),
             mail: Arc::default(),
@@ -182,6 +187,13 @@ impl AppState {
     /// character cap (`tts::global_cap_from_env()`).
     pub fn with_tts(mut self, provider: Option<Arc<dyn tts::TtsProvider>>, global_monthly_chars: i64) -> AppState {
         self.tts = Arc::new(tts::Runtime::new(provider, global_monthly_chars));
+        self
+    }
+
+    /// Pro smart features (`smart::provider_from_env()` in production, a fake in tests) and
+    /// the relay-wide daily call cap (`smart::daily_from_env()`).
+    pub fn with_smart(mut self, provider: Option<Arc<dyn smart::SmartProvider>>, daily_calls: i64) -> AppState {
+        self.smart = Arc::new(smart::Runtime::new(provider, daily_calls));
         self
     }
 
@@ -347,6 +359,7 @@ pub fn router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(bot::routes())
         .merge(tts::routes())
+        .merge(smart::routes())
         .merge(bot::youtube::web::routes())
         .merge(discord::routes())
         .merge(mail::routes())

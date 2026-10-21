@@ -303,6 +303,7 @@ pub(crate) fn features(st: &AppState) -> Value {
         "history": crate::history::available(st),
         "weekly_email": crate::mail::available(st),
         "tip_domain": crate::tips::domain_available(st),
+        "smart": crate::smart::available(st),
     })
 }
 
@@ -317,6 +318,7 @@ fn quotas(st: &AppState, sub: &str) -> Value {
         crate::tips::QUOTAS,
         crate::history::QUOTAS,
         crate::mail::QUOTAS,
+        crate::smart::QUOTAS,
     ];
     let mut m = serde_json::Map::new();
     for l in all.into_iter().flatten() {
