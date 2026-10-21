@@ -59,6 +59,17 @@ pub(super) struct KickWeb {
     pub deleted: std::sync::Mutex<Vec<String>>,
 }
 
+/// One small key for Kick's webhook signatures (RSA keys are slow to make in debug builds).
+pub(super) fn kick_key() -> &'static rsa::RsaPrivateKey {
+    static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 1024).unwrap())
+}
+
+fn kick_public_pem() -> String {
+    use rsa::pkcs8::EncodePublicKey;
+    rsa::RsaPublicKey::from(kick_key()).to_public_key_pem(rsa::pkcs8::LineEnding::LF).unwrap()
+}
+
 /// The Kick channel the fake Kick signs in as.
 pub(super) const KICK_CHANNEL: &str = "668";
 
@@ -71,6 +82,10 @@ async fn fake_kick(calls: Arc<KickWeb>) -> String {
             post(|| async {
                 axum::Json(json!({ "access_token": "kick-at", "refresh_token": "kick-rt", "expires_in": 3600 }))
             }),
+        )
+        .route(
+            "/public/v1/public-key",
+            get(|| async { axum::Json(json!({ "data": { "public_key": kick_public_pem() } })) }),
         )
         .route(
             "/public/v1/users",
@@ -132,11 +147,22 @@ pub(super) async fn world_with(keyed: bool) -> World {
         Some(tw.clone() as Arc<dyn crate::bot::TwitchCloud>),
         Some(kk.clone() as Arc<dyn crate::bot::KickBot>),
     );
+    // A tiny overlay build: the page, one script and the design catalogue.
+    let build = dir.path().join("overlays");
+    std::fs::create_dir_all(build.join("assets")).unwrap();
+    std::fs::write(
+        build.join("index.html"),
+        "<!doctype html><title>Overlay</title><script src=./assets/app.js></script>",
+    )
+    .unwrap();
+    std::fs::write(build.join("assets/app.js"), "console.log('overlay')").unwrap();
+    let blobs = crate::blob::FsBlobStore::new(dir.path().join("blobs")).unwrap();
     let state = AppState::new(cfg, db)
         .with_vault(Some(crate::bot::tests::vault()))
+        .with_blobs(Some(Arc::new(blobs)))
         .with_bot(bot)
         .with_remote(RemoteConfig::new(Some(&base), Some(b"test pepper, at least sixteen bytes"), None))
-        .with_cloud(CloudConfig::new(Some("http://overlays.test"), None, keyed.then_some(s.as_slice())));
+        .with_cloud(CloudConfig::new(Some("http://overlays.test"), Some(build), keyed.then_some(s.as_slice())));
     state.cloud.set_builtins(catalogue());
     let db = state.db.clone();
     let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
