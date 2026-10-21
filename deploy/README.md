@@ -414,7 +414,7 @@ keeps the row, ended now, so the usual 30-day lapse rules tidy its data. The ins
 part before the dot of `relay-install` in the app's `secrets.json`
 (macOS: `~/Library/Application Support/Ferrocast/secrets.json`; never share the part after the dot).
 
-## The Control Center (ops.transformx.site)
+## The Control Center (ops.clearcraftlabs.com)
 
 The owner's admin panel shows Ferrocast's numbers (installs, Pro subscriptions and MRR, Pro
 feature use, relay health, the last nightly backup) from `GET /admin/v1/stats`: aggregate

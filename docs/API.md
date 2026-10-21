@@ -1316,7 +1316,7 @@ The dashboard (`#/history`, at the end of the history panel, shown when `feature
 
 ### 9.9 The Control Center's stats (owner only)
 
-`crates/relay/src/admin.rs`. The owner's admin panel (ops.transformx.site, the separate Control Center repo) reads one route, server to server. **Aggregate counts only**: never an install id, subscription id, email or its hash, handle, server or channel name, token, or any tip amount.
+`crates/relay/src/admin.rs`. The owner's admin panel (ops.clearcraftlabs.com, the separate Control Center repo) reads one route, server to server. **Aggregate counts only**: never an install id, subscription id, email or its hash, handle, server or channel name, token, or any tip amount.
 
 | Method | Path | Response |
 |---|---|---|

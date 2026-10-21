@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The token the Control Center (ops.transformx.site) reads the relay's admin stats with
+# The token the Control Center (ops.clearcraftlabs.com) reads the relay's admin stats with
 # (GET /admin/v1/stats: aggregate counts only), made on the server itself: it never passes
 # through a chat, a command line, the Mac or GitHub, and this script never prints it.
 # Installed as /opt/ferrocast-relay/control-center-key.sh by deploy/relay-ci-setup.sh. From your Mac:
@@ -91,7 +91,7 @@ token=""
 if [[ "${1:-}" != --rotate ]] && good "$relay_now"; then
   if [[ "$cc_now" == "$relay_now" ]]; then
     echo "✓ The relay and the Control Center already share an admin token; nothing changed."
-    echo "  (A new one: --rotate. Is it working? Open ops.transformx.site → Ferrocast.)"
+    echo "  (A new one: --rotate. Is it working? Open ops.clearcraftlabs.com → Ferrocast.)"
     exit 0
   fi
   token="$relay_now"
@@ -238,9 +238,9 @@ except urllib.error.HTTPError as e:
 except Exception:
     print("unreachable")' 2>/dev/null || echo "unreachable")"
 case "$answer" in
-  200) echo "✓ The Control Center reads the relay's stats. Open ops.transformx.site → Ferrocast." ;;
+  200) echo "✓ The Control Center reads the relay's stats. Open ops.clearcraftlabs.com → Ferrocast." ;;
   401) die "The relay refused the Control Center's token. Run this script again with --rotate." ;;
-  404) die "The relay has no stats yet: release it first (Actions → 🚀 Deploy relay), then open ops.transformx.site." ;;
+  404) die "The relay has no stats yet: release it first (Actions → 🚀 Deploy relay), then open ops.clearcraftlabs.com." ;;
   503) die "The relay has no admin token: run this script again." ;;
   unreachable) die "The Control Center can't reach the relay at http://ferrocast-relay:8787. Check both run (docker ps) and the Control Center is on $NETWORK." ;;
   *) die "The relay answered $answer. Check its logs: sudo docker logs --since 5m ferrocast-relay" ;;
