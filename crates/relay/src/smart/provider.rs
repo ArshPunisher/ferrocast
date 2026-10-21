@@ -150,7 +150,8 @@ impl SmartProvider for Cloudflare {
 // ── Google Gemini (free tier) ────────────────────────────────────────────────────────
 
 pub const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-pub const GEMINI_MODEL: &str = "gemini-2.5-flash-lite";
+/// Google closed 2.5 Flash-Lite to new keys (404); 3.5 Flash-Lite is its free-tier successor.
+pub const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
 pub struct Gemini {
     key: String,
