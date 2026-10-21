@@ -177,8 +177,8 @@ M0 as built (19 Oct 2026):
   overwrites, a reclaim drops the other subscription's row without revoking, and a refusal revokes only a grant whose
   channel YouTube named and no subscription has bound (else it's left to expire).
   Chat read with the desktop's gRPC `streamList` (5 units per opened stream; `liveChatMessages.list` polling at 5 units per
-  call would spend 1,500 in well under an hour), so a stream YouTube closes after bringing lines is opened again at once from the last page
-  token (replies within about a second); closes without a line back off, 1 s doubling to 30 s; HTTP/2 keepalive (30 s ping, 10 s timeout, while idle
+  call would spend 1,500 in well under an hour), so a stream YouTube closes (after about 10 s, even while live) is opened again at once from
+  the last page token (replies within about a second, about 1,800 units a live hour); only instant empty closes back off, 1 s doubling to 30 s; HTTP/2 keepalive (30 s ping, 10 s timeout, while idle
   too) and a 90 s idle timeout on the stream (reopened from the page token; a second silence in a row is a failure);
   failed opens back off 30 s doubling to 1 h, the streak kept in `YtMem` across reader restarts, 6 in a row →
   `youtube_unavailable` (retryable) and no reading until "Try again" or a live check 1 h later. Live detection

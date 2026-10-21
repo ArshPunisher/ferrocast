@@ -287,7 +287,7 @@ video of the sign-in and the scope in use, domain ownership in Search Console); 
 restricted scope, so no paid security assessment. Separately, the 10,000 units a day can be
 raised with the **YouTube API Services audit and quota extension** form once the beta is used.
 
-Budget: `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (default 1,500) and `YOUTUBE_CLOUD_DAILY_UNITS`
+Budget: `YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB` (default: the relay's budget) and `YOUTUBE_CLOUD_DAILY_UNITS`
 (default 9,000, under Google's 10,000 so the relay's own checks keep a margin), counted per
 Pacific day (YouTube's quota resets at midnight Pacific time); set them by hand in
 `relay.env` only after a quota increase. `YOUTUBE_CLOUD_DESKTOP_CLIENT_ID` defaults to the

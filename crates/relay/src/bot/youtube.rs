@@ -9,7 +9,7 @@
 //!   the desktop bot does on YouTube. Scope: `youtube.force-ssl` only (reading, posting and,
 //!   with the opt-in, moderating live chat all need it; `youtube.readonly` adds nothing).
 //! - **Quota**: every call spends the Google project's shared 10,000 units a day. The relay
-//!   counts each call's units per subscription (`YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB`, 1,500)
+//!   counts each call's units per subscription (`YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB`, 9,000)
 //!   and relay-wide (`YOUTUBE_CLOUD_DAILY_UNITS`, 9,000) per *Pacific* day (YouTube's quota
 //!   resets at midnight Pacific time), after the sign-in is at hand and before the call.
 //!   Live detection is `liveBroadcasts.list` (1 unit), slowing down while offline: every 2
@@ -79,8 +79,10 @@ const NONCE_PREFIX: &str = "ytbot.";
 /// The official desktop app's public Google client id (the releases' FERROCAST_YOUTUBE_CLIENT_ID).
 /// A relay for another build sets YOUTUBE_CLOUD_DESKTOP_CLIENT_ID.
 pub const DESKTOP_YOUTUBE_CLIENT_ID: &str = "701866487620-p0npjp4t20ivffdcn89s5jhro9vik5cl.apps.googleusercontent.com";
-/// Units a subscription may spend a (Pacific) day, unless set.
-pub const DEFAULT_UNITS_PER_SUB: i64 = 1_500;
+/// Units a subscription may spend a (Pacific) day, unless set: as much as the relay, so one
+/// streamer alone can read chat at full speed (about 1,800 units a live hour, since YouTube
+/// ends each stream after about 10 s); the fair share still splits it on busy days.
+pub const DEFAULT_UNITS_PER_SUB: i64 = 9_000;
 /// Units the whole relay may spend a day, unless set (Google gives a project 10,000).
 pub const DEFAULT_UNITS: i64 = 9_000;
 /// A subscription's fair share never goes below this many units a day.
@@ -125,13 +127,15 @@ pub const GIVE_UP_FOR: Duration = Duration::from_secs(60 * 60);
 pub(crate) const GOOGLE_OUT_KEY: &str = "yt_google_out";
 /// A `bot_seen` hint about YouTube counts for this long.
 pub const HINT_FRESH: Duration = Duration::from_secs(10 * 60);
-/// YouTube ends a chat stream now and then. One that brought chat lines is opened again at
-/// once from the last page token, so a line typed meanwhile is answered in about a second.
-/// Closes without a line wait, from [`REOPEN_MIN`] doubling up to [`REOPEN_MAX`] for each
-/// such close in a row, so a stream YouTube keeps ending can't spend the budget (each open
-/// is 5 units).
+/// YouTube ends a chat stream after about 10 s even while live, so a stream that answered
+/// (or stayed open a moment) is opened again at once from the last page token, and a line
+/// is answered in about a second. Only a stream that closes at once without a chat line (an
+/// error in disguise) waits, from [`REOPEN_MIN`] doubling up to [`REOPEN_MAX`] for each such
+/// close in a row (each open is 5 units).
 pub const REOPEN_MIN: Duration = Duration::from_secs(1);
 pub const REOPEN_MAX: Duration = Duration::from_secs(30);
+/// A stream that closed sooner than this without a chat line counts as an instant close.
+const QUICK_CLOSE: Duration = Duration::from_secs(2);
 /// Failed opens wait from this long, doubling (see [`fail_wait`]).
 pub const FAIL_WAIT_MIN: Duration = Duration::from_secs(30);
 /// After YouTube (or the budget) said no for the day, look again this often at most.
@@ -229,8 +233,9 @@ impl YoutubeConfig {
                 Some(v) => v.parse::<i64>().map_err(|_| format!("{k} must be a whole number")),
             }
         };
-        let per_sub = num("YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB", DEFAULT_UNITS_PER_SUB)?;
         let total = num("YOUTUBE_CLOUD_DAILY_UNITS", DEFAULT_UNITS)?;
+        // Unset: as much as the relay.
+        let per_sub = num("YOUTUBE_CLOUD_DAILY_UNITS_PER_SUB", total)?;
         let gap = num("YOUTUBE_CLOUD_TIMER_GAP_MIN", (TIMER_GAP.as_secs() / 60) as i64)?;
         cfg.with_desktop_client_id(desktop).with_units(per_sub, total)?.with_timer_gap_min(gap).map(Some)
     }
@@ -2066,7 +2071,7 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
             },
             Err(e) => Ended::Failed(e),
         };
-        let closed_empty = matches!(ended, Ended::Closed) && lines == 0;
+        let closed_empty = matches!(ended, Ended::Closed) && lines == 0 && opened.elapsed() < QUICK_CLOSE;
         let failed = match ended {
             Ended::Offline => {
                 read_note(st, sub, "chat_offline", "");
@@ -2156,7 +2161,7 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
             st.bot.yt(sub, |m| m.gave_up = Some(Instant::now()));
             return reader_done(st, sub, generation, Some(GIVE_UP_FOR));
         }
-        // A stream that brought lines opens again at once; closes without one back off.
+        // Opened again at once; only instant closes without a line back off.
         quick = if closed_empty { quick + 1 } else { 0 };
         let pause = if quick > 0 { reopen_wait(quick - 1) } else { Duration::ZERO };
         let wait = pause.max(if failed { fail_wait(streak) } else { Duration::ZERO });

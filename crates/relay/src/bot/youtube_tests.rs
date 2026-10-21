@@ -423,7 +423,7 @@ fn settings_are_checked_and_never_show_the_secret() {
             YoutubeConfig::from_values(Some(CLIENT.into()), Some("s".into())).unwrap().unwrap().units_per_sub,
             DEFAULT_UNITS
         ),
-        (1_500, 9_000)
+        (9_000, 9_000)
     );
     let t = GoogleTokens { access_token: "ya29.x".into(), refresh_token: "1//r".into(), scopes: vec![], expires_in: 1 };
     assert!(!format!("{t:?}").contains("ya29") && !format!("{t:?}").contains("1//r"));
