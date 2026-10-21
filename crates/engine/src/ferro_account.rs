@@ -112,7 +112,7 @@ impl Engine {
         self.inner.account_flow.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn account_token(&self) -> Result<Option<String>, EngineError> {
+    pub(crate) fn account_token(&self) -> Result<Option<String>, EngineError> {
         self.inner.secrets.get(SESSION).map_err(keychain)
     }
 
@@ -152,7 +152,7 @@ impl Engine {
     }
 
     /// Calls the relay's `/v1/account…` with the app session token.
-    async fn account_call(
+    pub(crate) async fn account_call(
         &self,
         token: &str,
         method: reqwest::Method,

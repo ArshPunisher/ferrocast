@@ -12,6 +12,9 @@ mod actions;
 mod backups;
 mod cloud_backup;
 mod cloud_bot;
+mod cloud_sync;
+#[cfg(test)]
+mod cloud_sync_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod designs;
 mod discord;
@@ -173,6 +176,8 @@ struct Inner {
     remote: remote::Remote,
     /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
     cloud_bot: cloud_bot::CloudBot,
+    /// Cloud sync and "Use cloud overlays" (docs/CLOUD.md §1.1): the switches and URLs.
+    cloud_sync: Mutex<cloud_sync::Mem>,
     /// Pro smart features: settings, the moderation queue and log, reply limits.
     smart: Mutex<smart::Smart>,
 }
@@ -299,6 +304,7 @@ impl Engine {
                 cloud_tts: Default::default(),
                 remote: Default::default(),
                 cloud_bot: Default::default(),
+                cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
             }),
         };
@@ -322,6 +328,7 @@ impl Engine {
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
+        tokio::spawn(cloud_sync::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
         Ok(engine)

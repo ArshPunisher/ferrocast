@@ -516,6 +516,7 @@ impl Engine {
         self.db(move |s| repo::rules::save(s, &saved)).await?;
         let rules = self.db(repo::rules::list).await?;
         self.state_mut().rules = rules;
+        self.cloud_changed();
         Ok(rule)
     }
 
@@ -525,6 +526,7 @@ impl Engine {
         self.db(move |s| repo::rules::delete(s, &rid)).await?;
         let rules = self.db(repo::rules::list).await?;
         self.state_mut().rules = rules;
+        self.cloud_changed();
         Ok(())
     }
 

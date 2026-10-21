@@ -30,7 +30,8 @@ impl Engine {
         OverlayView {
             id: o.id.clone(),
             name: o.name.clone(),
-            url: format!("{}/o/{}/", self.base_url(), o.token),
+            // "Use cloud overlays" (docs/CLOUD.md §1.1): the synced overlay's cloud URL.
+            url: self.cloud_url_for(&o.id).unwrap_or_else(|| format!("{}/o/{}/", self.base_url(), o.token)),
             width: o.width,
             height: o.height,
             widgets: o.widgets.clone(),
@@ -69,6 +70,7 @@ impl Engine {
 
     /// Sends an overlay's new layout to its open pages.
     pub(crate) fn push_config(&self, o: &Overlay) {
+        self.cloud_changed();
         let view = self.overlay_view(o);
         self.send_overlay(OverlayFrame::new(
             Audience::Overlay(o.id.clone()),

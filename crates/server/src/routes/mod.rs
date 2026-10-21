@@ -5,6 +5,7 @@ mod autoreplies;
 mod bot;
 mod cloud_backups;
 mod cloud_bot;
+mod cloud_sync;
 mod core;
 mod designs;
 mod discord;
@@ -169,6 +170,9 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/account/sign-out", post(pro::account_sign_out))
         .route("/pro/account/sessions", get(pro::account_sessions))
         .route("/pro/account/sessions/{id}", delete(pro::account_revoke))
+        // Cloud sync and "Use cloud overlays" (CLOUD.md §1.1): free, with the account.
+        .route("/pro/cloud", get(cloud_sync::status).put(cloud_sync::set))
+        .route("/pro/cloud/sync", post(cloud_sync::sync))
         .route("/pro/history", get(history::list))
         .route("/pro/history/export.csv", get(history::export))
         .route("/pro/history/samples", get(history::samples))
