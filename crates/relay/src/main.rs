@@ -119,6 +119,11 @@ async fn main() {
     };
     let smart_cap = ferrocast_relay::smart::daily_from_env();
     let smart = ferrocast_relay::smart::provider_from_env();
+    let smart_backup = ferrocast_relay::smart::backup_from_env();
+    let smart_backup_cap = ferrocast_relay::smart::backup_daily_from_env();
+    if let Some(b) = &smart_backup {
+        tracing::info!(backup = b.name(), daily_cap = smart_backup_cap, "the smart features have a backup");
+    }
     match &smart {
         Some(p) => tracing::info!(provider = p.name(), daily_cap = smart_cap, "Pro smart features are on"),
         None => tracing::warn!("CLOUDFLARE_AI_* / GEMINI_API_KEY not set: Pro smart features are off"),
@@ -138,6 +143,7 @@ async fn main() {
         .with_blobs(blobs)
         .with_tts(tts, tts_cap)
         .with_smart(smart, smart_cap)
+        .with_smart_backup(smart_backup, smart_backup_cap)
         .with_admin(admin);
     let remote_cfg = ferrocast_relay::remote::RemoteConfig::from_env();
     match (&remote_cfg.origin, remote_cfg.dashboard_dir.is_some()) {

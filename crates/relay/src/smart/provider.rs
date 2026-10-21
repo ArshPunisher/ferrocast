@@ -4,8 +4,8 @@
 //! - **Cloudflare Workers AI** (`CLOUDFLARE_AI_ACCOUNT_ID` + `CLOUDFLARE_AI_TOKEN`), the
 //!   default: its free allocation is 10,000 Neurons a day and, on the Workers Free plan, it
 //!   stops instead of billing. Cloudflare doesn't train on what it's sent.
-//! - **Google Gemini** (`GEMINI_API_KEY`), only if Cloudflare isn't set: the free tier of the
-//!   Gemini API. The key must come from a Google project **without billing** (a project with
+//! - **Google Gemini** (`GEMINI_API_KEY`): the backup once Cloudflare rests or is down, or the
+//!   provider when Cloudflare isn't set. The free tier of the Gemini API. The key must come from a Google project **without billing** (a project with
 //!   billing is charged), and on the free tier Google may use what it's sent to improve its
 //!   products, so viewers' chat goes to Google: Cloudflare is the better choice.
 //!

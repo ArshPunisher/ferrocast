@@ -16,11 +16,16 @@ struct World {
     base: String,
     db: Arc<Db>,
     fake: Arc<FakeSmart>,
+    backup: Arc<FakeSmart>,
     http: reqwest::Client,
     _dir: tempfile::TempDir,
 }
 
 async fn world_with(fake: Option<FakeSmart>, daily: i64) -> World {
+    world_backed(fake, daily, None, DEFAULT_BACKUP_DAILY_CALLS).await
+}
+
+async fn world_backed(fake: Option<FakeSmart>, daily: i64, backup: Option<FakeSmart>, backup_daily: i64) -> World {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("relay.db")).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,11 +41,14 @@ async fn world_with(fake: Option<FakeSmart>, daily: i64) -> World {
     let on = fake.is_some();
     let fake = Arc::new(fake.unwrap_or_default());
     let provider: Option<Arc<dyn SmartProvider>> = on.then(|| fake.clone() as Arc<dyn SmartProvider>);
-    let state = AppState::new(cfg, db).with_smart(provider, daily);
+    let backed = backup.is_some();
+    let backup = Arc::new(backup.unwrap_or_default());
+    let second: Option<Arc<dyn SmartProvider>> = backed.then(|| backup.clone() as Arc<dyn SmartProvider>);
+    let state = AppState::new(cfg, db).with_smart(provider, daily).with_smart_backup(second, backup_daily);
     let db = state.db.clone();
     let app = router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
     tokio::spawn(async move { axum::serve(l, app).await });
-    World { base, db, fake, http: reqwest::Client::new(), _dir: dir }
+    World { base, db, fake, backup, http: reqwest::Client::new(), _dir: dir }
 }
 
 async fn world(answer: &str) -> World {
@@ -321,4 +329,53 @@ fn the_daily_cap_setting_is_bounded() {
     assert_eq!(parse_daily(Some("99999")), MAX_DAILY_CALLS);
     assert_eq!(parse_daily(Some("-3")), DEFAULT_DAILY_CALLS);
     assert_eq!(parse_daily(Some("0")), 0);
+}
+
+#[tokio::test]
+async fn the_backup_answers_once_the_provider_rests() {
+    let w = world_backed(Some(FakeSmart::answering("ok")), 100, Some(FakeSmart::answering("ok")), 100).await;
+    let auth = w.pro("p", "sub_1");
+    w.fake.then(Err(SmartError::Quota));
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200, "the backup answered");
+    assert_eq!(w.backup.calls().len(), 1);
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200);
+    assert_eq!((w.fake.calls().len(), w.backup.calls().len()), (1, 2), "the provider rests until midnight");
+    let (_, v) = w.send(reqwest::Method::GET, "/v1/pro/smart", Some(&auth), None).await;
+    assert_eq!(v["resting"].as_bool(), Some(false), "{v}");
+}
+
+#[tokio::test]
+async fn the_backup_takes_over_at_the_cap_and_rests_at_its_own() {
+    let w = world_backed(Some(FakeSmart::answering("ok")), 1, Some(FakeSmart::answering("ok")), 1).await;
+    let auth = w.pro("p", "sub_1");
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200);
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200);
+    assert_eq!((w.fake.calls().len(), w.backup.calls().len()), (1, 1));
+    let (s, v) = w.post("/v1/pro/smart/reply", &auth, reply_body()).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (503, Some("smart_resting")), "{v}");
+    assert_eq!((w.fake.calls().len(), w.backup.calls().len()), (1, 1), "never past either cap");
+    assert_eq!(w.db.quota_used("sub_1", REPLIES.name, Period::Day).unwrap(), 2, "the refused call is given back");
+}
+
+#[tokio::test]
+async fn a_provider_that_is_down_falls_back_without_resting() {
+    let w = world_backed(Some(FakeSmart::answering("ok")), 100, Some(FakeSmart::answering("ok")), 100).await;
+    let auth = w.pro("p", "sub_1");
+    w.fake.then(Err(SmartError::Unavailable("down".into())));
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200);
+    assert_eq!(w.post("/v1/pro/smart/reply", &auth, reply_body()).await.0, 200);
+    assert_eq!((w.fake.calls().len(), w.backup.calls().len()), (2, 1), "asked again next time");
+    w.fake.then(Err(SmartError::Unavailable("down".into())));
+    w.backup.then(Err(SmartError::Unavailable("down too".into())));
+    let (s, v) = w.post("/v1/pro/smart/reply", &auth, reply_body()).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (502, Some("smart_unavailable")), "{v}");
+}
+
+#[test]
+fn the_backup_cap_reads_with_its_own_default() {
+    assert_eq!(parse_backup_daily(None), DEFAULT_BACKUP_DAILY_CALLS);
+    assert_eq!(parse_backup_daily(Some("abc")), DEFAULT_BACKUP_DAILY_CALLS);
+    assert_eq!(parse_backup_daily(Some("-1")), DEFAULT_BACKUP_DAILY_CALLS);
+    assert_eq!(parse_backup_daily(Some("2_000")), MAX_DAILY_CALLS);
+    assert_eq!(parse_backup_daily(Some(" 300 ")), 300);
 }

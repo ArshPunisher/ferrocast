@@ -14,7 +14,10 @@
 //! - relay-wide: `SMART_DAILY_CALLS` model calls a UTC day (default [`DEFAULT_DAILY_CALLS`],
 //!   never above [`MAX_DAILY_CALLS`]) and [`GLOBAL_PER_MINUTE`] a minute. Once the day's
 //!   calls are used, or the provider says its free allowance is, nothing is asked of it
-//!   until midnight UTC (503 `smart_resting`).
+//!   until midnight UTC.
+//! - **A backup**: with both Cloudflare and Gemini set, Gemini answers once Cloudflare rests
+//!   (or is down), up to `SMART_BACKUP_DAILY_CALLS` a UTC day (default
+//!   [`DEFAULT_BACKUP_DAILY_CALLS`]). Only when both rest does a call get 503 `smart_resting`.
 //! - Each call's input and answer are bounded (message count and length, `max_tokens`).
 //!
 //! Stored: those counters only. Never the messages, the facts, the questions or the answers
@@ -57,6 +60,9 @@ pub const SUB_RATE: Limit = Limit { name: "smart_requests", period: Period::Minu
 pub const DEFAULT_DAILY_CALLS: i64 = 140;
 /// The setting can't go above this (Gemini's free tier allows about 1,000 a day).
 pub const MAX_DAILY_CALLS: i64 = 1_000;
+/// Backup calls a UTC day when `SMART_BACKUP_DAILY_CALLS` is unset: half of Gemini's free
+/// tier (about 1,000 a day), so the free allowance never runs out under us.
+pub const DEFAULT_BACKUP_DAILY_CALLS: i64 = 500;
 /// Relay-wide calls a minute (under the free tiers' own rate limits).
 pub const GLOBAL_PER_MINUTE: u32 = 12;
 /// Messages in one moderation check, and the longest one sent.
@@ -71,6 +77,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(14);
 /// The relay-wide day counter's owner in `quota_usage`.
 const RELAY_KEY: &str = "*smart";
 const RELAY_CALLS: &str = "smart_calls";
+const BACKUP_CALLS: &str = "smart_backup_calls";
 
 /// The provider and the relay-wide limits.
 #[derive(Debug)]
@@ -81,6 +88,10 @@ pub(crate) struct Runtime {
     minute: Mutex<(i64, u32)>,
     /// No call until then (ms): the provider said its free allowance is used up.
     resting_until: AtomicI64,
+    /// Asked when the provider rests or is down (Gemini behind Cloudflare), and its own day.
+    backup: Option<Arc<dyn SmartProvider>>,
+    backup_daily: i64,
+    backup_resting_until: AtomicI64,
 }
 
 impl Default for Runtime {
@@ -90,6 +101,9 @@ impl Default for Runtime {
             daily: DEFAULT_DAILY_CALLS,
             minute: Mutex::new((0, 0)),
             resting_until: AtomicI64::new(0),
+            backup: None,
+            backup_daily: DEFAULT_BACKUP_DAILY_CALLS,
+            backup_resting_until: AtomicI64::new(0),
         }
     }
 }
@@ -97,6 +111,12 @@ impl Default for Runtime {
 impl Runtime {
     pub(crate) fn new(provider: Option<Arc<dyn SmartProvider>>, daily: i64) -> Runtime {
         Runtime { provider, daily: daily.clamp(0, MAX_DAILY_CALLS), ..Runtime::default() }
+    }
+
+    /// Adds the provider asked once the first one rests or is down.
+    pub(crate) fn set_backup(&mut self, backup: Option<Arc<dyn SmartProvider>>, daily: i64) {
+        self.backup = backup;
+        self.backup_daily = daily.clamp(0, MAX_DAILY_CALLS);
     }
 
     fn take_minute(&self, now: i64) -> bool {
@@ -112,8 +132,25 @@ impl Runtime {
         true
     }
 
+    /// Nothing can answer until midnight UTC: the provider rests, and the backup (if any) too.
     fn resting(&self, now: i64) -> bool {
+        self.primary_resting(now) && (self.backup.is_none() || self.backup_resting(now))
+    }
+
+    fn primary_resting(&self, now: i64) -> bool {
         now < self.resting_until.load(Ordering::Relaxed)
+    }
+
+    fn backup_resting(&self, now: i64) -> bool {
+        now < self.backup_resting_until.load(Ordering::Relaxed)
+    }
+
+    /// Which one answers now (`GET /v1/pro/smart`).
+    fn answering(&self, now: i64) -> Option<&'static str> {
+        match &self.backup {
+            Some(b) if self.primary_resting(now) => Some(b.name()),
+            _ => self.provider.as_ref().map(|p| p.name()),
+        }
     }
 
     fn rest_until(&self, until: i64) {
@@ -130,25 +167,45 @@ pub fn provider_from_env() -> Option<Arc<dyn SmartProvider>> {
     Gemini::from_env().map(|g| Arc::new(g) as Arc<dyn SmartProvider>)
 }
 
+/// The backup: Gemini, when Cloudflare is the provider and a Gemini key is set too.
+pub fn backup_from_env() -> Option<Arc<dyn SmartProvider>> {
+    Cloudflare::from_env()?;
+    Gemini::from_env().map(|g| Arc::new(g) as Arc<dyn SmartProvider>)
+}
+
+/// `SMART_BACKUP_DAILY_CALLS`, read like `SMART_DAILY_CALLS` with its own default.
+pub fn backup_daily_from_env() -> i64 {
+    parse_backup_daily(std::env::var("SMART_BACKUP_DAILY_CALLS").ok().as_deref())
+}
+
+pub(crate) fn parse_backup_daily(raw: Option<&str>) -> i64 {
+    parse_cap("SMART_BACKUP_DAILY_CALLS", raw, DEFAULT_BACKUP_DAILY_CALLS)
+}
+
 /// `SMART_DAILY_CALLS`: unset or unreadable is the default; above the ceiling is brought down.
 pub fn daily_from_env() -> i64 {
     parse_daily(std::env::var("SMART_DAILY_CALLS").ok().as_deref())
 }
 
 pub(crate) fn parse_daily(raw: Option<&str>) -> i64 {
+    parse_cap("SMART_DAILY_CALLS", raw, DEFAULT_DAILY_CALLS)
+}
+
+/// A daily call cap setting: unset or unreadable is `default`; above the ceiling is brought down.
+fn parse_cap(name: &str, raw: Option<&str>, default: i64) -> i64 {
     let v = raw.unwrap_or("").trim().replace(['_', ','], "");
     if v.is_empty() {
-        return DEFAULT_DAILY_CALLS;
+        return default;
     }
     match v.parse::<i64>() {
         Ok(n) if (0..=MAX_DAILY_CALLS).contains(&n) => n,
         Ok(n) if n > MAX_DAILY_CALLS => {
-            tracing::warn!(set = n, used = MAX_DAILY_CALLS, "SMART_DAILY_CALLS is above the ceiling");
+            tracing::warn!(setting = name, set = n, used = MAX_DAILY_CALLS, "a smart call cap is above the ceiling");
             MAX_DAILY_CALLS
         }
         _ => {
-            tracing::warn!("SMART_DAILY_CALLS isn't a whole number from 0 up; using the default");
-            DEFAULT_DAILY_CALLS
+            tracing::warn!(setting = name, "a smart call cap isn't a whole number from 0 up; using the default");
+            default
         }
     }
 }
@@ -176,6 +233,9 @@ pub(crate) fn admin_view(st: &AppState) -> Value {
         "provider": st.smart.provider.as_ref().map(|p| p.name()),
         "calls_today": st.db.quota_used(RELAY_KEY, RELAY_CALLS, Period::Day).unwrap_or(0),
         "daily_cap": st.smart.daily,
+        "backup": st.smart.backup.as_ref().map(|p| p.name()),
+        "backup_calls_today": st.db.quota_used(RELAY_KEY, BACKUP_CALLS, Period::Day).unwrap_or(0),
+        "backup_daily_cap": st.smart.backup_daily,
         "resting": st.smart.resting(now),
         "resets_at": Period::Day.reset_at(now),
     })
@@ -310,37 +370,75 @@ async fn call(
         give_back();
         return Err(busy(now));
     }
-    match st.db.try_take(RELAY_KEY, RELAY_CALLS, Period::Day, 1, st.smart.daily) {
+    let reset = Period::Day.reset_at(now);
+    let backup = st.smart.backup.clone();
+    if !st.smart.primary_resting(now) {
+        match st.db.try_take(RELAY_KEY, RELAY_CALLS, Period::Day, 1, st.smart.daily) {
+            Ok(()) => match ask(provider, prompt).await {
+                Ok(text) => return Ok(text),
+                Err(SmartError::Quota) => st.smart.rest_until(reset),
+                Err(SmartError::Unavailable(_)) if backup.is_none() => {
+                    give_back();
+                    return Err(unavailable());
+                }
+                Err(SmartError::Unavailable(_)) => {}
+            },
+            Err(TakeErr::Over(_)) => {
+                st.smart.rest_until(reset);
+                tracing::warn!("the relay-wide smart call cap is reached: the provider isn't asked until 00:00 UTC");
+            }
+            Err(TakeErr::Db(e)) => {
+                give_back();
+                return Err(ApiError::db(e));
+            }
+        }
+    }
+    // The provider rests (or was down just now): the backup answers, within its own day.
+    let Some(backup) = backup else {
+        give_back();
+        return Err(resting(now));
+    };
+    if st.smart.backup_resting(now) {
+        give_back();
+        return Err(if st.smart.primary_resting(now) { resting(now) } else { unavailable() });
+    }
+    match st.db.try_take(RELAY_KEY, BACKUP_CALLS, Period::Day, 1, st.smart.backup_daily) {
         Ok(()) => {}
         Err(TakeErr::Over(_)) => {
             give_back();
-            st.smart.rest_until(Period::Day.reset_at(now));
-            tracing::warn!("the relay-wide smart call cap is reached: the model isn't asked until 00:00 UTC");
-            return Err(resting(now));
+            st.smart.backup_resting_until.fetch_max(reset, Ordering::Relaxed);
+            tracing::warn!("the backup's smart call cap is reached: it rests until 00:00 UTC");
+            return Err(if st.smart.primary_resting(now) { resting(now) } else { unavailable() });
         }
         Err(TakeErr::Db(e)) => {
             give_back();
             return Err(ApiError::db(e));
         }
     }
+    match ask(backup.as_ref(), prompt).await {
+        Ok(text) => Ok(text),
+        Err(SmartError::Quota) => {
+            give_back();
+            st.smart.backup_resting_until.fetch_max(reset, Ordering::Relaxed);
+            Err(if st.smart.primary_resting(now) { resting(now) } else { unavailable() })
+        }
+        Err(SmartError::Unavailable(_)) => {
+            give_back();
+            Err(unavailable())
+        }
+    }
+}
+
+/// One model call with the time limit; failures are logged without any of the text.
+async fn ask(provider: &dyn SmartProvider, prompt: &Prompt) -> Result<String, SmartError> {
     let result = match tokio::time::timeout(CALL_TIMEOUT, provider.complete(prompt)).await {
         Ok(r) => r,
         Err(_) => Err(SmartError::Unavailable("timed out".into())),
     };
-    match result {
-        Ok(text) => Ok(text),
-        Err(e) => {
-            give_back();
-            tracing::warn!(error = %e, provider = provider.name(), "the smart provider failed");
-            match e {
-                SmartError::Quota => {
-                    st.smart.rest_until(Period::Day.reset_at(now));
-                    Err(resting(now))
-                }
-                SmartError::Unavailable(_) => Err(unavailable()),
-            }
-        }
+    if let Err(e) = &result {
+        tracing::warn!(error = %e, provider = provider.name(), "the smart provider failed");
     }
+    result
 }
 
 fn no_store(v: Value) -> Response {
@@ -359,7 +457,7 @@ async fn status(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
         quotas.insert(l.name.into(), json!(st.db.usage(&ctx.sub_id, l).map_err(ApiError::db)?));
     }
     Ok(no_store(json!({
-        "provider": provider.name(),
+        "provider": st.smart.answering(now_ms()).unwrap_or(provider.name()),
         "resting": st.smart.resting(now_ms()),
         "max_messages": MAX_MESSAGES,
         "quotas": quotas,

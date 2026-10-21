@@ -197,6 +197,17 @@ impl AppState {
         self
     }
 
+    /// The smart features' backup (`smart::backup_from_env()`), asked once the provider rests
+    /// or is down, with its own daily call cap (`smart::backup_daily_from_env()`). Call after
+    /// `with_smart`.
+    pub fn with_smart_backup(mut self, backup: Option<Arc<dyn smart::SmartProvider>>, daily_calls: i64) -> AppState {
+        match Arc::get_mut(&mut self.smart) {
+            Some(rt) => rt.set_backup(backup, daily_calls),
+            None => tracing::error!("the smart backup must be set before the state is shared"),
+        }
+        self
+    }
+
     /// The dashboard from anywhere (`remote::RemoteConfig::from_env()` in production).
     pub fn with_remote(mut self, cfg: remote::RemoteConfig) -> AppState {
         self.remote = Arc::new(remote::Runtime::new(cfg));
