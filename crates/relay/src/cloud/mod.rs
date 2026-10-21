@@ -30,6 +30,8 @@ pub(crate) mod ingest;
 mod live;
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod load_tests;
 pub(crate) mod media;
 pub(crate) mod overlay;
 pub(crate) mod store;

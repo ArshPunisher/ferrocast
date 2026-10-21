@@ -1472,7 +1472,7 @@ async fn backup(api: Api, s: Sub, delay: Duration, bytes: usize, stop: Arc<Atomi
 }
 
 /// `ps` for the child: RSS in KB and CPU time in seconds.
-fn ps(pid: u32) -> Option<(u64, f64)> {
+pub(crate) fn ps(pid: u32) -> Option<(u64, f64)> {
     let out =
         std::process::Command::new("ps").args(["-o", "rss=", "-o", "time=", "-p", &pid.to_string()]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
