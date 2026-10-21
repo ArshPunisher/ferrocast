@@ -540,3 +540,20 @@ async fn the_designers_test_uses_its_design_and_chat_waits_for_a_viewer() {
     let (_, lines) = w.web(&u, Method::GET, "/c/api/v1/chat", None).await;
     assert_eq!(lines, json!([]));
 }
+
+#[tokio::test]
+async fn the_editors_lists_and_a_status_before_turning_on() {
+    let w = world().await;
+    let off = w.user("off@example.com");
+    let (s, v) = w.web(&off, Method::GET, "/c/api/v1/status", None).await;
+    assert_eq!((s, v["cloud"].as_bool()), (200, Some(true)));
+    let u = w.cloud_user("a@example.com").await;
+    let (s, v) = w.web(&u, Method::GET, "/c/api/v1/themes", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v.as_array().unwrap().len(), 5);
+    assert_eq!(v[0]["id"], "molten");
+    let (_, v) = w.web(&u, Method::GET, "/c/api/v1/goals", None).await;
+    assert_eq!(v, json!([]));
+    let (s, v) = w.web(&u, Method::POST, "/c/api/v1/queue/nope/remove", None).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
