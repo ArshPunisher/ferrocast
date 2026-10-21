@@ -46,6 +46,55 @@ pub(super) struct World {
     pub state: AppState,
     pub db: Arc<Db>,
     pub _dir: tempfile::TempDir,
+    /// Twitch, Kick's bot client and Kick's web API (sign-in, users, event subscriptions).
+    pub tw: Arc<crate::bot::tests::FakeTwitch>,
+    pub kk: Arc<crate::bot::tests::FakeKick>,
+    pub kick_web: Arc<KickWeb>,
+}
+
+/// What the fake Kick web API was asked: event subscriptions made (body) and deleted (ids).
+#[derive(Debug, Default)]
+pub(super) struct KickWeb {
+    pub subscribed: std::sync::Mutex<Vec<Value>>,
+    pub deleted: std::sync::Mutex<Vec<String>>,
+}
+
+/// The Kick channel the fake Kick signs in as.
+pub(super) const KICK_CHANNEL: &str = "668";
+
+async fn fake_kick(calls: Arc<KickWeb>) -> String {
+    use axum::routing::{get, post};
+    let (c1, c2) = (calls.clone(), calls);
+    let app = axum::Router::new()
+        .route(
+            "/oauth/token",
+            post(|| async {
+                axum::Json(json!({ "access_token": "kick-at", "refresh_token": "kick-rt", "expires_in": 3600 }))
+            }),
+        )
+        .route(
+            "/public/v1/users",
+            get(|| async {
+                axum::Json(json!({ "data": [{ "user_id": 668, "name": "asha_kick", "profile_picture": "https://kick.test/a.png" }] }))
+            }),
+        )
+        .route(
+            "/public/v1/events/subscriptions",
+            post(move |axum::Json(b): axum::Json<Value>| async move {
+                let n = b["events"].as_array().map_or(0, Vec::len);
+                c1.subscribed.lock().unwrap().push(b);
+                let data: Vec<Value> = (0..n).map(|i| json!({ "subscription_id": format!("ks-{i}") })).collect();
+                axum::Json(json!({ "data": data }))
+            })
+            .delete(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                c2.deleted.lock().unwrap().push(q.get("id").cloned().unwrap_or_default());
+                axum::http::StatusCode::NO_CONTENT
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    base
 }
 
 /// A signed-in browser (cookie + CSRF) and the same account's app session.
@@ -65,16 +114,27 @@ pub(super) async fn world_with(keyed: bool) -> World {
     let db = Db::open(&dir.path().join("relay.db")).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
+    let kick_web = Arc::new(KickWeb::default());
+    let kick_base = fake_kick(kick_web.clone()).await;
     let cfg = Config {
         public_url: base.clone(),
         tip_url: None,
-        kick_client_id: None,
-        kick_client_secret: None,
-        kick_id_url: base.clone(),
-        kick_api_url: base.clone(),
+        kick_client_id: Some("kick-client".into()),
+        kick_client_secret: Some("kick-secret".into()),
+        kick_id_url: kick_base.clone(),
+        kick_api_url: kick_base,
     };
     let s = secret();
+    let tw = Arc::new(crate::bot::tests::FakeTwitch::default());
+    let kk = Arc::new(crate::bot::tests::FakeKick::default());
+    let bot = crate::bot::Runtime::new(
+        Some(crate::bot::tests::twitch_cfg()),
+        Some(tw.clone() as Arc<dyn crate::bot::TwitchCloud>),
+        Some(kk.clone() as Arc<dyn crate::bot::KickBot>),
+    );
     let state = AppState::new(cfg, db)
+        .with_vault(Some(crate::bot::tests::vault()))
+        .with_bot(bot)
         .with_remote(RemoteConfig::new(Some(&base), Some(b"test pepper, at least sixteen bytes"), None))
         .with_cloud(CloudConfig::new(Some("http://overlays.test"), None, keyed.then_some(s.as_slice())));
     state.cloud.set_builtins(catalogue());
@@ -82,7 +142,7 @@ pub(super) async fn world_with(keyed: bool) -> World {
     let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     tokio::spawn(async move { axum::serve(l, app).await });
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    World { base, http, state, db, _dir: dir }
+    World { base, http, state, db, _dir: dir, tw, kk, kick_web }
 }
 
 impl World {
