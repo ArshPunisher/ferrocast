@@ -141,3 +141,45 @@ pub fn map(m: &LiveChatMessage, at: Millis) -> Option<Event> {
     };
     Some(Event::live(Platform::Youtube, source, at, kind))
 }
+
+/// A message's `publishedAt` (RFC 3339, `Z` or `+00:00`, YouTube's form) → Unix ms.
+pub fn published_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, sec) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut ms = 0;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits: String = frac.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        ms = format!("{:0<3}", &digits[..digits.len().min(3)]).parse::<i64>().ok()?;
+        rest = &frac[digits.len()..];
+    }
+    let offset_min = match rest {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) && o.as_bytes()[3] == b':' => {
+            let hh = o.get(1..3)?.parse::<i64>().ok()?;
+            let mm = o.get(4..6)?.parse::<i64>().ok()?;
+            let m = hh * 60 + mm;
+            if o.starts_with('-') { -m } else { m }
+        }
+        _ => return None,
+    };
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + h * 3_600 + mi * 60 + sec - offset_min * 60) * 1000 + ms)
+}

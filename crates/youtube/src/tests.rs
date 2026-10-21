@@ -478,3 +478,98 @@ async fn a_stream_on_a_dead_connection_ends_through_keepalive_instead_of_hanging
         (Duration::from_secs(30), Duration::from_secs(10))
     );
 }
+
+// ---------------------------------------------------------------- the relay's feed: history
+
+/// The first answer holds an old line, one with no time, and one published after the stream
+/// opened; the next answer one more.
+struct TimedChat;
+
+fn at(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // civil from days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}+00:00",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60,
+        ms.rem_euclid(1000)
+    )
+}
+
+fn text_at(id: &str, t: &str, published: Option<String>) -> LiveChatMessage {
+    let mut m = text(id, t);
+    if let Some(s) = m.snippet.as_mut() {
+        s.published_at = published;
+    }
+    m
+}
+
+#[tonic::async_trait]
+impl V3DataLiveChatMessageService for TimedChat {
+    type StreamListStream = tokio_stream::wrappers::ReceiverStream<Result<LiveChatMessageListResponse, Status>>;
+
+    async fn stream_list(
+        &self,
+        _req: Request<LiveChatMessageListRequest>,
+    ) -> Result<Response<Self::StreamListStream>, Status> {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let now = now_ms();
+            let first = vec![
+                text_at("old", "from before", Some(at(now - 60_000))),
+                text_at("untimed", "no time", None),
+                text_at("fresh", "!ferrocast", Some(at(now + 1_000))),
+            ];
+            let _ = tx.send(Ok(page(first, "p1", false))).await;
+            let _ = tx.send(Ok(page(vec![text_at("later", "hi", Some(at(now + 2_000)))], "p2", false))).await;
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+}
+
+#[test]
+fn published_times_parse_with_offsets() {
+    assert_eq!(map::published_ms("1970-01-01T00:00:01Z"), Some(1_000));
+    assert_eq!(map::published_ms("1970-01-01T01:00:00.250+01:00"), Some(250));
+    assert_eq!(map::published_ms("2026-10-21T13:02:11.123456+00:00"), map::published_ms("2026-10-21T13:02:11.123Z"));
+    assert_eq!(map::published_ms(&at(1_761_051_731_123)), Some(1_761_051_731_123));
+    assert_eq!(map::published_ms("yesterday"), None);
+}
+
+#[tokio::test]
+async fn only_lines_from_before_the_stream_opened_are_history() {
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = grpc.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(V3DataLiveChatMessageServiceServer::new(TimedChat))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
+            .await
+    });
+    let mut feed = crate::feed::open(&format!("http://{addr}"), "access-0", "chat-1", None).await.unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let b = feed.next().await.unwrap().unwrap();
+        seen.extend(b.events.into_iter().map(|e| (e.source_id.unwrap(), e.origin)));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("old".into(), Origin::Backfill),
+            ("untimed".into(), Origin::Backfill),
+            ("fresh".into(), Origin::Live),
+            ("later".into(), Origin::Live),
+        ]
+    );
+}

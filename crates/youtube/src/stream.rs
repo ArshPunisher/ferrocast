@@ -146,6 +146,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
         if let Ok(v) = format!("Bearer {token}").parse() {
             req.metadata_mut().insert("authorization", v);
         }
+        let opened_at = now_ms();
         let mut stream = match client.stream_list(req).await {
             Ok(r) => r.into_inner(),
             Err(status) => match status.code() {
@@ -169,8 +170,14 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                     }
                     for item in &resp.items {
                         if let Some(mut e) = map::map(item, Millis(now_ms())) {
-                            // The first answer replays recent chat; it's history, not new.
-                            if first_batch {
+                            // The first answer replays recent chat; it's history, not new
+                            // (a line published after the stream opened is new even there).
+                            let published = item
+                                .snippet
+                                .as_ref()
+                                .and_then(|s| s.published_at.as_deref())
+                                .and_then(map::published_ms);
+                            if first_batch && published.is_none_or(|p| p < opened_at - crate::feed::BACKFILL_SLACK_MS) {
                                 e.origin = Origin::Backfill;
                             }
                             if sink.send(e).await.is_err() {

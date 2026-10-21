@@ -42,7 +42,13 @@ pub struct Batch {
 pub struct Feed {
     inner: tonic::Streaming<LiveChatMessageListResponse>,
     first: bool,
+    /// When the stream opened (ms): in the first answer, only lines published before it are
+    /// history.
+    opened_at: i64,
 }
+
+/// Lines published this little before the stream opened still count as new (clocks differ).
+pub const BACKFILL_SLACK_MS: i64 = 5_000;
 
 /// HTTP/2 pings every 30 s, a connection that doesn't answer one in 10 s is dropped (also
 /// while no call is open), so a silently dead stream ends instead of hanging.
@@ -68,6 +74,10 @@ async fn channel(url: &str, keepalive: (Duration, Duration)) -> Result<Channel, 
 }
 
 fn status_err(status: &tonic::Status) -> FeedError {
+    if matches!(status.code(), Code::NotFound | Code::FailedPrecondition) {
+        // Rare, and the one answer that stops reading: say what YouTube said.
+        tracing::info!(code = ?status.code(), message = %status.message(), "YouTube ended the live chat stream");
+    }
     match status.code() {
         Code::Unauthenticated => FeedError::SignInNeeded,
         Code::ResourceExhausted => FeedError::Quota,
@@ -112,8 +122,9 @@ pub(crate) async fn open_tuned(
     });
     let auth = format!("Bearer {access_token}").parse().map_err(|_| FeedError::SignInNeeded)?;
     req.metadata_mut().insert("authorization", auth);
+    let opened_at = now_ms();
     match client.stream_list(req).await {
-        Ok(r) => Ok(Feed { inner: r.into_inner(), first }),
+        Ok(r) => Ok(Feed { inner: r.into_inner(), first, opened_at }),
         Err(status) => Err(status_err(&status)),
     }
 }
@@ -124,18 +135,24 @@ impl Feed {
     pub async fn next(&mut self) -> Result<Option<Batch>, FeedError> {
         match self.inner.message().await {
             Ok(Some(resp)) => {
-                let backfill = std::mem::replace(&mut self.first, false);
+                let first = std::mem::replace(&mut self.first, false);
+                let cutoff = self.opened_at - BACKFILL_SLACK_MS;
                 let events = resp
                     .items
                     .iter()
-                    .filter_map(|item| map::map(item, Millis(now_ms())))
-                    .map(|mut e| {
-                        if backfill {
+                    .filter_map(|item| {
+                        let mut e = map::map(item, Millis(now_ms()))?;
+                        // The first answer replays recent chat: history, not new. A line
+                        // published after the stream opened is new even there (YouTube may
+                        // put fresh lines in it), so it alerts and gets answered.
+                        let published =
+                            item.snippet.as_ref().and_then(|s| s.published_at.as_deref()).and_then(map::published_ms);
+                        if first && published.is_none_or(|p| p < cutoff) {
                             e.origin = Origin::Backfill;
                         }
-                        e
+                        Some(e)
                     })
-                    .collect();
+                    .collect::<Vec<Event>>();
                 Ok(Some(Batch {
                     events,
                     next_page_token: resp.next_page_token.clone().filter(|t| !t.is_empty()),
