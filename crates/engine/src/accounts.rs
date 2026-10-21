@@ -15,6 +15,9 @@ use serde::Serialize;
 use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
+/// The key of the notice [`Engine::browser_didnt_open`] sends.
+pub const BROWSER_NOTICE: &str = "browser";
+
 const TWITCH_TOKENS: &str = "twitch-tokens";
 const YOUTUBE_TOKENS: &str = "youtube-tokens";
 /// How long the browser sign-in for YouTube may take.
@@ -404,6 +407,17 @@ impl Engine {
         if let Some(w) = self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             w.notify_one();
         }
+    }
+
+    /// The desktop app couldn't hand a page (a sign-in page, a checkout) to the default
+    /// browser. Every screen shows it; the connect dialog also offers its link to copy, so
+    /// the person isn't left waiting for a browser that never opens.
+    pub fn browser_didnt_open(&self) {
+        self.notice(
+            BROWSER_NOTICE,
+            NoticeLevel::Warn,
+            "Ferrocast couldn't open your browser. Try again in a moment, or open your browser first.",
+        );
     }
 
     /// One line on the dashboard. Notices with the same `key` replace each other there.

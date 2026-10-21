@@ -70,7 +70,7 @@ use ferrocast_core::queue::AlertQueue;
 use ferrocast_store::{Store, StoreError, repo};
 use tokio::sync::{Notify, broadcast, mpsc};
 
-pub use accounts::{ConnectFlow, PlatformApps};
+pub use accounts::{BROWSER_NOTICE, ConnectFlow, PlatformApps};
 pub use actions::TestOptions;
 pub use discord::{DiscordFailure, DiscordView};
 pub use error::EngineError;

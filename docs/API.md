@@ -747,7 +747,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `status { connectors }`
 - `queue Queue`
 - `tts_pending [...]`
-- `notice { key?, level: "info" | "warn" | "error", message, action?: { label, href } }`. A notice replaces the shown one with the same `key` (one line per subject, never a stack): `panic`, `account:twitch` / `account:youtube` / `account:kick`, `discord`, `update`, `no-chat`, `alerts-folded` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
+- `notice { key?, level: "info" | "warn" | "error", message, action?: { label, href } }`. A notice replaces the shown one with the same `key` (one line per subject, never a stack): `panic`, `account:twitch` / `account:youtube` / `account:kick`, `browser` (desktop app only: it couldn't hand a page, such as a sign-in page, to the default browser), `discord`, `update`, `no-chat`, `alerts-folded` (one with `action: { label: "Reconnect", href: "#/settings/accounts" }` when a platform goes to `sign_in_needed` or `scopes_missing`)
 - `goals Goal[]` (after any goal change)
 - `held { event_id, reason }` (the chat filter held a message for a mod; its `event` frame comes first and it never reaches overlays)
 - `held_resolved { event_id, outcome: "released" | "dropped" }` (a mod approved or removed a held message, from any dashboard; it has its own seq, so a reconnecting dashboard replays it even with a `since` from after the `held` mark)

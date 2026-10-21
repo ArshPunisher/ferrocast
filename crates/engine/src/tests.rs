@@ -1733,3 +1733,22 @@ async fn disconnecting_an_account_tells_open_dashboards() {
     .unwrap_or(false);
     assert!(told, "a status frame says Twitch is off");
 }
+
+#[tokio::test]
+async fn a_browser_that_didnt_open_reaches_the_dashboard() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    e.browser_didnt_open();
+    let mut notices = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "notice" {
+            notices.push(v["data"].clone());
+        }
+    }
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["key"], crate::BROWSER_NOTICE);
+    assert_eq!(notices[0]["level"], "warn");
+    let message = notices[0]["message"].as_str().unwrap();
+    assert!(message.contains("couldn't open your browser") && message.contains("Try again"), "{message}");
+}
