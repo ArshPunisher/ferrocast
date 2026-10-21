@@ -98,28 +98,40 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'RELAY_TIP_URL=https://tip.clearcraftlabs.com\n'
   printf 'RELAY_REMOTE_URL=https://remote.clearcraftlabs.com\n'
   printf 'RELAY_DASHBOARD_DIR=/dashboard/current\n'
+  printf 'RELAY_OVERLAYS_DIR=/overlays/current\n'
   printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'
 } | ssh "$host" "sudo sh -c 'umask 077 && cat > $dir/relay.env.new &&
     { grep -E \"^(RAZORPAY_[A-Z_]+|PRO_SALES_OPEN|PRO_EMAIL_KEY|RELAY_VAULT_KEY|RELAY_REMOTE_PEPPER|GOOGLE_TTS_KEY|TTS_GLOBAL_MONTHLY_CHARS|DISCORD_[A-Z_]+|BREVO_API_KEY|MAIL_FROM|MAIL_TOKEN_KEY|MAIL_DAILY_BUDGET|TWITCH_CLOUD_[A-Z_]+|YOUTUBE_CLOUD_[A-Z_]+|CF_SAAS_TOKEN|CF_ZONE_ID|RELAY_ADMIN_TOKEN|RELAY_GOOGLE_CLIENT_ID|RELAY_GOOGLE_CLIENT_SECRET|RELAY_REMOTE_LOGIN|CLOUDFLARE_AI_ACCOUNT_ID|CLOUDFLARE_AI_TOKEN|GEMINI_API_KEY|SMART_[A-Z_]+)=\" $dir/relay.env 2>/dev/null || true; } >> $dir/relay.env.new &&
     chown $owner:$owner $dir/relay.env.new && chmod 600 $dir/relay.env.new && mv $dir/relay.env.new $dir/relay.env'"
+# Builds go up as dated releases and switch with one rename (dashboard-swap.sh).
+release="$(date -u +%Y%m%d%H%M%S)"
+ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/dashboard-swap.sh" < "$repo/deploy/dashboard-swap.sh"
 dashboard="$repo/../ferrocast-web/dist/dashboard"
 if [[ -f "$dashboard/index.html" ]]; then
   echo "Copying the phone dashboard (Dashboard anywhere)..."
   # Unpacked in full as a new release inside the mounted folder, then the `current` link
   # switches with one rename, so phones never see half a build (dashboard-swap.sh).
-  release="$(date -u +%Y%m%d%H%M%S)"
-  ssh "$host" "sudo install -m 755 -o root -g root /dev/stdin $dir/dashboard-swap.sh" < "$repo/deploy/dashboard-swap.sh"
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$dashboard" -czf - . | ssh "$host" "sudo bash $dir/dashboard-swap.sh $dir/dashboard $release $owner"
 else
   echo "No dashboard build at $dashboard (run 'pnpm build:embed' in ferrocast-web): phones keep the copy the server has."
+fi
+# Cloud mode's overlay pages (CLOUD.md §3): the same overlay build OBS gets from the app,
+# swapped in the same way into $dir/overlays (mounted read-only at /overlays).
+overlays="$repo/../ferrocast-web/dist/overlays"
+if [[ -f "$overlays/index.html" ]]; then
+  echo "Copying the overlay pages (cloud mode)..."
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$overlays" -czf - . | ssh "$host" "sudo bash $dir/dashboard-swap.sh $dir/overlays $release $owner"
+else
+  echo "No overlay build at $overlays (run 'pnpm build:embed' in ferrocast-web): cloud overlays keep the copy the server has."
 fi
 printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" | ssh "$host" "sudo install -m 600 -o $owner -g $owner /dev/stdin $dir/tunnel.env"
 
 ssh "$host" "set -e
   cd $dir && sudo env $image_env docker compose up -d --remove-orphans
   if [ -x $dir/dashboard-swap.sh ]; then sudo bash $dir/dashboard-swap.sh --tidy $dir/dashboard; fi
+  if [ -x $dir/dashboard-swap.sh ] && [ -d $dir/overlays ]; then sudo bash $dir/dashboard-swap.sh --tidy $dir/overlays; fi
   sleep 5
   sudo docker ps --filter name=ferrocast --format '{{.Names}}: {{.Status}}'"
 

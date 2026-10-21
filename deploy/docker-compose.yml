@@ -6,6 +6,8 @@
 #   dashboard/   the dashboard builds phones get (Pro "Dashboard anywhere"): releases/<date>/
 #                and a `current` link, switched by dashboard-swap.sh; mounted read-only at
 #                /dashboard and never renamed (RELAY_DASHBOARD_DIR=/dashboard/current)
+#   overlays/    cloud mode's overlay pages, the same layout as dashboard/ (RELAY_OVERLAYS_DIR=
+#                /overlays/current)
 #   tunnel.env   TUNNEL_TOKEN from the Cloudflare dashboard (chmod 600)
 name: ferrocast-relay
 
@@ -20,6 +22,7 @@ services:
     volumes:
       - relay-data:/data
       - ./dashboard:/dashboard:ro
+      - ./overlays:/overlays:ro
     networks: [ferrocast]
     read_only: true
     tmpfs: [/tmp]

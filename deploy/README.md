@@ -160,8 +160,10 @@ the same host (API.md §9.5). To switch it on:
 
 1. Cloudflare → Networking → Tunnels → ferrocast-relay → Public hostnames: add
    `remote.clearcraftlabs.com` → `http://ferrocast-relay:8787` (like `tip.clearcraftlabs.com`).
-2. In `../ferrocast-web`: `pnpm build:embed` (writes `dist/dashboard`).
-3. `deploy/deploy-relay.sh`: writes `RELAY_REMOTE_URL` and `RELAY_DASHBOARD_DIR=/dashboard/current`,
+2. In `../ferrocast-web`: `pnpm build:embed` (writes `dist/dashboard` and `dist/overlays`).
+3. `deploy/deploy-relay.sh`: writes `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR=/dashboard/current`
+   and `RELAY_OVERLAYS_DIR=/overlays/current` (cloud mode's overlay pages, swapped the same way
+   into `/opt/ferrocast-relay/overlays`),
    and copies the build to `/opt/ferrocast-relay/dashboard/releases/<date>`, then switches the
    `current` link inside to it with one rename (`deploy/dashboard-swap.sh`). The folder itself
    is mounted read-only and never renamed: a Docker bind mount follows the folder, so swapping
