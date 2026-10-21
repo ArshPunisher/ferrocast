@@ -125,12 +125,15 @@ pub const GIVE_UP_FOR: Duration = Duration::from_secs(60 * 60);
 pub(crate) const GOOGLE_OUT_KEY: &str = "yt_google_out";
 /// A `bot_seen` hint about YouTube counts for this long.
 pub const HINT_FRESH: Duration = Duration::from_secs(10 * 60);
-/// A closed chat stream is opened again after at least this long (each open is 5 units);
-/// streams that keep closing quickly wait twice as long each time, up to [`REOPEN_MAX`].
-pub const REOPEN_MIN: Duration = Duration::from_secs(30);
-pub const REOPEN_MAX: Duration = Duration::from_secs(300);
-/// A stream that stayed open this long was a good one: the wait starts over.
-const GOOD_STREAM: Duration = Duration::from_secs(300);
+/// YouTube ends a chat stream now and then. One that brought chat lines is opened again at
+/// once from the last page token, so a line typed meanwhile is answered in about a second.
+/// Closes without a line wait, from [`REOPEN_MIN`] doubling up to [`REOPEN_MAX`] for each
+/// such close in a row, so a stream YouTube keeps ending can't spend the budget (each open
+/// is 5 units).
+pub const REOPEN_MIN: Duration = Duration::from_secs(1);
+pub const REOPEN_MAX: Duration = Duration::from_secs(30);
+/// Failed opens wait from this long, doubling (see [`fail_wait`]).
+pub const FAIL_WAIT_MIN: Duration = Duration::from_secs(30);
 /// After YouTube (or the budget) said no for the day, look again this often at most.
 const QUOTA_RECHECK: Duration = Duration::from_secs(15 * 60);
 
@@ -1718,7 +1721,7 @@ pub fn fail_wait(streak: u32) -> Duration {
     if streak == 0 {
         return Duration::ZERO;
     }
-    (REOPEN_MIN * 2u32.pow((streak - 1).min(10))).min(FAIL_WAIT_MAX)
+    (FAIL_WAIT_MIN * 2u32.pow((streak - 1).min(10))).min(FAIL_WAIT_MAX)
 }
 
 /// The channels YouTube checks look at: Pro subscriptions with a ready channel whose cloud
@@ -1953,7 +1956,7 @@ fn reader_done(st: &AppState, sub: &str, generation: u64, next: Option<Duration>
 
 /// How long to wait before opening the stream again after `quick` short streams in a row.
 pub fn reopen_wait(quick: u32) -> Duration {
-    (REOPEN_MIN * 2u32.pow(quick.min(4))).min(REOPEN_MAX)
+    (REOPEN_MIN * 2u32.pow(quick.min(5))).min(REOPEN_MAX)
 }
 
 /// How one opened stream ended.
@@ -2012,12 +2015,16 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
         }
         let page = st.bot.yt(sub, |m| m.page_token.clone());
         let opened = Instant::now();
+        let mut answers = 0u32;
+        let mut lines = 0usize;
         let ended = match api.open_chat(&token, chat, page).await {
             Ok(mut feed) => loop {
                 match tokio::time::timeout(FEED_IDLE, feed.next()).await {
                     Err(_) => break Ended::Idle,
                     Ok(Ok(Some(batch))) => {
                         idle_in_a_row = 0;
+                        answers += 1;
+                        lines += batch.events.len();
                         let recovered = st.bot.yt(sub, |m| {
                             if let Some(t) = batch.next_page_token.clone() {
                                 m.page_token = Some(t);
@@ -2059,6 +2066,7 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
             },
             Err(e) => Ended::Failed(e),
         };
+        let closed_empty = matches!(ended, Ended::Closed) && lines == 0;
         let failed = match ended {
             Ended::Offline => {
                 read_note(st, sub, "chat_offline", "");
@@ -2123,7 +2131,12 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                 idle_in_a_row > 1
             }
             Ended::Closed => {
-                tracing::debug!("YouTube closed the cloud bot's chat stream; opening it again");
+                read_note(
+                    st,
+                    sub,
+                    "stream_closed",
+                    &format!("after {} s, {answers} answers, {lines} lines", opened.elapsed().as_secs()),
+                );
                 false
             }
         };
@@ -2143,8 +2156,10 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
             st.bot.yt(sub, |m| m.gave_up = Some(Instant::now()));
             return reader_done(st, sub, generation, Some(GIVE_UP_FOR));
         }
-        quick = if opened.elapsed() < GOOD_STREAM { quick + 1 } else { 0 };
-        let wait = reopen_wait(quick.saturating_sub(1)).max(if failed { fail_wait(streak) } else { Duration::ZERO });
+        // A stream that brought lines opens again at once; closes without one back off.
+        quick = if closed_empty { quick + 1 } else { 0 };
+        let pause = if quick > 0 { reopen_wait(quick - 1) } else { Duration::ZERO };
+        let wait = pause.max(if failed { fail_wait(streak) } else { Duration::ZERO });
         tokio::time::sleep(wait).await;
     }
 }

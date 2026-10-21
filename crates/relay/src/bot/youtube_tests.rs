@@ -446,10 +446,11 @@ fn googles_errors_are_told_apart() {
 #[test]
 fn reopening_a_closed_stream_waits_longer_when_streams_keep_closing() {
     assert_eq!(reopen_wait(0), REOPEN_MIN);
-    assert_eq!(reopen_wait(1), Duration::from_secs(60));
-    assert_eq!(reopen_wait(2), Duration::from_secs(120));
-    assert_eq!(reopen_wait(3), Duration::from_secs(240));
+    assert_eq!(reopen_wait(1), Duration::from_secs(2));
+    assert_eq!(reopen_wait(2), Duration::from_secs(4));
+    assert_eq!(reopen_wait(4), Duration::from_secs(16));
     assert_eq!(reopen_wait(9), REOPEN_MAX);
+    assert_eq!(fail_wait(1), FAIL_WAIT_MIN);
 }
 
 #[test]
@@ -853,7 +854,7 @@ fn ready_youtube_other(st: &AppState) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn live_chat_is_read_answered_once_reopened_after_the_wait_and_stopped_when_it_ends() {
+async fn live_chat_is_read_answered_once_reopened_at_once_and_stopped_when_it_ends() {
     let yt = Arc::new(FakeYoutube::default());
     let (st, _d) = bare(yt.clone(), 1_500, 9_000);
     ready_youtube(&st, "i1", "sub_1", false);
@@ -882,7 +883,9 @@ async fn live_chat_is_read_answered_once_reopened_after_the_wait_and_stopped_whe
     assert_eq!(sent, vec![("chat-1".to_string(), "Enjoy the lurk, UCviewer!".to_string())], "answered once");
     assert_eq!(opens[0].1, None);
     assert_eq!(opens[1].1.as_deref(), Some("page-2"), "resumed from the last page token");
-    assert!(opens[1].0 - opens[0].0 >= REOPEN_MIN, "{:?}", opens[1].0 - opens[0].0);
+    // YouTube closing a stream that answered is normal: opened again at once, so a line
+    // typed in between is answered in about a second, not after a long wait.
+    assert!(opens[1].0 - opens[0].0 < REOPEN_MIN, "{:?}", opens[1].0 - opens[0].0);
     // Units: 1 detect + 2 opens + 1 reply.
     assert_eq!(used(&st, "sub_1", None), 1 + 10 + 50);
     assert_eq!(used(&st, "sub_1", Some(Call::Read)), 10);
@@ -914,7 +917,8 @@ async fn streams_that_keep_closing_wait_longer_each_time() {
     step(&st, &chan(&st, "sub_1")).await;
     until(|| yt.with(|y| y.opens.len()) >= 5).await;
     let gaps: Vec<u64> = yt.with(|y| y.opens.windows(2).map(|w| (w[1].0 - w[0].0).as_secs()).collect());
-    assert_eq!(gaps, vec![30, 60, 120, 240], "doubling from 30 s");
+    // Not a hot loop, but short: a line typed meanwhile still gets answered within seconds.
+    assert_eq!(gaps, vec![1, 2, 4, 8], "doubling from 1 s");
     assert_eq!(used(&st, "sub_1", Some(Call::Read)), 25);
 }
 
@@ -1289,8 +1293,8 @@ async fn a_silent_stream_is_opened_again_from_the_page_token() {
     let opens = yt.with(|y| y.opens.clone());
     assert_eq!(opens[1].1.as_deref(), Some("p1"), "resumed from the page token");
     let gaps: Vec<u64> = opens.windows(2).map(|w| (w[1].0 - w[0].0).as_secs()).collect();
-    // 90 s silent + 30 s wait; then 90 s + 60 s (the quick-close wait, and now a failure).
-    assert_eq!(gaps, vec![120, 150]);
+    // 90 s silent, opened again at once; then 90 s + 30 s (two silences in a row: a failure).
+    assert_eq!(gaps, vec![90, 120]);
     // One silence isn't a failure; two in a row are.
     assert_eq!(st.bot.yt("sub_1", |m| m.fail_streak), 1);
     assert_eq!(FEED_IDLE, Duration::from_secs(90));
