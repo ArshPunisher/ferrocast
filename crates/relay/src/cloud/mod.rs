@@ -13,10 +13,17 @@
 // The parts the event pipeline, media and the sleep sweep use land with them (CLOUD.md §12).
 #![allow(dead_code)]
 
+pub(crate) mod bus;
 pub(crate) mod connect;
 #[cfg(test)]
 mod connect_tests;
 pub(crate) mod docs;
+pub(crate) mod ingest;
+mod live;
+#[cfg(test)]
+mod live_tests;
+pub(crate) mod media;
+pub(crate) mod overlay;
 pub(crate) mod store;
 mod sync;
 #[cfg(test)]
@@ -136,6 +143,28 @@ pub(crate) struct Runtime {
     pub(crate) cfg: CloudConfig,
     /// The built-in design catalogue (read from the overlay build once).
     builtins: RwLock<Option<Arc<Vec<Design>>>>,
+    /// The accounts' event buses in memory (docs/CLOUD.md §1).
+    pub(crate) buses: bus::Buses,
+    /// The ingest queue, started with its worker on first use.
+    pub(crate) ingest: std::sync::OnceLock<tokio::sync::mpsc::Sender<ingest::Job>>,
+    /// Uploads being read at once (each up to 20 MB in memory).
+    pub(crate) uploads: UploadSlots,
+}
+
+/// A few upload slots relay-wide ([`media::UPLOAD_SLOTS`]).
+#[derive(Debug)]
+pub(crate) struct UploadSlots(tokio::sync::Semaphore);
+
+impl Default for UploadSlots {
+    fn default() -> Self {
+        UploadSlots(tokio::sync::Semaphore::new(media::UPLOAD_SLOTS))
+    }
+}
+
+impl UploadSlots {
+    pub(crate) fn try_acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::TryAcquireError> {
+        self.0.try_acquire()
+    }
 }
 
 impl Runtime {
@@ -166,7 +195,12 @@ impl Runtime {
 }
 
 pub(crate) fn routes() -> axum::Router<AppState> {
-    web::routes().merge(sync::routes()).merge(connect::routes())
+    web::routes()
+        .merge(sync::routes())
+        .merge(connect::routes())
+        .merge(overlay::routes())
+        .merge(media::routes())
+        .merge(live::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────
@@ -377,12 +411,35 @@ pub(crate) fn bot_allowed(db: &crate::Db, account: &str) -> bool {
 
 /// An overlay's layout changed: its open pages re-render without reloading.
 pub(crate) fn changed_overlay(st: &AppState, account: &str, o: &ferrocast_core::overlay::Overlay) {
-    let _ = (st, account, o);
+    if let Some(bus) = st.cloud.buses.get(account) {
+        let view = serde_json::json!({ "id": o.id, "name": o.name, "width": o.width, "height": o.height,
+            "widgets": o.widgets, "updated_at": o.updated_at, "design": o.design });
+        bus.send_overlay(bus::Audience::Overlay(o.id.clone()), "config", &view);
+    }
 }
 
-/// An overlay's URL was rotated or the overlay deleted: open pages on it stop at once.
+/// An overlay's URL was rotated or the overlay deleted: open pages on it stop at once
+/// (`revoked`, then the socket closes with 4404).
 pub(crate) fn revoked_overlay(st: &AppState, account: &str, overlay: &str) {
-    let _ = (st, account, overlay);
+    if let Some(bus) = st.cloud.buses.get(account) {
+        bus.send_overlay(bus::Audience::Overlay(overlay.to_string()), "revoked", &serde_json::json!({}));
+    }
+}
+
+/// An account was disabled or put to sleep: its bus goes, and every open overlay page of it
+/// gets `revoked` and closes (a new one is refused until it's back).
+pub(crate) fn stop_account(st: &AppState, account: &str) {
+    if let Some(bus) = st.cloud.buses.drop_bus(account) {
+        let open: Vec<String> = bus.state().sockets.keys().cloned().collect();
+        for id in open {
+            bus.send_overlay(bus::Audience::Overlay(id), "revoked", &serde_json::json!({}));
+        }
+    }
+}
+
+/// An account's documents changed: its pipeline reads them again.
+pub(crate) fn docs_changed(st: &AppState, account: &str) {
+    st.cloud.buses.forget_cache(account);
 }
 
 // ── The hourly sweep ─────────────────────────────────────────────────────────────────

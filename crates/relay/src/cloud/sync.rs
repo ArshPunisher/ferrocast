@@ -166,6 +166,9 @@ async fn push(
             })),
         }
     }
+    if !applied.is_empty() {
+        super::docs_changed(&st, &account);
+    }
     let version = st.db.cloud_account(&account).map_err(ApiError::db)?.map_or(0, |c| c.version);
     Ok(json(json!({ "version": version, "applied": applied, "conflicts": conflicts })))
 }

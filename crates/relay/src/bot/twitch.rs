@@ -917,6 +917,7 @@ fn broadcaster_of(v: &Value) -> Option<String> {
 /// is unbound (its subscriptions deleted, its sign-in dropped), so a later owner can connect
 /// it again. Anything else shows an error the hourly sweep retries.
 pub(crate) async fn revoked(st: &AppState, v: &Value) {
+    crate::cloud::connect::twitch_revoked(st, v);
     let Some(b) = broadcaster_of(v) else { return };
     let Ok(Some(ch)) = super::db(st, move |db| db.bot_channel_by_channel("twitch", &b)).await else { return };
     let status = v.pointer("/subscription/status").and_then(Value::as_str).unwrap_or("revoked");
@@ -963,6 +964,8 @@ pub(crate) async fn unbind(st: &AppState, ch: &super::store::Channel, err: &Valu
 }
 
 async fn notification(st: &AppState, message_id: &str, v: &Value) {
+    // A channel bound to a cloud mode account (docs/CLOUD.md §1): its alerts and chat.
+    crate::cloud::ingest::twitch(st, message_id, v);
     let kind = v.pointer("/subscription/type").and_then(Value::as_str).unwrap_or("");
     let Some(b) = broadcaster_of(v) else { return };
     let b2 = b.clone();

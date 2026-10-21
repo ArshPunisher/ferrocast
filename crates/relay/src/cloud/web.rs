@@ -106,10 +106,11 @@ async fn enable(State(st): State<AppState>, method: Method, headers: HeaderMap) 
     Ok(json(summary_json(&st, &a.account.id)?))
 }
 
-/// `GET /c/api/v1/status`: the engine's `Status` shape, for a dashboard in cloud mode.
-async fn status(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
-    let a = web_account(&st, &headers, &method, true)?;
-    let channels = st.db.cloud_channels(&a.account.id).map_err(ApiError::db)?;
+/// The engine's `Status` shape for a dashboard in cloud mode: connectors from the channels,
+/// live from the bus.
+pub(crate) fn status_json(st: &AppState, account: &str) -> Result<Value, ApiError> {
+    let channels = st.db.cloud_channels(account).map_err(ApiError::db)?;
+    let live = st.cloud.buses.get(account).map(|b| b.state().live.clone()).unwrap_or_default();
     let connector = |p: &str| {
         let ch = channels.iter().find(|c| c.platform == p);
         match ch {
@@ -122,12 +123,19 @@ async fn status(State(st): State<AppState>, method: Method, headers: HeaderMap) 
             None => json!({ "state": "off", "account": null, "detail": null, "last_event_at": null }),
         }
     };
-    Ok(json(json!({
+    let is_live = |p: &str| live.get(p).copied().unwrap_or(false);
+    Ok(json!({
         "version": env!("CARGO_PKG_VERSION"), "port": 0, "cloud": true,
-        "live": { "twitch": false, "youtube": false, "kick": false },
+        "live": { "twitch": is_live("twitch"), "youtube": is_live("youtube"), "kick": is_live("kick") },
         "connectors": { "twitch": connector("twitch"), "youtube": connector("youtube"), "kick": connector("kick") },
         "setup_done": true,
-    })))
+    }))
+}
+
+/// `GET /c/api/v1/status`
+async fn status(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
+    let a = web_account(&st, &headers, &method, true)?;
+    Ok(json(status_json(&st, &a.account.id)?))
 }
 
 // ── Overlays ─────────────────────────────────────────────────────────────────────────

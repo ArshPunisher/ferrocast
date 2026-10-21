@@ -714,6 +714,8 @@ fn queue_tip(st: &AppState, install: &str, n: Notice<'_>) -> Response {
     }
     // Pro: count it towards the goal page (or take a refunded one back).
     goal::record(st, install, &n);
+    // Cloud mode: the account's own overlays alert it too (docs/CLOUD.md §7).
+    crate::cloud::ingest::tip(st, install, &payload);
     StatusCode::OK.into_response()
 }
 

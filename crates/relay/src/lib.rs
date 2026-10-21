@@ -765,6 +765,8 @@ async fn kick_webhook(State(st): State<AppState>, headers: HeaderMap, body: axum
         Some(Value::String(s)) => s.clone(),
         _ => return StatusCode::OK.into_response(),
     };
+    // A channel bound to a cloud mode account (docs/CLOUD.md §1): its alerts and chat.
+    cloud::ingest::kick(&st, &broadcaster, &ty, &id, &v);
     match st.db.kick_owner(&broadcaster) {
         Ok(Some(install)) => {
             let payload = json!({ "type": ty, "version": ver, "message_id": id, "body": v });

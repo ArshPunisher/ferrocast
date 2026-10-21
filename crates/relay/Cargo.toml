@@ -23,7 +23,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
 rsa = { version = "0.9", features = ["sha2"] }

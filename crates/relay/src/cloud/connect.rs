@@ -709,3 +709,30 @@ pub(crate) async fn sweep_pending(st: &AppState) {
         }
     }
 }
+
+/// Twitch stopped one of a cloud channel's subscriptions: the Cloud page shows why.
+pub(crate) fn twitch_revoked(st: &AppState, v: &Value) {
+    let cond = v.pointer("/subscription/condition");
+    let Some(b) = cond
+        .and_then(|c| c.get("broadcaster_user_id").or_else(|| c.get("to_broadcaster_user_id")))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let Ok(Some(ch)) = st.db.cloud_channel("twitch", b) else { return };
+    let status = v.pointer("/subscription/status").and_then(Value::as_str).unwrap_or("revoked");
+    let (code, message, hint) = match status {
+        "authorization_revoked" | "user_removed" => (
+            "twitch_revoked",
+            "Twitch says Ferrocast's permission for this channel was removed.",
+            "Disconnect Twitch on the Cloud page and connect it again.",
+        ),
+        _ => (
+            "twitch_unavailable",
+            "Twitch stopped sending this channel's events.",
+            "Ferrocast tries again within the hour.",
+        ),
+    };
+    tracing::info!(status, "Twitch stopped a cloud channel's subscription");
+    let _ = st.db.cloud_set_channel_error("twitch", &ch.channel_id, Some(&error_json(code, message, hint)));
+}

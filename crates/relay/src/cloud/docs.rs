@@ -95,7 +95,10 @@ fn encode<T: Serialize>(v: &T) -> Result<String, ApiError> {
 /// Saves without a version check (the web dashboard edits the cloud copy directly).
 fn save(st: &AppState, account: &str, kind: &str, id: &str, json: Option<&str>) -> Result<i64, ApiError> {
     match st.db.cloud_write(account, kind, id, json, None, now_ms()).map_err(ApiError::db)? {
-        Write::Saved(v) => Ok(v),
+        Write::Saved(v) => {
+            super::docs_changed(st, account);
+            Ok(v)
+        }
         Write::Conflict(_) => {
             Err(super::e(axum::http::StatusCode::CONFLICT, "stale_version", "That changed meanwhile."))
         }

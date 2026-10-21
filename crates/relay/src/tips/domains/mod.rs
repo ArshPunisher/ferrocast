@@ -462,9 +462,15 @@ fn host_of(origin: &str) -> Option<String> {
 /// (each host and its registrable domain).
 fn own_domains(st: &AppState) -> Vec<String> {
     let mut v: Vec<String> = OWN_DOMAINS.iter().map(|d| (*d).to_string()).collect();
-    for origin in [Some(st.cfg.public_url.as_str()), st.cfg.tip_url.as_deref(), st.remote.cfg.origin.as_deref()]
-        .into_iter()
-        .flatten()
+    // Cloud mode's overlay origin (`RELAY_OVERLAY_URL`, docs/CLOUD.md §3) is ours too.
+    for origin in [
+        Some(st.cfg.public_url.as_str()),
+        st.cfg.tip_url.as_deref(),
+        st.remote.cfg.origin.as_deref(),
+        st.cloud.cfg.overlay_origin.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(h) = host_of(origin)
             && h.parse::<std::net::IpAddr>().is_err()
