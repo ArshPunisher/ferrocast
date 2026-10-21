@@ -541,9 +541,41 @@ fn navigation(u: &tauri::Url, origin: &str) -> (bool, bool) {
     (ours && !pair, (!ours || pair) && is_web(u))
 }
 
+/// Tries at handing a page to the browser: the system can refuse one while the browser is
+/// still starting or quitting.
+const OPEN_ATTEMPTS: u32 = 3;
+const OPEN_RETRY: Duration = Duration::from_millis(700);
+
+/// Hands a web page to the default browser, off the window's thread: WebKit waits on the
+/// navigation handler, and starting a browser that isn't running can take a while. When
+/// every try fails the dashboard says so (the connect dialog keeps a link to copy) instead
+/// of a log line nobody sees.
 fn open_in_browser(app: &AppHandle, u: &tauri::Url) {
-    if let Err(e) = app.opener().open_url(u.as_str(), None::<&str>) {
-        tracing::warn!(error = %e, "couldn't open the browser");
+    let app = app.clone();
+    let url = u.to_string();
+    std::thread::spawn(move || {
+        let opened = open_with_retry(|| app.opener().open_url(&url, None::<&str>), OPEN_ATTEMPTS, OPEN_RETRY);
+        if let Err(e) = opened {
+            tracing::error!(error = %e, "couldn't open the browser");
+            if let Some(r) = app.try_state::<Running>() {
+                r.engine.browser_didnt_open();
+            }
+        }
+    });
+}
+
+/// Calls `open` until it works, up to `attempts` times with `wait` between; the last error.
+fn open_with_retry<E>(mut open: impl FnMut() -> Result<(), E>, attempts: u32, wait: Duration) -> Result<(), E> {
+    let mut tried = 1;
+    loop {
+        match open() {
+            Ok(()) => return Ok(()),
+            Err(e) if tried >= attempts => return Err(e),
+            Err(_) => {
+                tried += 1;
+                std::thread::sleep(wait);
+            }
+        }
     }
 }
 
@@ -701,6 +733,59 @@ mod tests {
         assert_eq!(nav("http://127.0.0.1:7879/app/"), (false, true));
         // A look-alike that starts with our origin but goes to another host.
         assert_eq!(nav("http://127.0.0.1:7878@evil.test/app/"), (false, true));
+    }
+
+    /// What `oauth::begin` makes: long, form-encoded (`+` between scopes), and with our own
+    /// address inside the query as the redirect.
+    const GOOGLE: &str = "https://accounts.google.com/o/oauth2/v2/auth?client_id=701866487620-p0npjp4t20ivffdcn89s5jhro9vik5cl.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube.force-ssl+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube.readonly&code_challenge=N07XXTGhamNvXHT0LS_emRx0ieA0Ua8QfloveAbcdefg&code_challenge_method=S256&state=abcdefghijklmnopqrstuvwxyzAB_-&access_type=offline&prompt=consent";
+
+    #[test]
+    fn the_youtube_sign_in_page_goes_to_the_browser() {
+        assert_eq!(nav(GOOGLE), (false, true));
+        let u: tauri::Url = GOOGLE.parse().unwrap();
+        assert_eq!(u.as_str(), GOOGLE, "parsing keeps the URL as the page sent it");
+        // Our origin in the query (unencoded, as some pages send it) doesn't make it ours.
+        assert_eq!(nav("https://accounts.google.com/auth?redirect_uri=http://127.0.0.1:7878/app/"), (false, true));
+        // Kick's sign-in goes through the relay.
+        assert_eq!(nav("https://relay.ferrocast.app/kick/start?state=a+b%20c"), (false, true));
+    }
+
+    #[test]
+    fn opening_the_browser_tries_again_then_gives_up() {
+        let mut calls = 0;
+        let r = open_with_retry(
+            || {
+                calls += 1;
+                if calls < 2 { Err("busy") } else { Ok(()) }
+            },
+            3,
+            Duration::ZERO,
+        );
+        assert_eq!((r, calls), (Ok(()), 2), "the second try worked");
+        let mut calls = 0;
+        let r = open_with_retry(
+            || {
+                calls += 1;
+                Err::<(), _>(calls)
+            },
+            OPEN_ATTEMPTS,
+            Duration::ZERO,
+        );
+        assert_eq!(r, Err(OPEN_ATTEMPTS), "the last error, after every try");
+        assert_eq!(calls, OPEN_ATTEMPTS);
+        let mut calls = 0;
+        assert_eq!(
+            open_with_retry(
+                || {
+                    calls += 1;
+                    Ok::<_, ()>(())
+                },
+                3,
+                Duration::ZERO
+            ),
+            Ok(())
+        );
+        assert_eq!(calls, 1, "no second try after it worked");
     }
 
     #[test]
