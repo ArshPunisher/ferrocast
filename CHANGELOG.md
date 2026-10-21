@@ -5,6 +5,13 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.3.1
+
+- Updates arrive on more networks: if one of GitHub's download servers doesn't answer,
+  Ferrocast tries another instead of giving up.
+- On a Mac, clicking Ferrocast in the Dock opens the window again after you've closed it.
+- See which version you run: under the Settings menu, and at the top of the tray menu.
+
 ## 1.3.0
 
 - Ferrocast accounts, free and optional. Sign in with Google or an email link from the bottom
