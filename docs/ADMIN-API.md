@@ -477,3 +477,27 @@ PCs, the web dashboard refused. The app keeps working without the account. Enabl
 `active_*`: used the app or the web within the days. `paid_ever`: accounts with a Razorpay
 subscription that was charged at least once. `rate_*`: a fraction (0..1, 4 decimals) or `null`
 with nothing to divide by. `per_day` has one entry per UTC day, oldest first, zeros included.
+
+## Pro in 1.4 (for the Control Center)
+
+What Pro adds in 1.4, as the plans page, Settings › Pro and the site list it:
+
+| Pro feature | Free |
+|---|---|
+| **YouTube from the cloud**: YouTube chat and the bot run on the relay with the PC off, or with no PC (the web dashboard's Account page), within a fair share of Google's daily quota | YouTube works in the app on the PC |
+| **Smart moderation**: second looks at doubtful chat in English, Hindi and Hinglish, as suggestions, and (if switched on) automatic short timeouts with Undo; never a ban on its own | The app's own filters, panic mode and ban lists |
+| **Smart replies** from facts the streamer approved, and a written **stream recap** | Commands, timers, auto-replies, the recap page |
+| **A year of stream insights**: charts per stream, best times, top supporters, CSV | The last **30 days** with a free account |
+
+Everything Pro had before 1.4 stays in Pro (the 24/7 cloud bot, dashboard from anywhere,
+Ferrocast voices, cloud backups, the Discord bot, the weekly email, tip branding, goal and
+own address).
+
+**New in `GET /admin/v1/stats` `usage`** (docs/API.md §9.9): `smart { provider, calls_today,
+daily_cap, resting, resets_at }` (the free-tier model's calls today relay-wide; `resting`: the
+cap or the provider's free allowance is used up until `resets_at`), and `history {
+free_accounts, pro_subscriptions }` (how many keep stream history). Counts only, as before.
+
+**What the owner runs**: `deploy/pro-keys.sh --ai` on the server (deploy/README.md, "smart
+features"); Google verification for YouTube (docs/GOOGLE-VERIFICATION.md). No migration: 1.4's
+Pro features store only counters (`quota_usage`) and reuse existing tables.

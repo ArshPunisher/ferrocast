@@ -4,6 +4,26 @@ Approved by the owner on 19 Oct 2026: seven Pro features, all of them things tha
 servers. Free features never move behind Pro (R-01, R-05). Google Cloud TTS is the chosen voice
 provider; a Discord app "Ferrocast" exists (id 1561463863197835294); Brevo is the mail sender.
 
+## 1.4: what Pro adds (owner decision, 21 Oct 2026)
+
+Pro = **YouTube from the cloud + smart features + a year of insights**, on top of everything
+Pro already has. Built 21 Oct 2026 (STATUS.md):
+
+- **F8. Insights** (F7 grown up): stream history for **free accounts** too, the last 30 days;
+  Pro keeps a year. The relay keys free rows by the account id, sweeps hourly, and says
+  `limited` when a range goes past what the plan keeps, so the dashboard shows a calm Pro note
+  (never to the audience). Insights page: charts per stream (viewers, follows, subs, tips,
+  chat), best times to stream, top supporters (from the PC's own log, free), CSV.
+- **F9. Smart features** (never called "AI" in the product, R-15): smart moderation
+  suggestions that read Hinglish (log, one-click undo, automatic short timeouts only if the
+  streamer turns it on, never a ban), smart replies from facts the streamer approved (rate
+  limited), and the written stream recap. A free model tier only (Cloudflare Workers AI, or
+  Gemini's free tier), off until `pro-keys.sh --ai`, hard caps per subscription and relay-wide
+  (API.md §9.10).
+- **F1 grown up: YouTube from the cloud** with no PC (the web dashboard connects it for a Pro
+  account) and a fair share of Google's daily quota across streamers (API.md §9.7). Google
+  verification steps: docs/GOOGLE-VERIFICATION.md.
+
 ## Ground rules
 
 - Relay DB: one `Db { conn: Mutex<Connection> }`, each module its own `SCHEMA` (`CREATE IF NOT
