@@ -99,6 +99,28 @@ The web dashboard edits the cloud copy directly. A desktop app that is signed in
 Widgets that need the PC (`poll`, `giveaway`) render nothing in a cloud overlay (the snapshot
 says `poll: null`, `giveaway: null`); the overlay editor marks them "Needs the app".
 
+### 1.3 How the live parts behave (M3)
+
+- **One ingest worker** takes the queue in order, so an account's alerts never overtake each
+  other; everything it does is in memory (the rules, the alert design in use and the settings
+  are read once per bus and again after any document change).
+- **TTS** follows the alert design in use: its own `tts` switch and minimum decide, the message
+  is read through `core::tts::decide` (never numbers, links or held text), and the overlay
+  speaks it with the browser's voice. Without an alert design nothing is read. There's no
+  approval queue in the cloud.
+- **Session labels** (latest follower, sub, tip, top tip, this stream's follows and subs) live on
+  the bus only and start again when a stream starts or the relay restarts.
+- **Dashboard lists**: `GET /c/api/v1/events` is the bus's last 25 live alertable events (test
+  ones never), `GET /c/api/v1/chat` its last 50 lines; both empty after a restart.
+- **Close codes** of an overlay socket: 4404 unknown, rotated, deleted or the account disabled
+  (the page clears and stops), 4410 the account sleeps, 4429 over a socket cap (20 an account,
+  4 an overlay, 30 opens a minute per IP), 4503 the relay is full; the page retries the last
+  three later. A frame over 4 KB closes the socket.
+- **Uploads** are read into memory (20 MB at most), four at a time relay-wide; one more gets 503
+  `cloud_busy`. Multipart `file` (the dashboard) or the raw file with `X-Media-Name` (the app).
+- `RELAY_OVERLAY_URL`'s host counts as one of Ferrocast's own hosts for the custom tip address
+  check, so overlay pages there are never mistaken for someone's tip address.
+
 ## 2. Storage
 
 New relay tables (one migration, `cloud::SCHEMA`):
@@ -237,7 +259,7 @@ Per **active** streamer (bus in memory): rings and queue ≈ 100 KB, a bus chann
 |---|---|---|
 | Active streamers (bus in memory) | 400 | `CLOUD_MAX_ACTIVE` |
 | Overlay sockets relay-wide | 4,000 | `CLOUD_MAX_SOCKETS` |
-| Ingest queue | 4,096 waiting, 32 workers | fixed |
+| Ingest queue | 4,096 waiting, one worker (in order, in memory only) | fixed |
 | Memory for cloud mode | ≈ 120 MB at 400 active | |
 
 How it degrades:
@@ -245,7 +267,8 @@ How it degrades:
 1. Over `CLOUD_MAX_SOCKETS`: new overlay sockets close with 4503 and retry with backoff; open
    ones keep working.
 2. Over `CLOUD_MAX_ACTIVE`: the least recently used idle bus (no socket open) is dropped; if
-   none is idle, a new account's events wait in the ingest queue and its sockets get 4503.
+   none is idle, a new account's events are dropped and counted (`cloud.dropped`) and its
+   sockets get 4503 (they retry).
    The dashboard says "Ferrocast's servers are busy; your overlays come back on their own".
 3. The ingest queue full: events are dropped and counted (`cloud.dropped` in the admin
    stats), webhooks still answer 2xx at once (Twitch and Kick never unsubscribe us).
