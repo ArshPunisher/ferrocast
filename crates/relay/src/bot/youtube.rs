@@ -41,7 +41,7 @@ use std::time::Duration;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use ferrocast_core::event::Platform;
+use ferrocast_core::event::{Origin, Platform};
 use hmac::{Hmac, Mac};
 use rsa::sha2::Sha256;
 use rusqlite::{OptionalExtension, params};
@@ -1034,6 +1034,9 @@ pub(crate) struct YtMem {
     hint: Option<(bool, Instant)>,
     /// Failed stream opens in a row (kept across reader restarts).
     pub(crate) fail_streak: u32,
+    /// Streams YouTube ended as "chat over" within moments of opening while the broadcast is
+    /// live (kept across reader restarts; a stream that delivers a line clears it).
+    pub(crate) quick_ends: u32,
     /// Reading stopped after [`GIVE_UP_AFTER`] failures, then (until "Try again" or a live
     /// check [`GIVE_UP_FOR`] later).
     gave_up: Option<Instant>,
@@ -1046,6 +1049,7 @@ impl YtMem {
     /// per [`WAKE_GAP`]), and read again after a give-up.
     pub(crate) fn retry_now(&mut self) {
         self.fail_streak = 0;
+        self.quick_ends = 0;
         self.gave_up = None;
         self.wake();
     }
@@ -1889,6 +1893,8 @@ async fn check_live(st: &AppState, ch: &store::Channel) {
                 }
                 m.chat = None;
                 m.page_token = None;
+                // The broadcast really ended: "chat over at once" strikes start again.
+                m.quick_ends = 0;
                 m.next_check = Some(now + cadence(m, now));
             });
         }
@@ -1918,6 +1924,8 @@ fn start_reader(st: &AppState, sub: &str, chat: String) {
         m.stop();
         if m.chat.as_deref() != Some(chat.as_str()) {
             m.page_token = None;
+            // Another broadcast: its own strikes.
+            m.quick_ends = 0;
         }
         m.chat = Some(chat);
         let h = tokio::spawn(async move { read(&st2, &sub2, &chat2, generation).await });
@@ -1948,8 +1956,24 @@ enum Ended {
     Closed,
     /// Nothing came for [`FEED_IDLE`].
     Idle,
+    /// An answer said the chat went offline (YouTube's own word that the stream ended).
+    Offline,
     Failed(YoutubeError),
 }
+
+/// Logs why reading YouTube chat stopped or paused: at info the first time per reason and
+/// subscription each hour, at debug after, so a quiet YouTube bot is never a mystery.
+fn read_note(st: &AppState, sub: &str, why: &'static str, detail: &str) {
+    if st.bot.note(sub, Platform::Youtube, why, now_ms()) {
+        tracing::info!(sub, why, detail, "the cloud bot's YouTube chat reader (first this hour)");
+    } else {
+        tracing::debug!(sub, why, detail, "the cloud bot's YouTube chat reader");
+    }
+}
+
+/// Streams ended as "chat over" right after opening, while YouTube says the broadcast is
+/// live, before the reader stops for [`GIVE_UP_FOR`] and says so on the channel.
+pub const QUICK_ENDS_GIVE_UP: u32 = 3;
 
 /// Holds the chat stream while live: each open counts 5 units (once the sign-in is at
 /// hand); lines go to [`super::on_chat`] (dedupe, ring, answers); a closed stream is opened
@@ -1964,7 +1988,10 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
     loop {
         let token = match access(st, sub).await {
             Ok(t) => t,
-            Err(_) => return reader_done(st, sub, generation, Some(CHECK_SLOW)),
+            Err(e) => {
+                read_note(st, sub, "no_sign_in", &format!("{e:?}"));
+                return reader_done(st, sub, generation, Some(CHECK_SLOW));
+            }
         };
         match take(st, sub, Call::Read) {
             Ok(()) => {}
@@ -1972,7 +1999,10 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                 let _ = st.db.bot_set_error(sub, "youtube", Some(&spent_error(s)));
                 return reader_done(st, sub, generation, Some(QUOTA_RECHECK));
             }
-            Err(None) => return reader_done(st, sub, generation, Some(CHECK_FAST)),
+            Err(None) => {
+                read_note(st, sub, "units_not_counted", "");
+                return reader_done(st, sub, generation, Some(CHECK_FAST));
+            }
         }
         let page = st.bot.yt(sub, |m| m.page_token.clone());
         let opened = Instant::now();
@@ -1992,6 +2022,11 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                             let _ = st.db.bot_clear_transient_error(sub, "youtube");
                         }
                         if !batch.events.is_empty() {
+                            let live = batch.events.iter().filter(|e| e.origin == Origin::Live).count();
+                            if live > 0 {
+                                st.bot.yt(sub, |m| m.quick_ends = 0);
+                            }
+                            read_note(st, sub, "lines_arrived", &format!("{} lines, {live} new", batch.events.len()));
                             let s2 = sub.to_string();
                             let ch = super::db(st, move |db| db.bot_channel(&s2, "youtube")).await;
                             if let Ok(Some(ch)) = ch {
@@ -2001,7 +2036,7 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                             }
                         }
                         if batch.offline {
-                            break Ended::Failed(YoutubeError::ChatEnded);
+                            break Ended::Offline;
                         }
                     }
                     Ok(Ok(None)) => break Ended::Closed,
@@ -2011,7 +2046,43 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
             Err(e) => Ended::Failed(e),
         };
         let failed = match ended {
+            Ended::Offline => {
+                read_note(st, sub, "chat_offline", "");
+                went_offline(st, sub);
+                return reader_done(st, sub, generation, None);
+            }
             Ended::Failed(YoutubeError::ChatEnded | YoutubeError::NotFound) => {
+                // "Chat over" moments after opening, every time, while liveBroadcasts says live:
+                // the stream itself is refused (the reader would open it every 2 minutes and
+                // read nothing). Said on the channel, and reading rests for an hour.
+                if opened.elapsed() < Duration::from_secs(20) {
+                    let n = st.bot.yt(sub, |m| {
+                        m.quick_ends += 1;
+                        m.quick_ends
+                    });
+                    read_note(st, sub, "chat_ended_at_once", &format!("{n} in a row"));
+                    if n >= QUICK_ENDS_GIVE_UP {
+                        let err = super::error_json(
+                            "youtube_chat_unavailable",
+                            "YouTube wouldn't let Ferrocast read this stream's live chat.",
+                            "Check that live chat is on for the stream (and not set to subscribers or members only), then press Try again.",
+                        );
+                        let _ = st.db.bot_set_error(sub, "youtube", Some(&err));
+                        st.bot.yt(sub, |m| {
+                            m.gave_up = Some(Instant::now());
+                            m.quick_ends = 0;
+                        });
+                        return reader_done(st, sub, generation, Some(GIVE_UP_FOR));
+                    }
+                    // Not offline yet: the next live check says (and keeps the strikes while
+                    // it's the same broadcast).
+                    st.bot.yt(sub, |m| {
+                        m.page_token = None;
+                        m.next_check = Some(Instant::now() + CHECK_FAST);
+                    });
+                    return reader_done(st, sub, generation, None);
+                }
+                read_note(st, sub, "chat_ended", "");
                 went_offline(st, sub);
                 return reader_done(st, sub, generation, None);
             }
@@ -2025,19 +2096,22 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                 true
             }
             Ended::Failed(YoutubeError::Forbidden(m)) => {
-                tracing::info!(why = %m, "YouTube refused the cloud bot's chat stream");
+                read_note(st, sub, "stream_refused", &m);
                 true
             }
             Ended::Failed(e) => {
-                tracing::debug!(error = %e, "the cloud bot's YouTube chat stream dropped");
+                read_note(st, sub, "stream_dropped", &e.to_string());
                 true
             }
             Ended::Idle => {
-                tracing::debug!("the cloud bot's YouTube chat stream went silent; opening it again");
+                read_note(st, sub, "stream_silent", "nothing for 90 s; opening it again");
                 idle_in_a_row += 1;
                 idle_in_a_row > 1
             }
-            Ended::Closed => false,
+            Ended::Closed => {
+                tracing::debug!("YouTube closed the cloud bot's chat stream; opening it again");
+                false
+            }
         };
         let streak = st.bot.yt(sub, |m| {
             if failed {
