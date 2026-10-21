@@ -1721,11 +1721,17 @@ pub fn fail_wait(streak: u32) -> Duration {
     (REOPEN_MIN * 2u32.pow((streak - 1).min(10))).min(FAIL_WAIT_MAX)
 }
 
-/// The channels YouTube checks look at: switched-on Pro subscriptions with a ready channel.
+/// The channels YouTube checks look at: Pro subscriptions with a ready channel whose cloud
+/// bot is switched on, or whose account uses cloud mode (its overlays show YouTube chat and
+/// alerts, docs/CLOUD.md §11; the bot itself still answers only when switched on).
 async fn channels(st: &AppState) -> Option<Vec<store::Channel>> {
     let work = super::db(st, |db| {
         let mut out = Vec::new();
-        for sub in db.bot_enabled_subs()? {
+        let mut subs = db.bot_enabled_subs()?;
+        subs.extend(db.cloud_youtube_subs()?);
+        subs.sort();
+        subs.dedup();
+        for sub in subs {
             if !super::sub_is_pro(db, &sub) {
                 continue;
             }
@@ -2030,7 +2036,15 @@ async fn read(st: &AppState, sub: &str, chat: &str, generation: u64) {
                             let s2 = sub.to_string();
                             let ch = super::db(st, move |db| db.bot_channel(&s2, "youtube")).await;
                             if let Ok(Some(ch)) = ch {
+                                let s3 = sub.to_string();
+                                let account =
+                                    super::db(st, move |db| db.cloud_account_for_sub(&s3)).await.ok().flatten();
                                 for e in batch.events {
+                                    // Cloud mode's bus too: the account's overlays, alerts and
+                                    // dashboard (it takes chat, Super Chats and memberships).
+                                    if let Some(a) = &account {
+                                        crate::cloud::ingest::youtube(st, a, &e);
+                                    }
                                     super::on_chat(st, &ch, Platform::Youtube, e).await;
                                 }
                             }

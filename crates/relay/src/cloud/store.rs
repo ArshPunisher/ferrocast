@@ -197,9 +197,18 @@ impl Db {
         s.query_map([], cloud_account)?.collect()
     }
 
-    pub(crate) fn cloud_set_install(&self, account: &str, install: &str) -> rusqlite::Result<()> {
-        self.c()
-            .execute("UPDATE cloud_accounts SET install_id = ?2 WHERE account_id = ?1", params![account, install])?;
+    /// Links a cloud install to the account unless it already has one; `false` then (another
+    /// request was first, and the caller drops the install it made).
+    pub(crate) fn cloud_set_install(&self, account: &str, install: &str) -> rusqlite::Result<bool> {
+        Ok(self.c().execute(
+            "UPDATE cloud_accounts SET install_id = ?2 WHERE account_id = ?1 AND install_id IS NULL",
+            params![account, install],
+        )? == 1)
+    }
+
+    /// Drops an install nothing uses (a cloud install that lost a race).
+    pub(crate) fn cloud_drop_install(&self, install: &str) -> rusqlite::Result<()> {
+        self.c().execute("DELETE FROM installs WHERE id = ?1", [install])?;
         Ok(())
     }
 
@@ -208,6 +217,25 @@ impl Db {
         self.c()
             .query_row("SELECT account_id FROM cloud_accounts WHERE install_id = ?1", [install], |r| r.get(0))
             .optional()
+    }
+
+    /// The account a Pro subscription is attached to.
+    pub(crate) fn cloud_account_for_sub(&self, sub: &str) -> rusqlite::Result<Option<String>> {
+        self.c().query_row("SELECT account_id FROM account_subs WHERE sub_id = ?1", [sub], |r| r.get(0)).optional()
+    }
+
+    /// Subscriptions with a YouTube channel whose account has cloud mode on and awake: their
+    /// YouTube chat is read for the cloud overlays even with the bot switched off (§11).
+    pub(crate) fn cloud_youtube_subs(&self) -> rusqlite::Result<Vec<String>> {
+        let c = self.c();
+        let mut q = c.prepare(
+            "SELECT DISTINCT s.sub_id FROM account_subs s
+               JOIN cloud_accounts c ON c.account_id = s.account_id AND c.sleeping_at IS NULL
+               JOIN accounts a ON a.id = s.account_id AND a.disabled_at IS NULL
+               JOIN bot_channels b ON b.sub_id = s.sub_id AND b.platform = 'youtube'
+              ORDER BY s.sub_id",
+        )?;
+        q.query_map([], |r| r.get(0))?.collect()
     }
 
     // ── Documents ────────────────────────────────────────────────────────────────────
@@ -298,6 +326,83 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(Write::Saved(version))
+    }
+
+    /// Makes a new document unless the account already has `cap` live ones of its kind (or
+    /// one with this id), counted and written in one transaction; `false` when over the cap.
+    pub(crate) fn cloud_create_capped(
+        &self,
+        account: &str,
+        kind: &str,
+        id: &str,
+        json: &str,
+        cap: i64,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM cloud_docs WHERE account_id = ?1 AND kind = ?2 AND deleted_at IS NULL",
+            params![account, kind],
+            |r| r.get(0),
+        )?;
+        if n >= cap {
+            return Ok(false);
+        }
+        let version: i64 = tx.query_row(
+            "UPDATE cloud_accounts SET version = version + 1 WHERE account_id = ?1 RETURNING version",
+            [account],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO cloud_docs(account_id, kind, id, version, created_at, updated_at, deleted_at, json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL, ?6)
+             ON CONFLICT(account_id, kind, id) DO UPDATE SET version = excluded.version, created_at = excluded.created_at,
+               updated_at = excluded.updated_at, deleted_at = NULL, json = excluded.json",
+            params![account, kind, id, version, now, json],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Reads and rewrites one live document in a single transaction, so nothing written in
+    /// between is lost (a goal's progress while the dashboard edits its title). `f` gets the
+    /// stored JSON and returns the new one, `Ok(None)` to leave it as it is, or its own error.
+    /// `Ok(Err(..))` carries `f`'s error; `Ok(Ok(None))`: no such document.
+    pub(crate) fn cloud_doc_edit<E>(
+        &self,
+        account: &str,
+        kind: &str,
+        id: &str,
+        now: i64,
+        f: impl FnOnce(&str) -> Result<Option<String>, E>,
+    ) -> rusqlite::Result<Result<Option<(i64, String)>, E>> {
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT version, json FROM cloud_docs WHERE account_id = ?1 AND kind = ?2 AND id = ?3 AND deleted_at IS NULL",
+                params![account, kind, id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((version, json)) = stored else { return Ok(Ok(None)) };
+        let next = match f(&json) {
+            Ok(Some(j)) => j,
+            Ok(None) => return Ok(Ok(Some((version, json)))),
+            Err(e) => return Ok(Err(e)),
+        };
+        let version: i64 = tx.query_row(
+            "UPDATE cloud_accounts SET version = version + 1 WHERE account_id = ?1 RETURNING version",
+            [account],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE cloud_docs SET version = ?4, updated_at = ?5, json = ?6 WHERE account_id = ?1 AND kind = ?2 AND id = ?3",
+            params![account, kind, id, version, now, next],
+        )?;
+        tx.commit()?;
+        Ok(Ok(Some((version, next))))
     }
 
     /// Old tombstones are forgotten.

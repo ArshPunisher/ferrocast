@@ -41,6 +41,8 @@ use crate::{ApiError, AppState, now_ms};
 
 /// The state's owner for a web connect (a channel id never looks like this).
 pub(crate) const WEB_OWNER: &str = "web";
+/// What a connect from the Cloud page keeps with its nonce: the finish goes back there.
+const CLOUD_PAGE: &str = "web_cloud";
 /// `pending_oauth` keys of a sign-in waiting for its finish on the web host.
 const PENDING_PREFIX: &str = "ytweb.";
 const PENDING_PURPOSE: &str = "youtube_web_pending";
@@ -71,7 +73,7 @@ fn see_other(to: &str) -> Response {
     r
 }
 
-fn not_set_up() -> ApiError {
+pub(crate) fn not_set_up() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
         "platform_unavailable",
@@ -80,13 +82,13 @@ fn not_set_up() -> ApiError {
     .hint("YouTube keeps working in the app on your PC. Try again later.")
 }
 
-fn pro_needed() -> ApiError {
+pub(crate) fn pro_needed() -> ApiError {
     ApiError::new(StatusCode::PAYMENT_REQUIRED, "pro_required", "YouTube from the cloud is part of Ferrocast Pro.")
         .hint("See Plans on the Account page. Twitch and Kick work in the cloud for free, and YouTube keeps working in the app.")
 }
 
 /// The account's Pro subscription, if it grants Pro now.
-fn account_pro(st: &AppState, account: &str) -> Result<Option<String>, ApiError> {
+pub(crate) fn account_pro(st: &AppState, account: &str) -> Result<Option<String>, ApiError> {
     let now = now_ms();
     Ok(st
         .db
@@ -104,7 +106,7 @@ fn channel_json(ch: &store::Channel) -> Value {
     })
 }
 
-fn view_json(st: &AppState, account: &str) -> Result<Value, ApiError> {
+pub(crate) fn view_json(st: &AppState, account: &str) -> Result<Value, ApiError> {
     let available = st.bot.youtube_cfg().is_some() && st.vault().is_ok();
     let Some(sub) = account_pro(st, account)? else {
         return Ok(json!({ "available": available, "pro": false, "bot_on": false, "channel": null, "quota": null }));
@@ -147,15 +149,17 @@ fn body<T: serde::de::DeserializeOwned + Default>(headers: &HeaderMap, raw: &[u8
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid", format!("The request isn't right: {e}")))
 }
 
-/// Google's consent page for this account.
-pub(crate) fn auth_url(
+/// Google's consent page; `cloud`: started on the Cloud page, so the finish goes back there.
+fn auth_url(
     st: &AppState,
     cfg: &YoutubeConfig,
     account: &str,
     moderation: bool,
+    cloud: bool,
 ) -> Result<String, ApiError> {
     let nonce = crate::random(12);
-    st.db.put_oauth(&format!("{NONCE_PREFIX}{nonce}"), account, WEB_OWNER).map_err(ApiError::db)?;
+    let kept = if cloud { CLOUD_PAGE } else { WEB_OWNER };
+    st.db.put_oauth(&format!("{NONCE_PREFIX}{nonce}"), account, kept).map_err(ApiError::db)?;
     let mut url = url::Url::parse(AUTHORIZE_URL).map_err(|_| not_set_up())?;
     url.query_pairs_mut()
         .append_pair("client_id", &cfg.client_id)
@@ -173,12 +177,20 @@ pub(crate) fn auth_url(
 async fn connect(State(st): State<AppState>, headers: HeaderMap, raw: axum::body::Bytes) -> Result<Response, ApiError> {
     let a = web_session_write(&st, &headers)?;
     let b: ConnectIn = body(&headers, &raw)?;
+    let url = connect_url(&st, &a.account.id, b.moderation, false)?;
+    Ok(no_store(json!({ "flow": "browser", "url": url })))
+}
+
+/// Checks and makes a web connect's consent link (the Account page's, or the Cloud page's
+/// with `cloud`): 503 without the "Ferrocast Cloud (YouTube)" client or the vault, 402
+/// without Pro, 429 after 20 in an hour.
+pub(crate) fn connect_url(st: &AppState, account: &str, moderation: bool, cloud: bool) -> Result<String, ApiError> {
     let cfg = st.bot.youtube_cfg().ok_or_else(not_set_up)?.clone();
-    st.vault()?;
-    if account_pro(&st, &a.account.id)?.is_none() {
+    st.vault().map_err(|_| not_set_up())?;
+    if account_pro(st, account)?.is_none() {
         return Err(pro_needed());
     }
-    if let Err(wait) = st.accounts.take("youtube_connect", &a.account.id, 20, 3_600_000) {
+    if let Err(wait) = st.accounts.take("youtube_connect", account, 20, 3_600_000) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -187,8 +199,7 @@ async fn connect(State(st): State<AppState>, headers: HeaderMap, raw: axum::body
         .hint("Wait a little and press Connect again.")
         .header(header::RETRY_AFTER, wait.to_string()));
     }
-    let url = auth_url(&st, &cfg, &a.account.id, b.moderation)?;
-    Ok(no_store(json!({ "flow": "browser", "url": url })))
+    auth_url(st, &cfg, account, moderation, cloud)
 }
 
 /// What waits for the finish (sealed for the account).
@@ -201,6 +212,9 @@ struct Pending {
     key_v: i64,
     nonce: String,
     ct: String,
+    /// Started on the Cloud page: the finish goes back there.
+    #[serde(default)]
+    cloud: bool,
 }
 
 fn b64() -> base64::engine::GeneralPurpose {
@@ -230,8 +244,8 @@ const TRY_SHORTLY: &str = "Ferrocast couldn't save that. Press Connect YouTube a
 pub(crate) async fn callback(st: &AppState, s: StateInfo, code: &str) -> Response {
     let page = crate::page;
     let account = s.install.clone();
-    match st.db.take_oauth(&format!("{NONCE_PREFIX}{}", s.nonce)) {
-        Ok(Some((a, owner))) if a == account && owner == WEB_OWNER => {}
+    let cloud = match st.db.take_oauth(&format!("{NONCE_PREFIX}{}", s.nonce)) {
+        Ok(Some((a, owner))) if a == account && (owner == WEB_OWNER || owner == CLOUD_PAGE) => owner == CLOUD_PAGE,
         Ok(_) => {
             return page(
                 StatusCode::BAD_REQUEST,
@@ -239,7 +253,7 @@ pub(crate) async fn callback(st: &AppState, s: StateInfo, code: &str) -> Respons
             );
         }
         Err(_) => return page(StatusCode::SERVICE_UNAVAILABLE, TRY_SHORTLY),
-    }
+    };
     let Ok(api) = st.bot.youtube() else {
         return page(StatusCode::SERVICE_UNAVAILABLE, "YouTube from the cloud isn't set up on this relay yet.");
     };
@@ -295,6 +309,7 @@ pub(crate) async fn callback(st: &AppState, s: StateInfo, code: &str) -> Respons
         key_v: sealed.key_v,
         nonce: b64().encode(&sealed.nonce),
         ct: b64().encode(&sealed.ct),
+        cloud,
     };
     let finish = crate::random(32);
     let saved = serde_json::to_string(&pending).ok().is_some_and(|p| {
@@ -369,6 +384,7 @@ async fn finish(State(st): State<AppState>, headers: HeaderMap, Query(q): Query<
         Err(_) => return page(StatusCode::SERVICE_UNAVAILABLE, TRY_SHORTLY),
     };
     match bind(&st, &sub, &p, &refresh).await {
+        Ok(()) if p.cloud => see_other(&format!("{}/app/#/cloud?connected=youtube", crate::accounts::web_origin(&st))),
         Ok(()) => see_other(&format!("{}/app/#/account?youtube=connected", crate::accounts::web_origin(&st))),
         Err(()) => {
             give_back(&st, Some(&p.channel_id), &refresh).await;

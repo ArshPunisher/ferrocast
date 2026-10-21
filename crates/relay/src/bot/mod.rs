@@ -908,6 +908,19 @@ fn load_config(st: &AppState, sub: &str) -> Option<i64> {
         return Some(v);
     }
     let row = st.db.bot_config(sub).ok().flatten()?;
+    // No PC ever pushed this subscription's config (version 0): its YouTube bot uses the
+    // cloud mode account's Bot page (docs/CLOUD.md §11), not an empty config.
+    if row.version == 0
+        && !crate::cloud::is_account_key(sub)
+        && let Some(cfg) = account_config_for_sub(st, sub)
+    {
+        st.bot.mem(sub, |m| {
+            if m.config.is_none() {
+                m.config = Some((0, cfg));
+            }
+        });
+        return Some(0);
+    }
     let mut cfg: BotConfig = serde_json::from_str(&row.json).unwrap_or_default();
     overlay_changes(&mut cfg, &st.db.bot_counter_changes(sub).unwrap_or_default());
     let v = row.version;
@@ -1985,17 +1998,104 @@ pub async fn sweep(st: &AppState) {
 /// so no PC code.
 pub(crate) fn account_view(st: &AppState, account: &str) -> Result<Value, ApiError> {
     let mut v = view(st, account, "")?;
+    // YouTube (Pro) is bound to the account's subscription: whether its bot follows this page.
+    let yt = youtube::web::view_json(st, account)?;
+    let follows = youtube_follows_account(st, account).is_some();
+    let own = st.db.bot_channels(account).map_err(ApiError::db)?.iter().any(store::Channel::ready);
     if let Some(o) = v.as_object_mut() {
         o.remove("pc_code");
+        if follows && !own {
+            // Only YouTube: the one switch is YouTube's bot.
+            o.insert("enabled".into(), yt["bot_on"].clone());
+        }
+        o.insert(
+            "youtube".into(),
+            json!({ "channel": yt["channel"], "bot_on": yt["bot_on"], "pro": yt["pro"], "follows_this_page": follows }),
+        );
     }
     Ok(v)
 }
 
-/// Switches a cloud mode account's bot on or off (the web dashboard's Bot page).
+/// Switches a cloud mode account's bot on or off (the web dashboard's Bot page). For an
+/// account whose YouTube bot follows the Bot page ([`youtube_follows_account`]), its YouTube
+/// bot switches with it.
 pub(crate) async fn account_set_enabled(st: &AppState, account: &str, enabled: bool) -> Result<Value, ApiError> {
     let ctx = ProCtx { install: String::new(), sub_id: account.to_string() };
-    set_enabled(st, &ctx, enabled).await?;
+    let yt = youtube_follows_account(st, account);
+    // With only YouTube connected, the account key has no channel: the switch is YouTube's.
+    let own = st.db.bot_channels(account).map_err(ApiError::db)?.iter().any(store::Channel::ready);
+    if own || yt.is_none() || !enabled {
+        set_enabled(st, &ctx, enabled).await?;
+    }
+    if let Some(sub) = yt {
+        let ctx = ProCtx { install: String::new(), sub_id: sub };
+        match set_enabled(st, &ctx, enabled).await {
+            Ok(_) => {}
+            // Twitch or Kick switched already: YouTube's own problem (a sign-in it needs)
+            // shows on its channel, the switch still answers.
+            Err(err) if own => {
+                tracing::info!(error = err.message(), "the YouTube bot didn't switch with the Bot page")
+            }
+            Err(err) => return Err(err),
+        }
+    }
     account_view(st, account)
+}
+
+/// The Pro subscription whose YouTube bot follows a cloud mode account's Bot page: the
+/// account's Pro subscription with a YouTube channel and **no PC** linked to it (docs/
+/// CLOUD.md §11). With a PC, its pushed config stays the YouTube bot's (the PC is where the
+/// streamer edits it), so the Bot page never overwrites it.
+pub(crate) fn youtube_follows_account(st: &AppState, account: &str) -> Option<String> {
+    let sub = youtube::web::account_pro(st, account).ok().flatten()?;
+    st.db.bot_channel(&sub, "youtube").ok().flatten()?;
+    let no_pc = st.db.pro_installs(&sub).ok()? == 0;
+    // A PC is linked but never pushed a config: until it does, this page's is YouTube's.
+    let never_pushed = st.db.bot_config(&sub).ok()?.is_none_or(|r| r.version == 0);
+    (no_pc || never_pushed).then_some(sub)
+}
+
+/// The cloud mode account's Bot page config for a subscription attached to it (cloud mode
+/// on), as the bot runs it (its own switch is the one switch, so `bot_on`).
+fn account_config_for_sub(st: &AppState, sub: &str) -> Option<BotConfig> {
+    let account = st.db.cloud_account_for_sub(sub).ok().flatten()?;
+    st.db.cloud_account(&account).ok().flatten()?;
+    let row = st.db.bot_config(&account).ok().flatten()?;
+    let mut cfg: BotConfig = serde_json::from_str(&row.json).ok()?;
+    cfg.bot_on = true;
+    Some(cfg)
+}
+
+/// The YouTube bot's config follows the account's (no PC): the same commands, timers and
+/// replies under the subscription's key. A failure is logged; the account's save stands.
+fn mirror_to_youtube(st: &AppState, account: &str, cfg: &BotConfig) {
+    let Some(sub) = youtube_follows_account(st, account) else { return };
+    if st.db.pro_installs(&sub).ok() != Some(0) {
+        // A PC could still push its own; until it does, the YouTube bot reads this page's
+        // config (`load_config`), so nothing is written under the subscription.
+        st.bot.mem(&sub, |m| m.config = Some((0, cfg.clone())));
+        return;
+    }
+    let Ok(json) = serde_json::to_string(cfg) else { return };
+    for _ in 0..2 {
+        let base = st.db.bot_config(&sub).ok().flatten().map_or(0, |r| r.version);
+        match st.db.bot_push_config(&sub, base, &json, 0, now_ms()) {
+            Ok(version) => {
+                let mut c = cfg.clone();
+                if let Ok(changes) = st.db.bot_counter_changes(&sub) {
+                    overlay_changes(&mut c, &changes);
+                }
+                st.bot.mem(&sub, |m| m.config = Some((version, c)));
+                return;
+            }
+            Err(store::PushErr::Stale(_)) => continue,
+            Err(store::PushErr::Db(e)) => {
+                tracing::warn!(error = %e, "couldn't copy the Bot page's settings to the YouTube bot");
+                return;
+            }
+        }
+    }
+    tracing::warn!("the YouTube bot's settings kept changing; the Bot page's save wasn't copied to it");
 }
 
 /// A cloud mode account's bot settings and their version (none saved yet: version 0).
@@ -2036,7 +2136,79 @@ pub(crate) fn account_save_config(
         }
         Err(store::PushErr::Db(e)) => return Err(ApiError::db(e)),
     };
+    mirror_to_youtube(st, account, &cfg);
     overlay_changes(&mut cfg, &st.db.bot_counter_changes(account).map_err(ApiError::db)?);
     st.bot.mem(account, |m| m.config = Some((version, cfg)));
     Ok(version)
+}
+
+/// Most characters one chat message may carry per platform (YouTube's is the shortest).
+fn chat_limit(p: Platform) -> usize {
+    if p == Platform::Youtube { 200 } else { 500 }
+}
+
+/// `text` cut into chat messages of at most `max` characters, at spaces where it can.
+pub(crate) fn split_chat(text: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_string();
+        while word.chars().count() > max {
+            let head: String = word.chars().take(max).collect();
+            word = word.chars().skip(max).collect();
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push(head);
+        }
+        let need = cur.chars().count() + usize::from(!cur.is_empty()) + word.chars().count();
+        if need > max && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(&word);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Posts a message as the streamer in a cloud mode account's chats (a poll, a giveaway, its
+/// winner; docs/CLOUD.md §7.2), through the cloud bot: only where the bot is on and the cloud
+/// has the chat (no PC answering), counted against its 20 messages a minute. `true` when it
+/// reached at least one chat. YouTube is the account's subscription's bot when it follows the
+/// Bot page.
+pub(crate) async fn announce(st: &AppState, account: &str, text: &str) -> bool {
+    let text = ferrocast_core::command::safe_reply(text);
+    if text.is_empty() {
+        return false;
+    }
+    let mut keys = vec![account.to_string()];
+    if let Some(sub) = youtube_follows_account(st, account) {
+        keys.push(sub);
+    }
+    let mut posted = false;
+    for key in keys {
+        let k2 = key.clone();
+        if !matches!(db(st, move |db| sub_is_on(db, &k2)).await, Ok(true)) {
+            continue;
+        }
+        for ch in st.db.bot_channels(&key).unwrap_or_default() {
+            let Some(p) = platform_from_key(&ch.platform) else { continue };
+            // The subscription only speaks for YouTube here; Twitch and Kick are the account's.
+            if !ch.ready() || (key != account && p != Platform::Youtube) || cloud_since(st, &key, p).is_none() {
+                continue;
+            }
+            for chunk in split_chat(&text, chat_limit(p)) {
+                if !say(st, &ch, p, &chunk, None).await {
+                    break;
+                }
+                posted = true;
+            }
+        }
+    }
+    posted
 }

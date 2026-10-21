@@ -95,19 +95,14 @@ fn label(platform: &str) -> &'static str {
     }
 }
 
-/// `twitch` or `kick`; YouTube in the cloud is Pro (§11, built separately).
+/// `twitch`, `kick` or `youtube` (YouTube in the cloud is Pro: §11).
 fn platform_of(raw: &str) -> Result<&'static str, ApiError> {
     match raw {
         "twitch" => Ok("twitch"),
         "kick" => Ok("kick"),
-        "youtube" => {
-            Err(e(StatusCode::PAYMENT_REQUIRED, "pro_required", "YouTube in cloud mode is part of Ferrocast Pro.")
-                .hint("Twitch and Kick are free. YouTube keeps working in the app on your PC."))
-        }
-        _ => {
-            Err(e(StatusCode::NOT_FOUND, "not_found", "Cloud mode connects Twitch and Kick.")
-                .hint("Pick Twitch or Kick."))
-        }
+        "youtube" => Ok("youtube"),
+        _ => Err(e(StatusCode::NOT_FOUND, "not_found", "Cloud mode connects Twitch, Kick and YouTube.")
+            .hint("Pick Twitch, Kick or YouTube.")),
     }
 }
 
@@ -151,6 +146,12 @@ async fn connect(
 ) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, true)?;
     let p = platform_of(&platform)?;
+    if p == "youtube" {
+        // Pro: the account's subscription's YouTube binding (§11), Google's consent page with
+        // a finish that comes back to the Cloud page.
+        let url = crate::bot::youtube::web::connect_url(&st, &a.account.id, false, true)?;
+        return Ok(json(json!({ "flow": "browser", "url": url })));
+    }
     // The sign-in is kept sealed: no vault, no connecting.
     st.vault()?;
     let state = format!("{STATE_PREFIX}{}", crate::random(24));
@@ -544,6 +545,21 @@ async fn disconnect(
 ) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, true)?;
     let p = platform_of(&platform)?;
+    if p == "youtube" {
+        // Bound to the account's subscription (open after Pro ends, R-04).
+        let sub = st.db.account_sub(&a.account.id, now_ms()).map_err(ApiError::db)?.map(|s| s.id);
+        let bound = match &sub {
+            Some(sub) => st.db.bot_channel(sub, "youtube").map_err(ApiError::db)?.is_some(),
+            None => false,
+        };
+        let Some(sub) = sub.filter(|_| bound) else {
+            return Err(
+                e(StatusCode::NOT_FOUND, "not_found", "YouTube isn't connected.").hint("Connect it on the Cloud page.")
+            );
+        };
+        crate::bot::disconnect_platform(&st, &sub, Platform::Youtube).await;
+        return Ok(no_store(StatusCode::NO_CONTENT.into_response()));
+    }
     if !unbind(&st, &a.account.id, p).await? {
         return Err(e(StatusCode::NOT_FOUND, "not_found", format!("{} isn't connected in cloud mode.", label(p)))
             .hint("Connect it on the Cloud page."));

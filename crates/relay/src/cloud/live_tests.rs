@@ -18,13 +18,13 @@ use super::tests::{KICK_CHANNEL, User, World, admin_token, kick_key, world};
 use crate::bot::tests::{ES_SECRET, STREAMER_ID};
 use crate::now_ms;
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub(super) type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const OVERLAY_HOST: &str = "overlays.test";
 
 impl World {
     /// The account's first overlay: id and token.
-    async fn first_overlay(&self, u: &User) -> (String, String) {
+    pub(super) async fn first_overlay(&self, u: &User) -> (String, String) {
         let (_, list) = self.web(u, Method::GET, "/c/api/v1/overlays", None).await;
         let url = list[0]["url"].as_str().unwrap();
         let token = url.strip_prefix("http://overlays.test/o/").unwrap().trim_end_matches('/').to_string();
@@ -32,11 +32,11 @@ impl World {
     }
 
     /// A GET on the overlay origin.
-    async fn overlay_get(&self, path: &str) -> reqwest::Response {
+    pub(super) async fn overlay_get(&self, path: &str) -> reqwest::Response {
         self.http.get(format!("{}{path}", self.base)).header("host", OVERLAY_HOST).send().await.unwrap()
     }
 
-    async fn open_socket(&self, token: &str, query: &str) -> Ws {
+    pub(super) async fn open_socket(&self, token: &str, query: &str) -> Ws {
         let url = format!("{}/o/{token}/ws{query}", self.base.replacen("http", "ws", 1));
         let mut req = url.into_client_request().unwrap();
         req.headers_mut().insert("host", OVERLAY_HOST.parse().unwrap());
@@ -44,7 +44,7 @@ impl World {
     }
 
     /// Binds the streamer's Twitch and Kick channels to `u` (as a finished connect does).
-    fn bind_channels(&self, u: &User) {
+    pub(super) fn bind_channels(&self, u: &User) {
         for (platform, id, login) in [("twitch", STREAMER_ID, "asha_live"), ("kick", KICK_CHANNEL, "asha_kick")] {
             self.db
                 .cloud_bind_channel(&Channel {
@@ -63,7 +63,7 @@ impl World {
         }
     }
 
-    async fn twitch_event(&self, msg_id: &str, kind: &str, event: Value) -> u16 {
+    pub(super) async fn twitch_event(&self, msg_id: &str, kind: &str, event: Value) -> u16 {
         let cond = if kind == "channel.raid" {
             json!({ "to_broadcaster_user_id": STREAMER_ID })
         } else {
@@ -92,7 +92,7 @@ impl World {
             .as_u16()
     }
 
-    async fn kick_event(&self, msg_id: &str, ty: &str, body: Value) -> u16 {
+    pub(super) async fn kick_event(&self, msg_id: &str, ty: &str, body: Value) -> u16 {
         use rsa::signature::{SignatureEncoding, Signer};
         let body = body.to_string();
         let ts = rfc3339_now();
@@ -123,7 +123,7 @@ fn rfc3339_now() -> String {
 }
 
 /// The next text frame (5 s at most), as JSON.
-async fn next(ws: &mut Ws) -> Value {
+pub(super) async fn next(ws: &mut Ws) -> Value {
     loop {
         let m = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a frame in time");
         match m {
@@ -136,7 +136,7 @@ async fn next(ws: &mut Ws) -> Value {
 }
 
 /// The next frame of `kind`, skipping others.
-async fn next_of(ws: &mut Ws, kind: &str) -> Value {
+pub(super) async fn next_of(ws: &mut Ws, kind: &str) -> Value {
     for _ in 0..20 {
         let f = next(ws).await;
         if f["type"] == kind || f["type"] == "closed" {

@@ -36,6 +36,8 @@ pub const IDLE_DROP_MS: i64 = 10 * 60_000;
 /// Overlay sockets per account, and per overlay (docs/CLOUD.md §5).
 pub const SOCKETS_PER_ACCOUNT: usize = 20;
 pub const SOCKETS_PER_OVERLAY: usize = 4;
+/// How long an open giveaway keeps an idle bus in memory.
+pub const GIVEAWAY_HELD_MS: i64 = 24 * 3_600_000;
 /// The longest the queue's timer sleeps without looking.
 const MAX_IDLE: Duration = Duration::from_secs(30);
 
@@ -54,6 +56,8 @@ pub enum Audience {
     Labels,
     /// The web dashboard's live socket.
     Dashboard,
+    /// Overlays with a widget of this kind (polls, giveaways).
+    Widget(WidgetKind),
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +179,25 @@ pub struct BusState {
     pub live: BTreeMap<String, bool>,
     /// Designs the designer's "Send test alert" asked for, by the test event's key.
     test_designs: VecDeque<(String, Design)>,
+    /// The account's goals with their progress (`None` until read; `goals::load`).
+    pub goals: Option<Vec<ferrocast_core::goal::Goal>>,
+    /// The running poll or giveaway, or the last one (memory only, as in the app).
+    pub poll: Option<ferrocast_core::poll::Poll>,
+    pub giveaway: Option<ferrocast_core::giveaway::Giveaway>,
+    /// Votes or entries came in since the last push; a push is already waiting.
+    pub community_dirty: bool,
+    pub community_flush: bool,
+}
+
+impl BusState {
+    /// A poll is open, or a giveaway takes entries and started less than a day ago: the bus
+    /// stays in memory (it holds them). A giveaway left open longer may be dropped with its
+    /// bus, as a relay restart would.
+    pub fn holds_community(&self) -> bool {
+        let now = Millis(now_ms());
+        self.poll.as_ref().is_some_and(|p| p.is_open(now))
+            || self.giveaway.as_ref().is_some_and(|g| g.open && now.0 - g.started_at.0 < GIVEAWAY_HELD_MS)
+    }
 }
 
 impl BusState {
@@ -269,6 +292,11 @@ impl Bus {
                 cache: None,
                 live: BTreeMap::new(),
                 test_designs: VecDeque::new(),
+                goals: None,
+                poll: None,
+                giveaway: None,
+                community_dirty: false,
+                community_flush: false,
             }),
             wake: Notify::new(),
             last_used: AtomicI64::new(now_ms()),
@@ -408,7 +436,10 @@ impl Buses {
         if map.len() >= max.max(1) {
             let idle = map
                 .iter()
-                .filter(|(_, b)| b.state().socket_count() == 0 && b.state().dashboards == 0)
+                .filter(|(_, b)| {
+                    let s = b.state();
+                    s.socket_count() == 0 && s.dashboards == 0 && !s.holds_community()
+                })
                 .min_by_key(|(_, b)| b.idle_since())
                 .map(|(k, _)| k.clone());
             match idle {
@@ -431,7 +462,7 @@ impl Buses {
         let before = map.len();
         map.retain(|_, b| {
             let st = b.state();
-            st.socket_count() > 0 || st.dashboards > 0 || now - b.idle_since() < IDLE_DROP_MS
+            st.socket_count() > 0 || st.dashboards > 0 || st.holds_community() || now - b.idle_since() < IDLE_DROP_MS
         });
         before - map.len()
     }
@@ -448,7 +479,9 @@ impl Buses {
     /// The documents an account's pipeline reads changed: read them again next time.
     pub fn forget_cache(&self, account: &str) {
         if let Some(b) = self.get(account) {
-            b.state().cache = None;
+            let mut s = b.state();
+            s.cache = None;
+            s.goals = None;
         }
     }
 }

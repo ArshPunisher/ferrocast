@@ -65,7 +65,9 @@ async fn pull(
     let c = super::must_be_on(&st, &a.account.id)?;
     let list = st.db.cloud_changes(&a.account.id, since.max(0), PAGE + 1).map_err(ApiError::db)?;
     let more = list.len() as i64 > PAGE;
-    let docs: Vec<Value> = list.iter().take(PAGE as usize).map(doc_json).collect();
+    // Only what the app syncs: goals live in the cloud alone (the app counts its own).
+    let docs: Vec<Value> =
+        list.iter().take(PAGE as usize).filter(|d| KINDS.contains(&d.kind.as_str())).map(doc_json).collect();
     // With more to come, the version to ask from next is the last one sent.
     let version = if more { list.get(PAGE as usize - 1).map_or(c.version, |d| d.version) } else { c.version };
     Ok(json(json!({ "version": version, "more": more, "docs": docs })))

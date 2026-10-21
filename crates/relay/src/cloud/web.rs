@@ -41,7 +41,7 @@ pub(super) fn routes() -> Router<AppState> {
 async fn not_in_cloud(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
     web_account(&st, &headers, &method, false)?;
     Err(super::e(StatusCode::NOT_FOUND, "not_in_cloud", "That needs the Ferrocast app on your PC.")
-        .hint("Cloud mode runs alerts, designs, overlays, chat and the bot. The rest stays in the app."))
+        .hint("Cloud mode runs alerts, designs, overlays, chat, the bot, tips, goals, polls and giveaways. The rest stays in the app."))
 }
 
 // ── Cloud mode itself ────────────────────────────────────────────────────────────────
@@ -57,11 +57,12 @@ pub(crate) fn summary_json(st: &AppState, account: &str) -> Result<Value, ApiErr
             "overlays": st.db.cloud_doc_count(account, docs::OVERLAY).map_err(ApiError::db)?,
             "rules": st.db.cloud_doc_count(account, docs::RULE).map_err(ApiError::db)?,
             "designs": st.db.cloud_doc_count(account, docs::DESIGN).map_err(ApiError::db)?,
+            "goals": super::goals::count(st, account)?,
         })
     } else {
         Value::Null
     };
-    let channels: Vec<Value> = st
+    let mut channels: Vec<Value> = st
         .db
         .cloud_channels(account)
         .map_err(ApiError::db)?
@@ -71,6 +72,10 @@ pub(crate) fn summary_json(st: &AppState, account: &str) -> Result<Value, ApiErr
                     "connected_at": c.connected_at, "error": c.error.and_then(|e| serde_json::from_str::<Value>(&e).ok()) })
         })
         .collect();
+    let youtube = youtube_view(st, account)?;
+    if let Some(ch) = youtube_channel(st, account)? {
+        channels.push(ch);
+    }
     Ok(json!({
         "enabled": enabled,
         "sleeping": row.as_ref().is_some_and(|r| r.sleeping_at.is_some()),
@@ -79,12 +84,42 @@ pub(crate) fn summary_json(st: &AppState, account: &str) -> Result<Value, ApiErr
         "usage": usage,
         "limits": {
             "bytes": super::STORAGE_LIMIT, "file_bytes": super::FILE_LIMIT, "overlays": super::MAX_OVERLAYS,
-            "rules": super::MAX_RULES, "designs": super::MAX_DESIGNS, "history_days": super::HISTORY_MS / 86_400_000,
+            "rules": super::MAX_RULES, "designs": super::MAX_DESIGNS, "goals": super::goals::MAX_GOALS, "history_days": super::HISTORY_MS / 86_400_000,
             "sleep_after_days": super::SLEEP_AFTER_MS / 86_400_000,
         },
         "channels": channels,
-        "features": { "twitch": st.bot.twitch_cfg().is_some(), "kick": st.cfg.kick_client_id.is_some(), "youtube": false },
+        "features": { "twitch": st.bot.twitch_cfg().is_some(), "kick": st.cfg.kick_client_id.is_some(),
+                      "youtube": youtube["available"].as_bool().unwrap_or(false) },
+        "youtube": youtube,
     }))
+}
+
+/// YouTube in cloud mode (Pro, §11): `{ available, pro, bot_on, channel, quota }` from the
+/// account's subscription. `available` is false until the relay has the "Ferrocast Cloud
+/// (YouTube)" client and the vault.
+fn youtube_view(st: &AppState, account: &str) -> Result<Value, ApiError> {
+    crate::bot::youtube::web::view_json(st, account)
+}
+
+/// The account's YouTube channel as a cloud channel row, bound to its subscription (also
+/// after Pro ends, so it can be disconnected; it then says why it stopped).
+fn youtube_channel(st: &AppState, account: &str) -> Result<Option<Value>, ApiError> {
+    let now = now_ms();
+    let Some(sub) = st.db.account_sub(account, now).map_err(ApiError::db)? else { return Ok(None) };
+    let Some(ch) = st.db.bot_channel(&sub.id, "youtube").map_err(ApiError::db)? else { return Ok(None) };
+    let pro = crate::billing::access::is_pro(&sub.access(), now);
+    let error = if !pro {
+        json!({ "code": "pro_required", "message": "YouTube in cloud mode stopped because Pro ended.",
+                "hint": "Renew Pro on the Account page, or disconnect YouTube here." })
+    } else {
+        ch.error
+            .clone()
+            .map(|e| json!({ "code": e["code"], "message": e["message"], "hint": e["hint"] }))
+            .unwrap_or(Value::Null)
+    };
+    let title = ch.channel_login.clone().unwrap_or_default();
+    Ok(Some(json!({ "platform": "youtube", "login": title, "name": ch.channel_login, "avatar_url": null,
+                    "connected_at": ch.connected_at, "error": error })))
 }
 
 /// `GET /c/v1/cloud`
@@ -116,8 +151,19 @@ async fn enable(State(st): State<AppState>, method: Method, headers: HeaderMap) 
 /// live from the bus.
 pub(crate) fn status_json(st: &AppState, account: &str) -> Result<Value, ApiError> {
     let channels = st.db.cloud_channels(account).map_err(ApiError::db)?;
+    let youtube = youtube_channel(st, account)?;
     let live = st.cloud.buses.get(account).map(|b| b.state().live.clone()).unwrap_or_default();
     let connector = |p: &str| {
+        if p == "youtube" {
+            return match &youtube {
+                Some(y) => json!({
+                    "state": if y["error"].is_null() { "connected" } else { "sign_in_needed" },
+                    "account": { "name": y["login"], "avatar_url": null },
+                    "detail": y["error"]["message"], "last_event_at": null,
+                }),
+                None => json!({ "state": "off", "account": null, "detail": null, "last_event_at": null }),
+            };
+        }
         let ch = channels.iter().find(|c| c.platform == p);
         match ch {
             Some(c) => json!({

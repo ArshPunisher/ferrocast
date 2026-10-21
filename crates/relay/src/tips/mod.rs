@@ -432,13 +432,19 @@ fn public_config(cfg: &TipConfig) -> Value {
 pub async fn save_config(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Body(mut cfg): Body<TipConfig>,
+    Body(cfg): Body<TipConfig>,
 ) -> Result<Response, ApiError> {
     let install = authed(&st, &headers)?;
-    let stored = config_for(&st, &install);
+    Ok(axum::Json(save_for(&st, &install, cfg)?).into_response())
+}
+
+/// Checks and saves an install's tip page (a PC's, or a cloud account's cloud install):
+/// `{ config, page_url, webhooks }`, secrets never in it.
+pub(crate) fn save_for(st: &AppState, install: &str, mut cfg: TipConfig) -> Result<Value, ApiError> {
+    let stored = config_for(st, install);
     cfg.prepare(stored.as_ref()).map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, "invalid", m))?;
     let json = serde_json::to_string(&cfg).unwrap_or_default();
-    match st.db.set_tip_config(&install, &cfg.handle, &json, HANDLE_HOLD_MS, HANDLE_CHANGES_PER_DAY) {
+    match st.db.set_tip_config(install, &cfg.handle, &json, HANDLE_HOLD_MS, HANDLE_CHANGES_PER_DAY) {
         Ok(Saved::Yes) => {}
         Ok(Saved::Taken) => {
             return Err(ApiError::new(StatusCode::CONFLICT, "taken", "That tip page name is taken.")
@@ -454,17 +460,25 @@ pub async fn save_config(
         }
         Err(e) => return Err(ApiError::db(e)),
     }
+    Ok(saved_view(st, install, &cfg))
+}
+
+fn saved_view(st: &AppState, install: &str, cfg: &TipConfig) -> Value {
     let base = &st.cfg.public_url;
-    Ok(axum::Json(json!({
-        "config": public_config(&cfg),
+    json!({
+        "config": public_config(cfg),
         "page_url": page_url(&st.cfg, &cfg.handle),
         "webhooks": {
             "razorpay": format!("{base}/v1/tips/razorpay/{install}"),
             "kofi": format!("{base}/v1/tips/kofi/{install}"),
             "stripe": format!("{base}/v1/tips/stripe/{install}"),
         }
-    }))
-    .into_response())
+    })
+}
+
+/// An install's saved tip page as `{ config, page_url, webhooks }`, or `None` without one.
+pub(crate) fn saved_for(st: &AppState, install: &str) -> Option<Value> {
+    config_for(st, install).map(|cfg| saved_view(st, install, &cfg))
 }
 
 /// `DELETE /v1/tips/config`: takes the page down (the name stays held for its owner).
@@ -705,17 +719,27 @@ fn queue_tip(st: &AppState, install: &str, n: Notice<'_>) -> Response {
         "amount_minor": n.amount_minor, "digits": n.digits, "amount": n.amount, "currency": n.currency.to_ascii_uppercase(),
         "name": if name.is_empty() { "Someone".to_string() } else { name }, "message": clean_text(n.message, 300), "at": now_ms(),
     });
-    if let Err(e) = st.enqueue(install, "tip", &payload) {
+    // A cloud install has no PC to deliver to: its tips go to the account's bus only.
+    let cloud = matches!(st.db.cloud_account_by_install(install), Ok(Some(_)));
+    if let Err(e) = if cloud { Ok(()) } else { st.enqueue(install, "tip", &payload) } {
         // Let the provider's retry try again.
         if let Err(err) = st.db.unsee(&key) {
             tracing::error!(error = %err, "couldn't release a tip id after a failed enqueue");
         }
         return e.into_response();
     }
+    // Cloud mode: the account's own overlays alert it too (docs/CLOUD.md §7). A cloud install
+    // has no PC queue, so a tip the cloud can't take now is given back for the retry.
+    if !crate::cloud::ingest::tip(st, install, &payload) {
+        if let Err(err) = st.db.unsee(&key) {
+            tracing::error!(error = %err, "couldn't release a tip id after a full cloud queue");
+        }
+        return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "Ferrocast is busy right now.")
+            .hint("The payment provider sends this notice again on its own.")
+            .into_response();
+    }
     // Pro: count it towards the goal page (or take a refunded one back).
     goal::record(st, install, &n);
-    // Cloud mode: the account's own overlays alert it too (docs/CLOUD.md §7).
-    crate::cloud::ingest::tip(st, install, &payload);
     StatusCode::OK.into_response()
 }
 

@@ -30,7 +30,6 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/c/api/v1/queue/{op}", post(queue_op))
         .route("/c/api/v1/queue/{alert_id}/remove", post(queue_remove))
         .route("/c/api/v1/themes", get(themes))
-        .route("/c/api/v1/goals", get(goals))
         .route("/c/api/v1/events", get(events))
         .route("/c/api/v1/chat", get(chat))
         .route("/c/api/v1/live", get(live))
@@ -159,13 +158,6 @@ async fn themes(State(st): State<AppState>, method: Method, headers: HeaderMap) 
         .map(|(id, name, description)| json!({ "id": id, "name": name, "description": description, "pro": false }))
         .collect();
     Ok(json(json!(list)))
-}
-
-/// Goals need the app on a PC in 1.4 (they're counted from its event log): none here, so the
-/// overlay editor's goal picker is simply empty.
-async fn goals(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {
-    web_account(&st, &headers, &method, true)?;
-    Ok(json(json!([])))
 }
 
 #[derive(Deserialize)]

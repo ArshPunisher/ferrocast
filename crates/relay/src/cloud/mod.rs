@@ -16,10 +16,16 @@
 mod admin;
 mod bot;
 pub(crate) mod bus;
+pub(crate) mod community;
+#[cfg(test)]
+mod community_tests;
 pub(crate) mod connect;
 #[cfg(test)]
 mod connect_tests;
 pub(crate) mod docs;
+pub(crate) mod goals;
+#[cfg(test)]
+mod goals_tests;
 pub(crate) mod ingest;
 mod live;
 #[cfg(test)]
@@ -30,6 +36,9 @@ pub(crate) mod store;
 mod sync;
 #[cfg(test)]
 mod tests;
+pub(crate) mod tips;
+#[cfg(test)]
+mod tips_tests;
 mod web;
 
 use std::path::PathBuf;
@@ -205,6 +214,9 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .merge(live::routes())
         .merge(bot::routes())
         .merge(admin::routes())
+        .merge(tips::routes())
+        .merge(goals::routes())
+        .merge(community::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────

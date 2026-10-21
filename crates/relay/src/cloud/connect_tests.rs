@@ -69,7 +69,7 @@ impl World {
         r.send().await.unwrap()
     }
 
-    async fn connect_twitch_for(&self, u: &User, code: &str) {
+    pub(super) async fn connect_twitch_for(&self, u: &User, code: &str) {
         let to = self.twitch_until_finish(u, code).await;
         let res = self.open_finish(Some(u), &to).await;
         assert_eq!(res.status(), 303);
@@ -197,9 +197,10 @@ async fn refusals_scopes_states_and_youtube() {
         .await
         .unwrap();
     assert_eq!(res.status(), 400);
-    // YouTube in the cloud is Pro; unknown platforms don't exist.
+    // YouTube without the relay's YouTube cloud client: 503 with what to do (Pro is checked
+    // after; cloud/youtube_tests.rs covers the rest); unknown platforms don't exist.
     let (s, v) = w.web(&u, Method::POST, "/c/api/v1/accounts/youtube/connect", None).await;
-    assert_eq!((s, code(&v)), (402, "pro_required"));
+    assert_eq!((s, code(&v)), (503, "platform_unavailable"));
     assert!(v["error"]["hint"].is_string());
     let (s, v) = w.web(&u, Method::POST, "/c/api/v1/accounts/tiktok/connect", None).await;
     assert_eq!((s, code(&v)), (404, "not_found"));

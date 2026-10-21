@@ -56,7 +56,8 @@ async fn world() -> World {
         .with_vault(Some(vault()))
         .with_bot(rt)
         .with_remote(RemoteConfig::new(Some(&base), Some(b"pepper-pepper-pepper-pepper-32b!"), None))
-        .with_accounts(AccountsConfig { google: Default::default(), remote_login: RemoteLogin::Required });
+        .with_accounts(AccountsConfig { google: Default::default(), remote_login: RemoteLogin::Required })
+        .with_cloud(crate::cloud::CloudConfig::new(None, None, Some(&[5u8; 32])));
     let db = state.db.clone();
     let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
     tokio::spawn(async move { axum::serve(l, app).await });
@@ -254,4 +255,101 @@ async fn the_bot_switch_and_disconnect() {
     assert_eq!((s, v["channel"].clone()), (200, Value::Null), "{v}");
     assert_eq!(w.revoked(), ["rt-c1"], "revoked at Google");
     assert_eq!(v["bot_on"], false, "no platform left: the bot goes off");
+}
+
+#[tokio::test]
+async fn the_cloud_page_connects_youtube_for_pro_and_comes_back_to_it() {
+    let w = world().await;
+    let free = w.user("free@example.com", false);
+    let (s, _) = w.web(Some(&free), Method::POST, "/c/v1/cloud/enable", None, true).await;
+    assert_eq!(s, 200);
+    let (s, v) = w.web(Some(&free), Method::GET, "/c/v1/cloud", None, false).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!((v["features"]["youtube"].as_bool(), v["youtube"]["pro"].as_bool()), (Some(true), Some(false)));
+    let (s, v) = w.web(Some(&free), Method::POST, "/c/api/v1/accounts/youtube/connect", None, true).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (402, Some("pro_required")), "{v}");
+    assert!(v["error"]["hint"].is_string());
+
+    let u = w.user("asha@example.com", true);
+    assert_eq!(w.web(Some(&u), Method::POST, "/c/v1/cloud/enable", None, true).await.0, 200);
+    let (s, v) = w.web(Some(&u), Method::POST, "/c/api/v1/accounts/youtube/connect", None, true).await;
+    assert_eq!(s, 200, "{v}");
+    let url = v["url"].as_str().unwrap();
+    assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"), "{url}");
+    let state = url::Url::parse(url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.to_string();
+    w.google_code("cc1", SCOPES);
+    let res = w
+        .http
+        .get(format!("{}/v1/bot/youtube/callback", w.base))
+        .query(&[("code", "cc1"), ("state", state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let to = res.headers()["location"].to_str().unwrap().to_string();
+    let res = w.open(Some(&u), &to).await;
+    assert_eq!(res.status(), 303);
+    assert!(res.headers()["location"].to_str().unwrap().ends_with("/app/#/cloud?connected=youtube"));
+
+    // The Cloud page and the status list it; the bot page knows YouTube follows it (no PC).
+    let (_, v) = w.web(Some(&u), Method::GET, "/c/v1/cloud", None, false).await;
+    let yt: Vec<&Value> = v["channels"].as_array().unwrap().iter().filter(|c| c["platform"] == "youtube").collect();
+    assert_eq!(yt.len(), 1, "{v}");
+    assert_eq!(yt[0]["login"], "Asha Live");
+    assert_eq!(yt[0]["error"], Value::Null);
+    assert_eq!(v["youtube"]["channel"]["title"], "Asha Live");
+    let (_, st) = w.web(Some(&u), Method::GET, "/c/api/v1/status", None, false).await;
+    assert_eq!(st["connectors"]["youtube"]["state"], "connected");
+    let (s, b) = w.web(Some(&u), Method::GET, "/c/api/v1/pro/bot", None, false).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["youtube"]["follows_this_page"], true);
+
+    // Disconnect from the Cloud page: unbound and revoked at Google.
+    let (s, _) = w.web(Some(&u), Method::DELETE, "/c/api/v1/accounts/youtube", None, true).await;
+    assert_eq!(s, 204);
+    let sub = format!("sub_{}", &u.account[3..]);
+    assert!(w.db.bot_channel(&sub, "youtube").unwrap().is_none());
+    assert!(w.revoked().contains(&"rt-cc1".to_string()));
+    let (s, v) = w.web(Some(&u), Method::DELETE, "/c/api/v1/accounts/youtube", None, true).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
+
+#[tokio::test]
+async fn without_the_youtube_client_the_cloud_page_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("relay.db")).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let cfg = Config {
+        public_url: base.clone(),
+        tip_url: None,
+        kick_client_id: None,
+        kick_client_secret: None,
+        kick_id_url: base.clone(),
+        kick_api_url: base.clone(),
+    };
+    let state = AppState::new(cfg, db)
+        .with_vault(Some(vault()))
+        .with_bot(Runtime::new(None, None, None))
+        .with_remote(RemoteConfig::new(Some(&base), Some(b"pepper-pepper-pepper-pepper-32b!"), None))
+        .with_accounts(AccountsConfig { google: Default::default(), remote_login: RemoteLogin::Required })
+        .with_cloud(crate::cloud::CloudConfig::new(None, None, Some(&[5u8; 32])));
+    let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let w = World {
+        base,
+        db: state.db.clone(),
+        yt: Arc::new(FakeYoutube::default()),
+        state,
+        http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+        _dir: dir,
+    };
+    let u = w.user("asha@example.com", true);
+    assert_eq!(w.web(Some(&u), Method::POST, "/c/v1/cloud/enable", None, true).await.0, 200);
+    let (_, v) = w.web(Some(&u), Method::GET, "/c/v1/cloud", None, false).await;
+    assert_eq!(v["features"]["youtube"], false);
+    assert_eq!(v["youtube"]["available"], false);
+    let (s, v) = w.web(Some(&u), Method::POST, "/c/api/v1/accounts/youtube/connect", None, true).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (503, Some("platform_unavailable")), "{v}");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("app"));
 }

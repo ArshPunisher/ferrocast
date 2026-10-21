@@ -45,13 +45,16 @@ fn sender(st: &AppState) -> &mpsc::Sender<Job> {
 
 /// Hands a normalised event to an account's bus (any producer: the platform hooks below,
 /// test alerts, and cloud YouTube, Pro, built separately: docs/CLOUD.md §11). Never waits.
-pub(crate) fn publish(st: &AppState, account: &str, event: Event) {
+/// `false` when the queue was full and the event was dropped (counted).
+pub(crate) fn publish(st: &AppState, account: &str, event: Event) -> bool {
     if sender(st).try_send(Job { account: account.to_string(), event }).is_err() {
         let n = st.cloud.buses.dropped.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_power_of_two() {
             tracing::warn!(dropped = n, "the cloud ingest queue is full: events are being dropped");
         }
+        return false;
     }
+    true
 }
 
 async fn worker(st: AppState, mut rx: mpsc::Receiver<Job>) {
@@ -65,7 +68,11 @@ async fn worker(st: AppState, mut rx: mpsc::Receiver<Job>) {
             }
         };
         let Some(cached) = cached(&st, &bus) else { continue };
-        process(&bus, &cached, job.event);
+        if let Some(ev) = process(&bus, &cached, job.event) {
+            // Goals (saved), then polls and giveaways (chat), as the engine does.
+            super::goals::on_event(&st, &bus, &ev);
+            super::community::on_event(&st, &bus, &ev);
+        }
     }
 }
 
@@ -97,8 +104,9 @@ pub(crate) fn cached(st: &AppState, bus: &Bus) -> Option<Arc<Cached>> {
     Some(c)
 }
 
-/// One event through the pipeline.
-pub(crate) fn process(bus: &Bus, cached: &Cached, mut e: Event) {
+/// One event through the pipeline; the event as it went out (`None`: dropped, a repeat, or
+/// only a viewer count).
+pub(crate) fn process(bus: &Bus, cached: &Cached, mut e: Event) -> Option<Arc<Event>> {
     let at = Millis(now_ms());
     e.id = docs::new_id();
     e.received_at = at;
@@ -111,7 +119,7 @@ pub(crate) fn process(bus: &Bus, cached: &Cached, mut e: Event) {
         && let Some(src) = &e.source_id
         && !bus.state().first_time(&format!("{}:{src}", platform_key(e.platform)))
     {
-        return;
+        return None;
     }
     bus.touch();
     e.seq = bus.state().next_seq();
@@ -123,9 +131,9 @@ pub(crate) fn process(bus: &Bus, cached: &Cached, mut e: Event) {
                 st.viewers.clone()
             };
             bus.send_overlay(Audience::All, "state", &json!({ "viewers": viewers }));
-            return;
+            return None;
         }
-        EventKind::Connector(_) => return,
+        EventKind::Connector(_) => return None,
         EventKind::StreamOnline { .. } => {
             let mut st = bus.state();
             let anyone_live = st.live.values().any(|l| *l);
@@ -184,6 +192,7 @@ pub(crate) fn process(bus: &Bus, cached: &Cached, mut e: Event) {
         }
         _ => {}
     }
+    Some(event)
 }
 
 /// Labels, then the alert (when a rule covers it), as the engine does.
@@ -363,20 +372,39 @@ pub(crate) fn kick(st: &AppState, broadcaster: &str, ty: &str, message_id: &str,
     publish(st, &ch.account_id, e);
 }
 
+/// A YouTube event the cloud bot's reader got for a subscription attached to `account`
+/// (Pro, §11): published while the account has cloud mode on and awake. Reading it cost the
+/// subscription's YouTube units already; publishing costs none.
+pub(crate) fn youtube(st: &AppState, account: &str, e: &Event) {
+    if e.platform != Platform::Youtube || !super::bot_allowed(&st.db, account) {
+        return;
+    }
+    publish(st, account, e.clone());
+}
+
 /// A verified tip for an install (`tips::queue_tip`): published on the account's bus when
 /// the install is the account's cloud install or a PC signed in to an account with cloud
 /// mode on (§7). Only captured payments alert (R-49).
-pub(crate) fn tip(st: &AppState, install: &str, p: &Value) {
-    let account = match st.db.cloud_account_by_install(install) {
-        Ok(Some(a)) => Some(a),
-        _ => st.db.account_for_install(install, now_ms()).ok().flatten(),
+/// `false` only when a tip for a cloud install couldn't be taken now (the ingest queue was
+/// full): the caller lets the provider retry, since no PC queue holds it either.
+pub(crate) fn tip(st: &AppState, install: &str, p: &Value) -> bool {
+    let cloud_install = st.db.cloud_account_by_install(install).ok().flatten();
+    let account = match &cloud_install {
+        Some(a) => Some(a.clone()),
+        None => st.db.account_for_install(install, now_ms()).ok().flatten(),
     };
-    let Some(account) = account else { return };
-    if !matches!(st.db.cloud_account(&account), Ok(Some(c)) if c.sleeping_at.is_none()) {
-        return;
+    let Some(account) = account else { return true };
+    let Ok(Some(c)) = st.db.cloud_account(&account) else { return true };
+    if c.sleeping_at.is_some() {
+        if cloud_install.is_none() {
+            return true;
+        }
+        // Money arriving on the account's own tip page is use: it wakes (§5).
+        super::touch(st, &c);
     }
-    if let Some(e) = tip_event(p) {
-        publish(st, &account, e);
+    match tip_event(p) {
+        Some(e) => publish(st, &account, e) || cloud_install.is_none(),
+        None => true,
     }
 }
 

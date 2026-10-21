@@ -396,11 +396,12 @@ fn wants(o: &Overlay, a: &Audience) -> bool {
         Audience::Overlay(id) => *id == o.id,
         Audience::Labels => o.widgets.iter().any(|w| w.kind == WidgetKind::Label),
         Audience::Dashboard => false,
+        Audience::Widget(k) => o.widgets.iter().any(|w| w.kind == *k),
     }
 }
 
-/// The first frame: layout and current state, so nothing is blank (R-38). Polls and
-/// giveaways need the PC: always `null` here (§1.2).
+/// The first frame: layout and current state, so nothing is blank (R-38): the goals (read
+/// first with `goals::load`), the running or last poll and giveaway (docs/CLOUD.md §7.1).
 fn snapshot(bus: &Bus, o: &Overlay, preview: bool) -> Arc<str> {
     let st = bus.state();
     let events: Vec<&Event> =
@@ -408,10 +409,15 @@ fn snapshot(bus: &Bus, o: &Overlay, preview: bool) -> Arc<str> {
     let chat: Vec<&Event> =
         if o.wants_chat() && !preview { st.chat.iter().map(|e| &**e).collect() } else { Vec::new() };
     let labels = if preview { serde_json::Map::new() } else { st.session.labels(o) };
+    let goals: Vec<_> = st.goals.iter().flatten().map(ferrocast_core::goal::Goal::view).collect();
+    let has = |k: WidgetKind| o.widgets.iter().any(|w| w.kind == k);
+    let poll = st.poll.as_ref().filter(|_| has(WidgetKind::Poll)).map(ferrocast_core::poll::Poll::view);
+    let giveaway =
+        st.giveaway.as_ref().filter(|_| has(WidgetKind::Giveaway)).map(ferrocast_core::giveaway::Giveaway::card);
     let data = json!({
         "overlay": public(o),
-        "state": { "goals": [], "labels": labels, "viewers": st.viewers, "events": events, "chat": chat,
-                   "poll": null, "giveaway": null },
+        "state": { "goals": goals, "labels": labels, "viewers": st.viewers, "events": events, "chat": chat,
+                   "poll": poll, "giveaway": giveaway },
     });
     envelope(Some(st.seq), "snapshot", &data)
 }
@@ -476,6 +482,7 @@ async fn overlay_loop(
 ) {
     let (mut tx, mut rx) = socket.split();
     let mut frames = bus.subscribe();
+    super::goals::load(&st, &bus);
     if !send_text(&mut tx, &snapshot(&bus, &overlay, false)).await {
         return;
     }
@@ -527,6 +534,7 @@ async fn overlay_loop(
                     };
                     overlay = fresh;
                     guard.set_chat(overlay.wants_chat());
+                    super::goals::load(&st, &bus);
                     if !send_text(&mut tx, &snapshot(&bus, &overlay, false)).await {
                         return;
                     }
@@ -542,6 +550,7 @@ async fn overlay_loop(
 async fn test_loop(st: AppState, bus: Arc<Bus>, mut overlay: Overlay, token: String, socket: WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let mut frames = bus.subscribe();
+    super::goals::load(&st, &bus);
     if !send_text(&mut tx, &snapshot(&bus, &overlay, true)).await {
         return;
     }

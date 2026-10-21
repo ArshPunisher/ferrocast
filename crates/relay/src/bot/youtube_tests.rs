@@ -1456,3 +1456,148 @@ fn who_shares_today_counts_only_subscriptions_that_spent_units() {
     assert_eq!(st.db.yt_active_today("me", now).unwrap(), 3, "a, b and me; the relay's own row isn't one");
     assert_eq!(st.db.yt_active_today("me", utc(2026, 10, 20, 8, 0)).unwrap(), 1, "a new Pacific day");
 }
+
+// ── Cloud mode (docs/CLOUD.md §11) ───────────────────────────────────────────────────
+
+/// `sub` attached to a new account with cloud mode on; the account id.
+fn cloud_account_for(st: &AppState, email: &str, sub: &str) -> String {
+    let (a, _) = st.db.account_sign_in(email, None, now_ms()).unwrap();
+    st.db.account_attach_sub(&a.id, sub, "checkout", now_ms()).unwrap();
+    st.db.cloud_enable(&a.id, now_ms()).unwrap();
+    a.id
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cloud_mode_account_sees_youtube_chat_on_its_bus_with_the_bot_off() {
+    let yt = Arc::new(FakeYoutube::default());
+    let (st, _d) = bare(yt.clone(), 1_500, 9_000);
+    ready_youtube(&st, "i1", "sub_1", false);
+    st.db.bot_set_enabled("sub_1", false, 1).unwrap();
+    let account = cloud_account_for(&st, "asha@example.com", "sub_1");
+    // A dashboard is open, so chat is kept on the bus.
+    let bus = st.cloud.buses.open(&account, 10).unwrap();
+    bus.state().dashboards = 1;
+    yt.with(|y| {
+        y.live = Some(Broadcast { live_chat_id: "chat-1".into(), started_at: None });
+        y.scripts.push_back(Script { items: vec![batch(vec![line("LCC.c1", "UCviewer", "!lurk")], "p1")], hold: true });
+    });
+    cloud_has_youtube(&st, "sub_1");
+    // The bot is off, but the account's cloud mode makes the reader run.
+    tick(&st).await;
+    until(|| bus.state().chat.len() == 1).await;
+    let e = bus.state().chat[0].clone();
+    assert_eq!(e.platform, Platform::Youtube);
+    assert!(yt.with(|y| y.sent.is_empty()), "the bot is off: nothing answered");
+    // Units are the subscription's own (1 detect + 1 open), nothing extra for the bus.
+    assert_eq!(used(&st, "sub_1", None), 1 + 5);
+
+    // Cloud mode asleep: the reader stops for it (the bot is still off).
+    st.db.cloud_sleep_idle(now_ms() + 1, now_ms()).unwrap();
+    tick(&st).await;
+    assert!(st.bot.yt_reading().is_empty(), "nobody needs YouTube now");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_bot_page_drives_youtube_for_an_account_without_a_pc() {
+    let yt = Arc::new(FakeYoutube::default());
+    let (st, _d) = bare(yt.clone(), 1_500, 9_000);
+    ready_youtube(&st, "i1", "sub_1", false);
+    let account = cloud_account_for(&st, "asha@example.com", "sub_1");
+    // With a PC linked, the PC's pushed config stays YouTube's.
+    assert_eq!(st.db.pro_installs("sub_1").unwrap(), 1);
+    assert!(super::youtube_follows_account(&st, &account).is_none());
+    let before = st.db.bot_config("sub_1").unwrap().unwrap();
+    let mut cfg: ferrocast_core::cloudbot::BotConfig = serde_json::from_value(config()).unwrap();
+    cfg.commands.retain(|c| c.name != "!lurk");
+    super::account_save_config(&st, &account, 0, cfg.clone()).unwrap();
+    assert_eq!(st.db.bot_config("sub_1").unwrap().unwrap().version, before.version, "untouched");
+
+    // No PC: the Bot page's settings and switch are YouTube's too.
+    st.db.c().execute("DELETE FROM pro_installs WHERE sub_id = 'sub_1'", []).unwrap();
+    assert_eq!(super::youtube_follows_account(&st, &account).as_deref(), Some("sub_1"));
+    let (v, _) = super::account_config(&st, &account).unwrap();
+    super::account_save_config(&st, &account, v, cfg).unwrap();
+    let mirrored: ferrocast_core::cloudbot::BotConfig =
+        serde_json::from_str(&st.db.bot_config("sub_1").unwrap().unwrap().json).unwrap();
+    assert!(!mirrored.commands.iter().any(|c| c.name == "!lurk"), "the YouTube bot has the page's commands");
+    let view = super::account_set_enabled(&st, &account, false).await.unwrap();
+    assert!(!st.db.bot_config("sub_1").unwrap().unwrap().enabled);
+    assert_eq!(view["youtube"]["follows_this_page"], true);
+    assert_eq!(view["enabled"], false);
+    let view = super::account_set_enabled(&st, &account, true).await.unwrap();
+    assert!(st.db.bot_config("sub_1").unwrap().unwrap().enabled, "only YouTube: its switch");
+    assert_eq!(view["enabled"], true);
+}
+
+/// A connected, switched-on YouTube channel no PC ever pushed a config for (the web connect
+/// with the bot switched on from the Account page).
+fn youtube_without_a_pc_config(st: &AppState, install: &str, sub: &str) {
+    pro_sub(st, install, sub);
+    st.db.bot_set_account(sub, "youtube", (OWNER, "Asha"), Some((OWNER, "Asha")), FORCE_SSL, false, "web", 1).unwrap();
+    seal_token(st, sub, "youtube", "bot", "yrt-1");
+    st.db.bot_set_enabled(sub, true, 1).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_no_pc_config_the_youtube_bot_answers_with_the_cloud_bot_pages_commands() {
+    let yt = Arc::new(FakeYoutube::default());
+    let (st, _d) = bare(yt.clone(), 1_500, 9_000);
+    youtube_without_a_pc_config(&st, "i1", "sub_1");
+    assert_eq!(st.db.bot_config("sub_1").unwrap().unwrap().version, 0);
+    let account = cloud_account_for(&st, "arx@example.com", "sub_1");
+    let mut cfg: ferrocast_core::cloudbot::BotConfig = serde_json::from_value(config()).unwrap();
+    cfg.commands[0].name = "!ferrocast".into();
+    cfg.commands[0].response = "Ferrocast runs this chat.".into();
+    super::account_save_config(&st, &account, 0, cfg).unwrap();
+    // Nothing written under the subscription (a PC may still push), and a fresh relay reads
+    // the page's config too.
+    assert_eq!(st.db.bot_config("sub_1").unwrap().unwrap().version, 0);
+    st.bot.mem("sub_1", |m| m.config = None);
+    yt.with(|y| {
+        y.live = Some(Broadcast { live_chat_id: "chat-1".into(), started_at: None });
+        // History first (as YouTube's first answer), then the owner's command.
+        let mut old = line("LCC.old", OWNER, "!ferrocast");
+        old.origin = Origin::Backfill;
+        y.scripts.push_back(Script {
+            items: vec![batch(vec![old], "p1"), batch(vec![line("LCC.new", OWNER, "!ferrocast please")], "p2")],
+            hold: true,
+        });
+    });
+    cloud_has_youtube(&st, "sub_1");
+    step(&st, &chan(&st, "sub_1")).await;
+    until(|| yt.with(|y| !y.sent.is_empty())).await;
+    assert_eq!(yt.with(|y| y.sent.clone()), vec![("chat-1".to_string(), "Ferrocast runs this chat.".to_string())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_youtube_ends_at_once_every_time_stops_and_says_so() {
+    let yt = Arc::new(FakeYoutube::default());
+    let (st, _d) = bare(yt.clone(), 1_500, 9_000);
+    ready_youtube(&st, "i1", "sub_1", false);
+    yt.with(|y| {
+        y.live = Some(Broadcast { live_chat_id: "chat-1".into(), started_at: None });
+        for _ in 0..5 {
+            y.scripts.push_back(Script { items: vec![Err(YoutubeError::ChatEnded)], hold: false });
+        }
+    });
+    cloud_has_youtube(&st, "sub_1");
+    for _ in 0..30 {
+        step(&st, &chan(&st, "sub_1")).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if chan(&st, "sub_1").error_code() == Some("youtube_chat_unavailable") {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(120)).await;
+    }
+    let ch = chan(&st, "sub_1");
+    assert_eq!(ch.error_code(), Some("youtube_chat_unavailable"), "{:?}", ch.error);
+    assert!(ch.error.as_ref().unwrap()["hint"].as_str().unwrap().contains("Try again"));
+    let opens = yt.with(|y| y.opens.len());
+    assert_eq!(opens, QUICK_ENDS_GIVE_UP as usize);
+    // It rests: no more opens for a while, so no units go on a chat that won't open.
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_secs(120)).await;
+        step(&st, &chan(&st, "sub_1")).await;
+    }
+    assert_eq!(yt.with(|y| y.opens.len()), opens);
+}

@@ -323,7 +323,7 @@ async fn turning_it_on_seeds_rules_and_a_starter_overlay_once() {
     assert_eq!(s, 200);
     assert_eq!(v["cloud"], true);
     assert_eq!(v["connectors"]["twitch"]["state"], "off");
-    let (s, v) = w.web(&u, Method::GET, "/c/api/v1/polls", None).await;
+    let (s, v) = w.web(&u, Method::GET, "/c/api/v1/mod/bans", None).await;
     assert_eq!((s, code(&v)), (404, "not_in_cloud"));
 }
 
