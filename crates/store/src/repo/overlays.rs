@@ -86,6 +86,25 @@ fn insert(store: &Store, o: &Overlay) -> Result<()> {
     })
 }
 
+/// An overlay from cloud sync (docs/CLOUD.md §1.1) under its own id: a new one gets a fresh
+/// token here, an existing one keeps this PC's token (so OBS keeps working).
+pub fn put_synced(store: &Store, mut o: Overlay) -> Result<Overlay> {
+    match get(store, &o.id) {
+        Ok(current) => {
+            o.token = current.token;
+            update(store, &o)
+        }
+        Err(StoreError::NotFound(_)) => {
+            o.token = new_token();
+            o.name = o.name.trim().to_string();
+            o.updated_at = now_ms();
+            insert(store, &o)?;
+            Ok(o)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Saves name, size, widgets and the design link. The token can't be changed here, only
 /// regenerated.
 pub fn update(store: &Store, o: &Overlay) -> Result<Overlay> {
