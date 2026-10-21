@@ -13,6 +13,7 @@
 // The parts the event pipeline, media and the sleep sweep use land with them (CLOUD.md §12).
 #![allow(dead_code)]
 
+mod bot;
 pub(crate) mod bus;
 pub(crate) mod connect;
 #[cfg(test)]
@@ -200,7 +201,7 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .merge(connect::routes())
         .merge(overlay::routes())
         .merge(media::routes())
-        .merge(live::routes())
+        .merge(live::routes()).merge(bot::routes())
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────────────

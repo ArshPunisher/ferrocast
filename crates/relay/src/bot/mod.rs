@@ -1489,6 +1489,17 @@ pub(crate) fn desktop_seen(st: &AppState, install: &str, platforms: &[Platform])
         Ok(None) => {}
         Err(e) => tracing::debug!(error = %e, "couldn't look up a PC's subscription for the bot lease"),
     }
+    // A PC signed in to a cloud mode account with its bot on: that account's cloud bot stands
+    // by too, so the two never answer twice (docs/CLOUD.md §6).
+    if let Ok(Some(account)) = st.db.account_for_install(install, now_ms())
+        && crate::cloud::is_account_key(&account)
+        && matches!(st.db.bot_channels(&account), Ok(c) if !c.is_empty())
+    {
+        let (now, ms) = (Instant::now(), now_ms());
+        for p in platforms {
+            st.bot.lease(&account, *p, |l| l.seen(now, ms));
+        }
+    }
 }
 
 // ── Answering ────────────────────────────────────────────────────────────────────────
@@ -1966,4 +1977,66 @@ pub async fn sweep(st: &AppState) {
     if let Err(e) = st.db.bot_prune(now - COUNTER_CHANGES_KEEP_MS) {
         tracing::warn!(error = %e, "couldn't prune cloud counter changes");
     }
+}
+
+// ── Cloud mode accounts (docs/CLOUD.md §6) ───────────────────────────────────────────
+
+/// The cloud bot's view for a cloud mode account (keyed by the account id). There's no PC,
+/// so no PC code.
+pub(crate) fn account_view(st: &AppState, account: &str) -> Result<Value, ApiError> {
+    let mut v = view(st, account, "")?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("pc_code");
+    }
+    Ok(v)
+}
+
+/// Switches a cloud mode account's bot on or off (the web dashboard's Bot page).
+pub(crate) async fn account_set_enabled(st: &AppState, account: &str, enabled: bool) -> Result<Value, ApiError> {
+    let ctx = ProCtx { install: String::new(), sub_id: account.to_string() };
+    set_enabled(st, &ctx, enabled).await?;
+    account_view(st, account)
+}
+
+/// A cloud mode account's bot settings and their version (none saved yet: version 0).
+pub(crate) fn account_config(st: &AppState, account: &str) -> Result<(i64, BotConfig), ApiError> {
+    let row = st.db.bot_config(account).map_err(ApiError::db)?;
+    Ok(match row {
+        Some(r) => (r.version, serde_json::from_str(&r.json).unwrap_or_default()),
+        None => (0, BotConfig::default()),
+    })
+}
+
+/// Saves a cloud mode account's bot settings from the web dashboard, checked like a PC's
+/// push; the new version. 409 `stale_version` when another tab saved meanwhile.
+pub(crate) fn account_save_config(
+    st: &AppState,
+    account: &str,
+    base: i64,
+    mut cfg: BotConfig,
+) -> Result<i64, ApiError> {
+    // There's no desktop switch for a cloud account: the bot's own on/off is the one switch.
+    cfg.bot_on = true;
+    cfg.validate().map_err(|e| match e {
+        ConfigError::TooManyCommands | ConfigError::TooManyTimers => {
+            ApiError::new(StatusCode::CONFLICT, "cloud_limit", e.to_string()).hint("Delete one you don't use.")
+        }
+        ConfigError::Invalid(m) => ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid", m),
+    })?;
+    let json = serde_json::to_string(&cfg).map_err(|_| invalid("The bot settings couldn't be read."))?;
+    let version = match st.db.bot_push_config(account, base, &json, 0, now_ms()) {
+        Ok(v) => v,
+        Err(store::PushErr::Stale(current)) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "stale_version",
+                format!("The bot settings changed in another tab (version {current})."),
+            )
+            .hint("Reload the Bot page and make the change again."));
+        }
+        Err(store::PushErr::Db(e)) => return Err(ApiError::db(e)),
+    };
+    overlay_changes(&mut cfg, &st.db.bot_counter_changes(account).map_err(ApiError::db)?);
+    st.bot.mem(account, |m| m.config = Some((version, cfg)));
+    Ok(version)
 }
