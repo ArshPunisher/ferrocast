@@ -64,6 +64,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "Accounts: identities, sessions, sign-ins, Pro and PCs",
         sql: &[crate::accounts::SCHEMA],
     },
+    Migration {
+        version: 16,
+        name: "Cloud mode: documents, overlay URLs, channels, media",
+        sql: &[crate::cloud::SCHEMA],
+    },
 ];
 
 pub(crate) fn latest() -> i64 {
@@ -165,6 +170,12 @@ mod tests {
             "bot_tokens",
             "bot_config",
             "bot_counter_changes",
+            "cloud_accounts",
+            "cloud_docs",
+            "cloud_overlay_tokens",
+            "cloud_channels",
+            "cloud_media",
+            "cloud_pending",
             "mail_addresses",
             "mail_sent",
             "mail_budget",

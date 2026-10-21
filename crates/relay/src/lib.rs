@@ -18,6 +18,7 @@ pub mod backups;
 pub mod billing;
 pub mod blob;
 pub mod bot;
+pub mod cloud;
 pub mod db;
 pub mod discord;
 mod history;
@@ -122,6 +123,8 @@ pub struct AppState {
     pub(crate) admin: Arc<admin::Runtime>,
     /// Accounts: Google's client, the web dashboard's login rule, sign-in rate limits.
     pub(crate) accounts: Arc<accounts::Runtime>,
+    /// Cloud mode (docs/CLOUD.md): off without the web host and the vault key.
+    pub(crate) cloud: Arc<cloud::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -149,6 +152,7 @@ impl AppState {
             tip_domains: Arc::default(),
             admin: Arc::default(),
             accounts: Arc::default(),
+            cloud: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -233,6 +237,12 @@ impl AppState {
     /// Accounts (`accounts::AccountsConfig::from_env()` in production).
     pub fn with_accounts(mut self, cfg: accounts::AccountsConfig) -> AppState {
         self.accounts = Arc::new(accounts::Runtime::new(cfg));
+        self
+    }
+
+    /// Cloud mode (`cloud::CloudConfig::from_env()` in production).
+    pub fn with_cloud(mut self, cfg: cloud::CloudConfig) -> AppState {
+        self.cloud = Arc::new(cloud::Runtime::new(cfg));
         self
     }
 
@@ -342,6 +352,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(admin_pro::routes())
         .merge(accounts::routes())
+        .merge(cloud::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))

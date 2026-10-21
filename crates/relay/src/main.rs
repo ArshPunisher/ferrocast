@@ -148,6 +148,13 @@ async fn main() {
         tracing::warn!("RELAY_GOOGLE_CLIENT_ID / _SECRET not set: Google sign-in is off (email sign-in works)");
     }
     let state = state.with_accounts(accounts_cfg);
+    let cloud_cfg = ferrocast_relay::cloud::CloudConfig::from_env();
+    if cloud_cfg.keyed() {
+        tracing::info!(overlays = ?cloud_cfg.overlays_dir, "cloud mode is on (when RELAY_REMOTE_URL is set)");
+    } else {
+        tracing::warn!("RELAY_VAULT_KEY not set: cloud mode is off");
+    }
+    let state = state.with_cloud(cloud_cfg);
     let discord_cfg = match ferrocast_relay::discord::DiscordConfig::from_env() {
         Ok(Some(c)) => {
             tracing::info!(app_id = %c.app_id, "the Ferrocast bot for Discord is on");
