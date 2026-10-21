@@ -142,15 +142,17 @@ fn main() {
             std::process::exit(1);
         }
     };
-    app.run(|app, event| {
+    app.run(|app, event| match event {
         // The last window closing must not quit a tray app; only "Quit" does (exit code
         // set). If startup failed there's no tray to quit from, so closing the error
         // window really exits.
-        if let RunEvent::ExitRequested { api, code: None, .. } = event
-            && app.try_state::<Running>().is_some()
-        {
+        RunEvent::ExitRequested { api, code: None, .. } if app.try_state::<Running>().is_some() => {
             api.prevent_exit();
         }
+        // macOS: clicking the Dock icon of a running app brings back the hidden window.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_window(app),
+        _ => {}
     });
 }
 
@@ -183,7 +185,11 @@ fn update_feed() -> Option<String> {
 
 /// A check gives up after this; a download after the long one (the plugin uses the same
 /// timeout for the whole download, body included).
-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Time to open a connection, split across the addresses a host resolves to. Some networks
+/// can't reach one of GitHub's download addresses; without this the system waits about 75
+/// seconds on it before trying the next, longer than a check is allowed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 async fn check_update<R: tauri::Runtime>(
@@ -195,7 +201,7 @@ async fn check_update<R: tauri::Runtime>(
         let url = feed.parse().map_err(tauri_plugin_updater::Error::UrlParse)?;
         builder = builder.endpoints(vec![url])?;
     }
-    builder.timeout(timeout).build()?.check().await
+    builder.timeout(timeout).configure_client(|c| c.connect_timeout(CONNECT_TIMEOUT)).build()?.check().await
 }
 
 /// What the feed's notes say, as plain text, without the "see GitHub" placeholder.
@@ -594,7 +600,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let pause = MenuItemBuilder::with_id("pause", "Pause or resume alerts").build(app)?;
     let panic = MenuItemBuilder::with_id("panic", "Panic mode on/off").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit Ferrocast").build(app)?;
+    let version = MenuItemBuilder::with_id("version", concat!("Ferrocast ", env!("CARGO_PKG_VERSION")))
+        .enabled(false)
+        .build(app)?;
     let menu = MenuBuilder::new(app)
+        .item(&version)
+        .item(&PredefinedMenuItem::separator(app)?)
         .items(&[&open, &test, &pause])
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&panic)
