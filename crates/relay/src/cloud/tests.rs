@@ -70,6 +70,11 @@ fn kick_public_pem() -> String {
     rsa::RsaPublicKey::from(kick_key()).to_public_key_pem(rsa::pkcs8::LineEnding::LF).unwrap()
 }
 
+/// The Control Center's token in tests (built, so nothing here looks like a real key).
+pub(super) fn admin_token() -> String {
+    "cloud-admin-test-".repeat(3)
+}
+
 /// The Kick channel the fake Kick signs in as.
 pub(super) const KICK_CHANNEL: &str = "668";
 
@@ -160,6 +165,7 @@ pub(super) async fn world_with(keyed: bool) -> World {
     let state = AppState::new(cfg, db)
         .with_vault(Some(crate::bot::tests::vault()))
         .with_blobs(Some(Arc::new(blobs)))
+        .with_admin(crate::admin::AdminConfig::new(Some(&admin_token()), None))
         .with_bot(bot)
         .with_remote(RemoteConfig::new(Some(&base), Some(b"test pepper, at least sixteen bytes"), None))
         .with_cloud(CloudConfig::new(Some("http://overlays.test"), Some(build), keyed.then_some(s.as_slice())));

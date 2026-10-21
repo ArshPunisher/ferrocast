@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::store::Channel;
-use super::tests::{KICK_CHANNEL, User, World, kick_key, world};
+use super::tests::{KICK_CHANNEL, User, World, admin_token, kick_key, world};
 use crate::bot::tests::{ES_SECRET, STREAMER_ID};
 use crate::now_ms;
 
@@ -556,4 +556,70 @@ async fn the_editors_lists_and_a_status_before_turning_on() {
     assert_eq!(v, json!([]));
     let (s, v) = w.web(&u, Method::POST, "/c/api/v1/queue/nope/remove", None).await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("not_found")));
+}
+
+#[tokio::test]
+async fn idle_accounts_sleep_close_their_overlays_and_wake_on_use() {
+    let w = world().await;
+    let u = w.cloud_user("a@example.com").await;
+    w.bind_channels(&u);
+    let (_, token) = w.first_overlay(&u).await;
+    let mut ws = w.open_socket(&token, "").await;
+    next(&mut ws).await;
+    // 31 days without use.
+    w.db.c().execute("UPDATE cloud_accounts SET last_active_at = ?1", [now_ms() - 31 * 86_400_000]).unwrap();
+    let slept = super::sleep_idle(&w.state, now_ms()).await;
+    assert_eq!(slept, vec![u.account.id.clone()]);
+    assert_eq!(closed_with(&mut ws).await, Some(4410), "the page tries again later");
+    assert!(w.db.cloud_account_channel(&u.account.id, "twitch").unwrap().unwrap().event_subs.is_empty());
+    assert!(!super::bot_allowed(&w.db, &u.account.id));
+    let mut again = w.open_socket(&token, "").await;
+    assert_eq!(closed_with(&mut again).await, Some(4410));
+    // The hourly sweep leaves a sleeping account's channels alone.
+    super::sweep(&w.state).await;
+    assert!(w.db.cloud_account_channel(&u.account.id, "twitch").unwrap().unwrap().event_subs.is_empty());
+
+    // Opening the dashboard wakes it: this answer says it slept, and the channels come back.
+    let (_, v) = w.web(&u, Method::GET, "/c/v1/cloud", None).await;
+    assert_eq!(v["sleeping"], true);
+    let (_, v) = w.web(&u, Method::GET, "/c/v1/cloud", None).await;
+    assert_eq!(v["sleeping"], false);
+    for _ in 0..50 {
+        if !w.db.cloud_account_channel(&u.account.id, "twitch").unwrap().unwrap().event_subs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!w.db.cloud_account_channel(&u.account.id, "twitch").unwrap().unwrap().event_subs.is_empty());
+    let mut back = w.open_socket(&token, "").await;
+    assert_eq!(next(&mut back).await["type"], "snapshot");
+}
+
+#[tokio::test]
+async fn the_control_center_reads_cloud_numbers_behind_the_admin_guard() {
+    let w = world().await;
+    let u = w.cloud_user("a@example.com").await;
+    w.bind_channels(&u);
+    let (_, token) = w.first_overlay(&u).await;
+    let mut ws = w.open_socket(&token, "").await;
+    next(&mut ws).await;
+    let res = w.http.get(format!("{}/admin/v1/cloud/stats", w.base)).send().await.unwrap();
+    assert_eq!(res.status(), 401);
+    let v: Value = w
+        .http
+        .get(format!("{}/admin/v1/cloud/stats", w.base))
+        .bearer_auth(admin_token())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["accounts_on"], 1);
+    assert_eq!(v["active_streamers"], 1);
+    assert_eq!(v["overlay_sockets"], 1);
+    assert_eq!(v["channels"]["twitch"], 1);
+    assert_eq!(v["channels"]["kick"], 1);
+    assert_eq!(v["sleeping"], 0);
+    assert!(v["memory_estimate_bytes"].as_u64().unwrap() > 0);
 }
