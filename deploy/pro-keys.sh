@@ -50,10 +50,11 @@
 #                          day instead of billing. See docs/API.md §9.9.
 #   CLOUDFLARE_AI_TOKEN    My Profile → API Tokens → Create Token → Custom: Account → Workers AI →
 #                          Read, on that account only (40 or more characters)
-#   GEMINI_API_KEY         only if you don't use Cloudflare: aistudio.google.com → Get API key, in a
-#                          Google project WITHOUT billing (a project with billing is charged). On
-#                          the free tier Google may use what it's sent to improve its products, so
-#                          Cloudflare is the better choice. Ignored while both Cloudflare keys are set.
+#   GEMINI_API_KEY         optional: aistudio.google.com → Get API key, in a Google project WITHOUT
+#                          billing (a project with billing is charged). With Cloudflare set it's the
+#                          backup, asked once Cloudflare's free day is used up or it's down (up to
+#                          SMART_BACKUP_DAILY_CALLS, 500); alone it's the provider. On the free tier
+#                          Google may use what it's sent to improve its products.
 set -euo pipefail
 
 DIR="${RELAY_DIR:-/opt/ferrocast-relay}"
@@ -313,7 +314,7 @@ if ((cf_ai == 1)); then
   echo "Smart features on Cloudflare need both CLOUDFLARE_AI_ACCOUNT_ID and CLOUDFLARE_AI_TOKEN; until then they use Gemini if its key is set, else stay off."
 fi
 if ((cf_ai == 2)) && [[ -n "$(value GEMINI_API_KEY)" ]]; then
-  echo "Both Cloudflare keys are set, so smart features use Cloudflare and GEMINI_API_KEY is ignored."
+  echo "Smart features use Cloudflare first and Gemini as the backup once Cloudflare's free day is used up."
 fi
 echo "Restarting the relay so it reads them…"
 restart || put_back "$BACKUP" "The relay didn't come back healthy with the new keys."

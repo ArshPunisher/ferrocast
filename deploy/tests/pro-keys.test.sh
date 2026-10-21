@@ -220,7 +220,7 @@ has "status lists Gemini as missing" "$out" "GEMINI_API_KEY: *missing"
 hasnt "status hides the AI token" "$out" "$cf_ai"
 run "\n\n$gem\n" --ai
 is "a Gemini key can be added too" "$(v GEMINI_API_KEY)" "$gem"
-has "says Cloudflare wins" "$out" "GEMINI_API_KEY is ignored"
+has "says Gemini is the backup" "$out" "Gemini as the backup"
 hasnt "never prints the Gemini key" "$out" "$gem"
 fresh_relay
 run "\n\n$gem\n" --ai
