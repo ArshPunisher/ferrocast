@@ -234,6 +234,12 @@ fresh_relay
 run "x\n" --nope
 is "unknown option fails" "$code" 1
 
+# AI Studio's newer key kinds are longer and may hold dots: still taken.
+gem_new="AQ.$(printf 'Ab3_%.0s' {1..12})"
+run "\n\n$gem_new\n" --ai
+is "a newer-style Gemini key is taken" "$(v GEMINI_API_KEY)" "$gem_new"
+hasnt "never prints the Gemini key" "$out" "$gem_new"
+
 if ((fails > 0)); then
   echo "$fails failed."
   exit 1

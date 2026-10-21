@@ -213,7 +213,9 @@ pattern() {
     RELAY_GOOGLE_CLIENT_SECRET) echo '^GOCSPX-[A-Za-z0-9_-]{28}$' ;;
     CLOUDFLARE_AI_ACCOUNT_ID) echo '^[0-9a-f]{32}$' ;;
     CLOUDFLARE_AI_TOKEN) echo '^[A-Za-z0-9_-]{40,128}$' ;;
-    GEMINI_API_KEY) echo '^AIza[0-9A-Za-z_-]{35}$' ;;
+    # Gemini keys: the older AIza and 35 more, or AI Studio's newer, longer kinds (letters,
+    # digits, dots, - and _). The relay only sends it in a header, so the shape is a typo check.
+    GEMINI_API_KEY) echo '^(AIza[0-9A-Za-z_-]{35}|[A-Za-z0-9._-]{30,200})$' ;;
   esac
 }
 what() {
@@ -235,7 +237,7 @@ what() {
     RELAY_GOOGLE_CLIENT_SECRET) echo "the Ferrocast accounts (web) client's secret, GOCSPX- and 28 more" ;;
     CLOUDFLARE_AI_ACCOUNT_ID) echo "the Cloudflare Account ID, 32 lowercase hex characters" ;;
     CLOUDFLARE_AI_TOKEN) echo "a Cloudflare API token with Workers AI Read, not the Global API Key" ;;
-    GEMINI_API_KEY) echo "a Gemini API key from a project without billing, starts with AIza; Enter to skip" ;;
+    GEMINI_API_KEY) echo "a Gemini API key from AI Studio, in a project without billing; Enter to skip" ;;
   esac
 }
 status_of() { if [[ -n "$(value "$1")" ]]; then echo set; else echo missing; fi; }
