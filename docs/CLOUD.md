@@ -182,7 +182,7 @@ picks which overlays OBS shows.
 | Event history | **30 days** for anything stored about events (counts, the session labels' last values); chat is never stored | swept hourly |
 | Documents | 50 overlays, 200 alert rules, 100 designs per account, 256 KB each | 409 `cloud_limit` naming the limit |
 | Overlay sockets | 20 open per account, 4 per overlay | the extra socket closes with 4429 (the page retries later) |
-| Dashboard requests | 120 a minute per account; writes 30 a minute | 429 `cloud_rate` with `Retry-After` |
+| Dashboard requests | 120 a minute per account; writes 60 a minute | 429 `cloud_rate` with `Retry-After` |
 | Test alerts | 10 a minute per account | 429 |
 | **Sleeping accounts** | an account not used for **30 days** (no sign-in, no dashboard, no overlay open) **sleeps**: ingest stops (subscriptions deleted, the bot off) | waking needs a sign-in on the web (or the app with sync on): subscriptions are made again within a minute; overlays of a sleeping account show nothing and the socket closes with 4410 |
 
@@ -264,7 +264,7 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 | `GET /c/api/v1/accounts` · `POST …/{twitch\|kick}/connect` · `DELETE …/{platform}` | §4 |
 | `GET/POST /c/api/v1/overlays`, `GET/PUT/DELETE …/{id}`, `POST …/{id}/regenerate-url` | as API.md §4 Overlays; `url` is the cloud URL |
 | `GET/POST /c/api/v1/alert-rules`, `PUT/DELETE …/{id}` | as API.md |
-| `GET /c/api/v1/designs[?kind=]`, `GET/PUT/DELETE …/{id}`, `POST /c/api/v1/designs`, `POST …/{id}/duplicate`, `GET/PUT /c/api/v1/designs/active` | built-ins from the overlay build's catalogue, read-only |
+| `GET /c/api/v1/designs[?kind=]`, `GET/PUT/DELETE …/{id}`, `POST /c/api/v1/designs`, `POST …/{id}/duplicate`, `POST …/{id}/use`, `GET/PUT /c/api/v1/designs/active-alert` | built-ins from the overlay build's catalogue, read-only |
 | `POST /c/api/v1/test` | a test alert through the cloud pipeline |
 | `GET /c/api/v1/queue`, `POST …/queue/{pause\|resume\|skip\|clear}` | the cloud queue |
 | `GET /c/api/v1/events`, `GET /c/api/v1/chat` | from the bus (memory) |
@@ -282,8 +282,10 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 | Route | Body → Response |
 |---|---|
 | `GET /v1/cloud` | the same as `GET /c/v1/cloud` |
+| `POST /v1/cloud/enable` | turns cloud mode on from the app (free, idempotent) → the same |
+| `GET /v1/cloud/overlays` | the cloud overlays with their cloud URLs ("Use cloud overlays", M6) |
 | `GET /v1/cloud/docs?since=0` | `{ version, docs: [ { kind, id, version, updated_at, deleted, body \| null } ] }` (at most 500 a page, `more: true`) |
-| `PUT /v1/cloud/docs` | `{ docs: [ { kind, id, base_version, body \| null } ] }` (≤ 100) → `{ version, applied: [{kind,id,version}], conflicts: [ { kind, id, server: {version, updated_at, deleted, body} } ] }`. A conflict is not an error (200); a bad document is 422 naming `docs[i]` |
+| `PUT /v1/cloud/docs` | `{ docs: [ { kind, id, base_version, body \| null } ] }` (≤ 100) → `{ version, applied: [{kind,id,version}], conflicts: [ { kind, id, server: {version, updated_at, deleted, body} } ] }`. A conflict is not an error (200); a bad document is 422 naming `docs[i]`, more than 100 is 413 `too_many`, a push that would go over a §5 document cap is 409 `cloud_limit`; all of these are checked before anything is written |
 | `POST /v1/cloud/media` | upload (octet-stream, `X-Media-Name`, `X-Media-Sha256`) → `{ id }` (dedupe by hash) |
 | `GET /v1/cloud/media/{id}` | the file |
 
