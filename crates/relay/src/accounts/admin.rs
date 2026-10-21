@@ -409,6 +409,8 @@ async fn disable(
     let b = body(&headers, &raw)?;
     let reason = text(&b["reason"], "reason", 255)?;
     st.db.account_set_disabled(&a.id, Some(&actor), now).map_err(db)?;
+    // Cloud mode: its ingest stops and its overlays close at once (docs/CLOUD.md §10).
+    crate::cloud::stop_account(&st, &a.id);
     audit_log(&st, now, &actor, "account.disable", &a.id, json!({ "reason": reason }));
     let a = account_or_404(&st, &id)?;
     ok(row_json(&st, &a, now).map_err(db)?)
