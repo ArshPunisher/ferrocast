@@ -2,10 +2,15 @@
 //!
 //! The desktop uploads each stream's totals when it ends (one row per platform, keyed by
 //! the desktop's own `key`, so a retry is the same row) and a viewer sample every five
-//! minutes while live. The dashboard reads it back as streams plus weekly totals, and as a
-//! CSV. History belongs to the subscription, is kept while Pro lasts and for 30 days after
-//! it ends (hourly housekeeping), and its export stays open during those 30 days (R-04).
-//! Only counts are stored: never chat, names or viewers (R-51).
+//! minutes while live. The dashboard reads it back as streams plus weekly totals, one
+//! stream's viewer samples, and a CSV.
+//!
+//! Who keeps it (1.4, the owner's decision): a **free account** keeps the last
+//! [`FREE_KEEP_DAYS`] days (rows keyed by the account id), **Pro** keeps [`PRO_KEEP_DAYS`]
+//! (rows keyed by the subscription, shared by the account's PCs). A PC that isn't signed in
+//! and has no Pro gets 403 `account_required`. History of a subscription whose Pro ended is
+//! kept 30 days more (hourly housekeeping), and its export stays open during those 30 days
+//! (R-04). Only counts are stored: never chat, names or viewers (R-51).
 
 mod store;
 #[cfg(test)]
@@ -22,7 +27,6 @@ use serde_json::{Value, json};
 pub(crate) use store::SCHEMA;
 use store::{Sampled, Upserted};
 
-use crate::billing::gate::{ProCtx, pro_required, require_pro};
 use crate::quota::{Limit, Period, TakeErr};
 use crate::{ApiError, AppState, authed, now_ms};
 
@@ -33,6 +37,11 @@ pub const MAX_SAMPLES: usize = 100;
 pub const LOCK_AFTER_MS: i64 = 86_400_000;
 /// History stays this long after Pro ends.
 pub const KEEP_AFTER_LAPSE_MS: i64 = 30 * 86_400_000;
+/// A free account's history: the last 30 days.
+pub const FREE_KEEP_DAYS: i64 = 30;
+/// Pro's history: the last year.
+pub const PRO_KEEP_DAYS: i64 = 365;
+const DAY_MS: i64 = 86_400_000;
 /// Viewer samples are kept a year and a bit (the longest range the dashboard shows).
 pub const SAMPLE_KEEP_MS: i64 = 400 * 86_400_000;
 /// The longest range one request may ask for.
@@ -54,7 +63,7 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/pro/history", get(list))
         .route("/v1/pro/history/streams", post(upsert_stream))
-        .route("/v1/pro/history/samples", post(add_samples))
+        .route("/v1/pro/history/samples", post(add_samples).get(get_samples))
         .route("/v1/pro/history/export.csv", get(export_csv))
 }
 
@@ -175,6 +184,16 @@ fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, "invalid", message)
 }
 
+/// 403 `account_required`: no Pro and not signed in to a Ferrocast account on this PC.
+pub(crate) fn account_required() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "account_required",
+        "Stream history needs a free Ferrocast account on this PC.",
+    )
+    .hint("Sign in in Settings › Account. Free accounts keep 30 days of stream history, Pro keeps a year.")
+}
+
 fn locked() -> ApiError {
     ApiError::new(StatusCode::CONFLICT, "ended_stream_locked", "That stream ended over a day ago and can't change now.")
         .hint("Nothing to do: its history is saved as it was.")
@@ -216,11 +235,49 @@ fn parse<T: serde::de::DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Re
     })
 }
 
-/// The gate, then this subscription's request rate.
-async fn gate(st: &AppState, headers: &HeaderMap) -> Result<ProCtx, ApiError> {
-    let ctx = require_pro(st, headers).await?;
-    take_rate(st, &ctx.sub_id)?;
-    Ok(ctx)
+/// Whose history a request is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub install: String,
+    /// Where this PC's streams are written: the Pro subscription, else the free account.
+    pub key: String,
+    pub pro: bool,
+    /// Every key whose history this PC may read: its subscription (lapsed too, while kept)
+    /// and its account (what it kept while free).
+    pub reads: Vec<String>,
+}
+
+impl Owner {
+    pub(crate) fn keep_days(&self) -> i64 {
+        if self.pro { PRO_KEEP_DAYS } else { FREE_KEEP_DAYS }
+    }
+
+    /// The oldest stream start this owner sees and may upload.
+    pub(crate) fn earliest(&self, now: i64) -> i64 {
+        now - self.keep_days() * DAY_MS
+    }
+}
+
+/// Pro (the install's own subscription or its account's) or a signed-in free account.
+pub(crate) fn owner_of(st: &AppState, install: String) -> Result<Owner, ApiError> {
+    let now = now_ms();
+    let sub = st.db.pro_sub_for_install(&install).map_err(ApiError::db)?;
+    let account = st.db.account_for_install(&install, now).map_err(ApiError::db)?;
+    let mut reads: Vec<String> = sub.iter().map(|s| s.id.clone()).collect();
+    reads.extend(account.iter().cloned());
+    match (sub.filter(|s| crate::billing::access::is_pro(&s.access(), now)), account) {
+        (Some(s), _) => Ok(Owner { install, key: s.id, pro: true, reads }),
+        (None, Some(a)) => Ok(Owner { install, key: a, pro: false, reads }),
+        (None, None) => Err(account_required()),
+    }
+}
+
+/// The gate, then the owner's request rate.
+async fn gate(st: &AppState, headers: &HeaderMap) -> Result<Owner, ApiError> {
+    let install = authed(st, headers)?;
+    let owner = owner_of(st, install)?;
+    take_rate(st, &owner.key)?;
+    Ok(owner)
 }
 
 fn take_rate(st: &AppState, sub: &str) -> Result<(), ApiError> {
@@ -265,7 +322,7 @@ fn clean(s: Option<&str>, max: usize) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
-fn check_stream(mut s: StreamIn, now: i64) -> Result<StreamIn, ApiError> {
+fn check_stream(mut s: StreamIn, now: i64, owner: &Owner) -> Result<StreamIn, ApiError> {
     let bad = |m: String| invalid("invalid_stream", m);
     if !platform_ok(&s.platform) {
         return Err(bad("platform: use twitch, youtube or kick.".into()));
@@ -276,8 +333,9 @@ fn check_stream(mut s: StreamIn, now: i64) -> Result<StreamIn, ApiError> {
     if s.started_at <= 0 || s.started_at > now + 10 * 60_000 {
         return Err(bad("started_at: a time in milliseconds, not in the future.".into()));
     }
-    if s.started_at < now - MAX_RANGE_MS {
-        return Err(bad("started_at: streams from more than 400 days ago aren't kept.".into()));
+    if s.started_at < owner.earliest(now) {
+        let what = if owner.pro { "a year ago on Pro" } else { "30 days ago on a free account" };
+        return Err(bad(format!("started_at: streams that started more than {what} aren't kept.")));
     }
     if let Some(e) = s.ended_at
         && (e < s.started_at || e - s.started_at > MAX_STREAM_MS || e > now + 10 * 60_000)
@@ -341,8 +399,8 @@ async fn upsert_stream(State(st): State<AppState>, headers: HeaderMap, RawBody(b
     let run = async {
         let ctx = gate(&st, &headers).await?;
         let now = now_ms();
-        let s = check_stream(parse::<StreamIn>(&headers, &body)?, now)?;
-        let done = st.db.upsert_stream(&ctx.sub_id, &ctx.install, &s, now).map_err(ApiError::db)?;
+        let s = check_stream(parse::<StreamIn>(&headers, &body)?, now, &ctx)?;
+        let done = st.db.upsert_stream(&ctx.key, &ctx.install, &s, now).map_err(ApiError::db)?;
         let status = match done {
             Upserted::Created => StatusCode::CREATED,
             Upserted::Updated => StatusCode::OK,
@@ -350,7 +408,7 @@ async fn upsert_stream(State(st): State<AppState>, headers: HeaderMap, RawBody(b
         };
         let saved = st
             .db
-            .list_streams(&ctx.sub_id, s.started_at, s.started_at + 1, Some(&s.platform), MAX_LISTED)
+            .list_streams(&ctx.key, s.started_at, s.started_at + 1, Some(&s.platform), MAX_LISTED)
             .map_err(ApiError::db)?
             .into_iter()
             .find(|x| x.key == s.key);
@@ -386,7 +444,15 @@ async fn add_samples(State(st): State<AppState>, headers: HeaderMap, RawBody(bod
             return Err(bad(format!("samples[{i}].viewers: a whole number from 0 to {MAX_COUNT}.")));
         }
         let list: Vec<(i64, i64)> = b.samples.iter().map(|s| (s.at, s.viewers)).collect();
-        match st.db.add_samples(&ctx.sub_id, &b.platform, &b.key, &list, now_ms()).map_err(ApiError::db)? {
+        // The stream is under the key it was started with (free, then Pro mid-stream).
+        let mut done = Sampled::NotFound;
+        for key in std::iter::once(&ctx.key).chain(ctx.reads.iter().filter(|k| **k != ctx.key)) {
+            done = st.db.add_samples(key, &b.platform, &b.key, &list, now_ms()).map_err(ApiError::db)?;
+            if done != Sampled::NotFound {
+                break;
+            }
+        }
+        match done {
             Sampled::Saved(n) => Ok(axum::Json(json!({ "saved": n })).into_response()),
             Sampled::NotFound => Err(ApiError::new(
                 StatusCode::NOT_FOUND,
@@ -495,15 +561,17 @@ pub fn weekly(streams: &[StreamOut], from: i64, to: i64, now: i64) -> Vec<Week> 
         .collect()
 }
 
-/// `GET /v1/pro/history?from&to&platform` → `{from, to, streams, truncated, weekly}`.
+/// `GET /v1/pro/history?from&to&platform` → `{from, to, streams, truncated, weekly, plan,
+/// keep_days, earliest, limited}`.
 async fn list(State(st): State<AppState>, headers: HeaderMap, RawQuery(q): RawQuery) -> Result<Response, ApiError> {
-    let ctx = gate(&st, &headers).await?;
-    Ok(axum::Json(listed(&st, &ctx.sub_id, q.as_deref())?).into_response())
+    let owner = gate(&st, &headers).await?;
+    Ok(axum::Json(listed(&st, &owner, q.as_deref())?).into_response())
 }
 
 /// `GET /r/api/v1/pro/history` from an owner's phone while the PC is off (M10): the same
-/// answer as `GET /v1/pro/history`, with the same per-subscription rate, only while this
-/// relay has the feature (`features.history`; 503 `history_unavailable` otherwise).
+/// answer as `GET /v1/pro/history` for a Pro subscription, with the same per-subscription
+/// rate, only while this relay has the feature (`features.history`; 503
+/// `history_unavailable` otherwise).
 pub(crate) fn phone_list(st: &AppState, sub: &str, query: Option<&str>) -> Result<Value, ApiError> {
     if !available(st) {
         return Err(ApiError::new(
@@ -514,37 +582,116 @@ pub(crate) fn phone_list(st: &AppState, sub: &str, query: Option<&str>) -> Resul
         .hint("Open History on the streaming PC, or try again later."));
     }
     take_rate(st, sub)?;
-    listed(st, sub, query)
+    let owner = Owner { install: String::new(), key: sub.to_string(), pro: true, reads: vec![sub.to_string()] };
+    listed(st, &owner, query)
 }
 
-fn listed(st: &AppState, sub: &str, query: Option<&str>) -> Result<Value, ApiError> {
+/// Streams that started in `[from, to)` under any of `keys`, newest first, one per stream:
+/// a stream begun on a free account and finished on Pro is under both keys, and the newer
+/// copy wins.
+pub(crate) fn streams_of(
+    st: &AppState,
+    keys: &[String],
+    from: i64,
+    to: i64,
+    platform: Option<&str>,
+    limit: usize,
+) -> Result<Vec<StreamOut>, ApiError> {
+    let mut all = Vec::new();
+    for k in keys {
+        all.extend(st.db.list_streams(k, from, to, platform, limit).map_err(ApiError::db)?);
+    }
+    all.sort_by(|a, b| {
+        b.started_at.cmp(&a.started_at).then_with(|| a.platform.cmp(&b.platform)).then(b.updated_at.cmp(&a.updated_at))
+    });
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|s| seen.insert((s.platform.clone(), s.key.clone())));
+    all.truncate(limit);
+    Ok(all)
+}
+
+fn listed(st: &AppState, owner: &Owner, query: Option<&str>) -> Result<Value, ApiError> {
     let now = now_ms();
     let r = range(query, now, None)?;
-    let mut streams =
-        st.db.list_streams(sub, r.from, r.to, r.platform.as_deref(), MAX_LISTED + 1).map_err(ApiError::db)?;
+    // Older than the plan keeps is cut off (a lapsed Pro's year, while it's still kept);
+    // `limited` tells the dashboard to say so.
+    let earliest = owner.earliest(now);
+    let limited = r.from < earliest;
+    let from = r.from.max(earliest);
+    let mut streams = if r.to > from {
+        streams_of(st, &owner.reads, from, r.to, r.platform.as_deref(), MAX_LISTED + 1)?
+    } else {
+        Vec::new()
+    };
     let truncated = streams.len() > MAX_LISTED;
     streams.truncate(MAX_LISTED);
-    let weekly = weekly(&streams, r.from, r.to, now);
-    Ok(json!({ "from": r.from, "to": r.to, "streams": streams, "truncated": truncated, "weekly": weekly }))
+    let weekly = weekly(&streams, from.min(r.to - 1), r.to, now);
+    Ok(json!({
+        "from": from, "to": r.to, "streams": streams, "truncated": truncated, "weekly": weekly,
+        "plan": if owner.pro { "pro" } else { "free" }, "keep_days": owner.keep_days(),
+        "earliest": earliest, "limited": limited,
+    }))
+}
+
+/// `GET /v1/pro/history/samples?platform&key` → `{platform, key, samples: [{at, viewers}]}`,
+/// oldest first: one stream's viewer count every five minutes (the per-stream chart).
+async fn get_samples(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, ApiError> {
+    let owner = gate(&st, &headers).await?;
+    let mut platform = None;
+    let mut key = None;
+    for (k, v) in url::form_urlencoded::parse(q.as_deref().unwrap_or("").as_bytes()) {
+        match k.as_ref() {
+            "platform" => platform = Some(v.into_owned()),
+            "key" => key = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let platform = platform.filter(|p| platform_ok(p)).ok_or_else(|| {
+        invalid("invalid_platform", "platform: use twitch, youtube or kick.").hint("Pick the stream again.")
+    })?;
+    let key = key
+        .filter(|k| key_ok(k))
+        .ok_or_else(|| invalid("invalid_key", "key: the stream's key from the list.").hint("Pick the stream again."))?;
+    for k in &owner.reads {
+        if let Some(samples) = st.db.stream_samples(k, &platform, &key).map_err(ApiError::db)? {
+            let list: Vec<Value> = samples.iter().map(|(at, v)| json!({ "at": at, "viewers": v })).collect();
+            return Ok(axum::Json(json!({ "platform": platform, "key": key, "samples": list })).into_response());
+        }
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, "stream_not_found", "That stream isn't in your history.")
+        .hint("It may be older than your history keeps. Pick another stream."))
 }
 
 /// `GET /v1/pro/history/export.csv?from&to&platform` (all kept history by default). Open
-/// to a subscription whose Pro ended, while its history is still kept (R-04).
+/// to a subscription whose Pro ended, while its history is still kept (R-04), and to a free
+/// account (its 30 days).
 async fn export_csv(
     State(st): State<AppState>,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, ApiError> {
     let install = authed(&st, &headers)?;
-    let sub = st.db.pro_sub_for_install(&install).map_err(ApiError::db)?.ok_or_else(pro_required)?;
+    let owner = match owner_of(&st, install.clone()) {
+        Ok(o) => o,
+        Err(e) => {
+            // No Pro and no account: a lapsed subscription's kept history can still leave.
+            let sub = st.db.pro_sub_for_install(&install).map_err(ApiError::db)?;
+            match sub {
+                Some(s) if st.db.has_history(&s.id).map_err(ApiError::db)? => {
+                    Owner { install, key: s.id.clone(), pro: false, reads: vec![s.id] }
+                }
+                _ => return Err(e),
+            }
+        }
+    };
+    take_rate(&st, &owner.key)?;
     let now = now_ms();
-    let pro = crate::billing::access::is_pro(&sub.access(), now);
-    if !pro && !st.db.has_history(&sub.id).map_err(ApiError::db)? {
-        return Err(pro_required());
-    }
-    take_rate(&st, &sub.id)?;
     let r = range(q.as_deref(), now, Some(0.max(now - MAX_RANGE_MS)))?;
-    let streams = st.db.list_streams(&sub.id, r.from, r.to, r.platform.as_deref(), usize::MAX).map_err(ApiError::db)?;
+    let streams = streams_of(&st, &owner.reads, r.from, r.to, r.platform.as_deref(), usize::MAX)?;
     let mut res = csv(&streams, now).into_response();
     let h = res.headers_mut();
     h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/csv; charset=utf-8"));

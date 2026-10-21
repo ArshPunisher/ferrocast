@@ -1,5 +1,6 @@
-//! Stream history's tables (migration 3). One row per stream per platform, owned by the
-//! subscription (`sub_id`), so the three PCs that share Pro share one history. Samples are
+//! Stream history's tables (migration 4). One row per stream per platform, owned by the
+//! subscription (`sub_id`), so the three PCs that share Pro share one history, or by a free
+//! account (its `ac_…` id in the same column; ids of the two never clash). Samples are
 //! the viewer count every five minutes while live. Nothing about viewers or chat is stored,
 //! only counts (R-51).
 
@@ -191,16 +192,25 @@ impl Db {
         rows.collect()
     }
 
-    /// One stream's viewer samples, oldest first (tests and later the per-stream chart).
-    #[cfg(test)]
-    pub(crate) fn stream_samples(&self, sub: &str, platform: &str, key: &str) -> rusqlite::Result<Vec<(i64, i64)>> {
+    /// One stream's viewer samples, oldest first; `None` when `sub` has no such stream.
+    pub(crate) fn stream_samples(
+        &self,
+        sub: &str,
+        platform: &str,
+        key: &str,
+    ) -> rusqlite::Result<Option<Vec<(i64, i64)>>> {
         let c = self.c();
-        let mut st = c.prepare(
-            "SELECT s.at, s.viewers FROM stream_samples s JOIN streams t ON t.id = s.stream_id
-             WHERE t.sub_id = ?1 AND t.platform = ?2 AND t.key = ?3 ORDER BY s.at",
-        )?;
-        let rows = st.query_map(params![sub, platform, key], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect()
+        let id: Option<i64> = c
+            .query_row(
+                "SELECT id FROM streams WHERE sub_id = ?1 AND platform = ?2 AND key = ?3",
+                params![sub, platform, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else { return Ok(None) };
+        let mut st = c.prepare("SELECT at, viewers FROM stream_samples WHERE stream_id = ?1 ORDER BY at")?;
+        let rows = st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map(Some)
     }
 
     /// Whether this subscription has any history kept (export stays open after a lapse, R-04).
@@ -208,38 +218,66 @@ impl Db {
         self.c().query_row("SELECT EXISTS(SELECT 1 FROM streams WHERE sub_id = ?1)", [sub], |r| r.get(0))
     }
 
-    /// Hourly housekeeping: history goes [`super::KEEP_AFTER_LAPSE_MS`] after a subscription
-    /// stopped granting Pro (lapsed, refunded, or gone), and samples older than a year and a
-    /// bit go for everyone (the longest range the dashboard shows is a year).
+    /// Hourly housekeeping (the retention sweep):
+    /// - a free account's streams older than [`super::FREE_KEEP_DAYS`] go, a Pro account's
+    ///   (it has Pro now) older than [`super::PRO_KEEP_DAYS`]; a deleted account's all go;
+    /// - a subscription's streams older than a year go while it grants Pro, and all of them
+    ///   [`super::KEEP_AFTER_LAPSE_MS`] after it stopped (lapsed, refunded, or gone);
+    /// - samples go with their stream, and any older than a year and a bit.
     pub(crate) fn prune_history(&self) -> rusqlite::Result<()> {
         let now = crate::now_ms();
-        let subs: Vec<String> = {
+        let day = 86_400_000;
+        let keys: Vec<String> = {
             let c = self.c();
             let mut st = c.prepare("SELECT DISTINCT sub_id FROM streams")?;
             let rows = st.query_map([], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        for sub in subs {
-            let row = self.pro_sub(&sub)?;
-            let keep = match &row {
-                None => false,
-                Some(s) => {
-                    let access = s.access();
-                    if crate::billing::access::is_pro(&access, now) {
-                        true
-                    } else {
-                        // When Pro stopped (see `SubRow::stopped_at`).
-                        let stopped = s.stopped_at();
-                        now < stopped.saturating_add(super::KEEP_AFTER_LAPSE_MS)
+        let pro_cut = now - super::PRO_KEEP_DAYS * day;
+        for key in keys {
+            // Keep streams that started at or after `cut`; `None` deletes them all. A lookup
+            // that fails skips this key until the next hour; the rest of the sweep goes on.
+            let looked = || -> rusqlite::Result<Option<i64>> {
+                Ok(if key.starts_with("ac_") {
+                    match self.account(&key)? {
+                        None => None,
+                        Some(_) => {
+                            let pro = self
+                                .account_sub(&key, now)?
+                                .is_some_and(|s| crate::billing::access::is_pro(&s.access(), now));
+                            Some(if pro { pro_cut } else { now - super::FREE_KEEP_DAYS * day })
+                        }
                     }
+                } else {
+                    match self.pro_sub(&key)? {
+                        None => None,
+                        Some(s) if crate::billing::access::is_pro(&s.access(), now) => Some(pro_cut),
+                        // When Pro stopped (see `SubRow::stopped_at`).
+                        Some(s) if now < s.stopped_at().saturating_add(super::KEEP_AFTER_LAPSE_MS) => Some(pro_cut),
+                        Some(_) => None,
+                    }
+                })
+            };
+            let cut = match looked() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stream history sweep skipped one owner this hour");
+                    continue;
                 }
             };
-            if !keep {
-                let n = self.c().execute("DELETE FROM streams WHERE sub_id = ?1", [&sub])?;
-                tracing::info!(streams = n, "stream history removed 30 days after Pro ended");
+            let n = match cut {
+                None => self.c().execute("DELETE FROM streams WHERE sub_id = ?1", [&key])?,
+                Some(cut) => {
+                    self.c().execute("DELETE FROM streams WHERE sub_id = ?1 AND started_at < ?2", params![key, cut])?
+                }
+            };
+            if n > 0 {
+                tracing::info!(streams = n, free = key.starts_with("ac_"), "stream history past what's kept removed");
             }
         }
-        self.c().execute("DELETE FROM stream_samples WHERE at < ?1", [now - super::SAMPLE_KEEP_MS])?;
+        let c = self.c();
+        c.execute("DELETE FROM stream_samples WHERE stream_id NOT IN (SELECT id FROM streams)", [])?;
+        c.execute("DELETE FROM stream_samples WHERE at < ?1", [now - super::SAMPLE_KEEP_MS])?;
         Ok(())
     }
 }

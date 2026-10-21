@@ -544,10 +544,16 @@ impl World {
 
     /// Every gated Pro route says 402 `pro_required` with the same words and hint.
     async fn all_gated(&self, auth: &str) {
+        // Stream history: a PC with no Pro and no account keeps none (1.4: a free account
+        // keeps 30 days).
+        for (m, path) in
+            [(M::GET, "/v1/pro/history"), (M::POST, "/v1/pro/history/streams"), (M::POST, "/v1/pro/history/samples")]
+        {
+            let body = (m == M::POST).then(|| json!({}));
+            let (s, v, text) = self.call(m.clone(), path, Some(auth), body).await;
+            assert_eq!((s, v["error"]["code"].as_str()), (403, Some("account_required")), "{m} {path}: {text}");
+        }
         let routes: Vec<(M, &str, Option<Value>)> = vec![
-            (M::GET, "/v1/pro/history", None),
-            (M::POST, "/v1/pro/history/streams", Some(json!({}))),
-            (M::POST, "/v1/pro/history/samples", Some(json!({}))),
             (M::POST, "/v1/pro/backups", Some(json!({}))),
             (M::GET, "/v1/pro/tips/brand", None),
             (M::PUT, "/v1/pro/tips/brand", Some(json!({ "accent": "#000000" }))),
@@ -760,9 +766,10 @@ async fn lapse_cancelled_deletes_everything_after_30_days_and_a_new_subscription
     assert!(!w.kk.with(|k| k.revoked.is_empty()), "the Kick sign-in revoked");
     assert!(w.yt.with(|y| y.revoked.contains(&"1//yt-refresh".to_string())), "the YouTube grant revoked");
     assert!(!w.dc.with(|d| d.joined.contains(GUILD)), "the Discord bot left the server");
-    // The export is closed once nothing is kept; the phone is still told Pro is paused.
+    // The export is closed once nothing is kept (no account here either); the phone is still
+    // told Pro is paused.
     let (s, _, _) = w.call(M::GET, "/v1/pro/history/export.csv", Some(&auth), None).await;
-    assert_eq!(s, 402);
+    assert_eq!(s, 403);
     let (s, _, _) = w.call(M::GET, "/v1/pro/backups", Some(&auth), None).await;
     assert_eq!(s, 402);
 

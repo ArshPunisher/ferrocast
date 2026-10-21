@@ -121,6 +121,16 @@ async fn world() -> World {
 }
 
 impl World {
+    /// Signs install `id` in to the account of `email` (made if new): its app session.
+    fn sign_in(&self, id: &str, email: &str) -> String {
+        let (a, _) = self.db.account_sign_in(email, None, now_ms()).unwrap();
+        let sid = format!("se_{id}");
+        self.db
+            .account_add_session(&sid, &a.id, &crate::hash(&sid), "app", "PC", Some(id), now_ms(), DAY, 90 * DAY)
+            .unwrap();
+        a.id
+    }
+
     /// An install, with no Pro.
     fn install(&self, id: &str) -> String {
         self.db.add_install(id, &crate::hash("secret")).unwrap();
@@ -179,7 +189,7 @@ fn stream(key: &str, started_at: i64, ended_at: Option<i64>) -> Value {
 }
 
 #[tokio::test]
-async fn every_route_needs_a_known_install_with_pro() {
+async fn every_route_needs_a_known_install_with_pro_or_an_account() {
     let w = world().await;
     let free = w.install("free");
     let routes: [(reqwest::Method, &str); 4] = [
@@ -196,8 +206,8 @@ async fn every_route_needs_a_known_install_with_pro() {
         let (s, v) = w.send(m.clone(), path, Some("nobody.secret"), body.clone()).await;
         assert_eq!(s, 401, "{path} unknown install: {v}");
         let (s, v) = w.send(m, path, Some(&free), body).await;
-        assert_eq!((s, v["error"]["code"].as_str()), (402, Some("pro_required")), "{path}");
-        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Pro"));
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("account_required")), "{path}");
+        assert!(v["error"]["hint"].as_str().unwrap().contains("Settings › Account"));
     }
 }
 
@@ -218,7 +228,7 @@ async fn a_stream_upload_is_idempotent_and_samples_follow_it() {
     // A retry of the same samples changes nothing.
     assert_eq!(w.post("/v1/pro/history/samples", &auth, samples).await.0, 200);
     assert_eq!(
-        w.db.stream_samples("sub_1", "twitch", "twitch:1").unwrap(),
+        w.db.stream_samples("sub_1", "twitch", "twitch:1").unwrap().unwrap(),
         [(start + 300_000, 50), (start + 600_000, 210)]
     );
     let (_, v) = w.get("/v1/pro/history", &auth).await;
@@ -474,18 +484,19 @@ async fn export_is_a_csv_and_stays_open_after_pro_ends() {
     assert!(lines[1].starts_with("twitch,"));
     assert!(lines[1].contains("\"'@everyone \"\"come\"\" in\""), "{}", lines[1]);
     assert!(lines[1].contains("\"INR 500.00\""));
-    // Pro lapses (every renewal failed): the list closes, the export stays open (R-04).
+    // Pro lapses (every renewal failed) on a PC that isn't signed in: the list closes, the
+    // export stays open (R-04).
     w.set_sub("sub_1", "halted", None);
-    assert_eq!(w.get("/v1/pro/history", &auth).await.0, 402);
-    assert_eq!(w.post("/v1/pro/history/streams", &auth, stream("twitch:z", start, None)).await.0, 402);
+    assert_eq!(w.get("/v1/pro/history", &auth).await.0, 403);
+    assert_eq!(w.post("/v1/pro/history/streams", &auth, stream("twitch:z", start, None)).await.0, 403);
     let (s, after, _) = w.csv("/v1/pro/history/export.csv", &auth).await;
     assert_eq!((s, after.lines().count()), (200, 2));
-    // A lapsed subscription with nothing kept, or no subscription at all: 402.
+    // A lapsed subscription with nothing kept, or no subscription at all: 403.
     let empty = w.pro("i2", "sub_2");
     w.set_sub("sub_2", "halted", None);
-    assert_eq!(w.csv("/v1/pro/history/export.csv", &empty).await.0, 402);
+    assert_eq!(w.csv("/v1/pro/history/export.csv", &empty).await.0, 403);
     let free = w.install("i3");
-    assert_eq!(w.csv("/v1/pro/history/export.csv", &free).await.0, 402);
+    assert_eq!(w.csv("/v1/pro/history/export.csv", &free).await.0, 403);
 }
 
 #[tokio::test]
@@ -525,7 +536,7 @@ async fn history_goes_30_days_after_pro_ends_and_old_samples_go() {
     assert_eq!(left, ["sub_active", "sub_recent"]);
     let samples: i64 = w.db.c().query_row("SELECT COUNT(*) FROM stream_samples", [], |r| r.get(0)).unwrap();
     assert_eq!(samples, 2, "the deleted streams' samples went with them, the old one too");
-    assert_eq!(w.db.stream_samples("sub_active", "twitch", "twitch:1").unwrap().len(), 1);
+    assert_eq!(w.db.stream_samples("sub_active", "twitch", "twitch:1").unwrap().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -536,4 +547,157 @@ async fn status_says_history_is_here() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["features"]["history"], true);
     assert!(v["quotas"].get("history_requests").is_none(), "a request rate, not a quota");
+}
+
+// ── 1.4: free accounts keep 30 days, Pro a year ─────────────────────────────────────
+
+#[tokio::test]
+async fn a_free_account_keeps_30_days_and_sees_the_limit() {
+    let w = world().await;
+    let auth = w.install("f1");
+    let acct = w.sign_in("f1", "free@example.com");
+    let now = now_ms();
+    let (s, v) = w
+        .post("/v1/pro/history/streams", &auth, stream("twitch:a", now - 3 * 3_600_000, Some(now - 2 * 3_600_000)))
+        .await;
+    assert_eq!(s, 201, "{v}");
+    let samples = json!({ "platform": "twitch", "key": "twitch:a", "samples": [{ "at": now - 3 * 3_600_000 + 60_000, "viewers": 7 }] });
+    assert_eq!(w.post("/v1/pro/history/samples", &auth, samples).await.0, 200);
+    // Older than 30 days isn't taken on a free account.
+    let (s, v) = w.post("/v1/pro/history/streams", &auth, stream("twitch:old", now - 31 * DAY, None)).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (422, Some("invalid_stream")), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("30 days"), "{v}");
+    // Asking for 90 days: the 30 kept, and `limited` says there's more to Pro.
+    let (s, v) = w.get(&format!("/v1/pro/history?from={}", now - 90 * DAY), &auth).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["plan"].as_str(), v["keep_days"].as_i64(), v["limited"].as_bool()),
+        (Some("free"), Some(30), Some(true))
+    );
+    assert_eq!(v["streams"].as_array().unwrap().len(), 1);
+    assert!(v["from"].as_i64().unwrap() >= now - 30 * DAY);
+    let (_, v) = w.get("/v1/pro/history", &auth).await;
+    assert_eq!(v["limited"], false, "the default four weeks fit");
+    // The per-stream chart and the export work for free.
+    let (s, v) = w.get("/v1/pro/history/samples?platform=twitch&key=twitch:a", &auth).await;
+    assert_eq!((s, v["samples"][0]["viewers"].as_i64()), (200, Some(7)), "{v}");
+    let (s, text, _) = w.csv("/v1/pro/history/export.csv", &auth).await;
+    assert_eq!((s, text.lines().count()), (200, 2));
+    // Rows are the account's, so another PC of the account sees them.
+    w.install("f2");
+    w.sign_in("f2", "free@example.com");
+    let (_, v) = w.get("/v1/pro/history", "f2.secret").await;
+    assert_eq!(v["streams"].as_array().unwrap().len(), 1);
+    let owner: String = w.db.c().query_row("SELECT sub_id FROM streams", [], |r| r.get(0)).unwrap();
+    assert_eq!(owner, acct);
+}
+
+#[tokio::test]
+async fn samples_are_read_back_per_stream_with_clear_errors() {
+    let w = world().await;
+    let auth = w.pro("p1", "sub_1");
+    let start = now_ms() - 3_600_000;
+    assert_eq!(w.post("/v1/pro/history/streams", &auth, stream("twitch:s", start, None)).await.0, 201);
+    let b = json!({ "platform": "twitch", "key": "twitch:s", "samples": [
+        { "at": start + 600_000, "viewers": 20 }, { "at": start + 300_000, "viewers": 10 } ] });
+    assert_eq!(w.post("/v1/pro/history/samples", &auth, b).await.0, 200);
+    let (s, v) = w.get("/v1/pro/history/samples?platform=twitch&key=twitch:s", &auth).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["samples"],
+        json!([{ "at": start + 300_000, "viewers": 10 }, { "at": start + 600_000, "viewers": 20 }])
+    );
+    for (q, status, code) in [
+        ("platform=tiktok&key=a", 422, "invalid_platform"),
+        ("platform=twitch", 422, "invalid_key"),
+        ("platform=twitch&key=twitch:none", 404, "stream_not_found"),
+    ] {
+        let (s, v) = w.get(&format!("/v1/pro/history/samples?{q}"), &auth).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (status, Some(code)), "{q}: {v}");
+        assert!(v["error"]["hint"].is_string(), "{q}");
+    }
+    let other = w.pro("p2", "sub_2");
+    assert_eq!(w.get("/v1/pro/history/samples?platform=twitch&key=twitch:s", &other).await.0, 404);
+}
+
+#[tokio::test]
+async fn pro_on_the_account_keeps_a_year_and_sees_what_it_kept_while_free() {
+    let w = world().await;
+    let auth = w.install("a1");
+    let acct = w.sign_in("a1", "up@example.com");
+    let now = now_ms();
+    let start = now - 3_600_000;
+    // Started while free...
+    assert_eq!(w.post("/v1/pro/history/streams", &auth, stream("twitch:x", start, None)).await.0, 201);
+    assert_eq!(
+        w.post("/v1/pro/history/streams", &auth, stream("twitch:y", now - 10 * DAY, Some(now - 10 * DAY + 60_000)))
+            .await
+            .0,
+        201
+    );
+    // ...then Pro on the account.
+    w.db.add_pro_sub_unlinked("sub_acct", "monthly", "e", "created").unwrap();
+    w.set_sub("sub_acct", "active", Some(now + 30 * DAY));
+    w.db.account_attach_sub(&acct, "sub_acct", "checkout", now).unwrap();
+    // The end of the same stream now goes to the subscription: one row shows, the newer.
+    let mut end = stream("twitch:x", start, Some(now - 60_000));
+    end["follows"] = json!(42);
+    assert_eq!(w.post("/v1/pro/history/streams", &auth, end).await.0, 201);
+    let (_, v) = w.get(&format!("/v1/pro/history?from={}", now - 300 * DAY), &auth).await;
+    assert_eq!(
+        (v["plan"].as_str(), v["keep_days"].as_i64(), v["limited"].as_bool()),
+        (Some("pro"), Some(365), Some(false))
+    );
+    let streams = v["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 2, "{v}");
+    assert_eq!(streams[0]["follows"], 42, "the newer copy wins");
+    // A year back is fine on Pro.
+    assert_eq!(
+        w.post("/v1/pro/history/streams", &auth, stream("twitch:z", now - 200 * DAY, Some(now - 200 * DAY + 60_000)))
+            .await
+            .0,
+        201
+    );
+    let (s, v) = w.post("/v1/pro/history/streams", &auth, stream("twitch:w", now - 366 * DAY, None)).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (422, Some("invalid_stream")), "{v}");
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_30_days_free_and_a_year_on_pro() {
+    let w = world().await;
+    let now = now_ms();
+    let free = w.sign_in("x", "f@example.com");
+    let pro_acct = w.sign_in("y", "p@example.com");
+    w.db.add_pro_sub_unlinked("sub_p", "monthly", "e", "created").unwrap();
+    w.set_sub("sub_p", "active", Some(now + 30 * DAY));
+    w.db.account_attach_sub(&pro_acct, "sub_p", "checkout", now).unwrap();
+    w.pro("z", "sub_z");
+    let put = |key: &str, platform_key: &str, started: i64| {
+        w.db.c()
+            .execute(
+                "INSERT INTO streams (sub_id, platform, key, install_id, started_at, created_at, updated_at)
+                 VALUES (?1, 'twitch', ?2, 'i', ?3, ?3, ?3)",
+                rusqlite::params![key, platform_key, started],
+            )
+            .unwrap();
+    };
+    put(&free, "f:new", now - 5 * DAY);
+    put(&free, "f:old", now - 31 * DAY);
+    put(&pro_acct, "pa:mid", now - 100 * DAY);
+    put(&pro_acct, "pa:old", now - 370 * DAY);
+    put("sub_z", "s:mid", now - 300 * DAY);
+    put("sub_z", "s:old", now - 400 * DAY);
+    put("ac_gone", "g:new", now - DAY);
+    w.db.c()
+        .execute("INSERT INTO stream_samples (stream_id, at, viewers) SELECT id, ?1, 3 FROM streams", [now - 2 * DAY])
+        .unwrap();
+    w.db.prune().unwrap();
+    let left: Vec<String> = {
+        let c = w.db.c();
+        let mut st = c.prepare("SELECT key FROM streams ORDER BY key").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(left, ["f:new", "pa:mid", "s:mid"]);
+    let samples: i64 = w.db.c().query_row("SELECT COUNT(*) FROM stream_samples", [], |r| r.get(0)).unwrap();
+    assert_eq!(samples, 3, "samples went with their streams");
 }
