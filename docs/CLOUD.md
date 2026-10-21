@@ -223,6 +223,14 @@ picks which overlays OBS shows.
 
 Overlays open in OBS count as use, so a streamer who streams at least monthly never sleeps.
 
+How sleeping works (M5): the hourly sweep puts an account to sleep, deletes its channels'
+subscriptions (so nothing arrives and the bot, gated by `bot_allowed`, is quiet), drops its bus
+and closes its open overlays with 4410 (they try again later). The rows, sign-ins and the
+bot's switch stay. Any dashboard call (`GET /c/v1/cloud` included, which still answers
+`sleeping: true` that once so the Cloud page can say so) or synced app wakes it and its
+channels are subscribed again at once. Event history: in 1.4 nothing about events is stored
+(the bus is memory only), so there's nothing to sweep after 30 days.
+
 ## 6. The bot in the cloud
 
 The existing cloud bot (API.md §9.7) runs it, keyed by the **account id** instead of a Pro
@@ -330,9 +338,10 @@ The dashboard's own client talks to `https://<web host>/c` with the same paths a
 
 ### 9.4 Admin (Control Center, ADMIN-API.md § Cloud mode)
 
-`GET /admin/v1/cloud/stats` → active cloud streamers now, accounts with cloud on, sleeping,
-connected channels per platform, overlay sockets open, events in the last hour, dropped
-events, storage used (bytes, files), memory estimate. Same guard as every admin route.
+`GET /admin/v1/cloud/stats` → `{ available, active_streamers, max_active, accounts_on, sleeping,
+channels: { twitch, kick, youtube }, overlay_sockets, max_sockets, events_last_hour (the hour
+before the last hourly sweep), events_since_start, dropped_events, storage: { bytes, files },
+memory_estimate_bytes (300 KB per active streamer) }`. Same guard as every admin route.
 
 ## 10. Security
 
