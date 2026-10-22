@@ -1528,3 +1528,122 @@ async fn ferrocast_voices_without_pro_answer_calmly() {
         .unwrap();
     assert_eq!(raw.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
+
+// ---------------------------------------------------------------- Go live everywhere
+
+#[tokio::test]
+async fn go_live_routes_refuse_what_is_wrong() {
+    let r = start().await;
+    r.engine.start_golive(0).await;
+    let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
+    assert!(v["ingest"].as_str().unwrap().starts_with("rtmp://127.0.0.1:"));
+    assert_eq!(v["destinations"].as_array().unwrap().len(), 3);
+    assert_eq!(v["destinations"][0]["id"], "twitch");
+    assert_eq!(v["destinations"][0]["enabled"], false);
+    assert_eq!(v["live"], false);
+    // The order must list every destination once.
+    let short =
+        r.put("/api/v1/golive/destinations", json!({ "destinations": [{ "id": "twitch", "enabled": true }] })).await;
+    assert_eq!(error_code(short).await.0, StatusCode::BAD_REQUEST);
+    let twice = json!({ "destinations": [
+        { "id": "twitch", "enabled": true }, { "id": "twitch", "enabled": true }, { "id": "kick", "enabled": true } ] });
+    assert_eq!(error_code(r.put("/api/v1/golive/destinations", twice).await).await.0, StatusCode::BAD_REQUEST);
+    let unknown = json!({ "destinations": [
+        { "id": "twitch", "enabled": true }, { "id": "nope", "enabled": true }, { "id": "kick", "enabled": true } ] });
+    assert_eq!(error_code(r.put("/api/v1/golive/destinations", unknown).await).await.0, StatusCode::BAD_REQUEST);
+    let extra = json!({ "destinations": [], "secret": 1 });
+    assert_eq!(error_code(r.put("/api/v1/golive/destinations", extra).await).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error_code(r.raw(reqwest::Method::PUT, "/api/v1/golive/destinations", "{nope").await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // A custom server must be rtmp:// or rtmps://, named, with a key.
+    for body in [
+        json!({ "name": "Backup", "url": "https://example.com/live", "key": "k" }),
+        json!({ "name": "", "url": "rtmp://example.com/live", "key": "k" }),
+        json!({ "name": "Backup", "url": "rtmp://example.com/live", "key": "has space" }),
+        json!({ "name": "x".repeat(41), "url": "rtmp://example.com/live", "key": "k" }),
+    ] {
+        let (status, _) = error_code(r.post("/api/v1/golive/destinations", body.clone()).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    // Platforms can be switched off, not removed; unknown ids are 404.
+    let del =
+        |id: &str| r.client.delete(format!("{}/api/v1/golive/destinations/{id}", r.base)).bearer_auth(&r.token).send();
+    assert_eq!(error_code(del("twitch").await.unwrap()).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(del("c_nope").await.unwrap()).await.0, StatusCode::NOT_FOUND);
+    // Nothing ticked: the upload check says so. No OBS: setup says how to fix it.
+    assert_eq!(
+        error_code(r.post("/api/v1/golive/upload-check", json!({})).await).await,
+        (StatusCode::UNPROCESSABLE_ENTITY, "golive_none".into())
+    );
+    assert_eq!(
+        error_code(r.post("/api/v1/golive/obs/restore", json!({})).await).await,
+        (StatusCode::UNPROCESSABLE_ENTITY, "golive_nothing_saved".into())
+    );
+    assert_eq!(
+        error_code(r.post("/api/v1/golive/obs/setup", json!({})).await).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    // No session: 401 like every route.
+    assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/golive/ingest").await.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_custom_destination_gets_the_stream_end_to_end() {
+    use ferrocast_testkit::rtmp::{Got, Obs, next, platform};
+    let r = start().await;
+    r.engine.start_golive(0).await;
+    let (port, mut got) = platform("dest-key").await;
+    let res = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "Backup PC", "url": format!("rtmp://127.0.0.1:{port}/app"), "key": "dest-key" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let added: Value = res.json().await.unwrap();
+    let id = added["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("c_"));
+    assert!(added.get("key").is_none(), "the key never comes back");
+    let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
+    let row = v["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id.as_str()).unwrap().clone();
+    assert_eq!(
+        (row["name"].as_str(), row["account"].as_str(), row["enabled"].as_bool()),
+        (Some("Backup PC"), Some("127.0.0.1"), Some(true))
+    );
+
+    // OBS streams to the local ingest with the install's key: the destination gets it.
+    let ing: Value = r.get("/api/v1/golive/ingest").await.json().await.unwrap();
+    let ingest_port: u16 =
+        ing["server"].as_str().unwrap().rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    assert!(ing["key"].as_str().unwrap().starts_with("fc_"));
+    let mut obs = Obs::publish(ingest_port, "live", ing["key"].as_str().unwrap()).await.unwrap();
+    assert_eq!(next(&mut got).await, Got::Publish("dest-key".into()));
+    assert!(matches!(obs.keyframes_until_seen(&mut got).await, Got::Video(0, _)));
+    let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
+    assert_eq!(v["live"], true);
+    let row = v["destinations"].as_array().unwrap().iter().find(|d| d["id"] == id.as_str()).unwrap().clone();
+    assert_eq!(row["health"]["state"], "live", "{row}");
+
+    // Unticked while live: it stops at once, the stream goes on.
+    let order: Vec<Value> = v["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!({ "id": d["id"], "enabled": d["id"] != id.as_str() && d["enabled"].as_bool().unwrap() }))
+        .collect();
+    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": order })).await.status(), StatusCode::OK);
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), got.recv()).await.unwrap(), Some(Got::Closed));
+    // Removed: gone from the list, its key deleted.
+    let gone = r
+        .client
+        .delete(format!("{}/api/v1/golive/destinations/{id}", r.base))
+        .bearer_auth(&r.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), StatusCode::NO_CONTENT);
+    let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
+    assert_eq!(v["destinations"].as_array().unwrap().len(), 3);
+}

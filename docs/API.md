@@ -674,6 +674,41 @@ type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started
 
 Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */, added: LaneItem | null, sound, volume }` (play the sound for `added`, only in the dashboard), `marker Marker`, `counter { name, value }`, `show { show: ShowRun | null }`, `obs_health Health`, `brb { on, scene }`.
 
+### Go live everywhere (2.0, free)
+OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key); Ferrocast sends the same stream on to every ticked destination, each on its own (no re-encode). Keys are fetched from the platforms (Twitch `channel:read:stream_key`, YouTube liveStreams, Kick `streamkey:read`), never pasted; custom servers keep their key in the secret store. A destination that joins mid-stream starts at the next keyframe; one that fails retries with backoff for as long as OBS streams, saying why; one falling behind skips ahead without slowing the others. Plan: `docs/plan/LIVE-STUDIO.md`.
+
+```ts
+type Service = "twitch" | "youtube" | "kick" | "custom"
+type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "c_<hex>" */; kind: Service; name?: string; url?: string /* custom */; enabled: boolean }
+type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
+                 | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string })
+                 & { kbps: number; dropped: number; since_ms: number }
+type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
+                     width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
+type DestinationView = { id: string; kind: Service; name: string; account: string | null /* platform account, or a custom server's host */;
+                         enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
+                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */ }
+type UploadRow = { id: string; name: string; server: string | null; delay_ms: number | null; need_kbps: number; problem?: string }
+type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: UploadRow[];
+                     verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
+type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
+                    obs: { connected: boolean; points_here: boolean; streaming: boolean; before: string | null /* "Twitch", "a custom server" */ };
+                    live: boolean; stats: StreamStats; destinations: DestinationView[] /* top first */; upload: UploadCheck | null }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/golive` | → `GoLiveView` (asks OBS for its stream setting) |
+| GET | `/api/v1/golive/ingest` | → `{ server, key }` for setting OBS up by hand. Denied to phones. 422 `golive_off` when the local server didn't start |
+| PUT | `/api/v1/golive/destinations` | `{ destinations: [{ id, enabled }] }` (every destination once, top first) → `{ destinations: DestinationConfig[] }`. While live, a newly ticked one starts and an unticked one stops at once. 400 for a missing, repeated or unknown id |
+| POST | `/api/v1/golive/destinations` | `{ name /* 1–40 */, url /* rtmp:// or rtmps:// */, key /* no spaces, ≤ 512 */ }` → 201 `DestinationConfig` (ticked, added last; the key is never returned). 400 names the field (`url: The server address must start with rtmp:// or rtmps://.`), 409 over 8. Denied to phones |
+| DELETE | `/api/v1/golive/destinations/{id}` | → 204 (custom servers only; its key is deleted). 400 for twitch / youtube / kick (switch them off), 404 unknown. Denied to phones |
+| POST | `/api/v1/golive/obs/setup` | Points OBS's stream setting at the local server, saving the one before (with its key, in the secret store) → `GoLiveView.obs`. 422 `obs_streaming` while OBS streams (OBS refuses; it would cut the stream), `obs_unreachable` / `obs_password` |
+| POST | `/api/v1/golive/obs/restore` | Puts OBS's earlier stream setting back exactly → `GoLiveView.obs`. 422 `golive_nothing_saved`, `obs_streaming` |
+| POST | `/api/v1/golive/upload-check` | ~8 s → `UploadCheck`: each ticked destination's server and connect delay, the upload speed (Twitch's bandwidth-test mode when Twitch is ticked: nothing goes live; else an upload to Cloudflare's speed test), each needing the stream's measured rate (6,160 kbps before anything streamed), and the verdict with 20% kept free. 422 `golive_none` (nothing ticked), `golive_upload`; 429 while one runs |
+
+Live frame `golive { live, stats, destinations }` (§5): every second while OBS streams, and after every change.
+
 ### Auto-replies (free, local)
 The bot answers chat that mentions something ("discord" → the invite), without a `!command`. Checked on live chat from this channel after moderation passed it; never for a message a command answers (custom, counter, module or points command), never for the streamer's own account (the bot speaks as it, R-28), the connected account, accounts with the bot role or well-known bots (Nightbot, StreamElements…), and never for text the bot itself sent in the last 2 minutes (loop guard). Quiet while the bot is off (`bot_enabled`) or panic mode is on. Rules are checked in order and the **first match wins** (a later rule never answers a message an earlier one matched, even while that one cools down). Each platform has a send budget for auto-replies (R-19: 6 per 30 s on Twitch and Kick, 2 per minute on YouTube); a platform's own rate limit pauses auto-replies there for its `Retry-After`.
 
@@ -761,6 +796,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
+- `golive { live, stats: StreamStats, destinations: DestinationView[] }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
 - `smart_mod SmartSuggestion` (§4 Smart features): a new suggestion, or one that changed (done, undone, dismissed, an error). Never sent to a mod's phone.
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 

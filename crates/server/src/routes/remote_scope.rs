@@ -108,6 +108,11 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/updates/*"),
     // The live socket has its own route on the relay, never a request frame.
     ("*", "/live"),
+    // Go live: the local stream key, and adding or removing a server with its key, stay on
+    // the PC. Watching, ticking platforms and the checks are fine from a phone.
+    ("*", "/golive/ingest"),
+    ("POST", "/golive/destinations"),
+    ("*", "/golive/destinations/*"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -248,6 +253,10 @@ mod tests {
     #[test]
     fn owners_get_everything_but_the_denied_list() {
         for (m, p) in [
+            ("GET", "/golive"),
+            ("PUT", "/golive/destinations"),
+            ("POST", "/golive/upload-check"),
+            ("POST", "/golive/obs/setup"),
             ("GET", "/settings"),
             ("PUT", "/settings"),
             ("POST", "/chat/send"),
@@ -312,6 +321,9 @@ mod tests {
             ("POST", "/updates/restart"),
             ("GET", "/live"),
             ("PATCH", "/settings"),
+            ("GET", "/golive/ingest"),
+            ("POST", "/golive/destinations"),
+            ("DELETE", "/golive/destinations/c_1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

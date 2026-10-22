@@ -10,6 +10,7 @@ mod core;
 mod designs;
 mod discord;
 mod giveaways;
+mod golive;
 mod history;
 mod import;
 mod loyalty;
@@ -207,6 +208,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/backups/{id}/restore", post(cloud_backups::restore))
         // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
         .merge(studio::routes())
+        // Go live everywhere: destinations, OBS setup, the upload check
+        .merge(golive::routes())
         // auto-replies (bot answers to chat that mentions something)
         .merge(autoreplies::routes())
         // Pro dashboard from anywhere: devices, pairing links (see crate::remote)
