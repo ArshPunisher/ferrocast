@@ -155,12 +155,20 @@ keeps working. Check with `pro-keys.sh --status`; the Control Center shows calls
 
 ## Ferrocast Pro: dashboard from anywhere
 
-Phones open the dashboard at `https://remote.clearcraftlabs.com/app/` and its API at `/r/…` on
-the same host (API.md §9.5). To switch it on:
+Phones open the dashboard on the website, `https://ferrocast.clearcraftlabs.com/app/` (Cloudflare
+Pages, deployed by every push to ferrocast-web), and its API at
+`https://api.clearcraftlabs.com/r/…` (API.md §9.5). To switch it on:
 
 1. Cloudflare → Networking → Tunnels → ferrocast-relay → Public hostnames: add
-   `remote.clearcraftlabs.com` → `http://ferrocast-relay:8787` (like `tip.clearcraftlabs.com`).
-2. In `../ferrocast-web`: `pnpm build:embed` (writes `dist/dashboard` and `dist/overlays`).
+   `api.clearcraftlabs.com` → `http://ferrocast-relay:8787` (like `tip.clearcraftlabs.com`), and
+   set `RELAY_REMOTE_URL=https://api.clearcraftlabs.com` and
+   `RELAY_WEB_URL=https://ferrocast.clearcraftlabs.com` in `../secrets/relay.env`.
+2. The public dashboard needs no step here: Cloudflare Pages (project `ferrocast-site`) builds
+   and publishes the website, `/app/` included, on every push to ferrocast-web's `main`.
+   The relay's own copy below is a fallback: the relay still answers `/app/` on its own hosts
+   (the old remote address until it's deleted), but nothing links there once `RELAY_WEB_URL` is
+   set. Cloud mode's overlay pages, which only the relay serves, come from the same build.
+   In `../ferrocast-web`: `pnpm build:embed` (writes `dist/dashboard` and `dist/overlays`).
 3. `deploy/deploy-relay.sh`: writes `RELAY_REMOTE_URL`, `RELAY_DASHBOARD_DIR=/dashboard/current`
    and `RELAY_OVERLAYS_DIR=/overlays/current` (cloud mode's overlay pages, swapped the same way
    into `/opt/ferrocast-relay/overlays`),

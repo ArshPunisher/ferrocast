@@ -98,9 +98,9 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'RELAY_TIP_URL=https://tip.clearcraftlabs.com\n'
   # The web host (sign-in, the dashboard's data); the website that serves the dashboard and
   # sign-in pages (one address, ferrocast-web plan §9); older web hosts kept during the move.
-  # Set them in ../secrets/relay.env to switch; these defaults keep today's setup.
+  # Set them in ../secrets/relay.env.
   remote_url="$(value RELAY_REMOTE_URL)"
-  printf 'RELAY_REMOTE_URL=%s\n' "${remote_url:-https://remote.clearcraftlabs.com}"
+  printf 'RELAY_REMOTE_URL=%s\n' "${remote_url:-https://api.clearcraftlabs.com}"
   printf 'RELAY_WEB_URL=%s\n' "$(value RELAY_WEB_URL)"
   printf 'RELAY_REMOTE_ALIASES=%s\n' "$(value RELAY_REMOTE_ALIASES)"
   printf 'RELAY_DASHBOARD_DIR=/dashboard/current\n'
