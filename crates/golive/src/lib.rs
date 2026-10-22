@@ -11,13 +11,15 @@
 pub mod flv;
 pub mod hub;
 pub mod ingest;
+pub mod probe;
 pub mod push;
 pub mod target;
 
 mod conn;
 
-pub use hub::Hub;
+pub use hub::{Hub, StreamStats};
 pub use ingest::Ingest;
+pub use probe::{Need, Service, Verdict};
 pub use push::{Destination, Health, PushError, PushState};
 pub use target::{Target, TargetError};
 

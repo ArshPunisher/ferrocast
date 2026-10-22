@@ -436,3 +436,27 @@ async fn a_quick_restart_is_followed_not_missed() {
     };
     assert_eq!(first, Got::Video(0, Bytes::from_static(KEY)));
 }
+
+#[tokio::test]
+async fn delay_and_upload_tests_reach_a_real_rtmp_server() {
+    let l = free_listener().await;
+    let port = l.local_addr().unwrap().port();
+    let key = format!("live_1{}", crate::probe::TWITCH_BANDWIDTH_TEST);
+    let mut got = platform(l, "live_1?bandwidthtest=true").await;
+    let t = Target::parse(&format!("rtmp://127.0.0.1:{port}/app")).unwrap();
+    let d = crate::probe::delay(&t).await.unwrap();
+    assert!(d < Duration::from_secs(1), "{d:?}");
+    let up = tokio::spawn(async move { crate::probe::upload(&t, &key, Duration::from_millis(1500)).await });
+    // The delay test's bare connections close first.
+    let mut first = next(&mut got).await;
+    while first == Got::Closed {
+        first = next(&mut got).await;
+    }
+    assert_eq!(first, Got::Publish("live_1?bandwidthtest=true".into()));
+    drop(got); // the fake platform stops keeping packets
+    let kbps = up.await.unwrap().unwrap();
+    assert!(kbps > 1_000, "{kbps}");
+    // Nothing listening: a plain reason.
+    let gone = Target::parse("rtmp://127.0.0.1:1/app").unwrap();
+    assert!(crate::probe::delay(&gone).await.unwrap_err().to_string().contains("Couldn't reach"));
+}

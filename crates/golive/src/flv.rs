@@ -4,6 +4,37 @@
 //! and starts at the next keyframe. Covers classic AVC and AAC, and Enhanced RTMP (HEVC, AV1,
 //! VP9 video and its audio, as OBS 30+ sends them).
 
+use serde::Serialize;
+
+/// The video codec, as its header names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+    Vp9,
+}
+
+/// Which codec a video header is for (classic AVC/HEVC ids, or Enhanced RTMP's FourCC).
+pub fn video_codec(data: &[u8]) -> Option<VideoCodec> {
+    let &b = data.first()?;
+    if b & 0x80 != 0 {
+        return match data.get(1..5)? {
+            b"avc1" => Some(VideoCodec::H264),
+            b"hvc1" => Some(VideoCodec::Hevc),
+            b"av01" => Some(VideoCodec::Av1),
+            b"vp09" => Some(VideoCodec::Vp9),
+            _ => None,
+        };
+    }
+    match b & 0x0F {
+        7 => Some(VideoCodec::H264),
+        12 => Some(VideoCodec::Hevc),
+        _ => None,
+    }
+}
+
 /// FLV video frame type 1: a keyframe.
 const KEYFRAME: u8 = 1;
 /// FLV sound format 10: AAC.
@@ -76,6 +107,19 @@ mod tests {
         assert!(!audio_is_header(&[0x91]));
         // MP3 (format 2) has no header.
         assert!(!audio_is_header(&[0x2F, 0x00]));
+    }
+
+    #[test]
+    fn codecs_from_headers() {
+        assert_eq!(video_codec(&[0x17, 0x00]), Some(VideoCodec::H264));
+        assert_eq!(video_codec(&[0x1C, 0x00]), Some(VideoCodec::Hevc));
+        assert_eq!(video_codec(b"\x90hvc1"), Some(VideoCodec::Hevc));
+        assert_eq!(video_codec(b"\x90av01"), Some(VideoCodec::Av1));
+        assert_eq!(video_codec(b"\x90vp09"), Some(VideoCodec::Vp9));
+        assert_eq!(video_codec(b"\x90xxxx"), None);
+        assert_eq!(video_codec(b"\x90av"), None);
+        assert_eq!(video_codec(&[]), None);
+        assert_eq!(video_codec(&[0x12, 0x00]), None);
     }
 
     #[test]

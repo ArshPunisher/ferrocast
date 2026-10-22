@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use rml_rtmp::sessions::StreamMetadata;
+use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
 use crate::flv;
@@ -69,7 +70,28 @@ pub struct Hub {
 struct State {
     headers: Headers,
     live: Live,
+    stats: StreamStats,
+    /// Bitrate window: its first packet's timestamp and the bytes since.
+    window: Option<(u32, u64)>,
+    last_key: Option<u32>,
 }
+
+/// What the incoming stream really is, measured from its packets (not OBS's settings), for
+/// the upload check and the platform rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct StreamStats {
+    /// Audio and video together over the last two seconds.
+    pub kbps: u32,
+    /// The latest gap between two keyframes.
+    pub keyframe_interval_ms: Option<u32>,
+    pub video_codec: Option<flv::VideoCodec>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f32>,
+}
+
+/// The bitrate window's length, in stream milliseconds.
+const RATE_WINDOW_MS: u32 = 2_000;
 
 impl Hub {
     pub fn new() -> Arc<Self> {
@@ -83,6 +105,12 @@ impl Hub {
         self.live.subscribe()
     }
 
+    /// The incoming stream's measured numbers (all empty while nothing streams).
+    pub fn stats(&self) -> StreamStats {
+        let st = self.lock();
+        if st.live.on { st.stats } else { StreamStats::default() }
+    }
+
     pub fn subscribe(&self) -> Subscription {
         let st = self.lock();
         Subscription { live: st.live, headers: st.headers.clone(), rx: self.tx.subscribe() }
@@ -90,8 +118,8 @@ impl Hub {
 
     pub(crate) fn start(&self) {
         let mut st = self.lock();
-        st.headers = Headers::default();
-        st.live = Live { stream: st.live.stream + 1, on: true };
+        let stream = st.live.stream + 1;
+        *st = State { live: Live { stream, on: true }, ..State::default() };
         self.live.send_replace(st.live);
     }
 
@@ -105,16 +133,26 @@ impl Hub {
     pub(crate) fn metadata(&self, m: StreamMetadata) {
         let m = Arc::new(m);
         let mut st = self.lock();
+        st.stats.width = m.video_width;
+        st.stats.height = m.video_height;
+        st.stats.fps = m.video_frame_rate;
         st.headers.metadata = Some(m.clone());
         let _ = self.tx.send(Frame::Metadata(m));
     }
 
     pub(crate) fn video(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
-        if flv::video_is_header(&data) {
-            st.headers.video = Some(data.clone());
-        }
         let key = flv::video_is_keyframe(&data);
+        if flv::video_is_header(&data) {
+            st.stats.video_codec = flv::video_codec(&data);
+            st.headers.video = Some(data.clone());
+        } else if key {
+            if let Some(prev) = st.last_key {
+                st.stats.keyframe_interval_ms = Some(ts.wrapping_sub(prev));
+            }
+            st.last_key = Some(ts);
+        }
+        st.count(ts, data.len());
         let _ = self.tx.send(Frame::Video { ts, data, key });
     }
 
@@ -123,6 +161,7 @@ impl Hub {
         if flv::audio_is_header(&data) {
             st.headers.audio = Some(data.clone());
         }
+        st.count(ts, data.len());
         let _ = self.tx.send(Frame::Audio { ts, data });
     }
 
@@ -130,5 +169,55 @@ impl Hub {
     /// never sees one without the other. A poisoned lock still holds a valid state.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl State {
+    /// Adds a packet to the bitrate window; every two seconds of stream time, the rate.
+    fn count(&mut self, ts: u32, len: usize) {
+        let (start, bytes) = self.window.get_or_insert((ts, 0));
+        *bytes += len as u64;
+        let span = ts.wrapping_sub(*start);
+        if (RATE_WINDOW_MS..u32::MAX / 2).contains(&span) {
+            self.stats.kbps = (*bytes * 8 / u64::from(span)) as u32;
+            self.window = Some((ts, 0));
+        } else if span >= u32::MAX / 2 {
+            // Time went backwards (a timestamp reset): start again.
+            self.window = Some((ts, 0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_measure_the_real_stream() {
+        let hub = Hub::new();
+        hub.start();
+        let mut m = StreamMetadata::new();
+        m.video_width = Some(1920);
+        m.video_height = Some(1080);
+        m.video_frame_rate = Some(60.0);
+        hub.metadata(m);
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        // 750 kB/s of video for 4 s, a keyframe every 2 s: 6000 kbps.
+        for i in 0..=40u32 {
+            let ts = i * 100;
+            let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+            d.resize(75_000, 0);
+            hub.video(ts, Bytes::from(d));
+        }
+        let s = hub.stats();
+        assert_eq!(s.video_codec, Some(flv::VideoCodec::H264));
+        assert_eq!(s.keyframe_interval_ms, Some(2000));
+        assert!((5900..=6100).contains(&s.kbps), "{}", s.kbps);
+        assert_eq!((s.width, s.height, s.fps), (Some(1920), Some(1080), Some(60.0)));
+        // Ended: nothing to report. A new stream starts with empty numbers.
+        hub.end();
+        assert_eq!(hub.stats(), StreamStats::default());
+        hub.start();
+        assert_eq!(hub.stats(), StreamStats::default());
     }
 }

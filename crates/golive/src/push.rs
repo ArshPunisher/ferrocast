@@ -225,55 +225,7 @@ async fn session(
     health: &watch::Sender<Health>,
     stream: u64,
 ) -> Result<Ended, PushError> {
-    let t = &dest.target;
-    let host = t.host.clone();
-    let mut s = connect(t).await?;
-    let rest = timeout(STEP_DEADLINE, conn::handshake(&mut s, PeerType::Client))
-        .await
-        .map_err(|_| PushError::Slow(host.clone()))?
-        .map_err(|e| match e {
-            conn::HandshakeFail::Closed => PushError::Closed(host.clone()),
-            conn::HandshakeFail::NotRtmp => PushError::NotRtmp(host.clone()),
-            conn::HandshakeFail::Io(_) => PushError::Broken(host.clone()),
-        })?;
-    let mut cfg = ClientSessionConfig::new();
-    cfg.tc_url = Some(t.tc_url.clone());
-    cfg.flash_version = "FMLE/3.0 (compatible; FMSc/1.0)".to_string();
-    let broken = |_: ClientSessionError| PushError::NotRtmp(host.clone());
-    let (mut client, first) = ClientSession::new(cfg).map_err(broken)?;
-    let mut out = Out { s: &mut s, host: &host, sent: 0 };
-    out.results(first).await?;
-    let mut buf = vec![0u8; READ_BUF];
-    let mut pending = client.handle_input(&rest).map_err(broken)?;
-
-    // Connect to the application, then ask to publish.
-    let r = client.request_connection(t.app.clone()).map_err(broken)?;
-    out.results(vec![r]).await?;
-    wait_for(&mut client, &mut out, &mut buf, &mut pending, &host, |ev| match ev {
-        ClientSessionEvent::ConnectionRequestAccepted => Some(Ok(())),
-        ClientSessionEvent::ConnectionRequestRejected { description } => {
-            Some(Err(PushError::Refused(host.clone(), description.clone())))
-        }
-        _ => None,
-    })
-    .await?;
-    let r = client.request_publishing(dest.key.clone(), PublishRequestType::Live).map_err(broken)?;
-    out.results(vec![r]).await?;
-    // Platforms answer a bad key with an error status, or by hanging up (Twitch).
-    wait_for(&mut client, &mut out, &mut buf, &mut pending, &host, |ev| match ev {
-        ClientSessionEvent::PublishRequestAccepted => Some(Ok(())),
-        ClientSessionEvent::UnhandleableOnStatusCode { code }
-            if code.contains("BadName") || code.contains("Failed") =>
-        {
-            Some(Err(PushError::KeyRefused(host.clone())))
-        }
-        _ => None,
-    })
-    .await
-    .map_err(|e| match e {
-        PushError::Closed(h) => PushError::KeyRefused(h),
-        e => e,
-    })?;
+    let mut p = Publisher::open(&dest.target, &dest.key).await?;
 
     // Headers first, then packets from the next keyframe, timestamps from zero.
     let Subscription { live, headers, mut rx } = hub.subscribe();
@@ -282,21 +234,21 @@ async fn session(
         return Ok(Ended::StreamEnded);
     }
     if let Some(m) = &headers.metadata {
-        let r = client.publish_metadata(m).map_err(broken)?;
-        out.results(vec![r]).await?;
+        let r = p.client.publish_metadata(m);
+        p.send(r).await?;
     }
     if let Some(v) = headers.video {
-        let r = client.publish_video_data(v, RtmpTimestamp::new(0), false).map_err(broken)?;
-        out.results(vec![r]).await?;
+        let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
+        p.send(r).await?;
     }
     if let Some(a) = headers.audio {
-        let r = client.publish_audio_data(a, RtmpTimestamp::new(0), false).map_err(broken)?;
-        out.results(vec![r]).await?;
+        let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
+        p.send(r).await?;
     }
     set_state(health, PushState::Live);
     let mut base: Option<u32> = None;
     let mut waiting_for_key = true;
-    let mut window = (Instant::now(), out.sent);
+    let mut window = (Instant::now(), p.sent);
     loop {
         tokio::select! {
             frame = rx.recv() => {
@@ -311,7 +263,7 @@ async fn session(
                 };
                 let r = match frame {
                     Frame::End => return Ok(Ended::StreamEnded),
-                    Frame::Metadata(m) => client.publish_metadata(&m).map_err(broken)?,
+                    Frame::Metadata(m) => p.client.publish_metadata(&m),
                     // Codec headers always go through; other packets wait for a real keyframe.
                     Frame::Video { ts, data, key } => {
                         if !flv::video_is_header(&data) {
@@ -320,31 +272,29 @@ async fn session(
                             }
                             waiting_for_key = false;
                         }
-                        client.publish_video_data(data, stamp(&mut base, ts), false).map_err(broken)?
+                        p.client.publish_video_data(data, stamp(&mut base, ts), false)
                     }
                     Frame::Audio { ts, data } => {
                         if waiting_for_key && !flv::audio_is_header(&data) {
                             continue;
                         }
-                        client.publish_audio_data(data, stamp(&mut base, ts), false).map_err(broken)?
+                        p.client.publish_audio_data(data, stamp(&mut base, ts), false)
                     }
                 };
-                out.results(vec![r]).await?;
+                p.send(r).await?;
             }
-            n = out.s.read(&mut buf) => {
-                let n = n.map_err(|_| PushError::Broken(host.clone()))?;
-                if n == 0 {
-                    return Err(PushError::Closed(host.clone()));
-                }
-                let results = client.handle_input(&buf[..n]).map_err(broken)?;
-                out.results(results).await?;
+            // Only the read races the next packet (a read can be dropped safely); the answer
+            // is written after, so a write is never cut off halfway.
+            n = p.read_some() => {
+                let n = n?;
+                p.answer(n).await?;
             }
         }
         if window.0.elapsed() >= HEALTH_EVERY {
             let secs = window.0.elapsed().as_secs_f64();
-            let kbps = ((out.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
+            let kbps = ((p.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
             health.send_modify(|h| h.kbps = kbps);
-            window = (Instant::now(), out.sent);
+            window = (Instant::now(), p.sent);
         }
     }
 }
@@ -356,14 +306,79 @@ fn stamp(base: &mut Option<u32>, ts: u32) -> RtmpTimestamp {
     RtmpTimestamp::new(ts.wrapping_sub(b))
 }
 
-/// Writes a session's outbound packets, counting bytes for the bitrate.
-struct Out<'a> {
-    s: &'a mut Stream,
-    host: &'a str,
-    sent: u64,
+/// A connection that a server accepted for publishing: the forwarder's and the upload test's.
+pub(crate) struct Publisher {
+    pub(crate) client: ClientSession,
+    s: Stream,
+    host: String,
+    buf: Vec<u8>,
+    /// Bytes written since the connection opened.
+    pub(crate) sent: u64,
 }
 
-impl Out<'_> {
+impl Publisher {
+    /// Connects, shakes hands, connects to the app and asks to publish with `key`.
+    pub(crate) async fn open(t: &Target, key: &str) -> Result<Self, PushError> {
+        let host = t.host.clone();
+        let mut s = connect(t).await?;
+        let rest = timeout(STEP_DEADLINE, conn::handshake(&mut s, PeerType::Client))
+            .await
+            .map_err(|_| PushError::Slow(host.clone()))?
+            .map_err(|e| match e {
+                conn::HandshakeFail::Closed => PushError::Closed(host.clone()),
+                conn::HandshakeFail::NotRtmp => PushError::NotRtmp(host.clone()),
+                conn::HandshakeFail::Io(_) => PushError::Broken(host.clone()),
+            })?;
+        let mut cfg = ClientSessionConfig::new();
+        cfg.tc_url = Some(t.tc_url.clone());
+        cfg.flash_version = "FMLE/3.0 (compatible; FMSc/1.0)".to_string();
+        let (client, first) = ClientSession::new(cfg).map_err(|_| PushError::NotRtmp(host.clone()))?;
+        let mut p = Self { client, s, host, buf: vec![0u8; READ_BUF], sent: 0 };
+        p.results(first).await?;
+        let mut pending = p.client.handle_input(&rest).map_err(|_| p.not_rtmp())?;
+
+        let r = p.client.request_connection(t.app.clone());
+        p.send(r).await?;
+        let host = p.host.clone();
+        p.wait_for(&mut pending, |ev| match ev {
+            ClientSessionEvent::ConnectionRequestAccepted => Some(Ok(())),
+            ClientSessionEvent::ConnectionRequestRejected { description } => {
+                Some(Err(PushError::Refused(host.clone(), description.clone())))
+            }
+            _ => None,
+        })
+        .await?;
+        let r = p.client.request_publishing(key.to_string(), PublishRequestType::Live);
+        p.send(r).await?;
+        // Platforms answer a bad key with an error status, or by hanging up (Twitch).
+        p.wait_for(&mut pending, |ev| match ev {
+            ClientSessionEvent::PublishRequestAccepted => Some(Ok(())),
+            ClientSessionEvent::UnhandleableOnStatusCode { code }
+                if code.contains("BadName") || code.contains("Failed") =>
+            {
+                Some(Err(PushError::KeyRefused(host.clone())))
+            }
+            _ => None,
+        })
+        .await
+        .map_err(|e| match e {
+            PushError::Closed(h) => PushError::KeyRefused(h),
+            e => e,
+        })?;
+        Ok(p)
+    }
+
+    fn not_rtmp(&self) -> PushError {
+        PushError::NotRtmp(self.host.clone())
+    }
+
+    /// Writes one session result (a packet to send, or an error making it).
+    pub(crate) async fn send(&mut self, r: Result<ClientSessionResult, ClientSessionError>) -> Result<(), PushError> {
+        let r = r.map_err(|_| self.not_rtmp())?;
+        self.results(vec![r]).await.map(|_| ())
+    }
+
+    /// Writes outbound packets; returns the events among the results.
     async fn results(&mut self, results: Vec<ClientSessionResult>) -> Result<Vec<ClientSessionEvent>, PushError> {
         let mut events = Vec::new();
         for r in results {
@@ -379,38 +394,51 @@ impl Out<'_> {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), PushError> {
         timeout(WRITE_DEADLINE, self.s.write_all(bytes))
             .await
-            .map_err(|_| PushError::Stalled(self.host.to_string()))?
-            .map_err(|_| PushError::Broken(self.host.to_string()))?;
+            .map_err(|_| PushError::Stalled(self.host.clone()))?
+            .map_err(|_| PushError::Broken(self.host.clone()))?;
         self.sent += bytes.len() as u64;
         Ok(())
     }
-}
 
-/// Reads and answers the server until `done` picks an event (within the step deadline).
-async fn wait_for(
-    client: &mut ClientSession,
-    out: &mut Out<'_>,
-    buf: &mut [u8],
-    pending: &mut Vec<ClientSessionResult>,
-    host: &str,
-    mut done: impl FnMut(&ClientSessionEvent) -> Option<Result<(), PushError>>,
-) -> Result<(), PushError> {
-    let deadline = Instant::now() + STEP_DEADLINE;
-    loop {
-        let events = out.results(std::mem::take(pending)).await?;
-        for ev in &events {
-            if let Some(r) = done(ev) {
-                return r;
-            }
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        let n = timeout(left, out.s.read(buf))
-            .await
-            .map_err(|_| PushError::Slow(host.to_string()))?
-            .map_err(|_| PushError::Broken(host.to_string()))?;
+    /// Reads what the server sent (acknowledgements, pings) into the buffer. Safe to drop
+    /// in `select!`: nothing is lost if it never completes.
+    pub(crate) async fn read_some(&mut self) -> Result<usize, PushError> {
+        let n = self.s.read(&mut self.buf).await.map_err(|_| PushError::Broken(self.host.clone()))?;
         if n == 0 {
-            return Err(PushError::Closed(host.to_string()));
+            return Err(PushError::Closed(self.host.clone()));
         }
-        *pending = client.handle_input(&buf[..n]).map_err(|_| PushError::NotRtmp(host.to_string()))?;
+        Ok(n)
+    }
+
+    /// Answers the `n` bytes [`Self::read_some`] read.
+    pub(crate) async fn answer(&mut self, n: usize) -> Result<(), PushError> {
+        let results = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
+        self.results(results).await.map(|_| ())
+    }
+
+    /// Reads and answers the server until `done` picks an event (within the step deadline).
+    async fn wait_for(
+        &mut self,
+        pending: &mut Vec<ClientSessionResult>,
+        mut done: impl FnMut(&ClientSessionEvent) -> Option<Result<(), PushError>>,
+    ) -> Result<(), PushError> {
+        let deadline = Instant::now() + STEP_DEADLINE;
+        loop {
+            let events = self.results(std::mem::take(pending)).await?;
+            for ev in &events {
+                if let Some(r) = done(ev) {
+                    return r;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = timeout(left, self.s.read(&mut self.buf))
+                .await
+                .map_err(|_| PushError::Slow(self.host.clone()))?
+                .map_err(|_| PushError::Broken(self.host.clone()))?;
+            if n == 0 {
+                return Err(PushError::Closed(self.host.clone()));
+            }
+            *pending = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
+        }
     }
 }
