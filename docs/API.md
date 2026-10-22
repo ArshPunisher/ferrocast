@@ -624,7 +624,8 @@ Permissions: Twitch needs `channel:manage:broadcast` (Modify Channel Information
 
 ```ts
 type ShowConfig = { preset_id: string | null; starting_scene: string | null; countdown_s: number /* 0 or 10–3600 */; live_scene: string | null;
-                    alerts_on: boolean; discord: boolean; bot_on: boolean; replay_buffer: boolean; ending_scene: string | null;
+                    alerts_on: boolean; discord: boolean; bot_on: boolean; replay_buffer: boolean;
+                    start_stream: boolean /* off */; ending_scene: string | null; stop_stream: boolean /* off */; stop_delay_s: number /* 0–600, 30 */;
                     recap_message: string | null /* {thanks} {follows} {subs} {duration} */; mic_sources: string[]; cam_sources: string[];
                     min_disk_gb: number; platforms: Platform[] }
 type Check = { id; label; status: "ok" | "warn" | "fail" | "skip"; detail; fix: { label, href /* "#/settings/obs" or "action:unmute:Mic" */ } | null }
@@ -637,9 +638,9 @@ type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started
 | GET | `/api/v1/show/preflight` | → `{ checks: Check[], ready }`: OBS, scenes exist, mics not muted, cameras shown, disk space (OBS's recording drive), platforms connected, stream-info permission, Discord webhook |
 | POST | `/api/v1/show/preflight/fix` | `{ action: "unmute:<input>" \| "show:<scene>/<source>" \| "start_replay_buffer" }` → the new pre-flight |
 | GET | `/api/v1/show` | → `{ show: ShowRun \| null }` |
-| POST | `/api/v1/show/start` | `{ force?: boolean }` → 201 `{ show }`. Runs: preset → replay buffer → starting scene → alerts on → bot on → Discord post → countdown (switches to the live scene at zero). 409 while a show runs, 422 `preflight_failed` (unless `force`) |
+| POST | `/api/v1/show/start` | `{ force?: boolean }` → 201 `{ show }`. Runs: preset → replay buffer → starting scene → OBS Start Streaming (`start_stream`, step `stream`) → alerts on → bot on → Discord post → countdown (switches to the live scene at zero). 409 while a show runs, 422 `preflight_failed` (unless `force`) |
 | POST | `/api/v1/show/countdown/skip` · `/countdown/cancel` · `/live-scene` | → `{ show }`. 404 `no_countdown` |
-| POST | `/api/v1/show/end` | → `{ show }`: ending scene, thank-you in chat, an "Show ended" marker. Never stops the stream itself |
+| POST | `/api/v1/show/end` | → `{ show }`: ending scene, thank-you in chat, an "Show ended" marker, then with `stop_stream` OBS Stop Streaming (step `stop_stream`: `done` at once with `stop_delay_s: 0`, else `waiting` and updated by a `show` frame when OBS stops; a show started meanwhile keeps streaming) |
 
 **OBS helpers.** `ScenesConfig = { chat_enabled; chat_allowed: string[] /* !scene allow-list */; hotkeys: string[] /* Alt+1…9 in the dashboard */; brb_scene; brb_on_ads; brb_mute: string[]; clip_command; clip_on_big_moments }`.
 
@@ -652,6 +653,7 @@ type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started
 | POST | `/api/v1/obs/input/mute` | `{ input, muted }` → 204 |
 | POST | `/api/v1/obs/replay/save` | `{ label? /* ≤200 */ }` → 201 `{ saved, path, marker }`; 422 with how to start the replay buffer |
 | POST | `/api/v1/obs/brb` | `{ on }` → `{ on, scene }` (remembers the scene to go back to; mutes `brb_mute`). 422 `no_brb_scene` / `no_return_scene` |
+| GET / POST | `/api/v1/obs/stream` | GET → `{ streaming }`; POST `{ on }` presses OBS's Start or Stop Streaming → `{ streaming }` (already in that state is fine). 422 `obs_no_stream_key` when OBS has no stream service or key, `obs_unreachable` / `obs_password` |
 | GET / POST | `/api/v1/obs/health` | GET → `{ health: Health \| null }` (the watcher's last reading, every 5 s while OBS is connected); POST reads now |
 | GET / PUT | `/api/v1/obs/switcher` | `ScenesConfig` |
 

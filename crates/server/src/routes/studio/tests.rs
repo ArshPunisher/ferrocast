@@ -143,6 +143,7 @@ async fn every_studio_route_needs_the_session() {
         "/show",
         "/show/preflight",
         "/obs/scenes",
+        "/obs/stream",
         "/moments/lane",
         "/moments/markers/export",
     ] {
@@ -417,6 +418,18 @@ async fn obs_helper_routes_and_their_errors() {
     let (s, h) = body(r.post("/obs/health", json!({})).await).await;
     assert_eq!(s, StatusCode::OK);
     assert!(h["health"]["disk_gb"].as_f64().unwrap() > 0.0);
+    // Start and stop streaming.
+    let (s, b) = body(r.get("/obs/stream").await).await;
+    assert_eq!((s, b["streaming"].as_bool()), (StatusCode::OK, Some(false)));
+    let (s, b) = body(r.post("/obs/stream", json!({ "on": true })).await).await;
+    assert_eq!((s, b["streaming"].as_bool()), (StatusCode::OK, Some(true)));
+    assert!(obs.lock().unwrap().streaming);
+    let (s, b) = body(r.post("/obs/stream", json!({ "on": false })).await).await;
+    assert_eq!((s, b["streaming"].as_bool()), (StatusCode::OK, Some(false)));
+    assert_eq!(code(r.post("/obs/stream", json!({})).await).await.0, StatusCode::BAD_REQUEST);
+    obs.lock().unwrap().stream_unconfigured = true;
+    let res = r.post("/obs/stream", json!({ "on": true })).await;
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]

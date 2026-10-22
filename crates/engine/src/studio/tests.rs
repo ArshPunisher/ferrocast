@@ -858,3 +858,49 @@ async fn a_mod_changes_the_title_from_chat_in_the_background() {
         .unwrap();
     assert_eq!(r.results.len(), 2);
 }
+
+#[tokio::test]
+async fn the_show_can_start_and_stop_streaming_in_obs() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let tw = Fake::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let cfg = json!({ "start_stream": true, "stop_stream": true, "stop_delay_s": 0, "discord": false, "recap_message": null });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    let run = e.start_show(true).await.unwrap();
+    let s = run.steps.iter().find(|s| s.id == "stream").unwrap();
+    assert_eq!(s.status, "done", "{s:?}");
+    assert!(obs.lock().unwrap().streaming);
+    assert!(e.obs_streaming().await.unwrap());
+    let ended = e.end_show().await.unwrap();
+    assert_eq!(ended.steps.iter().find(|s| s.id == "stop_stream").unwrap().status, "done");
+    assert!(!obs.lock().unwrap().streaming);
+    // With a delay it waits, then stops.
+    let cfg = json!({ "stop_delay_s": 1 });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    e.start_show(true).await.unwrap();
+    let ended = e.end_show().await.unwrap();
+    assert_eq!(ended.steps.iter().find(|s| s.id == "stop_stream").unwrap().status, "waiting");
+    assert!(obs.lock().unwrap().streaming, "not yet");
+    eventually(|| !obs.lock().unwrap().streaming).await;
+    eventually(|| e.show_run().unwrap().steps.iter().any(|s| s.id == "stop_stream" && s.status == "done")).await;
+    // Going live again before the delay keeps the new stream running.
+    let cfg = json!({ "stop_delay_s": 2 });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    e.start_show(true).await.unwrap();
+    e.end_show().await.unwrap();
+    e.start_show(true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert!(obs.lock().unwrap().streaming, "the old show's stop didn't touch the new stream");
+    // The plain buttons, and OBS without a stream key.
+    assert!(!e.obs_set_streaming(false).await.unwrap());
+    assert!(e.obs_set_streaming(true).await.unwrap());
+    e.obs_set_streaming(false).await.unwrap();
+    obs.lock().unwrap().stream_unconfigured = true;
+    let err = e.obs_set_streaming(true).await.unwrap_err().to_string();
+    assert!(err.contains("stream key"), "{err}");
+    assert!(matches!(
+        e.patch_show_config(json!({ "stop_delay_s": 601 }).as_object().unwrap()).await,
+        Err(crate::EngineError::Invalid(_))
+    ));
+}

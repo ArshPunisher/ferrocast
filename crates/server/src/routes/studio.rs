@@ -53,6 +53,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/obs/input/mute", post(mute_input))
         .route("/obs/replay/save", post(clip))
         .route("/obs/brb", post(brb))
+        .route("/obs/stream", get(obs_stream).post(set_obs_stream))
         .route("/obs/health", get(health).post(check_health))
         .route("/obs/switcher", get(switcher).put(save_switcher))
         // moments
@@ -353,6 +354,14 @@ struct BrbBody {
 
 async fn brb(State(app): State<AppState>, Body(b): Body<BrbBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.set_brb(b.on).await?))
+}
+
+async fn obs_stream(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "streaming": app.engine.obs_streaming().await? })))
+}
+
+async fn set_obs_stream(State(app): State<AppState>, Body(b): Body<BrbBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "streaming": app.engine.obs_set_streaming(b.on).await? })))
 }
 
 async fn health(State(app): State<AppState>) -> Json<Value> {

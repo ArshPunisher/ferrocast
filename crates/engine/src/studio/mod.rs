@@ -188,6 +188,9 @@ pub(crate) fn obs_error(e: ferrocast_obs::ObsError) -> EngineError {
     let (code, hint) = match &e {
         ObsError::NotReachable => ("obs_unreachable", "Open OBS on this computer, then check Settings, OBS."),
         ObsError::WrongPassword => ("obs_password", "Open Settings, OBS and use the details OBS shows."),
+        ObsError::Refused(m) if m.contains("stream key") => {
+            ("obs_no_stream_key", "In OBS open Settings, Stream and connect your account or paste the stream key.")
+        }
         ObsError::Refused(_) => ("obs_refused", "Check the name in OBS, or pick it again in Studio."),
     };
     EngineError::Refused { status: 422, code, message: e.to_string(), hint: hint.into(), retry_after: None }

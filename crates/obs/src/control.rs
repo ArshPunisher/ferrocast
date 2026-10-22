@@ -159,6 +159,36 @@ pub async fn save_replay(client: &Client) -> Result<Option<String>, ObsError> {
     Ok(client.replay_buffer().last_replay().await.ok().filter(|p| !p.is_empty()))
 }
 
+/// Whether OBS is streaming right now.
+pub async fn streaming(client: &Client) -> Result<bool, ObsError> {
+    client.streaming().status().await.map(|s| s.active).map_err(err)
+}
+
+/// Presses OBS's Start Streaming. Already live is what the caller wanted.
+pub async fn start_stream(client: &Client) -> Result<(), ObsError> {
+    match client.streaming().start().await {
+        Ok(()) => Ok(()),
+        Err(e) if code(&e) == Some(StatusCode::OutputRunning) => Ok(()),
+        Err(e) if matches!(code(&e), Some(StatusCode::InvalidResourceState | StatusCode::ResourceNotConfigurable)) => {
+            Err(ObsError::Refused(
+                "OBS has nowhere to stream to. In OBS open Settings, Stream, pick your platform and add the \
+                 stream key, then try again."
+                    .into(),
+            ))
+        }
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// Presses OBS's Stop Streaming. Already stopped is what the caller wanted.
+pub async fn stop_stream(client: &Client) -> Result<(), ObsError> {
+    match client.streaming().stop().await {
+        Ok(()) => Ok(()),
+        Err(e) if code(&e) == Some(StatusCode::OutputNotRunning) => Ok(()),
+        Err(e) => Err(err(e)),
+    }
+}
+
 /// Raw numbers for [`ferrocast_core::show::health`].
 pub async fn health_sample(client: &Client, at: i64) -> Result<ferrocast_core::show::HealthSample, ObsError> {
     let s = client.general().stats().await.map_err(err)?;
@@ -267,5 +297,21 @@ mod tests {
         assert_eq!((h.stream_bytes, h.stream_skipped, h.stream_total), (1_000_000, 5, 100));
         assert_eq!(h.cpu, 12.5);
         assert!(h.disk_mb > 0.0);
+    }
+
+    #[tokio::test]
+    async fn start_and_stop_streaming_are_idempotent_and_explain_a_missing_key() {
+        let st = FakeObs::studio();
+        let c = client(&st).await;
+        assert!(!streaming(&c).await.unwrap());
+        start_stream(&c).await.unwrap();
+        assert!(streaming(&c).await.unwrap());
+        start_stream(&c).await.unwrap();
+        stop_stream(&c).await.unwrap();
+        assert!(!streaming(&c).await.unwrap());
+        stop_stream(&c).await.unwrap();
+        st.lock().unwrap().stream_unconfigured = true;
+        let e = start_stream(&c).await.unwrap_err().to_string();
+        assert!(e.contains("stream key"), "{e}");
     }
 }

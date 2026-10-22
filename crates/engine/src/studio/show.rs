@@ -341,11 +341,12 @@ impl Engine {
                 }
             });
         }
-        let client = if cfg.starting_scene.is_some() || cfg.live_scene.is_some() || cfg.replay_buffer {
-            Some(self.obs_client().await)
-        } else {
-            None
-        };
+        let client =
+            if cfg.starting_scene.is_some() || cfg.live_scene.is_some() || cfg.replay_buffer || cfg.start_stream {
+                Some(self.obs_client().await)
+            } else {
+                None
+            };
         if cfg.replay_buffer {
             steps.push(match &client {
                 Some(Ok(c)) => match ferrocast_obs::control::start_replay_buffer(c).await {
@@ -358,6 +359,16 @@ impl Engine {
         }
         if let Some(scene) = &cfg.starting_scene {
             steps.push(self.switch_step(&client, "starting_scene", "Starting scene", scene).await);
+        }
+        if cfg.start_stream {
+            steps.push(match &client {
+                Some(Ok(c)) => match ferrocast_obs::control::start_stream(c).await {
+                    Ok(()) => Step::new("stream", "Go live in OBS", "done", "OBS is streaming."),
+                    Err(e) => Step::new("stream", "Go live in OBS", "failed", e.to_string()),
+                },
+                Some(Err(e)) => Step::new("stream", "Go live in OBS", "failed", e.to_string()),
+                None => Step::new("stream", "Go live in OBS", "skipped", ""),
+            });
         }
         if cfg.alerts_on {
             let q = self.queue().await;
@@ -527,11 +538,76 @@ impl Engine {
             });
         }
         let _ = self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Show ended", None, false).await;
+        if cfg.stop_stream {
+            run.steps.push(if cfg.stop_delay_s == 0 {
+                self.stop_stream_step().await
+            } else {
+                let engine = self.clone();
+                let (id, delay) = (run.id.clone(), cfg.stop_delay_s);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(u64::from(delay))).await;
+                    engine.stop_stream_later(&id).await;
+                });
+                Step::new(
+                    "stop_stream",
+                    "Stop streaming",
+                    "waiting",
+                    format!("OBS stops streaming in {delay} seconds."),
+                )
+            });
+        }
         run.phase = Phase::Ended;
         run.ended_at = Some(now().0);
         run.countdown_ends_at = None;
         self.set_show(Some(run.clone()));
         Ok(run)
+    }
+}
+
+impl Engine {
+    async fn stop_stream_step(&self) -> Step {
+        let r = match self.obs_client().await {
+            Ok(c) => ferrocast_obs::control::stop_stream(&c).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match r {
+            Ok(()) => Step::new("stop_stream", "Stop streaming", "done", "OBS stopped streaming."),
+            Err(e) => Step::new("stop_stream", "Stop streaming", "failed", e),
+        }
+    }
+
+    /// The delayed Stop Streaming of an ended show. Does nothing if another show started
+    /// meanwhile (the streamer went live again).
+    async fn stop_stream_later(&self, show_id: &str) {
+        let current = self.show_run();
+        if current.as_ref().is_none_or(|r| r.id != show_id || r.phase != Phase::Ended) {
+            return;
+        }
+        let step = self.stop_stream_step().await;
+        if let Some(mut run) = self.show_run().filter(|r| r.id == show_id) {
+            match run.steps.iter_mut().find(|s| s.id == "stop_stream") {
+                Some(s) => *s = step,
+                None => run.steps.push(step),
+            }
+            self.set_show(Some(run));
+        }
+    }
+
+    /// Whether OBS is streaming (`GET /api/v1/obs/stream`).
+    pub async fn obs_streaming(&self) -> Result<bool, EngineError> {
+        let c = self.obs_client().await?;
+        ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)
+    }
+
+    /// Presses OBS's Start or Stop Streaming (`POST /api/v1/obs/stream`).
+    pub async fn obs_set_streaming(&self, on: bool) -> Result<bool, EngineError> {
+        let c = self.obs_client().await?;
+        if on {
+            ferrocast_obs::control::start_stream(&c).await.map_err(super::obs_error)?;
+        } else {
+            ferrocast_obs::control::stop_stream(&c).await.map_err(super::obs_error)?;
+        }
+        ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)
     }
 }
 

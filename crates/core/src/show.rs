@@ -28,8 +28,15 @@ pub struct ShowConfig {
     pub bot_on: bool,
     /// Start OBS's replay buffer so "clip that" works.
     pub replay_buffer: bool,
+    /// Press OBS's Start Streaming as the show starts (after the starting scene, so viewers
+    /// see it during the countdown). Off by default: an existing show never goes live by itself.
+    pub start_stream: bool,
     /// Ending: switch here.
     pub ending_scene: Option<String>,
+    /// Ending: press OBS's Stop Streaming `stop_delay_s` after the ending scene.
+    pub stop_stream: bool,
+    /// 0–600 s, so viewers see the ending scene and the thank-you first.
+    pub stop_delay_s: u32,
     /// Ending: post a thank-you in chat (`{thanks}`, `{follows}`, `{subs}`, `{duration}`).
     pub recap_message: Option<String>,
     /// Pre-flight: these OBS audio inputs must not be muted.
@@ -54,7 +61,10 @@ impl Default for ShowConfig {
             discord: true,
             bot_on: true,
             replay_buffer: false,
+            start_stream: false,
             ending_scene: None,
+            stop_stream: false,
+            stop_delay_s: 30,
             recap_message: Some("Thanks for hanging out! Big love to {thanks}. See you next stream.".into()),
             mic_sources: Vec::new(),
             cam_sources: Vec::new(),
@@ -96,6 +106,9 @@ impl ShowConfig {
             if !valid_scene_name(s) {
                 return Err("mic_sources: source names are 1 to 100 characters.".into());
             }
+        }
+        if self.stop_delay_s > 600 {
+            return Err("stop_delay_s: 0 to 600 seconds.".into());
         }
         if self.min_disk_gb > 10_000 {
             return Err("min_disk_gb: up to 10000 GB.".into());

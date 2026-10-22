@@ -42,6 +42,8 @@ pub struct FakeObs {
     pub replay_active: bool,
     pub replay_saves: u32,
     pub streaming: bool,
+    /// OBS has no stream service or key set (StartStream answers 606).
+    pub stream_unconfigured: bool,
     pub reconnecting: bool,
     pub stream_bytes: u64,
     pub stream_skipped: u64,
@@ -277,6 +279,17 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                         "outputSkippedFrames": 0, "outputTotalFrames": s.render_total,
                         "webSocketSessionIncomingMessages": 1, "webSocketSessionOutgoingMessages": 1 }),
             )
+        }
+        "StartStream" if s.stream_unconfigured => (606, Value::Null),
+        "StartStream" if s.streaming => (500, Value::Null),
+        "StartStream" => {
+            s.streaming = true;
+            (100, Value::Null)
+        }
+        "StopStream" if !s.streaming => (501, Value::Null),
+        "StopStream" => {
+            s.streaming = false;
+            (100, Value::Null)
         }
         "GetStreamStatus" => (
             100,
