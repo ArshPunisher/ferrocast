@@ -460,3 +460,55 @@ async fn delay_and_upload_tests_reach_a_real_rtmp_server() {
     let gone = Target::parse("rtmp://127.0.0.1:1/app").unwrap();
     assert!(crate::probe::delay(&gone).await.unwrap_err().to_string().contains("Couldn't reach"));
 }
+
+/// A fake platform that accepts the stream, then hangs up `after` the publish was accepted
+/// (as Kick does with a stream over its bitrate limit).
+async fn platform_that_drops(
+    listener: TcpListener,
+    key: &'static str,
+    after: Duration,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (itx, mut irx) = mpsc::unbounded_channel();
+                let serve = serve_platform(&mut sock, key, &itx);
+                let drop_after_publish = async {
+                    while let Some(g) = irx.recv().await {
+                        let published = matches!(g, Got::Publish(_));
+                        let _ = tx.send(g);
+                        if published {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(after).await;
+                };
+                tokio::select! {
+                    _ = serve => {}
+                    _ = drop_after_publish => {}
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+#[tokio::test]
+async fn a_platform_that_keeps_dropping_a_live_stream_is_retried_from_the_first_wait() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
+    let mut health = start(&w, destination(dport, "k"));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for _ in 0..2 {
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, 1, "the count starts over after being live"),
+            s => panic!("{s:?}"),
+        }
+    }
+}

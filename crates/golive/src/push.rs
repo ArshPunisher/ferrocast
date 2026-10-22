@@ -148,6 +148,12 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     if !still_on(&live.borrow()) {
                         break;
                     }
+                    // A session that went live and then failed starts the count over: a
+                    // platform that keeps dropping a long stream is retried at once, not
+                    // after the longest wait.
+                    if health.borrow().state == PushState::Live {
+                        attempt = 0;
+                    }
                     attempt = attempt.saturating_add(1);
                     let wait = backoff(attempt);
                     tracing::info!(dest = %dest.id, attempt, error = %err, "golive: destination failed, retrying");
