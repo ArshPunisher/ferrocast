@@ -186,6 +186,13 @@ pub(crate) fn web_origin(st: &AppState) -> String {
     st.remote.cfg.origin.clone().unwrap_or_default()
 }
 
+/// Where people are sent (the dashboard, sign-in, email links): the website when it's set
+/// (`RELAY_WEB_URL`), else the web host. Callbacks from Google and the platforms stay on
+/// [`web_origin`], the host that holds the sign-in cookie.
+pub(crate) fn page_origin(st: &AppState) -> String {
+    st.remote.cfg.page_origin().unwrap_or_default().to_string()
+}
+
 pub(crate) fn sha(s: &str) -> String {
     crate::hash(s)
 }
@@ -214,13 +221,17 @@ pub(crate) fn set_cookie(name: &str, value: &str, max_age_s: i64) -> HeaderValue
 /// then `Sec-Fetch-Site: same-origin` must vouch for the request instead.
 pub(crate) fn same_origin(st: &AppState, headers: &HeaderMap) -> bool {
     let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    let origin_ok = match headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
+    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
+    let origin_ok = match origin {
         None => true,
         Some("null") => site == Some("same-origin"),
-        Some(o) => st.remote.cfg.origin.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(o)),
+        Some(o) => st.remote.cfg.trusted_origin(o),
     };
+    // The website (another address on the same site) calls the web host across origins.
+    let from_website = origin.is_some_and(|o| st.remote.cfg.web.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(o)));
     let site_ok = match site {
         None => true,
+        Some("same-site") => from_website,
         Some(s) => matches!(s, "same-origin" | "none"),
     };
     origin_ok && site_ok
@@ -590,7 +601,12 @@ async fn app_start(
     st.db
         .account_put_flow(&id, &install, &redirect, challenge, state, &label, now, expires_at)
         .map_err(ApiError::db)?;
-    let url = format!("{}/login?flow={id}", web_origin(&st));
+    // The website's sign-in page when there is one, else this host's own.
+    let url = if st.remote.cfg.web.is_some() {
+        format!("{}/login/?flow={id}", page_origin(&st))
+    } else {
+        format!("{}/login?flow={id}", web_origin(&st))
+    };
     Ok(no_store(
         (StatusCode::CREATED, axum::Json(json!({ "flow_id": id, "url": url, "expires_at": expires_at })))
             .into_response(),

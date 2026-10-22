@@ -384,8 +384,8 @@ async fn finish(State(st): State<AppState>, headers: HeaderMap, Query(q): Query<
         Err(_) => return page(StatusCode::SERVICE_UNAVAILABLE, TRY_SHORTLY),
     };
     match bind(&st, &sub, &p, &refresh).await {
-        Ok(()) if p.cloud => see_other(&format!("{}/app/#/cloud?connected=youtube", crate::accounts::web_origin(&st))),
-        Ok(()) => see_other(&format!("{}/app/#/account?youtube=connected", crate::accounts::web_origin(&st))),
+        Ok(()) if p.cloud => see_other(&format!("{}/app/#/cloud?connected=youtube", crate::accounts::page_origin(&st))),
+        Ok(()) => see_other(&format!("{}/app/#/account?youtube=connected", crate::accounts::page_origin(&st))),
         Err(()) => {
             give_back(&st, Some(&p.channel_id), &refresh).await;
             page(StatusCode::SERVICE_UNAVAILABLE, TRY_SHORTLY)

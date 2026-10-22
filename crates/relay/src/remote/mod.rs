@@ -102,6 +102,13 @@ pub struct RemoteConfig {
     pepper: Option<[u8; 32]>,
     /// `RELAY_DASHBOARD_DIR`: the dashboard build (`ferrocast-web/dist/dashboard`).
     pub dashboard_dir: Option<PathBuf>,
+    /// `RELAY_WEB_URL`'s origin (`https://ferrocast.clearcraftlabs.com`): the website that
+    /// serves the dashboard and the sign-in pages and calls this relay across sites (CORS).
+    /// People are sent there; `origin` stays the API host. None: everything on `origin`.
+    pub web: Option<String>,
+    /// `RELAY_REMOTE_ALIASES`: older web hosts still answered while people move over
+    /// (`https://remote.clearcraftlabs.com`), then removed.
+    pub aliases: Vec<String>,
 }
 
 impl std::fmt::Debug for RemoteConfig {
@@ -110,6 +117,8 @@ impl std::fmt::Debug for RemoteConfig {
             .field("origin", &self.origin)
             .field("pepper", &self.pepper.map(|_| "<redacted>"))
             .field("dashboard_dir", &self.dashboard_dir)
+            .field("web", &self.web)
+            .field("aliases", &self.aliases)
             .finish()
     }
 }
@@ -131,7 +140,35 @@ impl RemoteConfig {
                 .filter(|o| o != "null"),
             pepper: pepper.filter(|p| p.len() >= 16).map(|p| hmac(p, b"ferrocast remote pepper v1")),
             dashboard_dir,
+            web: None,
+            aliases: Vec::new(),
         }
+    }
+
+    /// The website origin and older web hosts (see the fields).
+    pub fn with_web(mut self, web: Option<&str>, aliases: &[&str]) -> RemoteConfig {
+        let origin_of =
+            |u: &str| reqwest::Url::parse(u).ok().map(|u| u.origin().ascii_serialization()).filter(|o| o != "null");
+        self.web = web.and_then(origin_of);
+        self.aliases =
+            aliases.iter().filter_map(|a| origin_of(a)).filter(|a| Some(a) != self.origin.as_ref()).collect();
+        self
+    }
+
+    /// Where people are sent: the website when there is one, else the web host itself.
+    pub fn page_origin(&self) -> Option<&str> {
+        self.web.as_deref().or(self.origin.as_deref())
+    }
+
+    /// An `Origin` header this relay trusts for its web routes: the web host, the website,
+    /// or an older web host.
+    pub fn trusted_origin(&self, o: &str) -> bool {
+        self.origin.iter().chain(self.web.iter()).chain(self.aliases.iter()).any(|t| t.eq_ignore_ascii_case(o))
+    }
+
+    /// Hosts the web routes answer on: the web host and the older ones.
+    fn hosts(&self) -> impl Iterator<Item = &str> {
+        self.origin.iter().chain(self.aliases.iter()).filter_map(|o| o.split_once("://")).map(|(_, h)| h)
     }
 
     pub fn from_env() -> RemoteConfig {
@@ -139,14 +176,18 @@ impl RemoteConfig {
         let pepper: Option<Vec<u8>> = env("RELAY_REMOTE_PEPPER")
             .map(String::into_bytes)
             .or_else(|| env("RELAY_VAULT_KEY").and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok()));
+        let aliases = env("RELAY_REMOTE_ALIASES").unwrap_or_default();
+        let aliases: Vec<&str> = aliases.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
         RemoteConfig::new(
             env("RELAY_REMOTE_URL").as_deref(),
             pepper.as_deref(),
             env("RELAY_DASHBOARD_DIR").map(PathBuf::from),
         )
+        .with_web(env("RELAY_WEB_URL").as_deref(), &aliases)
     }
 
     /// The phone page's host (`remote.clearcraftlabs.com`, with a port if it has one).
+    #[cfg(test)]
     fn host(&self) -> Option<&str> {
         self.origin.as_deref().and_then(|o| o.split_once("://")).map(|(_, h)| h)
     }
@@ -457,7 +498,7 @@ async fn create_code(
             ));
     }
     tell_counts(&st, &pro.install);
-    let origin = st.remote.cfg.origin.clone().unwrap_or_default();
+    let origin = st.remote.cfg.page_origin().unwrap_or_default().to_string();
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({

@@ -467,6 +467,7 @@ fn own_domains(st: &AppState) -> Vec<String> {
         Some(st.cfg.public_url.as_str()),
         st.cfg.tip_url.as_deref(),
         st.remote.cfg.origin.as_deref(),
+        st.remote.cfg.web.as_deref(),
         st.cloud.cfg.overlay_origin.as_deref(),
     ]
     .into_iter()

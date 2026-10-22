@@ -216,9 +216,8 @@ impl Run<'_> {
             let history = st
                 .remote
                 .cfg
-                .origin
-                .as_deref()
-                .filter(|_| st.remote.cfg.dashboard_dir.is_some())
+                .page_origin()
+                .filter(|_| st.remote.cfg.dashboard_dir.is_some() || st.remote.cfg.web.is_some())
                 .map(|o| format!("{o}/app/#/history"));
             let r = report::render_with(&rep, &unsubscribe, history.as_deref());
             let email = Email {

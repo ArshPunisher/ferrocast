@@ -84,15 +84,15 @@ fn not_found() -> ApiError {
 
 /// Whether the request came in on the remote host (`RELAY_REMOTE_URL`).
 pub(crate) fn on_remote_host(st: &AppState, headers: &HeaderMap) -> bool {
-    let Some(want) = st.remote.cfg.host() else { return false };
-    headers.get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(|h| h.eq_ignore_ascii_case(want))
+    let Some(h) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return false };
+    st.remote.cfg.hosts().any(|want| h.eq_ignore_ascii_case(want))
 }
 
 /// A present `Origin` must be the remote page's own (no other site can drive a phone's token).
 fn origin_ok(st: &AppState, headers: &HeaderMap) -> bool {
     match headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) {
         None => true,
-        Some(o) => st.remote.cfg.origin.as_deref().is_some_and(|want| want.eq_ignore_ascii_case(o)),
+        Some(o) => st.remote.cfg.trusted_origin(o),
     }
 }
 

@@ -432,7 +432,11 @@ async fn finish(State(st): State<AppState>, headers: HeaderMap, Query(q): Query<
         );
     }
     match bind(&st, &account, p).await {
-        Ok(()) => see_other(&format!("/app/#/cloud?connected={platform}")),
+        // On the website when there is one; else this host's own dashboard (relative).
+        Ok(()) => {
+            let base = if st.remote.cfg.web.is_some() { crate::accounts::page_origin(&st) } else { String::new() };
+            see_other(&format!("{base}/app/#/cloud?connected={platform}"))
+        }
         Err(m) => page(StatusCode::SERVICE_UNAVAILABLE, &m),
     }
 }
