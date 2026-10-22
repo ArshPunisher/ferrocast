@@ -4,5 +4,6 @@
 
 pub mod obs;
 pub mod razorpay;
+pub mod rtmp;
 pub mod streamelements;
 pub mod twitch;

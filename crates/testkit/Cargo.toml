@@ -13,6 +13,8 @@ axum = { version = "0.8", features = ["ws"] }
 serde_json.workspace = true
 tokio.workspace = true
 base64 = "0.23"
+rml_rtmp = "0.8"
+bytes = "1"
 
 [lints]
 workspace = true
