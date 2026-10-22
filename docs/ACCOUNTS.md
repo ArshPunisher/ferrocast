@@ -7,7 +7,7 @@ Owner decisions this follows:
 
 - The **app stays free and works without signing in**. Nothing that works today needs an account
   (app 1.2.0 keeps working exactly as before).
-- The **web dashboard** (`https://remote.clearcraftlabs.com/app/`) needs a sign-in. Accounts are free.
+- The **web dashboard** (`https://ferrocast.clearcraftlabs.com/app/`, on the website) needs a sign-in. Accounts are free.
 - **Pro belongs to an account** once one is signed in (install-only Pro keeps working).
 - Sign-in is **Google** or an **email link**. No passwords.
 
@@ -16,13 +16,13 @@ Owner decisions this follows:
 | Setting | Value |
 |---|---|
 | Application type | Web application |
-| Authorised redirect URI (the only one) | `https://remote.clearcraftlabs.com/login/google/callback` |
+| Authorised redirect URI | `https://api.clearcraftlabs.com/login/google/callback` (the old `https://remote.clearcraftlabs.com/login/google/callback` stays listed until that host is deleted) |
 | Authorised JavaScript origins | none needed |
 | Scopes | `openid email profile` |
 | Relay settings | `RELAY_GOOGLE_CLIENT_ID`, `RELAY_GOOGLE_CLIENT_SECRET` (`deploy/pro-keys.sh --google`) |
 
-Both the web flow and the app flow sign in **in the browser, on the web host**, so they share
-this one https callback. The app never registers a custom scheme at Google: the relay hands the
+Both the web flow and the app flow sign in **in the browser**, on the website's sign-in page,
+and share this one https callback on the API host. The app never registers a custom scheme at Google: the relay hands the
 app a one-time code through a loopback redirect (§3), after Google is done.
 
 Without `RELAY_GOOGLE_CLIENT_ID`/`_SECRET`, Google sign-in answers 503 `google_off` and the login
@@ -31,9 +31,13 @@ page hides the Google button; email sign-in keeps working.
 ## 1. Hosts, tokens, cookies
 
 - **API host** `https://ferrocast-relay.clearcraftlabs.com` (`RELAY_PUBLIC_URL`): the app's calls.
-- **Web host** `https://remote.clearcraftlabs.com` (`RELAY_REMOTE_URL`): the login pages, the
-  web dashboard and its `/r/…` API, with a cookie session. Accounts are off (404) without
-  `RELAY_REMOTE_URL`.
+- **Web host** `https://api.clearcraftlabs.com` (`RELAY_REMOTE_URL`): the sign-in API
+  (`/v1/login*`), the Google callback, `/v1/account`, `/v1/cloud` and the web dashboard's `/r/…`
+  API, with a cookie session. Accounts are off (404) without `RELAY_REMOTE_URL`.
+- **Website** `https://ferrocast.clearcraftlabs.com` (`RELAY_WEB_URL`): serves the sign-in pages
+  (`/login/`, `/login/link/`, `/login/done/`) and the dashboard (`/app/`) from Cloudflare Pages.
+  It calls the web host with `credentials: 'include'`; CORS allows this one origin only, and the
+  cookies count as same-site because both hosts are under clearcraftlabs.com.
 - **App session token**: `fca_<session id>.<secret>`, sent as `Authorization: Bearer fca_…` on
   `/v1/account*`. Kept by the engine like the install secret (never shown, never in a URL).
 - **Web session cookie**: `__Host-fc_session=<session id>.<secret>`; `HttpOnly; Secure;
@@ -91,7 +95,7 @@ Loopback redirect with PKCE (RFC 8252), on Mac, Windows and Linux alike, no deep
    explicit port; no `[::1]`), no userinfo, no fragment, ≤ 512 chars; else 422
    `invalid_redirect`. `state` 8–128 URL-safe chars. `label` optional, ≤ 40 chars (default
    "Ferrocast app"). 10 starts an hour per install.
-   → 201 `{ "flow_id": "af_…", "url": "https://remote.clearcraftlabs.com/login?flow=af_…", "expires_at": ms }`
+   → 201 `{ "flow_id": "af_…", "url": "https://ferrocast.clearcraftlabs.com/login/?flow=af_…", "expires_at": ms }`
 3. The engine opens `url` in the default browser. The person signs in (§4).
 4. The relay redirects the browser (303) to `redirect_uri?code=<one-time code>&state=<state>`
    (or `?error=access_denied&state=…` if they cancel at Google). The engine's local server
@@ -111,7 +115,15 @@ Signing in links the install to the account (§6). Signing out (`POST /v1/accoun
 revoked session unlinks it. The engine should call `GET /v1/account` at start and every few hours
 (keeps the session alive and Pro current).
 
-## 4. Login pages (web host, served by the relay, no JavaScript)
+## 4. Login pages
+
+With `RELAY_WEB_URL` set (production since 22 Oct) the pages are the website's
+(`{RELAY_WEB_URL}/login/`, `/login/link/#t=…`, `/login/done/`) and drive the same steps through
+the JSON API on the web host: `GET /v1/login` → `{csrf, google, app, signed_in, next}`, then
+`POST /v1/login/email`, `/code`, `/link`, `/google` with `X-CSRF-Token`. The email link points at
+`{RELAY_WEB_URL}/login/link/`. Without it the relay serves the pages itself (no JavaScript), as
+below; the rules are the same either way.
+
 
 - `GET /login?next=/app/` (web) or `GET /login?flow=af_…` (app): the page with "Continue with
   Google" (hidden when Google is off) and "Email me a sign-in link". `next` must be a path on the

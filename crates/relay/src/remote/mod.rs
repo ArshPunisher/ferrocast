@@ -95,7 +95,7 @@ const CODE_LEN: usize = 10;
 /// Settings for this feature, from the environment.
 #[derive(Clone, Default)]
 pub struct RemoteConfig {
-    /// `RELAY_REMOTE_URL`'s origin (`https://remote.clearcraftlabs.com`): the phone's page.
+    /// `RELAY_REMOTE_URL`'s origin (`https://api.clearcraftlabs.com`): sign-in and the phone's API.
     pub origin: Option<String>,
     /// Keys the stored token and code hashes: from `RELAY_REMOTE_PEPPER`, else derived from
     /// `RELAY_VAULT_KEY`. Never logged.

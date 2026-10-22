@@ -183,7 +183,8 @@ pub(crate) fn available(st: &AppState) -> bool {
     st.remote.cfg.origin.is_some()
 }
 
-/// The web host's origin (`https://remote.clearcraftlabs.com`).
+/// The web host's origin, where sign-in cookies and callbacks live: the API host
+/// (`https://api.clearcraftlabs.com`), not the website (`page_origin`).
 pub(crate) fn web_origin(st: &AppState) -> String {
     st.remote.cfg.origin.clone().unwrap_or_default()
 }

@@ -487,7 +487,7 @@ type SmartSuggestion = {
 Phones (§9.5): everything under `/pro/smart` stays on the PC; `/recap/summary` and `/insights/supporters` are open to an owner's phone like `/recap`.
 
 ### Ferrocast account (optional, 1.3)
-The app works the same without an account. Signing in (Google or an email link, in the browser) ties Pro to the account, so it follows the streamer to up to 3 PCs, and lets the web dashboard (`https://remote.clearcraftlabs.com/app/`) reach this PC without Pro. Relay contract: `docs/ACCOUNTS.md`. The routes live under `/pro`, so a paired phone can never sign the PC in or out (owner phones are denied `/pro/*`, §9.5) and `account` live frames never go to phones.
+The app works the same without an account. Signing in (Google or an email link, in the browser) ties Pro to the account, so it follows the streamer to up to 3 PCs, and lets the web dashboard (`https://ferrocast.clearcraftlabs.com/app/`) reach this PC without Pro. Relay contract: `docs/ACCOUNTS.md`. The routes live under `/pro`, so a paired phone can never sign the PC in or out (owner phones are denied `/pro/*`, §9.5) and `account` live frames never go to phones.
 
 ```ts
 type AccountView =

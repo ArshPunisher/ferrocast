@@ -86,8 +86,10 @@ the one being reviewed, so the **OAuth client ID must be visible in the browser'
 bar** at step 3.
 
 1. **The app and who it is for** (15 s): `https://ferrocast.clearcraftlabs.com`, then sign in
-   to the web dashboard (`https://remote.clearcraftlabs.com/app/`) with a Ferrocast account
-   that has Pro.
+   to the web dashboard (`https://ferrocast.clearcraftlabs.com/app/`) with a Ferrocast account
+   that has Pro. (The video sent on 22 Oct shows the older address,
+   `remote.clearcraftlabs.com/app/`; keep that host until the review ends, and give Google the
+   new address if they ask.)
 2. **Where the streamer starts it** (15 s): Account page → "YouTube from the cloud" →
    *Connect YouTube*.
 3. **The consent screen** (30 s): Google's page opens. Zoom into the address bar to show

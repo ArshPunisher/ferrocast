@@ -219,8 +219,10 @@ M0 as built (19 Oct 2026):
   frames; engine `server/src/remote.rs` runs requests through the same axum router in-process
   with a `RemotePrincipal { device_id, role }`; allowlist in `server/src/routes/remote_scope.rs`,
   checked again on the relay.
-- Phone: relay serves the dashboard at `https://remote.clearcraftlabs.com/app/`
-  (`RELAY_REMOTE_URL`, tunnel hostname), same origin, API base injected as `window.__FERROCAST__`.
+- Phone: the website serves the dashboard at `https://ferrocast.clearcraftlabs.com/app/`
+  (Cloudflare Pages); its API is `https://api.clearcraftlabs.com/r/…` (`RELAY_REMOTE_URL`,
+  tunnel hostname), set by `/app/ferrocast-remote.js`. (Until 22 Oct the relay served the page
+  itself at `remote.clearcraftlabs.com/app/`.)
 - Pairing without accounts: Settings › Dashboard anywhere › Add a device / Invite a mod → QR +
   link with a one-time code (10 min, single use, hashed); the phone exchanges it for a device
   token (30-day sliding, hashed, revocable).
@@ -285,15 +287,16 @@ M0 as built (19 Oct 2026):
   also faking the tunnel's install auth); a phone token can never pair more devices, see accounts,
   secrets, Pro or export data; codes are 10 symbols of 31 (~49 bits), single use, 10 minutes, 5
   tries per address (IPv6 /64) then one every 2 minutes, every miss the same 404; the token in the page lives in
-  `localStorage` on the remote origin, which serves only our own build under a strict CSP (no
-  inline script, no third-party script, no framing) and has no other content; requests carry no
-  cookies (Bearer only) and no CORS, and a foreign `Origin` is refused; the relay only ever forwards
+  `localStorage` on the website's origin (`ferrocast.clearcraftlabs.com`), which serves only our
+  own static build (the site and `/app/`, no viewer or user content) and gives `/app/` a strict CSP
+  (no inline script, no third-party script, no framing, `connect-src` only the API host); requests
+  carry the Bearer token plus the account cookie (`RELAY_REMOTE_LOGIN=required`), across sites
+  with CORS allowed for that one origin only (with credentials), and any other `Origin` is refused; the relay only ever forwards
   to the paired PC's own tunnel (no URL from the phone is fetched, no SSRF) and only `/api/v1/*`
   with a plain path; 2 MB requests, 8 MB answers, 20 requests/s per device, 3 live sockets per device, 32 waiting
   per PC, 15 s timeout. The relay sees traffic in memory (E2E later, decision 4). Follow-ups: the Cloudflare
-  tunnel needs the public hostname `remote.clearcraftlabs.com` → `http://ferrocast-relay:8787`;
-  run `pnpm build:embed` in ferrocast-web before `deploy-relay.sh` so phones get the current
-  dashboard (a version mismatch between the PC's engine and the phone's page is possible until the
+  tunnel needs the public hostname `api.clearcraftlabs.com` → `http://ferrocast-relay:8787`;
+  the website deploys the phone's dashboard on every push to ferrocast-web (a version mismatch between the PC's engine and the phone's page is possible until the
   page is versioned); memory limit of the relay container (8 MB answers in flight); privacy/terms
   pages must list these items before sales open; offline mode (M10).
 - M10 as built (19 Oct 2026, API.md §9.5 Offline): relay `remote/offline.rs` (+ `offline_tests.rs`), `bot/moderate.rs`,
