@@ -607,9 +607,30 @@ impl Engine {
         } else {
             ferrocast_obs::control::stop_stream(&c).await.map_err(super::obs_error)?;
         }
-        ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)
+        // OBS answers before its output has started or stopped: wait for it, so the answer
+        // is the new state (a stale one read "stopped" right after Start).
+        let deadline = tokio::time::Instant::now() + STREAM_SWITCH_WAIT;
+        loop {
+            let now = ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)?;
+            if now == on {
+                return Ok(now);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(EngineError::Refused {
+                    status: 422,
+                    code: "obs_stream_stuck",
+                    message: if on { "OBS didn't start streaming." } else { "OBS didn't stop streaming." }.into(),
+                    hint: "Look at OBS: it says why (often the server or the stream key).".into(),
+                    retry_after: None,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }
+
+/// How long Start or Stop Streaming may take before OBS is told to say why.
+const STREAM_SWITCH_WAIT: Duration = Duration::from_secs(5);
 
 const NO_COUNTDOWN: EngineError = EngineError::Missing {
     code: "no_countdown",
