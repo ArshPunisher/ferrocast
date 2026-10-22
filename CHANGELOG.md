@@ -5,6 +5,17 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.1
+
+- Go live everywhere (beta): stream once from OBS, and Ferrocast sends it on to Twitch,
+  YouTube and Kick at the same time, plus any server of your own. Find it first in Studio.
+- Ferrocast gets each platform's stream key by itself, so there's nothing to paste. Reconnect
+  Twitch and Kick once so Ferrocast may read the key.
+- One click points OBS at Ferrocast, and one click puts OBS back the way it was.
+- Test your upload before you go live: Ferrocast says in plain words how many platforms fit.
+- While live, each platform has its own health line. One that drops reconnects by itself and
+  never stops the others.
+
 ## 1.4.2
 
 - Go live and end your stream from Ferrocast: Studio shows whether OBS is streaming, with
