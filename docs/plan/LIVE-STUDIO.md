@@ -160,6 +160,86 @@ I/O, TLS through rustls for `rtmps://`):
   them all, bring it back when it recovers (the health line already has room for "Paused").
 - [ ] **A2:** stream info per platform (6 mixed), vertical forwarding.
 
+## Owner's notes, 23 Oct 2026 (to start later; nothing built)
+
+### Vertical streams (camera on top, game below)
+The owner streams with OBS plus the Aitum Vertical plugin (OBS shows "Vertical Scenes" and
+"Vertical Sources"). The goal is the Shorts look: camera on top, game underneath, 1080×1920.
+Three ways, in order:
+
+1. **Ferrocast cuts it from the normal stream (works with any OBS setup).** In Ferrocast the
+   streamer sees the normal stream and drags two boxes, one round the camera and one round the
+   game, and picks a layout (camera on top, small camera in a corner, game only, …). Ferrocast
+   crops, scales and stacks them upright and sends that to vertical destinations (YouTube
+   Shorts live, custom servers). No OBS change. Costs: decode plus one extra encode (GPU, light);
+   a small corner camera looks soft when enlarged.
+2. **OBS's own vertical picture (best quality).** With Aitum Vertical (or OBS 32's second
+   canvas) OBS sends an upright stream to Ferrocast's second local address and Ferrocast
+   forwards it (plan A2). Later: one click in Ferrocast builds the vertical scene from the
+   streamer's own camera and game sources in a chosen layout, if obs-websocket allows it
+   (check canvas support first). Works for the owner today, since Aitum Vertical is installed.
+3. **Ferrocast Studio (2.1+).** Ferrocast draws the vertical picture itself: full-quality
+   camera, any layout, different per platform.
+
+Recommended: build 1 first (everyone), plus 2's forwarding for people with a vertical canvas;
+3 comes with the Studio.
+
+**Aitum Multistream:** it also sends to several platforms from OBS. Using it and Ferrocast's
+Go live together uploads everything twice. The setup should notice it and say so.
+
+### A different picture per platform (Studio only)
+With OBS, Ferrocast only copies OBS's one stream, so every platform gets the same picture. In
+the Studio (2.1+) each platform can have its own scene or camera (Twitch: game and a big
+camera; YouTube: game only); a scene switch can apply to all platforms or one. Cost: one
+encode per different picture (2–3 are fine on a normal GPU); upload is unchanged (each
+platform is already its own copy).
+
+### OBS's screen against Ferrocast
+| In OBS | Ferrocast today | Ferrocast Studio |
+|---|---|---|
+| Scenes | Switches OBS's scenes | Its own scenes (2.1) |
+| Sources (camera, screen, mic, images, browser) | Shows/hides OBS's sources | Its own sources (2.1) |
+| Audio mixer | Mutes mics, mic check before going live | Full mixer and filters, noise removal (2.2) |
+| Start Streaming | Yes, to every platform at once | Yes, without OBS (2.1) |
+| Start Recording | No | Yes (2.1), plus a backup recording while live |
+| Replay buffer | Through OBS ("clip that") | Built in (2.2) |
+| Studio Mode | No | Yes (2.2) |
+| Scene transitions | No | Yes (2.2) |
+| Hotkeys | Panic key | Full hotkeys (2.2) |
+| Vertical scenes | Forwarding next (A2) | Built in, with layouts |
+| Virtual camera | No | Not planned yet: owner to decide |
+
+Easier than OBS: ready-made scene layouts, alerts and overlays built in, scenes that switch on
+events, one-click import of an OBS scene collection, each platform's rules checked live, a
+frozen camera or game capture restarted by itself.
+
+### Overlays
+- With OBS (now): no copy and paste; each overlay's "Add to OBS" puts it in OBS as a browser source.
+- With the Studio: no browser source at all. Overlays are part of the scene; tick an alert box,
+  chat box or goal bar on or off per scene.
+
+### Simple mode and Advanced mode
+Everyone starts in **Simple**; **Advanced** is one switch away (in the sidebar next to
+Light/Dark). Simple shows the few choices most people need, with ready-made layouts and
+self-adjusting settings. Advanced shows the same screens with every setting visible and typed
+as numbers, nothing decided for the streamer. Each card also gets a "More options" link, so a
+Simple user can open one section without switching everything. Remembered per install.
+
+| Area | Simple | Advanced adds |
+|---|---|---|
+| Go live | Tick platforms, set up OBS, test upload | Server region by hand, rtmps or rtmp, retry timing, buffer size, upload kept free, local port, a new local key |
+| Vertical | Pick a layout | Every box to the pixel, crop, zoom, background, size, frame rate, bitrate |
+| Upload protection (A1.8) | On, sensible order | Own limits, which platform pauses first, how long before it comes back |
+| Studio (2.1+) | Ready-made scenes and templates | Every source, filter, transition timing, encoder settings, audio routing, hotkeys |
+| Alerts and overlays | Pick a design | The full designer (exists) |
+
+**Before building:** a design board with the Simple/Advanced switch and the Go live and
+vertical screens in both modes, for the owner to pick from (no code until the owner says so).
+
+### Found in the real test (23 Oct)
+The owner's OBS sends ~12 Mbps at 1440p60; Twitch takes 6 and Kick 8 (Twitch "Unstable", Kick
+dropping). Ferrocast warned on both rows. To do: lower OBS's bitrate to ≤ 6,000 kbps.
+
 ## Plugins (3.0; designed once 2.0 and the Studio exist)
 
 OBS plugins run with full access, must match the exact OBS version, break on updates and can
