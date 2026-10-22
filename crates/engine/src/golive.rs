@@ -136,6 +136,8 @@ pub(crate) struct GoLive {
     running: Mutex<HashMap<String, Running>>,
     blocked: Mutex<HashMap<String, String>>,
     upload: Mutex<Option<UploadCheck>>,
+    /// The last stream's measured rate, for planning the next one (0: none yet).
+    last_kbps: std::sync::atomic::AtomicU32,
     /// One upload check or OBS change at a time.
     busy: tokio::sync::Mutex<()>,
     /// One start/stop pass at a time, so a destination is never started twice.
@@ -151,6 +153,7 @@ impl Default for GoLive {
             running: Mutex::new(HashMap::new()),
             blocked: Mutex::new(HashMap::new()),
             upload: Mutex::new(None),
+            last_kbps: std::sync::atomic::AtomicU32::new(0),
             busy: tokio::sync::Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
         }
@@ -491,7 +494,9 @@ impl Engine {
             ));
         }
         let stats = self.golive().hub.stats();
-        let need = if stats.kbps > 0 { stats.kbps } else { DEFAULT_NEED_KBPS };
+        // The stream as it is now, else as it was last time, else a 1080p60 plan.
+        let last = self.golive().last_kbps.load(std::sync::atomic::Ordering::Relaxed);
+        let need = [stats.kbps, last].into_iter().find(|k| *k > 0).unwrap_or(DEFAULT_NEED_KBPS);
         let mut rows = Vec::new();
         let mut twitch: Option<(Target, String)> = None;
         for d in &ticked {
@@ -547,8 +552,20 @@ impl Engine {
             .filter(|r| r.problem.is_none())
             .map(|r| Need { name: r.name.clone(), kbps: r.need_kbps })
             .collect();
-        let check =
-            UploadCheck { at: now().0, measured_by: measured_by.into(), verdict: probe::verdict(upload, &needs), rows };
+        let mut verdict = probe::verdict(upload, &needs);
+        let unreachable: Vec<&str> = rows.iter().filter(|r| r.problem.is_some()).map(|r| r.name.as_str()).collect();
+        if !unreachable.is_empty() {
+            let names = unreachable.join(", ");
+            verdict.message = if needs.is_empty() {
+                format!(
+                    "Your upload is {}. Ferrocast couldn't reach {names}, so nothing was counted yet.",
+                    probe::mbps(upload)
+                )
+            } else {
+                format!("{} {names} couldn't be reached and isn't counted.", verdict.message)
+            };
+        }
+        let check = UploadCheck { at: now().0, measured_by: measured_by.into(), verdict, rows };
         *lock(&self.golive().upload) = Some(check.clone());
         Ok(check)
     }
@@ -683,7 +700,13 @@ pub(crate) async fn run(engine: Engine) {
                     if changed.is_err() { return; }
                     break;
                 }
-                _ = tokio::time::sleep(HEALTH_EVERY) => engine.send_golive(),
+                _ = tokio::time::sleep(HEALTH_EVERY) => {
+                    let k = engine.golive().hub.stats().kbps;
+                    if k > 0 {
+                        engine.golive().last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    engine.send_golive();
+                }
             }
         }
         engine.stop_all();
