@@ -137,22 +137,27 @@ and **8** the phone view as drawn.
 
 Engine pieces (new crate `crates/golive`, RTMP from `rml_rtmp` 0.8, MIT, sans-IO; our own Tokio
 I/O, TLS through rustls for `rtmps://`):
-- [ ] **A1.1 Local ingest:** RTMP server on `127.0.0.1` only (R-43), an unguessable stream key per
+- [x] **A1.1 Local ingest:** RTMP server on `127.0.0.1` only (R-43), an unguessable stream key per
   install (wrong key: refused), one publisher at a time; keeps the metadata and the audio/video
   sequence headers so a destination that (re)connects mid-stream starts cleanly at the next
   keyframe (at most one keyframe interval, about 2 s; later: keep the last keyframe group so it
   starts at once).
-- [ ] **A1.2 Forwarding:** one task per destination (R-18): connect, publish, send the cached
+- [x] **A1.2 Forwarding:** one task per destination (R-18): connect, publish, send the cached
   headers, then the same packets (no re-encode); backoff with jitter, never giving up while the
   show runs; a slow destination drops its own queue, never slowing the others; health per
   destination (state, bitrate, drops, reconnect try, plain reason).
-- [ ] **A1.3 Destinations and keys:** Twitch, YouTube, Kick and custom (server + key, keychain
+- [x] **A1.3 Destinations and keys:** Twitch, YouTube, Kick and custom (server + key, keychain
   R-45); Twitch key by Helix (`channel:read:stream_key`), YouTube by liveStreams; Kick to confirm.
-- [ ] **A1.4 OBS setup:** point OBS's stream at the local ingest (`SetStreamServiceSettings`),
+- [x] **A1.4 OBS setup:** point OBS's stream at the local ingest (`SetStreamServiceSettings`),
   remember the old setting, put it back on request; never while OBS is streaming.
-- [ ] **A1.5 Upload check:** per-platform test to its ingest (Twitch `bandwidthtest`), speed and
+- [x] **A1.5 Upload check:** per-platform test to its ingest (Twitch `bandwidthtest`), speed and
   delay, the verdict in words.
-- [ ] **A1.6 API + dashboard:** routes in API.md, the Go live tab (1A, 2A, 3A, 4B, 5A), demo engine.
+- [x] **A1.6 API + dashboard:** routes in API.md, the Go live tab (1A, 2A, 3A, 4B, 5A), demo engine.
+- [ ] **A1.7 Real stream test (owner):** OBS on the owner's PC to Twitch and YouTube at once;
+  reconnect Twitch and Kick first (new scopes `channel:read:stream_key`, `streamkey:read`; Kick's
+  app may need `streamkey:read` ticked in its developer settings). Then release 2.0.0-beta.
+- [ ] **A1.8 Upload protection:** pause the bottom destination when the upload can't carry
+  them all, bring it back when it recovers (the health line already has room for "Paused").
 - [ ] **A2:** stream info per platform (6 mixed), vertical forwarding.
 
 ## Plugins (3.0; designed once 2.0 and the Studio exist)

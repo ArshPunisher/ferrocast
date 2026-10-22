@@ -26,6 +26,11 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-22 (Track A: Go live everywhere built, A1.1–A1.6)
+- Keys fetched, never pasted: Twitch Get Stream Key (new scope `channel:read:stream_key`) and the nearest server's `rtmps://` address (OBS's "auto" uses plain RTMP); YouTube's bound or default stream; Kick `GET /public/v1/channels` (new scope `streamkey:read`). Older sign-ins get "reconnect".
+- OBS setup through obs-websocket (saved setting in the secret store, put back exactly; refused while OBS streams). Upload check: delay per server, speed through Twitch's bandwidth-test mode (Cloudflare's speed test without Twitch), platform rules checked against the real stream (codec, keyframe gap, bitrate).
+- Engine `golive.rs`: ingest starts with the app; forwarders start and stop with OBS's stream; tick/untick live; routes `/api/v1/golive*`; phones can't read the key (both scope copies + the dashboard's). Dashboard: Go live tab first in Studio (picks 1A 2A 3A 4B 5A 7). Next: the owner's real stream test (A1.7), upload protection (A1.8), A2.
+
 ### 2026-10-22 (Track A starts: golive crate)
 - One address live: website and dashboard on ferrocast.clearcraftlabs.com, the relay's web host on api.clearcraftlabs.com (`RELAY_WEB_URL`, `RELAY_REMOTE_URL`); remote.clearcraftlabs.com stays until Google's review ends. Docs updated (ACCOUNTS, API, GOOGLE-VERIFICATION, PRO, deploy).
 - Track A picks recorded in `docs/plan/LIVE-STUDIO.md`. New `crates/golive`: RTMP ingest on 127.0.0.1 with a per-install key, one forwarder task per destination (headers again and the next keyframe on (re)join, timestamps from zero, skip-ahead when behind, backoff with jitter, health with a plain reason, numbered streams), `rtmp://` and `rtmps://` targets. 18 tests with a fake OBS and fake platforms. Not wired into the engine yet (next: keys A1.3, OBS setup A1.4, upload check A1.5, API and Go live tab A1.6).
