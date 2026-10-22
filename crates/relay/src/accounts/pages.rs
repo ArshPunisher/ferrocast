@@ -27,6 +27,8 @@ pub(super) fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/login", get(login_page))
+        // The dashboard links to `/login/` (the website's page); here it's the same page.
+        .route("/login/", get(login_page))
         .route("/login/email", post(email_start))
         .route("/login/code", post(email_code))
         .route("/login/link", get(link_page).post(link_use))
@@ -188,44 +190,97 @@ fn browser_hash(c: &str) -> String {
     sha(&format!("ferrocast login browser v1|{c}"))
 }
 
-/// The checks every POST here makes: the web host, same origin, the login cookie and the
-/// form token derived from it. The cookie's value.
-fn post_guard(st: &AppState, headers: &HeaderMap, f: &HashMap<String, String>) -> Result<String, Box<Response>> {
+/// Why a sign-in step stopped. The pages here show it as a page; the website's JSON
+/// endpoints (`login_api`) send it as `{error:{code,message,hint}}`.
+pub(super) struct Fail {
+    pub(super) status: StatusCode,
+    pub(super) code: &'static str,
+    title: &'static str,
+    pub(super) text: String,
+    /// Where "Try again" goes on a page.
+    again: String,
+    /// Seconds to wait, for a rate limit.
+    pub(super) retry_after: Option<i64>,
+}
+
+impl Fail {
+    fn new(status: StatusCode, code: &'static str, title: &'static str, text: impl Into<String>, again: &str) -> Fail {
+        Fail { status, code, title, text: text.into(), again: again.to_string(), retry_after: None }
+    }
+    fn db(err: rusqlite::Error) -> Fail {
+        tracing::error!(error = %err, "relay database error during sign-in");
+        Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage",
+            "Try again",
+            "The relay couldn't save that. Try again shortly.",
+            "/login",
+        )
+    }
+    fn page(self) -> Response {
+        let mut r = problem(self.status, self.title, &self.text, &self.again);
+        if let Some(w) = self.retry_after
+            && let Ok(v) = HeaderValue::from_str(&w.to_string())
+        {
+            r.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+        if self.code == "google_off" {
+            r.headers_mut().insert("x-error-code", HeaderValue::from_static("google_off"));
+        }
+        r
+    }
+}
+
+/// The checks every sign-in POST makes: the web host, a trusted origin, the login cookie and
+/// the form token derived from it (`given`: a page's hidden field, or the website's
+/// `X-CSRF-Token`). The cookie's value; `None` when this host has no sign-in.
+pub(super) fn login_guard(st: &AppState, headers: &HeaderMap, given: &str) -> Result<Option<String>, Fail> {
     if !available(st) || !crate::remote::on_web_host(st, headers) {
-        return Err(Box::new(not_here()));
+        return Ok(None);
     }
     let Some(c) = cookie(headers, LOGIN_COOKIE) else {
-        return Err(Box::new(problem(
+        return Err(Fail::new(
             StatusCode::BAD_REQUEST,
+            "cookies_needed",
             "Cookies are needed",
             "Signing in needs a cookie that this browser didn't send. Allow cookies for this site and try again.",
             "/login",
-        )));
+        ));
     };
-    let given = f.get("csrf").map(String::as_str).unwrap_or("");
     if !same_origin(st, headers) || given.is_empty() || !ct_eq(given, &form_token(&c)) {
-        return Err(Box::new(problem(
+        return Err(Fail::new(
             StatusCode::FORBIDDEN,
+            "form_expired",
             "Start again",
             "This form is out of date or came from another site.",
             "/login",
-        )));
+        ));
     }
-    Ok(c)
+    Ok(Some(c))
+}
+
+/// The page form's guard: [`login_guard`] with "not here" and the problem as pages.
+fn post_guard(st: &AppState, headers: &HeaderMap, f: &HashMap<String, String>) -> Result<String, Box<Response>> {
+    match login_guard(st, headers, f.get("csrf").map(String::as_str).unwrap_or("")) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Err(Box::new(not_here())),
+        Err(e) => Err(Box::new(e.page())),
+    }
 }
 
 /// The flow an app sign-in is in, if it's still waiting.
-fn live_flow(st: &AppState, id: Option<&str>) -> Result<Option<store::Flow>, Box<Response>> {
+pub(super) fn live_flow(st: &AppState, id: Option<&str>) -> Result<Option<store::Flow>, Fail> {
     let Some(id) = id.filter(|i| !i.is_empty()) else { return Ok(None) };
-    let f = st.db.account_flow(id).map_err(|e| Box::new(ApiError::db(e).into_response()))?;
+    let f = st.db.account_flow(id).map_err(Fail::db)?;
     match f {
         Some(f) if f.expires_at > now_ms() && f.code_hash.is_none() && f.used_at.is_none() => Ok(Some(f)),
-        _ => Err(Box::new(problem(
+        _ => Err(Fail::new(
             StatusCode::GONE,
+            "flow_expired",
             "This sign-in expired",
             "Sign-ins from the app last 10 minutes. Go back to Ferrocast and press Sign in again.",
             "/login",
-        ))),
+        )),
     }
 }
 
@@ -248,7 +303,7 @@ async fn login_page(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw
     let next = safe_next(q.get("next").map(String::as_str));
     let flow = match live_flow(&st, q.get("flow").map(String::as_str)) {
         Ok(f) => f,
-        Err(r) => return *r,
+        Err(e) => return e.page(),
     };
     // Already signed in on the web: straight to the dashboard.
     if flow.is_none() && web_session(&st, &headers).is_ok() {
@@ -326,6 +381,326 @@ fn code_form(token: &str, magic_id: &str, error: Option<&str>) -> String {
     )
 }
 
+// ── The steps, shared by these pages and the website's JSON endpoints ─────────────────
+
+/// Rate limits, the shared email budget, then the sign-in email: its link and code work
+/// once, for 15 minutes, in the browser holding login cookie `c`. The new sign-in's id.
+pub(super) async fn send_magic(
+    st: &AppState,
+    ip: &str,
+    c: &str,
+    email: &str,
+    flow: Option<&str>,
+    next: &str,
+) -> Result<String, Fail> {
+    let again = back_to(flow, next);
+    let email = email.trim().to_lowercase();
+    if !crate::billing::valid_email(&email) {
+        return Err(Fail::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_email",
+            "Check the address",
+            "That email address doesn't look right.",
+            &again,
+        ));
+    }
+    let Some(mailer) = st.mail.mailer() else {
+        return Err(Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "email_off",
+            "Email sign-in is off",
+            "This relay can't send email right now. Try Google, or try again later.",
+            &again,
+        ));
+    };
+    let limited = st
+        .accounts
+        .take("magic_15m", &email, 3, 15 * MINUTE)
+        .and_then(|_| st.accounts.take("magic_day", &email, 10, DAY))
+        .and_then(|_| st.accounts.take("magic_ip", ip, 20, 60 * MINUTE));
+    if let Err(wait) = limited {
+        let mut f = Fail::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Too many emails",
+            format!("We've sent a lot of sign-in emails. Wait {} minutes, or use the last one.", (wait + 59) / 60),
+            &again,
+        );
+        f.retry_after = Some(wait);
+        return Err(f);
+    }
+    // Sign-in emails share Brevo's daily allowance with the weekly email, plus a small
+    // reserve above the weekly budget so reports can't lock people out.
+    let day = now_ms().div_euclid(DAY);
+    match st.db.mail_budget_take(day, st.mail.budget() + SIGN_IN_RESERVE) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(Fail::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "email_busy",
+                "Email sign-in is busy",
+                "We've sent all the email we can today. Use Google, or try again tomorrow.",
+                &again,
+            ));
+        }
+        Err(err) => return Err(Fail::db(err)),
+    }
+    let id = store::new_id("ml_");
+    let token = crate::random(32);
+    let code = new_code();
+    let now = now_ms();
+    st.db
+        .account_put_magic(
+            &id,
+            &sha(&token),
+            &code_hash(&id, &code),
+            &email,
+            &browser_hash(c),
+            flow,
+            next,
+            now,
+            now + MAGIC_TTL_MS,
+        )
+        .map_err(Fail::db)?;
+    // On the website the token rides in the fragment, so it never reaches a server log.
+    let link = if st.remote.cfg.web.is_some() {
+        format!("{}/login/link/#t={token}", page_origin(st))
+    } else {
+        format!("{}/login/link?t={token}", web_origin(st))
+    };
+    let shown = format!("{}-{}", &code[..4], &code[4..]);
+    let text = format!(
+        "Sign in to Ferrocast:\n{link}\n\nOr type this code on the sign-in page: {shown}\n\n\
+         The link and the code work once, for 15 minutes, only in the browser where you asked for them.\n\
+         If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.\n\n{}\n",
+        crate::mail::layout::POSTAL_ADDRESS
+    );
+    let mail = crate::mail::Email {
+        to: email.clone(),
+        subject: "Your Ferrocast sign-in link".into(),
+        html: sign_in_html(&link, &shown),
+        text,
+        headers: Vec::new(),
+        tag: "sign_in",
+    };
+    let sent = tokio::time::timeout(std::time::Duration::from_secs(15), mailer.send(&st.mail.from(), &mail)).await;
+    match sent {
+        Ok(Ok(())) | Ok(Err(crate::mail::MailError::Uncertain(_))) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "a sign-in email couldn't be sent");
+            let _ = st.db.mail_budget_give_back(day);
+            return Err(Fail::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "email_failed",
+                "The email didn't go",
+                "We couldn't send the sign-in email just now. Try again in a minute, or use Google.",
+                &again,
+            ));
+        }
+        Err(_) => tracing::warn!("a sign-in email took too long; it may still arrive"),
+    }
+    Ok(id)
+}
+
+/// The code typed for sign-in `id`, checked in the browser that asked. A wrong code counts a
+/// try (`wrong_code`, with how many are left); the right one uses the sign-in up.
+pub(super) fn check_code(st: &AppState, c: &str, id: &str, typed: &str) -> Result<store::Magic, Fail> {
+    let gone = || {
+        Fail::new(
+            StatusCode::GONE,
+            "code_expired",
+            "This code expired",
+            "Codes work once, for 15 minutes, in the browser that asked. Ask for a new one.",
+            "/login",
+        )
+    };
+    let m = st.db.account_magic(id).map_err(Fail::db)?.ok_or_else(gone)?;
+    let now = now_ms();
+    if !ct_eq(&m.browser_hash, &browser_hash(c)) || m.used_at.is_some() || m.expires_at <= now || m.tries >= MAGIC_TRIES
+    {
+        return Err(gone());
+    }
+    let code = normal_code(typed);
+    if code.len() != CODE_LEN || !ct_eq(&m.code_hash, &code_hash(&m.id, &code)) {
+        let tries = st.db.account_magic_miss(&m.id).map_err(Fail::db)?;
+        if tries >= MAGIC_TRIES {
+            return Err(Fail::new(
+                StatusCode::GONE,
+                "too_many_codes",
+                "Too many wrong codes",
+                "That sign-in is closed now. Ask for a new email.",
+                &back_to(m.flow_id.as_deref(), &m.next),
+            ));
+        }
+        let left = MAGIC_TRIES - tries;
+        return Err(Fail::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_code",
+            "Check your email",
+            format!("That code isn't right. {left} {} left.", if left == 1 { "try" } else { "tries" }),
+            "/login",
+        ));
+    }
+    if !st.db.account_magic_use(&m.id, now).map_err(Fail::db)? {
+        return Err(gone());
+    }
+    Ok(m)
+}
+
+/// The emailed link's token `t`, used up in the browser that asked.
+pub(super) fn take_link(st: &AppState, c: &str, t: &str) -> Result<store::Magic, Fail> {
+    let gone = || {
+        Fail::new(
+            StatusCode::GONE,
+            "link_expired",
+            "This link expired",
+            "Sign-in links work once, for 15 minutes, in the browser that asked. Ask for a new one.",
+            "/login",
+        )
+    };
+    if t.is_empty() {
+        return Err(gone());
+    }
+    let m = st.db.account_magic_by_token(&sha(t)).map_err(Fail::db)?.ok_or_else(gone)?;
+    if !ct_eq(&m.browser_hash, &browser_hash(c)) {
+        return Err(Fail::new(
+            StatusCode::FORBIDDEN,
+            "other_browser",
+            "Open it where you asked",
+            "For your safety this link only works in the browser where you asked for it. Open it there, or type the code from the email on that sign-in page.",
+            "/login",
+        ));
+    }
+    if m.used_at.is_some() || m.expires_at <= now_ms() || !st.db.account_magic_use(&m.id, now_ms()).map_err(Fail::db)? {
+        return Err(gone());
+    }
+    Ok(m)
+}
+
+/// Google's sign-in address for this browser (PKCE, a state and a nonce kept for the
+/// callback on this host).
+pub(super) fn google_url(st: &AppState, ip: &str, c: &str, flow: Option<&str>, next: &str) -> Result<String, Fail> {
+    let again = back_to(flow, next);
+    let g = &st.accounts.cfg.google;
+    let Some(client_id) = g.client_id.as_deref().filter(|_| g.on()) else {
+        return Err(Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "google_off",
+            "Google sign-in is off",
+            "Google sign-in isn't set up on this relay yet. Use your email instead.",
+            &again,
+        ));
+    };
+    if st.accounts.take("google_ip", ip, 30, 60 * MINUTE).is_err() {
+        return Err(Fail::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Too many tries",
+            "Wait a few minutes and try again.",
+            &again,
+        ));
+    }
+    let state = crate::random(24);
+    let nonce = crate::random(24);
+    let verifier = crate::random(48);
+    let challenge =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, Sha256::digest(&verifier));
+    let now = now_ms();
+    st.db
+        .account_put_oauth(&sha(&state), &nonce, &verifier, &browser_hash(c), flow, next, now, now + OAUTH_TTL_MS)
+        .map_err(Fail::db)?;
+    let mut url = url::Url::parse(&g.auth_url).map_err(|_| {
+        Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "google_off",
+            "Google sign-in is off",
+            "Google's address is wrong on this relay.",
+            &again,
+        )
+    })?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", &callback_url(st))
+        .append_pair("response_type", "code")
+        .append_pair("scope", "openid email profile")
+        .append_pair("state", &state)
+        .append_pair("nonce", &nonce)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("prompt", "select_account");
+    Ok(url.into())
+}
+
+/// How a sign-in ends.
+pub(super) enum Finished {
+    /// The app's loopback address, with its one-time code.
+    App(String),
+    /// A web session: its cookie, how long it lasts (s), and the dashboard path to open.
+    Web { token: String, age: i64, next: String },
+}
+
+/// The person proved `email`: their account (made if new), then the app's one-time code, or
+/// a web session.
+pub(super) async fn finish_core(
+    st: &AppState,
+    headers: &HeaderMap,
+    email: &str,
+    google: Option<&GoogleId>,
+    flow: Option<&str>,
+    next: &str,
+) -> Result<Finished, Fail> {
+    let now = now_ms();
+    let (account, made) = st.db.account_sign_in(email, google, now).map_err(Fail::db)?;
+    if account.disabled_at.is_some() {
+        return Err(Fail::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "This account is turned off",
+            "Write to support@clearcraftlabs.com if you think that's a mistake. The Ferrocast app still works without an account.",
+            "/login",
+        ));
+    }
+    if made {
+        tracing::info!(account = %account.id, "account created");
+    }
+    attach_by_email(st, &account.id, email);
+    if let Some(fid) = flow {
+        let expired = || {
+            Fail::new(
+                StatusCode::GONE,
+                "flow_expired",
+                "This sign-in expired",
+                "Press Sign in again in Ferrocast.",
+                "/login",
+            )
+        };
+        let f = st.db.account_flow(fid).map_err(Fail::db)?.ok_or_else(expired)?;
+        let code = crate::random(32);
+        if !st.db.account_flow_code(&f.id, &sha(&code), &account.id, now, now + APP_CODE_TTL_MS).map_err(Fail::db)? {
+            return Err(expired());
+        }
+        let mut u = url::Url::parse(&f.redirect_uri).map_err(|_| expired())?;
+        u.query_pairs_mut().append_pair("code", &code).append_pair("state", &f.state);
+        return Ok(Finished::App(u.into()));
+    }
+    let (token, s) = new_session(st, &account, "web", &ua_label(headers), None)
+        .map_err(|e| Fail::new(e.status(), "session_failed", "Try again", e.message().to_string(), "/login"))?;
+    Ok(Finished::Web { token, age: (s.expires_at - now) / 1000, next: safe_next(Some(next)) })
+}
+
+/// The sign-in cookie for a web session, and the login cookie cleared.
+pub(super) fn session_cookies(r: &mut Response, token: &str, age: i64) {
+    r.headers_mut().append(header::SET_COOKIE, set_cookie(SESSION_COOKIE, token, age));
+    r.headers_mut().append(header::SET_COOKIE, set_cookie(LOGIN_COOKIE, "", 0));
+}
+
+/// The rate-limit key of the request's address.
+pub(super) fn ip_of(peer: std::net::SocketAddr, headers: &HeaderMap) -> String {
+    crate::remote::limits::ip_key(crate::client_ip(peer, headers))
+}
+
+// ── The pages ────────────────────────────────────────────────────────────────────────
+
 async fn email_start(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -342,108 +717,14 @@ async fn email_start(
     let next = safe_next(f.get("next").map(String::as_str));
     let flow = match live_flow(&st, f.get("flow").map(String::as_str)) {
         Ok(fl) => fl.map(|fl| fl.id),
-        Err(r) => return *r,
+        Err(e) => return e.page(),
     };
     let again = back_to(flow.as_deref(), &next);
     let email = f.get("email").map(|e| e.trim().to_lowercase()).unwrap_or_default();
-    if !crate::billing::valid_email(&email) {
-        return problem(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Check the address",
-            "That email address doesn't look right.",
-            &again,
-        );
-    }
-    let Some(mailer) = st.mail.mailer() else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Email sign-in is off",
-            "This relay can't send email right now. Try Google, or try again later.",
-            &again,
-        );
+    let id = match send_magic(&st, &ip_of(peer, &headers), &c, &email, flow.as_deref(), &next).await {
+        Ok(id) => id,
+        Err(e) => return e.page(),
     };
-    let ip = crate::remote::limits::ip_key(crate::client_ip(peer, &headers));
-    let limited = st
-        .accounts
-        .take("magic_15m", &email, 3, 15 * MINUTE)
-        .and_then(|_| st.accounts.take("magic_day", &email, 10, DAY))
-        .and_then(|_| st.accounts.take("magic_ip", &ip, 20, 60 * MINUTE));
-    if let Err(wait) = limited {
-        let mut r = problem(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many emails",
-            &format!("We've sent a lot of sign-in emails. Wait {} minutes, or use the last one.", (wait + 59) / 60),
-            &again,
-        );
-        if let Ok(v) = HeaderValue::from_str(&wait.to_string()) {
-            r.headers_mut().insert(header::RETRY_AFTER, v);
-        }
-        return r;
-    }
-    // Sign-in emails share Brevo's daily allowance with the weekly email, plus a small
-    // reserve above the weekly budget so reports can't lock people out.
-    let day = now_ms().div_euclid(DAY);
-    match st.db.mail_budget_take(day, st.mail.budget() + SIGN_IN_RESERVE) {
-        Ok(true) => {}
-        Ok(false) => {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Email sign-in is busy",
-                "We've sent all the email we can today. Use Google, or try again tomorrow.",
-                &again,
-            );
-        }
-        Err(err) => return ApiError::db(err).into_response(),
-    }
-    let id = store::new_id("ml_");
-    let token = crate::random(32);
-    let code = new_code();
-    let now = now_ms();
-    if let Err(err) = st.db.account_put_magic(
-        &id,
-        &sha(&token),
-        &code_hash(&id, &code),
-        &email,
-        &browser_hash(&c),
-        flow.as_deref(),
-        &next,
-        now,
-        now + MAGIC_TTL_MS,
-    ) {
-        return ApiError::db(err).into_response();
-    }
-    let link = format!("{}/login/link?t={token}", web_origin(&st));
-    let shown = format!("{}-{}", &code[..4], &code[4..]);
-    let text = format!(
-        "Sign in to Ferrocast:\n{link}\n\nOr type this code on the sign-in page: {shown}\n\n\
-         The link and the code work once, for 15 minutes, only in the browser where you asked for them.\n\
-         If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.\n\n{}\n",
-        crate::mail::layout::POSTAL_ADDRESS
-    );
-    let html = sign_in_html(&link, &shown);
-    let mail = crate::mail::Email {
-        to: email.clone(),
-        subject: "Your Ferrocast sign-in link".into(),
-        html,
-        text,
-        headers: Vec::new(),
-        tag: "sign_in",
-    };
-    let sent = tokio::time::timeout(std::time::Duration::from_secs(15), mailer.send(&st.mail.from(), &mail)).await;
-    match sent {
-        Ok(Ok(())) | Ok(Err(crate::mail::MailError::Uncertain(_))) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "a sign-in email couldn't be sent");
-            let _ = st.db.mail_budget_give_back(day);
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The email didn't go",
-                "We couldn't send the sign-in email just now. Try again in a minute, or use Google.",
-                &again,
-            );
-        }
-        Err(_) => tracing::warn!("a sign-in email took too long; it may still arrive"),
-    }
     let resend = format!(
         "<form method=post action=/login/email>{}{}{}{}<button class=btn type=submit>Resend link</button></form>",
         hidden("csrf", &form_token(&c)),
@@ -471,55 +752,13 @@ async fn email_code(State(st): State<AppState>, headers: HeaderMap, body: axum::
         Err(r) => return *r,
     };
     let id = f.get("m").map(String::as_str).unwrap_or("");
-    let gone = || {
-        problem(
-            StatusCode::GONE,
-            "This code expired",
-            "Codes work once, for 15 minutes, in the browser that asked. Ask for a new one.",
-            "/login",
-        )
-    };
-    let m = match st.db.account_magic(id) {
-        Ok(Some(m)) => m,
-        Ok(None) => return gone(),
-        Err(err) => return ApiError::db(err).into_response(),
-    };
-    let now = now_ms();
-    if !ct_eq(&m.browser_hash, &browser_hash(&c))
-        || m.used_at.is_some()
-        || m.expires_at <= now
-        || m.tries >= MAGIC_TRIES
-    {
-        return gone();
-    }
-    let code = normal_code(f.get("code").map(String::as_str).unwrap_or(""));
-    if code.len() != CODE_LEN || !ct_eq(&m.code_hash, &code_hash(&m.id, &code)) {
-        let tries = match st.db.account_magic_miss(&m.id) {
-            Ok(t) => t,
-            Err(err) => return ApiError::db(err).into_response(),
-        };
-        if tries >= MAGIC_TRIES {
-            return problem(
-                StatusCode::GONE,
-                "Too many wrong codes",
-                "That sign-in is closed now. Ask for a new email.",
-                &back_to(m.flow_id.as_deref(), &m.next),
-            );
+    match check_code(&st, &c, id, f.get("code").map(String::as_str).unwrap_or("")) {
+        Ok(m) => finish(&st, &headers, &m.email, None, m.flow_id.as_deref(), &m.next).await,
+        Err(e) if e.code == "wrong_code" => {
+            page(StatusCode::UNPROCESSABLE_ENTITY, "Check your email", &code_form(&form_token(&c), id, Some(&e.text)))
         }
-        let left = MAGIC_TRIES - tries;
-        let msg = format!("That code isn't right. {left} {} left.", if left == 1 { "try" } else { "tries" });
-        return page(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Check your email",
-            &code_form(&form_token(&c), &m.id, Some(&msg)),
-        );
+        Err(e) => e.page(),
     }
-    match st.db.account_magic_use(&m.id, now) {
-        Ok(true) => {}
-        Ok(false) => return gone(),
-        Err(err) => return ApiError::db(err).into_response(),
-    }
-    finish(&st, &headers, &m.email, None, m.flow_id.as_deref(), &m.next).await
 }
 
 async fn link_page(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Response {
@@ -570,29 +809,19 @@ async fn link_use(State(st): State<AppState>, headers: HeaderMap, body: axum::bo
         Ok(c) => c,
         Err(r) => return *r,
     };
-    let t = f.get("t").map(String::as_str).unwrap_or("");
-    let gone = || {
-        problem(
+    match take_link(&st, &c, f.get("t").map(String::as_str).unwrap_or("")) {
+        Ok(m) => finish(&st, &headers, &m.email, None, m.flow_id.as_deref(), &m.next).await,
+        // The page keeps its old wording for a link opened in another browser.
+        Err(e) if e.code == "other_browser" => Fail::new(
             StatusCode::GONE,
+            "link_expired",
             "This link expired",
             "Sign-in links work once, for 15 minutes, in the browser that asked. Ask for a new one.",
             "/login",
         )
-    };
-    let m = match st.db.account_magic_by_token(&sha(t)) {
-        Ok(Some(m)) if !t.is_empty() => m,
-        Ok(_) => return gone(),
-        Err(err) => return ApiError::db(err).into_response(),
-    };
-    if !ct_eq(&m.browser_hash, &browser_hash(&c)) {
-        return gone();
+        .page(),
+        Err(e) => e.page(),
     }
-    match st.db.account_magic_use(&m.id, now_ms()) {
-        Ok(true) => {}
-        Ok(false) => return gone(),
-        Err(err) => return ApiError::db(err).into_response(),
-    }
-    finish(&st, &headers, &m.email, None, m.flow_id.as_deref(), &m.next).await
 }
 
 // ── Google ───────────────────────────────────────────────────────────────────────────
@@ -613,94 +842,56 @@ async fn google_start(
     let next = safe_next(f.get("next").map(String::as_str));
     let flow = match live_flow(&st, f.get("flow").map(String::as_str)) {
         Ok(fl) => fl.map(|fl| fl.id),
-        Err(r) => return *r,
+        Err(e) => return e.page(),
     };
-    let again = back_to(flow.as_deref(), &next);
-    let g = &st.accounts.cfg.google;
-    let Some(client_id) = g.client_id.as_deref().filter(|_| g.on()) else {
-        return google_off_page(&again);
-    };
-    let ip = crate::remote::limits::ip_key(crate::client_ip(peer, &headers));
-    if st.accounts.take("google_ip", &ip, 30, 60 * MINUTE).is_err() {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many tries", "Wait a few minutes and try again.", &again);
+    match google_url(&st, &ip_of(peer, &headers), &c, flow.as_deref(), &next) {
+        Ok(u) => redirect(&u),
+        Err(e) => e.page(),
     }
-    let state = crate::random(24);
-    let nonce = crate::random(24);
-    let verifier = crate::random(48);
-    let challenge =
-        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, Sha256::digest(&verifier));
-    let now = now_ms();
-    if let Err(err) = st.db.account_put_oauth(
-        &sha(&state),
-        &nonce,
-        &verifier,
-        &browser_hash(&c),
-        flow.as_deref(),
-        &next,
-        now,
-        now + OAUTH_TTL_MS,
-    ) {
-        return ApiError::db(err).into_response();
-    }
-    let Ok(mut url) = url::Url::parse(&g.auth_url) else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Google sign-in is off",
-            "Google's address is wrong on this relay.",
-            &again,
-        );
-    };
-    url.query_pairs_mut()
-        .append_pair("client_id", client_id)
-        .append_pair("redirect_uri", &callback_url(&st))
-        .append_pair("response_type", "code")
-        .append_pair("scope", "openid email profile")
-        .append_pair("state", &state)
-        .append_pair("nonce", &nonce)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("prompt", "select_account");
-    redirect(url.as_str())
-}
-
-fn google_off_page(again: &str) -> Response {
-    let mut r = problem(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Google sign-in is off",
-        "Google sign-in isn't set up on this relay yet. Use your email instead.",
-        again,
-    );
-    r.headers_mut().insert("x-error-code", HeaderValue::from_static("google_off"));
-    r
 }
 
 pub(crate) fn callback_url(st: &AppState) -> String {
     format!("{}/login/google/callback", web_origin(st))
 }
 
+/// Google's answer comes back to this host (it holds the login cookie). Started from the
+/// website, a problem goes back to the website's sign-in page with the reason.
 async fn google_callback(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Response {
     if !available(&st) || !crate::remote::on_web_host(&st, &headers) {
         return not_here();
     }
     let q = query(raw.as_deref());
+    let show = |f: Fail| -> Response {
+        if st.remote.cfg.web.is_some() {
+            let to = format!(
+                "{}/login/?error={}",
+                page_origin(&st),
+                url::form_urlencoded::byte_serialize(f.text.as_bytes()).collect::<String>()
+            );
+            redirect(&to)
+        } else {
+            f.page()
+        }
+    };
     let expired = || {
-        problem(
+        Fail::new(
             StatusCode::BAD_REQUEST,
+            "google_expired",
             "Start again",
             "This Google sign-in expired, was already used, or was started in another browser.",
             "/login",
         )
     };
-    let Some(state) = q.get("state").filter(|s| !s.is_empty() && s.len() <= 128) else { return expired() };
+    let Some(state) = q.get("state").filter(|s| !s.is_empty() && s.len() <= 128) else { return show(expired()) };
     let now = now_ms();
     let o = match st.db.account_take_oauth(&sha(state), now) {
         Ok(Some(o)) => o,
-        Ok(None) => return expired(),
-        Err(err) => return ApiError::db(err).into_response(),
+        Ok(None) => return show(expired()),
+        Err(err) => return show(Fail::db(err)),
     };
     let c = cookie(&headers, LOGIN_COOKIE);
     if !c.as_deref().is_some_and(|c| ct_eq(&o.browser_hash, &browser_hash(c))) {
-        return expired();
+        return show(expired());
     }
     let again = back_to(o.flow_id.as_deref(), &o.next);
     if q.contains_key("error") {
@@ -712,13 +903,25 @@ async fn google_callback(State(st): State<AppState>, headers: HeaderMap, RawQuer
             u.query_pairs_mut().append_pair("error", "access_denied").append_pair("state", &f.state);
             return redirect(u.as_str());
         }
-        return problem(StatusCode::OK, "Sign-in cancelled", "Google sign-in was cancelled.", &again);
+        return show(Fail::new(
+            StatusCode::OK,
+            "cancelled",
+            "Sign-in cancelled",
+            "Google sign-in was cancelled.",
+            &again,
+        ));
     }
     let g = &st.accounts.cfg.google;
     let (Some(id), Some(secret)) = (g.client_id.as_deref(), g.client_secret.as_deref()) else {
-        return google_off_page(&again);
+        return show(Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "google_off",
+            "Google sign-in is off",
+            "Google sign-in isn't set up on this relay yet. Use your email instead.",
+            &again,
+        ));
     };
-    let Some(code) = q.get("code").filter(|c| !c.is_empty() && c.len() <= 2048) else { return expired() };
+    let Some(code) = q.get("code").filter(|c| !c.is_empty() && c.len() <= 2048) else { return show(expired()) };
     let cb = callback_url(&st);
     let form = [
         ("grant_type", "authorization_code"),
@@ -730,8 +933,9 @@ async fn google_callback(State(st): State<AppState>, headers: HeaderMap, RawQuer
     ];
     let unavailable = |why: &str| {
         tracing::warn!(why, "Google sign-in failed");
-        problem(
+        Fail::new(
             StatusCode::BAD_GATEWAY,
+            "google_failed",
             "Google didn't answer",
             "Google didn't accept the sign-in just now. Try again.",
             &again,
@@ -740,41 +944,58 @@ async fn google_callback(State(st): State<AppState>, headers: HeaderMap, RawQuer
     let tokens: serde_json::Value = match st.http.post(&g.token_url).form(&form).send().await {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(v) => v,
-            Err(_) => return unavailable("unreadable token answer"),
+            Err(_) => return show(unavailable("unreadable token answer")),
         },
-        Ok(r) => return unavailable(&format!("token endpoint HTTP {}", r.status().as_u16())),
-        Err(_) => return unavailable("token endpoint unreachable"),
+        Ok(r) => return show(unavailable(&format!("token endpoint HTTP {}", r.status().as_u16()))),
+        Err(_) => return show(unavailable("token endpoint unreachable")),
     };
-    let Some(id_token) = tokens["id_token"].as_str() else { return unavailable("no id_token") };
+    let Some(id_token) = tokens["id_token"].as_str() else { return show(unavailable("no id_token")) };
     let claims = match google::verify(&st.accounts.keys, &st.http, g, id_token, &o.nonce, now).await {
         Ok(c) => c,
         Err(google::TokenError::Unverified) => {
-            return problem(
+            return show(Fail::new(
                 StatusCode::FORBIDDEN,
+                "email_unverified",
                 "Email not verified",
                 "Google says this account's email isn't verified. Verify it with Google, or sign in by email.",
                 &again,
-            );
+            ));
         }
-        Err(google::TokenError::Keys(why)) => return unavailable(&why),
+        Err(google::TokenError::Keys(why)) => return show(unavailable(&why)),
         Err(err) => {
             tracing::warn!(error = %err, "refused a Google id_token");
-            return problem(
+            return show(Fail::new(
                 StatusCode::UNAUTHORIZED,
+                "google_refused",
                 "Sign-in refused",
                 "Google's answer didn't check out. Try again.",
                 &again,
-            );
+            ));
         }
     };
     let gid = GoogleId { subject: claims.sub, name: claims.name, picture: claims.picture };
-    finish(&st, &headers, &claims.email, Some(&gid), o.flow_id.as_deref(), &o.next).await
+    match finish_core(&st, &headers, &claims.email, Some(&gid), o.flow_id.as_deref(), &o.next).await {
+        Ok(done) => finished(&st, done),
+        Err(e) => show(e),
+    }
 }
 
 // ── Finishing ────────────────────────────────────────────────────────────────────────
 
-/// The person proved `email`: their account (made if new), then the app's loopback with a
-/// one-time code, or the web session cookie and the dashboard.
+/// A finished sign-in as a redirect: the app's loopback, or the dashboard with the session
+/// cookie (on the website when there is one).
+fn finished(st: &AppState, done: Finished) -> Response {
+    match done {
+        Finished::App(u) => redirect(&u),
+        Finished::Web { token, age, next } => {
+            let to = if st.remote.cfg.web.is_some() { format!("{}{next}", page_origin(st)) } else { next };
+            let mut r = redirect(&to);
+            session_cookies(&mut r, &token, age);
+            r
+        }
+    }
+}
+
 async fn finish(
     st: &AppState,
     headers: &HeaderMap,
@@ -783,64 +1004,10 @@ async fn finish(
     flow: Option<&str>,
     next: &str,
 ) -> Response {
-    let now = now_ms();
-    let (account, made) = match st.db.account_sign_in(email, google, now) {
-        Ok(x) => x,
-        Err(err) => return ApiError::db(err).into_response(),
-    };
-    if account.disabled_at.is_some() {
-        return problem(
-            StatusCode::FORBIDDEN,
-            "This account is turned off",
-            "Write to support@clearcraftlabs.com if you think that's a mistake. The Ferrocast app still works without an account.",
-            "/login",
-        );
+    match finish_core(st, headers, email, google, flow, next).await {
+        Ok(done) => finished(st, done),
+        Err(e) => e.page(),
     }
-    if made {
-        tracing::info!(account = %account.id, "account created");
-    }
-    attach_by_email(st, &account.id, email);
-    if let Some(fid) = flow {
-        let f = match st.db.account_flow(fid) {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                return problem(
-                    StatusCode::GONE,
-                    "This sign-in expired",
-                    "Press Sign in again in Ferrocast.",
-                    "/login",
-                );
-            }
-            Err(err) => return ApiError::db(err).into_response(),
-        };
-        let code = crate::random(32);
-        match st.db.account_flow_code(&f.id, &sha(&code), &account.id, now, now + APP_CODE_TTL_MS) {
-            Ok(true) => {}
-            Ok(false) => {
-                return problem(
-                    StatusCode::GONE,
-                    "This sign-in expired",
-                    "Press Sign in again in Ferrocast.",
-                    "/login",
-                );
-            }
-            Err(err) => return ApiError::db(err).into_response(),
-        }
-        let Ok(mut u) = url::Url::parse(&f.redirect_uri) else {
-            return problem(StatusCode::GONE, "This sign-in expired", "Press Sign in again in Ferrocast.", "/login");
-        };
-        u.query_pairs_mut().append_pair("code", &code).append_pair("state", &f.state);
-        return redirect(u.as_str());
-    }
-    let (token, s) = match new_session(st, &account, "web", &ua_label(headers), None) {
-        Ok(x) => x,
-        Err(err) => return err.into_response(),
-    };
-    let mut r = redirect(next);
-    let age = (s.expires_at - now) / 1000;
-    r.headers_mut().append(header::SET_COOKIE, set_cookie(SESSION_COOKIE, &token, age));
-    r.headers_mut().append(header::SET_COOKIE, set_cookie(LOGIN_COOKIE, "", 0));
-    r
 }
 
 /// `POST /logout` (form with `csrf`, the web session's CSRF token).
