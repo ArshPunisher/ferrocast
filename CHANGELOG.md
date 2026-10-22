@@ -5,7 +5,7 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.0.0-beta.1
+## 2.0.0-beta.2
 
 - Go live everywhere (beta): stream once from OBS, and Ferrocast sends it on to Twitch,
   YouTube and Kick at the same time, plus any server of your own. Find it first in Studio.
@@ -15,6 +15,7 @@ words. The Release workflow reads the section whose heading is the version being
 - Test your upload before you go live: Ferrocast says in plain words how many platforms fit.
 - While live, each platform has its own health line. One that drops reconnects by itself and
   never stops the others.
+- Start streaming in Studio no longer says "OBS stopped streaming" right after starting.
 
 ## 1.4.2
 
