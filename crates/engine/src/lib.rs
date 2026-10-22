@@ -15,6 +15,8 @@ mod cloud_bot;
 mod cloud_sync;
 #[cfg(test)]
 mod cloud_sync_tests;
+#[cfg(test)]
+mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod designs;
 mod discord;
@@ -22,6 +24,7 @@ mod dispatcher;
 mod error;
 mod ferro_account;
 mod giveaways;
+pub mod golive;
 mod history;
 pub mod import;
 mod loyalty;
@@ -180,6 +183,8 @@ struct Inner {
     cloud_sync: Mutex<cloud_sync::Mem>,
     /// Pro smart features: settings, the moderation queue and log, reply limits.
     smart: Mutex<smart::Smart>,
+    /// Go live everywhere: the local ingest, destinations and forwarders.
+    golive: golive::GoLive,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -206,6 +211,7 @@ impl Engine {
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
         engine.watch_obs();
         engine.watch_obs_health();
+        engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         Ok(engine)
     }
 
@@ -306,6 +312,7 @@ impl Engine {
                 cloud_bot: Default::default(),
                 cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
+                golive: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));

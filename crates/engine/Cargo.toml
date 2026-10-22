@@ -13,6 +13,7 @@ ferrocast-core.workspace = true
 ferrocast-connector.workspace = true
 ferrocast-store.workspace = true
 ferrocast-obs.workspace = true
+ferrocast-golive.workspace = true
 ferrocast-secrets.workspace = true
 ferrocast-twitch.workspace = true
 ferrocast-youtube.workspace = true
@@ -31,6 +32,7 @@ tokio.workspace = true
 async-trait = "0.1"
 sys-locale = "0.3"
 getrandom = "0.4"
+fastrand = "2"
 quick-xml = "0.42"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # Pro cloud backups: encrypted on this PC (X25519, optional scrypt passphrase). No default
