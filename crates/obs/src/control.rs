@@ -7,7 +7,8 @@ use obws::requests::inputs::InputId;
 use obws::requests::scene_items::SetEnabled;
 use obws::requests::scenes::SceneId;
 use obws::responses::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::ObsError;
 
@@ -189,6 +190,58 @@ pub async fn stop_stream(client: &Client) -> Result<(), ObsError> {
     }
 }
 
+/// OBS's stream setting (Settings › Stream): the service type (`rtmp_common` for a listed
+/// platform, `rtmp_custom` for a typed server) and its settings, which hold the stream key.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamService {
+    pub kind: String,
+    pub settings: Value,
+}
+
+impl std::fmt::Debug for StreamService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The settings carry the key: only the type and the server show.
+        f.debug_struct("StreamService")
+            .field("kind", &self.kind)
+            .field("server", &self.settings.get("server"))
+            .field("service", &self.settings.get("service"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamService {
+    /// A typed server and key (OBS's "Custom..." service).
+    pub fn custom(server: &str, key: &str) -> Self {
+        Self {
+            kind: "rtmp_custom".into(),
+            settings: json!({ "server": server, "key": key, "use_auth": false, "bwtest": false }),
+        }
+    }
+
+    /// Whether OBS already streams to `server`.
+    pub fn points_at(&self, server: &str) -> bool {
+        self.kind == "rtmp_custom" && self.settings.get("server").and_then(Value::as_str) == Some(server)
+    }
+}
+
+/// OBS's current stream setting.
+pub async fn stream_service(client: &Client) -> Result<StreamService, ObsError> {
+    let s = client.config().stream_service_settings::<Value>().await.map_err(err)?;
+    Ok(StreamService { kind: s.r#type, settings: s.settings })
+}
+
+/// Changes OBS's stream setting. OBS refuses while it streams, so this only happens between
+/// streams. A different type replaces the old settings; the same type is merged over them.
+pub async fn set_stream_service(client: &Client, s: &StreamService) -> Result<(), ObsError> {
+    match client.config().set_stream_service_settings(&s.kind, &s.settings).await {
+        Ok(()) => Ok(()),
+        Err(e) if code(&e) == Some(StatusCode::OutputRunning) => Err(ObsError::Refused(
+            "OBS is streaming right now. Stop the stream in OBS first; Ferrocast changes this between streams.".into(),
+        )),
+        Err(e) => Err(err(e)),
+    }
+}
+
 /// Raw numbers for [`ferrocast_core::show::health`].
 pub async fn health_sample(client: &Client, at: i64) -> Result<ferrocast_core::show::HealthSample, ObsError> {
     let s = client.general().stats().await.map_err(err)?;
@@ -313,5 +366,27 @@ mod tests {
         st.lock().unwrap().stream_unconfigured = true;
         let e = start_stream(&c).await.unwrap_err().to_string();
         assert!(e.contains("stream key"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn stream_service_points_at_ferrocast_and_goes_back_exactly() {
+        let st = FakeObs::studio();
+        let c = client(&st).await;
+        let before = stream_service(&c).await.unwrap();
+        assert_eq!(before.kind, "rtmp_common");
+        assert!(!format!("{before:?}").contains("OldKey"), "the key never shows in Debug");
+        let ours = StreamService::custom("rtmp://127.0.0.1:1935/live", "fc_k");
+        set_stream_service(&c, &ours).await.unwrap();
+        let now = stream_service(&c).await.unwrap();
+        assert!(now.points_at("rtmp://127.0.0.1:1935/live"));
+        assert!(!before.points_at("rtmp://127.0.0.1:1935/live"));
+        // Put back: a different type replaces, so OBS has exactly what it had.
+        set_stream_service(&c, &before).await.unwrap();
+        assert_eq!(stream_service(&c).await.unwrap(), before);
+        // Never while OBS streams.
+        st.lock().unwrap().streaming = true;
+        let e = set_stream_service(&c, &ours).await.unwrap_err();
+        assert!(matches!(e, ObsError::Refused(m) if m.contains("Stop the stream in OBS first")));
+        assert_eq!(stream_service(&c).await.unwrap(), before);
     }
 }

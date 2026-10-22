@@ -58,6 +58,9 @@ pub struct FakeObs {
     pub switches: Vec<String>,
     /// Close every connection at once (OBS quit).
     pub closed: bool,
+    /// Settings › Stream: the service type and its settings.
+    pub service_kind: String,
+    pub service: Value,
 }
 
 pub type St = Arc<Mutex<FakeObs>>;
@@ -97,6 +100,9 @@ impl FakeObs {
             replay_enabled: true,
             disk_mb: 200.0 * 1024.0,
             cpu: 8.0,
+            // Streaming to Twitch through OBS's own list, as most people do.
+            service_kind: "rtmp_common".into(),
+            service: json!({ "service": "Twitch", "server": "auto", "key": "live_123_OldKey", "bwtest": false }),
             ..Default::default()
         }))
     }
@@ -279,6 +285,26 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                         "outputSkippedFrames": 0, "outputTotalFrames": s.render_total,
                         "webSocketSessionIncomingMessages": 1, "webSocketSessionOutgoingMessages": 1 }),
             )
+        }
+        "GetStreamServiceSettings" => {
+            (100, json!({ "streamServiceType": s.service_kind, "streamServiceSettings": s.service }))
+        }
+        // As obs-websocket: refused while streaming; a new type replaces, the same type merges.
+        "SetStreamServiceSettings" if s.streaming => (500, Value::Null),
+        "SetStreamServiceSettings" => {
+            let kind = data["streamServiceType"].as_str().unwrap_or("").to_string();
+            let new = data["streamServiceSettings"].clone();
+            if kind == s.service_kind {
+                if let (Some(old), Some(new)) = (s.service.as_object_mut(), new.as_object()) {
+                    for (k, v) in new {
+                        old.insert(k.clone(), v.clone());
+                    }
+                }
+            } else {
+                s.service_kind = kind;
+                s.service = new;
+            }
+            (100, Value::Null)
         }
         "StartStream" if s.stream_unconfigured => (606, Value::Null),
         "StartStream" if s.streaming => (500, Value::Null),
