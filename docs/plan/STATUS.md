@@ -26,6 +26,10 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-22 (Track A starts: golive crate)
+- One address live: website and dashboard on ferrocast.clearcraftlabs.com, the relay's web host on api.clearcraftlabs.com (`RELAY_WEB_URL`, `RELAY_REMOTE_URL`); remote.clearcraftlabs.com stays until Google's review ends. Docs updated (ACCOUNTS, API, GOOGLE-VERIFICATION, PRO, deploy).
+- Track A picks recorded in `docs/plan/LIVE-STUDIO.md`. New `crates/golive`: RTMP ingest on 127.0.0.1 with a per-install key, one forwarder task per destination (headers again and the next keyframe on (re)join, timestamps from zero, skip-ahead when behind, backoff with jitter, health with a plain reason, numbered streams), `rtmp://` and `rtmps://` targets. 18 tests with a fake OBS and fake platforms. Not wired into the engine yet (next: keys A1.3, OBS setup A1.4, upload check A1.5, API and Go live tab A1.6).
+
 ### 2026-10-22 (1.4.2, emails, streaming plan)
 - 1.4.1 published (22 Oct). 1.4.2: OBS Start / Stop Streaming (`GET/POST /api/v1/obs/stream`, checklist `start_stream`, `stop_stream`, `stop_delay_s`), YouTube description and thumbnail in stream info (`thumbnails.set`, Twitch and Kick skip with the reason), plus the dashboard's theme choice, tip pictures, menu and designer fixes.
 - Relay: every email (sign-in, weekly confirm, weekly report) shares `mail/layout.rs`; the weekly report links to the web dashboard's History. Deployed 22 Oct (b2082a2).
