@@ -7,7 +7,7 @@
 
 pub(crate) mod admin;
 pub mod google;
-mod pages;
+pub(crate) mod pages;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;

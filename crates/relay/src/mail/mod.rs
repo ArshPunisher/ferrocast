@@ -26,6 +26,7 @@
 
 mod brevo;
 mod fake;
+pub(crate) mod layout;
 mod mailer;
 pub(crate) mod pages;
 pub mod report;

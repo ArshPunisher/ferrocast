@@ -414,14 +414,7 @@ async fn email_start(
          The link and the code work once, for 15 minutes, only in the browser where you asked for them.\n\
          If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.\n"
     );
-    let html = format!(
-        "<p>Sign in to Ferrocast:</p><p><a href=\"{l}\">Sign in</a></p>\
-         <p>Or type this code on the sign-in page: <strong style=\"font-family:monospace;letter-spacing:.1em\">{s}</strong></p>\
-         <p>The link and the code work once, for 15 minutes, only in the browser where you asked for them.</p>\
-         <p>If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.</p>",
-        l = esc(&link),
-        s = esc(&shown)
-    );
+    let html = sign_in_html(&link, &shown);
     let mail = crate::mail::Email {
         to: email.clone(),
         subject: "Your Ferrocast sign-in link".into(),
@@ -860,4 +853,25 @@ async fn logout_form(State(st): State<AppState>, headers: HeaderMap, body: axum:
     let mut r = redirect("/login");
     r.headers_mut().append(header::SET_COOKIE, set_cookie(SESSION_COOKIE, "", 0));
     r
+}
+
+/// The sign-in email's HTML: the button, the code in a box, and when it stops working.
+pub(crate) fn sign_in_html(link: &str, shown: &str) -> String {
+    use crate::mail::layout as l;
+    let body = format!(
+        "{}{}{}{}{}",
+        l::title("Sign in to Ferrocast"),
+        l::para("Press the button to finish signing in. It works in the browser where you asked for it."),
+        l::button(link, "Sign in"),
+        l::code_box("Or type this code on the sign-in page", shown),
+        l::note(
+            "The link and the code work once, for 15 minutes. Didn't ask to sign in? Ignore this email. Nobody can use it without your browser."
+        ),
+    );
+    l::page(
+        "Your Ferrocast sign-in link",
+        &format!("Your code is {shown}. It works once, for 15 minutes."),
+        &body,
+        &l::footer("Ferrocast by ClearCraft Labs"),
+    )
 }

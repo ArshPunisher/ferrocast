@@ -183,7 +183,7 @@ fn stream_titles_are_escaped_in_the_report() {
     let evil = "<script>alert(1)</script> \"Tom & Jerry's\" <img src=x onerror=y>";
     let week = [stream("twitch", from + DAY, 60, evil, 5, 9)];
     let out = report::render(&report::build(&week, &[], from, from + 7 * DAY).unwrap(), "https://r/u");
-    assert!(!out.html.contains("<script>") && !out.html.contains("<img"), "{}", out.html);
+    assert!(!out.html.contains("<script>") && !out.html.contains("<img src=x"), "{}", out.html);
     assert!(out.html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &quot;Tom &amp; Jerry&#39;s&quot;"));
     assert!(out.text.contains(evil), "plain text keeps the title as it is");
     let c = report::confirm("https://r/mail/confirm?t=a\"b<c");
@@ -1338,4 +1338,12 @@ fn write_sample_emails() {
     std::fs::write(dir.join("weekly.txt"), format!("Subject: {}\n\n{}", r.subject, r.text)).unwrap();
     let c = report::confirm("https://ferrocast-relay.clearcraftlabs.com/mail/confirm?t=c1.sub_x.1.n.m");
     std::fs::write(dir.join("confirm.html"), &c.html).unwrap();
+    let r = report::render_with(
+        &report::build(&week, &before, from, from + 7 * DAY).unwrap(),
+        "https://ferrocast-relay.clearcraftlabs.com/mail/unsubscribe?t=u1.sub_x.1.abc",
+        Some("https://ferrocast-remote.clearcraftlabs.com/app/#/history"),
+    );
+    std::fs::write(dir.join("weekly-button.html"), &r.html).unwrap();
+    let s = crate::accounts::pages::sign_in_html("https://ferrocast.clearcraftlabs.com/login/link?t=x", "SMEN-RGQB");
+    std::fs::write(dir.join("sign-in.html"), s).unwrap();
 }
