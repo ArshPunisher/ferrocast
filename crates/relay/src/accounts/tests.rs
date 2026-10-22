@@ -1110,6 +1110,8 @@ async fn login_pages_have_the_board_look_and_resend_works() {
     assert_eq!(page.status, 200);
     assert!(page.body.contains("Continue with Google") && page.body.contains("Email me a link"));
     assert!(page.body.contains("class=\"btn primary\"") && page.body.contains("prefers-color-scheme:light"));
+    // The age line and the legal links under the form.
+    assert!(page.body.contains("you’re 18 or older") && page.body.contains("/terms/\">Terms</a>"));
     let (sent, _, _, _) = w.ask_email(&mut b, "kabir@example.com", "").await;
     assert_eq!(sent.status, 200);
     assert!(sent.body.contains("Check your email") && sent.body.contains("Use another email"));

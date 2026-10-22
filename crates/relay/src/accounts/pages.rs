@@ -277,12 +277,17 @@ async fn login_page(State(st): State<AppState>, headers: HeaderMap, RawQuery(raw
          inputmode=email required maxlength=254 spellcheck=false placeholder=\"you@example.com\" aria-describedby=email-hint>\
          <p class=hint id=email-hint>We’ll email you a link and a code. No password to remember.</p>\
          <button class=\"btn primary\" type=submit>{ICON_MAIL}Email me a link</button></form>\
-         <p class=muted>The link and code work once, for 15 minutes, in this browser.</p>",
+         <p class=muted>The link and code work once, for 15 minutes, in this browser.</p>\
+         <p class=muted>By continuing you confirm you’re 18 or older, or have a parent’s or guardian’s consent. \
+         <a href=\"{SITE}/terms/\">Terms</a> · <a href=\"{SITE}/privacy/\">Privacy</a></p>",
         lead = esc(lead),
     );
     let r = page(StatusCode::OK, "Sign in to Ferrocast", &body);
     if fresh { with_login_cookie(r, &c) } else { r }
 }
+
+/// The website, for the terms and privacy links under the form.
+const SITE: &str = "https://ferrocast.clearcraftlabs.com";
 
 // ── Email ────────────────────────────────────────────────────────────────────────────
 
