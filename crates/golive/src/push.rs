@@ -361,8 +361,9 @@ impl Publisher {
             _ => None,
         })
         .await
+        // Twitch over rtmps:// resets the connection instead of closing it cleanly.
         .map_err(|e| match e {
-            PushError::Closed(h) => PushError::KeyRefused(h),
+            PushError::Closed(h) | PushError::Broken(h) => PushError::KeyRefused(h),
             e => e,
         })?;
         Ok(p)
