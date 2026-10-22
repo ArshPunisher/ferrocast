@@ -1,0 +1,25 @@
+[package]
+name = "ferrocast-golive"
+description = "Go live everywhere: a local RTMP ingest for OBS and one forwarder per platform (no re-encode)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# RTMP handshake, chunking and sessions, without I/O (MIT). The sockets are ours (Tokio).
+rml_rtmp = "0.8"
+bytes = "1"
+fastrand = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
