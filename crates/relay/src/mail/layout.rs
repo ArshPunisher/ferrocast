@@ -31,6 +31,10 @@ pub const MONO: &str = "font-family:'JetBrains Mono',ui-monospace,SFMono-Regular
 /// The site that hosts the icon and the help links.
 const SITE: &str = "https://ferrocast.clearcraftlabs.com";
 
+/// The sender's postal address under every email (anti-spam laws ask for one). The same
+/// registered address as the website's legal pages (`apps/site/src/data/company.ts`).
+pub const POSTAL_ADDRESS: &str = "ClearCraft Labs, Jandiala Guru, Amritsar, Punjab 143115, India";
+
 /// A paragraph in the card's body text.
 pub fn para(text_html: &str) -> String {
     format!("<p style=\"margin:0 0 18px;{FONT};font-size:16px;line-height:24px;color:{MUTED}\">{text_html}</p>")
@@ -106,7 +110,7 @@ pub fn page(subject: &str, preheader: &str, body_html: &str, footer_html: &str) 
          </tr></table>\
          <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr><td style=\"padding:30px 28px 28px\">{body_html}</td></tr></table>\
          </td></tr>\
-         <tr><td align=\"center\" style=\"padding:18px 8px 0;{FONT};font-size:12.5px;line-height:19px;color:{FAINT}\">{footer_html}</td></tr>\
+         <tr><td align=\"center\" style=\"padding:18px 8px 0;{FONT};font-size:12.5px;line-height:19px;color:{FAINT}\">{footer_html}<br>{POSTAL_ADDRESS}</td></tr>\
          </table></td></tr></table></body></html>",
         subject_e = esc(subject),
         pre_e = esc(preheader),

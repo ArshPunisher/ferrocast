@@ -412,7 +412,8 @@ async fn email_start(
     let text = format!(
         "Sign in to Ferrocast:\n{link}\n\nOr type this code on the sign-in page: {shown}\n\n\
          The link and the code work once, for 15 minutes, only in the browser where you asked for them.\n\
-         If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.\n"
+         If you didn't ask to sign in, ignore this email. Nobody can use it without that browser.\n\n{}\n",
+        crate::mail::layout::POSTAL_ADDRESS
     );
     let html = sign_in_html(&link, &shown);
     let mail = crate::mail::Email {

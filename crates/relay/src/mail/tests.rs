@@ -1297,6 +1297,21 @@ async fn an_address_stopped_or_changed_mid_run_is_left_alone() {
 
 /// Finding: a week without streams was final at once, so a stream uploaded after the moment
 /// never got its report. It's looked at again until the catch-up window ends.
+#[test]
+fn every_email_carries_the_postal_address() {
+    let addr = super::layout::POSTAL_ADDRESS;
+    let from = 1_792_281_600_000;
+    let week = [stream("twitch", from + DAY, 60, "Ranked", 5, 9)];
+    let r = report::render(&report::build(&week, &[], from, from + 7 * DAY).unwrap(), "https://r/u");
+    let c = report::confirm("https://r/mail/confirm?t=x");
+    for (name, html, text) in [("weekly", &r.html, &r.text), ("confirm", &c.html, &c.text)] {
+        assert!(html.contains(addr), "{name} html");
+        assert!(text.contains(addr), "{name} text");
+    }
+    let s = crate::accounts::pages::sign_in_html("https://x/login/link?t=y", "ABCD-EFGH");
+    assert!(s.contains(addr), "sign-in html");
+}
+
 #[tokio::test]
 async fn a_quiet_week_still_sends_when_a_stream_lands_late() {
     let w = world().await;

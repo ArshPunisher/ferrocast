@@ -242,7 +242,8 @@ pub fn render_with(r: &Report, unsubscribe_url: &str, history_url: Option<&str>)
         ));
     }
     text.push_str(&format!(
-        "\nFerrocast Pro sends this once a week from your stream history. Open Ferrocast › History for every stream.\nStop these emails: {unsubscribe_url}\n"
+        "\nFerrocast Pro sends this once a week from your stream history. Open Ferrocast › History for every stream.\nStop these emails: {unsubscribe_url}\n{}\n",
+        super::layout::POSTAL_ADDRESS
     ));
 
     // HTML: the shared layout (design board 2026-10-22-polish). The four main numbers are
@@ -352,7 +353,8 @@ pub fn confirm(link: &str) -> Rendered {
     let subject = "Confirm your Ferrocast weekly email".to_string();
     let text = format!(
         "Confirm your weekly email\n\nOpen this link and press Confirm to get a short report of your streams once a week:\n{link}\n\n\
-         The link works for 24 hours. If you didn't ask for this, ignore this email: nothing is sent without the confirm.\n"
+         The link works for 24 hours. If you didn't ask for this, ignore this email: nothing is sent without the confirm.\n\n{}\n",
+        super::layout::POSTAL_ADDRESS
     );
     let body = format!(
         "{}{}{}{}{}",
