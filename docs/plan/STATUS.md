@@ -26,6 +26,11 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-22 (1.4.2, emails, streaming plan)
+- 1.4.1 published (22 Oct). 1.4.2: OBS Start / Stop Streaming (`GET/POST /api/v1/obs/stream`, checklist `start_stream`, `stop_stream`, `stop_delay_s`), YouTube description and thumbnail in stream info (`thumbnails.set`, Twitch and Kick skip with the reason), plus the dashboard's theme choice, tip pictures, menu and designer fixes.
+- Relay: every email (sign-in, weekly confirm, weekly report) shares `mail/layout.rs`; the weekly report links to the web dashboard's History. Deployed 22 Oct (b2082a2).
+- Plans: `docs/plan/LIVE-STUDIO.md` (versions 2.0 Go live everywhere, 2.1 Studio preview on libobs, 3.0 plugins), research 09–11 (multistream, OBS feature map, OBS internals and failures). Website + dashboard merge and deleting `remote.clearcraftlabs.com`: ferrocast-web `docs/plan/STEPS.md` §9.
+
 ### 2026-10-21 (Pro 1.4: insights, smart features, YouTube from the web)
 - Relay `history`: free accounts keep 30 days of stream history (rows under the account id), Pro a year; 403 `account_required` with neither; `plan`, `keep_days`, `earliest`, `limited` in the list; `GET /v1/pro/history/samples` for the per-stream chart; reads merge a PC's subscription and account (a stream begun free and ended on Pro shows once); the hourly retention sweep. Engine: counts and uploads while Pro **or** signed in (`history_allowed`), `GET /api/v1/pro/history/samples`; `GET /api/v1/insights/supporters` (local event log, free).
 - Relay `smart/{mod,prompts,provider,tests}.rs` (API.md §9.10): Cloudflare Workers AI or Gemini free tier, off without a key; `/v1/pro/smart{,/moderate,/reply,/recap}`; per-subscription day quotas (`smart_moderation` 30, `smart_replies` 20, `smart_recaps` 3), 10 a minute, relay-wide `SMART_DAILY_CALLS` (140) and 12 a minute, resting until 00:00 UTC when used up or the provider says so; strict reading of the model's answers (ids, fixed actions, links only from the approved facts). `features.smart`, Control Center `usage.smart` and `usage.history`. `deploy/pro-keys.sh --ai` (+ tests), `deploy-relay.sh` keeps the keys.
