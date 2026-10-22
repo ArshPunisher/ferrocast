@@ -575,8 +575,24 @@ async fn kick_oauth(State(st): State<AppState>, headers: HeaderMap) -> Result<Re
     Ok(axum::Json(json!({ "url": url.to_string() })).into_response())
 }
 
-/// Every Kick scope Ferrocast uses (mirrors `ferrocast_kick::SCOPES`).
+/// Every Kick scope the app asks for (mirrors `ferrocast_kick::SCOPES`): cloud mode's, plus
+/// the stream key for Go live everywhere.
 pub const KICK_SCOPES: &[&str] = &[
+    "user:read",
+    "channel:read",
+    "chat:write",
+    "events:subscribe",
+    "moderation:ban",
+    "moderation:chat_message:manage",
+    "channel:rewards:read",
+    "kicks:read",
+    "channel:write",
+    "streamkey:read",
+];
+
+/// Cloud mode's Kick scopes: never the stream key (cloud mode doesn't stream), so cloud
+/// accounts connected before Go live everywhere keep every scope they need.
+pub const KICK_CLOUD_SCOPES: &[&str] = &[
     "user:read",
     "channel:read",
     "chat:write",

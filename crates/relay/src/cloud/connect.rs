@@ -116,7 +116,7 @@ fn not_set_up(platform: &str) -> ApiError {
 }
 
 fn required_scopes(platform: &str) -> Vec<&'static str> {
-    if platform == "twitch" { TWITCH_SCOPES.to_vec() } else { crate::KICK_SCOPES.to_vec() }
+    if platform == "twitch" { TWITCH_SCOPES.to_vec() } else { crate::KICK_CLOUD_SCOPES.to_vec() }
 }
 
 /// `GET /c/api/v1/accounts`: the engine's `Account[]` for the connected channels.
@@ -181,7 +181,7 @@ async fn connect(
                 .append_pair("client_id", &client_id)
                 .append_pair("response_type", "code")
                 .append_pair("redirect_uri", &format!("{}/v1/kick/callback", st.cfg.public_url))
-                .append_pair("scope", &crate::KICK_SCOPES.join(" "))
+                .append_pair("scope", &crate::KICK_CLOUD_SCOPES.join(" "))
                 .append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256")
                 .append_pair("state", &state);
@@ -371,7 +371,7 @@ pub(crate) async fn kick_callback(
         name: user["name"].as_str().map(String::from),
         avatar_url: user["profile_picture"].as_str().filter(|u| u.starts_with("https://")).map(String::from),
         // Kick's token answer doesn't list scopes: what was asked for (Kick shows all or nothing).
-        scopes: crate::KICK_SCOPES.iter().map(|s| s.to_string()).collect(),
+        scopes: crate::KICK_CLOUD_SCOPES.iter().map(|s| s.to_string()).collect(),
         refresh_token: tokens.refresh_token.clone(),
         access_token: tokens.access_token.clone(),
         expires_in: tokens.expires_in.clamp(0, 86_400),

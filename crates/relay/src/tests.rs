@@ -791,3 +791,13 @@ async fn pro_parts_without_a_key_or_a_store_say_so_and_work_once_set() {
     st.blobs().unwrap().put("a/b", axum::body::Bytes::from_static(b"y")).await.unwrap();
     assert_eq!(st.blobs().unwrap().size("a/b").await.unwrap(), Some(1));
 }
+
+#[test]
+fn kick_sign_in_asks_for_the_stream_key_cloud_mode_never() {
+    assert!(crate::KICK_SCOPES.contains(&"streamkey:read"));
+    assert!(!crate::KICK_CLOUD_SCOPES.contains(&"streamkey:read"));
+    for s in crate::KICK_CLOUD_SCOPES {
+        assert!(crate::KICK_SCOPES.contains(s), "{s}");
+    }
+    assert_eq!(crate::KICK_SCOPES.len(), crate::KICK_CLOUD_SCOPES.len() + 1);
+}

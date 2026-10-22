@@ -70,3 +70,9 @@ async fn a_platform_that_is_not_connected_says_why_when_the_stream_starts() {
     }
     assert_eq!(why.as_deref(), Some("Connect Twitch in Settings, Accounts first."));
 }
+
+/// The relay builds the app's Kick sign-in link: its scope list must be the app's own.
+#[test]
+fn the_relays_kick_scopes_are_the_apps() {
+    assert_eq!(ferrocast_relay::KICK_SCOPES, ferrocast_kick::SCOPES);
+}
