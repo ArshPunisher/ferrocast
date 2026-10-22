@@ -31,6 +31,7 @@ pub mod smart;
 pub mod tips;
 pub mod tts;
 pub mod vault;
+mod web_cors;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -381,6 +382,8 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
+        // The website calling the web routes across sites (preflights answered here).
+        .layer(axum::middleware::from_fn_with_state(state.clone(), web_cors::layer))
         .with_state(state)
 }
 
