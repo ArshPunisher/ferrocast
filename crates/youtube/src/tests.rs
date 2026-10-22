@@ -346,6 +346,15 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
             }),
         )
         .route(
+            "/api/liveStreams",
+            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+                assert_eq!(q.get("mine").map(String::as_str), Some("true"));
+                axum::Json(json!({ "items": [{ "id": "s1", "snippet": { "isDefaultStream": true },
+                    "cdn": { "ingestionInfo": { "streamName": "abcd-efgh-ijkl",
+                        "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }] }))
+            }),
+        )
+        .route(
             "/api/videos",
             axum::routing::get(|| async {
                 axum::Json(json!({ "items": [{ "id": "vid-1", "snippet": {
@@ -629,4 +638,37 @@ async fn a_description_replaces_the_old_one_and_a_thumbnail_is_uploaded() {
     let (ep, _) = fake_videos(false).await;
     let e = video_api(ep).set_thumbnail(b"x", "image/png").await.unwrap_err().to_string();
     assert!(e.contains("live or scheduled"), "{e}");
+}
+
+// ---------------------------------------------------------------- ingest (Go live everywhere)
+
+#[test]
+fn the_bound_stream_wins_then_the_default_then_the_first() {
+    use crate::api::pick_stream;
+    let s = |id: &str, default: bool, key: &str| {
+        json!({ "id": id, "snippet": { "isDefaultStream": default },
+                "cdn": { "ingestionInfo": { "streamName": key,
+                    "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2",
+                    "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2/" } } })
+    };
+    let list = json!({ "items": [s("one", false, "k-one"), s("dflt", true, "k-dflt"), s("bound", false, "k-bound")] });
+    let i = pick_stream(&list, Some("bound")).unwrap();
+    assert_eq!((i.key.as_str(), i.url.as_str()), ("k-bound", "rtmps://a.rtmps.youtube.com/live2"));
+    assert_eq!(pick_stream(&list, None).unwrap().key, "k-dflt");
+    assert_eq!(pick_stream(&list, Some("gone")).unwrap().key, "k-dflt");
+    let plain = json!({ "items": [s("one", false, "k-one")] });
+    assert_eq!(pick_stream(&plain, None).unwrap().key, "k-one");
+    // No secure address: the plain one. No key, or nothing: none.
+    let old = json!({ "items": [{ "id": "x", "cdn": { "ingestionInfo": { "streamName": "k", "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2" } } }] });
+    assert_eq!(pick_stream(&old, None).unwrap().url, "rtmp://a.rtmp.youtube.com/live2");
+    assert!(pick_stream(&json!({ "items": [{ "id": "x", "cdn": {} }] }), None).is_none());
+    assert!(pick_stream(&json!({ "items": [] }), None).is_none());
+    assert!(pick_stream(&json!({}), None).is_none());
+}
+
+#[tokio::test]
+async fn ingest_asks_youtube_for_the_channels_stream() {
+    let (ep, _) = fake_videos(false).await;
+    let i = video_api(ep).ingest().await.unwrap();
+    assert_eq!((i.url.as_str(), i.key.as_str()), ("rtmps://a.rtmps.youtube.com/live2", "abcd-efgh-ijkl"));
 }

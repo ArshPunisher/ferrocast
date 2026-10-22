@@ -247,6 +247,32 @@ impl KickApi {
     }
 }
 
+impl KickApi {
+    /// Go live everywhere: `GET /public/v1/channels` for the signed-in channel's stream URL and
+    /// key. Kick leaves the key out without `streamkey:read`, so an older sign-in is told to
+    /// reconnect.
+    pub async fn ingest(&self) -> Result<ferrocast_connector::Ingest, KickError> {
+        let v = match self.call(Method::GET, "/public/v1/channels", &[], None).await {
+            Err(KickError::Forbidden(_)) => return Err(KickError::MissingScope("streamkey:read".into())),
+            other => other?,
+        };
+        let stream = v.pointer("/data/0/stream");
+        let field = |name: &str| {
+            stream
+                .and_then(|s| s.get(name))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let key = field("key").ok_or_else(|| KickError::MissingScope("streamkey:read".into()))?;
+        let url = field("url")
+            .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
+            .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
+        Ok(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key })
+    }
+}
+
 fn numeric(id: &str) -> Result<u64, KickError> {
     id.parse().map_err(|_| KickError::Refused(format!("\"{id}\" isn't a Kick user id")))
 }

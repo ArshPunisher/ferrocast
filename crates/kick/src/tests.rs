@@ -186,6 +186,18 @@ async fn fake_channels(forbid: bool) -> (String, Arc<Mutex<Seen>>) {
                     .collect();
                 return (axum::http::StatusCode::OK, axum::Json(json!({ "data": data })));
             }
+            if method == axum::http::Method::GET && path == "/public/v1/channels" {
+                // Without `streamkey:read` (`forbid`), Kick leaves the key out.
+                let stream = if forbid {
+                    json!({ "is_live": false })
+                } else {
+                    json!({ "key": "sk_us-west-2_FakeKey", "url": "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app/", "is_live": false })
+                };
+                return (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({ "data": [{ "slug": "arsh", "stream": stream }] })),
+                );
+            }
             let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             s.lock().unwrap().bodies.push((format!("{method} {path}"), v));
             if forbid {
@@ -254,4 +266,17 @@ async fn a_403_on_the_channel_means_reconnect_for_channel_write() {
         matches!(ConnectorError::from(err), ConnectorError::MissingScope { scope, .. } if scope == "channel:write")
     );
     assert!(SCOPES.contains(&"channel:write"));
+}
+
+#[tokio::test]
+async fn ingest_reads_the_channels_stream_url_and_key() {
+    let (base, seen) = fake_channels(false).await;
+    let i = api(&base, seen).ingest().await.unwrap();
+    assert_eq!(i.url, "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app");
+    assert_eq!(i.key, "sk_us-west-2_FakeKey");
+    assert!(!format!("{i:?}").contains("FakeKey"));
+    // An older sign-in: no key in the answer, so "reconnect Kick".
+    let (base, seen) = fake_channels(true).await;
+    assert_eq!(api(&base, seen).ingest().await.unwrap_err(), KickError::MissingScope("streamkey:read".into()));
+    assert!(SCOPES.contains(&"streamkey:read"));
 }

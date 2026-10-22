@@ -1,7 +1,7 @@
 //! Twitch actions for the engine (send chat, moderate, chat modes).
 
 use async_trait::async_trait;
-use ferrocast_connector::{CategoryHit, Connector, Result, StreamInfo};
+use ferrocast_connector::{CategoryHit, Connector, Ingest, Result, StreamInfo};
 use ferrocast_core::event::{ChatMode, Platform};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use serde_json::json;
@@ -65,7 +65,7 @@ impl Connector for TwitchConnector {
     }
 
     async fn update_stream_info(&self, info: &StreamInfo) -> Result<Vec<String>> {
-        self.need_broadcast_scope().await?;
+        self.need_scope(BROADCAST).await?;
         Ok(self.helix.modify_channel(&self.user_id, info).await?)
     }
 
@@ -74,7 +74,7 @@ impl Connector for TwitchConnector {
     }
 
     async fn create_marker(&self, description: &str) -> Result<()> {
-        self.need_broadcast_scope().await?;
+        self.need_scope(BROADCAST).await?;
         Ok(self.helix.create_marker(&self.user_id, description).await?)
     }
 
@@ -82,18 +82,26 @@ impl Connector for TwitchConnector {
         let at = self.helix.followed_at(&self.user_id, user_id).await?;
         Ok(at.as_deref().and_then(crate::channel::rfc3339_ms))
     }
+
+    async fn ingest(&self) -> Result<Ingest> {
+        self.need_scope("channel:read:stream_key").await?;
+        let key = self.helix.stream_key(&self.user_id).await?;
+        Ok(Ingest { url: self.helix.nearest_ingest().await, key })
+    }
 }
 
+const BROADCAST: &str = "channel:manage:broadcast";
+
 impl TwitchConnector {
-    /// Older sign-ins predate `channel:manage:broadcast`: say "reconnect" before Twitch
-    /// refuses (R-22). A token with no recorded scopes (tests, very old saves) is tried.
-    async fn need_broadcast_scope(&self) -> Result<()> {
-        const SCOPE: &str = "channel:manage:broadcast";
+    /// Older sign-ins predate newer scopes (`channel:manage:broadcast`,
+    /// `channel:read:stream_key`): say "reconnect" before Twitch refuses (R-22). A token with no
+    /// recorded scopes (tests, very old saves) is tried.
+    async fn need_scope(&self, scope: &str) -> Result<()> {
         let have = self.helix.auth.scopes().await;
-        if !have.is_empty() && !have.iter().any(|s| s == SCOPE) {
+        if !have.is_empty() && !have.iter().any(|s| s == scope) {
             return Err(ferrocast_connector::ConnectorError::MissingScope {
                 platform: Platform::Twitch,
-                scope: SCOPE.into(),
+                scope: scope.into(),
             });
         }
         Ok(())

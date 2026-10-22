@@ -82,4 +82,8 @@ impl Connector for YoutubeConnector {
     async fn set_thumbnail(&self, image: &[u8], mime: &str) -> Result<()> {
         Ok(self.api.set_thumbnail(image, mime).await?)
     }
+
+    async fn ingest(&self) -> Result<ferrocast_connector::Ingest> {
+        Ok(self.api.ingest().await?)
+    }
 }

@@ -50,6 +50,10 @@ impl Connector for KickConnector {
         Ok(self.api.update_channel(info).await?)
     }
 
+    async fn ingest(&self) -> Result<ferrocast_connector::Ingest> {
+        Ok(self.api.ingest().await?)
+    }
+
     async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>> {
         Ok(self.api.search_categories(query).await?)
     }

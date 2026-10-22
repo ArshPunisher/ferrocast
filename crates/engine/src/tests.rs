@@ -647,7 +647,7 @@ async fn connecting_twitch_signs_in_runs_eventsub_and_answers_commands() {
     let secrets = mem();
     let apps = PlatformApps {
         twitch_client_id: Some("client".into()),
-        twitch_endpoints: ferrocast_twitch::Endpoints { id, api, eventsub },
+        twitch_endpoints: ferrocast_twitch::Endpoints { ingest: id.clone(), id, api, eventsub },
         ..PlatformApps::default()
     };
     let e = Engine::start_with(dir.path(), secrets.clone(), apps.clone()).await.unwrap();

@@ -96,6 +96,27 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn followed_at(&self, _user_id: &str) -> Result<Option<i64>> {
         Ok(None)
     }
+
+    /// Where this channel streams to and with which key, fetched from the platform so the
+    /// streamer never pastes it (Go live everywhere).
+    async fn ingest(&self) -> Result<Ingest> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "give out the stream key" })
+    }
+}
+
+/// A channel's ingest: the server address and the stream key. The key is a secret: it never
+/// shows in logs or `Debug`, and is only handed to the stream forwarder.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ingest {
+    /// `rtmp://` or `rtmps://` server address, without the key.
+    pub url: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for Ingest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ingest").field("url", &self.url).finish_non_exhaustive()
+    }
 }
 
 pub use ferrocast_core::stream_info::StreamInfo;

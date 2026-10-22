@@ -10,6 +10,7 @@ pub mod auth;
 pub mod channel;
 pub mod eventsub;
 pub mod helix;
+pub mod ingest;
 pub mod map;
 
 pub mod connector;
@@ -29,6 +30,8 @@ pub struct Endpoints {
     pub id: String,
     pub api: String,
     pub eventsub: String,
+    /// Twitch's ingest list, nearest server first.
+    pub ingest: String,
 }
 
 impl Default for Endpoints {
@@ -37,6 +40,7 @@ impl Default for Endpoints {
             id: "https://id.twitch.tv".into(),
             api: "https://api.twitch.tv/helix".into(),
             eventsub: "wss://eventsub.wss.twitch.tv/ws".into(),
+            ingest: "https://ingest.twitch.tv".into(),
         }
     }
 }

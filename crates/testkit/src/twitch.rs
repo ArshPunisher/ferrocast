@@ -29,6 +29,7 @@ pub const SCOPES: &[&str] = &[
     "channel:moderate",
     "bits:read",
     "channel:manage:broadcast",
+    "channel:read:stream_key",
 ];
 
 /// State of the fake Twitch, open for tests to inspect and steer.
@@ -64,6 +65,8 @@ pub async fn fake() -> (St, (String, String, String)) {
         .route("/helix/channels", get(channels).patch(patch_channel))
         .route("/helix/search/categories", get(search_categories))
         .route("/helix/streams/markers", post(marker))
+        .route("/helix/streams/key", get(stream_key))
+        .route("/ingests", get(ingests))
         .route("/helix/channels/followers", get(followers))
         .route("/helix/chat/messages", post(chat))
         .route("/helix/eventsub/subscriptions", post(subscribe))
@@ -77,6 +80,23 @@ pub async fn fake() -> (St, (String, String, String)) {
     tokio::spawn(async move { axum::serve(listener, app).await });
     let ws = format!("{}/ws", base.replace("http", "ws"));
     (st, (base.clone(), format!("{base}/helix"), ws))
+}
+
+async fn stream_key() -> Response {
+    axum::Json(json!({ "data": [{ "stream_key": "live_123456_FakeKey" }] })).into_response()
+}
+
+/// Twitch's ingest list: nearest first; the first one is down, so the second is picked.
+async fn ingests() -> Response {
+    axum::Json(json!({ "ingests": [
+        { "name": "Asia: Mumbai (down)", "availability": 0.0,
+          "url_template": "rtmp://bom01.contribute.live-video.net/app/{stream_key}",
+          "url_template_secure": "rtmps://bom01.contribute.live-video.net/app/{stream_key}" },
+        { "name": "Asia: Chennai", "availability": 1.0,
+          "url_template": "rtmp://maa01.contribute.live-video.net/app/{stream_key}",
+          "url_template_secure": "rtmps://maa01.contribute.live-video.net/app/{stream_key}" },
+    ]}))
+    .into_response()
 }
 
 async fn device() -> Response {

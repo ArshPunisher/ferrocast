@@ -324,3 +324,56 @@ pub fn search_video_categories(query: &str) -> Vec<ferrocast_connector::Category
         .map(|(id, n)| ferrocast_connector::CategoryHit { id: (*id).into(), name: (*n).into(), image_url: None })
         .collect()
 }
+
+impl Api {
+    /// Go live everywhere: the stream key and secure server for this channel, never pasted.
+    /// The key bound to the live (or next scheduled) broadcast wins, then the channel's
+    /// default key, then the first one (liveBroadcasts + liveStreams, 1 unit each).
+    pub async fn ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
+        let mut bound = None;
+        for status in ["active", "upcoming"] {
+            let q = [
+                ("part", "contentDetails"),
+                ("broadcastStatus", status),
+                ("broadcastType", "all"),
+                ("maxResults", "1"),
+            ];
+            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            if let Some(id) = v.pointer("/items/0/contentDetails/boundStreamId").and_then(Value::as_str) {
+                bound = Some(id.to_string());
+                break;
+            }
+        }
+        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
+        let v = self.call(Method::GET, "/liveStreams", &q, None).await?;
+        pick_stream(&v, bound.as_deref()).ok_or_else(|| {
+            YoutubeError::Refused(
+                "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
+            )
+        })
+    }
+}
+
+/// Picks the stream to send to from a liveStreams list (see [`Api::ingest`]).
+pub(crate) fn pick_stream(list: &Value, bound: Option<&str>) -> Option<ferrocast_connector::Ingest> {
+    let items: Vec<&Value> = list.get("items")?.as_array()?.iter().filter(|s| usable(s).is_some()).collect();
+    let id_is = |s: &Value, id: &str| s.get("id").and_then(Value::as_str) == Some(id);
+    let default = |s: &Value| s.pointer("/snippet/isDefaultStream").and_then(Value::as_bool) == Some(true);
+    let pick = bound
+        .and_then(|b| items.iter().find(|s| id_is(s, b)))
+        .or_else(|| items.iter().find(|s| default(s)))
+        .or_else(|| items.first())?;
+    usable(pick)
+}
+
+/// A stream's secure address and key, if it has both.
+fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
+    let info = s.pointer("/cdn/ingestionInfo")?;
+    let key = info.get("streamName").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty())?;
+    let url = info
+        .get("rtmpsIngestionAddress")
+        .and_then(Value::as_str)
+        .filter(|u| u.starts_with("rtmps://"))
+        .or_else(|| info.get("ingestionAddress").and_then(Value::as_str))?;
+    Some(ferrocast_connector::Ingest { url: url.trim().trim_end_matches('/').to_string(), key: key.to_string() })
+}

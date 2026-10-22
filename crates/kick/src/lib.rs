@@ -42,6 +42,8 @@ pub const SCOPES: &[&str] = &[
     "kicks:read",
     // The stream-info editor (title, category, tags).
     "channel:write",
+    // Go live everywhere: the stream URL and key, fetched so they're never pasted.
+    "streamkey:read",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

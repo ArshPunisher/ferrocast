@@ -13,7 +13,7 @@ use super::*;
 
 async fn fake() -> (ferrocast_testkit::twitch::St, Endpoints) {
     let (st, (id, api, eventsub)) = ferrocast_testkit::twitch::fake().await;
-    (st, Endpoints { id, api, eventsub })
+    (st, Endpoints { ingest: id.clone(), id, api, eventsub })
 }
 use crate::auth::{Poll, Tokens};
 use crate::helix::Helix;
@@ -353,4 +353,45 @@ async fn markers_and_follow_dates() {
     assert_eq!(st.lock().unwrap().markers[0]["description"], "Raid from Bowow");
     assert_eq!(c.followed_at("222").await.unwrap(), Some(1_704_164_645_000));
     assert_eq!(c.followed_at("999").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn ingest_is_the_key_and_the_nearest_secure_server() {
+    use ferrocast_connector::{Connector, ConnectorError};
+    let (_st, ep) = fake().await;
+    let c = connector_for(&ep, crate::auth::SCOPES.iter().map(|s| s.to_string()).collect());
+    let ing = c.ingest().await.unwrap();
+    assert_eq!(ing.key, "live_123456_FakeKey");
+    assert_eq!(ing.url, "rtmps://maa01.contribute.live-video.net/app", "the first available, secure");
+    assert!(!format!("{ing:?}").contains("FakeKey"), "the key never shows in Debug");
+    // An older sign-in without the scope is told to reconnect, before asking Twitch.
+    let old = connector_for(&ep, vec!["user:read:chat".into()]);
+    let err = old.ingest().await.unwrap_err();
+    assert!(
+        matches!(&err, ConnectorError::MissingScope { scope, .. } if scope == "channel:read:stream_key"),
+        "{err:?}"
+    );
+    // The ingest list down: Twitch's own secure address.
+    let down = Endpoints { ingest: "http://127.0.0.1:1".into(), ..ep.clone() };
+    let c = connector_for(&down, crate::auth::SCOPES.iter().map(|s| s.to_string()).collect());
+    assert_eq!(c.ingest().await.unwrap().url, crate::ingest::FALLBACK_INGEST);
+}
+
+#[test]
+fn ingest_lists_are_read_leniently() {
+    use crate::ingest::pick_ingest;
+    assert_eq!(pick_ingest(&json!({})), None);
+    assert_eq!(pick_ingest(&json!({ "ingests": [] })), None);
+    assert_eq!(
+        pick_ingest(&json!({ "ingests": [{ "url_template_secure": "rtmps://a/app/{stream_key}" }] })),
+        Some("rtmps://a/app".into())
+    );
+    // Plain RTMP or a template without the key slot is skipped.
+    assert_eq!(pick_ingest(&json!({ "ingests": [{ "url_template_secure": "rtmp://a/app/{stream_key}" }] })), None);
+    assert_eq!(
+        pick_ingest(
+            &json!({ "ingests": [{ "url_template_secure": "rtmps://a/app" }, { "url_template_secure": "rtmps://b/app/{stream_key}" }] })
+        ),
+        Some("rtmps://b/app".into())
+    );
 }

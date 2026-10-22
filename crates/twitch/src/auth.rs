@@ -26,6 +26,8 @@ pub const SCOPES: &[&str] = &[
     "bits:read",
     // The stream-info editor and stream markers (Modify Channel Information).
     "channel:manage:broadcast",
+    // Go live everywhere: the stream key, fetched so it's never pasted.
+    "channel:read:stream_key",
 ];
 
 /// What the streamer sees while signing in.
