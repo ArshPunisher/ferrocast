@@ -25,6 +25,8 @@ struct Fake {
     infos: Mutex<Vec<StreamInfo>>,
     refuse_scope: bool,
     markers: Mutex<Vec<String>>,
+    /// Thumbnails taken: (bytes, mime). Only a YouTube fake takes them.
+    thumbs: Mutex<Vec<(usize, String)>>,
 }
 
 impl Fake {
@@ -69,6 +71,13 @@ impl Connector for Fake {
         }
         self.infos.lock().unwrap().push(info.clone());
         Ok(info.fields().into_iter().map(String::from).collect())
+    }
+    async fn set_thumbnail(&self, image: &[u8], mime: &str) -> ferrocast_connector::Result<()> {
+        if self.platform() != Platform::Youtube {
+            return Err(ConnectorError::NotSupported { platform: self.platform(), what: "set a stream thumbnail" });
+        }
+        self.thumbs.lock().unwrap().push((image.len(), mime.to_string()));
+        Ok(())
     }
     async fn search_categories(&self, q: &str) -> ferrocast_connector::Result<Vec<CategoryHit>> {
         Ok(vec![CategoryHit { id: "1".into(), name: format!("{q} result"), image_url: None }])
@@ -857,6 +866,56 @@ async fn a_mod_changes_the_title_from_chat_in_the_background() {
         .await
         .unwrap();
     assert_eq!(r.results.len(), 2);
+}
+
+#[tokio::test]
+async fn description_and_thumbnail_go_to_youtube_and_are_skipped_elsewhere() {
+    let (e, _d) = engine().await;
+    let tw = Fake::new(Platform::Twitch);
+    let yt = Fake::new(Platform::Youtube);
+    e.register_connector(tw.clone());
+    e.register_connector(yt.clone());
+    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[0u8; 64]].concat();
+    let media = e.db(move |s| Ok(ferrocast_store::repo::media::save(s, "thumb.png", &png).unwrap())).await.unwrap();
+    // Only YouTube's fields: Twitch isn't called, and says why.
+    let info = StreamInfo {
+        description: Some("Ranked all night\n!discord".into()),
+        thumbnail: Some(media.id.clone()),
+        ..Default::default()
+    };
+    let r = e.apply_stream_info(info, None, None).await.unwrap();
+    assert_eq!((r.ok, r.failed), (2, 0));
+    let t = r.results.iter().find(|x| x.platform == Platform::Twitch).unwrap();
+    assert!(t.applied.is_empty());
+    assert!(t.skipped.iter().any(|s| s.starts_with("description")), "{:?}", t.skipped);
+    assert!(t.skipped.iter().any(|s| s.starts_with("thumbnail")), "{:?}", t.skipped);
+    assert!(tw.infos.lock().unwrap().is_empty(), "nothing Twitch takes, so no call");
+    let y = r.results.iter().find(|x| x.platform == Platform::Youtube).unwrap();
+    assert_eq!(y.applied, vec!["description", "thumbnail"]);
+    assert_eq!(yt.infos.lock().unwrap()[0].description.as_deref(), Some("Ranked all night\n!discord"));
+    assert!(yt.infos.lock().unwrap()[0].thumbnail.is_none(), "the id never reaches a platform");
+    assert_eq!(yt.thumbs.lock().unwrap()[0], (72, "image/png".to_string()));
+    // A title too: Twitch gets the title only.
+    let info = StreamInfo { title: Some("Ranked".into()), description: Some("d".into()), ..Default::default() };
+    e.apply_stream_info(info, None, None).await.unwrap();
+    let sent = tw.infos.lock().unwrap()[0].clone();
+    assert_eq!((sent.title.as_deref(), sent.description), (Some("Ranked"), None));
+    // A picture that's gone: YouTube's thumbnail fails with the reason, alone it's an error.
+    let info = StreamInfo { thumbnail: Some("gone".into()), ..Default::default() };
+    let r = e.apply_stream_info(info, Some(vec![Platform::Youtube]), None).await.unwrap();
+    let y = &r.results[0];
+    assert!(!y.ok);
+    assert!(y.error.as_ref().unwrap().message.contains("media library"), "{:?}", y.error);
+    // With a title it still counts, and says what happened to the picture.
+    let info = StreamInfo { title: Some("t".into()), thumbnail: Some("gone".into()), ..Default::default() };
+    let r = e.apply_stream_info(info, Some(vec![Platform::Youtube]), None).await.unwrap();
+    assert!(r.results[0].ok);
+    assert!(r.results[0].skipped.iter().any(|s| s.starts_with("thumbnail:")), "{:?}", r.results[0].skipped);
+    // Validation.
+    let long = StreamInfo { description: Some("x".repeat(5001)), ..Default::default() };
+    assert!(matches!(e.apply_stream_info(long, None, None).await, Err(crate::EngineError::Invalid(_))));
+    let angle = StreamInfo { description: Some("<b>hi</b>".into()), ..Default::default() };
+    assert!(matches!(e.apply_stream_info(angle, None, None).await, Err(crate::EngineError::Invalid(_))));
 }
 
 #[tokio::test]

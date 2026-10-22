@@ -601,12 +601,14 @@ Chat: `!deaths` shows the count (everyone); mods `!deaths +`, `+5`, `-`, `set 10
 
 ```ts
 type StreamInfo = { title?: string /* 1–140 (YouTube: 100) */; category?: { name: string; ids?: { twitch?, youtube?, kick? } };
-                    tags?: string[] /* ≤10, letters and digits, ≤25 each; [] clears */; language?: string /* "en" */ }
+                    tags?: string[] /* ≤10, letters and digits, ≤25 each; [] clears */; language?: string /* "en" */;
+                    description?: string /* YouTube only; ≤5000, line breaks kept, no < or >; "" clears */;
+                    thumbnail?: string /* a media library id; YouTube only; JPEG or PNG ≤2 MB */ }
 type PlatformResult = { platform; ok: boolean; applied: string[]; skipped: string[] /* "language: Kick has no stream language setting" */;
                         error: { code: "not_connected" | "reconnect_needed" | "rate_limited" | "refused" | "unreachable" | "no_broadcast"
                                        | "unknown_category" | "not_supported"; message; hint } | null }
 type StreamInfoView = { last: HistoryEntry | null; presets: Preset[]; history: HistoryEntry[] /* newest first, 20 */;
-                        platforms: { platform; connected; can_edit; needs: string | null; supports: { title, category, tags, language } }[] }
+                        platforms: { platform; connected; can_edit; needs: string | null; supports: { title, category, tags, language, description, thumbnail } }[] }
 type Preset = { id; name /* 1–60, unique */; info: StreamInfo; updated_at }   // up to 50
 type HistoryEntry = { info: StreamInfo; at: number; results: PlatformResult[] }
 ```
@@ -618,7 +620,7 @@ type HistoryEntry = { info: StreamInfo; at: number; results: PlatformResult[] }
 | POST | `/api/v1/stream-info/presets` | `{ name, info }` → 201 `Preset`; 409 name taken |
 | PUT / DELETE | `/api/v1/stream-info/presets/{id}` | `Preset` → `Preset`; → 204. 404 `preset_not_found` |
 
-Permissions: Twitch needs `channel:manage:broadcast` (Modify Channel Information, stream markers) and Kick `channel:write`; both are asked for at sign-in from this version. Accounts connected earlier show `can_edit: false` with `needs` ("Reconnect Twitch…") and get `reconnect_needed` instead of a silent failure (R-22). YouTube uses the existing `youtube.force-ssl` sign-in and changes the live (or next scheduled) broadcast's video, keeping its description; a game category becomes YouTube's Gaming category.
+Permissions: Twitch needs `channel:manage:broadcast` (Modify Channel Information, stream markers) and Kick `channel:write`; both are asked for at sign-in from this version. Accounts connected earlier show `can_edit: false` with `needs` ("Reconnect Twitch…") and get `reconnect_needed` instead of a silent failure (R-22). YouTube uses the existing `youtube.force-ssl` sign-in and changes the live (or next scheduled) broadcast's video, keeping its description unless `description` is given; a game category becomes YouTube's Gaming category. `thumbnail` uploads that picture with `thumbnails.set` (50 units); a channel without phone verification is refused ("custom thumbnails need a verified channel; verify yours at youtube.com/verify"). Twitch and Kick have no stream description and make their own thumbnails, so those fields are in their `skipped` with the reason, and a platform with nothing it takes isn't called (`ok`, empty `applied`). A thumbnail that fails next to other changes is in `skipped` as `thumbnail: <why>`; alone it's the platform's `error`.
 
 **Show (go-live checklist).**
 

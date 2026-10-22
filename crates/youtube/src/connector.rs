@@ -78,4 +78,8 @@ impl Connector for YoutubeConnector {
     async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>> {
         Ok(crate::api::search_video_categories(query))
     }
+
+    async fn set_thumbnail(&self, image: &[u8], mime: &str) -> Result<()> {
+        Ok(self.api.set_thumbnail(image, mime).await?)
+    }
 }

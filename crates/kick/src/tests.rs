@@ -211,6 +211,7 @@ async fn stream_info_patches_the_channel_and_finds_the_category() {
         category: Some(Category { name: "valorant".into(), ids: CategoryIds::default() }),
         tags: Some(vec!["English".into()]),
         language: Some("en".into()),
+        ..Default::default()
     };
     assert_eq!(kick.update_channel(&info).await.unwrap(), vec!["title", "category", "tags"], "no language on Kick");
     let b = seen.lock().unwrap().bodies.clone();

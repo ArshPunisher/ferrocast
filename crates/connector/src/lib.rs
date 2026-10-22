@@ -77,6 +77,11 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "change stream info" })
     }
 
+    /// Sets the stream's thumbnail (a JPEG or PNG), when the platform lets apps do that.
+    async fn set_thumbnail(&self, _image: &[u8], _mime: &str) -> Result<()> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "set a stream thumbnail" })
+    }
+
     /// Categories (games) matching `query`, best first, for the stream-info form.
     async fn search_categories(&self, _query: &str) -> Result<Vec<CategoryHit>> {
         Ok(Vec::new())

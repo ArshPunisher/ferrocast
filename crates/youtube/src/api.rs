@@ -187,8 +187,19 @@ impl Api {
         Ok(None)
     }
 
-    /// Changes the broadcast video's title, category, tags and language (`videos.update`,
-    /// 50 units). The video's snippet is read first so its description is kept.
+    /// The live (or next scheduled) broadcast's video id, or the "no broadcast" refusal.
+    async fn broadcast_id(&self) -> Result<String, YoutubeError> {
+        self.current_broadcast().await?.ok_or_else(|| {
+            YoutubeError::Refused(
+                "you don't have a live or scheduled stream on YouTube; start or schedule one in YouTube Studio first"
+                    .into(),
+            )
+        })
+    }
+
+    /// Changes the broadcast video's title, category, tags, language and description
+    /// (`videos.update`, 50 units). The video's snippet is read first so whatever isn't
+    /// being changed (the description, unless given) is kept.
     pub async fn update_broadcast_info(
         &self,
         info: &ferrocast_core::stream_info::StreamInfo,
@@ -198,12 +209,16 @@ impl Api {
         {
             return Err(YoutubeError::Refused(format!("YouTube titles are {MAX_TITLE_CHARS} characters at most")));
         }
-        let id = self.current_broadcast().await?.ok_or_else(|| {
-            YoutubeError::Refused(
-                "you don't have a live or scheduled stream on YouTube; start or schedule one in YouTube Studio first"
-                    .into(),
-            )
-        })?;
+        if info.title.is_none()
+            && info.category.is_none()
+            && info.tags.is_none()
+            && info.language.is_none()
+            && info.description.is_none()
+        {
+            // Only a thumbnail: nothing for videos.update to do.
+            return Ok(Vec::new());
+        }
+        let id = self.broadcast_id().await?;
         let v = self.call(Method::GET, "/videos", &[("part", "snippet"), ("id", id.as_str())], None).await?;
         let mut snippet = v
             .pointer("/items/0/snippet")
@@ -235,12 +250,68 @@ impl Api {
             snippet["defaultAudioLanguage"] = json!(l);
             applied.push("language".to_string());
         }
+        if let Some(d) = &info.description {
+            snippet["description"] = json!(d);
+            applied.push("description".to_string());
+        }
         if snippet.get("categoryId").is_none() {
             snippet["categoryId"] = json!("20");
         }
         let body = json!({ "id": id, "snippet": snippet });
         self.call(Method::PUT, "/videos", &[("part", "snippet")], Some(body)).await?;
         Ok(applied)
+    }
+
+    /// Sets the broadcast's thumbnail (`thumbnails.set`, 50 units): a JPEG or PNG of up to 2 MB.
+    pub async fn set_thumbnail(&self, image: &[u8], mime: &str) -> Result<(), YoutubeError> {
+        if !matches!(mime, "image/jpeg" | "image/png") {
+            return Err(YoutubeError::Refused("YouTube thumbnails must be a JPEG or PNG picture".into()));
+        }
+        if image.len() > MAX_THUMBNAIL_BYTES {
+            return Err(YoutubeError::Refused("YouTube thumbnails can be 2 MB at most".into()));
+        }
+        let id = self.broadcast_id().await?;
+        let url = upload_base(&self.ep.api) + "/thumbnails/set";
+        let mut token = self.access().await?;
+        for attempt in 0..2 {
+            let res = self
+                .http
+                .post(&url)
+                .query(&[("videoId", id.as_str()), ("uploadType", "media")])
+                .bearer_auth(&token)
+                .header(reqwest::header::CONTENT_TYPE, mime)
+                .body(image.to_vec())
+                .send()
+                .await
+                .map_err(YoutubeError::network)?;
+            if res.status().as_u16() == 401 && attempt == 0 {
+                token = self.refresh_after_401(&token).await?;
+                continue;
+            }
+            if res.status().is_success() {
+                return Ok(());
+            }
+            let status = res.status().as_u16();
+            return Err(match YoutubeError::from_response(res).await {
+                // Custom thumbnails are only for channels that verified a phone number.
+                YoutubeError::Refused(_) if status == 403 => YoutubeError::Refused(
+                    "custom thumbnails need a verified channel; verify yours at youtube.com/verify".into(),
+                ),
+                e => e,
+            });
+        }
+        Err(YoutubeError::SignInNeeded)
+    }
+}
+
+/// YouTube's own limit for a thumbnail.
+pub const MAX_THUMBNAIL_BYTES: usize = 2 * 1024 * 1024;
+
+/// Uploads go to `/upload/youtube/v3` next to the API (`{api}/upload` for a test server).
+fn upload_base(api: &str) -> String {
+    match api.strip_suffix("/youtube/v3") {
+        Some(host) => format!("{host}/upload/youtube/v3"),
+        None => format!("{api}/upload"),
     }
 }
 

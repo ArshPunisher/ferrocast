@@ -133,10 +133,16 @@ impl Engine {
                 retry_after: None,
             });
         }
+        // The thumbnail is read once from the media library, for the platforms that take one.
+        let thumb = match &info.thumbnail {
+            Some(id) => Some(self.thumbnail_image(id).await),
+            None => None,
+        };
         let jobs = targets.iter().map(|&p| {
             let info = info.clone();
             let c = self.connector(p);
-            async move { (p, push_one(p, c, &info).await) }
+            let thumb = thumb.clone();
+            async move { (p, push_one(p, c, &info, thumb).await) }
         });
         let results: Vec<PlatformResult> =
             futures_util::future::join_all(jobs).await.into_iter().map(|(_, r)| r).collect();
@@ -202,6 +208,20 @@ impl Engine {
         save_setting(self, STREAM_INFO_KEY, &saved).await
     }
 
+    /// A media-library picture as `(bytes, mime)` for a thumbnail, or why it can't be one.
+    async fn thumbnail_image(&self, id: &str) -> Result<(Vec<u8>, String), String> {
+        let lookup = id.to_string();
+        let found = self.db(move |s| repo::media::get(s, &lookup)).await.map_err(|e| e.to_string())?;
+        let Some((media, path)) = found else {
+            return Err("that picture isn't in your media library any more".into());
+        };
+        if !matches!(media.mime.as_str(), "image/jpeg" | "image/png") {
+            return Err("thumbnails must be a JPEG or PNG picture".into());
+        }
+        let bytes = tokio::fs::read(&path).await.map_err(|_| "the picture's file couldn't be read".to_string())?;
+        Ok((bytes, media.mime))
+    }
+
     pub async fn preset(&self, id: &str) -> Result<Preset, EngineError> {
         self.stream_info_saved().await?.presets.into_iter().find(|p| p.id == id).ok_or(PRESET_NOT_FOUND)
     }
@@ -212,12 +232,24 @@ async fn push_one(
     p: Platform,
     c: Option<std::sync::Arc<dyn ferrocast_connector::Connector>>,
     info: &StreamInfo,
+    thumb: Option<Result<(Vec<u8>, String), String>>,
 ) -> PlatformResult {
     let sup = stream_info::supports(p);
     let mut skipped = Vec::new();
+    let mut info = info.clone();
     if info.language.is_some() && !sup.language {
         skipped.push(format!("language: {} has no stream language setting", p.label()));
+        info.language = None;
     }
+    if info.description.is_some() && !sup.description {
+        skipped.push(format!("description: {} has no stream description", p.label()));
+        info.description = None;
+    }
+    if info.thumbnail.is_some() && !sup.thumbnail {
+        skipped.push(format!("thumbnail: {} makes its own from your stream", p.label()));
+    }
+    let thumb = if sup.thumbnail { thumb } else { None };
+    info.thumbnail = None;
     if p == Platform::Youtube && info.category.is_some() {
         skipped.push("category: YouTube only takes a video category (a game becomes Gaming)".into());
     }
@@ -236,14 +268,55 @@ async fn push_one(
             skipped,
         );
     };
-    match tokio::time::timeout(PLATFORM_DEADLINE, c.update_stream_info(info)).await {
+    // Nothing this platform takes (only YouTube's description or thumbnail were set).
+    let nothing = info.title.is_none()
+        && info.category.is_none()
+        && info.tags.is_none()
+        && info.language.is_none()
+        && info.description.is_none();
+    let pushed = if nothing {
+        Ok(Ok(Vec::new()))
+    } else {
+        tokio::time::timeout(PLATFORM_DEADLINE, c.update_stream_info(&info)).await
+    };
+    match pushed {
         Err(_) => fail(
             "unreachable",
             format!("{} took too long to answer.", p.label()),
             Some("Check your connection and try again."),
             skipped,
         ),
-        Ok(Ok(applied)) => PlatformResult { platform: p, ok: true, applied, skipped, error: None },
+        Ok(Ok(mut applied)) => {
+            if let Some(t) = thumb {
+                let r = match t {
+                    Err(why) => Err(why),
+                    Ok((bytes, mime)) => {
+                        match tokio::time::timeout(PLATFORM_DEADLINE, c.set_thumbnail(&bytes, &mime)).await {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(e)) => Err(match e {
+                                ConnectorError::Refused { message, .. } => message,
+                                other => other.to_string(),
+                            }),
+                            Err(_) => Err(format!("{} took too long to take the picture", p.label())),
+                        }
+                    }
+                };
+                match r {
+                    Ok(()) => applied.push("thumbnail".into()),
+                    Err(why) if applied.is_empty() => {
+                        return fail(
+                            "refused",
+                            sentence(&format!("Thumbnail: {why}")),
+                            Some("Pick a JPEG or PNG of up to 2 MB, then try again."),
+                            skipped,
+                        );
+                    }
+                    Err(why) => skipped.push(format!("thumbnail: {why}")),
+                }
+            }
+            // With nothing this platform takes, `applied` is empty and `skipped` says why.
+            PlatformResult { platform: p, ok: true, applied, skipped, error: None }
+        }
         Ok(Err(e)) => {
             let (code, hint) = match &e {
                 ConnectorError::MissingScope { .. } | ConnectorError::SignInNeeded(_) => {

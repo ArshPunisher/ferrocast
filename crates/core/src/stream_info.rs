@@ -11,6 +11,8 @@ pub const MAX_TAGS: usize = 10;
 pub const MAX_TAG_CHARS: usize = 25;
 pub const MAX_PRESETS: usize = 50;
 pub const MAX_HISTORY: usize = 20;
+/// YouTube's own limit for a video description.
+pub const MAX_DESCRIPTION_CHARS: usize = 5000;
 
 /// A category (Twitch and Kick: a game or "Just Chatting"; YouTube: a video category).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +57,12 @@ pub struct StreamInfo {
     /// ISO 639-1, like `en` or `hi`.
     #[serde(default)]
     pub language: Option<String>,
+    /// The stream's description (only YouTube has one). `Some("")` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A picture from the media library for the stream's thumbnail (only YouTube takes one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
 }
 
 impl StreamInfo {
@@ -111,8 +119,33 @@ impl StreamInfo {
             }
             self.language = Some(l);
         }
-        if self.title.is_none() && self.category.is_none() && self.tags.is_none() && self.language.is_none() {
-            return Err("Fill in at least one of title, category, tags or language.".into());
+        if let Some(d) = &self.description {
+            // Keep line breaks; drop other control characters.
+            let d: String = d.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+            let d = d.trim().to_string();
+            if d.chars().count() > MAX_DESCRIPTION_CHARS {
+                return Err(format!("description: {MAX_DESCRIPTION_CHARS} characters at most (YouTube's limit)."));
+            }
+            if d.contains(['<', '>']) {
+                return Err("description: YouTube doesn't allow < or > in a description.".into());
+            }
+            self.description = Some(d);
+        }
+        if let Some(t) = &self.thumbnail {
+            let t = t.trim().to_string();
+            if t.is_empty() || t.len() > 64 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err("thumbnail: pick a picture from your media library.".into());
+            }
+            self.thumbnail = Some(t);
+        }
+        if self.title.is_none()
+            && self.category.is_none()
+            && self.tags.is_none()
+            && self.language.is_none()
+            && self.description.is_none()
+            && self.thumbnail.is_none()
+        {
+            return Err("Fill in at least one of title, category, tags, language, description or thumbnail.".into());
         }
         Ok(self)
     }
@@ -132,6 +165,12 @@ impl StreamInfo {
         if self.language.is_some() {
             f.push("language");
         }
+        if self.description.is_some() {
+            f.push("description");
+        }
+        if self.thumbnail.is_some() {
+            f.push("thumbnail");
+        }
         f
     }
 }
@@ -143,15 +182,31 @@ pub struct Supports {
     pub category: bool,
     pub tags: bool,
     pub language: bool,
+    pub description: bool,
+    pub thumbnail: bool,
 }
 
 pub fn supports(p: Platform) -> Supports {
     match p {
-        Platform::Twitch => Supports { title: true, category: true, tags: true, language: true },
+        // Twitch and Kick have no stream description, and make their own thumbnails from the stream.
+        Platform::Twitch => {
+            Supports { title: true, category: true, tags: true, language: true, description: false, thumbnail: false }
+        }
         // YouTube: the broadcast's video. Its category is a video category ("Gaming"), not a game.
-        Platform::Youtube => Supports { title: true, category: true, tags: true, language: true },
-        Platform::Kick => Supports { title: true, category: true, tags: true, language: false },
-        _ => Supports { title: false, category: false, tags: false, language: false },
+        Platform::Youtube => {
+            Supports { title: true, category: true, tags: true, language: true, description: true, thumbnail: true }
+        }
+        Platform::Kick => {
+            Supports { title: true, category: true, tags: true, language: false, description: false, thumbnail: false }
+        }
+        _ => Supports {
+            title: false,
+            category: false,
+            tags: false,
+            language: false,
+            description: false,
+            thumbnail: false,
+        },
     }
 }
 

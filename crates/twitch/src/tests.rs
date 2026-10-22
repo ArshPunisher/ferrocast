@@ -290,6 +290,7 @@ async fn stream_info_goes_to_modify_channel_with_the_game_looked_up() {
         category: Some(Category { name: "valorant".into(), ids: CategoryIds::default() }),
         tags: Some(vec!["English".into()]),
         language: Some("en".into()),
+        ..Default::default()
     };
     let applied = c.update_stream_info(&info).await.unwrap();
     assert_eq!(applied, vec!["title", "category", "tags", "language"]);

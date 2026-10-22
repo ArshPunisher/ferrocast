@@ -311,7 +311,32 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
     use std::collections::HashMap;
     let puts = Arc::new(Mutex::new(Vec::new()));
     let p2 = puts.clone();
+    let p3 = puts.clone();
     let app = axum::Router::new()
+        // thumbnails.set: a body of "403" is refused like an unverified channel; anything
+        // else is recorded as {"thumbnail": video id, "type", "bytes"}.
+        .route(
+            "/api/upload/thumbnails/set",
+            axum::routing::post(
+                move |Query(q): Query<HashMap<String, String>>, h: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let p = p3.clone();
+                    async move {
+                        if &body[..] == b"403" {
+                            return (
+                                axum::http::StatusCode::FORBIDDEN,
+                                axum::Json(json!({ "error": { "message": "The authenticated user doesn't have permissions to upload and set custom video thumbnails.", "errors": [{ "reason": "forbidden" }] } })),
+                            );
+                        }
+                        p.lock().unwrap().push(json!({
+                            "thumbnail": q.get("videoId"),
+                            "type": h.get("content-type").and_then(|v| v.to_str().ok()),
+                            "bytes": body.len(),
+                        }));
+                        (axum::http::StatusCode::OK, axum::Json(json!({ "items": [] })))
+                    }
+                },
+            ),
+        )
         .route(
             "/api/liveBroadcasts",
             axum::routing::get(move |Query(q): Query<HashMap<String, String>>| async move {
@@ -363,6 +388,7 @@ async fn stream_info_updates_the_broadcast_video_and_keeps_its_description() {
         category: Some(Category { name: "Valorant".into(), ids: CategoryIds::default() }),
         tags: Some(vec!["valorant".into()]),
         language: Some("hi".into()),
+        ..Default::default()
     };
     assert_eq!(api.update_broadcast_info(&info).await.unwrap(), vec!["title", "category", "tags", "language"]);
     let body = puts.lock().unwrap()[0].clone();
@@ -572,4 +598,35 @@ async fn only_lines_from_before_the_stream_opened_are_history() {
             ("later".into(), Origin::Live),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_description_replaces_the_old_one_and_a_thumbnail_is_uploaded() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let (ep, puts) = fake_videos(true).await;
+    let api = video_api(ep);
+    let info = StreamInfo { description: Some("New words\nline two".into()), ..Default::default() };
+    assert_eq!(api.update_broadcast_info(&info).await.unwrap(), vec!["description"]);
+    assert_eq!(puts.lock().unwrap()[0]["snippet"]["description"], "New words\nline two");
+    // Only a thumbnail: videos.update isn't called.
+    let only = StreamInfo { thumbnail: Some("m1".into()), ..Default::default() };
+    assert!(api.update_broadcast_info(&only).await.unwrap().is_empty());
+    assert_eq!(puts.lock().unwrap().len(), 1);
+    api.set_thumbnail(b"\x89PNG fake", "image/png").await.unwrap();
+    let up = puts.lock().unwrap()[1].clone();
+    assert_eq!(
+        (up["thumbnail"].as_str(), up["type"].as_str(), up["bytes"].as_u64()),
+        (Some("vid-1"), Some("image/png"), Some(9))
+    );
+    let e = api.set_thumbnail(b"403", "image/jpeg").await.unwrap_err().to_string();
+    assert!(e.contains("verified channel"), "{e}");
+    let e = api.set_thumbnail(b"GIF89a", "image/gif").await.unwrap_err().to_string();
+    assert!(e.contains("JPEG or PNG"), "{e}");
+    let e =
+        api.set_thumbnail(&vec![0; crate::api::MAX_THUMBNAIL_BYTES + 1], "image/jpeg").await.unwrap_err().to_string();
+    assert!(e.contains("2 MB"), "{e}");
+    // No broadcast: the usual refusal.
+    let (ep, _) = fake_videos(false).await;
+    let e = video_api(ep).set_thumbnail(b"x", "image/png").await.unwrap_err().to_string();
+    assert!(e.contains("live or scheduled"), "{e}");
 }
