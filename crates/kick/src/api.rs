@@ -269,8 +269,16 @@ impl KickApi {
         let url = field("url")
             .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
             .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
-        Ok(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key })
+        Ok(ferrocast_connector::Ingest { url: with_app(&url), key })
     }
+}
+
+/// Kick streams through Amazon IVS, whose RTMP application is `app`; Kick's API gives the
+/// server without it (`rtmps://….global-contribute.live-video.net`), as its dashboard shows.
+pub(crate) fn with_app(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    if after_scheme.contains('/') { url.to_string() } else { format!("{url}/app") }
 }
 
 fn numeric(id: &str) -> Result<u64, KickError> {

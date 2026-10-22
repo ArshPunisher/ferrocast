@@ -280,3 +280,18 @@ async fn ingest_reads_the_channels_stream_url_and_key() {
     assert_eq!(api(&base, seen).ingest().await.unwrap_err(), KickError::MissingScope("streamkey:read".into()));
     assert!(SCOPES.contains(&"streamkey:read"));
 }
+
+#[test]
+fn kick_servers_get_ivs_app_when_kick_leaves_it_out() {
+    use crate::api::with_app;
+    assert_eq!(
+        with_app("rtmps://fa723fc1b171.global-contribute.live-video.net"),
+        "rtmps://fa723fc1b171.global-contribute.live-video.net/app"
+    );
+    assert_eq!(
+        with_app("rtmps://fa723fc1b171.global-contribute.live-video.net:443/"),
+        "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"
+    );
+    assert_eq!(with_app("rtmps://x.live-video.net:443/app/"), "rtmps://x.live-video.net:443/app");
+    assert_eq!(with_app(" rtmps://x/custom "), "rtmps://x/custom");
+}
