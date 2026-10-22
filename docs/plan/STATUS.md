@@ -26,6 +26,12 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-23 (Go live everywhere: real test, 2.0.0-beta.3 draft)
+- Real test on the owner's Mac with beta.3 (installed over 1.4.2; 1.4.2's DMG kept to roll back), driven from the website dashboard through the relay. OBS 32.2.2 → Ferrocast → Twitch, YouTube and Kick at once (2560×1440 60 fps H.264, ~12 Mbps). YouTube: "Excellent". Twitch: received, "Unstable"; Kick: drops every few seconds. Both because 12 Mbps is over their limits (6 and 8 Mbps), which Ferrocast's rule lines said on each row. Untick/re-tick and adding a platform while live, refusing OBS changes while live, and Put OBS back (byte-identical service.json) all worked.
+- Negative tests, local and real: wrong keys on Twitch and Kick, a second publisher, wrong app, the ingest from the LAN, an unknown host, the receiver dying mid-stream (reconnects alone, recordings decode cleanly), Ferrocast killed mid-stream (OBS back 9 s after restart), phones/web refused the key, adding servers, accounts and a `../` path (403).
+- Fixed from it: Start/Stop streaming answered too early; the upload verdict for unreachable servers and the planned rate; the relay's Kick sign-in lacked `streamkey:read` (cloud mode keeps its own list); Kick's stream URL without `/app`; Twitch's reset on a bad key now reads as a refused key; the retry count starts over after a live stretch (not in beta.3). Kick's developer app now has "Read stream key". Twitch and Kick reconnected with the new scopes.
+- Tags v2.0.0-beta.1 and beta.2 have no release (builds stopped for fixes). Next: owner lowers OBS's bitrate to ≤ 6 Mbps for Twitch; beta.4 with the retry fix; upload protection (A1.8).
+
 ### 2026-10-22 (Track A: Go live everywhere built, A1.1–A1.6)
 - Keys fetched, never pasted: Twitch Get Stream Key (new scope `channel:read:stream_key`) and the nearest server's `rtmps://` address (OBS's "auto" uses plain RTMP); YouTube's bound or default stream; Kick `GET /public/v1/channels` (new scope `streamkey:read`). Older sign-ins get "reconnect".
 - OBS setup through obs-websocket (saved setting in the secret store, put back exactly; refused while OBS streams). Upload check: delay per server, speed through Twitch's bandwidth-test mode (Cloudflare's speed test without Twitch), platform rules checked against the real stream (codec, keyframe gap, bitrate).

@@ -153,7 +153,7 @@ I/O, TLS through rustls for `rtmps://`):
 - [x] **A1.5 Upload check:** per-platform test to its ingest (Twitch `bandwidthtest`), speed and
   delay, the verdict in words.
 - [x] **A1.6 API + dashboard:** routes in API.md, the Go live tab (1A, 2A, 3A, 4B, 5A), demo engine.
-- [ ] **A1.7 Real stream test (owner):** OBS on the owner's PC to Twitch and YouTube at once;
+- [x] **A1.7 Real stream test (owner):** done 22–23 Oct with 2.0.0-beta.3 on the owner's Mac (notes in STATUS.md). OBS on the owner's PC to Twitch and YouTube at once;
   reconnect Twitch and Kick first (new scopes `channel:read:stream_key`, `streamkey:read`; Kick's
   app may need `streamkey:read` ticked in its developer settings). Then release 2.0.0-beta.
 - [ ] **A1.8 Upload protection:** pause the bottom destination when the upload can't carry
