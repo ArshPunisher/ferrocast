@@ -212,7 +212,15 @@ impl Run<'_> {
                 return Step::Stop;
             };
             let unsubscribe = format!("{}/mail/unsubscribe?t={token}", st.cfg.public_url);
-            let r = report::render(&rep, &unsubscribe);
+            // The web dashboard's History, when this relay serves one.
+            let history = st
+                .remote
+                .cfg
+                .origin
+                .as_deref()
+                .filter(|_| st.remote.cfg.dashboard_dir.is_some())
+                .map(|o| format!("{o}/app/#/history"));
+            let r = report::render_with(&rep, &unsubscribe, history.as_deref());
             let email = Email {
                 to: address,
                 subject: r.subject,
