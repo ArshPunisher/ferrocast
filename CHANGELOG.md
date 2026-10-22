@@ -5,6 +5,19 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 1.4.2
+
+- Go live and end your stream from Ferrocast: Studio shows whether OBS is streaming, with
+  Start streaming and Stop streaming (it asks first). The go-live checklist can also press
+  them for you, and stop a little after your ending scene so viewers see it.
+- Stream info can set your YouTube description and thumbnail too. Twitch and Kick don't
+  allow either, and Ferrocast says so next to each one.
+- Pick Light, Dark or Auto (follows your computer) right in the sidebar.
+- The tip page settings show your banner and avatar the way tippers see them.
+- The ... menu on your designs no longer gets cut off.
+- The alert designer plays sound while you design (it used to start muted).
+- Ferrocast's emails (sign-in, weekly report) have a cleaner new look.
+
 ## 1.4.1
 
 - Connecting YouTube or Kick opens the sign-in page in your browser by itself. If your
