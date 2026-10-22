@@ -103,6 +103,13 @@ struct World {
 }
 
 async fn world_with(google_on: bool, login: RemoteLogin) -> World {
+    world_cfg(google_on, login, None).await
+}
+
+/// The website that serves sign-in and the dashboard in the web tests.
+const WEB: &str = "https://ferrocast.example";
+
+async fn world_cfg(google_on: bool, login: RemoteLogin, web: Option<&str>) -> World {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("relay.db")).unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -126,7 +133,7 @@ async fn world_with(google_on: bool, login: RemoteLogin) -> World {
     };
     let billing = crate::billing::BillingConfig { email_key: Some(email_key()), ..Default::default() };
     let state = AppState::new(cfg, db)
-        .with_remote(RemoteConfig::new(Some(&base), Some(PEPPER), None))
+        .with_remote(RemoteConfig::new(Some(&base), Some(PEPPER), None).with_web(web, &[]))
         .with_mail(Some(mail.clone()), crate::mail::MailConfig::new(None, None))
         .with_billing(billing)
         .with_accounts(AccountsConfig { google: gcfg, remote_login: login })
@@ -213,6 +220,39 @@ impl World {
         let res = r.send().await.unwrap();
         let s = res.status().as_u16();
         (s, res.json().await.unwrap_or(Value::Null))
+    }
+
+    /// A JSON request from the website (its Origin and `Sec-Fetch-Site: same-site`), with the
+    /// browser's cookies and, for writes, its login form token.
+    async fn web_json(&self, b: &mut Browser, method: Method, path: &str, body: Option<Value>) -> (Res, HeaderMap) {
+        let mut r = self.http.request(method.clone(), format!("{}{path}", self.base));
+        if !b.cookies.is_empty() {
+            let c: Vec<String> = b.cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            r = r.header("cookie", c.join("; "));
+        }
+        r = r.header("origin", WEB).header("sec-fetch-site", "same-site");
+        if method != Method::GET
+            && let Some(c) = b.cookies.get(LOGIN_COOKIE)
+        {
+            r = r.header("x-csrf-token", form_token(c));
+        }
+        if let Some(v) = body {
+            r = r.json(&v);
+        }
+        let res = r.send().await.unwrap();
+        let headers = res.headers().clone();
+        for sc in headers.get_all("set-cookie") {
+            let s = sc.to_str().unwrap();
+            let (kv, _) = s.split_once(';').unwrap();
+            let (k, v) = kv.split_once('=').unwrap();
+            if v.is_empty() || s.contains("Max-Age=0") {
+                b.cookies.remove(k);
+            } else {
+                b.cookies.insert(k.to_string(), v.to_string());
+            }
+        }
+        let status = res.status().as_u16();
+        (Res { status, location: None, body: res.text().await.unwrap() }, headers)
     }
 
     /// Opens /login (`query` after `?`): the form token.
@@ -1134,4 +1174,185 @@ async fn login_pages_have_the_board_look_and_resend_works() {
         let gone = w.req(&mut b, Method::GET, "/login/link?t=nope", None, &[]).await;
         std::fs::write(format!("{dir}/expired.html"), &gone.body).unwrap();
     }
+}
+
+// ── Sign-in from the website (JSON, plan §9) ─────────────────────────────────────────
+
+/// The last email's link token and code, for the website's link format.
+fn web_link_and_code(w: &World) -> (String, String) {
+    let m = w.mail.last().unwrap();
+    assert!(m.text.contains(&format!("{WEB}/login/link/#t=")), "{}", m.text);
+    let t = m.text.split("#t=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    let code = m.text.split("page: ").nth(1).unwrap().split_whitespace().next().unwrap().replace('-', "");
+    (t, code)
+}
+
+#[tokio::test]
+async fn the_website_signs_in_by_code_and_by_link() {
+    let w = world_cfg(true, RemoteLogin::Optional, Some(WEB)).await;
+    let mut b = Browser::default();
+    let (r, h) = w.web_json(&mut b, Method::GET, "/v1/login?next=/app/%23/home", None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert_eq!(
+        (v["google"].as_bool(), v["app"].as_bool(), v["signed_in"].as_bool()),
+        (Some(true), Some(false), Some(false))
+    );
+    assert_eq!(v["csrf"].as_str(), b.cookies.get(LOGIN_COOKIE).map(|c| form_token(c)).as_deref());
+    assert_eq!(h["access-control-allow-origin"], WEB);
+    assert_eq!(h["access-control-allow-credentials"], "true");
+    assert_eq!(h["cache-control"], "no-store");
+    let (r, _) = w
+        .web_json(
+            &mut b,
+            Method::POST,
+            "/v1/login/email",
+            Some(json!({ "email": " Ana@Example.com ", "next": "/app/" })),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let mid = r.json()["magic_id"].as_str().unwrap().to_string();
+    let (_, code) = web_link_and_code(&w);
+    // A wrong code says how many tries are left; the right one signs in.
+    let (r, _) =
+        w.web_json(&mut b, Method::POST, "/v1/login/code", Some(json!({ "magic_id": mid, "code": "ZZZZZZZZ" }))).await;
+    assert_eq!((r.status, r.json()["error"]["code"].as_str()), (422, Some("wrong_code")), "{}", r.body);
+    assert!(r.json()["error"]["message"].as_str().unwrap().contains("4 tries left"));
+    let (r, _) =
+        w.web_json(&mut b, Method::POST, "/v1/login/code", Some(json!({ "magic_id": mid, "code": code }))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!((r.json()["done"].as_str(), r.json()["next"].as_str()), (Some("web"), Some("/app/")));
+    assert!(b.cookies.contains_key(SESSION_COOKIE) && !b.cookies.contains_key(LOGIN_COOKIE));
+    let (me, h) = w.web_json(&mut b, Method::GET, "/v1/account", None).await;
+    assert_eq!((me.status, me.json()["account"]["email"].as_str()), (200, Some("ana@example.com")), "{}", me.body);
+    assert_eq!(h["access-control-allow-origin"], WEB);
+    // Signed in: the start says so.
+    let (r, _) = w.web_json(&mut b, Method::GET, "/v1/login", None).await;
+    assert_eq!(r.json()["signed_in"].as_bool(), Some(true));
+
+    // The link, in a second browser, works once.
+    w.state.accounts.limits.lock().unwrap().clear();
+    let mut b2 = Browser::default();
+    w.web_json(&mut b2, Method::GET, "/v1/login", None).await;
+    let (r, _) = w.web_json(&mut b2, Method::POST, "/v1/login/email", Some(json!({ "email": "bo@example.com" }))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (t, _) = web_link_and_code(&w);
+    // Another browser (no login cookie of its own) can't use it.
+    let mut b3 = Browser::default();
+    w.web_json(&mut b3, Method::GET, "/v1/login", None).await;
+    let (r, _) = w.web_json(&mut b3, Method::POST, "/v1/login/link", Some(json!({ "t": t }))).await;
+    assert_eq!((r.status, r.json()["error"]["code"].as_str()), (403, Some("other_browser")), "{}", r.body);
+    let (r, _) = w.web_json(&mut b2, Method::POST, "/v1/login/link", Some(json!({ "t": t }))).await;
+    assert_eq!((r.status, r.json()["done"].as_str()), (200, Some("web")), "{}", r.body);
+    let (r, _) = w.web_json(&mut b2, Method::POST, "/v1/login/link", Some(json!({ "t": t }))).await;
+    assert_eq!(r.status, 400, "the login cookie is gone after signing in: {}", r.body);
+}
+
+#[tokio::test]
+async fn the_website_sign_in_needs_its_origin_the_cookie_and_the_token() {
+    let w = world_cfg(true, RemoteLogin::Optional, Some(WEB)).await;
+    let mut b = Browser::default();
+    w.web_json(&mut b, Method::GET, "/v1/login", None).await;
+    let c = b.cookies.get(LOGIN_COOKIE).unwrap().clone();
+    let post = |origin: &'static str, token: Option<String>, site: &'static str| {
+        let mut r = w
+            .http
+            .post(format!("{}/v1/login/email", w.base))
+            .header("cookie", format!("{LOGIN_COOKIE}={c}"))
+            .header("origin", origin)
+            .header("sec-fetch-site", site)
+            .json(&json!({ "email": "x@example.com" }));
+        if let Some(t) = token {
+            r = r.header("x-csrf-token", t);
+        }
+        r.send()
+    };
+    let r = post(WEB, None, "same-site").await.unwrap();
+    assert_eq!(r.status(), 403);
+    let r = post("https://evil.example", Some(form_token(&c)), "cross-site").await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(r.headers().get("access-control-allow-origin").is_none(), "no CORS for other sites");
+    let r = post(WEB, Some(form_token(&c)), "same-site").await.unwrap();
+    assert_eq!(r.status(), 200);
+    // Preflights: answered for the website only.
+    let pre = |origin: &'static str| {
+        w.http
+            .request(Method::OPTIONS, format!("{}/v1/login/email", w.base))
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type,x-csrf-token")
+            .send()
+    };
+    let r = pre(WEB).await.unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(r.headers()["access-control-allow-origin"], WEB);
+    assert!(r.headers()["access-control-allow-headers"].to_str().unwrap().contains("X-CSRF-Token"));
+    let r = pre("https://evil.example").await.unwrap();
+    assert!(r.headers().get("access-control-allow-origin").is_none());
+    // Without a website set, a same-site caller isn't trusted.
+    let plain = world().await;
+    let mut b = Browser::default();
+    let (r, h) = plain.web_json(&mut b, Method::GET, "/v1/login", None).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert!(h.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn the_app_signs_in_through_the_website_and_lands_on_its_loopback() {
+    let w = world_cfg(true, RemoteLogin::Optional, Some(WEB)).await;
+    let auth = w.install("in_web1");
+    let verifier = crate::random(40);
+    let challenge = b64(&rsa::sha2::Sha256::digest(verifier.as_bytes()));
+    let (s, v) = w
+        .api(
+            Method::POST,
+            "/v1/account/app/start",
+            Some(&auth),
+            Some(json!({ "redirect_uri": "http://127.0.0.1:7878/auth/callback", "code_challenge": challenge,
+                         "code_challenge_method": "S256", "state": "state-12345", "label": "Studio PC" })),
+        )
+        .await;
+    assert_eq!(s, 201, "{v}");
+    let flow = v["flow_id"].as_str().unwrap().to_string();
+    assert_eq!(v["url"].as_str().unwrap(), format!("{WEB}/login/?flow={flow}"), "the website's sign-in page");
+    let mut b = Browser::default();
+    let (r, _) = w.web_json(&mut b, Method::GET, &format!("/v1/login?flow={flow}"), None).await;
+    assert_eq!((r.json()["app"].as_bool(), r.json()["signed_in"].as_bool()), (Some(true), Some(false)));
+    let (r, _) = w
+        .web_json(&mut b, Method::POST, "/v1/login/email", Some(json!({ "email": "cy@example.com", "flow": flow })))
+        .await;
+    let mid = r.json()["magic_id"].as_str().unwrap().to_string();
+    let (_, code) = web_link_and_code(&w);
+    let (r, _) =
+        w.web_json(&mut b, Method::POST, "/v1/login/code", Some(json!({ "magic_id": mid, "code": code }))).await;
+    assert_eq!((r.status, r.json()["done"].as_str()), (200, Some("app")), "{}", r.body);
+    let next = r.json()["next"].as_str().unwrap().to_string();
+    assert!(next.starts_with("http://127.0.0.1:7878/auth/callback?code="), "{next}");
+    assert!(!b.cookies.contains_key(SESSION_COOKIE), "no web session for an app sign-in");
+    // An expired or unknown flow is a plain 410.
+    let (r, _) = w.web_json(&mut b, Method::GET, "/v1/login?flow=nope", None).await;
+    assert_eq!((r.status, r.json()["error"]["code"].as_str()), (410, Some("flow_expired")));
+}
+
+#[tokio::test]
+async fn google_from_the_website_comes_back_to_its_dashboard() {
+    let w = world_cfg(true, RemoteLogin::Optional, Some(WEB)).await;
+    let mut b = Browser::default();
+    w.web_json(&mut b, Method::GET, "/v1/login", None).await;
+    let (r, _) = w.web_json(&mut b, Method::POST, "/v1/login/google", Some(json!({ "next": "/app/#/insights" }))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let url = url::Url::parse(r.json()["url"].as_str().unwrap()).unwrap();
+    let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(q["redirect_uri"], format!("{}/login/google/callback", w.base), "Google comes back to the API host");
+    *w.google.next_token.lock().unwrap() = Some(id_token(&claims(&q["nonce"], "dee@example.com", true), "k1", "RS256"));
+    let cb =
+        w.req(&mut b, Method::GET, &format!("/login/google/callback?state={}&code=c1", q["state"]), None, &[]).await;
+    assert_eq!(cb.status, 303, "{}", cb.body);
+    assert_eq!(cb.location.as_deref(), Some(&*format!("{WEB}/app/#/insights")));
+    assert!(b.cookies.contains_key(SESSION_COOKIE));
+    // A stale state goes back to the website's sign-in page with the reason.
+    let cb =
+        w.req(&mut b, Method::GET, &format!("/login/google/callback?state={}&code=c1", q["state"]), None, &[]).await;
+    assert_eq!(cb.status, 303);
+    assert!(cb.location.as_deref().unwrap().starts_with(&format!("{WEB}/login/?error=")), "{:?}", cb.location);
 }

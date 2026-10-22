@@ -7,6 +7,7 @@
 
 pub(crate) mod admin;
 pub mod google;
+mod login_api;
 pub(crate) mod pages;
 pub(crate) mod store;
 #[cfg(test)]
@@ -131,6 +132,7 @@ pub(crate) fn routes() -> axum::Router<AppState> {
         .route("/v1/account/app/start", post(app_start))
         .route("/v1/account/app/token", post(app_token))
         .merge(pages::routes())
+        .merge(login_api::routes())
         .merge(web::routes())
         .merge(admin::routes())
 }
