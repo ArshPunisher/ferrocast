@@ -26,6 +26,10 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24, late night (beta.8 real test)
+- 2.0.0-beta.8 built (draft, all four jobs green) and installed on the owner's Mac. Tested from the owner's personal Chrome through the relay against the real OBS 32.2.2 (not streaming): Use on Forge guessed Gameplay and Chatting and the Streamlabs Chat widget, 9/9 steps in 0.5 s, full 2560x1440 canvas; Make it yours (pink, Bold, arxpunisher) saved Forge (mine) and switched in the same scenes; changing it to blue reached OBS by itself (following); Use on Prism switched in place (10/10, 12 scenes); Take it out left scenes, items, visibility and order identical to the snapshot, OBS on Be Right Back, profile hashes identical.
+- Found: the title gradient kept its gold, and two quick changes in Make it yours could lose one; both fixed on main for the next beta.
+
 ### 2026-10-24, late night (theme into OBS, finished)
 - Owner picked 1A 2B, rest as drawn, and asked for far less text app-wide. Engine: overlays follow their theme until edited by hand (`design.follows`, `POST /overlays/{id}/follow-design`); a second theme switches in place (same overlays, scenes and sources, renamed; OBS renamed first so a refusal retries); a switch without a plan keeps the screens already in OBS; scene names leave out "(mine)" and "copy".
 - Dashboard (ferrocast-web): Use has "Set it up in OBS too", Make it yours, Your theme in OBS card; every explanation sits behind an (i). 1006 browser tests pass on Chromium, WebKit and mobile.
