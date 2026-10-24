@@ -26,6 +26,12 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24, later (real test of beta.6, A2.4 cut from the stream)
+- 2.0.0-beta.6 (draft) installed over beta.3 and tested for real, driven through the relay from the owner's Chrome: Aitum Multistream 1.0.8 found (it has no vendor requests before 1.0.9: fixed by reading its settings file), Aitum Vertical pointed at Ferrocast and back, YouTube Shorts live made by Ferrocast and live on YouTube (Unlisted, copying the upcoming test broadcast; one 1:11 video left, unlisted), app killed mid-stream and back sending in ~4 s with the same broadcast, YouTube ended it by itself ~3 min after the stream stopped. Phone scope refused the vertical key and vertical servers. OBS's three settings files byte-identical afterwards, also after OBS saved and quit.
+- Local headless tests against the real OBS: vertical canvas 1080x1920 60 fps to a local receiver, normal and vertical at once, a 3 Mbps throttled destination paused by upload protection (vertical first, then the slow one; the top one never), Resume now, protection off, automatic return after 60 s and the doubled pause. Found and fixed: the pause reason named a paused destination; a still scene's bursty low-bitrate stream could look slow (now a 3 s average).
+- Not tested for real: per-platform titles (the owner's current titles can't be read back to restore them).
+- A2.4 built: cutter (ffmpeg, GPU encode), editor with OBS's on-air picture. Website dashboard is still the older deploy (needs the owner's OK to deploy).
+
 ### 2026-10-24 (A2.1 per-platform stream info, A2.2 Aitum Multistream, beta.4 draft)
 - Owner's picks from `design/2026-10-24-vertical-modes`: 1B 2B 4B 5A, the rest as drawn (LIVE-STUDIO.md).
 - A2.1: stream info can differ per platform (`per`), with tabs in the dashboard. A2.2: Ferrocast notices Aitum Multistream sending to the same platforms and says so before and during a stream.

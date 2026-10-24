@@ -273,8 +273,12 @@ Simple/Advanced switch (1B) with Go live's Advanced card (2B) and upload protect
   stream; destinations have a canvas; YouTube Shorts live (Ferrocast makes a reusable "Ferrocast
   vertical" stream and a self-starting broadcast with the normal live's title and privacy);
   Aitum Vertical pointed here and back through its vendor requests; Studio's Vertical tab (4B).
-- [ ] **A2.4** cut-from-stream vertical (decode, crop, stack, encode; 5A, 6). **A2.5**
-  Simple/Advanced (1B, 2B, 3).
+- [x] **A2.4 Cut from the stream:** done 24 Oct (engine and 5A editor). ffmpeg crops, fills and
+  stacks the camera and game into 1080x1920, encodes on the GPU (VideoToolbox, NVENC, QSV, AMF,
+  else x264) and publishes to the vertical key. Real test on the owner's Mac: their 2560x1440
+  OBS scene cut in about 3 s, ~70% of one core with GPU decode. Still to do: ffmpeg comes with
+  the app (today it uses Homebrew's or PATH), and the Advanced numbers (item 6) with A2.5.
+- [ ] **A2.5** Simple/Advanced (1B, 2B, 3, 6).
 
 ### Found in the real test (23 Oct)
 The owner's OBS sends ~12 Mbps at 1440p60; Twitch takes 6 and Kick 8 (Twitch "Unstable", Kick
