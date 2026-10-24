@@ -33,7 +33,7 @@ pub struct Step {
 }
 
 impl Step {
-    fn new(id: &str, label: &str, status: &str, detail: impl Into<String>) -> Step {
+    pub(crate) fn new(id: &str, label: &str, status: &str, detail: impl Into<String>) -> Step {
         Step { id: id.into(), label: label.into(), status: status.into(), detail: detail.into() }
     }
 }

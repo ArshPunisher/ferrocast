@@ -332,7 +332,7 @@ impl Engine {
         Ok(UseResult { alert_design, overlays: changed })
     }
 
-    async fn place_scene(
+    pub(crate) async fn place_scene(
         &self,
         design: &Design,
         scene: &ferrocast_core::design::Scene,

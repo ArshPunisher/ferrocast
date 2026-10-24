@@ -30,6 +30,7 @@ mod history;
 pub mod import;
 mod loyalty;
 mod obs;
+pub mod obs_theme;
 mod patch;
 mod pipeline;
 mod polls;
