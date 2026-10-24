@@ -1074,8 +1074,10 @@ impl Engine {
     async fn reconcile_cut(&self) {
         let g = self.golive();
         let cfg = self.golive_config();
+        // Only while a vertical destination would send it (a paused one doesn't need the CPU).
+        let paused = lock(&g.paused).keys().cloned().collect::<Vec<_>>();
         let wanted = cfg.vertical_source == VerticalSource::Cut
-            && cfg.destinations.iter().any(|d| d.enabled && d.canvas == Canvas::Vertical);
+            && cfg.destinations.iter().any(|d| d.enabled && d.canvas == Canvas::Vertical && !paused.contains(&d.id));
         // A cutter whose task ended (it never should) is cleared, so a new one starts.
         let ended = lock(&g.cut).as_ref().is_some_and(|c| c.state.has_changed().is_err());
         if ended {
@@ -1264,6 +1266,7 @@ impl Engine {
                     .map(dest_name)
                     .unwrap_or_default();
                 self.pause(id, top);
+                self.reconcile_cut().await;
             }
             Some(Action::Resume(id)) => {
                 tracing::info!(dest = %id, "Go live: upload protection brought a destination back");
