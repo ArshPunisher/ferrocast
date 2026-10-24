@@ -63,6 +63,12 @@ pub enum PushState {
         reason: String,
     },
     Stopped,
+    /// Upload protection paused it to keep the destinations above smooth (the engine sets
+    /// this; the forwarder isn't running). It comes back by itself after `until_ms`.
+    Paused {
+        until_ms: u64,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

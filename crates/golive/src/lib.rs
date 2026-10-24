@@ -12,6 +12,7 @@ pub mod flv;
 pub mod hub;
 pub mod ingest;
 pub mod probe;
+pub mod protect;
 pub mod push;
 pub mod target;
 
