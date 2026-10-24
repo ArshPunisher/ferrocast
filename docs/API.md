@@ -739,7 +739,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 
 **Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
-Live frame `golive { live, stats, vertical_live, vertical_stats, destinations }` (§5): every second while OBS streams, and after every change.
+Live frame `golive { live, stats, vertical_live, vertical_stats, destinations, cut_state }` (§5): every second while OBS streams, and after every change.
 
 ### Auto-replies (free, local)
 The bot answers chat that mentions something ("discord" → the invite), without a `!command`. Checked on live chat from this channel after moderation passed it; never for a message a command answers (custom, counter, module or points command), never for the streamer's own account (the bot speaks as it, R-28), the connected account, accounts with the bot role or well-known bots (Nightbot, StreamElements…), and never for text the bot itself sent in the last 2 minutes (loop guard). Quiet while the bot is off (`bot_enabled`) or panic mode is on. Rules are checked in order and the **first match wins** (a later rule never answers a message an earlier one matched, even while that one cools down). Each platform has a send budget for auto-replies (R-19: 6 per 30 s on Twitch and Kick, 2 per minute on YouTube); a platform's own rate limit pauses auto-replies there for its `Retry-After`.
@@ -828,7 +828,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
-- `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[] }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
+- `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[], cut_state: CutState | null }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
 - `smart_mod SmartSuggestion` (§4 Smart features): a new suggestion, or one that changed (done, undone, dismissed, an error). Never sent to a mod's phone.
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 

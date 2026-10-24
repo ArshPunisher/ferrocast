@@ -732,7 +732,8 @@ impl Engine {
         self.send_live(LiveFrame::new(
             "golive",
             &serde_json::json!({ "live": v.live, "stats": v.stats, "vertical_live": v.vertical_live,
-                                  "vertical_stats": v.vertical_stats, "destinations": v.destinations }),
+                                  "vertical_stats": v.vertical_stats, "destinations": v.destinations,
+                                  "cut_state": v.cut.state }),
         ));
     }
 
