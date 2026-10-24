@@ -203,7 +203,11 @@ fn breaky(name: &str) -> bool {
 /// Ferrocast's guesses: every screen a new scene; the scene with the game under In game; a
 /// chat (or camera) scene under Just chatting; roles from the screen; old widgets hidden.
 pub fn guess(theme_name: &str, screens: &[Scene], obs: &Scenes, old: &[OldWidget], skip: &[String]) -> ThemePlan {
-    let prefix = format!("{} · ", theme_name.trim().chars().take(MAX_PREFIX - 3).collect::<String>().trim_end());
+    // "Forge (mine)" and "Forge copy" name their scenes like Forge: switching to your copy
+    // keeps the scene names.
+    let base = theme_name.trim();
+    let base = [" (mine)", " copy"].iter().find_map(|x| base.strip_suffix(x)).unwrap_or(base);
+    let prefix = format!("{} · ", base.chars().take(MAX_PREFIX - 3).collect::<String>().trim_end());
     let own: Vec<&ferrocast_obs::control::Scene> =
         obs.scenes.iter().filter(|s| !s.name.starts_with(&prefix) && !skip.contains(&s.name)).collect();
     let captures = |s: &ferrocast_obs::control::Scene, on: bool| {
@@ -445,7 +449,16 @@ impl Engine {
             None => {
                 let old = ferrocast_obs::theme::old_widgets(&client).await.map_err(obs_error)?;
                 let made = previous.as_ref().map(|r| r.made_scenes.clone()).unwrap_or_default();
-                guess(&design.name, &screens, &obs, &old, &made)
+                let mut g = guess(&design.name, &screens, &obs, &old, &made);
+                // No plan with a theme in OBS (Make it yours, again): the same screens as now.
+                if let Some(prev) = &previous {
+                    for p in &mut g.screens {
+                        if !prev.screens.iter().any(|s| s.key == p.key) {
+                            *p = ScreenPlan { key: p.key.clone(), place: Place::Skip, under: None, role: None };
+                        }
+                    }
+                }
+                g
             }
         };
         check(&plan, &screens, &obs, &sources).map_err(EngineError::Invalid)?;
@@ -877,6 +890,8 @@ mod tests {
     fn guesses_put_the_game_and_chat_scenes_under_their_screens() {
         let p = guess("Forge", &screens(), &obs(), &[], &[]);
         assert_eq!(p.prefix, "Forge · ");
+        assert_eq!(guess("Forge (mine)", &screens(), &obs(), &[], &[]).prefix, "Forge · ");
+        assert_eq!(guess("Forge copy", &screens(), &obs(), &[], &[]).prefix, "Forge · ");
         let by = |k: &str| p.screens.iter().find(|s| s.key == k).unwrap().clone();
         assert_eq!(by("in_game").under.as_deref(), Some("Gameplay"));
         assert_eq!(by("in_game").role, Some(Role::Live));
