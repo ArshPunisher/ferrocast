@@ -26,6 +26,13 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24 (Go live: upload protection, A1.8)
+- When the upload can't carry every platform, the bottom live one pauses so the ones above stay smooth, and comes back by itself after a calm spell (60 s first, doubling to 10 min). Never the last one live; nothing stays paused when the stream ends. State machine in `crates/golive/src/protect.rs`, wired into the engine's per-second Go live loop.
+- New routes: `PUT /golive/protection {on}`, `POST /golive/resume/{id}` (outside `/golive/destinations/*`, so a phone can press Resume now while adding servers stays denied). API.md documents the `paused` state and the rules.
+- Dashboard: the live card shows "Paused", why, and when it can come back, with Resume now; the status pill says "stream paused to save upload"; the platform list shows Paused; an Upload protection switch sits under the platforms. Checked at 1440 and 375 px, light and dark. Demo engine mirrors it (a 9 Mbps demo upload pauses YouTube).
+- Tests: protect.rs unit tests, an engine test with two real RTMP receivers (pause, not restarted, Resume now, switch off), server route tests, vitest, and a Playwright test in Chromium and WebKit. CodeRabbit: fixed a broken API.md table; skipped a suggestion to judge against the upload check's 20% reserve (protection reacts to what platforms actually receive).
+- Not released yet: goes into 2.0.0-beta.4 with the retry-counter fix.
+
 ### 2026-10-23 (Go live everywhere: real test, 2.0.0-beta.3 draft)
 - Real test on the owner's Mac with beta.3 (installed over 1.4.2; 1.4.2's DMG kept to roll back), driven from the website dashboard through the relay. OBS 32.2.2 → Ferrocast → Twitch, YouTube and Kick at once (2560×1440 60 fps H.264, ~12 Mbps). YouTube: "Excellent". Twitch: received, "Unstable"; Kick: drops every few seconds. Both because 12 Mbps is over their limits (6 and 8 Mbps), which Ferrocast's rule lines said on each row. Untick/re-tick and adding a platform while live, refusing OBS changes while live, and Put OBS back (byte-identical service.json) all worked.
 - Negative tests, local and real: wrong keys on Twitch and Kick, a second publisher, wrong app, the ingest from the LAN, an unknown host, the receiver dying mid-stream (reconnects alone, recordings decode cleanly), Ferrocast killed mid-stream (OBS back 9 s after restart), phones/web refused the key, adding servers, accounts and a `../` path (403).

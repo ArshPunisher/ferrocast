@@ -156,8 +156,12 @@ I/O, TLS through rustls for `rtmps://`):
 - [x] **A1.7 Real stream test (owner):** done 22–23 Oct with 2.0.0-beta.3 on the owner's Mac (notes in STATUS.md). OBS on the owner's PC to Twitch and YouTube at once;
   reconnect Twitch and Kick first (new scopes `channel:read:stream_key`, `streamkey:read`; Kick's
   app may need `streamkey:read` ticked in its developer settings). Then release 2.0.0-beta.
-- [ ] **A1.8 Upload protection:** pause the bottom destination when the upload can't carry
-  them all, bring it back when it recovers (the health line already has room for "Paused").
+- [x] **A1.8 Upload protection:** done 24 Oct (unreleased, for 2.0.0-beta.4). With 2+ live,
+  4 s of a destination under 70% of the stream's rate or skipping packets pauses the bottom
+  live one (`crates/golive/src/protect.rs`); after 10 calm seconds and its pause (60 s, doubling
+  to 10 min) the highest paused one comes back. The health line says "Paused" and why, with
+  Resume now; a switch under the platforms turns it off (on by default). Advanced limits wait
+  for the Simple/Advanced work.
 - [ ] **A2:** stream info per platform (6 mixed), vertical forwarding.
 
 ## Owner's notes, 23 Oct 2026 (to start later; nothing built)

@@ -5,6 +5,14 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.4
+
+- Upload protection for Go live everywhere: if your upload can't carry every platform, the
+  bottom one in your list pauses for a while so the others stay smooth, then comes back by
+  itself. Its health line says why, with Resume now. Turn it off under Your platforms.
+- A platform that keeps dropping a live stream now starts its retries from the shortest wait
+  each time, instead of waiting longer and longer.
+
 ## 2.0.0-beta.3
 
 - Go live everywhere (beta): stream once from OBS, and Ferrocast sends it on to Twitch,
