@@ -638,14 +638,16 @@ type ShowConfig = { preset_id: string | null; starting_scene: string | null; cou
                     alerts_on: boolean; discord: boolean; bot_on: boolean; replay_buffer: boolean;
                     start_stream: boolean /* off */; ending_scene: string | null; stop_stream: boolean /* off */; stop_delay_s: number /* 0–600, 30 */;
                     recap_message: string | null /* {thanks} {follows} {subs} {duration} */; mic_sources: string[]; cam_sources: string[];
-                    min_disk_gb: number; platforms: Platform[] }
+                    min_disk_gb: number; platforms: Platform[];
+                    at_zero: { switch: boolean /* to live_scene, on */; unmute: boolean /* mic_sources */; start_stream: boolean /* if not streaming */;
+                               record: boolean; chat: string | null /* 1–400, one line */; marker: boolean /* on */ } }
 type Check = { id; label; status: "ok" | "warn" | "fail" | "skip"; detail; fix: { label, href /* "#/settings/obs" or "action:unmute:Mic" */ } | null }
 type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started_at; countdown_ends_at: number | null; live_scene; ended_at;
                  steps: { id, label, status: "done" | "failed" | "skipped" | "waiting", detail }[] }
 ```
 | Method | Path | Body → Response |
 |---|---|---|
-| GET / PUT | `/api/v1/show/config` | `ShowConfig` (400 `countdown_s: …`, `preset_id: …`) |
+| GET / PUT | `/api/v1/show/config` | `ShowConfig` (400 `countdown_s: …`, `preset_id: …`, `at_zero.chat: …`). A countdown needs `live_scene` only while `at_zero.switch` is on; at zero, each `at_zero` action that's on runs and adds a `zero_*` step (`live_scene` for the switch) |
 | GET | `/api/v1/show/preflight` | → `{ checks: Check[], ready }`: OBS, scenes exist, mics not muted, cameras shown, disk space (OBS's recording drive), platforms connected, stream-info permission, Discord webhook |
 | POST | `/api/v1/show/preflight/fix` | `{ action: "unmute:<input>" \| "show:<scene>/<source>" \| "start_replay_buffer" }` → the new pre-flight |
 | GET | `/api/v1/show` | → `{ show: ShowRun \| null }` |
@@ -860,11 +862,11 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null } }`, always first |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, show: { countdown_ends_at: number \| null } } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
 | `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
-| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway? }` (`poll` and `giveaway` only to overlays with that widget) |
+| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll` and `giveaway` only to overlays with that widget) |
 | `config` | `Overlay` (re-render without reloading) |
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |

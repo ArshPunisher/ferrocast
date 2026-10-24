@@ -182,7 +182,8 @@ impl Engine {
         Ok(json!({
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
-                       "poll": self.poll(), "giveaway": self.giveaway_card().await },
+                       "poll": self.poll(), "giveaway": self.giveaway_card().await,
+                       "show": self.show_overlay_state() },
         }))
     }
 }

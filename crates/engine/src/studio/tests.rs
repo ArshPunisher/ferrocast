@@ -596,7 +596,13 @@ async fn start_show_runs_the_checklist_and_the_countdown_switches_scenes() {
     assert!(obs.lock().unwrap().replay_active);
     assert_eq!(obs.lock().unwrap().current, "Starting Soon");
     assert!(matches!(e.start_show(true).await, Err(crate::EngineError::Conflict(_))), "one show at a time");
+    // Timers on screen get the countdown's end, so they reach zero with the switch.
+    let o = e.create_overlay("Starting", ferrocast_core::overlay::Preset::Blank).await.unwrap();
+    let snap = e.overlay_snapshot(&e.overlay(&o.id).await.unwrap()).await.unwrap();
+    assert_eq!(snap["state"]["show"]["countdown_ends_at"].as_i64(), run.countdown_ends_at);
     let live = e.skip_countdown().await.unwrap();
+    let snap = e.overlay_snapshot(&e.overlay(&o.id).await.unwrap()).await.unwrap();
+    assert!(snap["state"]["show"]["countdown_ends_at"].is_null(), "no countdown once live");
     assert_eq!(live.phase, super::show::Phase::Live);
     assert_eq!(obs.lock().unwrap().current, "Gameplay");
     assert!(matches!(e.skip_countdown().await, Err(crate::EngineError::Missing { code: "no_countdown", .. })));
@@ -991,4 +997,45 @@ async fn the_show_can_start_and_stop_streaming_in_obs() {
         e.patch_show_config(json!({ "stop_delay_s": 601 }).as_object().unwrap()).await,
         Err(crate::EngineError::Invalid(_))
     ));
+}
+
+#[tokio::test]
+async fn at_zero_runs_only_the_actions_that_are_on() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let tw = Fake::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let cfg = json!({
+        "starting_scene": "Starting Soon", "live_scene": "Gameplay", "countdown_s": 10, "mic_sources": ["Mic"],
+        "discord": false,
+        "at_zero": { "switch": true, "unmute": true, "record": true, "chat": "We're live!", "marker": true }
+    });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    obs.lock().unwrap().inputs[0].muted = true;
+    e.start_show(true).await.unwrap();
+    let live = e.skip_countdown().await.unwrap();
+    let got: Vec<(&str, &str)> = live.steps.iter().map(|s| (s.id.as_str(), s.status.as_str())).collect();
+    for want in [("live_scene", "done"), ("zero_unmute", "done"), ("zero_record", "done"), ("zero_chat", "done")] {
+        assert!(got.contains(&want), "{want:?} in {got:?}");
+    }
+    assert!(!got.iter().any(|(id, _)| *id == "zero_stream"), "off: not run");
+    assert!(!obs.lock().unwrap().inputs[0].muted);
+    assert!(obs.lock().unwrap().recording);
+    assert!(tw.said().iter().any(|s| s == "We're live!"));
+    e.end_show().await.unwrap();
+
+    // Switching off: the countdown needs no live scene, and OBS stays where it is.
+    let off = json!({ "live_scene": null, "at_zero": { "switch": false, "marker": false } });
+    e.patch_show_config(off.as_object().unwrap()).await.unwrap();
+    obs.lock().unwrap().current = "Starting Soon".into();
+    e.start_show(true).await.unwrap();
+    let live = e.skip_countdown().await.unwrap();
+    assert!(!live.steps.iter().any(|s| s.id == "live_scene"));
+    assert_eq!(obs.lock().unwrap().current, "Starting Soon");
+
+    // A bad chat line is refused with the field.
+    let bad = json!({ "at_zero": { "chat": "" } });
+    assert!(
+        matches!(e.patch_show_config(bad.as_object().unwrap()).await, Err(crate::EngineError::Invalid(m)) if m.starts_with("at_zero.chat"))
+    );
 }

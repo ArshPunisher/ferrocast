@@ -45,6 +45,8 @@ pub struct FakeObs {
     pub replay_active: bool,
     pub replay_saves: u32,
     pub streaming: bool,
+    /// OBS is recording.
+    pub recording: bool,
     /// OBS has no stream service or key set (StartStream answers 606).
     pub stream_unconfigured: bool,
     pub reconnecting: bool,
@@ -486,6 +488,15 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
         }
         "StartStream" if s.stream_unconfigured => (606, Value::Null),
         "StartStream" if s.streaming => (500, Value::Null),
+        "GetRecordStatus" => (
+            100,
+            json!({ "outputActive": s.recording, "outputPaused": false, "outputTimecode": "00:00:00.000",
+                    "outputDuration": 0, "outputBytes": 0 }),
+        ),
+        "StartRecord" => {
+            s.recording = true;
+            (100, Value::Null)
+        }
         "StartStream" => {
             s.streaming = true;
             (100, Value::Null)

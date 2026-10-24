@@ -47,6 +47,32 @@ pub struct ShowConfig {
     pub min_disk_gb: u32,
     /// Pre-flight: these platforms should be connected.
     pub platforms: Vec<crate::event::Platform>,
+    /// What happens when the countdown reaches zero (each on or off).
+    pub at_zero: AtZero,
+}
+
+/// When Start show's countdown reaches zero (owner, 24 Oct: "configurable, each on or off").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AtZero {
+    /// Switch OBS to `live_scene`.
+    pub switch: bool,
+    /// Unmute the pre-flight mics (`mic_sources`).
+    pub unmute: bool,
+    /// Press OBS's Start Streaming, when it isn't streaming yet.
+    pub start_stream: bool,
+    /// Press OBS's Start Recording.
+    pub record: bool,
+    /// Say this in chat on every connected platform.
+    pub chat: Option<String>,
+    /// Add a "Live" marker.
+    pub marker: bool,
+}
+
+impl Default for AtZero {
+    fn default() -> Self {
+        AtZero { switch: true, unmute: false, start_stream: false, record: false, chat: None, marker: true }
+    }
 }
 
 impl Default for ShowConfig {
@@ -70,6 +96,7 @@ impl Default for ShowConfig {
             cam_sources: Vec::new(),
             min_disk_gb: 10,
             platforms: Vec::new(),
+            at_zero: AtZero::default(),
         }
     }
 }
@@ -90,7 +117,12 @@ impl ShowConfig {
         if self.countdown_s != 0 && !(10..=3600).contains(&self.countdown_s) {
             return Err("countdown_s: 10 seconds to 1 hour, or 0 for no countdown.".into());
         }
-        if self.countdown_s > 0 && self.live_scene.is_none() {
+        if let Some(m) = &self.at_zero.chat
+            && (m.trim().is_empty() || m.chars().count() > 400 || m.chars().any(char::is_control))
+        {
+            return Err("at_zero.chat: 1 to 400 characters on one line, or turn it off.".into());
+        }
+        if self.countdown_s > 0 && self.at_zero.switch && self.live_scene.is_none() {
             return Err("live_scene: pick the scene to switch to when the countdown ends.".into());
         }
         if let Some(m) = &self.recap_message {

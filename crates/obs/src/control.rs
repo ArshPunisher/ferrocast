@@ -189,6 +189,14 @@ pub async fn streaming(client: &Client) -> Result<bool, ObsError> {
 }
 
 /// Presses OBS's Start Streaming. Already live is what the caller wanted.
+/// Starts OBS's recording (already recording is fine).
+pub async fn start_record(client: &Client) -> Result<(), ObsError> {
+    if client.recording().status().await.map_err(err)?.active {
+        return Ok(());
+    }
+    client.recording().start().await.map_err(err)
+}
+
 pub async fn start_stream(client: &Client) -> Result<(), ObsError> {
     match client.streaming().start().await {
         Ok(()) => Ok(()),

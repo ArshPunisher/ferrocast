@@ -90,7 +90,20 @@ impl Engine {
     fn set_show(&self, run: Option<ShowRun>) {
         *self.studio().show.lock().unwrap_or_else(|p| p.into_inner()) = run.clone();
         self.studio_frame("show", &serde_json::json!({ "show": run }));
+        // Timers on screen follow Start show's countdown (they reach zero with the switch).
+        self.send_overlay(crate::frames::OverlayFrame::new(
+            crate::frames::Audience::All,
+            self.next_seq(),
+            "state",
+            &serde_json::json!({ "show": self.show_overlay_state() }),
+        ));
         self.studio().show_wake.notify_one();
+    }
+
+    /// What overlays get about the show: when its countdown ends (ms), or null.
+    pub(crate) fn show_overlay_state(&self) -> serde_json::Value {
+        let ends = self.show_run().and_then(|r| r.countdown_ends_at);
+        serde_json::json!({ "countdown_ends_at": ends })
     }
 
     /// Everything that could go wrong at go-live, each with how to fix it.
@@ -402,13 +415,19 @@ impl Engine {
                 _ => Step::new("discord", "Discord post", "skipped", "No Discord webhook (Settings, Discord)."),
             });
         }
+        // A countdown runs with a live scene to switch to, or with the switch turned off.
+        let counts = cfg.countdown_s > 0 && (cfg.live_scene.is_some() || !cfg.at_zero.switch);
         let (phase, ends) = match (&cfg.live_scene, cfg.countdown_s) {
-            (Some(_), n) if n > 0 => {
+            (_, n) if counts => {
                 steps.push(Step::new(
                     "countdown",
                     "Countdown",
                     "waiting",
-                    format!("{n} seconds, then the live scene."),
+                    if cfg.at_zero.switch {
+                        format!("{n} seconds, then the live scene.")
+                    } else {
+                        format!("{n} seconds.")
+                    },
                 ));
                 (Phase::Countdown, Some(at + i64::from(n) * 1000))
             }
@@ -481,12 +500,98 @@ impl Engine {
     }
 
     async fn go_live_now(&self, mut run: ShowRun) -> ShowRun {
-        let step = match &run.live_scene {
-            Some(scene) => self.switch_step(&None, "live_scene", "Live scene", scene).await,
-            None => Step::new("live_scene", "Live scene", "skipped", "No live scene picked."),
-        };
-        run.steps.retain(|s| s.id != "countdown" && s.id != "live_scene");
-        run.steps.push(step);
+        let cfg = self.show_config();
+        let z = &cfg.at_zero;
+        run.steps.retain(|s| s.id != "countdown" && !s.id.starts_with("zero_") && s.id != "live_scene");
+        if z.switch {
+            run.steps.push(match &run.live_scene {
+                Some(scene) => self.switch_step(&None, "live_scene", "Live scene", scene).await,
+                None => Step::new("live_scene", "Live scene", "skipped", "No live scene picked."),
+            });
+        }
+        let client = if z.unmute || z.start_stream || z.record { Some(self.obs_client().await) } else { None };
+        if z.unmute {
+            run.steps.push(match &client {
+                Some(Ok(c)) => {
+                    let mut bad = Vec::new();
+                    for m in &cfg.mic_sources {
+                        if ferrocast_obs::control::set_muted(c, m, false).await.is_err() {
+                            bad.push(m.clone());
+                        }
+                    }
+                    if cfg.mic_sources.is_empty() {
+                        Step::new("zero_unmute", "Mic", "skipped", "No mic is picked in the pre-flight.")
+                    } else if bad.is_empty() {
+                        Step::new("zero_unmute", "Mic", "done", "On.")
+                    } else {
+                        Step::new("zero_unmute", "Mic", "failed", format!("OBS has no {}.", bad.join(", ")))
+                    }
+                }
+                Some(Err(e)) => Step::new("zero_unmute", "Mic", "failed", e.to_string()),
+                None => Step::new("zero_unmute", "Mic", "skipped", ""),
+            });
+        }
+        if z.start_stream {
+            run.steps.push(match &client {
+                Some(Ok(c)) => match ferrocast_obs::control::streaming(c).await {
+                    Ok(true) => Step::new("zero_stream", "Go live in OBS", "skipped", "OBS is streaming already."),
+                    _ => match ferrocast_obs::control::start_stream(c).await {
+                        Ok(()) => Step::new("zero_stream", "Go live in OBS", "done", "OBS is streaming."),
+                        Err(e) => Step::new("zero_stream", "Go live in OBS", "failed", e.to_string()),
+                    },
+                },
+                Some(Err(e)) => Step::new("zero_stream", "Go live in OBS", "failed", e.to_string()),
+                None => Step::new("zero_stream", "Go live in OBS", "skipped", ""),
+            });
+        }
+        if z.record {
+            run.steps.push(match &client {
+                Some(Ok(c)) => match ferrocast_obs::control::start_record(c).await {
+                    Ok(()) => Step::new("zero_record", "Recording", "done", "OBS is recording."),
+                    Err(e) => Step::new("zero_record", "Recording", "failed", e.to_string()),
+                },
+                Some(Err(e)) => Step::new("zero_record", "Recording", "failed", e.to_string()),
+                None => Step::new("zero_record", "Recording", "skipped", ""),
+            });
+        }
+        if let Some(text) = &z.chat {
+            let connected: Vec<Platform> =
+                Platform::CHAT.iter().copied().filter(|p| self.connector(*p).is_some()).collect();
+            run.steps.push(if connected.is_empty() {
+                Step::new("zero_chat", "Chat", "skipped", "No chat is connected.")
+            } else {
+                match self.send_chat(text, &connected, None).await {
+                    Ok(o) if !o.ok.is_empty() && o.failed.is_empty() => {
+                        Step::new("zero_chat", "Chat", "done", text.clone())
+                    }
+                    // Said on some platforms: done, with the ones that refused and why.
+                    Ok(o) if !o.ok.is_empty() => Step::new(
+                        "zero_chat",
+                        "Chat",
+                        "done",
+                        o.failed
+                            .iter()
+                            .map(|f| format!("{}: {}", f.platform.label(), f.reason))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    Ok(o) => Step::new(
+                        "zero_chat",
+                        "Chat",
+                        "failed",
+                        o.failed
+                            .iter()
+                            .map(|f| format!("{}: {}", f.platform.label(), f.reason))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    Err(e) => Step::new("zero_chat", "Chat", "failed", e.to_string()),
+                }
+            });
+        }
+        if z.marker {
+            let _ = self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Live", None, false).await;
+        }
         run.phase = Phase::Live;
         run.countdown_ends_at = None;
         self.set_show(Some(run.clone()));
