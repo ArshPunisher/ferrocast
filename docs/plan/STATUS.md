@@ -4,6 +4,8 @@ Newest entry first. Update at the end of every working session.
 
 ## Now
 
+- **25 Oct: music for the screens.** `fx`, `music` and `sound` layers and six timer looks are checked by core; three more break screens (Getting ready, Paused, Offline). The engine reads OBS's volume meters on a second connection and the song from Spotify or Music (macOS), the media controls (Windows), playerctl (Linux) or a text file, and sends `music` frames to the overlays that use them (`crates/engine/src/music.rs`, GET/PUT `/music`). New browser sources send their sounds through OBS; existing ones and monitoring are left alone (CodeRabbit: monitoring could double sounds on stream).
+
 - **v1 feature-complete.** Engine, adapters (Twitch, YouTube, Kick, OBS), tips through the relay, export/import, plus community features: loyalty points, chat polls, giveaways, first-time chatter marks, stream recap, Discord go-live posts, OBS auto-detect and starter commands.
 - **Relay is live** at ferrocast-relay.clearcraftlabs.com (Docker on the Oracle server behind its own Cloudflare tunnel).
 - **Pro billing built, not on sale** (18 Oct): Razorpay Subscriptions in the relay (`crates/relay/src/billing`), Pro status in the engine (`/api/v1/pro`), `deploy/razorpay-keys.sh` for keys and plans. `PRO_SALES_OPEN=false` until Pro's features exist (ARCHITECTURE.md §10).
