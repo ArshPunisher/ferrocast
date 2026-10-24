@@ -183,7 +183,7 @@ impl Engine {
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
                        "poll": self.poll(), "giveaway": self.giveaway_card().await,
-                       "show": self.show_overlay_state() },
+                       "show": self.show_overlay_state(), "music": self.music_now() },
         }))
     }
 }

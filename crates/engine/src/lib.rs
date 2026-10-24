@@ -29,6 +29,7 @@ pub mod golive;
 mod history;
 pub mod import;
 mod loyalty;
+pub mod music;
 mod obs;
 pub mod obs_theme;
 mod patch;
@@ -187,6 +188,8 @@ struct Inner {
     smart: Mutex<smart::Smart>,
     /// Go live everywhere: the local ingest, destinations and forwarders.
     golive: golive::GoLive,
+    /// Music for the screens: the beat OBS hears and the song (Settings › Music).
+    music: music::Music,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -315,6 +318,7 @@ impl Engine {
                 cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
                 golive: Default::default(),
+                music: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -327,6 +331,8 @@ impl Engine {
         tokio::spawn(giveaways::run(engine.clone()));
         engine.load_studio().await;
         tokio::spawn(studio::run(engine.clone()));
+        engine.load_music().await;
+        tokio::spawn(music::run(engine.clone()));
         engine.load_history().await;
         tokio::spawn(history::run(engine.clone()));
         tokio::spawn(cloud_backup::run(engine.clone()));

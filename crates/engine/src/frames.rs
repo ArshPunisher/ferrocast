@@ -21,6 +21,8 @@ pub enum Audience {
     Overlay(String),
     /// Overlays with a widget of this kind (poll results, giveaway cards).
     Widget(ferrocast_core::overlay::WidgetKind),
+    /// Overlays with a layer that moves or plays with the music.
+    Music,
 }
 
 #[derive(Debug, Clone)]

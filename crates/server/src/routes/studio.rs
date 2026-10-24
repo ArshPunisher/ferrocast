@@ -248,6 +248,16 @@ async fn save_show_config(State(app): State<AppState>, Body(b): Body<Map<String,
     Ok(Json(json!(app.engine.patch_show_config(&b).await?)))
 }
 
+/// `GET /music`: Settings › Music, what's playing and what can't be read.
+pub async fn music(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.music_view()))
+}
+
+/// `PUT /music`: changes Settings › Music (only the fields sent).
+pub async fn save_music(State(app): State<AppState>, Body(b): Body<Map<String, Value>>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.patch_music_config(&b).await?)))
+}
+
 async fn preflight(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.preflight().await))
 }

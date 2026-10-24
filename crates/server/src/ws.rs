@@ -255,6 +255,7 @@ fn wants(o: &Overlay, a: &Audience) -> bool {
         Audience::Alerts => o.widgets.iter().any(|w| matches!(w.kind, WidgetKind::Alerts | WidgetKind::Events)),
         Audience::Overlay(id) => *id == o.id,
         Audience::Widget(kind) => o.widgets.iter().any(|w| w.kind == *kind),
+        Audience::Music => o.wants_music(),
     }
 }
 

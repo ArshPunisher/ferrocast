@@ -142,6 +142,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/obs", get(core::obs).put(core::save_obs))
         .route("/obs/detect", get(core::obs_detect).post(core::obs_use_detected))
         .route("/obs/theme", get(designs::obs_theme).delete(designs::take_theme_out))
+        // music for the screens: the beat OBS hears and the song
+        .route("/music", get(studio::music).put(studio::save_music))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
         .route("/themes", get(app::themes))

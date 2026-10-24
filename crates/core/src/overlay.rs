@@ -196,6 +196,15 @@ impl Overlay {
     pub fn wants_alerts(&self) -> bool {
         self.widgets.iter().any(|w| w.kind == WidgetKind::Alerts)
     }
+
+    /// Whether a layer here moves or plays with the music (a motion background, the music
+    /// piece or a sound element), so only these overlays get the many `music` frames.
+    pub fn wants_music(&self) -> bool {
+        self.widgets.iter().any(|w| {
+            w.kind == WidgetKind::Layer
+                && w.config.get("type").and_then(|t| t.as_str()).is_some_and(|t| matches!(t, "fx" | "music" | "sound"))
+        })
+    }
 }
 
 /// Starting layouts for "New overlay". `starter` is what first-run setup creates.
