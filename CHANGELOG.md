@@ -5,6 +5,16 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.5
+
+- Vertical streams: Studio has a Vertical tab. Point Aitum Vertical (OBS's vertical canvas) at
+  Ferrocast in one click, and it goes live on YouTube Shorts or a server of your own, next to
+  your normal stream. Ferrocast makes the YouTube stream for you; nothing to paste.
+- Stream info per platform: give Twitch, YouTube or Kick its own title, category or tags. The
+  Everywhere tab shows what each platform changed.
+- If Aitum Multistream also sends to a platform Go live sends to, Ferrocast says so before you
+  go live, and while live if a platform gets your stream twice.
+
 ## 2.0.0-beta.4
 
 - Upload protection for Go live everywhere: if your upload can't carry every platform, the
