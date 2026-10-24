@@ -26,6 +26,11 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24, late night (theme into OBS, finished)
+- Owner picked 1A 2B, rest as drawn, and asked for far less text app-wide. Engine: overlays follow their theme until edited by hand (`design.follows`, `POST /overlays/{id}/follow-design`); a second theme switches in place (same overlays, scenes and sources, renamed; OBS renamed first so a refusal retries); a switch without a plan keeps the screens already in OBS; scene names leave out "(mine)" and "copy".
+- Dashboard (ferrocast-web): Use has "Set it up in OBS too", Make it yours, Your theme in OBS card; every explanation sits behind an (i). 1006 browser tests pass on Chromium, WebKit and mobile.
+- The debug build cache had filled the disk (43 GB, 119 MB free): cleared with `cargo clean --profile dev`.
+
 ### 2026-10-24, night (a theme into OBS, engine)
 - Owner asked for a theme to go into OBS in one click, configurable, with Simple and Advanced, and designs. Board: `../design/2026-10-24-theme-to-obs/` (8 items), picks pending.
 - Engine built (needed by every option): `crates/obs/src/theme.rs`, `crates/engine/src/obs_theme.rs`, routes `GET/POST /designs/{id}/obs`, `GET/DELETE /obs/theme` (API.md §4 Designs). Each screen becomes an overlay plus an OBS scene with the streamer's game or camera scene nested under it; Start show's and BRB scenes set; old StreamElements / Streamlabs widgets hidden; everything recorded so Undo removes only that.
