@@ -54,15 +54,35 @@ fn data_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(std::env::temp_dir).join(name)
 }
 
-fn init_tracing() {
+/// The log goes to the terminal and to `<data>/logs/ferrocast.log` (kept under 5 MB, one old
+/// file beside it), so a restart or a crash can be looked into afterwards. A panic is written
+/// there too.
+fn init_tracing(dir: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tao=warn,wry=warn"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let logs = dir.join("logs");
+    let file = std::fs::create_dir_all(&logs).ok().and_then(|()| {
+        let path = logs.join("ferrocast.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+            let _ = std::fs::rename(&path, logs.join("ferrocast.1.log"));
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+    });
+    let to_file = file.map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)));
+    let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(%info, "Ferrocast stopped unexpectedly");
+        default(info);
+    }));
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
 }
 
 fn main() {
-    init_tracing();
     let dir = data_dir();
+    init_tracing(&dir);
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
@@ -152,6 +172,7 @@ fn main() {
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
+        RunEvent::Exit => tracing::info!("Ferrocast quitting"),
         _ => {}
     });
 }
@@ -437,6 +458,7 @@ async fn restart_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
                 continue;
             }
         }
+        tracing::info!("restarting to finish the update");
         app.restart();
     }
 }
