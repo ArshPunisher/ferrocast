@@ -1098,7 +1098,13 @@ impl Engine {
         let action = lock(&g.protector).tick(std::time::Instant::now(), &samples, &order);
         match action {
             Some(Action::Pause(id)) => {
-                let top = cfg.destinations.iter().find(|d| d.enabled && d.id != id).map(dest_name).unwrap_or_default();
+                // The top destination still sending is the one the pause keeps smooth.
+                let top = order
+                    .iter()
+                    .filter(|o| **o != id && samples.iter().any(|s| s.id == **o))
+                    .find_map(|o| cfg.destinations.iter().find(|d| d.id == *o))
+                    .map(dest_name)
+                    .unwrap_or_default();
                 self.pause(id, top);
             }
             Some(Action::Resume(id)) => {
