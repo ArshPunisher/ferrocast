@@ -276,9 +276,13 @@ Simple/Advanced switch (1B) with Go live's Advanced card (2B) and upload protect
 - [x] **A2.4 Cut from the stream:** done 24 Oct (engine and 5A editor). ffmpeg crops, fills and
   stacks the camera and game into 1080x1920, encodes on the GPU (VideoToolbox, NVENC, QSV, AMF,
   else x264) and publishes to the vertical key. Real test on the owner's Mac: their 2560x1440
-  OBS scene cut in about 3 s, ~70% of one core with GPU decode. Still to do: ffmpeg comes with
-  the app (today it uses Homebrew's or PATH), and the Advanced numbers (item 6) with A2.5.
-- [ ] **A2.5** Simple/Advanced (1B, 2B, 3, 6).
+  OBS scene cut in about 3 s, ~70% of one core with GPU decode. ffmpeg is fetched on first use
+  (pinned ffmpeg-static b6.1.1 per system, SHA-256 checked) rather than shipped in every installer.
+- [x] **A2.5 Simple/Advanced:** done 24 Oct. 1B per-screen switch (Studio), 2B Advanced settings
+  card (per-platform server address and retry timing; local port, new key, upload kept free),
+  3 the protection rule with its numbers, 6 the vertical layout in pixels with size, fps,
+  bitrate and encoder. Left out on purpose: a per-platform "buffer" (the backlog is shared) and
+  a separate rtmp/rtmps switch (the server address covers both). 2.0.0-beta.7 has all of A2.
 
 ### Found in the real test (23 Oct)
 The owner's OBS sends ~12 Mbps at 1440p60; Twitch takes 6 and Kick 8 (Twitch "Unstable", Kick
