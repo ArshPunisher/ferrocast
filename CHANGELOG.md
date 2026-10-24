@@ -5,6 +5,20 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.8
+
+- Put a theme into OBS in one click. Use on a theme can set it up in OBS too: a scene per
+  screen with your own game and camera scene under it, Start show's scenes set, and old
+  StreamElements or Streamlabs widgets hidden. Tick the screens you want, or switch to Advanced
+  to pick every scene. Undo takes out only what Ferrocast added.
+- Make it yours: change a theme's colour, font, your name and logo on every screen at once.
+  Screens in OBS follow your theme until you edit one by hand.
+- Your theme in OBS, on Studio's OBS tab: make it yours, switch theme in the same scenes, or
+  take it out.
+- Much less text: explanations are behind an (i) you hover or tap.
+- The vertical preview shows exactly the part of the box phones get.
+- Stream info's Send to is three switches in one row.
+
 ## 2.0.0-beta.7
 
 - Cut the vertical picture from your stream: no vertical canvas needed. Mark your camera and
