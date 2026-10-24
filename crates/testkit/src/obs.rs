@@ -65,6 +65,16 @@ pub struct FakeObs {
     pub profile: String,
     /// The Aitum Multistream plugin's outputs and whether each is sending, when it's installed.
     pub aitum: Option<Vec<(String, bool)>>,
+    /// Aitum Vertical's first stream output, when it's installed.
+    pub vertical: Option<FakeVertical>,
+}
+
+/// Aitum Vertical in the fake OBS: is the vertical canvas streaming, and where to.
+#[derive(Debug, Default, Clone)]
+pub struct FakeVertical {
+    pub streaming: bool,
+    pub server: String,
+    pub key: String,
 }
 
 pub type St = Arc<Mutex<FakeObs>>;
@@ -352,7 +362,25 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                               "responseData": { "outputs": outputs, "success": true } }),
                 )
             }
-            _ => (604, Value::Null),
+            _ => match (&mut s.vertical, name("vendorName").as_str(), name("requestType").as_str()) {
+                (Some(v), "aitum-vertical-canvas", rt) => {
+                    let rd = &data["requestData"];
+                    let response = match rt {
+                        "status" => json!({ "success": true, "streaming": v.streaming }),
+                        "update_stream_server" => {
+                            v.server = rd["stream_server"].as_str().unwrap_or("").to_string();
+                            json!({ "success": true })
+                        }
+                        "update_stream_key" => {
+                            v.key = rd["stream_key"].as_str().unwrap_or("").to_string();
+                            json!({ "success": true })
+                        }
+                        _ => json!({ "success": false }),
+                    };
+                    (100, json!({ "vendorName": "aitum-vertical-canvas", "requestType": rt, "responseData": response }))
+                }
+                _ => (604, Value::Null),
+            },
         },
         _ => (204, Value::Null),
     }

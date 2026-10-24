@@ -98,6 +98,71 @@ fn host_of(server: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
+/// Aitum Vertical (OBS's vertical canvas plugin): its vendor name for obs-websocket.
+pub const VERTICAL_VENDOR: &str = "aitum-vertical-canvas";
+
+#[derive(Deserialize)]
+struct VerticalStatus {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    streaming: bool,
+}
+
+#[derive(Deserialize)]
+struct Done {
+    #[serde(default)]
+    success: bool,
+}
+
+/// Whether OBS's vertical canvas is streaming, or `None` when OBS doesn't have Aitum Vertical.
+pub async fn vertical_streaming(client: &Client) -> Option<bool> {
+    let req = CallVendorRequest {
+        vendor_name: VERTICAL_VENDOR,
+        request_type: "status",
+        request_data: &serde_json::json!({}),
+    };
+    let res = client.general().call_vendor_request::<_, VerticalStatus>(req).await.ok()?;
+    res.response_data.success.then_some(res.response_data.streaming)
+}
+
+/// Points the vertical canvas's first stream output at `server` with `key`.
+pub async fn set_vertical_stream(client: &Client, server: &str, key: &str) -> Result<(), ObsError> {
+    for (request_type, data) in [
+        ("update_stream_server", serde_json::json!({ "stream_server": server, "index": 0 })),
+        ("update_stream_key", serde_json::json!({ "stream_key": key, "index": 0 })),
+    ] {
+        let req = CallVendorRequest { vendor_name: VERTICAL_VENDOR, request_type, request_data: &data };
+        let res = client.general().call_vendor_request::<_, Done>(req).await.map_err(err)?;
+        if !res.response_data.success {
+            return Err(ObsError::Refused(
+                "Aitum Vertical didn't take the change. Open its settings in OBS once (the vertical dock's gear), then try again.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Aitum Vertical's settings file next to obs-websocket's.
+pub fn vertical_config_path(websocket_config: &Path) -> Option<PathBuf> {
+    Some(websocket_config.parent()?.parent()?.join("vertical-canvas").join("config.json"))
+}
+
+/// The vertical canvas's first stream output: its server and key, to put back later.
+pub fn vertical_first_output(config: &[u8]) -> Option<(String, String)> {
+    let v: Value = serde_json::from_slice(config).ok()?;
+    let canvas = v.get("canvas")?.as_array()?.first()?;
+    let out = canvas.get("stream_outputs").and_then(Value::as_array).and_then(|o| o.first()).unwrap_or(canvas);
+    let server = out.get("stream_server").and_then(Value::as_str)?.trim().to_string();
+    let key = out.get("stream_key").and_then(Value::as_str).unwrap_or_default().to_string();
+    (!server.is_empty()).then_some((server, key))
+}
+
+/// A server's host, for saying where something streams to without its key.
+pub fn server_host(server: &str) -> Option<String> {
+    host_of(server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +187,20 @@ mod tests {
         assert_eq!(s["Shorts"], "a.rtmps.youtube.com");
         assert!(!format!("{s:?}").contains("secret"));
         assert!(servers(b"{nope", "Untitled").is_empty());
+        let vertical = serde_json::json!({ "canvas": [{ "width": 1080, "height": 1920, "stream_outputs": [
+            { "name": "YouTube", "enabled": true, "stream_server": "rtmps://a.rtmps.youtube.com/live2", "stream_key": "yt-vertical" }
+        ] }] });
+        assert_eq!(
+            vertical_first_output(&serde_json::to_vec(&vertical).unwrap()),
+            Some(("rtmps://a.rtmps.youtube.com/live2".into(), "yt-vertical".into()))
+        );
+        let legacy =
+            serde_json::json!({ "canvas": [{ "stream_server": "rtmp://x.example.com/live", "stream_key": "k" }] });
+        assert_eq!(
+            vertical_first_output(&serde_json::to_vec(&legacy).unwrap()).unwrap().0,
+            "rtmp://x.example.com/live"
+        );
+        assert_eq!(vertical_first_output(br#"{"canvas":[{}]}"#), None);
         assert!(servers(&serde_json::to_vec(&cfg).unwrap(), "Missing").is_empty());
         let ws = Path::new("/c/obs-studio/plugin_config/obs-websocket/config.json");
         assert_eq!(config_path(ws).unwrap(), Path::new("/c/obs-studio/plugin_config/aitum-multistream/config.json"));
