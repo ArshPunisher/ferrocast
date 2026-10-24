@@ -434,17 +434,8 @@ impl Engine {
         let design = self.design(design_id).await?;
         let screens = self.theme_screens(&design)?;
         let previous = self.obs_theme_record().await?;
-        if let Some(p) = &previous
-            && p.design_id != design.id
-        {
-            return Err(EngineError::Refused {
-                status: 409,
-                code: "theme_in_obs",
-                message: format!("{} is in OBS already.", p.design_name),
-                hint: "Take it out of OBS first (Studio, OBS), then put this one in.".into(),
-                retry_after: None,
-            });
-        }
+        // Another theme in OBS: this one takes its place in the same scenes and sources.
+        let switching = previous.as_ref().is_some_and(|p| p.design_id != design.id);
         let client = self.obs_client().await?;
         let obs = ferrocast_obs::control::scenes(&client).await.map_err(obs_error)?;
         let sources: Vec<String> =
@@ -475,7 +466,17 @@ impl Engine {
             scene_before: obs.current.clone(),
         });
         rec.at = now().0;
+        rec.design_id = design.id.clone();
+        rec.design_name = design.name.clone();
         let mut steps = Vec::new();
+        if switching {
+            steps.push(Step::new(
+                "switch_theme",
+                "Theme",
+                "done",
+                format!("{} takes the old theme's place.", design.name),
+            ));
+        }
         let overlays = self.overlays().await?;
         let mut roles = self.current_roles();
         let mut starting_scene = None;
@@ -534,7 +535,12 @@ impl Engine {
                             }
                         }
                     }
-                    steps.push(Step::new("old", "Old widgets", "done", format!("Hid {n} (not deleted).")));
+                    steps.push(Step::new(
+                        "old",
+                        "Old widgets",
+                        "done",
+                        if n == 0 { "Already hidden.".to_string() } else { format!("Hid {n} (not deleted).") },
+                    ));
                 }
                 Err(e) => steps.push(Step::new("old", "Old widgets", "failed", e.to_string())),
             }
@@ -603,11 +609,39 @@ impl Engine {
                     .map(|o| o.id.clone())
             });
         let name: String = format!("{} ({})", screen.name, design.name).chars().take(60).collect();
+        let name = name.trim().to_string();
         // As Use does: no overlay edit in between (released before OBS is asked anything).
-        let overlay = {
+        let mut overlay = {
             let _one_at_a_time = self.config_lock().await;
-            self.place_scene(design, screen, name.trim(), existing.as_deref()).await?
+            self.place_scene(design, screen, &name, existing.as_deref()).await?
         };
+        // Switching theme: the overlay and its OBS source take the new name (the URL stays).
+        if overlay.name != name {
+            let old_source = ferrocast_obs::source_name(&overlay.name);
+            let new_source = ferrocast_obs::source_name(&name);
+            // OBS first: if it refuses, the overlay keeps its old name and the next apply retries.
+            if ferrocast_obs::theme::rename_input(client, &old_source, &new_source).await.map_err(obs_error)? {
+                for n in rec.made_inputs.iter_mut().chain(rec.added_items.iter_mut().map(|(_, s)| s)) {
+                    if *n == old_source {
+                        n.clone_from(&new_source);
+                    }
+                }
+            }
+            overlay = self.rename_overlay(&overlay.id, &name).await?;
+        }
+        // And a scene Ferrocast made for this screen takes the new name.
+        if matches!(p.place, Place::New)
+            && let Some(old) = rec.screens.iter().find(|s| s.key == p.key).map(|s| s.scene.clone())
+            && old != scene
+            && rec.made_scenes.contains(&old)
+            && ferrocast_obs::theme::rename_scene(client, &old, scene).await.map_err(obs_error)?
+        {
+            for n in &mut rec.made_scenes {
+                if *n == old {
+                    *n = scene.to_string();
+                }
+            }
+        }
 
         if matches!(p.place, Place::New)
             && ferrocast_obs::theme::ensure_scene(client, scene).await.map_err(obs_error)?

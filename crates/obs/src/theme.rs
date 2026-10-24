@@ -45,6 +45,26 @@ pub async fn remove_scene(client: &Client, name: &str) -> Result<(), ObsError> {
     gone_is_fine(client.scenes().remove(SceneId::Name(name)).await)
 }
 
+/// Renames a scene; `false` when it isn't there or the new name is taken.
+pub async fn rename_scene(client: &Client, from: &str, to: &str) -> Result<bool, ObsError> {
+    let list = client.scenes().list().await.map_err(err)?;
+    if !list.scenes.iter().any(|s| s.id.name == from) || list.scenes.iter().any(|s| s.id.name == to) {
+        return Ok(false);
+    }
+    client.scenes().set_name(SceneId::Name(from), to).await.map_err(err)?;
+    Ok(true)
+}
+
+/// Renames an input; `false` when it isn't there or the new name is taken.
+pub async fn rename_input(client: &Client, from: &str, to: &str) -> Result<bool, ObsError> {
+    let inputs = client.inputs().list(None).await.map_err(err)?;
+    if !inputs.iter().any(|i| i.id.name == from) || inputs.iter().any(|i| i.id.name == to) {
+        return Ok(false);
+    }
+    client.inputs().set_name(InputId::Name(from), to).await.map_err(err)?;
+    Ok(true)
+}
+
 /// Shows a source again; one that's gone (or its scene) counts as done.
 pub async fn show_item(client: &Client, scene: &str, item_id: i64) -> Result<(), ObsError> {
     use obws::requests::scene_items::SetEnabled;

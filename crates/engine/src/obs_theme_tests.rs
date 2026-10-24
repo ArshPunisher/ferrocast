@@ -226,14 +226,7 @@ async fn refusals_say_what_to_do() {
     assert!(
         matches!(e.apply_theme_to_obs("builtin.forge", Some(p)).await, Err(EngineError::Invalid(m)) if m.starts_with("screens.0.under"))
     );
-    // One theme at a time.
     e.apply_theme_to_obs("builtin.forge", None).await.unwrap();
-    match e.apply_theme_to_obs("builtin.prism", None).await {
-        Err(EngineError::Refused { status: 409, code: "theme_in_obs", message, .. }) => {
-            assert!(message.contains("Forge"))
-        }
-        other => panic!("{other:?}"),
-    }
     // OBS closed.
     let port = closed_port().await;
     e.save_obs(ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
@@ -267,4 +260,69 @@ async fn an_undo_that_obs_partly_refuses_can_be_tried_again() {
     assert_eq!(scene_names(&st), before);
     assert!(e.obs_theme().await.unwrap().is_none());
     assert_eq!(e.show_config().starting_scene.as_deref(), Some("Starting Soon"), "a second undo doesn't move it again");
+}
+
+#[tokio::test]
+async fn switching_theme_keeps_the_same_scenes_sources_and_addresses() {
+    let (e, _d, st) = setup().await;
+    let before = scene_names(&st);
+    e.apply_theme_to_obs("builtin.forge", None).await.unwrap();
+    let urls: Vec<String> = e.overlays().await.unwrap().iter().map(|o| o.url.clone()).collect();
+    let inputs = st.lock().unwrap().inputs.len();
+    let r = e.apply_theme_to_obs("builtin.prism", None).await.unwrap();
+    assert!(r.steps.iter().all(|s| s.status == "done"), "{:#?}", r.steps);
+    let names = scene_names(&st);
+    assert_eq!(names.len(), before.len() + 5, "no new scenes: {names:?}");
+    assert!(names.contains(&"Prism · In game".to_string()) && !names.iter().any(|n| n.starts_with("Forge")));
+    let overlays = e.overlays().await.unwrap();
+    assert_eq!(overlays.iter().map(|o| o.url.clone()).collect::<Vec<_>>(), urls, "OBS keeps the same addresses");
+    assert!(overlays.iter().all(|o| o.name.ends_with("(Prism)") && o.design.as_ref().unwrap().id == "builtin.prism"));
+    assert_eq!(st.lock().unwrap().inputs.len(), inputs, "sources renamed, not added");
+    assert!(items(&st, "Prism · In game").iter().any(|(s, _)| s == "Ferrocast: In game (Prism)"));
+    assert_eq!(e.show_config().live_scene.as_deref(), Some("Prism · In game"));
+    assert_eq!(e.obs_theme().await.unwrap().unwrap().design_name, "Prism");
+    e.undo_theme_in_obs().await.unwrap();
+    assert_eq!(scene_names(&st), before);
+    assert_eq!(e.show_config().live_scene.as_deref(), Some("Gameplay"), "back to what was there before either theme");
+}
+
+#[tokio::test]
+async fn screens_follow_their_theme_until_edited_by_hand() {
+    let (e, _d, _st) = setup().await;
+    let mine = e.duplicate_design("builtin.forge", Some("Forge (mine)")).await.unwrap();
+    e.apply_theme_to_obs(&mine.id, None).await.unwrap();
+    let find = |list: &[crate::snapshot::OverlayView], key: &str| {
+        list.iter().find(|o| o.design.as_ref().is_some_and(|d| d.scene == key)).unwrap().clone()
+    };
+    let brb = find(&e.overlays().await.unwrap(), "brb");
+    assert!(brb.design.as_ref().unwrap().follows);
+
+    // Editing the theme changes every screen that follows it.
+    let mut edited = e.design(&mine.id).await.unwrap();
+    let DesignContent::Theme(t) = &mut edited.content else { unreachable!() };
+    for s in &mut t.scenes {
+        s.layers.remove(0);
+    }
+    let n_before = brb.widgets.len();
+    e.update_design(&mine.id, edited.clone()).await.unwrap();
+    let brb = find(&e.overlays().await.unwrap(), "brb");
+    assert_eq!(brb.widgets.len(), n_before - 1, "the screen followed the theme");
+
+    // A hand edit stops it following.
+    let mut o = e.overlay(&brb.id).await.unwrap();
+    o.widgets.pop();
+    let saved = e.update_overlay(o).await.unwrap();
+    assert!(!saved.design.as_ref().unwrap().follows);
+    let DesignContent::Theme(t) = &mut edited.content else { unreachable!() };
+    t.scenes.iter_mut().for_each(|s| s.layers.truncate(1));
+    e.update_design(&mine.id, edited).await.unwrap();
+    assert_eq!(e.overlay(&brb.id).await.unwrap().widgets.len(), saved.widgets.len(), "left alone");
+    let in_game = find(&e.overlays().await.unwrap(), "in_game");
+    assert_eq!(in_game.widgets.len(), 1, "the others still follow");
+
+    // "Follow the theme again".
+    let back = e.follow_design(&brb.id).await.unwrap();
+    assert!(back.design.as_ref().unwrap().follows);
+    assert_eq!(back.widgets.len(), 1);
+    assert_eq!(back.url, brb.url);
 }

@@ -297,6 +297,41 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
             s.scenes.insert(0, Scene { name: n, items: Vec::new() });
             (100, json!({ "sceneUuid": uuid(900 + s.scenes.len()) }))
         }
+        "SetSceneName" => {
+            let (from, to) = (name("sceneName"), name("newSceneName"));
+            if scene_index(&s, &to).is_some() {
+                return (601, Value::Null);
+            }
+            let Some(i) = scene_index(&s, &from) else { return (600, Value::Null) };
+            s.scenes[i].name = to.clone();
+            for sc in &mut s.scenes {
+                for it in &mut sc.items {
+                    if it.kind.is_empty() && it.source == from {
+                        it.source = to.clone();
+                    }
+                }
+            }
+            if s.current == from {
+                s.current = to;
+            }
+            (100, Value::Null)
+        }
+        "SetInputName" => {
+            let (from, to) = (name("inputName"), name("newInputName"));
+            if s.inputs.iter().any(|x| x.name == to) {
+                return (601, Value::Null);
+            }
+            let Some(x) = s.inputs.iter_mut().find(|x| x.name == from) else { return (600, Value::Null) };
+            x.name = to.clone();
+            for sc in &mut s.scenes {
+                for it in &mut sc.items {
+                    if !it.kind.is_empty() && it.source == from {
+                        it.source = to.clone();
+                    }
+                }
+            }
+            (100, Value::Null)
+        }
         "RemoveScene" => match scene_index(&s, &name("sceneName")) {
             None => (600, Value::Null),
             Some(i) => {
