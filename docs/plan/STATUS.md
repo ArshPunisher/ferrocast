@@ -26,6 +26,10 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24, evening (beta.7 real test)
+- 2.0.0-beta.7 (draft) installed and tested for real from the owner's personal Chrome: the editor's picture is OBS's real 2560x1440 scene; cut source with only YouTube Shorts live ticked (normal platforms off) went live on YouTube in ~6 s, encoded on the GPU (VideoToolbox) at 1080x1920 30 fps; changing the layout while live restarted the cutter and YouTube was back in ~6 s; a new key, a bad rule and a bad box were refused. Everything put back; OBS's settings files byte-identical. Another unlisted test video left on the channel.
+- The site (Cloudflare Pages project `ferrocast-web`) deploys itself on push; the live dashboard has the Vertical tab, the cut editor and Simple/Advanced.
+
 ### 2026-10-24, later (real test of beta.6, A2.4 cut from the stream)
 - 2.0.0-beta.6 (draft) installed over beta.3 and tested for real, driven through the relay from the owner's Chrome: Aitum Multistream 1.0.8 found (it has no vendor requests before 1.0.9: fixed by reading its settings file), Aitum Vertical pointed at Ferrocast and back, YouTube Shorts live made by Ferrocast and live on YouTube (Unlisted, copying the upcoming test broadcast; one 1:11 video left, unlisted), app killed mid-stream and back sending in ~4 s with the same broadcast, YouTube ended it by itself ~3 min after the stream stopped. Phone scope refused the vertical key and vertical servers. OBS's three settings files byte-identical afterwards, also after OBS saved and quit.
 - Local headless tests against the real OBS: vertical canvas 1080x1920 60 fps to a local receiver, normal and vertical at once, a 3 Mbps throttled destination paused by upload protection (vertical first, then the slow one; the top one never), Resume now, protection off, automatic return after 60 s and the doubled pause. Found and fixed: the pause reason named a paused destination; a still scene's bursty low-bitrate stream could look slow (now a 3 s average).
