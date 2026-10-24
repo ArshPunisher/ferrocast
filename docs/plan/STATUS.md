@@ -31,6 +31,8 @@ Newest entry first. Update at the end of every working session.
 - A2.1: stream info can differ per platform (`per`), with tabs in the dashboard. A2.2: Ferrocast notices Aitum Multistream sending to the same platforms and says so before and during a stream.
 - 2.0.0-beta.4 built as a draft (Mac, Windows, Linux). CI caught two new RustSec advisories: ctutils updated (relay), crypto-bigint 0.5 ignored with the reason (only age's P-256 code, never used). The relay with the ctutils fix is built; deploying it waits for the owner's OK.
 - Go live config saves now take the config lock (CodeRabbit: two saves at once could undo each other).
+- A2.3 vertical from OBS's canvas: second ingest key and stream, canvas per destination, YouTube Shorts live made by Ferrocast (owner chose that over pasting a key), Aitum Vertical set up from the dashboard, upload protection per stream (vertical pauses first). Owner's real test still to do: OBS + Aitum Vertical to YouTube Shorts live.
+- Relay with the ctutils fix deployed (owner ran the workflow; /health ok).
 
 ### 2026-10-24 (Go live: upload protection, A1.8)
 - When the upload can't carry every platform, the bottom live one pauses so the ones above stay smooth, and comes back by itself after a calm spell (60 s first, doubling to 10 min). Never the last one live; nothing stays paused when the stream ends. State machine in `crates/golive/src/protect.rs`, wired into the engine's per-second Go live loop.

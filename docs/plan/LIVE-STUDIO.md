@@ -269,8 +269,12 @@ Simple/Advanced switch (1B) with Go live's Advanced card (2B) and upload protect
 - [x] **A2.2 Aitum Multistream:** done 24 Oct. Found through its obs-websocket vendor request,
   OBS's output list and its settings file (names and servers only); setup note with "I use it
   on purpose", live "getting your stream twice" with "Stop Ferrocast's copy".
-- [ ] **A2.3** vertical forwarding from OBS's canvas. **A2.4** cut-from-stream vertical.
-  **A2.5** Simple/Advanced.
+- [x] **A2.3 Vertical from OBS's canvas:** done 24 Oct. A second local key into its own
+  stream; destinations have a canvas; YouTube Shorts live (Ferrocast makes a reusable "Ferrocast
+  vertical" stream and a self-starting broadcast with the normal live's title and privacy);
+  Aitum Vertical pointed here and back through its vendor requests; Studio's Vertical tab (4B).
+- [ ] **A2.4** cut-from-stream vertical (decode, crop, stack, encode; 5A, 6). **A2.5**
+  Simple/Advanced (1B, 2B, 3).
 
 ### Found in the real test (23 Oct)
 The owner's OBS sends ~12 Mbps at 1440p60; Twitch takes 6 and Kick 8 (Twitch "Unstable", Kick
