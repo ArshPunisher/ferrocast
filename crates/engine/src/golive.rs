@@ -26,6 +26,8 @@ use crate::{Engine, EngineError, now};
 pub(crate) const CONFIG_KEY: &str = "golive";
 const INGEST_KEY_SECRET: &str = "golive_ingest_key";
 const OBS_BEFORE_SECRET: &str = "golive_obs_before";
+/// Aitum Vertical's first output before Ferrocast pointed it here: `{ "server", "key" }`.
+const VERTICAL_BEFORE_SECRET: &str = "golive_vertical_before";
 const CUSTOM_KEY_PREFIX: &str = "golive_dest_";
 /// Custom destinations at most (the upload is the real limit long before).
 const MAX_CUSTOM: usize = 8;
@@ -35,6 +37,23 @@ const UPLOAD_TEST: Duration = Duration::from_secs(6);
 const HEALTH_EVERY: Duration = Duration::from_secs(1);
 /// Before anything streamed, what a 1080p60 destination is planned at (video and audio).
 const DEFAULT_NEED_KBPS: u32 = 6_160;
+/// The same for an upright 1080×1920 stream from OBS's vertical canvas.
+const DEFAULT_VERTICAL_NEED_KBPS: u32 = 4_660;
+/// YouTube's ingest, for the upload check of the vertical stream (resolving it would make one).
+const YOUTUBE_INGEST: &str = "rtmps://a.rtmps.youtube.com/live2";
+
+/// Which picture a destination gets: OBS's normal stream, or its vertical canvas (A2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Canvas {
+    #[default]
+    Main,
+    Vertical,
+}
+
+fn is_main(c: &Canvas) -> bool {
+    *c == Canvas::Main
+}
 
 /// One place the stream goes, in the streamer's order (top first; the bottom one pauses first).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,7 +68,12 @@ pub struct DestinationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_main")]
+    pub canvas: Canvas,
 }
+
+/// YouTube Shorts live: the vertical stream's platform destination.
+pub const YOUTUBE_VERTICAL: &str = "youtube_vertical";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoLiveConfig {
@@ -68,12 +92,35 @@ fn on() -> bool {
     true
 }
 
+impl GoLiveConfig {
+    /// Saved before 2.0's vertical stream: YouTube Shorts live is added, off, at the end.
+    fn with_vertical(mut self) -> Self {
+        if !self.destinations.iter().any(|d| d.id == YOUTUBE_VERTICAL) {
+            let yt = GoLiveConfig::default().destinations.into_iter().find(|d| d.id == YOUTUBE_VERTICAL);
+            self.destinations.extend(yt);
+        }
+        self
+    }
+}
+
 impl Default for GoLiveConfig {
     /// The three platforms, all off until the streamer ticks them.
     fn default() -> Self {
-        let p = |id: &str, kind| DestinationConfig { id: id.into(), kind, name: None, url: None, enabled: false };
+        let p = |id: &str, kind| DestinationConfig {
+            id: id.into(),
+            kind,
+            name: None,
+            url: None,
+            enabled: false,
+            canvas: Canvas::Main,
+        };
         Self {
-            destinations: vec![p("twitch", Service::Twitch), p("youtube", Service::Youtube), p("kick", Service::Kick)],
+            destinations: vec![
+                p("twitch", Service::Twitch),
+                p("youtube", Service::Youtube),
+                p("kick", Service::Kick),
+                DestinationConfig { canvas: Canvas::Vertical, ..p(YOUTUBE_VERTICAL, Service::Youtube) },
+            ],
             protect: true,
             aitum_ok: false,
         }
@@ -110,6 +157,9 @@ pub struct GoLiveView {
     pub obs: ObsView,
     pub live: bool,
     pub stats: StreamStats,
+    /// OBS's vertical canvas is streaming to Ferrocast (its second key).
+    pub vertical_live: bool,
+    pub vertical_stats: StreamStats,
     pub destinations: Vec<DestinationView>,
     pub upload: Option<UploadCheck>,
     /// Upload protection is on (A1.8).
@@ -128,6 +178,24 @@ pub struct ObsView {
     pub before: Option<String>,
     /// Aitum Multistream's outputs, when OBS has that plugin (A2.2).
     pub aitum: Option<Vec<AitumOutput>>,
+    /// OBS's vertical canvas (Aitum Vertical), when OBS has it (A2.3).
+    pub vertical: Option<VerticalObs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VerticalObs {
+    /// Its stream goes to Ferrocast's vertical key.
+    pub points_here: bool,
+    pub streaming: bool,
+    /// Where "Put it back" sends it again (the server's host, never the key).
+    pub before: Option<String>,
+}
+
+/// Aitum Vertical's setting before Ferrocast, kept in the secret store (it holds a key).
+#[derive(Serialize, Deserialize)]
+struct VerticalBefore {
+    server: String,
+    key: String,
 }
 
 /// One Aitum Multistream output: where it goes (when Ferrocast can tell) and whether it's
@@ -164,6 +232,7 @@ pub(crate) fn aitum_platform(host: Option<&str>, name: &str) -> Option<Service> 
 pub struct DestinationView {
     pub id: String,
     pub kind: Service,
+    pub canvas: Canvas,
     pub name: String,
     /// The connected account's name (platforms), or the server host (custom).
     pub account: Option<String>,
@@ -181,6 +250,8 @@ pub struct DestinationView {
 #[derive(Debug)]
 pub(crate) struct GoLive {
     pub hub: Arc<Hub>,
+    /// OBS's vertical canvas (A2.3).
+    pub vhub: Arc<Hub>,
     pub cfg: RwLock<GoLiveConfig>,
     ingest: Mutex<Option<String>>,
     running: Mutex<HashMap<String, Running>>,
@@ -202,6 +273,7 @@ impl Default for GoLive {
     fn default() -> Self {
         Self {
             hub: Hub::new(),
+            vhub: Hub::new(),
             cfg: RwLock::new(GoLiveConfig::default()),
             ingest: Mutex::new(None),
             running: Mutex::new(HashMap::new()),
@@ -237,9 +309,15 @@ fn platform_of(kind: Service) -> Option<Platform> {
 
 fn dest_name(d: &DestinationConfig) -> String {
     match platform_of(d.kind) {
+        Some(Platform::Youtube) if d.canvas == Canvas::Vertical => "YouTube Shorts live".into(),
         Some(p) => p.label().to_string(),
         None => d.name.clone().unwrap_or_else(|| "Custom server".into()),
     }
+}
+
+/// The vertical canvas's local key: unguessable like the main one, and never the same.
+fn vertical_key(main: &str) -> String {
+    format!("{main}v")
 }
 
 fn refused(code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> EngineError {
@@ -256,7 +334,7 @@ impl Engine {
     pub async fn start_golive(&self, port: u16) {
         use ferrocast_store::repo::settings::get_or_default;
         match self.db(|s| Ok(get_or_default::<GoLiveConfig>(s, CONFIG_KEY))).await {
-            Ok(Ok(cfg)) => *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg,
+            Ok(Ok(cfg)) => *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg.with_vertical(),
             Ok(Err(e)) | Err(EngineError::Store(e)) => {
                 tracing::error!(error = %e, "the Go live setting couldn't be read")
             }
@@ -269,16 +347,15 @@ impl Engine {
                 return;
             }
         };
-        let hub = self.golive().hub.clone();
-        let ingest = match Ingest::bind(port, key.clone(), hub.clone()).await {
+        let (hub, vhub) = (self.golive().hub.clone(), self.golive().vhub.clone());
+        let vkey = vertical_key(&key);
+        let bound = match Ingest::bind(port, key.clone(), hub.clone()).await {
+            Ok(i) => Ok(i),
+            Err(_) if port != 0 => Ingest::bind(0, key, hub).await,
+            Err(e) => Err(e),
+        };
+        let ingest = match bound.map(|i| i.with_route(vkey, vhub)) {
             Ok(i) => i,
-            Err(_) if port != 0 => match Ingest::bind(0, key, hub).await {
-                Ok(i) => i,
-                Err(e) => {
-                    tracing::error!(error = %e, "Go live: the local server couldn't start");
-                    return;
-                }
-            },
             Err(e) => {
                 tracing::error!(error = %e, "Go live: the local server couldn't start");
                 return;
@@ -316,6 +393,19 @@ impl Engine {
         Ok((server, self.ingest_key()?))
     }
 
+    /// The key for OBS's vertical canvas: the same local server, its own key.
+    pub async fn golive_vertical_ingest(&self) -> Result<(String, String), EngineError> {
+        let (server, key) = self.golive_ingest().await?;
+        Ok((server, vertical_key(&key)))
+    }
+
+    fn hub_for(&self, c: Canvas) -> &Arc<Hub> {
+        match c {
+            Canvas::Main => &self.golive().hub,
+            Canvas::Vertical => &self.golive().vhub,
+        }
+    }
+
     pub fn golive_config(&self) -> GoLiveConfig {
         self.golive().cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -331,6 +421,8 @@ impl Engine {
         let g = self.golive();
         let live = g.hub.live().borrow().on;
         let stats = g.hub.stats();
+        let vertical_live = g.vhub.live().borrow().on;
+        let vertical_stats = g.vhub.stats();
         let cfg = self.golive_config();
         let running = lock(&g.running);
         let paused = lock(&g.paused);
@@ -350,6 +442,7 @@ impl Engine {
                 DestinationView {
                     id: d.id.clone(),
                     kind: d.kind,
+                    canvas: d.canvas,
                     name: dest_name(d),
                     account,
                     enabled: d.enabled,
@@ -359,7 +452,11 @@ impl Engine {
                         .map(|r| r.health.borrow().clone())
                         .or_else(|| paused.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
-                    rules: if d.enabled { probe::rules(&stats, d.kind) } else { Vec::new() },
+                    rules: match (d.enabled, d.canvas) {
+                        (false, _) => Vec::new(),
+                        (true, Canvas::Main) => probe::rules(&stats, d.kind),
+                        (true, Canvas::Vertical) => probe::rules(&vertical_stats, d.kind),
+                    },
                 }
             })
             .collect();
@@ -368,6 +465,8 @@ impl Engine {
             obs,
             live,
             stats,
+            vertical_live,
+            vertical_stats,
             destinations,
             upload: lock(&g.upload).clone(),
             protect: cfg.protect,
@@ -385,13 +484,122 @@ impl Engine {
             .and_then(|j| serde_json::from_str::<StreamService>(&j).ok());
         let before = before.map(|b| describe_service(&b));
         let Ok(c) = self.obs_client().await else {
-            return ObsView { connected: false, points_here: false, streaming: false, before, aitum: None };
+            return ObsView {
+                connected: false,
+                points_here: false,
+                streaming: false,
+                before,
+                aitum: None,
+                vertical: None,
+            };
         };
         let service = obs::stream_service(&c).await.ok();
         let streaming = obs::streaming(&c).await.unwrap_or(false);
         let points_here = matches!((&service, ingest), (Some(s), Some(i)) if s.points_at(i));
         let aitum = self.aitum_outputs(&c).await;
-        ObsView { connected: true, points_here, streaming, before, aitum }
+        let vertical = self.vertical_obs(&c).await;
+        ObsView { connected: true, points_here, streaming, before, aitum, vertical }
+    }
+
+    fn vertical_before(&self) -> Option<VerticalBefore> {
+        let j = self.inner.secrets.get(VERTICAL_BEFORE_SECRET).ok().flatten()?;
+        serde_json::from_str(&j).ok()
+    }
+
+    async fn vertical_obs(&self, c: &ferrocast_obs::Client) -> Option<VerticalObs> {
+        let streaming = ferrocast_obs::aitum::vertical_streaming(c).await?;
+        let before = self.vertical_before();
+        Some(VerticalObs {
+            points_here: before.is_some(),
+            streaming,
+            before: before.and_then(|b| ferrocast_obs::aitum::server_host(&b.server)),
+        })
+    }
+
+    /// Aitum Vertical's first output from its settings file (server and key, to put back).
+    async fn vertical_setting_on_disk(&self) -> Option<(String, String)> {
+        let files: Vec<_> =
+            self.obs_paths().iter().filter_map(|p| ferrocast_obs::aitum::vertical_config_path(p)).collect();
+        tokio::task::spawn_blocking(move || {
+            let path = files.into_iter().find(|p| p.is_file())?;
+            if std::fs::metadata(&path).ok()?.len() > ferrocast_obs::aitum::MAX_CONFIG_BYTES {
+                return None;
+            }
+            ferrocast_obs::aitum::vertical_first_output(&std::fs::read(path).ok()?)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Points OBS's vertical canvas (Aitum Vertical) at Ferrocast's vertical key, keeping its
+    /// setting to put back. Never while it streams.
+    pub async fn golive_point_vertical(&self) -> Result<Option<VerticalObs>, EngineError> {
+        let _one = self.golive().busy.lock().await;
+        let (server, key) = self.golive_vertical_ingest().await?;
+        let c = self.obs_client().await?;
+        match ferrocast_obs::aitum::vertical_streaming(&c).await {
+            None => {
+                return Err(refused(
+                    "aitum_vertical_missing",
+                    "OBS doesn't have Aitum Vertical.",
+                    "Install Aitum Vertical in OBS (aitum.tv), or use \"Cut it from your stream\".",
+                ));
+            }
+            Some(true) => {
+                return Err(refused(
+                    "obs_streaming",
+                    "OBS's vertical canvas is streaming right now.",
+                    "Stop the vertical stream in OBS first; Ferrocast changes this between streams.",
+                ));
+            }
+            Some(false) => {}
+        }
+        // Its update requests change an output that exists; with none, nothing would stream.
+        let (old_server, old_key) = self.vertical_setting_on_disk().await.ok_or_else(|| {
+            refused(
+                "aitum_vertical_no_output",
+                "Aitum Vertical has no stream output yet.",
+                "In OBS, open the vertical dock's settings, add a stream output (any server), then try again.",
+            )
+        })?;
+        if self.vertical_before().is_none() {
+            // Already pointed here by hand: nothing to put back, but it points here.
+            let before = if old_server == server {
+                VerticalBefore { server: String::new(), key: String::new() }
+            } else {
+                VerticalBefore { server: old_server, key: old_key }
+            };
+            let j = serde_json::to_string(&before).map_err(|e| EngineError::Internal(e.to_string()))?;
+            self.inner.secrets.set(VERTICAL_BEFORE_SECRET, &j).map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        }
+        ferrocast_obs::aitum::set_vertical_stream(&c, &server, &key).await?;
+        tracing::info!("Go live: Aitum Vertical now streams to Ferrocast");
+        Ok(self.vertical_obs(&c).await)
+    }
+
+    /// Puts Aitum Vertical's own setting back exactly.
+    pub async fn golive_restore_vertical(&self) -> Result<Option<VerticalObs>, EngineError> {
+        let _one = self.golive().busy.lock().await;
+        let before = self.vertical_before().filter(|b| !b.server.is_empty()).ok_or_else(|| {
+            refused(
+                "golive_nothing_saved",
+                "There's no earlier Aitum Vertical setting to put back.",
+                "Set its stream in OBS, in the vertical dock's settings.",
+            )
+        })?;
+        let c = self.obs_client().await?;
+        if ferrocast_obs::aitum::vertical_streaming(&c).await == Some(true) {
+            return Err(refused(
+                "obs_streaming",
+                "OBS's vertical canvas is streaming right now.",
+                "Stop the vertical stream in OBS first; Ferrocast changes this between streams.",
+            ));
+        }
+        ferrocast_obs::aitum::set_vertical_stream(&c, &before.server, &before.key).await?;
+        let _ = self.inner.secrets.delete(VERTICAL_BEFORE_SECRET);
+        tracing::info!("Go live: Aitum Vertical's own setting is back");
+        Ok(self.vertical_obs(&c).await)
     }
 
     /// Aitum Multistream's outputs: the names and live state from OBS, where each goes from
@@ -435,12 +643,20 @@ impl Engine {
     fn send_golive(&self) {
         let ingest = lock(&self.golive().ingest).clone();
         // OBS isn't asked on every tick: the dashboard reads it with GET.
-        let obs = ObsView { connected: false, points_here: false, streaming: false, before: None, aitum: None };
+        let obs = ObsView {
+            connected: false,
+            points_here: false,
+            streaming: false,
+            before: None,
+            aitum: None,
+            vertical: None,
+        };
         let mut v = self.view_with(ingest, obs);
         v.upload = None;
         self.send_live(LiveFrame::new(
             "golive",
-            &serde_json::json!({ "live": v.live, "stats": v.stats, "destinations": v.destinations }),
+            &serde_json::json!({ "live": v.live, "stats": v.stats, "vertical_live": v.vertical_live,
+                                  "vertical_stats": v.vertical_stats, "destinations": v.destinations }),
         ));
     }
 
@@ -485,6 +701,7 @@ impl Engine {
         name: &str,
         url: &str,
         key: &str,
+        canvas: Canvas,
     ) -> Result<DestinationConfig, EngineError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
@@ -513,6 +730,7 @@ impl Engine {
             name: Some(name.to_string()),
             url: Some(target.tc_url.clone()),
             enabled: true,
+            canvas,
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
@@ -616,7 +834,9 @@ impl Engine {
         let stats = self.golive().hub.stats();
         // The stream as it is now, else as it was last time, else a 1080p60 plan.
         let last = self.golive().last_kbps.load(std::sync::atomic::Ordering::Relaxed);
-        let need = [stats.kbps, last].into_iter().find(|k| *k > 0).unwrap_or(DEFAULT_NEED_KBPS);
+        let need_main = [stats.kbps, last].into_iter().find(|k| *k > 0).unwrap_or(DEFAULT_NEED_KBPS);
+        let vertical = self.golive().vhub.stats().kbps;
+        let need_vertical = if vertical > 0 { vertical } else { DEFAULT_VERTICAL_NEED_KBPS };
         let mut rows = Vec::new();
         let mut twitch: Option<(Target, String)> = None;
         for d in &ticked {
@@ -625,10 +845,21 @@ impl Engine {
                 name: dest_name(d),
                 server: None,
                 delay_ms: None,
-                need_kbps: need,
+                need_kbps: if d.canvas == Canvas::Vertical { need_vertical } else { need_main },
                 problem: None,
             };
-            match self.resolve(d).await {
+            // YouTube's vertical stream is made when it's first needed, not for a check.
+            let resolved = if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
+                match self.connector(Platform::Youtube) {
+                    Some(_) => Target::parse(YOUTUBE_INGEST)
+                        .map(|target| Destination { id: d.id.clone(), target, key: String::new() })
+                        .map_err(|e| e.to_string()),
+                    None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
+                }
+            } else {
+                self.resolve(d).await
+            };
+            match resolved {
                 Ok(dest) => {
                     row.server = Some(dest.target.host.clone());
                     match probe::delay(&dest.target).await {
@@ -696,7 +927,11 @@ impl Engine {
         let (url, key) = match platform_of(d.kind) {
             Some(p) => {
                 let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
-                match c.ingest().await {
+                let got = match d.canvas {
+                    Canvas::Main => c.ingest().await,
+                    Canvas::Vertical => c.vertical_ingest().await,
+                };
+                match got {
                     Ok(i) => (i.url, i.key),
                     Err(ferrocast_connector::ConnectorError::MissingScope { .. }) => {
                         return Err(format!(
@@ -719,25 +954,31 @@ impl Engine {
         Ok(Destination { id: d.id.clone(), target, key })
     }
 
-    /// While live: starts forwarders for ticked destinations that aren't running and stops
-    /// the ones no longer ticked.
+    /// Starts forwarders for ticked destinations whose stream (normal or vertical) is live and
+    /// stops the rest. When neither stream is live, the show's pauses and reasons are cleared.
     pub(crate) async fn reconcile(&self) {
         let g = self.golive();
         let _one = g.reconciling.lock().await;
-        if !g.hub.live().borrow().on {
-            return;
-        }
-        let ticked: Vec<DestinationConfig> =
-            self.golive_config().destinations.into_iter().filter(|d| d.enabled).collect();
-        let stale: Vec<String> =
-            lock(&g.running).keys().filter(|id| !ticked.iter().any(|d| &d.id == *id)).cloned().collect();
+        let (main_on, vertical_on) = (g.hub.live().borrow().on, g.vhub.live().borrow().on);
+        let on = |c: Canvas| match c {
+            Canvas::Main => main_on,
+            Canvas::Vertical => vertical_on,
+        };
+        let want: Vec<DestinationConfig> =
+            self.golive_config().destinations.into_iter().filter(|d| d.enabled && on(d.canvas)).collect();
+        let wanted = |id: &String| want.iter().any(|d| &d.id == id);
+        let stale: Vec<String> = lock(&g.running).keys().filter(|id| !wanted(id)).cloned().collect();
         for id in stale {
             if let Some(r) = lock(&g.running).remove(&id) {
                 r.stop.send_replace(true);
             }
-            lock(&g.blocked).remove(&id);
         }
-        for d in ticked {
+        lock(&g.blocked).retain(|id, _| wanted(id));
+        lock(&g.paused).retain(|id, _| wanted(id));
+        if !main_on && !vertical_on {
+            lock(&g.protector).reset();
+        }
+        for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
                 continue;
             }
@@ -754,7 +995,7 @@ impl Engine {
                 let (health_tx, health) =
                     watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
                 let (stop, stop_rx) = watch::channel(false);
-                tokio::spawn(ferrocast_golive::push::run(dest, g.hub.clone(), health_tx, stop_rx));
+                tokio::spawn(ferrocast_golive::push::run(dest, self.hub_for(d.canvas).clone(), health_tx, stop_rx));
                 lock(&g.running).insert(d.id.clone(), Running { stop, health });
             }
             Err(reason) => {
@@ -762,16 +1003,6 @@ impl Engine {
                 lock(&g.blocked).insert(d.id.clone(), reason);
             }
         }
-    }
-
-    fn stop_all(&self) {
-        let g = self.golive();
-        for (_, r) in lock(&g.running).drain() {
-            r.stop.send_replace(true);
-        }
-        lock(&g.blocked).clear();
-        lock(&g.paused).clear();
-        lock(&g.protector).reset();
     }
 
     /// Turns upload protection on or off. Off brings every paused destination back.
@@ -844,14 +1075,29 @@ impl Engine {
         let now_ms = u64::try_from(now().0).unwrap_or(0);
         let healths: Vec<(String, Health)> =
             lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone())).collect();
+        let canvas_of = |id: &str| cfg.destinations.iter().find(|d| d.id == id).map(|d| d.canvas).unwrap_or_default();
+        let (main_kbps, vertical_kbps) = (g.hub.stats().kbps, g.vhub.stats().kbps);
         let samples: Vec<Sample<'_>> = healths
             .iter()
             .filter(|(_, h)| h.state == PushState::Live)
-            .map(|(id, h)| Sample { id, kbps: h.kbps, dropped: h.dropped, live_ms: now_ms.saturating_sub(h.since_ms) })
+            .map(|(id, h)| Sample {
+                id,
+                kbps: h.kbps,
+                want_kbps: match canvas_of(id) {
+                    Canvas::Main => main_kbps,
+                    Canvas::Vertical => vertical_kbps,
+                },
+                dropped: h.dropped,
+                live_ms: now_ms.saturating_sub(h.since_ms),
+            })
             .collect();
-        let order: Vec<&str> = cfg.destinations.iter().filter(|d| d.enabled).map(|d| d.id.as_str()).collect();
-        let stream_kbps = g.hub.stats().kbps;
-        let action = lock(&g.protector).tick(std::time::Instant::now(), stream_kbps, &samples, &order);
+        // The vertical stream comes after every normal destination: it pauses first.
+        let order: Vec<&str> = [Canvas::Main, Canvas::Vertical]
+            .into_iter()
+            .flat_map(|c| cfg.destinations.iter().filter(move |d| d.enabled && d.canvas == c))
+            .map(|d| d.id.as_str())
+            .collect();
+        let action = lock(&g.protector).tick(std::time::Instant::now(), &samples, &order);
         match action {
             Some(Action::Pause(id)) => {
                 let top = cfg.destinations.iter().find(|d| d.enabled && d.id != id).map(dest_name).unwrap_or_default();
@@ -899,37 +1145,37 @@ fn describe_service(s: &StreamService) -> String {
     }
 }
 
-/// Starts the destinations when OBS starts streaming and stops them when it stops; while
-/// live, sends the health lines every second.
+/// Starts and stops the destinations as OBS's streams (normal and vertical) start and stop;
+/// while either is live, sends the health lines and runs upload protection every second.
 pub(crate) async fn run(engine: Engine) {
-    let mut live = engine.golive().hub.live();
-    let mut done = 0u64;
+    let g = engine.golive();
+    let (mut main, mut vertical) = (g.hub.live(), g.vhub.live());
+    let mut was = (false, false);
     loop {
-        let Ok(stream) = live.wait_for(|l| l.on && l.stream > done).await.map(|l| l.stream) else { return };
-        tracing::info!(stream, "Go live: OBS started streaming");
-        engine.reconcile().await;
-        loop {
-            // The wait's watch guard isn't Send, so the awaiting tick runs after the select.
-            let ended = tokio::select! {
-                changed = live.wait_for(|l| !(l.on && l.stream == stream)) => {
-                    if changed.is_err() { return; }
-                    true
-                }
-                _ = tokio::time::sleep(HEALTH_EVERY) => false,
-            };
-            if ended {
-                break;
+        let any = was.0 || was.1;
+        // The watch guards aren't Send, so values are read after the select.
+        let changed = tokio::select! {
+            r = main.changed() => { if r.is_err() { return; } true }
+            r = vertical.changed() => { if r.is_err() { return; } true }
+            _ = tokio::time::sleep(HEALTH_EVERY), if any => false,
+        };
+        if changed {
+            let now = (main.borrow_and_update().on, vertical.borrow_and_update().on);
+            if now.0 != was.0 {
+                tracing::info!(live = now.0, "Go live: OBS's stream changed");
             }
-            let k = engine.golive().hub.stats().kbps;
-            if k > 0 {
-                engine.golive().last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
+            if now.1 != was.1 {
+                tracing::info!(live = now.1, "Go live: OBS's vertical stream changed");
             }
-            engine.protect_tick().await;
-            engine.send_golive();
+            was = now;
+            engine.reconcile().await;
+            continue;
         }
-        engine.stop_all();
-        done = stream;
+        let k = g.hub.stats().kbps;
+        if k > 0 {
+            g.last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
+        }
+        engine.protect_tick().await;
         engine.send_golive();
-        tracing::info!(stream, "Go live: OBS stopped streaming");
     }
 }

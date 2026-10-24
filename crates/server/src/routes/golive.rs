@@ -26,6 +26,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/upload-check", post(upload_check))
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
+        .route("/golive/vertical/obs/setup", post(point_vertical))
+        .route("/golive/vertical/obs/restore", post(restore_vertical))
         .route("/golive/resume/{id}", post(resume))
 }
 
@@ -37,7 +39,8 @@ async fn view(State(app): State<AppState>) -> Json<Value> {
 /// (not in the remote allow-list).
 async fn ingest(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     let (server, key) = app.engine.golive_ingest().await?;
-    Ok(Json(json!({ "server": server, "key": key })))
+    let (_, vertical_key) = app.engine.golive_vertical_ingest().await?;
+    Ok(Json(json!({ "server": server, "key": key, "vertical_key": vertical_key })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,10 +67,13 @@ struct AddBody {
     name: String,
     url: String,
     key: String,
+    /// `vertical` for a server that takes OBS's vertical canvas.
+    #[serde(default)]
+    canvas: ferrocast_engine::golive::Canvas,
 }
 
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {
-    let d = app.engine.add_golive_destination(&b.name, &b.url, &b.key).await?;
+    let d = app.engine.add_golive_destination(&b.name, &b.url, &b.key, b.canvas).await?;
     Ok((StatusCode::CREATED, Json(json!(d))).into_response())
 }
 
@@ -114,4 +120,14 @@ struct AitumBody {
 /// "I use Aitum Multistream on purpose" (A2.2): hides the setup note.
 async fn aitum_ok(State(app): State<AppState>, Body(b): Body<AitumBody>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.set_golive_aitum_ok(b.ok).await?)))
+}
+
+/// Points Aitum Vertical (OBS's vertical canvas) at Ferrocast (A2.3).
+async fn point_vertical(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_point_vertical().await?)))
+}
+
+/// Puts Aitum Vertical's own setting back.
+async fn restore_vertical(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_restore_vertical().await?)))
 }

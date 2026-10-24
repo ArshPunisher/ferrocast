@@ -22,6 +22,8 @@ const MAX_PAUSE: Duration = Duration::from_secs(600);
 pub struct Sample<'a> {
     pub id: &'a str,
     pub kbps: u32,
+    /// The rate of the stream it forwards (the normal picture or the vertical one).
+    pub want_kbps: u32,
     /// Packets skipped so far this session (it only grows).
     pub dropped: u64,
     /// How long this session has been live.
@@ -51,17 +53,17 @@ impl Default for Protector {
 }
 
 impl Protector {
-    /// One second: `stream_kbps` is what OBS sends, `live` the destinations sending now, and
+    /// One second: `live` the destinations sending now (each with its stream's rate), and
     /// `order` every ticked destination, top first. At most one action per tick.
-    pub fn tick(&mut self, now: Instant, stream_kbps: u32, live: &[Sample<'_>], order: &[&str]) -> Option<Action> {
-        if stream_kbps == 0 {
+    pub fn tick(&mut self, now: Instant, live: &[Sample<'_>], order: &[&str]) -> Option<Action> {
+        if live.iter().all(|s| s.want_kbps == 0) {
             return None;
         }
-        let judged: Vec<&Sample<'_>> = live.iter().filter(|s| s.live_ms >= WARM_UP_MS).collect();
+        let judged: Vec<&Sample<'_>> = live.iter().filter(|s| s.live_ms >= WARM_UP_MS && s.want_kbps > 0).collect();
         let mut trouble = false;
         for s in &judged {
             let before = self.last_dropped.iter().find(|(id, _)| id == s.id).map(|(_, d)| *d);
-            if before.is_some_and(|b| s.dropped > b) || f64::from(s.kbps) < f64::from(stream_kbps) * SLOW_SHARE {
+            if before.is_some_and(|b| s.dropped > b) || f64::from(s.kbps) < f64::from(s.want_kbps) * SLOW_SHARE {
                 trouble = true;
             }
         }
@@ -118,7 +120,7 @@ mod tests {
     use super::*;
 
     fn s(id: &str, kbps: u32) -> Sample<'_> {
-        Sample { id, kbps, dropped: 0, live_ms: 10_000 }
+        Sample { id, kbps, want_kbps: 6000, dropped: 0, live_ms: 10_000 }
     }
 
     const ORDER: &[&str] = &["twitch", "youtube", "kick"];
@@ -129,20 +131,20 @@ mod tests {
         let t = Instant::now();
         let slow = [s("twitch", 6000), s("youtube", 3000), s("kick", 3000)];
         for i in 0..3 {
-            assert_eq!(p.tick(t + Duration::from_secs(i), 6000, &slow, ORDER), None, "a burst isn't trouble");
+            assert_eq!(p.tick(t + Duration::from_secs(i), &slow, ORDER), None, "a burst isn't trouble");
         }
-        assert_eq!(p.tick(t + Duration::from_secs(3), 6000, &slow, ORDER), Some(Action::Pause("kick".into())));
+        assert_eq!(p.tick(t + Duration::from_secs(3), &slow, ORDER), Some(Action::Pause("kick".into())));
         assert!(p.is_paused("kick"));
         // Still struggling with two left: the next one up pauses after another four seconds.
         let two = [s("twitch", 6000), s("youtube", 3000)];
         let mut next = None;
         for i in 4..8 {
-            next = p.tick(t + Duration::from_secs(i), 6000, &two, ORDER);
+            next = p.tick(t + Duration::from_secs(i), &two, ORDER);
         }
         assert_eq!(next, Some(Action::Pause("youtube".into())));
         // One left: never paused, whatever happens.
         for i in 8..20 {
-            assert_eq!(p.tick(t + Duration::from_secs(i), 6000, &[s("twitch", 1000)], ORDER), None);
+            assert_eq!(p.tick(t + Duration::from_secs(i), &[s("twitch", 1000)], ORDER), None);
         }
     }
 
@@ -152,17 +154,17 @@ mod tests {
         let t = Instant::now();
         let slow = [s("twitch", 6000), s("kick", 1000)];
         for i in 0..4 {
-            p.tick(t + Duration::from_secs(i), 6000, &slow, &["twitch", "kick"]);
+            p.tick(t + Duration::from_secs(i), &slow, &["twitch", "kick"]);
         }
         assert!(p.is_paused("kick"));
         let calm = [s("twitch", 6100)];
         // Calm, but the first pause lasts 60 s.
         for i in 4..60 {
-            assert_eq!(p.tick(t + Duration::from_secs(i), 6000, &calm, &["twitch", "kick"]), None, "second {i}");
+            assert_eq!(p.tick(t + Duration::from_secs(i), &calm, &["twitch", "kick"]), None, "second {i}");
         }
         let mut back = None;
         for i in 60..75 {
-            if let Some(a) = p.tick(t + Duration::from_secs(i), 6000, &calm, &["twitch", "kick"]) {
+            if let Some(a) = p.tick(t + Duration::from_secs(i), &calm, &["twitch", "kick"]) {
                 back = Some((i, a));
                 break;
             }
@@ -171,7 +173,7 @@ mod tests {
         // Trouble again: this pause is 120 s.
         let now = t + Duration::from_secs(80);
         for i in 0..4 {
-            p.tick(now + Duration::from_secs(i), 6000, &slow, &["twitch", "kick"]);
+            p.tick(now + Duration::from_secs(i), &slow, &["twitch", "kick"]);
         }
         let until = p.paused_until("kick").unwrap();
         assert!(until >= now + Duration::from_secs(120));
@@ -185,22 +187,23 @@ mod tests {
         let mut last = None;
         for i in 0..4 {
             dropped += 50;
-            let live = [s("twitch", 6000), Sample { id: "youtube", kbps: 6000, dropped, live_ms: 10_000 }];
-            last = p.tick(t + Duration::from_secs(i), 6000, &live, &["twitch", "youtube"]);
+            let live =
+                [s("twitch", 6000), Sample { id: "youtube", kbps: 6000, want_kbps: 6000, dropped, live_ms: 10_000 }];
+            last = p.tick(t + Duration::from_secs(i), &live, &["twitch", "youtube"]);
         }
         // The first sample has no "before": three growing ticks after it aren't four yet.
         assert_eq!(last, None);
         dropped += 50;
-        let live = [s("twitch", 6000), Sample { id: "youtube", kbps: 6000, dropped, live_ms: 10_000 }];
+        let live = [s("twitch", 6000), Sample { id: "youtube", kbps: 6000, want_kbps: 6000, dropped, live_ms: 10_000 }];
         assert_eq!(
-            p.tick(t + Duration::from_secs(4), 6000, &live, &["twitch", "youtube"]),
+            p.tick(t + Duration::from_secs(4), &live, &["twitch", "youtube"]),
             Some(Action::Pause("youtube".into()))
         );
         // A destination that just went live at 0 kbps isn't judged.
         let mut q = Protector::default();
-        let fresh = [s("twitch", 6000), Sample { id: "kick", kbps: 0, dropped: 0, live_ms: 1_000 }];
+        let fresh = [s("twitch", 6000), Sample { id: "kick", kbps: 0, want_kbps: 6000, dropped: 0, live_ms: 1_000 }];
         for i in 0..10 {
-            assert_eq!(q.tick(t + Duration::from_secs(i), 6000, &fresh, ORDER), None);
+            assert_eq!(q.tick(t + Duration::from_secs(i), &fresh, ORDER), None);
         }
     }
 
@@ -209,7 +212,7 @@ mod tests {
         let mut p = Protector::default();
         let t = Instant::now();
         for i in 0..4 {
-            p.tick(t + Duration::from_secs(i), 6000, &[s("twitch", 6000), s("kick", 10)], &["twitch", "kick"]);
+            p.tick(t + Duration::from_secs(i), &[s("twitch", 6000), s("kick", 10)], &["twitch", "kick"]);
         }
         assert!(p.is_paused("kick"));
         p.release("kick");
@@ -217,6 +220,6 @@ mod tests {
         p.reset();
         assert_eq!(p.next_pause, FIRST_PAUSE);
         // Nothing streaming: nothing happens.
-        assert_eq!(p.tick(t, 0, &[], &[]), None);
+        assert_eq!(p.tick(t, &[], &[]), None);
     }
 }

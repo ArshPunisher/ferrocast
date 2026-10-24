@@ -92,8 +92,19 @@ async fn a_paused_destination_stays_off_until_resumed() {
     let (e, _dir) = engine().await;
     let (port_a, mut got_a) = platform("key-a").await;
     let (port_b, mut got_b) = platform("key-b").await;
-    let a = e.add_golive_destination("Main", &format!("rtmp://127.0.0.1:{port_a}/app"), "key-a").await.unwrap();
-    let b = e.add_golive_destination("Backup", &format!("rtmp://127.0.0.1:{port_b}/app"), "key-b").await.unwrap();
+    let a = e
+        .add_golive_destination("Main", &format!("rtmp://127.0.0.1:{port_a}/app"), "key-a", crate::golive::Canvas::Main)
+        .await
+        .unwrap();
+    let b = e
+        .add_golive_destination(
+            "Backup",
+            &format!("rtmp://127.0.0.1:{port_b}/app"),
+            "key-b",
+            crate::golive::Canvas::Main,
+        )
+        .await
+        .unwrap();
     let (server, key) = e.golive_ingest().await.unwrap();
     let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
     let _obs = Obs::publish(port, "live", &key).await.unwrap();
@@ -128,6 +139,105 @@ async fn a_paused_destination_stays_off_until_resumed() {
     assert_eq!(until(&mut got_a, publish).await, Got::Publish("key-a".into()));
     assert!(!e.golive_view().await.protect);
     assert!(!e.golive_config().protect);
+}
+
+/// OBS's vertical canvas on the second key: only vertical destinations get it, and they stop
+/// when it stops, while the normal stream's destinations follow the normal stream.
+#[tokio::test]
+async fn the_vertical_canvas_goes_only_to_vertical_destinations() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::{Got, Obs, next, platform};
+    let (e, _dir) = engine().await;
+    let (port_v, mut got_v) = platform("vert-key").await;
+    let (port_m, mut got_m) = platform("main-key").await;
+    e.add_golive_destination("Shorts box", &format!("rtmp://127.0.0.1:{port_v}/app"), "vert-key", Canvas::Vertical)
+        .await
+        .unwrap();
+    e.add_golive_destination("Backup", &format!("rtmp://127.0.0.1:{port_m}/app"), "main-key", Canvas::Main)
+        .await
+        .unwrap();
+    let (server, vkey) = e.golive_vertical_ingest().await.unwrap();
+    let (_, key) = e.golive_ingest().await.unwrap();
+    assert_ne!(vkey, key);
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let vertical = Obs::publish(port, "live", &vkey).await.unwrap();
+    assert_eq!(next(&mut got_v).await, Got::Publish("vert-key".into()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), got_m.recv()).await.is_err(),
+        "the normal destination waits for the normal stream"
+    );
+    let v = e.golive_view().await;
+    assert!(v.vertical_live && !v.live);
+    // The normal stream starts too: its destination joins; the vertical stops alone.
+    let _main = Obs::publish(port, "live", &key).await.unwrap();
+    assert_eq!(next(&mut got_m).await, Got::Publish("main-key".into()));
+    drop(vertical);
+    loop {
+        let g = tokio::time::timeout(std::time::Duration::from_secs(5), got_v.recv()).await.unwrap().unwrap();
+        if g == Got::Closed {
+            break;
+        }
+    }
+    assert!(e.golive_view().await.live);
+}
+
+/// Aitum Vertical: pointed at Ferrocast's vertical key with its own setting kept, never while
+/// it streams, and put back exactly.
+#[tokio::test]
+async fn aitum_vertical_is_pointed_here_and_put_back() {
+    use ferrocast_testkit::obs::FakeVertical;
+    let (e, dir) = engine().await;
+    let st = FakeObs::studio();
+    st.lock().unwrap().vertical = Some(FakeVertical {
+        streaming: false,
+        server: "rtmps://a.rtmps.youtube.com/live2".into(),
+        key: "yt-vertical".into(),
+    });
+    let port = start_obs(st.clone()).await;
+    e.save_obs(ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
+    let ws = dir.path().join("obs-studio/plugin_config/obs-websocket/config.json");
+    let vdir = dir.path().join("obs-studio/plugin_config/vertical-canvas");
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(
+        vdir.join("config.json"),
+        serde_json::to_vec(&json!({ "canvas": [{ "width": 1080, "height": 1920, "stream_outputs": [
+            { "name": "YouTube", "stream_server": "rtmps://a.rtmps.youtube.com/live2", "stream_key": "yt-vertical" }] }] }))
+        .unwrap(),
+    )
+    .unwrap();
+    e.set_obs_detect_paths(vec![ws]);
+    let v = e.golive_view().await.obs.vertical.expect("Aitum Vertical is there");
+    assert!(!v.points_here && v.before.is_none());
+    // Not while it streams.
+    st.lock().unwrap().vertical.as_mut().unwrap().streaming = true;
+    assert!(e.golive_point_vertical().await.unwrap_err().to_string().contains("streaming"));
+    st.lock().unwrap().vertical.as_mut().unwrap().streaming = false;
+    let v = e.golive_point_vertical().await.unwrap().unwrap();
+    assert!(v.points_here);
+    assert_eq!(v.before.as_deref(), Some("a.rtmps.youtube.com"));
+    let (server, vkey) = e.golive_vertical_ingest().await.unwrap();
+    {
+        let s = st.lock().unwrap();
+        let fv = s.vertical.as_ref().unwrap();
+        assert_eq!((fv.server.as_str(), fv.key.as_str()), (server.as_str(), vkey.as_str()));
+    }
+    // Pointing again keeps the first saved setting.
+    e.golive_point_vertical().await.unwrap();
+    let v = e.golive_restore_vertical().await.unwrap().unwrap();
+    assert!(!v.points_here);
+    {
+        let s = st.lock().unwrap();
+        let fv = s.vertical.as_ref().unwrap();
+        assert_eq!((fv.server.as_str(), fv.key.as_str()), ("rtmps://a.rtmps.youtube.com/live2", "yt-vertical"));
+    }
+    assert!(e.golive_restore_vertical().await.unwrap_err().to_string().contains("no earlier"));
+    // No stream output in Aitum Vertical yet: said, not pretended.
+    std::fs::remove_file(vdir.join("config.json")).unwrap();
+    assert!(e.golive_point_vertical().await.unwrap_err().to_string().contains("no stream output"));
+    // Without the plugin: said plainly.
+    st.lock().unwrap().vertical = None;
+    assert!(e.golive_view().await.obs.vertical.is_none());
+    assert!(e.golive_point_vertical().await.unwrap_err().to_string().contains("Aitum Vertical"));
 }
 
 /// Aitum Multistream in OBS: its outputs, where each goes (from its settings file, never the

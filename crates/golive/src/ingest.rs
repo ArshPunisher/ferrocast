@@ -1,6 +1,7 @@
-//! Where OBS sends its one stream: an RTMP server on 127.0.0.1 only (R-43). It takes one
-//! publisher at a time, and only with this install's stream key, then hands the packets to the
-//! [`Hub`]. OBS's stream setting points here (`rtmp://127.0.0.1:<port>/live` + the key).
+//! Where OBS sends its stream: an RTMP server on 127.0.0.1 only (R-43). Each stream key is a
+//! route to its own [`Hub`] (the normal picture, and OBS's vertical canvas on a second key);
+//! each route takes one publisher at a time. OBS's stream setting points here
+//! (`rtmp://127.0.0.1:<port>/live` + the key).
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -29,20 +30,33 @@ const IDLE: Duration = Duration::from_secs(30);
 /// Local connections at once (OBS uses one; a few more for retries and the upload check).
 const MAX_CONNECTIONS: usize = 4;
 
+/// One stream key and where its stream goes.
+#[derive(Debug)]
+struct Route {
+    key: Arc<str>,
+    hub: Arc<Hub>,
+    busy: AtomicBool,
+}
+
 /// The local RTMP server, bound and ready to run.
 #[derive(Debug)]
 pub struct Ingest {
     listener: TcpListener,
-    key: Arc<str>,
-    hub: Arc<Hub>,
-    busy: Arc<AtomicBool>,
+    routes: Vec<Arc<Route>>,
 }
 
 impl Ingest {
-    /// Binds 127.0.0.1:`port` (0 picks a free one).
+    /// Binds 127.0.0.1:`port` (0 picks a free one), with `key` sending to `hub`.
     pub async fn bind(port: u16, key: impl Into<Arc<str>>, hub: Arc<Hub>) -> std::io::Result<Self> {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
-        Ok(Self { listener, key: key.into(), hub, busy: Arc::new(AtomicBool::new(false)) })
+        Ok(Self { listener, routes: vec![Arc::new(Route { key: key.into(), hub, busy: AtomicBool::new(false) })] })
+    }
+
+    /// Another stream key, with its own hub (OBS's vertical canvas).
+    #[must_use]
+    pub fn with_route(mut self, key: impl Into<Arc<str>>, hub: Arc<Hub>) -> Self {
+        self.routes.push(Arc::new(Route { key: key.into(), hub, busy: AtomicBool::new(false) }));
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -56,7 +70,8 @@ impl Ingest {
 
     /// Accepts connections until `stop` turns true.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
-        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS * self.routes.len()));
+        let routes: Arc<[Arc<Route>]> = self.routes.clone().into();
         loop {
             tokio::select! {
                 _ = stop.wait_for(|s| *s) => return,
@@ -66,9 +81,9 @@ impl Ingest {
                         tracing::warn!("golive ingest: too many local connections, refused one");
                         continue;
                     };
-                    let (key, hub, busy) = (self.key.clone(), self.hub.clone(), self.busy.clone());
+                    let routes = routes.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = serve(sock, &key, &hub, &busy).await {
+                        if let Err(err) = serve(sock, &routes).await {
                             tracing::info!(error = %err, "golive ingest: a connection ended");
                         }
                         drop(slot);
@@ -93,20 +108,19 @@ enum IngestError {
     Io(#[from] std::io::Error),
 }
 
-/// While this lives, the connection is the publisher; dropping it ends the stream for everyone.
+/// While this lives, the connection is its route's publisher; dropping it ends that stream.
 struct Publishing<'a> {
-    hub: &'a Hub,
-    busy: &'a AtomicBool,
+    route: &'a Route,
 }
 
 impl Drop for Publishing<'_> {
     fn drop(&mut self) {
-        self.hub.end();
-        self.busy.store(false, Ordering::Release);
+        self.route.hub.end();
+        self.route.busy.store(false, Ordering::Release);
     }
 }
 
-async fn serve(mut sock: TcpStream, key: &str, hub: &Hub, busy: &AtomicBool) -> Result<(), IngestError> {
+async fn serve(mut sock: TcpStream, routes: &[Arc<Route>]) -> Result<(), IngestError> {
     let _ = sock.set_nodelay(true);
     let rest = timeout(HANDSHAKE_DEADLINE, conn::handshake(&mut sock, PeerType::Server))
         .await
@@ -123,8 +137,7 @@ async fn serve(mut sock: TcpStream, key: &str, hub: &Hub, busy: &AtomicBool) -> 
             match result {
                 ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await?,
                 ServerSessionResult::RaisedEvent(ev) => {
-                    let (more, no) =
-                        on_event(&mut session, ev, key, hub, busy, &mut publishing).map_err(session_err)?;
+                    let (more, no) = on_event(&mut session, ev, routes, &mut publishing).map_err(session_err)?;
                     refused |= no;
                     queue.extend(more);
                 }
@@ -147,9 +160,7 @@ async fn serve(mut sock: TcpStream, key: &str, hub: &Hub, busy: &AtomicBool) -> 
 fn on_event<'a>(
     session: &mut ServerSession,
     ev: ServerSessionEvent,
-    key: &str,
-    hub: &'a Hub,
-    busy: &'a AtomicBool,
+    routes: &'a [Arc<Route>],
     publishing: &mut Option<Publishing<'a>>,
 ) -> Result<(Vec<ServerSessionResult>, bool), rml_rtmp::sessions::ServerSessionError> {
     let ok = |r: Vec<ServerSessionResult>| Ok((r, false));
@@ -163,31 +174,44 @@ fn on_event<'a>(
             }
         }
         ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
-            if !conn::same_secret(&stream_key, key) {
+            // Every key is compared (in constant time), so timing doesn't tell which one is close.
+            let mut found = None;
+            for r in routes {
+                if conn::same_secret(&stream_key, &r.key) {
+                    found = Some(r.as_ref());
+                }
+            }
+            let Some(route) = found else {
                 tracing::warn!("golive ingest: refused a publisher with the wrong stream key");
                 return refuse(session.reject_request(request_id, "NetStream.Publish.BadName", "Wrong stream key")?);
-            }
-            if busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            };
+            if route.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
                 return refuse(session.reject_request(
                     request_id,
                     "NetStream.Publish.BadName",
                     "Already publishing",
                 )?);
             }
-            hub.start();
-            *publishing = Some(Publishing { hub, busy });
+            route.hub.start();
+            *publishing = Some(Publishing { route });
             ok(session.accept_request(request_id)?)
         }
-        ServerSessionEvent::StreamMetadataChanged { metadata, .. } if publishing.is_some() => {
-            hub.metadata(metadata);
+        ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
+            if let Some(p) = publishing {
+                p.route.hub.metadata(metadata);
+            }
             ok(Vec::new())
         }
-        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } if publishing.is_some() => {
-            hub.video(timestamp.value, data);
+        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+            if let Some(p) = publishing {
+                p.route.hub.video(timestamp.value, data);
+            }
             ok(Vec::new())
         }
-        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } if publishing.is_some() => {
-            hub.audio(timestamp.value, data);
+        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+            if let Some(p) = publishing {
+                p.route.hub.audio(timestamp.value, data);
+            }
             ok(Vec::new())
         }
         ServerSessionEvent::PublishStreamFinished { .. } => {

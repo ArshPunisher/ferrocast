@@ -1537,8 +1537,14 @@ async fn go_live_routes_refuse_what_is_wrong() {
     r.engine.start_golive(0).await;
     let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
     assert!(v["ingest"].as_str().unwrap().starts_with("rtmp://127.0.0.1:"));
-    assert_eq!(v["destinations"].as_array().unwrap().len(), 3);
+    assert_eq!(v["destinations"].as_array().unwrap().len(), 4);
     assert_eq!(v["destinations"][0]["id"], "twitch");
+    assert_eq!(
+        (v["destinations"][3]["id"].as_str(), v["destinations"][3]["canvas"].as_str()),
+        (Some("youtube_vertical"), Some("vertical"))
+    );
+    assert_eq!(v["destinations"][3]["name"], "YouTube Shorts live");
+    assert_eq!(v["vertical_live"], false);
     assert_eq!(v["destinations"][0]["enabled"], false);
     assert_eq!(v["live"], false);
     // The order must list every destination once.
@@ -1546,10 +1552,12 @@ async fn go_live_routes_refuse_what_is_wrong() {
         r.put("/api/v1/golive/destinations", json!({ "destinations": [{ "id": "twitch", "enabled": true }] })).await;
     assert_eq!(error_code(short).await.0, StatusCode::BAD_REQUEST);
     let twice = json!({ "destinations": [
-        { "id": "twitch", "enabled": true }, { "id": "twitch", "enabled": true }, { "id": "kick", "enabled": true } ] });
+        { "id": "twitch", "enabled": true }, { "id": "twitch", "enabled": true }, { "id": "kick", "enabled": true },
+        { "id": "youtube_vertical", "enabled": false } ] });
     assert_eq!(error_code(r.put("/api/v1/golive/destinations", twice).await).await.0, StatusCode::BAD_REQUEST);
     let unknown = json!({ "destinations": [
-        { "id": "twitch", "enabled": true }, { "id": "nope", "enabled": true }, { "id": "kick", "enabled": true } ] });
+        { "id": "twitch", "enabled": true }, { "id": "nope", "enabled": true }, { "id": "kick", "enabled": true },
+        { "id": "youtube_vertical", "enabled": false } ] });
     assert_eq!(error_code(r.put("/api/v1/golive/destinations", unknown).await).await.0, StatusCode::BAD_REQUEST);
     let extra = json!({ "destinations": [], "secret": 1 });
     assert_eq!(error_code(r.put("/api/v1/golive/destinations", extra).await).await.0, StatusCode::BAD_REQUEST);
@@ -1665,5 +1673,5 @@ async fn a_custom_destination_gets_the_stream_end_to_end() {
         .unwrap();
     assert_eq!(gone.status(), StatusCode::NO_CONTENT);
     let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
-    assert_eq!(v["destinations"].as_array().unwrap().len(), 3);
+    assert_eq!(v["destinations"].as_array().unwrap().len(), 4);
 }

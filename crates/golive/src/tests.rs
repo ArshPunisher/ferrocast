@@ -317,6 +317,23 @@ async fn only_one_publisher_at_a_time() {
 }
 
 #[tokio::test]
+async fn a_second_key_feeds_its_own_hub() {
+    let (main, vertical) = (Hub::new(), Hub::new());
+    let ingest = Ingest::bind(0, OBS_KEY, main.clone()).await.unwrap().with_route("obs-key-vertical", vertical.clone());
+    let port = ingest.port();
+    let (_stop, rx) = watch::channel(false);
+    tokio::spawn(ingest.run(rx));
+    let _v = Obs::publish(port, "live", "obs-key-vertical").await.unwrap();
+    assert!(vertical.live().borrow().on);
+    assert!(!main.live().borrow().on, "the vertical stream doesn't start the main one");
+    // Both at once, each one publisher.
+    let _m = Obs::publish(port, "live", OBS_KEY).await.unwrap();
+    assert!(main.live().borrow().on);
+    assert!(Obs::publish(port, "live", "obs-key-vertical").await.is_err());
+    assert!(Obs::publish(port, "live", "obs-key-vertical-x").await.is_err());
+}
+
+#[tokio::test]
 async fn a_refused_destination_key_says_so_and_keeps_trying() {
     let w = world().await;
     let l = free_listener().await;

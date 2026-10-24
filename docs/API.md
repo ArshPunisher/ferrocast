@@ -682,14 +682,16 @@ OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key
 
 ```ts
 type Service = "twitch" | "youtube" | "kick" | "custom"
-type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "c_<hex>" */; kind: Service; name?: string; url?: string /* custom */; enabled: boolean }
+type Canvas = "main" | "vertical"   // OBS's normal stream, or its vertical canvas (A2.3)
+type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "youtube_vertical" | "c_<hex>" */; kind: Service; name?: string; url?: string /* custom */;
+                           enabled: boolean; canvas?: Canvas /* left out: "main" */ }
 type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                  | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string }
                  | { state: "paused"; until_ms: number /* earliest it comes back */; reason: string /* upload protection */ })
                  & { kbps: number; dropped: number; since_ms: number }
 type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
-type DestinationView = { id: string; kind: Service; name: string; account: string | null /* platform account, or a custom server's host */;
+type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;
                          enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
                          blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */ }
 type UploadRow = { id: string; name: string; server: string | null; delay_ms: number | null; need_kbps: number; problem?: string }
@@ -697,30 +699,36 @@ type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: Upl
                      verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
 type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                     obs: { connected: boolean; points_here: boolean; streaming: boolean; before: string | null /* "Twitch", "a custom server" */;
-                           aitum: { name: string; platform: Service | null /* "custom" never; null when unknown */; live: boolean }[] | null /* Aitum Multistream's outputs, when OBS has it */ };
-                    live: boolean; stats: StreamStats; destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
+                           aitum: { name: string; platform: Service | null /* "custom" never; null when unknown */; live: boolean }[] | null /* Aitum Multistream's outputs, when OBS has it */;
+                           vertical: { points_here: boolean; streaming: boolean; before: string | null /* host */ } | null /* Aitum Vertical, when OBS has it */ };
+                    live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
+                    destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
                     protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */ }
 ```
 
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/golive` | → `GoLiveView` (asks OBS for its stream setting) |
-| GET | `/api/v1/golive/ingest` | → `{ server, key }` for setting OBS up by hand. Denied to phones. 422 `golive_off` when the local server didn't start |
+| GET | `/api/v1/golive/ingest` | → `{ server, key, vertical_key }` for setting OBS up by hand (`vertical_key` for its vertical canvas). Denied to phones. 422 `golive_off` when the local server didn't start |
 | PUT | `/api/v1/golive/destinations` | `{ destinations: [{ id, enabled }] }` (every destination once, top first) → `{ destinations: DestinationConfig[] }`. While live, a newly ticked one starts and an unticked one stops at once. 400 for a missing, repeated or unknown id |
-| POST | `/api/v1/golive/destinations` | `{ name /* 1–40 */, url /* rtmp:// or rtmps:// */, key /* no spaces, ≤ 512 */ }` → 201 `DestinationConfig` (ticked, added last; the key is never returned). 400 names the field (`url: The server address must start with rtmp:// or rtmps://.`), 409 over 8. Denied to phones |
+| POST | `/api/v1/golive/destinations` | `{ name /* 1–40 */, url /* rtmp:// or rtmps:// */, key /* no spaces, ≤ 512 */, canvas?: Canvas }` → 201 `DestinationConfig` (ticked, added last; the key is never returned). 400 names the field (`url: The server address must start with rtmp:// or rtmps://.`), 409 over 8. Denied to phones |
 | DELETE | `/api/v1/golive/destinations/{id}` | → 204 (custom servers only; its key is deleted). 400 for twitch / youtube / kick (switch them off), 404 unknown. Denied to phones |
 | POST | `/api/v1/golive/obs/setup` | Points OBS's stream setting at the local server, saving the one before (with its key, in the secret store) → `GoLiveView.obs`. 422 `obs_streaming` while OBS streams (OBS refuses; it would cut the stream), `obs_unreachable` / `obs_password` |
 | POST | `/api/v1/golive/obs/restore` | Puts OBS's earlier stream setting back exactly → `GoLiveView.obs`. 422 `golive_nothing_saved`, `obs_streaming` |
 | POST | `/api/v1/golive/upload-check` | ~8 s → `UploadCheck`: each ticked destination's server and connect delay, the upload speed (Twitch's bandwidth-test mode when Twitch is ticked: nothing goes live; else an upload to Cloudflare's speed test), each needing the stream's measured rate (6,160 kbps before anything streamed), and the verdict with 20% kept free. 422 `golive_none` (nothing ticked), `golive_upload`; 429 while one runs |
 | PUT | `/api/v1/golive/protection` | `{ on: boolean }` → `{ destinations, protect }`. Off brings every paused destination back at once |
+| POST | `/api/v1/golive/vertical/obs/setup` | Points Aitum Vertical's first stream output at the local server with the vertical key, keeping its own server and key (secret store) → `ObsView.vertical`. 422 `aitum_vertical_missing`, `aitum_vertical_no_output` (add a stream output in its settings first), `obs_streaming` (its canvas streams) |
+| POST | `/api/v1/golive/vertical/obs/restore` | Puts Aitum Vertical's own server and key back → `ObsView.vertical`. 422 `golive_nothing_saved`, `obs_streaming` |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
 | POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
+
+**Vertical (A2.3).** OBS's vertical canvas (Aitum Vertical, or anything else sending to `vertical_key`) streams to the same local server on its own key, into its own stream. Destinations with `canvas: "vertical"` get that stream and run while it's live, whatever the normal stream does. `youtube_vertical` (YouTube Shorts live) is made by Ferrocast: a reusable YouTube stream "Ferrocast vertical" once (about 150 units the first time), and before each vertical stream a broadcast bound to it that starts and ends by itself, with the title and privacy of the channel's normal live (2 units when it exists); the normal YouTube destination never picks that stream. Twitch and Kick take one live per channel, so vertical goes to YouTube or your own servers (`POST /golive/destinations` with `"canvas": "vertical"`). Upload protection counts vertical destinations after every normal one, so they pause first, each judged against its own stream's rate. The upload check plans 4,660 kbps for vertical before it has streamed.
 
 **Aitum Multistream (A2.2).** When OBS has the Aitum Multistream plugin (it answers the `aitum-multistream` / `get_outputs` vendor request), `GoLiveView.obs.aitum` lists its outputs: which are sending now (OBS's output `aitum_multi_output_<name>` is active) and the platform each goes to, from the plugin's settings file `<OBS config>/plugin_config/aitum-multistream/config.json` for OBS's current profile (only each output's name and server are read, never its key), else from its name. The dashboard warns when one goes to a platform Go live also sends to: before going live unless `aitum_ok`, and while both are live always.
 
 **Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
-Live frame `golive { live, stats, destinations }` (§5): every second while OBS streams, and after every change.
+Live frame `golive { live, stats, vertical_live, vertical_stats, destinations }` (§5): every second while OBS streams, and after every change.
 
 ### Auto-replies (free, local)
 The bot answers chat that mentions something ("discord" → the invite), without a `!command`. Checked on live chat from this channel after moderation passed it; never for a message a command answers (custom, counter, module or points command), never for the streamer's own account (the bot speaks as it, R-28), the connected account, accounts with the bot role or well-known bots (Nightbot, StreamElements…), and never for text the bot itself sent in the last 2 minutes (loop guard). Quiet while the bot is off (`bot_enabled`) or panic mode is on. Rules are checked in order and the **first match wins** (a later rule never answers a message an earlier one matched, even while that one cools down). Each platform has a send budget for auto-replies (R-19: 6 per 30 s on Twitch and Kick, 2 per minute on YouTube); a platform's own rate limit pauses auto-replies there for its `Retry-After`.
@@ -809,7 +817,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
-- `golive { live, stats: StreamStats, destinations: DestinationView[] }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
+- `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[] }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
 - `smart_mod SmartSuggestion` (§4 Smart features): a new suggestion, or one that changed (done, undone, dismissed, an error). Never sent to a mod's phone.
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
 
