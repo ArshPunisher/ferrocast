@@ -26,6 +26,12 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24 (A2.1 per-platform stream info, A2.2 Aitum Multistream, beta.4 draft)
+- Owner's picks from `design/2026-10-24-vertical-modes`: 1B 2B 4B 5A, the rest as drawn (LIVE-STUDIO.md).
+- A2.1: stream info can differ per platform (`per`), with tabs in the dashboard. A2.2: Ferrocast notices Aitum Multistream sending to the same platforms and says so before and during a stream.
+- 2.0.0-beta.4 built as a draft (Mac, Windows, Linux). CI caught two new RustSec advisories: ctutils updated (relay), crypto-bigint 0.5 ignored with the reason (only age's P-256 code, never used). The relay with the ctutils fix is built; deploying it waits for the owner's OK.
+- Go live config saves now take the config lock (CodeRabbit: two saves at once could undo each other).
+
 ### 2026-10-24 (Go live: upload protection, A1.8)
 - When the upload can't carry every platform, the bottom live one pauses so the ones above stay smooth, and comes back by itself after a calm spell (60 s first, doubling to 10 min). Never the last one live; nothing stays paused when the stream ends. State machine in `crates/golive/src/protect.rs`, wired into the engine's per-second Go live loop.
 - New routes: `PUT /golive/protection {on}`, `POST /golive/resume/{id}` (outside `/golive/destinations/*`, so a phone can press Resume now while adding servers stays denied). API.md documents the `paused` state and the rules.
