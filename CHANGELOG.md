@@ -5,6 +5,13 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.6
+
+Everything in beta.5 (its build was stopped), plus two fixes from a real test:
+
+- Aitum Multistream 1.0.8 is noticed too (it doesn't answer OBS's remote control).
+- When upload protection pauses a platform, it names the one it keeps smooth correctly.
+
 ## 2.0.0-beta.5
 
 - Vertical streams: Studio has a Vertical tab. Point Aitum Vertical (OBS's vertical canvas) at
