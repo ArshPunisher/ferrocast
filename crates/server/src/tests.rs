@@ -1603,6 +1603,15 @@ async fn go_live_routes_refuse_what_is_wrong() {
         error_code(r.put("/api/v1/golive/protection", json!({ "on": "yes" })).await).await.0,
         StatusCode::BAD_REQUEST
     );
+    // Advanced settings: checked by field; saved and shown.
+    let mut adv = v["advanced"].clone();
+    adv["rules"]["calm_s"] = json!(500);
+    let (status, _) = error_code(r.put("/api/v1/golive/advanced", adv.clone()).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    adv["rules"]["calm_s"] = json!(20);
+    adv["keep_free_pct"] = json!(25);
+    let saved: Value = r.put("/api/v1/golive/advanced", adv).await.json().await.unwrap();
+    assert_eq!(saved["advanced"]["keep_free_pct"], 25);
     // Aitum Multistream: "on purpose" is saved; no OBS means no plugin to report.
     assert_eq!(v["aitum_ok"], false);
     assert_eq!(v["obs"]["aitum"], Value::Null);

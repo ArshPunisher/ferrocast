@@ -31,6 +31,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/vertical/cut", put(vertical_cut))
         .route("/golive/picture", get(picture))
         .route("/golive/ffmpeg", post(get_ffmpeg))
+        .route("/golive/advanced", put(advanced))
+        .route("/golive/new-key", post(new_key))
         .route("/golive/vertical/obs/restore", post(restore_vertical))
         .route("/golive/resume/{id}", post(resume))
 }
@@ -163,4 +165,18 @@ async fn picture(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 /// Fetches ffmpeg for cutting the vertical picture (once; the cut starts when it's ready).
 async fn get_ffmpeg(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.get_ffmpeg().await?)))
+}
+
+/// Go live's Advanced settings (A2.5).
+async fn advanced(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::golive::Advanced>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_advanced(b).await?)))
+}
+
+/// A new local stream key; OBS and Aitum Vertical are pointed at it again (A2.5).
+async fn new_key(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.golive_new_key().await?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -95,6 +95,93 @@ pub struct GoLiveConfig {
     /// The cut-from-stream layout (A2.4).
     #[serde(default)]
     pub cut: CutConfig,
+    /// Advanced mode's settings (A2.5): defaults that work for most people.
+    #[serde(default)]
+    pub advanced: Advanced,
+}
+
+/// Go live's Advanced settings (board items 2B and 3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Advanced {
+    /// Upload protection's rule.
+    pub rules: ferrocast_golive::protect::Rules,
+    /// How much of the upload the check keeps free for the game and chat, in percent.
+    pub keep_free_pct: u8,
+    /// The local server's port (used from the next start).
+    pub port: u16,
+    /// Per destination: its own server address and retry timing.
+    pub per: HashMap<String, DestAdvanced>,
+}
+
+impl Default for Advanced {
+    fn default() -> Self {
+        Self {
+            rules: Default::default(),
+            keep_free_pct: 20,
+            port: ferrocast_golive::ingest::DEFAULT_PORT,
+            per: HashMap::new(),
+        }
+    }
+}
+
+/// One destination's Advanced settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DestAdvanced {
+    /// A platform's server instead of the one it gives (another region; rtmp or rtmps).
+    pub server: Option<String>,
+    pub first_retry_s: u32,
+    pub max_retry_s: u32,
+}
+
+impl Default for DestAdvanced {
+    fn default() -> Self {
+        Self { server: None, first_retry_s: 1, max_retry_s: 30 }
+    }
+}
+
+impl Advanced {
+    /// Messages name the field.
+    pub fn validate(&self, destinations: &[DestinationConfig]) -> Result<(), String> {
+        self.rules.validate().map_err(|m| format!("rules.{m}"))?;
+        if let Some(id) = &self.rules.first_to_pause
+            && !destinations.iter().any(|d| &d.id == id)
+        {
+            return Err("rules.first_to_pause: no such destination.".into());
+        }
+        if self.keep_free_pct > 50 {
+            return Err("keep_free_pct: 0 to 50 percent.".into());
+        }
+        if self.port < 1024 {
+            return Err("port: 1024 to 65535.".into());
+        }
+        for (id, a) in &self.per {
+            let d =
+                destinations.iter().find(|d| &d.id == id).ok_or_else(|| format!("per.{id}: no such destination."))?;
+            if let Some(server) = &a.server {
+                if d.kind == Service::Custom {
+                    return Err(format!("per.{id}.server: a server of your own already has its address."));
+                }
+                Target::parse(server).map_err(|e| format!("per.{id}.server: {e}"))?;
+            }
+            if !(1..=30).contains(&a.first_retry_s) {
+                return Err(format!("per.{id}.first_retry_s: 1 to 30 seconds."));
+            }
+            if a.max_retry_s < a.first_retry_s || a.max_retry_s > 600 {
+                return Err(format!("per.{id}.max_retry_s: at least the first wait, at most 600 seconds."));
+            }
+        }
+        Ok(())
+    }
+
+    fn retry(&self, id: &str) -> ferrocast_golive::push::Retry {
+        let a = self.per.get(id).cloned().unwrap_or_default();
+        ferrocast_golive::push::Retry {
+            first: Duration::from_secs(u64::from(a.first_retry_s)),
+            max: Duration::from_secs(u64::from(a.max_retry_s)),
+        }
+    }
 }
 
 /// Where the vertical picture comes from.
@@ -145,6 +232,7 @@ impl Default for GoLiveConfig {
             aitum_ok: false,
             vertical_source: VerticalSource::Canvas,
             cut: CutConfig::default(),
+            advanced: Advanced::default(),
         }
     }
 }
@@ -190,6 +278,8 @@ pub struct GoLiveView {
     pub aitum_ok: bool,
     /// The vertical source and, for cutting, its layout and what the cutter is doing (A2.4).
     pub cut: CutView,
+    /// Advanced mode's settings (A2.5).
+    pub advanced: Advanced,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -305,6 +395,8 @@ pub(crate) struct GoLive {
     cut: Mutex<Option<CutRun>>,
     /// The engine's data folder (where fetched ffmpeg lives).
     data_dir: Mutex<Option<std::path::PathBuf>>,
+    /// Stops the local server (for a new key) and its task, to wait for the port to free.
+    ingest_task: Mutex<Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>>,
     /// Fetching ffmpeg: progress or why it failed (`None`: not fetching).
     ffmpeg_fetch: Mutex<Option<crate::ffmpeg_get::FfmpegState>>,
 }
@@ -333,6 +425,7 @@ impl Default for GoLive {
             paused: Mutex::new(HashMap::new()),
             cut: Mutex::new(None),
             data_dir: Mutex::new(None),
+            ingest_task: Mutex::new(None),
             ffmpeg_fetch: Mutex::new(None),
         }
     }
@@ -416,7 +509,10 @@ impl Engine {
     pub async fn start_golive(&self, port: u16) {
         use ferrocast_store::repo::settings::get_or_default;
         match self.db(|s| Ok(get_or_default::<GoLiveConfig>(s, CONFIG_KEY))).await {
-            Ok(Ok(cfg)) => *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg.with_vertical(),
+            Ok(Ok(cfg)) => {
+                lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
+                *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg.with_vertical();
+            }
             Ok(Err(e)) | Err(EngineError::Store(e)) => {
                 tracing::error!(error = %e, "the Go live setting couldn't be read")
             }
@@ -432,6 +528,8 @@ impl Engine {
                 return;
             }
         };
+        // The streamer's port from Advanced mode (0 is for tests: any free port).
+        let port = if port == 0 { 0 } else { self.golive_config().advanced.port };
         let (hub, vhub) = (self.golive().hub.clone(), self.golive().vhub.clone());
         let vkey = vertical_key(&key);
         let bound = match Ingest::bind(port, key.clone(), hub.clone()).await {
@@ -448,13 +546,63 @@ impl Engine {
         };
         *lock(&self.golive().ingest) = Some(ingest.server_url());
         tracing::info!(server = %ingest.server_url(), "Go live: OBS can stream here");
-        // The ingest runs for the engine's life (it only listens on 127.0.0.1).
-        let (_keep, never) = watch::channel(false);
-        tokio::spawn(async move {
-            let _keep = _keep;
-            ingest.run(never).await;
-        });
+        // The ingest runs for the engine's life (it only listens on 127.0.0.1), or until a new
+        // key replaces it.
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(ingest.run(stop_rx));
+        *lock(&self.golive().ingest_task) = Some((stop, task));
         tokio::spawn(run(self.clone()));
+    }
+
+    /// "Make a new key": a new local key (and vertical key), the local server restarted with it,
+    /// and OBS's stream setting and Aitum Vertical pointed at it again if they pointed here.
+    /// Never while either stream is live.
+    pub async fn golive_new_key(&self) -> Result<(), EngineError> {
+        let g = self.golive();
+        if g.hub.live().borrow().on || g.vhub.live().borrow().on {
+            return Err(refused(
+                "golive_streaming",
+                "A stream is coming in right now.",
+                "Stop streaming in OBS first; the key changes between streams.",
+            ));
+        }
+        let ingest = lock(&g.ingest).clone();
+        let obs = self.golive_obs_view(ingest.as_deref()).await;
+        let (obs_here, vertical_here) = (obs.points_here, obs.vertical.as_ref().is_some_and(|v| v.points_here));
+        let port = ingest
+            .as_deref()
+            .and_then(|u| u.rsplit(':').next())
+            .and_then(|p| p.split('/').next())
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(ferrocast_golive::ingest::DEFAULT_PORT);
+        {
+            let _one = g.busy.lock().await;
+            self.inner.secrets.delete(INGEST_KEY_SECRET).map_err(|e| EngineError::Unavailable(e.to_string()))?;
+            let key = self.ingest_key()?;
+            let old = lock(&g.ingest_task).take();
+            if let Some((stop, task)) = old {
+                stop.send_replace(true);
+                let _ = task.await;
+            }
+            // The same port, else any free one (OBS is pointed at the new address below).
+            let bound = match Ingest::bind(port, key.clone(), g.hub.clone()).await {
+                Ok(i) => Ok(i),
+                Err(_) => Ingest::bind(0, key.clone(), g.hub.clone()).await,
+            };
+            let ingest = bound
+                .map_err(|e| EngineError::Unavailable(format!("the local server couldn't restart: {e}")))?
+                .with_route(vertical_key(&key), g.vhub.clone());
+            *lock(&g.ingest) = Some(ingest.server_url());
+            let (stop, stop_rx) = watch::channel(false);
+            let task = tokio::spawn(ingest.run(stop_rx));
+            *lock(&g.ingest_task) = Some((stop, task));
+        }
+        tracing::info!("Go live: a new local stream key");
+        // Both are tried even if one fails, so neither keeps the old key silently.
+        let main = if obs_here { self.golive_point_obs().await.map(|_| ()) } else { Ok(()) };
+        let vertical = if vertical_here { self.golive_point_vertical().await.map(|_| ()) } else { Ok(()) };
+        self.reconcile().await;
+        main.and(vertical)
     }
 
     pub(crate) fn golive_data_dir(&self) -> Option<std::path::PathBuf> {
@@ -585,6 +733,7 @@ impl Engine {
             upload: lock(&g.upload).clone(),
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
+            advanced: cfg.advanced.clone(),
             cut: CutView {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
@@ -870,6 +1019,11 @@ impl Engine {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
         cfg.destinations.remove(i);
+        // Its Advanced settings go with it, so a saved set never names a missing destination.
+        cfg.advanced.per.remove(id);
+        if cfg.advanced.rules.first_to_pause.as_deref() == Some(id) {
+            cfg.advanced.rules.first_to_pause = None;
+        }
         self.save_golive(cfg).await?;
         drop(one_at_a_time);
         let _ = self.inner.secrets.delete(&format!("{CUSTOM_KEY_PREFIX}{id}"));
@@ -898,9 +1052,15 @@ impl Engine {
             ));
         }
         let now = obs::stream_service(&c).await.map_err(crate::studio::obs_error)?;
-        if !now.points_at(&server) {
+        let here = now.points_at(&server);
+        // Already pointed here with another key (a new key, a reinstall): only the key changes,
+        // and the setting kept from before stays the first one.
+        let same_key = now.settings.get("key").and_then(|k| k.as_str()) == Some(key.as_str());
+        if !here {
             let json = serde_json::to_string(&now).map_err(|e| EngineError::Internal(e.to_string()))?;
             self.inner.secrets.set(OBS_BEFORE_SECRET, &json).map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        }
+        if !here || !same_key {
             obs::set_stream_service(&c, &StreamService::custom(&server, &key))
                 .await
                 .map_err(crate::studio::obs_error)?;
@@ -976,7 +1136,12 @@ impl Engine {
             let resolved = if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
                 match self.connector(Platform::Youtube) {
                     Some(_) => Target::parse(YOUTUBE_INGEST)
-                        .map(|target| Destination { id: d.id.clone(), target, key: String::new() })
+                        .map(|target| Destination {
+                            id: d.id.clone(),
+                            target,
+                            key: String::new(),
+                            retry: Default::default(),
+                        })
                         .map_err(|e| e.to_string()),
                     None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
                 }
@@ -1027,7 +1192,7 @@ impl Engine {
             .filter(|r| r.problem.is_none())
             .map(|r| Need { name: r.name.clone(), kbps: r.need_kbps })
             .collect();
-        let mut verdict = probe::verdict(upload, &needs);
+        let mut verdict = probe::verdict_keeping(upload, &needs, self.golive_config().advanced.keep_free_pct);
         let unreachable: Vec<&str> = rows.iter().filter(|r| r.problem.is_some()).map(|r| r.name.as_str()).collect();
         if !unreachable.is_empty() {
             let names = unreachable.join(", ");
@@ -1055,8 +1220,9 @@ impl Engine {
                     Canvas::Main => c.ingest().await,
                     Canvas::Vertical => c.vertical_ingest().await,
                 };
+                let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
                 match got {
-                    Ok(i) => (i.url, i.key),
+                    Ok(i) => (own_server.unwrap_or(i.url), i.key),
                     Err(ferrocast_connector::ConnectorError::MissingScope { .. }) => {
                         return Err(format!(
                             "{p} needs one more permission to stream: reconnect {p} in Settings, Accounts."
@@ -1075,7 +1241,7 @@ impl Engine {
             }
         };
         let target = Target::parse(&url).map_err(|e| e.to_string())?;
-        Ok(Destination { id: d.id.clone(), target, key })
+        Ok(Destination { id: d.id.clone(), target, key, retry: self.golive_config().advanced.retry(&d.id) })
     }
 
     /// Starts forwarders for ticked destinations whose stream (normal or vertical) is live and
@@ -1141,7 +1307,7 @@ impl Engine {
         let Ok((server, key)) = self.golive_vertical_ingest().await else { return };
         let (stop, stop_rx) = watch::channel(false);
         let (state_tx, state) = watch::channel(CutState::Waiting);
-        let encoders = ferrocast_golive::cut::encoder_candidates().to_vec();
+        let encoders = ferrocast_golive::cut::encoders_for(cfg.cut.encoder);
         tokio::spawn(ferrocast_golive::cutter::run(
             ffmpeg,
             g.hub.clone(),
@@ -1159,6 +1325,22 @@ impl Engine {
         let c = self.obs_client().await?;
         let (image, width, height) = obs::program_picture(&c, 960).await?;
         Ok(serde_json::json!({ "image": image, "width": width, "height": height }))
+    }
+
+    /// Saves Go live's Advanced settings; the protection rule applies at once, the port at
+    /// the next start.
+    pub async fn set_golive_advanced(&self, advanced: Advanced) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        advanced.validate(&cfg.destinations).map_err(EngineError::Invalid)?;
+        let rules_changed = cfg.advanced.rules != advanced.rules;
+        cfg.advanced = advanced;
+        self.save_golive(cfg.clone()).await?;
+        // After the save, and only when the rule changed (it restarts the pause doubling).
+        if rules_changed {
+            lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
+        }
+        Ok(cfg)
     }
 
     /// Picks where the vertical picture comes from.

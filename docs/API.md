@@ -704,11 +704,18 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                     live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
                     destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
                     protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */;
+                    advanced: Advanced;
                     cut: { source: "canvas" | "cut"; config: CutConfig; state: CutState | null /* null while not needed */; ffmpeg: FfmpegState } }
+type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number /* 2–30, 4 */; calm_s: number /* 5–120, 10 */;
+                            first_pause_s: number /* 10–3600, 60 */; max_pause_s: number /* ≥ first, ≤ 7200; 600 */; first_to_pause: string | null };
+                  keep_free_pct: number /* 0–50, 20: the upload check's reserve */; port: number /* the local server's, from the next start */;
+                  per: { [destination id]: { server: string | null /* a platform's own address instead (region, rtmp or rtmps) */;
+                                             first_retry_s: number /* 1–30 */; max_retry_s: number /* ≥ first, ≤ 600 */ } } }
 type FfmpegState = { state: "ready" | "missing" | "unsupported" } | { state: "downloading"; percent: number } | { state: "failed"; reason: string }
 type CutBox = { x: number; y: number; w: number; h: number }   // fractions (0–1) of the normal picture
 type CutConfig = { layout: "camera_top" | "small_camera" | "half_half" | "game_only"; camera: CutBox; game: CutBox;
-                   camera_share?: number /* 20–60 %, camera_top */; width?: 1080 | 720; height?: 1920 | 1280; fps?: 30 | 60; kbps?: number /* 1,000–12,000 */ }
+                   camera_share?: number /* 20–60 %, camera_top */; width?: 1080 | 720; height?: 1920 | 1280; fps?: 30 | 60; kbps?: number /* 1,000–12,000 */;
+                   encoder?: "auto" | "processor" }
 type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder: string; on: string /* "your graphics card" */ }
               | { state: "failed"; reason: string /* in words; it tries again by itself */ }
 ```
@@ -728,6 +735,8 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | POST | `/api/v1/golive/vertical/obs/restore` | Puts Aitum Vertical's own server and key back → `ObsView.vertical`. 422 `golive_nothing_saved`, `obs_streaming` |
 | GET | `/api/v1/golive/picture` | → `{ image /* JPEG data URL, 960 wide */, width, height /* the size OBS streams at */ }`: what's on air, for marking the camera and game. 422 `obs_unreachable`, `obs_refused` |
 | PUT | `/api/v1/golive/vertical/source` | `{ source: "canvas" \| "cut" }` → `GoLiveConfig`. `cut` without ffmpeg starts fetching it (below); 422 `ffmpeg_unsupported` where there's no build to fetch |
+| PUT | `/api/v1/golive/advanced` | `Advanced` → `GoLiveConfig`. The protection rule applies at once, the port from the next start. 400 names the field (`per.twitch.first_retry_s: 1 to 30 seconds.`) |
+| POST | `/api/v1/golive/new-key` | A new local key (and vertical key): the local server restarts with it, and OBS and Aitum Vertical are pointed at it again if they pointed here → 204. 422 `golive_streaming` while a stream comes in |
 | POST | `/api/v1/golive/ffmpeg` | Fetches ffmpeg (again, after a failure) → `FfmpegState`; progress in `GoLiveView.cut.ffmpeg` |
 | PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |

@@ -241,6 +241,61 @@ async fn the_cut_editor_gets_a_picture_of_what_is_on_air() {
     assert_eq!((v["width"].as_u64(), v["height"].as_u64()), (Some(1920), Some(1080)), "the streamed size");
 }
 
+/// Advanced mode (A2.5): settings are checked field by field and saved.
+#[tokio::test]
+async fn advanced_settings_are_checked_and_saved() {
+    use crate::golive::{Advanced, Canvas, DestAdvanced};
+    let (e, _dir) = engine().await;
+    let c = e.add_golive_destination("Backup", "rtmp://127.0.0.1:1/app", "k", Canvas::Main).await.unwrap();
+    let mut a = Advanced::default();
+    a.rules.slow_pct = 99;
+    assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("rules.slow_pct"));
+    a.rules.slow_pct = 60;
+    a.rules.first_to_pause = Some("nope".into());
+    assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("first_to_pause"));
+    a.rules.first_to_pause = Some("kick".into());
+    a.per.insert(c.id.clone(), DestAdvanced { server: Some("rtmp://x.example.com/live".into()), ..Default::default() });
+    assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("already has its address"));
+    a.per.clear();
+    a.per.insert("twitch".into(), DestAdvanced { server: Some("https://nope".into()), ..Default::default() });
+    assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("per.twitch.server"));
+    a.per.insert(
+        "twitch".into(),
+        DestAdvanced { server: Some("rtmps://live-fra.twitch.tv/app".into()), first_retry_s: 2, max_retry_s: 60 },
+    );
+    a.keep_free_pct = 30;
+    e.set_golive_advanced(a.clone()).await.unwrap();
+    let v = e.golive_view().await;
+    assert_eq!(v.advanced, a);
+    assert_eq!(e.golive_config().advanced.keep_free_pct, 30);
+    let mut bad = a.clone();
+    bad.per.insert("twitch".into(), DestAdvanced { first_retry_s: 40, ..Default::default() });
+    assert!(e.set_golive_advanced(bad).await.unwrap_err().to_string().contains("first_retry_s"));
+}
+
+/// "Make a new key": the old key stops working, the new one works, and OBS is pointed at it.
+#[tokio::test]
+async fn a_new_key_replaces_the_old_one_and_obs_follows() {
+    use ferrocast_testkit::rtmp::Obs;
+    let (e, _dir) = engine().await;
+    let st = FakeObs::studio();
+    let port = start_obs(st.clone()).await;
+    e.save_obs(ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
+    e.golive_point_obs().await.unwrap();
+    let (server, old) = e.golive_ingest().await.unwrap();
+    e.golive_new_key().await.unwrap();
+    let (server2, new) = e.golive_ingest().await.unwrap();
+    assert_eq!(server, server2, "same address");
+    assert_ne!(old, new);
+    assert_eq!(st.lock().unwrap().service["key"], new.as_str(), "OBS follows");
+    let p: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    assert!(Obs::publish(p, "live", &old).await.is_err(), "the old key is refused");
+    let _ok = Obs::publish(p, "live", &new).await.unwrap();
+    // Not while a stream comes in.
+    let err = e.golive_new_key().await.unwrap_err().to_string();
+    assert!(err.contains("right now"), "{err}");
+}
+
 /// Aitum Vertical: pointed at Ferrocast's vertical key with its own setting kept, never while
 /// it streams, and put back exactly.
 #[tokio::test]
