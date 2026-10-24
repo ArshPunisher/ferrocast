@@ -261,6 +261,17 @@ async fn stream_info_answers_200_207_or_422_with_each_platforms_result() {
     assert_eq!(v["error"]["code"], "stream_info_failed");
     assert_eq!(v["results"][0]["platform"], "kick", "the details come with the error");
     assert_eq!(code(r.post("/stream-info/apply", json!({ "info": {} })).await).await.0, StatusCode::BAD_REQUEST);
+    // A platform's own fields: checked like the rest, named by platform; unknown platforms refused.
+    let (s, v) = body(
+        r.post("/stream-info/apply", json!({ "info": { "title": "x", "per": { "youtube": { "title": "" } } } })).await,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap().starts_with("per.youtube.title:"), "{v}");
+    assert_eq!(
+        code(r.post("/stream-info/apply", json!({ "info": { "title": "x", "per": { "tiktok": {} } } })).await).await.0,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         code(r.post("/stream-info/apply", json!({ "info": { "title": "x".repeat(141) } })).await).await.0,
         StatusCode::BAD_REQUEST

@@ -133,17 +133,18 @@ impl Engine {
                 retry_after: None,
             });
         }
-        // The thumbnail is read once from the media library, for the platforms that take one.
-        let thumb = match &info.thumbnail {
-            Some(id) => Some(self.thumbnail_image(id).await),
-            None => None,
-        };
-        let jobs = targets.iter().map(|&p| {
-            let info = info.clone();
+        // Each platform gets the everywhere fields with its own on top. The thumbnail is read
+        // from the media library only for platforms that take one.
+        let mut jobs = Vec::new();
+        for &p in &targets {
+            let info = info.for_platform(p);
+            let thumb = match &info.thumbnail {
+                Some(id) if stream_info::supports(p).thumbnail => Some(self.thumbnail_image(id).await),
+                _ => None,
+            };
             let c = self.connector(p);
-            let thumb = thumb.clone();
-            async move { (p, push_one(p, c, &info, thumb).await) }
-        });
+            jobs.push(async move { (p, push_one(p, c, &info, thumb).await) });
+        }
         let results: Vec<PlatformResult> =
             futures_util::future::join_all(jobs).await.into_iter().map(|(_, r)| r).collect();
         let ok = results.iter().filter(|r| r.ok).count();

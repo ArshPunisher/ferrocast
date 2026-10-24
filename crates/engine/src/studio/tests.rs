@@ -466,6 +466,35 @@ async fn stream_info_reports_each_platform_and_keeps_history() {
 }
 
 #[tokio::test]
+async fn each_platform_gets_its_own_fields_on_top_of_everywhere() {
+    use ferrocast_core::stream_info::PerPlatform;
+    let (e, _d) = engine().await;
+    let tw = Fake::new(Platform::Twitch);
+    let yt = Fake::new(Platform::Youtube);
+    e.register_connector(tw.clone());
+    e.register_connector(yt.clone());
+    let info = StreamInfo {
+        title: Some("Day 41: Immortal or bust".into()),
+        tags: Some(vec!["valorant".into()]),
+        per: PerPlatform {
+            twitch: Some(Box::new(StreamInfo { title: Some("Ranked grind | !socials".into()), ..Default::default() })),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let r = e.apply_stream_info(info, None, None).await.unwrap();
+    assert_eq!((r.ok, r.failed), (2, 0));
+    let got = tw.infos.lock().unwrap()[0].clone();
+    assert_eq!(got.title.as_deref(), Some("Ranked grind | !socials"));
+    assert_eq!(got.tags, Some(vec!["valorant".to_string()]));
+    assert!(got.per.is_empty(), "a platform only sees its own merged fields");
+    assert_eq!(yt.infos.lock().unwrap()[0].title.as_deref(), Some("Day 41: Immortal or bust"));
+    // History and presets keep the per-platform choices.
+    let last = e.stream_info().await.unwrap().last.unwrap();
+    assert_eq!(last.info.per.twitch.as_ref().and_then(|t| t.title.as_deref()), Some("Ranked grind | !socials"));
+}
+
+#[tokio::test]
 async fn presets_and_reconnect_hints() {
     use ferrocast_core::stream_info::Preset;
     let (e, _d) = engine().await;

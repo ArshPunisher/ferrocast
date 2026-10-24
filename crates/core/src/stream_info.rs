@@ -63,11 +63,85 @@ pub struct StreamInfo {
     /// A picture from the media library for the stream's thumbnail (only YouTube takes one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// A platform's own fields, used there instead of the ones above (A2.1). A field left out
+    /// of a platform's own uses the everywhere one.
+    #[serde(default, skip_serializing_if = "PerPlatform::is_empty")]
+    pub per: PerPlatform,
+}
+
+/// Per-platform fields: what Twitch, YouTube or Kick gets instead of the everywhere value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PerPlatform {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twitch: Option<Box<StreamInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<Box<StreamInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kick: Option<Box<StreamInfo>>,
+}
+
+impl PerPlatform {
+    pub fn is_empty(&self) -> bool {
+        self.twitch.is_none() && self.youtube.is_none() && self.kick.is_none()
+    }
+
+    pub fn get(&self, p: Platform) -> Option<&StreamInfo> {
+        match p {
+            Platform::Twitch => self.twitch.as_deref(),
+            Platform::Youtube => self.youtube.as_deref(),
+            Platform::Kick => self.kick.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn slots(&mut self) -> [(Platform, &mut Option<Box<StreamInfo>>); 3] {
+        [(Platform::Twitch, &mut self.twitch), (Platform::Youtube, &mut self.youtube), (Platform::Kick, &mut self.kick)]
+    }
 }
 
 impl StreamInfo {
     /// Trims, drops duplicate tags (case-blind) and checks every field. Messages name the field.
     pub fn normalised(mut self) -> Result<StreamInfo, String> {
+        let mut per = std::mem::take(&mut self.per);
+        for (p, slot) in per.slots() {
+            let p = p.label().to_lowercase();
+            let Some(own) = slot.take() else { continue };
+            if !own.per.is_empty() {
+                return Err(format!("per.{p}: a platform's own fields can't have their own per-platform fields."));
+            }
+            // A platform with nothing of its own just uses the everywhere fields.
+            if own.fields().is_empty() {
+                continue;
+            }
+            let own = own.normalised_fields().map_err(|m| format!("per.{p}.{m}"))?;
+            *slot = Some(Box::new(own));
+        }
+        self = self.normalised_fields()?;
+        self.per = per;
+        if self.fields().is_empty() && self.per.is_empty() {
+            return Err("Fill in at least one of title, category, tags, language, description or thumbnail.".into());
+        }
+        Ok(self)
+    }
+
+    /// What `p` gets: the everywhere fields with that platform's own on top.
+    pub fn for_platform(&self, p: Platform) -> StreamInfo {
+        let mut out = StreamInfo { per: PerPlatform::default(), ..self.clone() };
+        if let Some(own) = self.per.get(p) {
+            let own = own.clone();
+            out.title = own.title.or(out.title);
+            out.category = own.category.or(out.category);
+            out.tags = own.tags.or(out.tags);
+            out.language = own.language.or(out.language);
+            out.description = own.description.or(out.description);
+            out.thumbnail = own.thumbnail.or(out.thumbnail);
+        }
+        out
+    }
+
+    /// Checks and tidies the fields themselves (not `per`).
+    fn normalised_fields(mut self) -> Result<StreamInfo, String> {
         if let Some(t) = &self.title {
             let t: String = t.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
             let t = t.trim().to_string();
@@ -137,15 +211,6 @@ impl StreamInfo {
                 return Err("thumbnail: pick a picture from your media library.".into());
             }
             self.thumbnail = Some(t);
-        }
-        if self.title.is_none()
-            && self.category.is_none()
-            && self.tags.is_none()
-            && self.language.is_none()
-            && self.description.is_none()
-            && self.thumbnail.is_none()
-        {
-            return Err("Fill in at least one of title, category, tags, language, description or thumbnail.".into());
         }
         Ok(self)
     }
@@ -376,6 +441,52 @@ mod tests {
         }
         assert_eq!(s.history.len(), MAX_HISTORY);
         assert_eq!(s.history[0].at, 24, "newest first");
+    }
+
+    #[test]
+    fn a_platform_can_have_its_own_fields() {
+        let json = serde_json::json!({
+            "title": "Day 41: Immortal or bust",
+            "tags": ["valorant"],
+            "per": { "twitch": { "title": " Ranked grind | !socials " }, "kick": {} }
+        });
+        let i: StreamInfo = serde_json::from_value(json).unwrap();
+        let i = i.normalised().unwrap();
+        assert!(i.per.kick.is_none(), "an empty platform entry is dropped");
+        let tw = i.for_platform(Platform::Twitch);
+        assert_eq!(tw.title.as_deref(), Some("Ranked grind | !socials"), "trimmed, and Twitch's own");
+        assert_eq!(tw.tags, Some(vec!["valorant".to_string()]), "the rest comes from everywhere");
+        assert!(tw.per.is_empty());
+        assert_eq!(i.for_platform(Platform::Youtube).title.as_deref(), Some("Day 41: Immortal or bust"));
+        // Only one platform's own title: still something to send.
+        let only = StreamInfo {
+            per: PerPlatform { twitch: Some(Box::new(info("Twitch only"))), ..Default::default() },
+            ..Default::default()
+        };
+        let only = only.normalised().unwrap();
+        assert_eq!(only.for_platform(Platform::Kick).fields(), Vec::<&str>::new());
+        // A platform's own field is checked like any other, and names where it is.
+        let bad = StreamInfo {
+            per: PerPlatform { youtube: Some(Box::new(info(&"x".repeat(141)))), ..Default::default() },
+            ..info("ok")
+        };
+        assert!(bad.normalised().unwrap_err().starts_with("per.youtube.title:"));
+        let nested = StreamInfo {
+            per: PerPlatform {
+                twitch: Some(Box::new(StreamInfo {
+                    per: PerPlatform { kick: Some(Box::new(info("x"))), ..Default::default() },
+                    ..info("y")
+                })),
+                ..Default::default()
+            },
+            ..info("ok")
+        };
+        assert!(nested.normalised().unwrap_err().starts_with("per.twitch:"));
+        // Old saved presets without `per` still read, and don't write it back.
+        let old: StreamInfo = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert!(!serde_json::to_string(&old).unwrap().contains("per"));
+        let unknown = serde_json::from_value::<StreamInfo>(serde_json::json!({ "per": { "tiktok": {} } }));
+        assert!(unknown.is_err(), "only Twitch, YouTube and Kick");
     }
 
     #[test]

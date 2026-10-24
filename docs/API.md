@@ -603,7 +603,8 @@ Chat: `!deaths` shows the count (everyone); mods `!deaths +`, `+5`, `-`, `set 10
 type StreamInfo = { title?: string /* 1–140 (YouTube: 100) */; category?: { name: string; ids?: { twitch?, youtube?, kick? } };
                     tags?: string[] /* ≤10, letters and digits, ≤25 each; [] clears */; language?: string /* "en" */;
                     description?: string /* YouTube only; ≤5000, line breaks kept, no < or >; "" clears */;
-                    thumbnail?: string /* a media library id; YouTube only; JPEG or PNG ≤2 MB */ }
+                    thumbnail?: string /* a media library id; YouTube only; JPEG or PNG ≤2 MB */;
+                    per?: { twitch?: StreamInfo; youtube?: StreamInfo; kick?: StreamInfo } /* a platform's own fields (no nested per) */ }
 type PlatformResult = { platform; ok: boolean; applied: string[]; skipped: string[] /* "language: Kick has no stream language setting" */;
                         error: { code: "not_connected" | "reconnect_needed" | "rate_limited" | "refused" | "unreachable" | "no_broadcast"
                                        | "unknown_category" | "not_supported"; message; hint } | null }
@@ -619,6 +620,8 @@ type HistoryEntry = { info: StreamInfo; at: number; results: PlatformResult[] }
 | GET | `/api/v1/stream-info/categories?platform=twitch&q=valo` | → `{ platform, items: { id, name, image_url }[] }` (YouTube: its video categories). 400 without `q`, 422 when that platform isn't connected |
 | POST | `/api/v1/stream-info/presets` | `{ name, info }` → 201 `Preset`; 409 name taken |
 | PUT / DELETE | `/api/v1/stream-info/presets/{id}` | `Preset` → `Preset`; → 204. 404 `preset_not_found` |
+
+**Per platform (2.0).** A field in `per.<platform>` is what that platform gets instead of the everywhere value; fields it leaves out use the everywhere ones, and an empty entry is dropped. Each platform is sent only its merged fields. Errors name the place (`per.youtube.title: …`); an unknown platform under `per` is 400. Presets and history keep `per`, and Show's checklist sends a preset's `per` too. `!title` from chat sets one title everywhere.
 
 Permissions: Twitch needs `channel:manage:broadcast` (Modify Channel Information, stream markers) and Kick `channel:write`; both are asked for at sign-in from this version. Accounts connected earlier show `can_edit: false` with `needs` ("Reconnect Twitch…") and get `reconnect_needed` instead of a silent failure (R-22). YouTube uses the existing `youtube.force-ssl` sign-in and changes the live (or next scheduled) broadcast's video, keeping its description unless `description` is given; a game category becomes YouTube's Gaming category. `thumbnail` uploads that picture with `thumbnails.set` (50 units); a channel without phone verification is refused ("custom thumbnails need a verified channel; verify yours at youtube.com/verify"). Twitch and Kick have no stream description and make their own thumbnails, so those fields are in their `skipped` with the reason, and a platform with nothing it takes isn't called (`ok`, empty `applied`). A thumbnail that fails next to other changes is in `skipped` as `thumbnail: <why>`; alone it's the platform's `error`.
 
