@@ -5,6 +5,17 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.7
+
+- Cut the vertical picture from your stream: no vertical canvas needed. Mark your camera and
+  game on OBS's picture, pick a layout (camera on top, small camera, half and half, game only)
+  and Ferrocast makes the upright stream on your graphics card. The first time, it fetches
+  ffmpeg by itself (about 25 MB, checked before it's used).
+- Simple and Advanced: Studio has a switch at the top. Advanced shows upload protection's rule
+  with its numbers, a server address and retry timing per platform, the local server's port and
+  a new stream key, and the vertical layout in exact pixels.
+- Pointing OBS at Ferrocast also fixes an old stream key when OBS already points here.
+
 ## 2.0.0-beta.6
 
 Everything in beta.5 (its build was stopped), plus two fixes from a real test:
