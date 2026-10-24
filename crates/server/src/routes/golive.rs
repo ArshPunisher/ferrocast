@@ -29,6 +29,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/vertical/obs/setup", post(point_vertical))
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
+        .route("/golive/picture", get(picture))
         .route("/golive/vertical/obs/restore", post(restore_vertical))
         .route("/golive/resume/{id}", post(resume))
 }
@@ -151,4 +152,9 @@ async fn vertical_cut(
     Body(b): Body<ferrocast_engine::golive::CutConfig>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.set_vertical_cut(b).await?)))
+}
+
+/// What's on air in OBS, for marking the camera and game (A2.4).
+async fn picture(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.golive_picture().await?))
 }

@@ -230,6 +230,17 @@ async fn the_vertical_picture_is_cut_from_the_normal_stream() {
     let _ = obs.kill().await;
 }
 
+/// The cut editor's picture: what's on air, at the size OBS streams.
+#[tokio::test]
+async fn the_cut_editor_gets_a_picture_of_what_is_on_air() {
+    let (e, _dir) = engine().await;
+    let port = start_obs(FakeObs::studio()).await;
+    e.save_obs(ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
+    let v = e.golive_picture().await.unwrap();
+    assert!(v["image"].as_str().unwrap().starts_with("data:image/jpg;base64,"));
+    assert_eq!((v["width"].as_u64(), v["height"].as_u64()), (Some(1920), Some(1080)), "the streamed size");
+}
+
 /// Aitum Vertical: pointed at Ferrocast's vertical key with its own setting kept, never while
 /// it streams, and put back exactly.
 #[tokio::test]

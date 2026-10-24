@@ -1111,6 +1111,13 @@ impl Engine {
         *lock(&g.cut) = Some(CutRun { config: cfg.cut, stop, state });
     }
 
+    /// What's on air in OBS, to mark the camera and game on (the cut editor).
+    pub async fn golive_picture(&self) -> Result<serde_json::Value, EngineError> {
+        let c = self.obs_client().await?;
+        let (image, width, height) = obs::program_picture(&c, 960).await?;
+        Ok(serde_json::json!({ "image": image, "width": width, "height": height }))
+    }
+
     /// Picks where the vertical picture comes from.
     pub async fn set_vertical_source(&self, source: VerticalSource) -> Result<GoLiveConfig, EngineError> {
         if source == VerticalSource::Cut && find_ffmpeg().is_none() {

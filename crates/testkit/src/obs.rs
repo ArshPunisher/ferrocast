@@ -340,6 +340,15 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                     "outputDuration": 600_000, "outputCongestion": 0.0, "outputBytes": s.stream_bytes,
                     "outputSkippedFrames": s.stream_skipped, "outputTotalFrames": s.stream_total }),
         ),
+        "GetVideoSettings" => (
+            100,
+            json!({ "fpsNumerator": 60, "fpsDenominator": 1, "baseWidth": 2560, "baseHeight": 1440,
+                    "outputWidth": 1920, "outputHeight": 1080 }),
+        ),
+        "GetSourceScreenshot" if s.scenes.iter().any(|x| x.name == name("sourceName")) => {
+            (100, json!({ "imageData": "data:image/jpg;base64,/9j/4AAQ" }))
+        }
+        "GetSourceScreenshot" => (600, Value::Null),
         "GetProfileList" => (100, json!({ "currentProfileName": s.profile, "profiles": [s.profile] })),
         "GetOutputList" => {
             let mut outputs = vec![

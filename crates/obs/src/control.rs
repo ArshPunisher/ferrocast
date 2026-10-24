@@ -82,6 +82,29 @@ pub async fn scene_names(client: &Client) -> Result<(Option<String>, Vec<String>
     Ok((list.current_program_scene.map(|c| c.name), s.into_iter().map(|s| s.id.name).collect()))
 }
 
+/// What's on air now, as a small JPEG data URL (for marking boxes on it), with the size OBS
+/// streams at.
+pub async fn program_picture(client: &Client, width: u32) -> Result<(String, u32, u32), ObsError> {
+    let list = client.scenes().list().await.map_err(err)?;
+    let scene = list
+        .current_program_scene
+        .map(|c| c.name)
+        .ok_or_else(|| ObsError::Refused("OBS has no scene on air.".into()))?;
+    let video = client.config().video_settings().await.map_err(err)?;
+    let shot = client
+        .sources()
+        .take_screenshot(obws::requests::sources::TakeScreenshot {
+            source: obws::requests::sources::SourceId::Name(&scene),
+            format: "jpg",
+            width: Some(width),
+            height: None,
+            compression_quality: Some(70),
+        })
+        .await
+        .map_err(err)?;
+    Ok((shot, video.output_width, video.output_height))
+}
+
 /// Switches the program (live) scene.
 pub async fn switch_scene(client: &Client, name: &str) -> Result<(), ObsError> {
     client.scenes().set_current_program_scene(SceneId::Name(name)).await.map_err(|e| not_found(e, "scene", name))

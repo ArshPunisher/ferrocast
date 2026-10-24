@@ -725,6 +725,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | PUT | `/api/v1/golive/protection` | `{ on: boolean }` → `{ destinations, protect }`. Off brings every paused destination back at once |
 | POST | `/api/v1/golive/vertical/obs/setup` | Points Aitum Vertical's first stream output at the local server with the vertical key, keeping its own server and key (secret store) → `ObsView.vertical`. 422 `aitum_vertical_missing`, `aitum_vertical_no_output` (add a stream output in its settings first), `obs_streaming` (its canvas streams) |
 | POST | `/api/v1/golive/vertical/obs/restore` | Puts Aitum Vertical's own server and key back → `ObsView.vertical`. 422 `golive_nothing_saved`, `obs_streaming` |
+| GET | `/api/v1/golive/picture` | → `{ image /* JPEG data URL, 960 wide */, width, height /* the size OBS streams at */ }`: what's on air, for marking the camera and game. 422 `obs_unreachable`, `obs_refused` |
 | PUT | `/api/v1/golive/vertical/source` | `{ source: "canvas" \| "cut" }` → `GoLiveConfig`. 422 `ffmpeg_missing` for `cut` without ffmpeg |
 | PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
