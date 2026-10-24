@@ -102,6 +102,12 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "give out the stream key" })
     }
+
+    /// Where an upright (vertical) stream goes, made by Ferrocast when needed (YouTube Shorts
+    /// live). Platforms with one live per channel don't have one.
+    async fn vertical_ingest(&self) -> Result<Ingest> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "take a second, vertical stream" })
+    }
 }
 
 /// A channel's ingest: the server address and the stream key. The key is a secret: it never

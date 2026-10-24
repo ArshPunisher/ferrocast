@@ -672,3 +672,103 @@ async fn ingest_asks_youtube_for_the_channels_stream() {
     let i = video_api(ep).ingest().await.unwrap();
     assert_eq!((i.url.as_str(), i.key.as_str()), ("rtmps://a.rtmps.youtube.com/live2", "abcd-efgh-ijkl"));
 }
+
+/// A YouTube that keeps the streams and broadcasts it's given (for the vertical stream).
+async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
+    use axum::extract::{Query, State};
+    use std::collections::HashMap;
+    #[derive(Clone, Default)]
+    struct Live {
+        streams: Arc<Mutex<Vec<serde_json::Value>>>,
+        broadcasts: Arc<Mutex<Vec<serde_json::Value>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    let st = Live::default();
+    st.streams.lock().unwrap().push(json!({ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
+        "cdn": { "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
+    st.broadcasts.lock().unwrap().push(json!({ "id": "b1", "snippet": { "title": "Day 41 ranked" },
+        "status": { "privacyStatus": "unlisted", "lifeCycleStatus": "ready" }, "contentDetails": { "boundStreamId": "s1" } }));
+    let calls = st.calls.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get(|State(st): State<Live>| async move {
+                st.calls.lock().unwrap().push("streams.list".into());
+                axum::Json(json!({ "items": st.streams.lock().unwrap().clone() }))
+            })
+            .post(|State(st): State<Live>, axum::Json(mut b): axum::Json<serde_json::Value>| async move {
+                st.calls.lock().unwrap().push("streams.insert".into());
+                b["id"] = json!("sv");
+                b["cdn"]["ingestionInfo"] = json!({ "streamName": "vertical-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" });
+                st.streams.lock().unwrap().push(b.clone());
+                axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|State(st): State<Live>, Query(q): Query<HashMap<String, String>>| async move {
+                // Everything here is "upcoming"; "active" answers nothing.
+                let upcoming = q.get("broadcastStatus").map(String::as_str) == Some("upcoming");
+                let items = if upcoming { st.broadcasts.lock().unwrap().clone() } else { vec![] };
+                axum::Json(json!({ "items": items }))
+            })
+            .post(|State(st): State<Live>, axum::Json(mut b): axum::Json<serde_json::Value>| async move {
+                st.calls.lock().unwrap().push(format!("broadcasts.insert {}", b["status"]["privacyStatus"]));
+                assert_eq!(b["contentDetails"]["enableAutoStart"], true);
+                assert!(b["snippet"]["scheduledStartTime"].as_str().unwrap().ends_with('Z'));
+                b["id"] = json!("bv");
+                st.broadcasts.lock().unwrap().push(b.clone());
+                axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts/bind",
+            axum::routing::post(|State(st): State<Live>, Query(q): Query<HashMap<String, String>>| async move {
+                st.calls.lock().unwrap().push(format!("bind {} {}", q["id"], q["streamId"]));
+                for b in st.broadcasts.lock().unwrap().iter_mut() {
+                    if b["id"] == json!(q["id"]) {
+                        b["contentDetails"]["boundStreamId"] = json!(q["streamId"]);
+                    }
+                }
+                axum::Json(json!({ "id": q["id"] }))
+            }),
+        )
+        .with_state(st);
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    (ep, calls)
+}
+
+#[tokio::test]
+async fn the_vertical_stream_is_made_once_and_never_taken_for_the_normal_one() {
+    let (ep, calls) = fake_live().await;
+    let api = video_api(ep);
+    let v = api.vertical_ingest().await.unwrap();
+    assert_eq!(v.key, "vertical-key");
+    assert_eq!(
+        calls.lock().unwrap().iter().filter(|c| !c.ends_with(".list")).cloned().collect::<Vec<_>>(),
+        vec!["streams.insert", "broadcasts.insert \"unlisted\"", "bind bv sv"],
+        "made once, with the normal live's privacy"
+    );
+    // Again: found, nothing new made.
+    calls.lock().unwrap().clear();
+    assert_eq!(api.vertical_ingest().await.unwrap().key, "vertical-key");
+    assert!(calls.lock().unwrap().iter().all(|c| c.ends_with(".list")), "{:?}", calls.lock().unwrap());
+    // The normal YouTube destination keeps its own key, even with the vertical broadcast upcoming.
+    assert_eq!(api.ingest().await.unwrap().key, "main-key");
+}
+
+#[test]
+fn utc_timestamps() {
+    use crate::api::rfc3339_utc;
+    assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339_utc(1_793_097_000_000), "2026-10-27T10:30:00Z");
+    assert_eq!(rfc3339_utc(951_782_400_000), "2000-02-29T00:00:00Z");
+}

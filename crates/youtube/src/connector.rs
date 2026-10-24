@@ -86,4 +86,8 @@ impl Connector for YoutubeConnector {
     async fn ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.ingest().await?)
     }
+
+    async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest> {
+        Ok(self.api.vertical_ingest().await?)
+    }
 }

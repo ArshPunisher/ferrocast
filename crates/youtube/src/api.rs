@@ -330,28 +330,156 @@ impl Api {
     /// The key bound to the live (or next scheduled) broadcast wins, then the channel's
     /// default key, then the first one (liveBroadcasts + liveStreams, 1 unit each).
     pub async fn ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
+        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
+        let mut v = self.call(Method::GET, "/liveStreams", &q, None).await?;
+        // Ferrocast's own vertical stream (and its broadcast) is never the normal one.
+        let vertical = vertical_id(&v);
         let mut bound = None;
-        for status in ["active", "upcoming"] {
+        'status: for status in ["active", "upcoming"] {
             let q = [
                 ("part", "contentDetails"),
                 ("broadcastStatus", status),
                 ("broadcastType", "all"),
-                ("maxResults", "1"),
+                ("maxResults", "5"),
             ];
-            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
-            if let Some(id) = v.pointer("/items/0/contentDetails/boundStreamId").and_then(Value::as_str) {
-                bound = Some(id.to_string());
-                break;
+            let b = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            for item in b.get("items").and_then(Value::as_array).into_iter().flatten() {
+                let id = item.pointer("/contentDetails/boundStreamId").and_then(Value::as_str);
+                if let Some(id) = id.filter(|id| Some(*id) != vertical.as_deref()) {
+                    bound = Some(id.to_string());
+                    break 'status;
+                }
             }
         }
-        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
-        let v = self.call(Method::GET, "/liveStreams", &q, None).await?;
+        if let (Some(id), Some(items)) = (&vertical, v.get_mut("items").and_then(Value::as_array_mut)) {
+            items.retain(|s| s.get("id").and_then(Value::as_str) != Some(id));
+        }
         pick_stream(&v, bound.as_deref()).ok_or_else(|| {
             YoutubeError::Refused(
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })
     }
+}
+
+impl Api {
+    /// Go live everywhere, vertical (YouTube Shorts live): Ferrocast's own upright stream,
+    /// made once ("Ferrocast vertical", reusable), and a broadcast bound to it that starts and
+    /// ends with the stream, with the title and privacy of the channel's normal live.
+    /// Costs 2 units when both exist, about 150 the first time (insert stream, broadcast, bind).
+    pub async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
+        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
+        let streams = self.call(Method::GET, "/liveStreams", &q, None).await?;
+        let (id, ingest) = match vertical_id(&streams) {
+            Some(id) => {
+                let s = streams
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .and_then(|i| i.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id.as_str())));
+                (id, s.and_then(usable))
+            }
+            None => {
+                let body = json!({
+                    "snippet": { "title": VERTICAL_STREAM_TITLE, "description": "Ferrocast sends OBS's vertical canvas here." },
+                    "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable" },
+                    "contentDetails": { "isReusable": true },
+                });
+                let made = self
+                    .call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body))
+                    .await?;
+                let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                tracing::info!("YouTube: made Ferrocast's vertical stream");
+                (id, usable(&made))
+            }
+        };
+        let ingest = match (id.is_empty(), ingest) {
+            (false, Some(i)) => i,
+            _ => {
+                return Err(YoutubeError::Refused(
+                    "YouTube hasn't given the vertical stream a key yet; try again in a minute".into(),
+                ));
+            }
+        };
+        // A broadcast already bound to it, or the normal live to copy the title and privacy from.
+        let mut normal: Option<Value> = None;
+        for status in ["active", "upcoming"] {
+            let q = [
+                ("part", "id,snippet,status,contentDetails"),
+                ("broadcastStatus", status),
+                ("broadcastType", "all"),
+                ("maxResults", "10"),
+            ];
+            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+                let bound = b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str);
+                if bound == Some(id.as_str()) {
+                    return Ok(ingest);
+                }
+                if normal.is_none() {
+                    normal = Some(b.clone());
+                }
+            }
+        }
+        let title: String = normal
+            .as_ref()
+            .and_then(|b| b.pointer("/snippet/title").and_then(Value::as_str))
+            .unwrap_or("Live now")
+            .chars()
+            .take(100)
+            .collect();
+        let privacy = normal
+            .as_ref()
+            .and_then(|b| b.pointer("/status/privacyStatus").and_then(Value::as_str))
+            .unwrap_or("public")
+            .to_string();
+        let body = json!({
+            "snippet": { "title": title, "scheduledStartTime": rfc3339_utc(now_ms()) },
+            "status": { "privacyStatus": privacy, "selfDeclaredMadeForKids": false },
+            "contentDetails": { "enableAutoStart": true, "enableAutoStop": true, "monitorStream": { "enableMonitorStream": false } },
+        });
+        let b = self
+            .call(Method::POST, "/liveBroadcasts", &[("part", "id,snippet,status,contentDetails")], Some(body))
+            .await?;
+        let bid = b.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        self.call(
+            Method::POST,
+            "/liveBroadcasts/bind",
+            &[("id", bid.as_str()), ("part", "id"), ("streamId", id.as_str())],
+            None,
+        )
+        .await?;
+        tracing::info!("YouTube: made a broadcast for the vertical stream");
+        Ok(ingest)
+    }
+}
+
+/// The upright stream Ferrocast makes for YouTube Shorts live (found again by this title).
+pub const VERTICAL_STREAM_TITLE: &str = "Ferrocast vertical";
+
+/// Ferrocast's vertical stream in a liveStreams list.
+fn vertical_id(list: &Value) -> Option<String> {
+    list.get("items")?
+        .as_array()?
+        .iter()
+        .find(|s| s.pointer("/snippet/title").and_then(Value::as_str) == Some(VERTICAL_STREAM_TITLE))
+        .and_then(|s| s.get("id").and_then(Value::as_str))
+        .map(String::from)
+}
+
+/// Unix ms as `2026-10-24T10:30:00Z` (UTC; days-to-civil from H. Hinnant's date algorithms).
+pub(crate) fn rfc3339_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// Picks the stream to send to from a liveStreams list (see [`Api::ingest`]).
