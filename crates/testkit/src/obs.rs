@@ -65,6 +65,8 @@ pub struct FakeObs {
     pub profile: String,
     /// The Aitum Multistream plugin's outputs and whether each is sending, when it's installed.
     pub aitum: Option<Vec<(String, bool)>>,
+    /// Aitum Multistream 1.0.8 and earlier: its outputs run, but it doesn't answer vendor requests.
+    pub aitum_old: bool,
     /// Aitum Vertical's first stream output, when it's installed.
     pub vertical: Option<FakeVertical>,
 }
@@ -354,7 +356,7 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
         }
         // obs-websocket answers an unknown vendor with 604 (ResourceNotFound family).
         "CallVendorRequest" => match (&s.aitum, name("vendorName").as_str(), name("requestType").as_str()) {
-            (Some(list), "aitum-multistream", "get_outputs") => {
+            (Some(list), "aitum-multistream", "get_outputs") if !s.aitum_old => {
                 let outputs: Vec<Value> = list.iter().map(|(n, _)| json!({ "name": n, "vertical": false })).collect();
                 (
                     100,

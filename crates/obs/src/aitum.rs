@@ -2,13 +2,13 @@
 //! and Ferrocast's Go live both on, a platform can get the stream twice and the upload carries
 //! double, so Ferrocast looks for it (docs/plan/LIVE-STUDIO.md, A2.2).
 //!
-//! The plugin answers obs-websocket vendor requests (`aitum-multistream`, `get_outputs`) with
-//! its outputs' names, and runs each as an OBS output called `aitum_multi_output_<name>`.
+//! From 1.0.9 the plugin answers obs-websocket vendor requests (`aitum-multistream`,
+//! `get_outputs`) with its outputs' names; 1.0.8 and earlier don't, so then the names come from
+//! its settings file. It runs each as an OBS output called `aitum_multi_output_<name>`.
 //! Where an output goes is only in the plugin's own settings file,
 //! `<OBS config>/plugin_config/aitum-multistream/config.json`; Ferrocast reads each output's
 //! name and server there, never its key.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use obws::Client;
@@ -37,12 +37,15 @@ struct Named {
 }
 
 /// The plugin's outputs and whether each is sending now, or `None` when this OBS doesn't have
-/// the plugin.
-pub async fn outputs(client: &Client) -> Result<Option<Vec<(String, bool)>>, ObsError> {
+/// the plugin. `from_file` is the output names in its settings file, used when the plugin is
+/// too old to answer (none there: not installed).
+pub async fn outputs(client: &Client, from_file: &[String]) -> Result<Option<Vec<(String, bool)>>, ObsError> {
     let req =
         CallVendorRequest { vendor_name: VENDOR, request_type: "get_outputs", request_data: &serde_json::json!({}) };
-    let Ok(res) = client.general().call_vendor_request::<_, Outputs>(req).await else {
-        return Ok(None);
+    let names: Vec<String> = match client.general().call_vendor_request::<_, Outputs>(req).await {
+        Ok(res) => res.response_data.outputs.into_iter().map(|o| o.name).filter(|n| !n.is_empty()).collect(),
+        Err(_) if !from_file.is_empty() => from_file.to_vec(),
+        Err(_) => return Ok(None),
     };
     let active: Vec<String> = client
         .outputs()
@@ -53,17 +56,15 @@ pub async fn outputs(client: &Client) -> Result<Option<Vec<(String, bool)>>, Obs
         .filter(|o| o.active)
         .filter_map(|o| o.name.strip_prefix(OUTPUT_PREFIX).map(String::from))
         .collect();
-    let list = res
-        .response_data
-        .outputs
-        .into_iter()
-        .filter(|o| !o.name.is_empty())
-        .map(|o| {
-            let live = active.contains(&o.name);
-            (o.name, live)
-        })
-        .collect();
-    Ok(Some(list))
+    Ok(Some(
+        names
+            .into_iter()
+            .map(|name| {
+                let live = active.contains(&name);
+                (name, live)
+            })
+            .collect(),
+    ))
 }
 
 /// The plugin's settings file next to obs-websocket's (`…/plugin_config/obs-websocket/config.json`).
@@ -71,20 +72,21 @@ pub fn config_path(websocket_config: &Path) -> Option<PathBuf> {
     Some(websocket_config.parent()?.parent()?.join(VENDOR).join("config.json"))
 }
 
-/// Each output's server host, by output name, for OBS profile `profile`. Keys are never read.
-pub fn servers(config: &[u8], profile: &str) -> HashMap<String, String> {
-    let Ok(v) = serde_json::from_slice::<Value>(config) else { return HashMap::new() };
-    let Some(profiles) = v.get("profiles").and_then(Value::as_array) else { return HashMap::new() };
+/// Each output's name and server host (when it has one), in order, for OBS profile `profile`.
+/// Keys are never read.
+pub fn servers(config: &[u8], profile: &str) -> Vec<(String, Option<String>)> {
+    let Ok(v) = serde_json::from_slice::<Value>(config) else { return Vec::new() };
+    let Some(profiles) = v.get("profiles").and_then(Value::as_array) else { return Vec::new() };
     let Some(p) = profiles.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(profile)) else {
-        return HashMap::new();
+        return Vec::new();
     };
-    let mut out = HashMap::new();
+    let mut out = Vec::new();
     for key in ["outputs", "vertical_outputs"] {
         for o in p.get(key).and_then(Value::as_array).into_iter().flatten() {
             let name = o.get("name").and_then(Value::as_str).unwrap_or_default();
             let server = o.get("stream_server").and_then(Value::as_str).unwrap_or_default();
-            if let (false, Some(host)) = (name.is_empty(), host_of(server)) {
-                out.insert(name.to_string(), host);
+            if !name.is_empty() {
+                out.push((name.to_string(), host_of(server)));
             }
         }
     }
@@ -181,10 +183,16 @@ mod tests {
             ]
         });
         let s = servers(&serde_json::to_vec(&cfg).unwrap(), "Untitled");
-        assert_eq!(s.len(), 3);
-        assert_eq!(s["Twitch Output"], "aps30.contribute.live-video.net");
-        assert_eq!(s["Kick"], "fa723fc1b171.global-contribute.live-video.net");
-        assert_eq!(s["Shorts"], "a.rtmps.youtube.com");
+        let host = |n: &str| s.iter().find(|(x, _)| x == n).and_then(|(_, h)| h.clone());
+        assert_eq!(
+            s.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["Twitch Output", "Kick", "Broken", "Shorts"],
+            "in order; nameless ones left out"
+        );
+        assert_eq!(host("Twitch Output").as_deref(), Some("aps30.contribute.live-video.net"));
+        assert_eq!(host("Kick").as_deref(), Some("fa723fc1b171.global-contribute.live-video.net"));
+        assert_eq!(host("Shorts").as_deref(), Some("a.rtmps.youtube.com"));
+        assert_eq!(host("Broken"), None);
         assert!(!format!("{s:?}").contains("secret"));
         assert!(servers(b"{nope", "Untitled").is_empty());
         let vertical = serde_json::json!({ "canvas": [{ "width": 1080, "height": 1920, "stream_outputs": [

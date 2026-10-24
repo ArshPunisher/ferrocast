@@ -606,7 +606,6 @@ impl Engine {
     /// the plugin's settings file (only names and servers are read, never keys).
     async fn aitum_outputs(&self, c: &ferrocast_obs::Client) -> Option<Vec<AitumOutput>> {
         use ferrocast_obs::aitum;
-        let list = aitum::outputs(c).await.ok().flatten()?;
         let profile = c.profiles().current().await.unwrap_or_default();
         let files: Vec<_> = self.obs_paths().iter().filter_map(|p| aitum::config_path(p)).collect();
         let servers = tokio::task::spawn_blocking(move || {
@@ -620,13 +619,12 @@ impl Engine {
         .ok()
         .flatten()
         .unwrap_or_default();
+        let names: Vec<String> = servers.iter().map(|(n, _)| n.clone()).collect();
+        let list = aitum::outputs(c, &names).await.ok().flatten()?;
+        let host = |n: &str| servers.iter().find(|(x, _)| x == n).and_then(|(_, h)| h.clone());
         Some(
             list.into_iter()
-                .map(|(name, live)| AitumOutput {
-                    platform: aitum_platform(servers.get(&name).map(String::as_str), &name),
-                    name,
-                    live,
-                })
+                .map(|(name, live)| AitumOutput { platform: aitum_platform(host(&name).as_deref(), &name), name, live })
                 .collect(),
         )
     }

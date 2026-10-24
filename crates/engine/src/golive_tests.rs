@@ -280,8 +280,17 @@ async fn aitum_multistream_outputs_are_found_and_named() {
     assert!(!v.aitum_ok);
     e.set_golive_aitum_ok(true).await.unwrap();
     assert!(e.golive_view().await.aitum_ok);
+    // 1.0.8 doesn't answer: the names come from its settings file, live from OBS's outputs.
+    st.lock().unwrap().aitum_old = true;
+    let old = e.golive_view().await.obs.aitum.expect("found from the settings file");
+    assert_eq!(
+        old.iter().map(|o| (o.name.as_str(), o.live)).collect::<Vec<_>>(),
+        [("Twitch Output", true), ("Kick", false), ("Backup", false)]
+    );
+    st.lock().unwrap().aitum_old = false;
     // Without the plugin: nothing to say.
     st.lock().unwrap().aitum = None;
+    std::fs::remove_file(aitum.join("config.json")).unwrap();
     assert_eq!(e.golive_view().await.obs.aitum, None);
     // Names decide when the server doesn't.
     assert_eq!(aitum_platform(Some("a.rtmps.youtube.com"), "x"), Some(Service::Youtube));
