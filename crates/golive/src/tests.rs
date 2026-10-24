@@ -529,3 +529,58 @@ async fn a_platform_that_keeps_dropping_a_live_stream_is_retried_from_the_first_
         }
     }
 }
+
+/// ffmpeg on this machine, for the cut-from-stream tests (skipped where there's none).
+fn ffmpeg() -> Option<std::path::PathBuf> {
+    ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+#[tokio::test]
+async fn the_cutter_makes_an_upright_stream_from_the_normal_one() {
+    use crate::cut::{CutConfig, Encoder};
+    use crate::cutter::{self, CutState};
+    let Some(ff) = ffmpeg() else { return };
+    let (main, vertical) = (Hub::new(), Hub::new());
+    let ingest = Ingest::bind(0, OBS_KEY, main.clone()).await.unwrap().with_route("vkey-test", vertical.clone());
+    let port = ingest.port();
+    let (stop, rx) = watch::channel(false);
+    tokio::spawn(ingest.run(rx));
+    let (state_tx, mut state) = watch::channel(CutState::Waiting);
+    let publish = format!("rtmp://127.0.0.1:{port}/live/vkey-test");
+    let enc = vec![Encoder { name: "libx264", on: "the processor" }];
+    tokio::spawn(cutter::run(ff.clone(), main.clone(), CutConfig::default(), enc, publish, state_tx, stop.subscribe()));
+    // "OBS": a real H.264 picture, 1920×1080, to the normal key.
+    let mut obs = tokio::process::Command::new(&ff)
+        .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "15"])
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-c:a", "aac", "-f", "flv"])
+        .arg(format!("rtmp://127.0.0.1:{port}/live/{OBS_KEY}"))
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut vlive = vertical.live();
+    timeout(Duration::from_secs(20), vlive.wait_for(|l| l.on)).await.expect("vertical stream in time").unwrap();
+    // Its size shows once a few packets are in.
+    let mut size = None;
+    for _ in 0..40 {
+        let s = vertical.stats();
+        if let (Some(w), Some(h)) = (s.width, s.height) {
+            size = Some((w, h));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(size, Some((1080, 1920)));
+    timeout(Duration::from_secs(10), state.wait_for(|s| matches!(s, CutState::Running { .. })))
+        .await
+        .expect("running in time")
+        .unwrap();
+    // OBS stops: the vertical stream ends too, and the cutter waits for the next one.
+    let _ = obs.kill().await;
+    timeout(Duration::from_secs(15), vlive.wait_for(|l| !l.on)).await.expect("vertical ended").unwrap();
+    timeout(Duration::from_secs(10), state.wait_for(|s| *s == CutState::Waiting)).await.unwrap().unwrap();
+    stop.send_replace(true);
+}
