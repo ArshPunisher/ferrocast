@@ -6,7 +6,7 @@
 
 use ferrocast_core::design::{DesignContent, Scene};
 use ferrocast_obs::control::Scenes;
-use ferrocast_obs::theme::{CAMERA_KINDS, CAPTURE_KINDS, OldWidget};
+use ferrocast_obs::theme::{CAMERA_KINDS, CAPTURE_KINDS, MIC_KINDS, OldWidget};
 use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -78,6 +78,9 @@ pub struct ThemePlan {
     /// Also play alerts with the theme's alert design.
     #[serde(default = "yes")]
     pub alert_style: bool,
+    /// Your mic on the Starting, BRB and Ending screens (off: most want them quiet).
+    #[serde(default)]
+    pub mic_on_breaks: bool,
 }
 
 /// A theme screen, for the dialog.
@@ -152,6 +155,9 @@ pub struct ObsTheme {
     /// The scene on air before, for Undo to go back to.
     #[serde(default)]
     pub scene_before: Option<String>,
+    /// (scene, mic) Ferrocast added for "Mic on break screens", so turning it off takes them out.
+    #[serde(default)]
+    pub mic_items: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -265,6 +271,7 @@ pub fn guess(theme_name: &str, screens: &[Scene], obs: &Scenes, old: &[OldWidget
         switch_to_starting: true,
         hide_old: old.iter().map(|w| w.source.clone()).collect(),
         alert_style: true,
+        mic_on_breaks: false,
     }
 }
 
@@ -477,6 +484,7 @@ impl Engine {
             alert_changed: false,
             alert_before: None,
             scene_before: obs.current.clone(),
+            mic_items: Vec::new(),
         });
         rec.at = now().0;
         rec.design_id = design.id.clone();
@@ -491,6 +499,29 @@ impl Engine {
             ));
         }
         let overlays = self.overlays().await?;
+        // Turned off: the mics Ferrocast added come out again (ones that were there stay).
+        if !plan.mic_on_breaks && !rec.mic_items.is_empty() {
+            for (scene, m) in std::mem::take(&mut rec.mic_items) {
+                if ferrocast_obs::theme::remove_item(&client, &scene, &m).await.is_ok() {
+                    rec.added_items.retain(|(s, x)| !(s == &scene && x == &m));
+                } else {
+                    rec.mic_items.push((scene, m));
+                }
+            }
+        }
+        // The mic for break screens: Start show's mic check list, else every mic OBS has.
+        let mics: Vec<String> = if plan.mic_on_breaks {
+            let kinds = ferrocast_obs::control::inputs(&client).await.map_err(obs_error)?;
+            let picked: Vec<String> =
+                self.show_config().mic_sources.into_iter().filter(|m| kinds.iter().any(|(n, _)| n == m)).collect();
+            if picked.is_empty() {
+                kinds.into_iter().filter(|(_, k)| MIC_KINDS.contains(&k.as_str())).map(|(n, _)| n).collect()
+            } else {
+                picked
+            }
+        } else {
+            Vec::new()
+        };
         let mut roles = self.current_roles();
         let mut starting_scene = None;
 
@@ -500,7 +531,7 @@ impl Engine {
                 steps.push(Step::new(&format!("screen.{}", p.key), &screen.name, "skipped", "Left out."));
                 continue;
             };
-            match self.put_screen(&client, &design, screen, p, &scene, &overlays, &mut rec).await {
+            match self.put_screen(&client, &design, screen, p, &scene, &overlays, &mics, &obs, &mut rec).await {
                 Ok(detail) => {
                     steps.push(Step::new(&format!("screen.{}", p.key), &screen.name, "done", detail));
                     match p.role {
@@ -606,6 +637,8 @@ impl Engine {
         p: &ScreenPlan,
         scene: &str,
         overlays: &[crate::snapshot::OverlayView],
+        mics: &[String],
+        obs: &Scenes,
         rec: &mut ObsTheme,
     ) -> Result<String, EngineError> {
         // The overlay: the one made from this screen before (its address stays), or a new one.
@@ -699,6 +732,26 @@ impl Engine {
                 rec.added_items.push((scene.to_string(), u.clone()));
             }
         }
+        let break_screen = matches!(p.role, Some(Role::Starting | Role::Brb | Role::Ending))
+            || matches!(p.key.as_str(), "starting_soon" | "brb" | "ending");
+        let mut mic_added = false;
+        if break_screen {
+            // A scene under it that has the mic already brings it: no second copy.
+            let under_has = |m: &String| {
+                p.under.as_ref().is_some_and(|u| {
+                    u == m || obs.scenes.iter().any(|x| &x.name == u && x.items.iter().any(|i| &i.source == m))
+                })
+            };
+            for m in mics.iter().filter(|m| !under_has(m)) {
+                if ferrocast_obs::theme::put_under(client, scene, m).await.map_err(obs_error)? {
+                    mic_added = true;
+                    rec.mic_items.push((scene.to_string(), m.clone()));
+                    if !mine {
+                        rec.added_items.push((scene.to_string(), m.clone()));
+                    }
+                }
+            }
+        }
         rec.screens.retain(|s| s.key != p.key);
         rec.screens.push(AppliedScreen {
             key: p.key.clone(),
@@ -716,6 +769,9 @@ impl Engine {
             if !under_added {
                 detail.push_str(" (already there)");
             }
+        }
+        if mic_added {
+            detail.push_str(", with your mic");
         }
         if hid > 0 {
             detail.push_str(&format!(", {hid} old source{} hidden", if hid == 1 { "" } else { "s" }));

@@ -338,3 +338,36 @@ async fn without_a_plan_a_theme_in_obs_keeps_its_screens() {
     assert_eq!(view.screens.len(), 4, "Ending stays out");
     assert!(!scene_names(&st).iter().any(|n| n.ends_with("Ending") && n.contains('·')));
 }
+
+#[tokio::test]
+async fn the_mic_goes_on_break_screens_only_when_asked() {
+    let (e, _d, st) = setup().await;
+    e.apply_theme_to_obs("builtin.forge", None).await.unwrap();
+    assert!(!items(&st, "Forge · BRB").iter().any(|(s, _)| s == "Mic"), "quiet by default");
+    e.undo_theme_in_obs().await.unwrap();
+    {
+        // A Windows mic, as OBS names its kind.
+        let mut s = st.lock().unwrap();
+        s.inputs.iter_mut().find(|i| i.name == "Mic").unwrap().kind = "wasapi_input_capture".into();
+    }
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = true;
+    let r = e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    for scene in ["Forge · Starting soon", "Forge · BRB", "Forge · Ending"] {
+        assert!(items(&st, scene).iter().any(|(s, _)| s == "Mic"), "{scene}");
+    }
+    assert!(!items(&st, "Forge · In game").iter().any(|(s, _)| s == "Mic"), "In game gets it from Gameplay");
+    assert!(r.steps.iter().any(|s| s.detail.contains("with your mic")));
+    // Off again: the mics Ferrocast added come out.
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = false;
+    e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    assert!(!items(&st, "Forge · BRB").iter().any(|(s, _)| s == "Mic"));
+    // Under a scene that has the mic: no second copy.
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = true;
+    p.screens[3].under = Some("Gameplay".into());
+    e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    assert!(!items(&st, "Forge · BRB").iter().any(|(s, _)| s == "Mic"), "Gameplay brings it");
+    assert!(items(&st, "Forge · Ending").iter().any(|(s, _)| s == "Mic"));
+}

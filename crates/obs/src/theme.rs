@@ -30,6 +30,10 @@ pub const CAPTURE_KINDS: [&str; 8] = [
 pub const CAMERA_KINDS: [&str; 6] =
     ["dshow_input", "av_capture_input", "av_capture_input_v2", "macos-avcapture", "macos-avcapture-fast", "v4l2_input"];
 
+/// Input kinds for a microphone.
+pub const MIC_KINDS: [&str; 4] =
+    ["wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture", "alsa_input_capture"];
+
 /// Makes `name` unless OBS has it. `true` when it was made now.
 pub async fn ensure_scene(client: &Client, name: &str) -> Result<bool, ObsError> {
     let list = client.scenes().list().await.map_err(err)?;
