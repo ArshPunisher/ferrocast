@@ -16,6 +16,7 @@ pub struct Item {
     pub id: i64,
     pub source: String,
     pub enabled: bool,
+    /// The input's kind; empty for a scene nested in this one.
     pub kind: String,
 }
 
@@ -30,6 +31,8 @@ pub struct Input {
     pub name: String,
     pub kind: String,
     pub muted: bool,
+    /// Its settings (a browser source's `url`, `width`, `height`…).
+    pub settings: Value,
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +72,10 @@ pub struct FakeObs {
     pub aitum_old: bool,
     /// Aitum Vertical's first stream output, when it's installed.
     pub vertical: Option<FakeVertical>,
+    /// Request types this OBS refuses (it answers 702, "processing failed").
+    pub refuse: Vec<String>,
+    /// SetSceneItemTransform calls: (scene, item id, transform).
+    pub transforms: Vec<(String, i64, Value)>,
 }
 
 /// Aitum Vertical in the fake OBS: is the vertical canvas streaming, and where to.
@@ -109,9 +116,14 @@ impl FakeObs {
             ],
             current: "Starting Soon".into(),
             inputs: vec![
-                Input { name: "Mic".into(), kind: "wasapi_input_capture".into(), muted: false },
-                Input { name: "Webcam".into(), kind: "dshow_input".into(), muted: false },
-                Input { name: "Desktop Audio".into(), kind: "wasapi_output_capture".into(), muted: false },
+                Input { name: "Mic".into(), kind: "wasapi_input_capture".into(), muted: false, settings: Value::Null },
+                Input { name: "Webcam".into(), kind: "dshow_input".into(), muted: false, settings: Value::Null },
+                Input {
+                    name: "Desktop Audio".into(),
+                    kind: "wasapi_output_capture".into(),
+                    muted: false,
+                    settings: Value::Null,
+                },
             ],
             replay_enabled: true,
             disk_mb: 200.0 * 1024.0,
@@ -178,6 +190,13 @@ async fn session(st: St, mut ws: WebSocket) {
     }
 }
 
+/// Adds a source on top of a scene's list; its item id.
+fn add_item(scene: &mut Scene, source: &str, kind: &str) -> i64 {
+    let id = scene.items.iter().map(|it| it.id).max().unwrap_or(0) + 1;
+    scene.items.push(Item { id, source: source.into(), enabled: true, kind: kind.into() });
+    id
+}
+
 fn scene_index(s: &FakeObs, name: &str) -> Option<usize> {
     s.scenes.iter().position(|x| x.name == name)
 }
@@ -185,6 +204,9 @@ fn scene_index(s: &FakeObs, name: &str) -> Option<usize> {
 fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
     let mut s = st.lock().unwrap();
     s.requests.push(kind.to_string());
+    if s.refuse.iter().any(|r| r == kind) {
+        return (702, Value::Null);
+    }
     let name = |k: &str| data[k].as_str().unwrap_or("").to_string();
     let n = s.scenes.len();
     match kind {
@@ -232,8 +254,10 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                     .iter()
                     .enumerate()
                     .map(|(idx, it)| {
+                        let nested = it.kind.is_empty();
                         json!({ "sceneItemId": it.id, "sceneItemIndex": idx, "sourceName": it.source,
-                                "sourceType": "OBS_SOURCE_TYPE_INPUT", "inputKind": it.kind, "isGroup": null,
+                                "sourceType": if nested { "OBS_SOURCE_TYPE_SCENE" } else { "OBS_SOURCE_TYPE_INPUT" },
+                                "inputKind": if nested { Value::Null } else { json!(it.kind) }, "isGroup": null,
                                 "sceneItemEnabled": it.enabled })
                     })
                     .collect();
@@ -252,15 +276,113 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
             }
         }
         "GetInputList" => {
+            let only = name("inputKind");
             let inputs: Vec<Value> = s
                 .inputs
                 .iter()
                 .enumerate()
+                .filter(|(_, x)| only.is_empty() || x.kind == only)
                 .map(|(i, x)| {
                     json!({ "inputName": x.name, "inputUuid": uuid(100 + i), "inputKind": x.kind, "unversionedInputKind": x.kind })
                 })
                 .collect();
             (100, json!({ "inputs": inputs }))
+        }
+        "CreateScene" => {
+            let n = name("sceneName");
+            if scene_index(&s, &n).is_some() {
+                return (601, Value::Null);
+            }
+            // A new scene goes to the top of the dock.
+            s.scenes.insert(0, Scene { name: n, items: Vec::new() });
+            (100, json!({ "sceneUuid": uuid(900 + s.scenes.len()) }))
+        }
+        "RemoveScene" => match scene_index(&s, &name("sceneName")) {
+            None => (600, Value::Null),
+            Some(i) => {
+                s.scenes.remove(i);
+                (100, Value::Null)
+            }
+        },
+        "CreateInput" => {
+            let (scene, input, kind) = (name("sceneName"), name("inputName"), name("inputKind"));
+            if s.inputs.iter().any(|x| x.name == input) {
+                return (601, Value::Null);
+            }
+            let Some(i) = scene_index(&s, &scene) else { return (600, Value::Null) };
+            s.inputs.push(Input {
+                name: input.clone(),
+                kind: kind.clone(),
+                muted: false,
+                settings: data["inputSettings"].clone(),
+            });
+            let id = add_item(&mut s.scenes[i], &input, &kind);
+            (100, json!({ "inputUuid": uuid(200 + s.inputs.len()), "sceneItemId": id }))
+        }
+        "GetInputSettings" => match s.inputs.iter().find(|x| x.name == name("inputName")) {
+            None => (600, Value::Null),
+            Some(x) => (
+                100,
+                json!({ "inputSettings": if x.settings.is_null() { json!({}) } else { x.settings.clone() }, "inputKind": x.kind }),
+            ),
+        },
+        "SetInputSettings" => {
+            let input = name("inputName");
+            let Some(x) = s.inputs.iter_mut().find(|x| x.name == input) else { return (600, Value::Null) };
+            let mut merged = if x.settings.is_object() { x.settings.clone() } else { json!({}) };
+            if let (Some(m), Some(new)) = (merged.as_object_mut(), data["inputSettings"].as_object()) {
+                m.extend(new.clone());
+            }
+            x.settings = merged;
+            (100, Value::Null)
+        }
+        "RemoveInput" => {
+            let input = name("inputName");
+            if !s.inputs.iter().any(|x| x.name == input) {
+                return (600, Value::Null);
+            }
+            s.inputs.retain(|x| x.name != input);
+            for sc in &mut s.scenes {
+                sc.items.retain(|it| it.source != input);
+            }
+            (100, Value::Null)
+        }
+        "CreateSceneItem" => {
+            let (scene, source) = (name("sceneName"), name("sourceName"));
+            let kind = match (s.inputs.iter().find(|x| x.name == source), scene_index(&s, &source)) {
+                (Some(x), _) => x.kind.clone(),
+                (None, Some(_)) => String::new(),
+                (None, None) => return (600, Value::Null),
+            };
+            let Some(i) = scene_index(&s, &scene) else { return (600, Value::Null) };
+            let id = add_item(&mut s.scenes[i], &source, &kind);
+            (100, json!({ "sceneItemId": id }))
+        }
+        "RemoveSceneItem" => {
+            let Some(i) = scene_index(&s, &name("sceneName")) else { return (600, Value::Null) };
+            let id = data["sceneItemId"].as_i64().unwrap_or(-1);
+            s.scenes[i].items.retain(|it| it.id != id);
+            (100, Value::Null)
+        }
+        "SetSceneItemTransform" => {
+            let scene = name("sceneName");
+            let Some(i) = scene_index(&s, &scene) else { return (600, Value::Null) };
+            let id = data["sceneItemId"].as_i64().unwrap_or(-1);
+            if !s.scenes[i].items.iter().any(|it| it.id == id) {
+                return (600, Value::Null);
+            }
+            s.transforms.push((scene, id, data["sceneItemTransform"].clone()));
+            (100, Value::Null)
+        }
+        "SetSceneItemIndex" => {
+            let Some(i) = scene_index(&s, &name("sceneName")) else { return (600, Value::Null) };
+            let id = data["sceneItemId"].as_i64().unwrap_or(-1);
+            let items = &mut s.scenes[i].items;
+            let Some(from) = items.iter().position(|it| it.id == id) else { return (600, Value::Null) };
+            let it = items.remove(from);
+            let to = (data["sceneItemIndex"].as_u64().unwrap_or(0) as usize).min(items.len());
+            items.insert(to, it);
+            (100, Value::Null)
         }
         "GetInputMute" | "SetInputMute" => {
             let target = name("inputName");
