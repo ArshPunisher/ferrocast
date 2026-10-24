@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 /// A live destination getting less than this share of the stream's rate is struggling.
 const SLOW_SHARE: f64 = 0.7;
+/// A destination's rate is judged over this many seconds: a low-bitrate stream arrives in bursts
+/// around its keyframes, so one second alone can look slow when nothing is wrong.
+const RATE_SECONDS: usize = 3;
 /// Seconds of trouble in a row before something pauses (a keyframe burst isn't trouble).
 const STRUGGLE_TICKS: u32 = 4;
 /// Calm seconds in a row before a paused destination may come back.
@@ -44,11 +47,20 @@ pub struct Protector {
     /// Paused destinations and the earliest time each may come back.
     paused: Vec<(String, Instant)>,
     last_dropped: Vec<(String, u64)>,
+    /// The last few seconds' rates per destination.
+    rates: Vec<(String, std::collections::VecDeque<u32>)>,
 }
 
 impl Default for Protector {
     fn default() -> Self {
-        Self { struggle: 0, calm: 0, next_pause: FIRST_PAUSE, paused: Vec::new(), last_dropped: Vec::new() }
+        Self {
+            struggle: 0,
+            calm: 0,
+            next_pause: FIRST_PAUSE,
+            paused: Vec::new(),
+            last_dropped: Vec::new(),
+            rates: Vec::new(),
+        }
     }
 }
 
@@ -59,11 +71,30 @@ impl Protector {
         if live.iter().all(|s| s.want_kbps == 0) {
             return None;
         }
+        // Each live destination's recent rates (the others are forgotten).
+        self.rates.retain(|(id, _)| live.iter().any(|s| s.id == id));
+        for s in live {
+            match self.rates.iter_mut().find(|(id, _)| id == s.id) {
+                Some((_, q)) => {
+                    q.push_back(s.kbps);
+                    if q.len() > RATE_SECONDS {
+                        q.pop_front();
+                    }
+                }
+                None => self.rates.push((s.id.to_string(), std::collections::VecDeque::from([s.kbps]))),
+            }
+        }
         let judged: Vec<&Sample<'_>> = live.iter().filter(|s| s.live_ms >= WARM_UP_MS && s.want_kbps > 0).collect();
         let mut trouble = false;
         for s in &judged {
             let before = self.last_dropped.iter().find(|(id, _)| id == s.id).map(|(_, d)| *d);
-            if before.is_some_and(|b| s.dropped > b) || f64::from(s.kbps) < f64::from(s.want_kbps) * SLOW_SHARE {
+            let avg = self
+                .rates
+                .iter()
+                .find(|(id, _)| id == s.id)
+                .map(|(_, q)| q.iter().map(|k| u64::from(*k)).sum::<u64>() / q.len().max(1) as u64)
+                .unwrap_or(u64::from(s.kbps));
+            if before.is_some_and(|b| s.dropped > b) || (avg as f64) < f64::from(s.want_kbps) * SLOW_SHARE {
                 trouble = true;
             }
         }
@@ -204,6 +235,20 @@ mod tests {
         let fresh = [s("twitch", 6000), Sample { id: "kick", kbps: 0, want_kbps: 6000, dropped: 0, live_ms: 1_000 }];
         for i in 0..10 {
             assert_eq!(q.tick(t + Duration::from_secs(i), &fresh, ORDER), None);
+        }
+    }
+
+    #[test]
+    fn a_bursty_low_rate_stream_is_not_trouble() {
+        // A still scene: 370 and 1,670 kbps in turns against a 1,040 kbps stream.
+        let mut p = Protector::default();
+        let t = Instant::now();
+        let order = &["twitch", "shorts"];
+        for i in 0..20 {
+            let k = if i % 2 == 0 { 370 } else { 1670 };
+            let live =
+                [s("twitch", 6000), Sample { id: "shorts", kbps: k, want_kbps: 1040, dropped: 0, live_ms: 10_000 }];
+            assert_eq!(p.tick(t + Duration::from_secs(i), &live, order), None, "second {i}");
         }
     }
 

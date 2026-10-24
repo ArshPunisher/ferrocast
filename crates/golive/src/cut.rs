@@ -218,6 +218,9 @@ pub fn ffmpeg_args(cfg: &CutConfig, src_w: u32, src_h: u32, encoder: &Encoder, p
         "1000000",
         "-probesize",
         "1000000",
+        // Decode on the graphics card when there is one (ffmpeg falls back by itself).
+        "-hwaccel",
+        "auto",
         "-f",
         "flv",
         "-i",
