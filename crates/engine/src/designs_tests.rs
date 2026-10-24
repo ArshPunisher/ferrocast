@@ -254,7 +254,7 @@ async fn the_design_decides_whether_tts_reads_on_top_of_the_policy() {
 async fn using_a_theme_makes_an_overlay_per_scene_that_keeps_the_mark() {
     let (e, _d) = with_catalogue().await;
     let r = e.use_design("builtin.forge", UseRequest::default()).await.unwrap();
-    assert_eq!(r.overlays.len(), 5);
+    assert_eq!(r.overlays.len(), SCENE_KEYS.len(), "one per screen");
     assert_eq!(r.alert_design.as_deref(), Some("builtin.molten"), "the theme's alerts come along");
     let o = e.overlay(&r.overlays[0].id).await.unwrap();
     assert_eq!(o.design.as_ref().unwrap().id, "builtin.forge");

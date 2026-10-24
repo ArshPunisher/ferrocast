@@ -1,4 +1,5 @@
-//! Static overlay layers (image, text, shape, frame, webcam frame, brand mark), the style a
+//! Overlay layers (image, text, shape, frame, webcam frame, brand mark, and the 25 Oct motion
+//! background, music piece and sound element), the style a
 //! widget design gives a live widget, and the small value checks designs share: colours,
 //! media references, font names and custom CSS.
 //!
@@ -211,7 +212,16 @@ fn text_len(obj: &Map<String, Value>, path: &str, key: &str, max: usize) -> Chec
     }
 }
 
-pub const LAYER_TYPES: [&str; 6] = ["image", "text", "shape", "frame", "webcam", "brand"];
+pub const LAYER_TYPES: [&str; 9] = ["image", "text", "shape", "frame", "webcam", "brand", "fx", "music", "sound"];
+/// Motion backgrounds an `fx` layer draws (the overlay page has each one).
+pub const FX_PRESETS: [&str; 11] =
+    ["hex", "nightdrive", "wasteland", "circuit", "tunnel", "dunes", "forge", "arena", "coderain", "orbit", "sonar"];
+/// Short sounds a `sound` layer plays once (made by the overlay page, no files).
+pub const STINGERS: [&str; 6] = ["whoosh", "riser", "impact", "tick", "chime", "glitch"];
+/// Sounds a `sound` layer loops behind the screen.
+pub const SOUND_LOOPS: [&str; 4] = ["rain", "wind", "pad", "hum"];
+/// How a text layer's countdown looks.
+pub const COUNTDOWN_LOOKS: [&str; 6] = ["digital", "thin", "ring", "bar", "flip", "words"];
 pub const SHADOWS: [&str; 4] = ["none", "soft", "hard", "glow"];
 const LOOPS: [&str; 4] = ["none", "float", "pulse", "shimmer"];
 
@@ -245,6 +255,53 @@ pub fn validate(config: &Value) -> Check {
             one_of(obj, path, "shadow", &SHADOWS)?;
             num_in(obj, path, "outline", 0.0, 20.0)?;
             opt_color(obj, path, "outline_color")?;
+            num_in(obj, path, "countdown", 1.0, 86_400.0)?;
+            one_of(obj, path, "countdown_look", &COUNTDOWN_LOOKS)?;
+            for b in ["countdown_restart", "countdown_show", "countdown_up"] {
+                opt_bool(obj, path, b)?;
+            }
+        }
+        "fx" => {
+            let p = opt_str(obj, path, "preset")?.ok_or("config.preset: pick a motion background.")?;
+            if !FX_PRESETS.contains(&p) {
+                return Err(format!("config.preset: \"{}\" isn't one of {}.", clip(p), FX_PRESETS.join(", ")));
+            }
+            for c in ["color", "color2", "background"] {
+                opt_color(obj, path, c)?;
+            }
+            num_in(obj, path, "speed", 0.25, 3.0)?;
+            num_in(obj, path, "density", 0.5, 2.0)?;
+            opt_bool(obj, path, "reactive")?;
+        }
+        "music" => {
+            one_of(obj, path, "look", &["wave", "pulse"])?;
+            for c in ["color", "color2", "text_color"] {
+                opt_color(obj, path, c)?;
+            }
+            if let Some(f) = opt_str(obj, path, "font")? {
+                font_family("config.font", f)?;
+            }
+            num_in(obj, path, "title_size", 8.0, 160.0)?;
+            opt_bool(obj, path, "show_title")?;
+            opt_bool(obj, path, "only_playing")?;
+        }
+        "sound" => {
+            for k in ["on_show", "at_zero"] {
+                if let Some(v) = opt_str(obj, path, k)?
+                    && !STINGERS.contains(&v)
+                {
+                    return Err(format!("config.{k}: \"{}\" isn't one of {}.", clip(v), STINGERS.join(", ")));
+                }
+            }
+            one_of(obj, path, "loop", &SOUND_LOOPS)?;
+            for k in ["on_show_media", "loop_media"] {
+                if let Some(m) = opt_str(obj, path, k)? {
+                    media_ref(&format!("config.{k}"), m)?;
+                }
+            }
+            opt_bool(obj, path, "last_ticks")?;
+            opt_bool(obj, path, "duck")?;
+            num_in(obj, path, "volume", 0.0, 1.0)?;
         }
         "shape" => {
             one_of(obj, path, "shape", &["rect", "ellipse", "line", "slant", "triangle"])?;
@@ -384,6 +441,14 @@ mod tests {
             json!({ "type": "frame", "style": "notch", "color": "#ffa424", "thickness": 4, "radius": 16, "label": "LIVE" }),
             json!({ "type": "webcam", "style": "corners", "color": "#33d4ff" }),
             json!({ "type": "brand", "variant": "badge" }),
+            json!({ "type": "text", "text": "{time}", "countdown": 300, "countdown_look": "ring", "countdown_up": true }),
+            json!({ "type": "fx", "preset": "nightdrive", "color": "#ff3df0", "color2": "#33d4ff",
+                    "background": "#07040f", "speed": 1.5, "density": 1, "reactive": true }),
+            json!({ "type": "music", "look": "pulse", "color": "#ffa424", "font": "Space Grotesk", "show_title": true,
+                    "only_playing": true, "title_size": 28 }),
+            json!({ "type": "sound", "on_show": "whoosh", "loop": "rain", "last_ticks": true, "at_zero": "impact",
+                    "volume": 0.6, "duck": true, "on_show_media": "01hx2k3m4n5p6q7r8s9t0vwxyz" }),
+            json!({ "type": "sound" }),
         ];
         for c in ok {
             validate(&c).unwrap_or_else(|e| panic!("{c}: {e}"));
@@ -405,6 +470,18 @@ mod tests {
             (json!({ "type": "text", "anim": "rise" }), "config.anim"),
             (json!({ "type": "text", "css": "@import url(x)" }), "config.css"),
             (json!({ "type": "text", "uppercase": "yes" }), "config.uppercase"),
+            (json!({ "type": "text", "countdown_look": "sundial" }), "config.countdown_look"),
+            (json!({ "type": "text", "countdown": 0 }), "config.countdown"),
+            (json!({ "type": "fx" }), "config.preset"),
+            (json!({ "type": "fx", "preset": "lava" }), "config.preset"),
+            (json!({ "type": "fx", "preset": "hex", "speed": 9 }), "config.speed"),
+            (json!({ "type": "fx", "preset": "hex", "color": "url(x)" }), "config.color"),
+            (json!({ "type": "music", "look": "ring" }), "config.look"),
+            (json!({ "type": "music", "font": "a;b" }), "config.font"),
+            (json!({ "type": "sound", "on_show": "airhorn" }), "config.on_show"),
+            (json!({ "type": "sound", "loop": "whoosh" }), "config.loop"),
+            (json!({ "type": "sound", "volume": 2 }), "config.volume"),
+            (json!({ "type": "sound", "loop_media": "https://x.test/a.mp3" }), "config.loop_media"),
         ];
         for (c, field) in bad {
             let e = validate(&c).unwrap_err();

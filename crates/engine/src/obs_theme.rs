@@ -854,7 +854,7 @@ impl Engine {
             }
         }
         let break_screen = matches!(p.role, Some(Role::Starting | Role::Brb | Role::Ending))
-            || matches!(p.key.as_str(), "starting_soon" | "brb" | "ending");
+            || ferrocast_core::design::BREAK_KEYS.contains(&p.key.as_str());
         let mut mic_added = false;
         if break_screen {
             // A scene under it that has the mic already brings it: no second copy.

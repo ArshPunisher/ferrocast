@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ferrocast_core::design::{Design, DesignContent, SCENE_KEYS, ThemeContent};
+use ferrocast_core::design::{Design, DesignContent, ThemeContent};
 use ferrocast_obs::ObsConfig;
 use ferrocast_testkit::obs::{FakeObs, Input, Item, St, closed_port, start as start_obs};
 use serde_json::{Map, Value, json};
@@ -29,7 +29,7 @@ fn theme(id: &str, name: &str) -> Design {
     d.name = name.into();
     d.built_in = true;
     d.content = DesignContent::Theme(ThemeContent {
-        scenes: SCENE_KEYS
+        scenes: ["in_game", "just_chatting", "starting_soon", "brb", "ending"]
             .iter()
             .zip(names)
             .map(|(k, n)| {

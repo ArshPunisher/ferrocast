@@ -714,8 +714,13 @@ pub struct ThemeContent {
     pub alert_design: Option<String>,
 }
 
-/// The standard scene keys; `custom_<n>` are allowed too.
-pub const SCENE_KEYS: [&str; 5] = ["in_game", "just_chatting", "starting_soon", "brb", "ending"];
+/// The standard scene keys; `custom_<n>` are allowed too. `getting_ready`, `paused` and
+/// `offline` are the 25 Oct break screens (Ending also covers "stream over").
+pub const SCENE_KEYS: [&str; 8] =
+    ["in_game", "just_chatting", "starting_soon", "getting_ready", "brb", "paused", "offline", "ending"];
+
+/// Screens shown while the streamer is away from the game: they get the mic when asked.
+pub const BREAK_KEYS: [&str; 6] = ["starting_soon", "getting_ready", "brb", "paused", "offline", "ending"];
 
 /// One screen: layers are overlay widgets, bottom to top, so "Use" turns a scene into an
 /// overlay as is.
