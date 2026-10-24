@@ -124,6 +124,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("/overlays/*", "/overlays/{id}"),
     ("/designs/*/duplicate", "/designs/{id}/duplicate"),
     ("/designs/*/use", "/designs/{id}/use"),
+    ("/designs/*/obs", "/designs/{id}/obs"),
     ("/designs/*/export", "/designs/{id}/export"),
     ("/designs/*", "/designs/{id}"),
     ("/alert-rules/*", "/alert-rules/{id}"),

@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use ferrocast_core::design::{Design, DesignKind};
 use ferrocast_engine::designs::UseRequest;
+use ferrocast_engine::obs_theme::ThemePlan;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -87,6 +88,31 @@ pub async fn duplicate(
 ) -> ApiResult<impl IntoResponse> {
     let name = optional_body::<DuplicateBody>(&body)?.name;
     Ok((StatusCode::CREATED, Json(json!(app.engine.duplicate_design(&id, name.as_deref()).await?))))
+}
+
+/// `GET /designs/{id}/obs`: Ferrocast's guesses for putting a theme into OBS.
+pub async fn obs_plan(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.theme_obs_plan(&id).await?)))
+}
+
+/// `POST /designs/{id}/obs`: puts a theme into OBS (an empty body uses the guesses).
+pub async fn put_in_obs(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Value>> {
+    let plan: Option<ThemePlan> = optional_body(&body)?;
+    Ok(Json(json!(app.engine.apply_theme_to_obs(&id, plan).await?)))
+}
+
+/// `GET /obs/theme`: the theme Ferrocast put into OBS, or null.
+pub async fn obs_theme(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.obs_theme().await?)))
+}
+
+/// `DELETE /obs/theme`: takes it out again (only what Ferrocast added).
+pub async fn take_theme_out(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.undo_theme_in_obs().await?)))
 }
 
 pub async fn use_design(

@@ -1684,3 +1684,26 @@ async fn a_custom_destination_gets_the_stream_end_to_end() {
     let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
     assert_eq!(v["destinations"].as_array().unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn theme_in_obs_routes_answer_in_our_shape() {
+    let r = start().await;
+    let none = r.get("/api/v1/obs/theme").await;
+    assert_eq!(none.status(), StatusCode::OK);
+    assert_eq!(none.json::<Value>().await.unwrap(), Value::Null);
+    let undo = r.client.delete(format!("{}/api/v1/obs/theme", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(error_code(undo).await, (StatusCode::NOT_FOUND, "no_theme_in_obs".into()));
+    let bad = r
+        .client
+        .post(format!("{}/api/v1/designs/whatever/obs", r.base))
+        .bearer_auth(&r.token)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_code(bad).await.0, StatusCode::BAD_REQUEST);
+    let unknown = r.post("/api/v1/designs/whatever/obs", json!({ "prefix": "x", "screens": [], "extra": 1 })).await;
+    assert_eq!(error_code(unknown).await.0, StatusCode::BAD_REQUEST, "unknown fields are refused");
+    assert_eq!(r.get("/api/v1/designs/whatever/obs").await.status(), StatusCode::NOT_FOUND);
+}

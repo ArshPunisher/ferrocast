@@ -56,6 +56,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/designs/{id}", get(designs::get).put(designs::update).delete(designs::remove))
         .route("/designs/{id}/duplicate", post(designs::duplicate))
         .route("/designs/{id}/use", post(designs::use_design))
+        .route("/designs/{id}/obs", get(designs::obs_plan).post(designs::put_in_obs))
         .route("/designs/{id}/export", post(designs::export))
         // alerts and queue
         .route("/alert-rules", get(core::rules).post(core::create_rule))
@@ -139,6 +140,7 @@ pub(crate) fn api() -> Router<AppState> {
         // OBS
         .route("/obs", get(core::obs).put(core::save_obs))
         .route("/obs/detect", get(core::obs_detect).post(core::obs_use_detected))
+        .route("/obs/theme", get(designs::obs_theme).delete(designs::take_theme_out))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
         .route("/themes", get(app::themes))
