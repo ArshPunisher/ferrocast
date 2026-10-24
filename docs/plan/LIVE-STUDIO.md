@@ -240,6 +240,30 @@ Simple user can open one section without switching everything. Remembered per in
 **Before building:** a design board with the Simple/Advanced switch and the Go live and
 vertical screens in both modes, for the owner to pick from (no code until the owner says so).
 
+**Picks, 24 Oct 2026** (board `../design/2026-10-24-vertical-modes/index.html`):
+- **1B** the Simple/Advanced switch sits at the top of each screen, and each screen remembers
+  its own mode (Go live can be Advanced while Alerts stays Simple). No global switch in the
+  sidebar.
+- **2B** Go live's Advanced settings live in one "Advanced settings" card below the platforms,
+  with a picker for Twitch / YouTube / Kick / Local server (server region, rtmps or rtmp, first
+  retry, longest wait, buffer; local port, new key, upload kept free).
+- **3** upload protection as drawn: Simple is the switch; Advanced is the rule as a sentence
+  with editable numbers (share, trouble seconds, which pauses first, calm seconds, first and
+  longest pause).
+- **4B** vertical gets its own Studio tab ("Vertical", after Go live) with the source choice
+  (cut from your stream, or OBS's vertical canvas, Aitum Vertical detected) and its own
+  destinations. Replaces 2A's "vertical group" in Your platforms.
+- **5A** Simple layout: one screen, the stream with Camera and Game boxes (guessed from OBS
+  sources), the upright preview beside it, four layouts (camera on top, small camera, half and
+  half, game only).
+- **6, 7, 8, 9** approved as drawn: Advanced vertical numbers, the Aitum Multistream double
+  upload warning, stream info per platform (pick 6 mix), the phone layout picker.
+
+Build order once the owner says to code: A2.1 stream info per platform (8), A2.2 Aitum
+Multistream warning (7), A2.3 vertical forwarding from OBS's canvas (second local address,
+4B tab), A2.4 cut-from-stream vertical (decode, crop, stack, encode; 5A, 6), A2.5 the per-screen
+Simple/Advanced switch (1B) with Go live's Advanced card (2B) and upload protection's (3).
+
 ### Found in the real test (23 Oct)
 The owner's OBS sends ~12 Mbps at 1440p60; Twitch takes 6 and Kick 8 (Twitch "Unstable", Kick
 dropping). Ferrocast warned on both rows. To do: lower OBS's bitrate to ≤ 6,000 kbps.
