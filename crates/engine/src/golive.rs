@@ -54,6 +54,14 @@ pub struct DestinationConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GoLiveConfig {
     pub destinations: Vec<DestinationConfig>,
+    /// Upload protection (A1.8): pause the bottom destination when the upload can't carry
+    /// them all. On unless the streamer turns it off.
+    #[serde(default = "on")]
+    pub protect: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 impl Default for GoLiveConfig {
@@ -62,6 +70,7 @@ impl Default for GoLiveConfig {
         let p = |id: &str, kind| DestinationConfig { id: id.into(), kind, name: None, url: None, enabled: false };
         Self {
             destinations: vec![p("twitch", Service::Twitch), p("youtube", Service::Youtube), p("kick", Service::Kick)],
+            protect: true,
         }
     }
 }
@@ -98,6 +107,8 @@ pub struct GoLiveView {
     pub stats: StreamStats,
     pub destinations: Vec<DestinationView>,
     pub upload: Option<UploadCheck>,
+    /// Upload protection is on (A1.8).
+    pub protect: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -142,6 +153,10 @@ pub(crate) struct GoLive {
     busy: tokio::sync::Mutex<()>,
     /// One start/stop pass at a time, so a destination is never started twice.
     reconciling: tokio::sync::Mutex<()>,
+    /// Upload protection's state: what's paused and until when.
+    protector: Mutex<ferrocast_golive::protect::Protector>,
+    /// Paused destinations' health lines (their forwarders aren't running).
+    paused: Mutex<HashMap<String, Health>>,
 }
 
 impl Default for GoLive {
@@ -156,6 +171,8 @@ impl Default for GoLive {
             last_kbps: std::sync::atomic::AtomicU32::new(0),
             busy: tokio::sync::Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
+            protector: Mutex::new(Default::default()),
+            paused: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -277,6 +294,7 @@ impl Engine {
         let stats = g.hub.stats();
         let cfg = self.golive_config();
         let running = lock(&g.running);
+        let paused = lock(&g.paused);
         let blocked = lock(&g.blocked);
         let st = self.state();
         let destinations = cfg
@@ -297,13 +315,16 @@ impl Engine {
                     account,
                     enabled: d.enabled,
                     connected,
-                    health: running.get(&d.id).map(|r| r.health.borrow().clone()),
+                    health: running
+                        .get(&d.id)
+                        .map(|r| r.health.borrow().clone())
+                        .or_else(|| paused.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
                     rules: if d.enabled { probe::rules(&stats, d.kind) } else { Vec::new() },
                 }
             })
             .collect();
-        GoLiveView { ingest, obs, live, stats, destinations, upload: lock(&g.upload).clone() }
+        GoLiveView { ingest, obs, live, stats, destinations, upload: lock(&g.upload).clone(), protect: cfg.protect }
     }
 
     async fn golive_obs_view(&self, ingest: Option<&str>) -> ObsView {
@@ -356,8 +377,13 @@ impl Engine {
             }
             next.push(DestinationConfig { enabled: *enabled, ..d.clone() });
         }
-        let next = GoLiveConfig { destinations: next };
+        let next = GoLiveConfig { destinations: next, ..self.golive_config() };
         self.save_golive(next.clone()).await?;
+        // Unticking a paused destination ends its pause (ticking it again starts it at once).
+        for d in next.destinations.iter().filter(|d| !d.enabled) {
+            lock(&self.golive().protector).release(&d.id);
+            lock(&self.golive().paused).remove(&d.id);
+        }
         self.reconcile().await;
         Ok(next)
     }
@@ -601,7 +627,7 @@ impl Engine {
 
     /// While live: starts forwarders for ticked destinations that aren't running and stops
     /// the ones no longer ticked.
-    async fn reconcile(&self) {
+    pub(crate) async fn reconcile(&self) {
         let g = self.golive();
         let _one = g.reconciling.lock().await;
         if !g.hub.live().borrow().on {
@@ -618,7 +644,7 @@ impl Engine {
             lock(&g.blocked).remove(&id);
         }
         for d in ticked {
-            if lock(&g.running).contains_key(&d.id) {
+            if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
                 continue;
             }
             self.start_destination(&d).await;
@@ -650,6 +676,96 @@ impl Engine {
             r.stop.send_replace(true);
         }
         lock(&g.blocked).clear();
+        lock(&g.paused).clear();
+        lock(&g.protector).reset();
+    }
+
+    /// Turns upload protection on or off. Off brings every paused destination back.
+    pub async fn set_golive_protect(&self, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let mut cfg = self.golive_config();
+        cfg.protect = on;
+        self.save_golive(cfg.clone()).await?;
+        if !on {
+            let ids: Vec<String> = lock(&self.golive().paused).keys().cloned().collect();
+            for id in ids {
+                self.unpause(&id).await;
+            }
+            // Switched on again later, it starts from a clean slate.
+            lock(&self.golive().protector).reset();
+        }
+        Ok(cfg)
+    }
+
+    /// "Resume now" on a paused destination: it starts again at once.
+    pub async fn golive_resume(&self, id: &str) -> Result<(), EngineError> {
+        if !lock(&self.golive().paused).contains_key(id) {
+            return Err(refused("golive_not_paused", "That platform isn't paused.", "Nothing to resume."));
+        }
+        self.unpause(id).await;
+        Ok(())
+    }
+
+    async fn unpause(&self, id: &str) {
+        let g = self.golive();
+        lock(&g.protector).release(id);
+        lock(&g.paused).remove(id);
+        self.reconcile().await;
+    }
+
+    /// Stops a destination the protector just paused and shows why on its health line.
+    pub(crate) fn pause(&self, id: String, top: String) {
+        let g = self.golive();
+        if let Some(r) = lock(&g.running).remove(&id) {
+            r.stop.send_replace(true);
+        }
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        let left = lock(&g.protector)
+            .paused_until(&id)
+            .map(|u| u.saturating_duration_since(std::time::Instant::now()).as_millis() as u64)
+            .unwrap_or(0);
+        tracing::info!(dest = %id, "Go live: upload protection paused a destination");
+        let reason = format!("Your upload dipped, so this paused to keep {top} smooth. It comes back by itself.");
+        let health = Health {
+            state: PushState::Paused { until_ms: now_ms + left, reason },
+            kbps: 0,
+            dropped: 0,
+            since_ms: now_ms,
+        };
+        lock(&g.paused).insert(id, health);
+        self.send_golive();
+    }
+
+    /// One second of upload protection while live.
+    async fn protect_tick(&self) {
+        use ferrocast_golive::protect::{Action, Sample};
+        let g = self.golive();
+        let cfg = self.golive_config();
+        if !cfg.protect {
+            return;
+        }
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        let healths: Vec<(String, Health)> =
+            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone())).collect();
+        let samples: Vec<Sample<'_>> = healths
+            .iter()
+            .filter(|(_, h)| h.state == PushState::Live)
+            .map(|(id, h)| Sample { id, kbps: h.kbps, dropped: h.dropped, live_ms: now_ms.saturating_sub(h.since_ms) })
+            .collect();
+        let order: Vec<&str> = cfg.destinations.iter().filter(|d| d.enabled).map(|d| d.id.as_str()).collect();
+        let stream_kbps = g.hub.stats().kbps;
+        let action = lock(&g.protector).tick(std::time::Instant::now(), stream_kbps, &samples, &order);
+        match action {
+            Some(Action::Pause(id)) => {
+                let top = cfg.destinations.iter().find(|d| d.enabled && d.id != id).map(dest_name).unwrap_or_default();
+                self.pause(id, top);
+            }
+            Some(Action::Resume(id)) => {
+                tracing::info!(dest = %id, "Go live: upload protection brought a destination back");
+                lock(&g.paused).remove(&id);
+                self.reconcile().await;
+            }
+            None => {}
+        }
     }
 }
 
@@ -695,19 +811,23 @@ pub(crate) async fn run(engine: Engine) {
         tracing::info!(stream, "Go live: OBS started streaming");
         engine.reconcile().await;
         loop {
-            tokio::select! {
+            // The wait's watch guard isn't Send, so the awaiting tick runs after the select.
+            let ended = tokio::select! {
                 changed = live.wait_for(|l| !(l.on && l.stream == stream)) => {
                     if changed.is_err() { return; }
-                    break;
+                    true
                 }
-                _ = tokio::time::sleep(HEALTH_EVERY) => {
-                    let k = engine.golive().hub.stats().kbps;
-                    if k > 0 {
-                        engine.golive().last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    engine.send_golive();
-                }
+                _ = tokio::time::sleep(HEALTH_EVERY) => false,
+            };
+            if ended {
+                break;
             }
+            let k = engine.golive().hub.stats().kbps;
+            if k > 0 {
+                engine.golive().last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
+            }
+            engine.protect_tick().await;
+            engine.send_golive();
         }
         engine.stop_all();
         done = stream;

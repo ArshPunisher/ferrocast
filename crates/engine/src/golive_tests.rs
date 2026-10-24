@@ -71,6 +71,65 @@ async fn a_platform_that_is_not_connected_says_why_when_the_stream_starts() {
     assert_eq!(why.as_deref(), Some("Connect Twitch in Settings, Accounts first."));
 }
 
+/// Upload protection pausing a destination: it stops, says why, isn't restarted by the next
+/// start/stop pass, and comes back on "Resume now" or when protection is turned off.
+#[tokio::test]
+async fn a_paused_destination_stays_off_until_resumed() {
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{Got, Obs, platform};
+    use tokio::time::{Duration, timeout};
+    // The next message matching `want`, skipping media in between.
+    async fn until(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: impl Fn(&Got) -> bool) -> Got {
+        loop {
+            let g = timeout(Duration::from_secs(5), rx.recv()).await.expect("in time").expect("open");
+            if want(&g) {
+                return g;
+            }
+        }
+    }
+    let publish = |g: &Got| matches!(g, Got::Publish(_));
+    let closed = |g: &Got| *g == Got::Closed;
+    let (e, _dir) = engine().await;
+    let (port_a, mut got_a) = platform("key-a").await;
+    let (port_b, mut got_b) = platform("key-b").await;
+    let a = e.add_golive_destination("Main", &format!("rtmp://127.0.0.1:{port_a}/app"), "key-a").await.unwrap();
+    let b = e.add_golive_destination("Backup", &format!("rtmp://127.0.0.1:{port_b}/app"), "key-b").await.unwrap();
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+    assert_eq!(until(&mut got_a, publish).await, Got::Publish("key-a".into()));
+    assert_eq!(until(&mut got_b, publish).await, Got::Publish("key-b".into()));
+    let state = |v: &crate::golive::GoLiveView, id: &str| {
+        v.destinations.iter().find(|d| d.id == id).and_then(|d| d.health.clone()).map(|h| h.state)
+    };
+
+    e.pause(b.id.clone(), "Main".into());
+    until(&mut got_b, closed).await;
+    let v = e.golive_view().await;
+    match state(&v, &b.id) {
+        Some(PushState::Paused { reason, .. }) => assert!(reason.contains("keep Main smooth"), "{reason}"),
+        other => panic!("not paused: {other:?}"),
+    }
+    // A start/stop pass (any order change) leaves it paused.
+    e.reconcile().await;
+    assert!(matches!(state(&e.golive_view().await, &b.id), Some(PushState::Paused { .. })));
+    assert!(timeout(Duration::from_millis(300), got_b.recv()).await.is_err(), "nothing reconnected");
+
+    // "Resume now" starts it again; resuming twice says there's nothing to resume.
+    e.golive_resume(&b.id).await.unwrap();
+    assert_eq!(until(&mut got_b, publish).await, Got::Publish("key-b".into()));
+    let err = e.golive_resume(&b.id).await.unwrap_err().to_string();
+    assert!(err.contains("isn't paused"), "{err}");
+
+    // Turning protection off brings back whatever is paused, and stays saved.
+    e.pause(a.id.clone(), "Backup".into());
+    until(&mut got_a, closed).await;
+    e.set_golive_protect(false).await.unwrap();
+    assert_eq!(until(&mut got_a, publish).await, Got::Publish("key-a".into()));
+    assert!(!e.golive_view().await.protect);
+    assert!(!e.golive_config().protect);
+}
+
 /// The relay builds the app's Kick sign-in link: its scope list must be the app's own.
 #[test]
 fn the_relays_kick_scopes_are_the_apps() {
