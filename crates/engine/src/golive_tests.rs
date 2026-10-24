@@ -181,6 +181,55 @@ async fn the_vertical_canvas_goes_only_to_vertical_destinations() {
     assert!(e.golive_view().await.live);
 }
 
+/// Cut from the stream (A2.4): with ffmpeg here, the normal stream becomes an upright one that
+/// reaches the vertical destinations; a bad layout is refused with the field named.
+#[tokio::test]
+async fn the_vertical_picture_is_cut_from_the_normal_stream() {
+    use crate::golive::{Canvas, CutBox, CutConfig, VerticalSource, find_ffmpeg};
+    use ferrocast_testkit::rtmp::{Got, next, platform};
+    let Some(ff) = find_ffmpeg() else { return };
+    let (e, _dir) = engine().await;
+    let bad = CutConfig { game: CutBox { x: 0.6, y: 0.0, w: 0.6, h: 1.0 }, ..CutConfig::default() };
+    assert!(e.set_vertical_cut(bad).await.unwrap_err().to_string().contains("game:"));
+    e.set_vertical_cut(CutConfig { kbps: 2000, ..CutConfig::default() }).await.unwrap();
+    e.set_vertical_source(VerticalSource::Cut).await.unwrap();
+    let (port_v, mut got_v) = platform("cut-key").await;
+    e.add_golive_destination("Shorts box", &format!("rtmp://127.0.0.1:{port_v}/app"), "cut-key", Canvas::Vertical)
+        .await
+        .unwrap();
+    assert!(e.golive_view().await.cut.state.is_some(), "the cutter waits for the stream");
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let mut obs = tokio::process::Command::new(&ff)
+        .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30"])
+        .args(["-t", "20", "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-f", "flv"])
+        .arg(format!("{server}/{key}"))
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // ffmpeg looks at the input for a second before the vertical stream starts.
+    for _ in 0..40 {
+        if e.golive_view().await.vertical_live {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_eq!(next(&mut got_v).await, Got::Publish("cut-key".into()));
+    let mut vertical = false;
+    for _ in 0..60 {
+        let v = e.golive_view().await;
+        if v.vertical_live && v.vertical_stats.height == Some(1920) {
+            vertical = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(vertical, "the cut stream is 1080x1920");
+    // Back to OBS's canvas: the cutter stops and the vertical stream ends.
+    e.set_vertical_source(VerticalSource::Canvas).await.unwrap();
+    assert!(e.golive_view().await.cut.state.is_none());
+    let _ = obs.kill().await;
+}
+
 /// Aitum Vertical: pointed at Ferrocast's vertical key with its own setting kept, never while
 /// it streams, and put back exactly.
 #[tokio::test]

@@ -703,7 +703,13 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                            vertical: { points_here: boolean; streaming: boolean; before: string | null /* host */ } | null /* Aitum Vertical, when OBS has it */ };
                     live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
                     destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
-                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */ }
+                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */;
+                    cut: { source: "canvas" | "cut"; config: CutConfig; state: CutState | null /* null while not needed */; ffmpeg: boolean /* found */ } }
+type CutBox = { x: number; y: number; w: number; h: number }   // fractions (0–1) of the normal picture
+type CutConfig = { layout: "camera_top" | "small_camera" | "half_half" | "game_only"; camera: CutBox; game: CutBox;
+                   camera_share?: number /* 20–60 %, camera_top */; width?: 1080 | 720; height?: 1920 | 1280; fps?: 30 | 60; kbps?: number /* 1,000–12,000 */ }
+type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder: string; on: string /* "your graphics card" */ }
+              | { state: "failed"; reason: string /* in words; it tries again by itself */ }
 ```
 
 | Method | Path | Body → Response |
@@ -719,10 +725,14 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
 | PUT | `/api/v1/golive/protection` | `{ on: boolean }` → `{ destinations, protect }`. Off brings every paused destination back at once |
 | POST | `/api/v1/golive/vertical/obs/setup` | Points Aitum Vertical's first stream output at the local server with the vertical key, keeping its own server and key (secret store) → `ObsView.vertical`. 422 `aitum_vertical_missing`, `aitum_vertical_no_output` (add a stream output in its settings first), `obs_streaming` (its canvas streams) |
 | POST | `/api/v1/golive/vertical/obs/restore` | Puts Aitum Vertical's own server and key back → `ObsView.vertical`. 422 `golive_nothing_saved`, `obs_streaming` |
+| PUT | `/api/v1/golive/vertical/source` | `{ source: "canvas" \| "cut" }` → `GoLiveConfig`. 422 `ffmpeg_missing` for `cut` without ffmpeg |
+| PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
 | POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
 
 **Vertical (A2.3).** OBS's vertical canvas (Aitum Vertical, or anything else sending to `vertical_key`) streams to the same local server on its own key, into its own stream. Destinations with `canvas: "vertical"` get that stream and run while it's live, whatever the normal stream does. `youtube_vertical` (YouTube Shorts live) is made by Ferrocast: a reusable YouTube stream "Ferrocast vertical" once (about 150 units the first time), and before each vertical stream a broadcast bound to it that starts and ends by itself, with the title and privacy of the channel's normal live (2 units when it exists); the normal YouTube destination never picks that stream. Twitch and Kick take one live per channel, so vertical goes to YouTube or your own servers (`POST /golive/destinations` with `"canvas": "vertical"`). Upload protection counts vertical destinations after every normal one, so they pause first, each judged against its own stream's rate. The upload check plans 4,660 kbps for vertical before it has streamed.
+
+**Cut from the stream (A2.4).** With `source: "cut"`, while a vertical destination is ticked, ffmpeg (`FERROCAST_FFMPEG`, next to the app, Homebrew or `PATH`) takes the normal stream from Ferrocast, crops the camera and game boxes, fills the layout's slots (scaled to cover, no bars), encodes H.264 on the graphics card when it can (VideoToolbox, NVENC, Quick Sync, AMF; else x264 veryfast), copies the audio and publishes to the vertical key, so the vertical destinations carry it like OBS's canvas. It waits for the normal stream and follows it; an encoder that won't start is skipped for the next; ffmpeg stopping says why in `state.reason` and is tried again after 3 s. The upload check plans `kbps` + 160 for it.
 
 **Aitum Multistream (A2.2).** When OBS has the Aitum Multistream plugin (it answers the `aitum-multistream` / `get_outputs` vendor request), `GoLiveView.obs.aitum` lists its outputs: which are sending now (OBS's output `aitum_multi_output_<name>` is active) and the platform each goes to, from the plugin's settings file `<OBS config>/plugin_config/aitum-multistream/config.json` for OBS's current profile (only each output's name and server are read, never its key), else from its name. The dashboard warns when one goes to a platform Go live also sends to: before going live unless `aitum_ok`, and while both are live always.
 

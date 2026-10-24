@@ -27,6 +27,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
         .route("/golive/vertical/obs/setup", post(point_vertical))
+        .route("/golive/vertical/source", put(vertical_source))
+        .route("/golive/vertical/cut", put(vertical_cut))
         .route("/golive/vertical/obs/restore", post(restore_vertical))
         .route("/golive/resume/{id}", post(resume))
 }
@@ -130,4 +132,23 @@ async fn point_vertical(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 /// Puts Aitum Vertical's own setting back.
 async fn restore_vertical(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.golive_restore_vertical().await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceBody {
+    source: ferrocast_engine::golive::VerticalSource,
+}
+
+/// Where the vertical picture comes from: OBS's vertical canvas, or cut from the stream (A2.4).
+async fn vertical_source(State(app): State<AppState>, Body(b): Body<SourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_vertical_source(b.source).await?)))
+}
+
+/// The cut-from-stream layout.
+async fn vertical_cut(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::golive::CutConfig>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_vertical_cut(b).await?)))
 }

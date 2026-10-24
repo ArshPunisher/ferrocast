@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use ferrocast_core::event::Platform;
+pub use ferrocast_golive::cut::{CutBox, CutConfig, Layout};
+pub use ferrocast_golive::cutter::CutState as CutStateView;
+use ferrocast_golive::cutter::CutState;
 use ferrocast_golive::probe::{self, Need, Service, TWITCH_BANDWIDTH_TEST};
 use ferrocast_golive::{Destination, Health, Hub, Ingest, PushState, StreamStats, Target, Verdict};
 use ferrocast_obs::control::{self as obs, StreamService};
@@ -86,6 +89,23 @@ pub struct GoLiveConfig {
     /// (the live "sent twice" warning still shows).
     #[serde(default)]
     pub aitum_ok: bool,
+    /// Where the vertical picture comes from (A2.3 canvas, A2.4 cut).
+    #[serde(default)]
+    pub vertical_source: VerticalSource,
+    /// The cut-from-stream layout (A2.4).
+    #[serde(default)]
+    pub cut: CutConfig,
+}
+
+/// Where the vertical picture comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerticalSource {
+    /// OBS's vertical canvas (Aitum Vertical) streams to the vertical key.
+    #[default]
+    Canvas,
+    /// Ferrocast cuts it from the normal stream with ffmpeg.
+    Cut,
 }
 
 fn on() -> bool {
@@ -123,6 +143,8 @@ impl Default for GoLiveConfig {
             ],
             protect: true,
             aitum_ok: false,
+            vertical_source: VerticalSource::Canvas,
+            cut: CutConfig::default(),
         }
     }
 }
@@ -166,6 +188,18 @@ pub struct GoLiveView {
     pub protect: bool,
     /// The streamer said they run Aitum Multistream on purpose (A2.2).
     pub aitum_ok: bool,
+    /// The vertical source and, for cutting, its layout and what the cutter is doing (A2.4).
+    pub cut: CutView,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CutView {
+    pub source: VerticalSource,
+    pub config: CutConfig,
+    /// `None` while it isn't needed (another source, or no vertical destination ticked).
+    pub state: Option<CutState>,
+    /// ffmpeg was found on this computer (cutting needs it).
+    pub ffmpeg: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -267,6 +301,15 @@ pub(crate) struct GoLive {
     protector: Mutex<ferrocast_golive::protect::Protector>,
     /// Paused destinations' health lines (their forwarders aren't running).
     paused: Mutex<HashMap<String, Health>>,
+    /// The cutter for the vertical picture, while it runs (A2.4).
+    cut: Mutex<Option<CutRun>>,
+}
+
+#[derive(Debug)]
+struct CutRun {
+    config: CutConfig,
+    stop: watch::Sender<bool>,
+    state: watch::Receiver<CutState>,
 }
 
 impl Default for GoLive {
@@ -284,6 +327,7 @@ impl Default for GoLive {
             reconciling: tokio::sync::Mutex::new(()),
             protector: Mutex::new(Default::default()),
             paused: Mutex::new(HashMap::new()),
+            cut: Mutex::new(None),
         }
     }
 }
@@ -313,6 +357,34 @@ fn dest_name(d: &DestinationConfig) -> String {
         Some(p) => p.label().to_string(),
         None => d.name.clone().unwrap_or_else(|| "Custom server".into()),
     }
+}
+
+fn cfg_cut_source(c: &GoLiveConfig) -> bool {
+    c.vertical_source == VerticalSource::Cut
+}
+
+/// ffmpeg for cutting the vertical picture: `FERROCAST_FFMPEG`, next to the app, then the
+/// usual places it's installed, then `PATH`.
+pub fn find_ffmpeg() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let mut c: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("FERROCAST_FFMPEG") {
+        c.push(PathBuf::from(p));
+    }
+    if let Ok(me) = std::env::current_exe()
+        && let Some(dir) = me.parent()
+    {
+        c.push(dir.join(exe));
+        c.push(dir.join("../Resources").join(exe));
+    }
+    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        c.push(PathBuf::from(d).join(exe));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        c.extend(std::env::split_paths(&path).map(|d| d.join(exe)));
+    }
+    c.into_iter().find(|p| p.is_file())
 }
 
 /// The vertical canvas's local key: unguessable like the main one, and never the same.
@@ -471,6 +543,12 @@ impl Engine {
             upload: lock(&g.upload).clone(),
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
+            cut: CutView {
+                source: cfg.vertical_source,
+                config: cfg.cut.clone(),
+                state: lock(&g.cut).as_ref().map(|c| c.state.borrow().clone()),
+                ffmpeg: find_ffmpeg().is_some(),
+            },
         }
     }
 
@@ -834,7 +912,12 @@ impl Engine {
         let last = self.golive().last_kbps.load(std::sync::atomic::Ordering::Relaxed);
         let need_main = [stats.kbps, last].into_iter().find(|k| *k > 0).unwrap_or(DEFAULT_NEED_KBPS);
         let vertical = self.golive().vhub.stats().kbps;
-        let need_vertical = if vertical > 0 { vertical } else { DEFAULT_VERTICAL_NEED_KBPS };
+        let planned = if cfg_cut_source(&self.golive_config()) {
+            self.golive_config().cut.kbps + 160
+        } else {
+            DEFAULT_VERTICAL_NEED_KBPS
+        };
+        let need_vertical = if vertical > 0 { vertical } else { planned };
         let mut rows = Vec::new();
         let mut twitch: Option<(Target, String)> = None;
         for d in &ticked {
@@ -982,7 +1065,82 @@ impl Engine {
             }
             self.start_destination(&d).await;
         }
+        self.reconcile_cut().await;
         self.send_golive();
+    }
+
+    /// Runs the cutter while the vertical picture is cut from the stream and a vertical
+    /// destination is ticked; a changed layout restarts it.
+    async fn reconcile_cut(&self) {
+        let g = self.golive();
+        let cfg = self.golive_config();
+        let wanted = cfg.vertical_source == VerticalSource::Cut
+            && cfg.destinations.iter().any(|d| d.enabled && d.canvas == Canvas::Vertical);
+        // A cutter whose task ended (it never should) is cleared, so a new one starts.
+        let ended = lock(&g.cut).as_ref().is_some_and(|c| c.state.has_changed().is_err());
+        if ended {
+            tracing::warn!("Go live: the vertical cutter stopped unexpectedly, starting it again");
+            lock(&g.cut).take();
+        }
+        let running_config = lock(&g.cut).as_ref().map(|c| c.config.clone());
+        if running_config.is_some()
+            && (!wanted || running_config.as_ref() != Some(&cfg.cut))
+            && let Some(c) = lock(&g.cut).take()
+        {
+            c.stop.send_replace(true);
+        }
+        if !wanted || lock(&g.cut).is_some() {
+            return;
+        }
+        let Some(ffmpeg) = find_ffmpeg() else { return };
+        let Ok((server, key)) = self.golive_vertical_ingest().await else { return };
+        let (stop, stop_rx) = watch::channel(false);
+        let (state_tx, state) = watch::channel(CutState::Waiting);
+        let encoders = ferrocast_golive::cut::encoder_candidates().to_vec();
+        tokio::spawn(ferrocast_golive::cutter::run(
+            ffmpeg,
+            g.hub.clone(),
+            cfg.cut.clone(),
+            encoders,
+            format!("{server}/{key}"),
+            state_tx,
+            stop_rx,
+        ));
+        *lock(&g.cut) = Some(CutRun { config: cfg.cut, stop, state });
+    }
+
+    /// Picks where the vertical picture comes from.
+    pub async fn set_vertical_source(&self, source: VerticalSource) -> Result<GoLiveConfig, EngineError> {
+        if source == VerticalSource::Cut && find_ffmpeg().is_none() {
+            return Err(refused(
+                "ffmpeg_missing",
+                "Cutting the vertical picture needs ffmpeg, and it isn't on this computer.",
+                "Install ffmpeg (on a Mac: brew install ffmpeg), then try again, or use OBS's vertical canvas.",
+            ));
+        }
+        let cfg = {
+            let _one_at_a_time = self.config_lock().await;
+            let mut cfg = self.golive_config();
+            cfg.vertical_source = source;
+            self.save_golive(cfg.clone()).await?;
+            cfg
+        };
+        self.reconcile().await;
+        Ok(cfg)
+    }
+
+    /// Saves the cut-from-stream layout; a running cut restarts with it.
+    pub async fn set_vertical_cut(&self, cut: CutConfig) -> Result<GoLiveConfig, EngineError> {
+        cut.validate().map_err(EngineError::Invalid)?;
+        let cfg = {
+            let _one_at_a_time = self.config_lock().await;
+            let mut cfg = self.golive_config();
+            cfg.cut = cut;
+            self.save_golive(cfg.clone()).await?;
+            cfg
+        };
+        self.reconcile().await;
+        Ok(cfg)
     }
 
     async fn start_destination(&self, d: &DestinationConfig) {
