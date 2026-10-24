@@ -5,6 +5,16 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.10
+
+- A theme in OBS keeps every choice: switching theme or Make it yours keeps where each screen
+  goes, what's under it, its Start show job and the mic. The dialog opens on last time's
+  choices, and unticking a screen later takes it out of OBS.
+- Mic on break screens uses your game scene's mic, never OBS's global Mic/Aux (which viewers
+  would hear twice).
+- Your theme in OBS updates by itself when something changes it from another tab or a phone.
+- Ferrocast keeps a log file (in its data folder, under logs) to look into problems.
+
 ## 2.0.0-beta.9
 
 - Mic on break screens: in Advanced, Starting, BRB and Ending can get your mic. Never twice,
