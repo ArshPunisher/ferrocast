@@ -212,6 +212,7 @@ fn destination(port: u16, key: &str) -> Destination {
         id: "test".into(),
         target: Target::parse(&format!("rtmp://127.0.0.1:{port}/app")).unwrap(),
         key: key.into(),
+        retry: Default::default(),
     }
 }
 
@@ -404,7 +405,7 @@ async fn stop_ends_destinations_and_the_ingest() {
 #[test]
 fn backoff_grows_then_caps_with_jitter() {
     for (attempt, base) in [(1, 1.0), (2, 2.0), (3, 4.0), (5, 16.0), (6, 30.0), (40, 30.0)] {
-        let d = push::backoff(attempt).as_secs_f64();
+        let d = push::backoff(attempt, &push::Retry::default()).as_secs_f64();
         assert!(d >= base * 0.8 - 1e-9 && d <= base * 1.2 + 1e-9, "attempt {attempt}: {d}");
     }
 }

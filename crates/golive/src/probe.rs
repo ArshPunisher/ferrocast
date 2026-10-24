@@ -107,8 +107,13 @@ pub struct Verdict {
 }
 
 pub fn verdict(upload_kbps: u32, needs: &[Need]) -> Verdict {
+    verdict_keeping(upload_kbps, needs, ((1.0 - HEADROOM) * 100.0).round() as u8)
+}
+
+/// [`verdict`] keeping `free_pct` percent of the upload for the game and chat (Advanced mode).
+pub fn verdict_keeping(upload_kbps: u32, needs: &[Need], free_pct: u8) -> Verdict {
     let need: u32 = needs.iter().map(|n| n.kbps).sum();
-    let usable = (f64::from(upload_kbps) * HEADROOM) as u32;
+    let usable = (f64::from(upload_kbps) * (1.0 - f64::from(free_pct.min(90)) / 100.0)) as u32;
     let n = needs.len();
     let mut fit_count = 0;
     let mut total = 0;

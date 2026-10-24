@@ -29,8 +29,19 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const STEP_DEADLINE: Duration = Duration::from_secs(10);
 /// A write that can't finish in this long means the destination stopped reading.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
-const BACKOFF_FIRST: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long a destination waits before trying again: the first wait, doubling up to the
+/// longest (Advanced mode can change both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    pub first: Duration,
+    pub max: Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self { first: Duration::from_secs(1), max: Duration::from_secs(30) }
+    }
+}
 /// How often health (bitrate) is updated while live.
 const HEALTH_EVERY: Duration = Duration::from_secs(1);
 
@@ -40,6 +51,7 @@ pub struct Destination {
     pub id: String,
     pub target: Target,
     pub key: String,
+    pub retry: Retry,
 }
 
 impl std::fmt::Debug for Destination {
@@ -161,7 +173,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         attempt = 0;
                     }
                     attempt = attempt.saturating_add(1);
-                    let wait = backoff(attempt);
+                    let wait = backoff(attempt, &dest.retry);
                     tracing::info!(dest = %dest.id, attempt, error = %err, "golive: destination failed, retrying");
                     set_state(
                         &health,
@@ -195,9 +207,10 @@ fn set_state(health: &watch::Sender<Health>, state: PushState) {
     });
 }
 
-/// 1, 2, 4, 8, 16, 30, 30… seconds, each ±20% so many destinations don't retry in step.
-pub(crate) fn backoff(attempt: u32) -> Duration {
-    let base = BACKOFF_FIRST.saturating_mul(1u32 << attempt.saturating_sub(1).min(5)).min(BACKOFF_MAX);
+/// 1, 2, 4, 8, 16, 30, 30… seconds by default, each ±20% so many destinations don't retry in
+/// step.
+pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
+    let base = retry.first.saturating_mul(1u32 << attempt.saturating_sub(1).min(8)).min(retry.max);
     let jitter = 0.8 + fastrand::f64() * 0.4;
     base.mul_f64(jitter)
 }

@@ -5,20 +5,56 @@
 
 use std::time::{Duration, Instant};
 
-/// A live destination getting less than this share of the stream's rate is struggling.
-const SLOW_SHARE: f64 = 0.7;
+use serde::{Deserialize, Serialize};
+
 /// A destination's rate is judged over this many seconds: a low-bitrate stream arrives in bursts
 /// around its keyframes, so one second alone can look slow when nothing is wrong.
 const RATE_SECONDS: usize = 3;
-/// Seconds of trouble in a row before something pauses (a keyframe burst isn't trouble).
-const STRUGGLE_TICKS: u32 = 4;
-/// Calm seconds in a row before a paused destination may come back.
-const CALM_TICKS: u32 = 10;
 /// A destination that only just went live is still filling its buffers: not judged yet.
 const WARM_UP_MS: u64 = 3_000;
-/// How long the first pause lasts at least; each pause in the same stream doubles it.
-const FIRST_PAUSE: Duration = Duration::from_secs(60);
-const MAX_PAUSE: Duration = Duration::from_secs(600);
+/// The rule, as Advanced mode writes it (board item 3): pause when a destination gets under
+/// `slow_pct` % of its stream, or skips video, for `trouble_s` seconds; pause `first_to_pause`
+/// (else the bottom one) first; bring it back after `calm_s` calm seconds, no sooner than
+/// `first_pause_s`, doubling each time up to `max_pause_s`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rules {
+    pub slow_pct: u8,
+    pub trouble_s: u32,
+    pub calm_s: u32,
+    pub first_pause_s: u32,
+    pub max_pause_s: u32,
+    /// A destination that always pauses first, when it's live.
+    pub first_to_pause: Option<String>,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self { slow_pct: 70, trouble_s: 4, calm_s: 10, first_pause_s: 60, max_pause_s: 600, first_to_pause: None }
+    }
+}
+
+impl Rules {
+    /// Messages name the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(50..=95).contains(&self.slow_pct) {
+            return Err("slow_pct: 50 to 95 percent.".into());
+        }
+        if !(2..=30).contains(&self.trouble_s) {
+            return Err("trouble_s: 2 to 30 seconds.".into());
+        }
+        if !(5..=120).contains(&self.calm_s) {
+            return Err("calm_s: 5 to 120 seconds.".into());
+        }
+        if !(10..=3600).contains(&self.first_pause_s) {
+            return Err("first_pause_s: 10 seconds to an hour.".into());
+        }
+        if self.max_pause_s < self.first_pause_s || self.max_pause_s > 7200 {
+            return Err("max_pause_s: at least the first pause, at most two hours.".into());
+        }
+        Ok(())
+    }
+}
 
 /// One live destination's last second.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +80,7 @@ pub struct Protector {
     struggle: u32,
     calm: u32,
     next_pause: Duration,
+    rules: Rules,
     /// Paused destinations and the earliest time each may come back.
     paused: Vec<(String, Instant)>,
     last_dropped: Vec<(String, u64)>,
@@ -56,7 +93,8 @@ impl Default for Protector {
         Self {
             struggle: 0,
             calm: 0,
-            next_pause: FIRST_PAUSE,
+            next_pause: Duration::from_secs(60),
+            rules: Rules::default(),
             paused: Vec::new(),
             last_dropped: Vec::new(),
             rates: Vec::new(),
@@ -94,7 +132,9 @@ impl Protector {
                 .find(|(id, _)| id == s.id)
                 .map(|(_, q)| q.iter().map(|k| u64::from(*k)).sum::<u64>() / q.len().max(1) as u64)
                 .unwrap_or(u64::from(s.kbps));
-            if before.is_some_and(|b| s.dropped > b) || (avg as f64) < f64::from(s.want_kbps) * SLOW_SHARE {
+            if before.is_some_and(|b| s.dropped > b)
+                || (avg as f64) < f64::from(s.want_kbps) * f64::from(self.rules.slow_pct) / 100.0
+            {
                 trouble = true;
             }
         }
@@ -107,15 +147,17 @@ impl Protector {
             self.struggle = 0;
         }
 
-        if self.struggle >= STRUGGLE_TICKS && live.len() >= 2 {
+        if self.struggle >= self.rules.trouble_s && live.len() >= 2 {
             // The bottom-most destination that's sending: it pauses so the top ones keep going.
-            let victim = order.iter().rev().find(|id| live.iter().any(|s| s.id == **id))?;
+            let sending = |id: &str| live.iter().any(|s| s.id == id);
+            let chosen = self.rules.first_to_pause.as_deref().filter(|id| sending(id) && order.contains(id));
+            let victim = chosen.or_else(|| order.iter().rev().find(|id| sending(id)).copied())?;
             self.struggle = 0;
             self.paused.push((victim.to_string(), now + self.next_pause));
-            self.next_pause = (self.next_pause * 2).min(MAX_PAUSE);
+            self.next_pause = (self.next_pause * 2).min(Duration::from_secs(u64::from(self.rules.max_pause_s)));
             return Some(Action::Pause(victim.to_string()));
         }
-        if self.calm >= CALM_TICKS {
+        if self.calm >= self.rules.calm_s {
             // The highest one in the order comes back first.
             let ready =
                 order.iter().find(|id| self.paused.iter().any(|(p, until)| p == **id && *until <= now))?.to_string();
@@ -142,7 +184,17 @@ impl Protector {
 
     /// A new stream starts with nothing paused and the shortest pause.
     pub fn reset(&mut self) {
+        let rules = self.rules.clone();
         *self = Self::default();
+        self.set_rules(rules);
+    }
+
+    /// The streamer's rule (Advanced mode); a pause already running keeps its end.
+    pub fn set_rules(&mut self, rules: Rules) {
+        if self.paused.is_empty() {
+            self.next_pause = Duration::from_secs(u64::from(rules.first_pause_s));
+        }
+        self.rules = rules;
     }
 }
 
@@ -239,6 +291,39 @@ mod tests {
     }
 
     #[test]
+    fn the_streamers_rule_is_used() {
+        let mut p = Protector::default();
+        p.set_rules(Rules {
+            slow_pct: 50,
+            trouble_s: 2,
+            first_pause_s: 30,
+            max_pause_s: 40,
+            first_to_pause: Some("twitch".into()),
+            ..Rules::default()
+        });
+        let t = Instant::now();
+        let order = &["twitch", "youtube", "kick"];
+        // 60% of the rate isn't slow under a 50% rule.
+        let fine = [s("twitch", 3600), s("youtube", 3600), s("kick", 3600)];
+        for i in 0..5 {
+            assert_eq!(p.tick(t + Duration::from_secs(i), &fine, order), None);
+        }
+        // Slow: after 2 seconds the chosen one pauses, not the bottom one.
+        let slow = [s("twitch", 1000), s("youtube", 1000), s("kick", 1000)];
+        p.tick(t + Duration::from_secs(5), &slow, order);
+        assert_eq!(p.tick(t + Duration::from_secs(6), &slow, order), Some(Action::Pause("twitch".into())));
+        assert!(p.paused_until("twitch").unwrap() >= t + Duration::from_secs(36));
+        // Then the bottom one; the second pause is capped at 40 s.
+        let two = [s("youtube", 1000), s("kick", 1000)];
+        p.tick(t + Duration::from_secs(7), &two, order);
+        assert_eq!(p.tick(t + Duration::from_secs(8), &two, order), Some(Action::Pause("kick".into())));
+        assert!(p.paused_until("kick").unwrap() <= t + Duration::from_secs(48));
+        assert!(Rules { slow_pct: 99, ..Rules::default() }.validate().unwrap_err().starts_with("slow_pct:"));
+        assert!(Rules { max_pause_s: 30, ..Rules::default() }.validate().unwrap_err().starts_with("max_pause_s:"));
+        assert!(Rules::default().validate().is_ok());
+    }
+
+    #[test]
     fn a_bursty_low_rate_stream_is_not_trouble() {
         // A still scene: 370 and 1,670 kbps in turns against a 1,040 kbps stream.
         let mut p = Protector::default();
@@ -263,7 +348,7 @@ mod tests {
         p.release("kick");
         assert!(!p.is_paused("kick"));
         p.reset();
-        assert_eq!(p.next_pause, FIRST_PAUSE);
+        assert_eq!(p.next_pause, Duration::from_secs(60));
         // Nothing streaming: nothing happens.
         assert_eq!(p.tick(t, &[], &[]), None);
     }

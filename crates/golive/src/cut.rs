@@ -80,6 +80,17 @@ pub struct CutConfig {
     /// Video bitrate in kbps (audio is copied from the normal stream).
     #[serde(default = "default_kbps")]
     pub kbps: u32,
+    /// Which encoder: the graphics card when there is one, or always the processor.
+    #[serde(default)]
+    pub encoder: EncoderChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderChoice {
+    #[default]
+    Auto,
+    Processor,
 }
 
 fn default_share() -> u8 {
@@ -110,6 +121,7 @@ impl Default for CutConfig {
             height: default_height(),
             fps: default_fps(),
             kbps: default_kbps(),
+            encoder: EncoderChoice::Auto,
         }
     }
 }
@@ -183,6 +195,14 @@ pub struct Encoder {
     pub name: &'static str,
     /// Shown to the streamer ("your graphics card", "the processor").
     pub on: &'static str,
+}
+
+/// The encoders to try for `choice`, best first.
+pub fn encoders_for(choice: EncoderChoice) -> Vec<Encoder> {
+    match choice {
+        EncoderChoice::Auto => encoder_candidates().to_vec(),
+        EncoderChoice::Processor => encoder_candidates().iter().filter(|e| e.name == "libx264").copied().collect(),
+    }
 }
 
 /// The encoders to try on this OS, best first; the software one always works.
