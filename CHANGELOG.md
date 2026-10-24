@@ -5,6 +5,15 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.9
+
+- Mic on break screens: in Advanced, Starting, BRB and Ending can get your mic. Never twice,
+  and turning it off takes out only the mics Ferrocast added.
+- Make it yours changes the whole colour family, so title gradients follow your colour too.
+- Live safety: putting a theme in while you're live never switches what viewers see, and
+  Take it out waits while you're live on one of the theme's scenes.
+- Quick changes in Make it yours are never lost.
+
 ## 2.0.0-beta.8
 
 - Put a theme into OBS in one click. Use on a theme can set it up in OBS too: a scene per
