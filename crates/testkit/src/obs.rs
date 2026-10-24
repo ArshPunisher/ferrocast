@@ -354,6 +354,10 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
             let id = add_item(&mut s.scenes[i], &input, &kind);
             (100, json!({ "inputUuid": uuid(200 + s.inputs.len()), "sceneItemId": id }))
         }
+        "GetSpecialInputs" => (
+            100,
+            json!({ "desktop1": "Desktop Audio", "desktop2": null, "mic1": "Mic/Aux", "mic2": null, "mic3": null, "mic4": null }),
+        ),
         "GetInputSettings" => match s.inputs.iter().find(|x| x.name == name("inputName")) {
             None => (600, Value::Null),
             Some(x) => (

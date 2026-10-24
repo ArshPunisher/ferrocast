@@ -34,6 +34,12 @@ pub const CAMERA_KINDS: [&str; 6] =
 pub const MIC_KINDS: [&str; 4] =
     ["wasapi_input_capture", "coreaudio_input_capture", "pulse_input_capture", "alsa_input_capture"];
 
+/// OBS's global audio devices (Settings, Audio): they play in every scene by themselves.
+pub async fn global_audio(client: &Client) -> Result<Vec<String>, ObsError> {
+    let s = client.inputs().specials().await.map_err(err)?;
+    Ok([s.desktop1, s.desktop2, s.mic1, s.mic2, s.mic3, s.mic4].into_iter().flatten().collect())
+}
+
 /// Makes `name` unless OBS has it. `true` when it was made now.
 pub async fn ensure_scene(client: &Client, name: &str) -> Result<bool, ObsError> {
     let list = client.scenes().list().await.map_err(err)?;

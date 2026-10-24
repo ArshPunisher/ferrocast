@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ferrocast_core::design::{Design, DesignContent, SCENE_KEYS, ThemeContent};
 use ferrocast_obs::ObsConfig;
 use ferrocast_testkit::obs::{FakeObs, Input, Item, St, closed_port, start as start_obs};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::*;
 use crate::PasswordChange;
@@ -391,4 +391,71 @@ async fn live_streams_are_never_switched_by_a_theme() {
     st.lock().unwrap().current = "Gameplay".into();
     e.undo_theme_in_obs().await.unwrap();
     assert_eq!(st.lock().unwrap().current, "Gameplay");
+}
+
+#[tokio::test]
+async fn break_screens_get_the_game_scenes_mic_never_obs_global_audio() {
+    let (e, _d, st) = setup().await;
+    {
+        // OBS's global mic (Settings, Audio) and a second mic the game scene doesn't use.
+        let mut s = st.lock().unwrap();
+        for (name, kind) in [("Mic/Aux", "wasapi_input_capture"), ("Spare mic", "wasapi_input_capture")] {
+            s.inputs.push(Input { name: name.into(), kind: kind.into(), muted: false, settings: Value::Null });
+        }
+    }
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = true;
+    e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    let brb: Vec<String> = items(&st, "Forge · BRB").into_iter().map(|(s, _)| s).collect();
+    assert!(brb.contains(&"Mic".to_string()), "the mic Gameplay uses: {brb:?}");
+    assert!(!brb.contains(&"Mic/Aux".to_string()), "never OBS's global mic (heard twice)");
+    assert!(!brb.contains(&"Spare mic".to_string()), "not every mic OBS has");
+}
+
+#[tokio::test]
+async fn switching_keeps_every_choice_from_last_time() {
+    let (e, _d, st) = setup().await;
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = true;
+    p.screens[3].place = Place::Replace { scene: "BRB".into() };
+    p.screens[4] = ScreenPlan { key: "ending".into(), place: Place::Skip, under: None, role: None };
+    e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    e.apply_theme_to_obs("builtin.prism", None).await.unwrap();
+    let names = scene_names(&st);
+    assert!(
+        !names.iter().any(|n| n.contains("BRB") && n.contains('·')),
+        "BRB stays on top of their own scene: {names:?}"
+    );
+    assert!(items(&st, "BRB").iter().any(|(s, _)| s.starts_with("Ferrocast: BRB (Prism)")));
+    assert!(items(&st, "BRB").iter().any(|(s, _)| s == "Mic"), "the mic choice is kept");
+    assert!(!names.iter().any(|n| n.ends_with("Ending") && n.contains('·')), "Ending stays out");
+    assert_eq!(e.scenes_config().brb_scene.as_deref(), Some("BRB"));
+    e.undo_theme_in_obs().await.unwrap();
+    assert_eq!(items(&st, "BRB"), [("BRB card".into(), true)]);
+}
+
+#[tokio::test]
+async fn unticking_a_screen_later_takes_it_out_and_the_dialog_starts_from_last_time() {
+    let (e, _d, st) = setup().await;
+    let mut p = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    p.mic_on_breaks = true;
+    p.hide_old.clear();
+    e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    // The dialog opens on last time's choices.
+    let again = e.theme_obs_plan("builtin.forge").await.unwrap().plan;
+    assert!(again.mic_on_breaks && again.hide_old.is_empty(), "{again:?}");
+    // Untick Ending now: it comes out of OBS and Start show forgets it.
+    let mut p = again.clone();
+    p.screens[4] = ScreenPlan { key: "ending".into(), place: Place::Skip, under: None, role: None };
+    let r = e.apply_theme_to_obs("builtin.forge", Some(p)).await.unwrap();
+    let step = r.steps.iter().find(|s| s.id == "screen.ending").unwrap();
+    assert_eq!((step.status.as_str(), step.detail.as_str()), ("done", "Taken out."));
+    assert!(!scene_names(&st).contains(&"Forge · Ending".to_string()));
+    assert!(!st.lock().unwrap().inputs.iter().any(|i| i.name.starts_with("Ferrocast: Ending")));
+    assert_eq!(e.show_config().ending_scene, None, "back to what was there before");
+    assert_eq!(e.obs_theme().await.unwrap().unwrap().screens.len(), 4);
+    // Switching keeps it out, and keeps the old widget showing.
+    e.apply_theme_to_obs("builtin.prism", None).await.unwrap();
+    assert!(!scene_names(&st).iter().any(|n| n.ends_with("Ending") && n.contains('·')));
+    assert!(items(&st, "Gameplay").contains(&("Alert box".into(), true)), "hide_old [] is kept");
 }

@@ -158,6 +158,9 @@ pub struct ObsTheme {
     /// (scene, mic) Ferrocast added for "Mic on break screens", so turning it off takes them out.
     #[serde(default)]
     pub mic_items: Vec<(String, String)>,
+    /// The last plan, so another theme (or Make it yours) keeps every choice.
+    #[serde(default)]
+    pub plan: Option<ThemePlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -208,12 +211,16 @@ fn breaky(name: &str) -> bool {
 
 /// Ferrocast's guesses: every screen a new scene; the scene with the game under In game; a
 /// chat (or camera) scene under Just chatting; roles from the screen; old widgets hidden.
-pub fn guess(theme_name: &str, screens: &[Scene], obs: &Scenes, old: &[OldWidget], skip: &[String]) -> ThemePlan {
-    // "Forge (mine)" and "Forge copy" name their scenes like Forge: switching to your copy
-    // keeps the scene names.
+/// The scene-name prefix a theme gets by default. "Forge (mine)" and "Forge copy" name their
+/// scenes like Forge, so switching to your copy keeps the scene names.
+pub fn default_prefix(theme_name: &str) -> String {
     let base = theme_name.trim();
     let base = [" (mine)", " copy"].iter().find_map(|x| base.strip_suffix(x)).unwrap_or(base);
-    let prefix = format!("{} · ", base.chars().take(MAX_PREFIX - 3).collect::<String>().trim_end());
+    format!("{} · ", base.chars().take(MAX_PREFIX - 3).collect::<String>().trim_end())
+}
+
+pub fn guess(theme_name: &str, screens: &[Scene], obs: &Scenes, old: &[OldWidget], skip: &[String]) -> ThemePlan {
+    let prefix = default_prefix(theme_name);
     let own: Vec<&ferrocast_obs::control::Scene> =
         obs.scenes.iter().filter(|s| !s.name.starts_with(&prefix) && !skip.contains(&s.name)).collect();
     let captures = |s: &ferrocast_obs::control::Scene, on: bool| {
@@ -336,6 +343,33 @@ pub fn check(plan: &ThemePlan, screens: &[Scene], obs: &Scenes, sources: &[Strin
     Ok(())
 }
 
+/// With a theme in OBS, a fresh guess becomes last time's choices (switching, Make it yours, and
+/// the dialog's starting point): every screen's place, what's under it and its job, the mic,
+/// old widgets and the switch; scene names follow the new theme unless they were the
+/// streamer's own.
+fn carry(prev: &ObsTheme, mut g: ThemePlan) -> ThemePlan {
+    let last = prev.plan.clone();
+    for p in &mut g.screens {
+        match last.as_ref().and_then(|l| l.screens.iter().find(|s| s.key == p.key)) {
+            Some(was) => *p = was.clone(),
+            None if !prev.screens.iter().any(|s| s.key == p.key) => {
+                *p = ScreenPlan { key: p.key.clone(), place: Place::Skip, under: None, role: None }
+            }
+            None => {}
+        }
+    }
+    if let Some(l) = last {
+        if l.prefix != default_prefix(&prev.design_name) {
+            g.prefix = l.prefix;
+        }
+        g.mic_on_breaks = l.mic_on_breaks;
+        g.switch_to_starting = l.switch_to_starting;
+        g.alert_style = l.alert_style;
+        g.hide_old = l.hide_old;
+    }
+    g
+}
+
 impl ObsTheme {
     fn view(&self, obs: Option<&Scenes>) -> ObsThemeView {
         ObsThemeView {
@@ -415,7 +449,10 @@ impl Engine {
         let made: Vec<String> = rec.as_ref().map(|r| r.made_scenes.clone()).unwrap_or_default();
         let inputs = ferrocast_obs::control::inputs(&client).await.map_err(obs_error)?;
         Ok(ThemeObsPlan {
-            plan: guess(&design.name, &screens, &obs, &old, &made),
+            plan: match &rec {
+                Some(prev) => carry(prev, guess(&design.name, &screens, &obs, &old, &made)),
+                None => guess(&design.name, &screens, &obs, &old, &made),
+            },
             screens: screens.iter().map(|s| ScreenInfo { key: s.key.clone(), name: s.name.clone() }).collect(),
             obs_scenes: obs.scenes.iter().map(|s| s.name.clone()).collect(),
             obs_cameras: inputs
@@ -456,16 +493,11 @@ impl Engine {
             None => {
                 let old = ferrocast_obs::theme::old_widgets(&client).await.map_err(obs_error)?;
                 let made = previous.as_ref().map(|r| r.made_scenes.clone()).unwrap_or_default();
-                let mut g = guess(&design.name, &screens, &obs, &old, &made);
-                // No plan with a theme in OBS (Make it yours, again): the same screens as now.
-                if let Some(prev) = &previous {
-                    for p in &mut g.screens {
-                        if !prev.screens.iter().any(|s| s.key == p.key) {
-                            *p = ScreenPlan { key: p.key.clone(), place: Place::Skip, under: None, role: None };
-                        }
-                    }
+                let g = guess(&design.name, &screens, &obs, &old, &made);
+                match &previous {
+                    Some(prev) => carry(prev, g),
+                    None => g,
                 }
-                g
             }
         };
         check(&plan, &screens, &obs, &sources).map_err(EngineError::Invalid)?;
@@ -485,6 +517,7 @@ impl Engine {
             alert_before: None,
             scene_before: obs.current.clone(),
             mic_items: Vec::new(),
+            plan: None,
         });
         rec.at = now().0;
         rec.design_id = design.id.clone();
@@ -512,12 +545,28 @@ impl Engine {
         // The mic for break screens: Start show's mic check list, else every mic OBS has.
         let mics: Vec<String> = if plan.mic_on_breaks {
             let kinds = ferrocast_obs::control::inputs(&client).await.map_err(obs_error)?;
-            let picked: Vec<String> =
-                self.show_config().mic_sources.into_iter().filter(|m| kinds.iter().any(|(n, _)| n == m)).collect();
-            if picked.is_empty() {
-                kinds.into_iter().filter(|(_, k)| MIC_KINDS.contains(&k.as_str())).map(|(n, _)| n).collect()
+            // OBS's global devices (Mic/Aux, Desktop Audio) play in every scene already.
+            let global = ferrocast_obs::theme::global_audio(&client).await.map_err(obs_error)?;
+            let is_mic = |n: &String| {
+                !global.contains(n) && kinds.iter().any(|(x, k)| x == n && MIC_KINDS.contains(&k.as_str()))
+            };
+            let listed: Vec<String> = self.show_config().mic_sources.into_iter().filter(|m| is_mic(m)).collect();
+            // Else the mics the game scene uses (what the streamer talks into on stream).
+            let game = plan.screens.iter().find(|p| p.role == Some(Role::Live)).and_then(|p| match &p.place {
+                _ if p.under.is_some() => p.under.clone(),
+                Place::OnTop { scene } | Place::Replace { scene } => Some(scene.clone()),
+                _ => None,
+            });
+            let in_game: Vec<String> = game
+                .and_then(|g| obs.scenes.iter().find(|s| s.name == g))
+                .map(|s| s.items.iter().map(|i| i.source.clone()).filter(|n| is_mic(n)).collect())
+                .unwrap_or_default();
+            if !listed.is_empty() {
+                listed
+            } else if !in_game.is_empty() {
+                in_game
             } else {
-                picked
+                kinds.iter().map(|(n, _)| n.clone()).filter(|n| is_mic(n)).collect()
             }
         } else {
             Vec::new()
@@ -528,7 +577,13 @@ impl Engine {
         for p in &plan.screens {
             let Some(screen) = screens.iter().find(|s| s.key == p.key) else { continue };
             let Some(scene) = target(&plan, screen, p) else {
-                steps.push(Step::new(&format!("screen.{}", p.key), &screen.name, "skipped", "Left out."));
+                // In OBS from last time and unticked now: it comes out.
+                let step = match self.take_screen_out(&client, &p.key, &mut rec, &mut roles).await {
+                    Ok(true) => Step::new(&format!("screen.{}", p.key), &screen.name, "done", "Taken out."),
+                    Ok(false) => Step::new(&format!("screen.{}", p.key), &screen.name, "skipped", "Left out."),
+                    Err(e) => Step::new(&format!("screen.{}", p.key), &screen.name, "failed", e.to_string()),
+                };
+                steps.push(step);
                 continue;
             };
             match self.put_screen(&client, &design, screen, p, &scene, &overlays, &mics, &obs, &mut rec).await {
@@ -628,10 +683,70 @@ impl Engine {
             });
         }
 
+        rec.plan = Some(plan.clone());
         let saved = rec.clone();
         self.db(move |s| repo::settings::set(s, KEY, &saved)).await?;
         let after = ferrocast_obs::control::scenes(&client).await.ok();
         Ok(ThemeObsResult { steps, applied: Some(rec.view(after.as_ref())) })
+    }
+
+    /// Takes one screen applied before out of OBS (unticked on a later apply). `false` when it
+    /// wasn't in OBS.
+    async fn take_screen_out(
+        &self,
+        client: &ferrocast_obs::Client,
+        key: &str,
+        rec: &mut ObsTheme,
+        roles: &mut RoleScenes,
+    ) -> Result<bool, EngineError> {
+        let Some(was) = rec.screens.iter().find(|s| s.key == key).cloned() else { return Ok(false) };
+        let scene = was.scene.clone();
+        let source = self.overlay(&was.overlay_id).await.map(|o| ferrocast_obs::source_name(&o.name)).ok();
+        if rec.made_scenes.contains(&scene) {
+            let (current, _) = ferrocast_obs::control::scene_names(client).await.map_err(obs_error)?;
+            if current.as_deref() == Some(scene.as_str()) {
+                return Err(EngineError::Refused {
+                    status: 409,
+                    code: "screen_on_air",
+                    message: format!("\"{scene}\" is on air."),
+                    hint: "Switch OBS to another scene first.".into(),
+                    retry_after: None,
+                });
+            }
+            ferrocast_obs::theme::remove_scene(client, &scene).await.map_err(obs_error)?;
+            rec.made_scenes.retain(|s| s != &scene);
+        } else {
+            if let Some(src) = &source {
+                ferrocast_obs::theme::remove_item(client, &scene, src).await.map_err(obs_error)?;
+            }
+            for (s, id) in rec.hidden.iter().filter(|(s, _)| s == &scene) {
+                let _ = ferrocast_obs::theme::show_item(client, s, *id).await;
+            }
+            for (s, m) in rec.mic_items.iter().filter(|(s, _)| s == &scene) {
+                let _ = ferrocast_obs::theme::remove_item(client, s, m).await;
+            }
+            rec.hidden.retain(|(s, _)| s != &scene);
+        }
+        if let Some(src) = &source
+            && rec.made_inputs.contains(src)
+        {
+            ferrocast_obs::theme::remove_input(client, src).await.map_err(obs_error)?;
+            rec.made_inputs.retain(|n| n != src);
+        }
+        rec.added_items.retain(|(s, _)| s != &scene);
+        rec.mic_items.retain(|(s, _)| s != &scene);
+        rec.screens.retain(|s| s.key != key);
+        // A job it had goes back to what was there before the theme.
+        let back = |r: &mut Option<String>, before: &Option<String>| {
+            if r.as_deref() == Some(scene.as_str()) {
+                r.clone_from(before);
+            }
+        };
+        back(&mut roles.starting, &rec.roles_before.starting);
+        back(&mut roles.live, &rec.roles_before.live);
+        back(&mut roles.brb, &rec.roles_before.brb);
+        back(&mut roles.ending, &rec.roles_before.ending);
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
