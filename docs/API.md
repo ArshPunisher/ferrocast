@@ -136,12 +136,16 @@ Widget `config` per kind:
 - `viewers`: `{ platforms: Platform[], theme: string }`
 - `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
 - `giveaway`: `{ theme: string }` (how to enter while open, then a winner card)
-- `layer` (a static piece of a scene): `{ type: "image" | "text" | "shape" | "frame" | "webcam" | "brand", anim?: { in: AnimIn, delay_ms: 0…10000, loop: "none" | "float" | "pulse" | "shimmer" }, css?: string }` plus, by type:
+- `layer` (a piece of a scene): `{ type: "image" | "text" | "shape" | "frame" | "webcam" | "brand" | "fx" | "music" | "sound", anim?: { in: AnimIn, delay_ms: 0…10000, loop: "none" | "float" | "pulse" | "shimmer" }, css?: string }` plus, by type:
   - `image`: `{ media: MediaRef, fit?: "cover" | "contain" | "fill", radius? }`
   - `text`: `{ text (≤500 chars, shown as is), font?: FontFamily, size? 6…400, weight? 100…900, color?, align?: "left" | "center" | "right", uppercase?, italic?, letter_spacing? -0.2…1, shadow?: "none" | "soft" | "hard" | "glow", outline? 0…20, outline_color? }`
   - `shape`: `{ shape?: "rect" | "ellipse" | "line" | "slant" | "triangle", fill?, fill2? (gradient end), angle? 0…360, stroke?, stroke_width? 0…50, radius? }`
   - `frame` / `webcam` (a frame with a see-through middle for the camera): `{ style?: "line" | "double" | "corners" | "notch" | "glow", color?, accent?, thickness? 1…40, radius? 0…400, label? ≤40 }`
   - `brand`: `{ variant?: "mark" | "badge" | "watermark", color? }`: the small Spark mark of a built-in design (below)
+  - text countdowns (25 Oct): `{ countdown? 1…86400 (seconds), countdown_look?: "digital" | "thin" | "ring" | "bar" | "flip" | "words", countdown_restart?, countdown_show?, countdown_up? }`. `ring` and `bar` empty as it counts; `words` says "4 minutes"
+  - `fx` (a motion background): `{ preset: "hex" | "nightdrive" | "wasteland" | "circuit" | "tunnel" | "dunes" | "forge" | "arena" | "coderain" | "orbit" | "sonar", color?, color2?, background? (the preset's own when unset), speed? 0.25…3, density? 0.5…2, reactive? }`. `reactive` moves it with the music OBS hears (`music` frames, §6)
+  - `music` (the wave player or the heartbeat line, with the song): `{ look?: "wave" | "pulse", color?, color2?, text_color?, font?: FontFamily, title_size? 8…160, show_title? (default true), only_playing? (default true: shown only while music plays) }`
+  - `sound` (heard, not seen): `{ on_show?: Stinger, on_show_media?: MediaRef, loop?: "rain" | "wind" | "pad" | "hum", loop_media?: MediaRef, last_ticks?, at_zero?: Stinger, volume? 0…1, duck? }`, `Stinger` = `"whoosh" | "riser" | "impact" | "tick" | "chime" | "glitch"`. `on_show` plays when the screen comes on air, `loop` while it is, `last_ticks` ticks each of a timer's last ten seconds on that screen, `at_zero` plays when it ends, `duck` plays quieter while music plays. The sounds are files in the overlay bundle; a browser source Ferrocast makes sends its audio through OBS (below)
 - Any live widget may carry a style from a widget design: `config.style = { variant?, font?, text?, accent?, background?, track?, muted?, radius? 0…64, font_size? 8…120, uppercase?, brand?: BrandSpot }`, with `config.design_id` and `config.branded`.
 
 Colours are `#rgb`, `#rrggbb`, `#rrggbbaa` or `transparent`. `MediaRef` is a media library id or `asset:<path>` (a file bundled with the app, lowercase `a-z 0-9 / _ . -`). `FontFamily` is letters, digits, spaces and hyphens (1–60). Every check fails with 400 naming the field (`layer 'title': config.color: "red;}" isn't a colour; use #rrggbb.`).
@@ -242,7 +246,7 @@ type Motion = { idle: "none" | "breathe" | "float" | "shimmer" | "glow" | "jelly
 // Every Motion field has a default, so a partial object reads; a wrong type or unknown name is refused.
 
 type ThemeContent = { scenes: Scene[] /* 1–8, keys unique */; alert_design: string | null /* the alert design that goes with it */ }
-type Scene = { key: "in_game" | "just_chatting" | "starting_soon" | "brb" | "ending" | `custom_${number}`; name: string /* 1–40 */;
+type Scene = { key: "in_game" | "just_chatting" | "starting_soon" | "getting_ready" | "brb" | "paused" | "offline" | "ending" | `custom_${number}`; name: string /* 1–40 */;
                width: number; height: number; background: string | null; layers: Widget[] /* checked exactly like an overlay's widgets */ }
 type WidgetContent = { widget: WidgetKind /* not "layer" */; w: 40–1920; h: 20–1080; config: object /* starting settings, no style */; style: WidgetStyle }
 
@@ -272,7 +276,7 @@ type AlertDesignView = { design_id: string; variation_id: string; event_key: Eve
 | POST | `/api/v1/designs/{id}/export` | → a `.ferrodesign` download (`application/zip`). 409 `built_in` (duplicate it first) |
 | POST | `/api/v1/designs/import` | multipart `file` (up to 100 MB) → 201 `{ designs: Design[], media_files: number, notes: string[] }` |
 
-**`ThemePlan`** (unknown fields are refused): `{ prefix: string (≤ 40, e.g. "Forge · "; empty names scenes after the screen), screens: { key: string, place: { kind: "new" } | { kind: "on_top" | "replace", scene: string } | { kind: "skip" }, under?: string | null, role?: "starting" | "live" | "brb" | "ending" | null }[], switch_to_starting?: boolean (default true), hide_old?: string[], alert_style?: boolean (default true), mic_on_breaks?: boolean }`. `mic_on_breaks` is false by default: no mics are added. When true, the Starting, BRB and Ending screens get Start show's mic check list (or, when it's empty, every mic OBS has), except a mic the source under that screen already has; turning it off on a later apply takes out the mics Ferrocast added. The guesses: every screen `new`; under In game the scene that names or captures the game (a camera counts; never a break or recording-only scene); under Just chatting a scene named chat or talk, else a camera-only scene, else a camera; roles from the screen; every old widget hidden. `Step` is Start show's `{ id, label, status: "done" | "failed" | "skipped", detail }`.
+**`ThemePlan`** (unknown fields are refused): `{ prefix: string (≤ 40, e.g. "Forge · "; empty names scenes after the screen), screens: { key: string, place: { kind: "new" } | { kind: "on_top" | "replace", scene: string } | { kind: "skip" }, under?: string | null, role?: "starting" | "live" | "brb" | "ending" | null }[], switch_to_starting?: boolean (default true), hide_old?: string[], alert_style?: boolean (default true), mic_on_breaks?: boolean }`. `mic_on_breaks` is false by default: no mics are added. When true, the break screens (Starting soon, Getting ready, BRB, Paused, Offline, Ending) get Start show's mic check list (or, when it's empty, every mic OBS has), except a mic the source under that screen already has; turning it off on a later apply takes out the mics Ferrocast added. The guesses: every screen `new`; under In game the scene that names or captures the game (a camera counts; never a break or recording-only scene); under Just chatting a scene named chat or talk, else a camera-only scene, else a camera; roles from the screen; every old widget hidden. `Step` is Start show's `{ id, label, status: "done" | "failed" | "skipped", detail }`.
 
 **`.ferrodesign`** (version 1) is a zip with `manifest.json` (`{ format: "ferrodesign", version: 1, app_version, created_at, name, kind, designs: number, files: { "media/<sha256>.<ext>": { sha256, bytes, mime } } }`), `designs/<n>.json` (a theme's own alert design travels with it) and `media/<sha256>.<ext>` (png, jpg, gif, webp, mp3, ogg, wav, webm, mp4). Inside the designs, library files are named by their SHA-256. Nothing else is allowed in the file: no scripts, web pages or SVG, no settings, tokens, overlay URLs or viewer data. Import checks every name, every file's real type, size and checksum and every design, then always adds **new** designs of your own (new ids, unbranded, `origin.type: "import"`) and reuses a library file with the same content. Errors: 413 `too_large` (the file over 100 MB, one media file over its limit, more than 10 designs or 300 files), 415 `wrong_content_type` (not multipart), 415 `bad_design_file` (not a zip, or not a Ferrocast design file: a `.ferropack` too), 415 `unsafe_design_file` (a script, page or unexpected file inside), 415 `damaged_design_file` (a checksum doesn't match), 415 `unsupported_type` (a media file that isn't a picture, sound or video Ferrocast plays), 422 `design_too_new` (made by a newer Ferrocast), 422 `invalid_design` (the message names the file and field: `designs/1.json: content.events.tip.variations[0].look.colors.highlight: "red" isn't a colour; use #rrggbb.`), 400 when there's no `file` field or it's empty. Nothing is saved when an import fails.
 
@@ -570,6 +574,8 @@ type DiscordView = { has_webhook: boolean; webhook_hint: string | null /* "disco
 Defaults: on, `{name} is live on {platform}! {title|default:"Come hang out."} {url}`, no @everyone ping (`mention_everyone` lets the message ping). One post per platform per 30 minutes (a stream that drops and comes back isn't news). A failed go-live post becomes one `notice` with a link to the Discord settings.
 
 ### OBS
+Browser sources Ferrocast makes (Add to OBS, a theme into OBS) have "Control audio via OBS" on (`reroute_audio: true`), so alert sounds, music screens and sound elements reach the stream on their own. A source that exists keeps its audio settings, and monitoring is never switched on (with Desktop Audio capturing the monitoring device, viewers would hear every sound twice): the dashboard says how to hear them yourself.
+
 GET `/api/v1/obs` → `{ state, version: "31.1.2" | null, scene: string | null, host, port, has_password, auto, detail }`; PUT `/api/v1/obs` `{ host, port, password }` (password goes to the secret store; absent keeps it, `null` clears it).
 
 The engine keeps OBS connected by itself: it checks a working connection every 5 s, retries a closed OBS every 3 s, and sends one `status` frame whenever the state changes. `auto: true` means Ferrocast follows OBS's own settings (below): each attempt re-reads them, so switching on OBS's WebSocket server (or changing its password) connects within seconds, no click needed, and the password is never copied out of OBS's file. The details become the streamer's own (`auto: false`) when they PUT `/obs` with anything different from what's in use; from then on detected values never replace them, until POST `/obs/detect`. Settings saved before `auto` existed count as the streamer's own only if the address or port differ from `127.0.0.1:4455`. With `auto` and no OBS settings on this computer, a failed attempt is `state: "off"` (nothing set up), not `disconnected`.
@@ -577,6 +583,17 @@ The engine keeps OBS connected by itself: it checks a working connection every 5
 Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/config.json` in OBS's config folder: `~/Library/Application Support/obs-studio` on macOS, `%APPDATA%\obs-studio` on Windows, `$XDG_CONFIG_HOME` or `~/.config/obs-studio` and the Flatpak folder on Linux), so nobody types the port or password:
 - GET `/api/v1/obs/detect` → `{ found, port: number | null, has_password, server_enabled, in_use, reason: string | null }`. `in_use`: Ferrocast already uses these (following OBS, or the typed details match), so there is nothing to offer. Never the password. A missing or damaged file is `found: false` with a plain `reason`; `server_enabled: false` comes with how to switch it on.
 - POST `/api/v1/obs/detect` ("Use these") → the OBS view (as GET `/obs`) after switching back to following OBS's settings (`auto: true`; a typed password is forgotten). 422 with the reason when nothing usable was found.
+
+### Music for the screens (25 Oct, free)
+| Method | Path | |
+|---|---|---|
+| GET | `/api/v1/music` | `{ config: MusicConfig, now: MusicNow, beat_problem: string \| null, song_problem: string \| null }` (a problem is a plain sentence with what to do) |
+| PUT | `/api/v1/music` | partial `MusicConfig` → as GET. 400 naming the field |
+
+`MusicConfig = { beat_input: string | null /* an OBS audio source, e.g. "Desktop Audio" */, song: "off" | "player" | "file", file: string | null /* a .txt file's full path */ }`. `MusicNow = { playing: boolean, level: 0…1, title: string | null, artist: string | null }`.
+- The beat: OBS's volume meters for `beat_input` (a connection of its own that asks for `InputVolumeMeters`), -50 dB as 0 and 0 dB as 1.
+- The song, every 3 s (5 s on Windows): `player` asks Spotify, then Music (macOS; neither is opened, and macOS asks once to allow it), the system's media controls (Windows) or playerctl (Linux); `file` reads the first line as the song and the second as the artist (never split on dashes), up to 4 KB.
+- `playing`: the player says it plays, or OBS heard `beat_input` louder than -46 dB in the last 2.5 s; with a file and no `beat_input`, a song in the file. `level` is 0 while not playing.
 
 ### Studio (streamer tools, all free)
 Production helpers that run on the streamer's PC. OBS requests use the OBS details above; when OBS can't be reached every OBS route answers 422 `obs_unreachable` (`obs_password`, or `obs_refused` for an unknown scene/source) with a hint. Settings PUTs save only the fields sent; 400 names the field.
@@ -862,12 +879,13 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, show: { countdown_ends_at: number \| null } } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, show: { countdown_ends_at: number \| null }, music: MusicNow } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
 | `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
 | `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll` and `giveaway` only to overlays with that widget) |
 | `config` | `Overlay` (re-render without reloading) |
+| `music` | `MusicNow` (§4 Music), `seq: 0` (never replayed): only to overlays with an `fx`, `music` or `sound` layer, when the song or playing changes at once and the loudness at most 15 times a second |
 | `delete_message` | `{ platform, message_id }` |
 | `delete_user` | `{ platform, user_id }` |
 | `clear_chat` | `{ platform: Platform \| null }` |
