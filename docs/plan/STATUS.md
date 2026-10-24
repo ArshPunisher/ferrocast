@@ -26,6 +26,13 @@ Newest entry first. Update at the end of every working session.
 
 ## Log
 
+### 2026-10-24, night (a theme into OBS, engine)
+- Owner asked for a theme to go into OBS in one click, configurable, with Simple and Advanced, and designs. Board: `../design/2026-10-24-theme-to-obs/` (8 items), picks pending.
+- Engine built (needed by every option): `crates/obs/src/theme.rs`, `crates/engine/src/obs_theme.rs`, routes `GET/POST /designs/{id}/obs`, `GET/DELETE /obs/theme` (API.md §4 Designs). Each screen becomes an overlay plus an OBS scene with the streamer's game or camera scene nested under it; Start show's and BRB scenes set; old StreamElements / Streamlabs widgets hidden; everything recorded so Undo removes only that.
+- Real test on the owner's OBS 32.2.2 (not streaming), from a separate headless engine: found and fixed (1) the game guess picked "Recording" because Gameplay's screen capture is switched off, now scored by name, capture and camera; (2) macOS cameras (`macos-avcapture`) weren't known; (3) a 1080p overlay filled only part of the 1440p canvas, now fitted on placing; (4) Undo didn't put the alert look back when there was none before, and moved OBS to the first scene, now back to the scene it was on. After the fixes: apply took 0.25 s, all 9 steps done; Undo left every scene and source identical to the snapshot taken before, OBS back on "Be Right Back".
+- CodeRabbit: 2 findings, both fixed (config lock around the overlay write; a partly refused Undo keeps what's left so it can be tried again).
+- Next: the dashboard (after the owner's picks), then the 375 px check and a real test from the app.
+
 ### 2026-10-24, evening (beta.7 real test)
 - 2.0.0-beta.7 (draft) installed and tested for real from the owner's personal Chrome: the editor's picture is OBS's real 2560x1440 scene; cut source with only YouTube Shorts live ticked (normal platforms off) went live on YouTube in ~6 s, encoded on the GPU (VideoToolbox) at 1080x1920 30 fps; changing the layout while live restarted the cutter and YouTube was back in ~6 s; a new key, a bad rule and a bad box were refused. Everything put back; OBS's settings files byte-identical. Another unlisted test video left on the channel.
 - The site (Cloudflare Pages project `ferrocast-web`) deploys itself on push; the live dashboard has the Vertical tab, the cut editor and Simple/Advanced.
