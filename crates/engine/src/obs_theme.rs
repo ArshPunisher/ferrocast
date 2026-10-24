@@ -616,9 +616,15 @@ impl Engine {
         if plan.switch_to_starting
             && let Some(scene) = &starting_scene
         {
-            steps.push(match ferrocast_obs::control::switch_scene(&client, scene).await {
-                Ok(()) => Step::new("switch", "OBS", "done", format!("OBS is on \"{scene}\".")),
-                Err(e) => Step::new("switch", "OBS", "failed", e.to_string()),
+            // Live: viewers keep seeing what's on air; the streamer switches when ready.
+            let live = ferrocast_obs::control::streaming(&client).await.unwrap_or(true);
+            steps.push(if live {
+                Step::new("switch", "OBS", "skipped", "You're live, so OBS stays on the scene it's on.")
+            } else {
+                match ferrocast_obs::control::switch_scene(&client, scene).await {
+                    Ok(()) => Step::new("switch", "OBS", "done", format!("OBS is on \"{scene}\".")),
+                    Err(e) => Step::new("switch", "OBS", "failed", e.to_string()),
+                }
             });
         }
 
@@ -791,6 +797,19 @@ impl Engine {
             });
         };
         let client = self.obs_client().await?;
+        // Live on one of the theme's scenes: taking it out would change what viewers see.
+        if ferrocast_obs::control::streaming(&client).await.unwrap_or(false) {
+            let (current, _) = ferrocast_obs::control::scene_names(&client).await.map_err(obs_error)?;
+            if let Some(c) = current.filter(|c| rec.made_scenes.contains(c)) {
+                return Err(EngineError::Refused {
+                    status: 409,
+                    code: "theme_on_air",
+                    message: format!("You're live on \"{c}\", one of the theme's scenes."),
+                    hint: "Switch OBS to one of your own scenes first, or take it out after the stream.".into(),
+                    retry_after: None,
+                });
+            }
+        }
         let mut steps = Vec::new();
         // What couldn't be undone stays in the record, so Undo can be tried again.
         let mut left = ObsTheme {

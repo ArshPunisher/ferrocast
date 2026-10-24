@@ -371,3 +371,24 @@ async fn the_mic_goes_on_break_screens_only_when_asked() {
     assert!(!items(&st, "Forge · BRB").iter().any(|(s, _)| s == "Mic"), "Gameplay brings it");
     assert!(items(&st, "Forge · Ending").iter().any(|(s, _)| s == "Mic"));
 }
+
+#[tokio::test]
+async fn live_streams_are_never_switched_by_a_theme() {
+    let (e, _d, st) = setup().await;
+    st.lock().unwrap().streaming = true;
+    let r = e.apply_theme_to_obs("builtin.forge", None).await.unwrap();
+    let sw = r.steps.iter().find(|s| s.id == "switch").unwrap();
+    assert_eq!(sw.status, "skipped", "{sw:?}");
+    assert_eq!(st.lock().unwrap().current, "Starting Soon", "still on air");
+    // On air on one of the theme's scenes: Take it out waits.
+    st.lock().unwrap().current = "Forge · In game".into();
+    match e.undo_theme_in_obs().await {
+        Err(EngineError::Refused { status: 409, code: "theme_on_air", .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(e.obs_theme().await.unwrap().is_some(), "nothing was taken out");
+    // On one of their own scenes, it goes.
+    st.lock().unwrap().current = "Gameplay".into();
+    e.undo_theme_in_obs().await.unwrap();
+    assert_eq!(st.lock().unwrap().current, "Gameplay");
+}
