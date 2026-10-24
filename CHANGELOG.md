@@ -5,6 +5,21 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.11
+
+- Eleven new themes with a live world behind every break screen: Hex Pulse, Night Drive,
+  Wasteland, Circuit, Neon Tunnel, Night Dunes, Lava Forge, Arena Lights, Code Rain City, Orbit
+  and Deep Sonar. Each has eight screens, with Getting ready, Paused and Offline added.
+- Music on your screens: the wave player or a heartbeat line with the song, shown only while
+  music plays, and backgrounds that move with the beat. Pick where the beat and the song come
+  from in Settings, Music (Spotify or Music on a Mac, your player on Windows, or a text file).
+- Sound on any screen: a whoosh or riser when it comes on, rain or a synth pad behind it, ticks
+  in a timer's last ten seconds and a hit at zero. New overlays in OBS send their sound
+  through OBS, so viewers hear it.
+- Timers have six looks: digital, thin, ring, bar, flip cards and words.
+- Start show's countdown: choose what happens at zero (switch scene, unmute, start streaming or
+  recording, a chat message, a marker), each on or off. Timers on screen follow it.
+
 ## 2.0.0-beta.10
 
 - A theme in OBS keeps every choice: switching theme or Make it yours keeps where each screen
