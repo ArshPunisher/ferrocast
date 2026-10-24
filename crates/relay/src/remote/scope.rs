@@ -121,6 +121,7 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("/accounts/*", "/accounts/{platform}"),
     ("/overlays/*/regenerate-url", "/overlays/{id}/regenerate-url"),
     ("/overlays/*/add-to-obs", "/overlays/{id}/add-to-obs"),
+    ("/overlays/*/follow-design", "/overlays/{id}/follow-design"),
     ("/overlays/*", "/overlays/{id}"),
     ("/designs/*/duplicate", "/designs/{id}/duplicate"),
     ("/designs/*/use", "/designs/{id}/use"),

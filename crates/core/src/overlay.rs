@@ -84,6 +84,10 @@ pub struct DesignRef {
     /// Set by the engine from the design, never by the client.
     #[serde(default)]
     pub branded: bool,
+    /// The overlay changes when its design does (24 Oct pick 6A); set by the engine, and
+    /// false once the overlay's layout is edited by hand.
+    #[serde(default)]
+    pub follows: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

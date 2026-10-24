@@ -58,14 +58,30 @@ impl Engine {
 
     /// Saves an edited overlay and pushes the new layout to its open pages. A built-in
     /// design's mark can't be edited away (`check_branding`).
-    pub async fn update_overlay(&self, o: Overlay) -> Result<OverlayView, EngineError> {
+    pub async fn update_overlay(&self, mut o: Overlay) -> Result<OverlayView, EngineError> {
         o.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
         let current = self.overlay(&o.id).await?;
         self.check_branding(&current, &o)?;
+        // Whether it follows its design is the engine's to say: a changed layout stops it.
+        let hand_edited = o.widgets != current.widgets || (o.width, o.height) != (current.width, current.height);
+        if let (Some(d), Some(cur)) = (o.design.as_mut(), current.design.as_ref()) {
+            d.follows = cur.follows && cur.id == d.id && !hand_edited;
+        } else if let Some(d) = o.design.as_mut() {
+            d.follows = false;
+        }
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
         self.push_config(&saved);
         Ok(view)
+    }
+
+    /// Renames an overlay (Theme in OBS when switching theme); its layout and URL stay.
+    pub(crate) async fn rename_overlay(&self, id: &str, name: &str) -> Result<OverlayView, EngineError> {
+        let mut o = self.overlay(id).await?;
+        o.name = name.to_string();
+        let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
+        self.push_config(&saved);
+        Ok(self.overlay_view(&saved))
     }
 
     /// Sends an overlay's new layout to its open pages.

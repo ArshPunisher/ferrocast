@@ -876,7 +876,12 @@ mod tests {
         d.id = "mine".into();
         repo::designs::insert(&s, &d).unwrap();
         let mut o = repo::overlays::create(&s, "BRB", ferrocast_core::overlay::Preset::Blank).unwrap();
-        o.design = Some(ferrocast_core::overlay::DesignRef { id: "mine".into(), scene: "brb".into(), branded: false });
+        o.design = Some(ferrocast_core::overlay::DesignRef {
+            id: "mine".into(),
+            scene: "brb".into(),
+            branded: false,
+            follows: false,
+        });
         repo::overlays::update(&s, &o).unwrap();
         let pack = a.path().join("p.ferropack");
         let manifest = export(&s, &pack, "0.1.0").unwrap();

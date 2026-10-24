@@ -105,6 +105,11 @@ pub async fn put_in_obs(
     Ok(Json(json!(app.engine.apply_theme_to_obs(&id, plan).await?)))
 }
 
+/// `POST /overlays/{id}/follow-design`: the overlay takes its design's layout and follows it again.
+pub async fn follow_design(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.follow_design(&id).await?)))
+}
+
 /// `GET /obs/theme`: the theme Ferrocast put into OBS, or null.
 pub async fn obs_theme(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.obs_theme().await?)))

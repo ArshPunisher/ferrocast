@@ -541,7 +541,7 @@ fn place_scene(
     if !d.branded {
         layers.retain(|l| !is_brand_layer(l));
     }
-    let link = DesignRef { id: d.id.clone(), scene: scene.key.clone(), branded: d.branded };
+    let link = DesignRef { id: d.id.clone(), scene: scene.key.clone(), branded: d.branded, follows: false };
     match overlay_id {
         Some(oid) => {
             let mut o = overlay(st, account, oid)?;

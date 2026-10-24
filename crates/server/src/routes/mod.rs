@@ -50,6 +50,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/overlays/{id}", get(core::overlay).put(core::update_overlay).delete(core::delete_overlay))
         .route("/overlays/{id}/regenerate-url", post(core::regenerate_url))
         .route("/overlays/{id}/add-to-obs", post(core::add_to_obs))
+        .route("/overlays/{id}/follow-design", post(designs::follow_design))
         // designs (gallery, designer, Use, share files)
         .route("/designs", get(designs::list).post(designs::create))
         .route("/designs/active-alert", get(designs::active_alert).put(designs::set_active_alert))

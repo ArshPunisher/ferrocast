@@ -166,7 +166,43 @@ impl Engine {
             other => other,
         })?;
         self.refresh_active_design().await;
+        self.refresh_following(&saved).await;
         Ok(saved)
+    }
+
+    /// Overlays made from `design` that still follow it get its new layout (their URLs stay).
+    async fn refresh_following(&self, design: &Design) {
+        let scenes: Vec<&ferrocast_core::design::Scene> = match &design.content {
+            DesignContent::Theme(t) => t.scenes.iter().collect(),
+            DesignContent::Scene(s) => vec![s],
+            _ => return,
+        };
+        let Ok(list) = self.db(repo::overlays::list).await else { return };
+        for o in list {
+            let Some(link) = o.design.as_ref().filter(|d| d.follows && d.id == design.id) else { continue };
+            let Some(scene) = scenes.iter().find(|s| s.key == link.scene) else { continue };
+            let _one_at_a_time = self.config_lock().await;
+            if let Err(e) = self.place_scene(design, scene, &o.name, Some(&o.id)).await {
+                tracing::warn!(error = %e, overlay = %o.id, "an overlay couldn't follow its design");
+            }
+        }
+    }
+
+    /// "Follow the theme again": the overlay takes its design's layout and follows it.
+    pub async fn follow_design(&self, overlay_id: &str) -> Result<OverlayView, EngineError> {
+        let o = self.overlay(overlay_id).await?;
+        let Some(link) = o.design.clone() else {
+            return Err(EngineError::Invalid("design: this overlay wasn't made from a design.".into()));
+        };
+        let design = self.design(&link.id).await?;
+        let scene = match &design.content {
+            DesignContent::Theme(t) => t.scenes.iter().find(|s| s.key == link.scene).cloned(),
+            DesignContent::Scene(s) => Some(s.clone()),
+            _ => None,
+        }
+        .ok_or_else(|| EngineError::Invalid("design: that screen isn't in the design any more.".into()))?;
+        let _one_at_a_time = self.config_lock().await;
+        self.place_scene(&design, &scene, &o.name, Some(&o.id)).await
     }
 
     pub async fn delete_design(&self, id: &str) -> Result<(), EngineError> {
@@ -343,7 +379,8 @@ impl Engine {
         if !design.branded {
             layers.retain(|l| !is_brand_layer(l));
         }
-        let link = DesignRef { id: design.id.clone(), scene: scene.key.clone(), branded: design.branded };
+        let link =
+            DesignRef { id: design.id.clone(), scene: scene.key.clone(), branded: design.branded, follows: true };
         match overlay_id {
             Some(oid) => {
                 let mut o = self.overlay(oid).await?;

@@ -173,8 +173,12 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let mut o = create(&s, "Scene", Preset::Blank).unwrap();
         assert_eq!(o.design, None);
-        o.design =
-            Some(ferrocast_core::overlay::DesignRef { id: "builtin.forge".into(), scene: "brb".into(), branded: true });
+        o.design = Some(ferrocast_core::overlay::DesignRef {
+            id: "builtin.forge".into(),
+            scene: "brb".into(),
+            branded: true,
+            follows: false,
+        });
         let saved = update(&s, &o).unwrap();
         assert_eq!(saved.design, o.design);
         let made = create_from(&s, saved.clone()).unwrap();
