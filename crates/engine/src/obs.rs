@@ -193,7 +193,7 @@ impl Engine {
         self.inner.obs_wake.notify_one();
     }
 
-    fn obs_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn obs_paths(&self) -> Vec<PathBuf> {
         self.inner.obs_paths.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 

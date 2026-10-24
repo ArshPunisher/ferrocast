@@ -25,6 +25,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
         .route("/golive/protection", put(protection))
+        .route("/golive/aitum", put(aitum_ok))
         .route("/golive/resume/{id}", post(resume))
 }
 
@@ -102,4 +103,15 @@ async fn protection(State(app): State<AppState>, Body(b): Body<ProtectBody>) -> 
 async fn resume(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     app.engine.golive_resume(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AitumBody {
+    ok: bool,
+}
+
+/// "I use Aitum Multistream on purpose" (A2.2): hides the setup note.
+async fn aitum_ok(State(app): State<AppState>, Body(b): Body<AitumBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_aitum_ok(b.ok).await?)))
 }

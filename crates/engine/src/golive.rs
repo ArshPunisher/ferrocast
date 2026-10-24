@@ -58,6 +58,10 @@ pub struct GoLiveConfig {
     /// them all. On unless the streamer turns it off.
     #[serde(default = "on")]
     pub protect: bool,
+    /// The streamer said they run Aitum Multistream on purpose: the setup note stays hidden
+    /// (the live "sent twice" warning still shows).
+    #[serde(default)]
+    pub aitum_ok: bool,
 }
 
 fn on() -> bool {
@@ -71,6 +75,7 @@ impl Default for GoLiveConfig {
         Self {
             destinations: vec![p("twitch", Service::Twitch), p("youtube", Service::Youtube), p("kick", Service::Kick)],
             protect: true,
+            aitum_ok: false,
         }
     }
 }
@@ -109,6 +114,8 @@ pub struct GoLiveView {
     pub upload: Option<UploadCheck>,
     /// Upload protection is on (A1.8).
     pub protect: bool,
+    /// The streamer said they run Aitum Multistream on purpose (A2.2).
+    pub aitum_ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -119,6 +126,38 @@ pub struct ObsView {
     pub streaming: bool,
     /// What "Put OBS back" restores (`Twitch`, `a custom server`), when there's a saved one.
     pub before: Option<String>,
+    /// Aitum Multistream's outputs, when OBS has that plugin (A2.2).
+    pub aitum: Option<Vec<AitumOutput>>,
+}
+
+/// One Aitum Multistream output: where it goes (when Ferrocast can tell) and whether it's
+/// sending now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AitumOutput {
+    pub name: String,
+    pub platform: Option<Service>,
+    pub live: bool,
+}
+
+/// Which platform an Aitum output streams to, from its server (else its name).
+pub(crate) fn aitum_platform(host: Option<&str>, name: &str) -> Option<Service> {
+    if let Some(h) = host {
+        // Kick runs on Amazon IVS like Twitch: its own ingest channel comes first.
+        if h.starts_with("fa723fc1b171.") || h.contains("kick") {
+            return Some(Service::Kick);
+        }
+        if h == "youtube.com" || h.ends_with(".youtube.com") {
+            return Some(Service::Youtube);
+        }
+        if h.ends_with("contribute.live-video.net") || h.ends_with(".twitch.tv") {
+            return Some(Service::Twitch);
+        }
+    }
+    let n = name.to_lowercase();
+    [("twitch", Service::Twitch), ("youtube", Service::Youtube), ("kick", Service::Kick)]
+        .into_iter()
+        .find(|(w, _)| n.contains(w))
+        .map(|(_, s)| s)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -324,7 +363,16 @@ impl Engine {
                 }
             })
             .collect();
-        GoLiveView { ingest, obs, live, stats, destinations, upload: lock(&g.upload).clone(), protect: cfg.protect }
+        GoLiveView {
+            ingest,
+            obs,
+            live,
+            stats,
+            destinations,
+            upload: lock(&g.upload).clone(),
+            protect: cfg.protect,
+            aitum_ok: cfg.aitum_ok,
+        }
     }
 
     async fn golive_obs_view(&self, ingest: Option<&str>) -> ObsView {
@@ -337,18 +385,57 @@ impl Engine {
             .and_then(|j| serde_json::from_str::<StreamService>(&j).ok());
         let before = before.map(|b| describe_service(&b));
         let Ok(c) = self.obs_client().await else {
-            return ObsView { connected: false, points_here: false, streaming: false, before };
+            return ObsView { connected: false, points_here: false, streaming: false, before, aitum: None };
         };
         let service = obs::stream_service(&c).await.ok();
         let streaming = obs::streaming(&c).await.unwrap_or(false);
         let points_here = matches!((&service, ingest), (Some(s), Some(i)) if s.points_at(i));
-        ObsView { connected: true, points_here, streaming, before }
+        let aitum = self.aitum_outputs(&c).await;
+        ObsView { connected: true, points_here, streaming, before, aitum }
+    }
+
+    /// Aitum Multistream's outputs: the names and live state from OBS, where each goes from
+    /// the plugin's settings file (only names and servers are read, never keys).
+    async fn aitum_outputs(&self, c: &ferrocast_obs::Client) -> Option<Vec<AitumOutput>> {
+        use ferrocast_obs::aitum;
+        let list = aitum::outputs(c).await.ok().flatten()?;
+        let profile = c.profiles().current().await.unwrap_or_default();
+        let files: Vec<_> = self.obs_paths().iter().filter_map(|p| aitum::config_path(p)).collect();
+        let servers = tokio::task::spawn_blocking(move || {
+            let path = files.into_iter().find(|p| p.is_file())?;
+            if std::fs::metadata(&path).ok()?.len() > aitum::MAX_CONFIG_BYTES {
+                return None;
+            }
+            Some(aitum::servers(&std::fs::read(path).ok()?, &profile))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        Some(
+            list.into_iter()
+                .map(|(name, live)| AitumOutput {
+                    platform: aitum_platform(servers.get(&name).map(String::as_str), &name),
+                    name,
+                    live,
+                })
+                .collect(),
+        )
+    }
+
+    /// "I use it on purpose": hides the Aitum Multistream setup note.
+    pub async fn set_golive_aitum_ok(&self, ok: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        cfg.aitum_ok = ok;
+        self.save_golive(cfg.clone()).await?;
+        Ok(cfg)
     }
 
     fn send_golive(&self) {
         let ingest = lock(&self.golive().ingest).clone();
         // OBS isn't asked on every tick: the dashboard reads it with GET.
-        let obs = ObsView { connected: false, points_here: false, streaming: false, before: None };
+        let obs = ObsView { connected: false, points_here: false, streaming: false, before: None, aitum: None };
         let mut v = self.view_with(ingest, obs);
         v.upload = None;
         self.send_live(LiveFrame::new(
@@ -360,6 +447,8 @@ impl Engine {
     /// Saves the destinations' order and switches (custom ones keep their name and server).
     /// While live, a newly ticked one starts and an unticked one stops at once.
     pub async fn set_golive_destinations(&self, order: Vec<(String, bool)>) -> Result<GoLiveConfig, EngineError> {
+        // Read, change and save under the config lock, so two saves never undo each other.
+        let one_at_a_time = self.config_lock().await;
         let cfg = self.golive_config();
         if order.len() != cfg.destinations.len() {
             return Err(EngineError::Invalid("destinations: list every destination once, in the new order.".into()));
@@ -379,6 +468,7 @@ impl Engine {
         }
         let next = GoLiveConfig { destinations: next, ..self.golive_config() };
         self.save_golive(next.clone()).await?;
+        drop(one_at_a_time);
         // Unticking a paused destination ends its pause (ticking it again starts it at once).
         for d in next.destinations.iter().filter(|d| !d.enabled) {
             lock(&self.golive().protector).release(&d.id);
@@ -405,6 +495,7 @@ impl Engine {
         if key.is_empty() || key.len() > 512 || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(EngineError::Invalid("key: the stream key the server gave you, without spaces.".into()));
         }
+        let one_at_a_time = self.config_lock().await;
         let mut cfg = self.golive_config();
         if cfg.destinations.iter().filter(|d| d.kind == Service::Custom).count() >= MAX_CUSTOM {
             return Err(EngineError::Conflict(format!("You can add up to {MAX_CUSTOM} servers of your own.")));
@@ -425,6 +516,7 @@ impl Engine {
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
+        drop(one_at_a_time);
         self.reconcile().await;
         Ok(d)
     }
@@ -432,6 +524,7 @@ impl Engine {
     /// Removes a custom destination and its key. The three platforms can't be removed, only
     /// switched off.
     pub async fn remove_golive_destination(&self, id: &str) -> Result<(), EngineError> {
+        let one_at_a_time = self.config_lock().await;
         let mut cfg = self.golive_config();
         let Some(i) = cfg.destinations.iter().position(|d| d.id == id) else {
             return Err(EngineError::NotFound("destination"));
@@ -441,6 +534,7 @@ impl Engine {
         }
         cfg.destinations.remove(i);
         self.save_golive(cfg).await?;
+        drop(one_at_a_time);
         let _ = self.inner.secrets.delete(&format!("{CUSTOM_KEY_PREFIX}{id}"));
         self.reconcile().await;
         Ok(())
@@ -682,9 +776,13 @@ impl Engine {
 
     /// Turns upload protection on or off. Off brings every paused destination back.
     pub async fn set_golive_protect(&self, on: bool) -> Result<GoLiveConfig, EngineError> {
-        let mut cfg = self.golive_config();
-        cfg.protect = on;
-        self.save_golive(cfg.clone()).await?;
+        let cfg = {
+            let _one_at_a_time = self.config_lock().await;
+            let mut cfg = self.golive_config();
+            cfg.protect = on;
+            self.save_golive(cfg.clone()).await?;
+            cfg
+        };
         if !on {
             let ids: Vec<String> = lock(&self.golive().paused).keys().cloned().collect();
             for id in ids {

@@ -1595,6 +1595,12 @@ async fn go_live_routes_refuse_what_is_wrong() {
         error_code(r.put("/api/v1/golive/protection", json!({ "on": "yes" })).await).await.0,
         StatusCode::BAD_REQUEST
     );
+    // Aitum Multistream: "on purpose" is saved; no OBS means no plugin to report.
+    assert_eq!(v["aitum_ok"], false);
+    assert_eq!(v["obs"]["aitum"], Value::Null);
+    let ok: Value = r.put("/api/v1/golive/aitum", json!({ "ok": true })).await.json().await.unwrap();
+    assert_eq!(ok["aitum_ok"], true);
+    assert_eq!(error_code(r.put("/api/v1/golive/aitum", json!({ "ok": 1 })).await).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         error_code(r.post("/api/v1/golive/resume/kick", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "golive_not_paused".into())

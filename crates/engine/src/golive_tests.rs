@@ -130,6 +130,56 @@ async fn a_paused_destination_stays_off_until_resumed() {
     assert!(!e.golive_config().protect);
 }
 
+/// Aitum Multistream in OBS: its outputs, where each goes (from its settings file, never the
+/// key) and which are sending now; "on purpose" is saved.
+#[tokio::test]
+async fn aitum_multistream_outputs_are_found_and_named() {
+    use crate::golive::aitum_platform;
+    use ferrocast_golive::probe::Service;
+    let (e, dir) = engine().await;
+    let st = FakeObs::studio();
+    st.lock().unwrap().aitum =
+        Some(vec![("Twitch Output".into(), true), ("Kick".into(), false), ("Backup".into(), false)]);
+    let port = start_obs(st.clone()).await;
+    e.save_obs(ObsConfig { host: "127.0.0.1".into(), port }, PasswordChange::Keep).await.unwrap();
+    let ws = dir.path().join("obs-studio/plugin_config/obs-websocket/config.json");
+    let aitum = dir.path().join("obs-studio/plugin_config/aitum-multistream");
+    std::fs::create_dir_all(&aitum).unwrap();
+    std::fs::write(
+        aitum.join("config.json"),
+        serde_json::to_vec(&json!({ "profiles": [{ "name": "Untitled", "outputs": [
+            { "name": "Twitch Output", "stream_server": "rtmps://aps30.contribute.live-video.net/app", "stream_key": "live_x" },
+            { "name": "Kick", "stream_server": "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app/" },
+            { "name": "Backup", "stream_server": "rtmp://backup.example.com/live" }
+        ] }] }))
+        .unwrap(),
+    )
+    .unwrap();
+    e.set_obs_detect_paths(vec![ws]);
+    let v = e.golive_view().await;
+    let out = v.obs.aitum.expect("the plugin is there");
+    let got: Vec<(&str, Option<Service>, bool)> = out.iter().map(|o| (o.name.as_str(), o.platform, o.live)).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Twitch Output", Some(Service::Twitch), true),
+            ("Kick", Some(Service::Kick), false),
+            ("Backup", None, false)
+        ]
+    );
+    assert!(!v.aitum_ok);
+    e.set_golive_aitum_ok(true).await.unwrap();
+    assert!(e.golive_view().await.aitum_ok);
+    // Without the plugin: nothing to say.
+    st.lock().unwrap().aitum = None;
+    assert_eq!(e.golive_view().await.obs.aitum, None);
+    // Names decide when the server doesn't.
+    assert_eq!(aitum_platform(Some("a.rtmps.youtube.com"), "x"), Some(Service::Youtube));
+    assert_eq!(aitum_platform(None, "My YouTube"), Some(Service::Youtube));
+    assert_eq!(aitum_platform(Some("ingest.global-contribute.live-video.net"), "x"), Some(Service::Twitch));
+    assert_eq!(aitum_platform(Some("restream.example.com"), "Backup"), None);
+}
+
 /// The relay builds the app's Kick sign-in link: its scope list must be the app's own.
 #[test]
 fn the_relays_kick_scopes_are_the_apps() {

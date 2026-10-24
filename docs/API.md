@@ -696,9 +696,10 @@ type UploadRow = { id: string; name: string; server: string | null; delay_ms: nu
 type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: UploadRow[];
                      verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
 type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
-                    obs: { connected: boolean; points_here: boolean; streaming: boolean; before: string | null /* "Twitch", "a custom server" */ };
+                    obs: { connected: boolean; points_here: boolean; streaming: boolean; before: string | null /* "Twitch", "a custom server" */;
+                           aitum: { name: string; platform: Service | null /* "custom" never; null when unknown */; live: boolean }[] | null /* Aitum Multistream's outputs, when OBS has it */ };
                     live: boolean; stats: StreamStats; destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
-                    protect: boolean /* upload protection, on by default */ }
+                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */ }
 ```
 
 | Method | Path | Body → Response |
@@ -712,7 +713,10 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
 | POST | `/api/v1/golive/obs/restore` | Puts OBS's earlier stream setting back exactly → `GoLiveView.obs`. 422 `golive_nothing_saved`, `obs_streaming` |
 | POST | `/api/v1/golive/upload-check` | ~8 s → `UploadCheck`: each ticked destination's server and connect delay, the upload speed (Twitch's bandwidth-test mode when Twitch is ticked: nothing goes live; else an upload to Cloudflare's speed test), each needing the stream's measured rate (6,160 kbps before anything streamed), and the verdict with 20% kept free. 422 `golive_none` (nothing ticked), `golive_upload`; 429 while one runs |
 | PUT | `/api/v1/golive/protection` | `{ on: boolean }` → `{ destinations, protect }`. Off brings every paused destination back at once |
+| PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
 | POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
+
+**Aitum Multistream (A2.2).** When OBS has the Aitum Multistream plugin (it answers the `aitum-multistream` / `get_outputs` vendor request), `GoLiveView.obs.aitum` lists its outputs: which are sending now (OBS's output `aitum_multi_output_<name>` is active) and the platform each goes to, from the plugin's settings file `<OBS config>/plugin_config/aitum-multistream/config.json` for OBS's current profile (only each output's name and server are read, never its key), else from its name. The dashboard warns when one goes to a platform Go live also sends to: before going live unless `aitum_ok`, and while both are live always.
 
 **Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
