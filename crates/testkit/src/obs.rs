@@ -61,6 +61,10 @@ pub struct FakeObs {
     /// Settings › Stream: the service type and its settings.
     pub service_kind: String,
     pub service: Value,
+    /// The current OBS profile's name.
+    pub profile: String,
+    /// The Aitum Multistream plugin's outputs and whether each is sending, when it's installed.
+    pub aitum: Option<Vec<(String, bool)>>,
 }
 
 pub type St = Arc<Mutex<FakeObs>>;
@@ -103,6 +107,7 @@ impl FakeObs {
             // Streaming to Twitch through OBS's own list, as most people do.
             service_kind: "rtmp_common".into(),
             service: json!({ "service": "Twitch", "server": "auto", "key": "live_123_OldKey", "bwtest": false }),
+            profile: "Untitled".into(),
             ..Default::default()
         }))
     }
@@ -323,6 +328,32 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
                     "outputDuration": 600_000, "outputCongestion": 0.0, "outputBytes": s.stream_bytes,
                     "outputSkippedFrames": s.stream_skipped, "outputTotalFrames": s.stream_total }),
         ),
+        "GetProfileList" => (100, json!({ "currentProfileName": s.profile, "profiles": [s.profile] })),
+        "GetOutputList" => {
+            let mut outputs = vec![
+                json!({ "outputName": "simple_stream", "outputKind": "rtmp_output", "outputWidth": 1920,
+                "outputHeight": 1080, "outputActive": s.streaming, "outputFlags": { "OBS_OUTPUT_AUDIO": true,
+                "OBS_OUTPUT_VIDEO": true, "OBS_OUTPUT_ENCODED": true, "OBS_OUTPUT_MULTI_TRACK": false, "OBS_OUTPUT_SERVICE": true } }),
+            ];
+            for (name, live) in s.aitum.iter().flatten() {
+                outputs.push(json!({ "outputName": format!("aitum_multi_output_{name}"), "outputKind": "rtmp_output",
+                    "outputWidth": 1920, "outputHeight": 1080, "outputActive": live, "outputFlags": { "OBS_OUTPUT_AUDIO": true,
+                    "OBS_OUTPUT_VIDEO": true, "OBS_OUTPUT_ENCODED": true, "OBS_OUTPUT_MULTI_TRACK": false, "OBS_OUTPUT_SERVICE": true } }));
+            }
+            (100, json!({ "outputs": outputs }))
+        }
+        // obs-websocket answers an unknown vendor with 604 (ResourceNotFound family).
+        "CallVendorRequest" => match (&s.aitum, name("vendorName").as_str(), name("requestType").as_str()) {
+            (Some(list), "aitum-multistream", "get_outputs") => {
+                let outputs: Vec<Value> = list.iter().map(|(n, _)| json!({ "name": n, "vertical": false })).collect();
+                (
+                    100,
+                    json!({ "vendorName": "aitum-multistream", "requestType": "get_outputs",
+                              "responseData": { "outputs": outputs, "success": true } }),
+                )
+            }
+            _ => (604, Value::Null),
+        },
         _ => (204, Value::Null),
     }
 }

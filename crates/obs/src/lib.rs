@@ -4,6 +4,7 @@
 //! current scene as a Browser Source in one click, or fix the URL of one that's already
 //! there, so nobody has to copy a URL into a dialog (VISION: few clicks).
 
+pub mod aitum;
 pub mod control;
 pub mod detect;
 

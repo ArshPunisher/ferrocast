@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::ObsError;
 
-fn err(e: obws::error::Error) -> ObsError {
+pub(crate) fn err(e: obws::error::Error) -> ObsError {
     crate::map_err(e)
 }
 
