@@ -6,6 +6,10 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
+  # Timing branches in crypto-bigint 0.5 (fixed in 0.7.6). It reaches us only through age's
+  # P-256 tagged recipients (p256, hpke). Ferrocast encrypts and decrypts backups with age's
+  # x25519 and scrypt only, which never run that code. Revisit when age moves to crypto-bigint 0.7.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only via age's P-256 recipients, which Ferrocast never uses" },
   # Unmaintained (not a vulnerability): read at build time by i18n-embed-fl, the proc macro
   # age uses for its error messages. Nothing parses TOML at run time. Revisit when age moves
   # off it.
