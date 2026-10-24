@@ -1585,6 +1585,20 @@ async fn go_live_routes_refuse_what_is_wrong() {
         error_code(r.post("/api/v1/golive/obs/setup", json!({})).await).await.0,
         StatusCode::UNPROCESSABLE_ENTITY
     );
+    // Upload protection: on by default, a switch, and nothing to resume when nothing paused.
+    assert_eq!(v["protect"], true);
+    let off: Value = r.put("/api/v1/golive/protection", json!({ "on": false })).await.json().await.unwrap();
+    assert_eq!(off["protect"], false);
+    let v: Value = r.get("/api/v1/golive").await.json().await.unwrap();
+    assert_eq!(v["protect"], false);
+    assert_eq!(
+        error_code(r.put("/api/v1/golive/protection", json!({ "on": "yes" })).await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        error_code(r.post("/api/v1/golive/resume/kick", json!({})).await).await,
+        (StatusCode::UNPROCESSABLE_ENTITY, "golive_not_paused".into())
+    );
     // No session: 401 like every route.
     assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/golive/ingest").await.status(), StatusCode::UNAUTHORIZED);
 }

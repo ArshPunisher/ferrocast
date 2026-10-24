@@ -681,7 +681,8 @@ OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key
 type Service = "twitch" | "youtube" | "kick" | "custom"
 type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "c_<hex>" */; kind: Service; name?: string; url?: string /* custom */; enabled: boolean }
 type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
-                 | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string })
+                 | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string }
+                 | { state: "paused"; until_ms: number /* earliest it comes back */; reason: string /* upload protection */ })
                  & { kbps: number; dropped: number; since_ms: number }
 type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
@@ -693,7 +694,8 @@ type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: Upl
                      verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
 type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                     obs: { connected: boolean; points_here: boolean; streaming: boolean; before: string | null /* "Twitch", "a custom server" */ };
-                    live: boolean; stats: StreamStats; destinations: DestinationView[] /* top first */; upload: UploadCheck | null }
+                    live: boolean; stats: StreamStats; destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
+                    protect: boolean /* upload protection, on by default */ }
 ```
 
 | Method | Path | Body → Response |
@@ -706,6 +708,10 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
 | POST | `/api/v1/golive/obs/setup` | Points OBS's stream setting at the local server, saving the one before (with its key, in the secret store) → `GoLiveView.obs`. 422 `obs_streaming` while OBS streams (OBS refuses; it would cut the stream), `obs_unreachable` / `obs_password` |
 | POST | `/api/v1/golive/obs/restore` | Puts OBS's earlier stream setting back exactly → `GoLiveView.obs`. 422 `golive_nothing_saved`, `obs_streaming` |
 | POST | `/api/v1/golive/upload-check` | ~8 s → `UploadCheck`: each ticked destination's server and connect delay, the upload speed (Twitch's bandwidth-test mode when Twitch is ticked: nothing goes live; else an upload to Cloudflare's speed test), each needing the stream's measured rate (6,160 kbps before anything streamed), and the verdict with 20% kept free. 422 `golive_none` (nothing ticked), `golive_upload`; 429 while one runs |
+| PUT | `/api/v1/golive/protection` | `{ on: boolean }` → `{ destinations, protect }`. Off brings every paused destination back at once |
+| POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
+
+**Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
 Live frame `golive { live, stats, destinations }` (§5): every second while OBS streams, and after every change.
 

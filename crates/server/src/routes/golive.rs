@@ -24,6 +24,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
+        .route("/golive/protection", put(protection))
+        .route("/golive/resume/{id}", post(resume))
 }
 
 async fn view(State(app): State<AppState>) -> Json<Value> {
@@ -83,4 +85,21 @@ async fn restore_obs(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 
 async fn upload_check(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.golive_upload_check().await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectBody {
+    on: bool,
+}
+
+/// Upload protection on or off (A1.8). Off brings every paused destination back.
+async fn protection(State(app): State<AppState>, Body(b): Body<ProtectBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_protect(b.on).await?)))
+}
+
+/// "Resume now" on a destination upload protection paused.
+async fn resume(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.golive_resume(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

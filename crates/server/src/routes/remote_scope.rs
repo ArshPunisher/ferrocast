@@ -257,6 +257,8 @@ mod tests {
             ("PUT", "/golive/destinations"),
             ("POST", "/golive/upload-check"),
             ("POST", "/golive/obs/setup"),
+            ("POST", "/golive/resume/kick"),
+            ("PUT", "/golive/protection"),
             ("GET", "/settings"),
             ("PUT", "/settings"),
             ("POST", "/chat/send"),
