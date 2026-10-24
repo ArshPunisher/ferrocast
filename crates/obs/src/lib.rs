@@ -7,6 +7,7 @@
 pub mod aitum;
 pub mod control;
 pub mod detect;
+pub mod theme;
 
 /// The open connection [`connect`] returns.
 pub use obws::Client;
