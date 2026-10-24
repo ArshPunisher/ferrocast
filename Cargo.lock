@@ -4209,6 +4209,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-stream",
  "tokio-websockets",
  "tracing",
  "uuid",
@@ -6836,6 +6837,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

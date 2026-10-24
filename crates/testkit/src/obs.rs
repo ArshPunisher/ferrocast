@@ -78,6 +78,11 @@ pub struct FakeObs {
     pub refuse: Vec<String>,
     /// SetSceneItemTransform calls: (scene, item id, transform).
     pub transforms: Vec<(String, i64, Value)>,
+    /// Volume meters (input, peak 0 to 1) sent every 50 ms to a connection that asked for
+    /// them (InputVolumeMeters).
+    pub meters: Vec<(String, f32)>,
+    /// Inputs whose audio monitoring was set: (input, monitor type).
+    pub monitor: Vec<(String, String)>,
 }
 
 /// Aitum Vertical in the fake OBS: is the vertical canvas streaming, and where to.
@@ -163,12 +168,39 @@ async fn session(st: St, mut ws: WebSocket) {
         return;
     }
     // Identify, then Identified.
-    let Some(Ok(_identify)) = ws.recv().await else { return };
+    let Some(Ok(identify)) = ws.recv().await else { return };
+    let subs = match &identify {
+        Message::Text(t) => serde_json::from_str::<Value>(t).ok().and_then(|v| v["d"]["eventSubscriptions"].as_u64()),
+        _ => None,
+    };
+    let wants_meters = subs.is_some_and(|s| s & (1 << 16) != 0);
     let ok = json!({ "op": 2, "d": { "negotiatedRpcVersion": 1 } });
     if ws.send(Message::Text(ok.to_string().into())).await.is_err() {
         return;
     }
-    while let Some(Ok(msg)) = ws.recv().await {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    loop {
+        let msg = tokio::select! {
+            m = ws.recv() => m,
+            _ = tick.tick(), if wants_meters => {
+                let inputs: Vec<Value> = {
+                    let g = st.lock().unwrap();
+                    if g.closed {
+                        return;
+                    }
+                    g.meters
+                        .iter()
+                        .map(|(name, p)| json!({ "inputName": name, "inputUuid": uuid(0), "inputLevelsMul": [[p * 0.5, p, p], [p * 0.5, p, p]] }))
+                        .collect()
+                };
+                let ev = json!({ "op": 5, "d": { "eventType": "InputVolumeMeters", "eventIntent": 1 << 16, "eventData": { "inputs": inputs } } });
+                if ws.send(Message::Text(ev.to_string().into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(Ok(msg)) = msg else { return };
         if st.lock().unwrap().closed {
             return;
         }
@@ -360,6 +392,22 @@ fn handle(st: &St, kind: &str, data: &Value) -> (u16, Value) {
             100,
             json!({ "desktop1": "Desktop Audio", "desktop2": null, "mic1": "Mic/Aux", "mic2": null, "mic3": null, "mic4": null }),
         ),
+        "GetInputAudioMonitorType" => {
+            let input = name("inputName");
+            let t = s
+                .monitor
+                .iter()
+                .rev()
+                .find(|(n, _)| *n == input)
+                .map_or("OBS_MONITORING_TYPE_NONE".to_string(), |(_, t)| t.clone());
+            (100, json!({ "monitorType": t }))
+        }
+        "SetInputAudioMonitorType" => {
+            let input = name("inputName");
+            let t = data["monitorType"].as_str().unwrap_or("").to_string();
+            s.monitor.push((input, t));
+            (100, Value::Null)
+        }
         "GetInputSettings" => match s.inputs.iter().find(|x| x.name == name("inputName")) {
             None => (600, Value::Null),
             Some(x) => (

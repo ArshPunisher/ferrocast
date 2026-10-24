@@ -7,6 +7,7 @@
 pub mod aitum;
 pub mod control;
 pub mod detect;
+pub mod meters;
 pub mod theme;
 
 /// The open connection [`connect`] returns.
@@ -102,6 +103,20 @@ pub fn source_name(overlay_name: &str) -> String {
     format!("Ferrocast: {}", clean.trim())
 }
 
+/// A Ferrocast browser source's settings. A new one sends its sounds through OBS ("Control
+/// audio via OBS"), so alerts, music screens and sound elements reach the stream whatever OBS
+/// captures. An existing source keeps the audio setting the streamer has: switching it, or
+/// switching on monitoring, could make viewers hear every sound twice when Desktop Audio
+/// captures the monitoring device.
+pub fn browser_settings(url: &str, width: u32, height: u32, new: bool) -> serde_json::Value {
+    let mut s = json!({ "url": url, "width": width, "height": height, "shutdown": false,
+                        "restart_when_active": false });
+    if new {
+        s["reroute_audio"] = json!(true);
+    }
+    s
+}
+
 /// Adds the overlay to the current scene, or updates the existing source and makes sure
 /// it's in the current scene. Idempotent.
 pub async fn add_browser_source(
@@ -113,14 +128,12 @@ pub async fn add_browser_source(
 ) -> Result<Added, ObsError> {
     let scene = client.scenes().current_program_scene().await.map_err(map_err)?.id;
     let scene_id = SceneId::Uuid(scene.uuid);
-    // Keep the source running when hidden so a queued alert isn't lost on a scene switch;
-    // audio stays with OBS's defaults.
-    let settings =
-        json!({ "url": url, "width": width, "height": height, "shutdown": false, "restart_when_active": false });
+    // Keep the source running when hidden so a queued alert isn't lost on a scene switch.
     let existing =
         client.inputs().list(Some("browser_source")).await.map_err(map_err)?.into_iter().find(|i| i.id.name == name);
     match existing {
         Some(input) => {
+            let settings = browser_settings(url, width, height, false);
             client
                 .inputs()
                 .set_settings(SetSettings {
@@ -146,6 +159,7 @@ pub async fn add_browser_source(
             Ok(Added { scene: scene.name, source: name.to_string(), created: false })
         }
         None => {
+            let settings = browser_settings(url, width, height, true);
             client
                 .inputs()
                 .create(Create {

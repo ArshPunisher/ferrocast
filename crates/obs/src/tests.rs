@@ -151,6 +151,7 @@ async fn adds_then_updates_in_place_then_adds_to_a_new_scene() {
         assert_eq!(s.inputs[0].2["url"], "http://127.0.0.1:47820/o/bbb/");
         assert_eq!(s.inputs[0].2["width"], 1280);
         assert_eq!(s.inputs[0].2["shutdown"], false);
+        assert_eq!(s.inputs[0].2["reroute_audio"], true, "a new source's sounds go through OBS");
     }
     st.lock().unwrap().scene = ("Just Chatting".into(), "22222222-2222-4222-8222-222222222222".into());
     let third = add_browser_source(&client, &name, "http://127.0.0.1:47820/o/bbb/", 1920, 1080).await.unwrap();

@@ -9,7 +9,7 @@ use obws::requests::scene_items::{CreateSceneItem, SetIndex};
 use obws::requests::scenes::SceneId;
 use obws::requests::sources::SourceId;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::ObsError;
 use crate::control::err;
@@ -108,10 +108,9 @@ pub async fn put_overlay(
     width: u32,
     height: u32,
 ) -> Result<Placed, ObsError> {
-    let settings =
-        json!({ "url": url, "width": width, "height": height, "shutdown": false, "restart_when_active": false });
     let existing =
         client.inputs().list(Some("browser_source")).await.map_err(err)?.into_iter().any(|i| i.id.name == name);
+    let settings = crate::browser_settings(url, width, height, !existing);
     let mut placed = Placed { input_created: false, item_added: false };
     if existing {
         client

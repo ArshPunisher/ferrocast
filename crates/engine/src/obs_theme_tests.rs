@@ -130,6 +130,14 @@ async fn one_click_puts_every_screen_in_obs_and_undo_takes_only_that_away() {
     assert!(in_game.last().unwrap().0.starts_with("Ferrocast: In game"), "the overlay is on top: {in_game:?}");
     assert_eq!(items(&st, "Forge · Just chatting")[0].0, "Webcam");
     {
+        // A new source's sounds reach the stream through OBS; monitoring stays the streamer's
+        // choice (switching it on could double every sound on stream).
+        let s = st.lock().unwrap();
+        let src = s.inputs.iter().find(|i| i.name.starts_with("Ferrocast: In game")).unwrap();
+        assert_eq!(src.settings["reroute_audio"], true);
+        assert!(s.monitor.is_empty(), "{:?}", s.monitor);
+    }
+    {
         // A 1080p theme fills the 1440p canvas.
         let s = st.lock().unwrap();
         let t = s.transforms.iter().find(|t| t.0 == "Forge · In game").expect("the overlay was fitted");
