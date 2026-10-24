@@ -23,6 +23,7 @@ mod discord;
 mod dispatcher;
 mod error;
 mod ferro_account;
+pub mod ffmpeg_get;
 mod giveaways;
 pub mod golive;
 mod history;

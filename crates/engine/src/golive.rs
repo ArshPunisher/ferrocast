@@ -198,8 +198,8 @@ pub struct CutView {
     pub config: CutConfig,
     /// `None` while it isn't needed (another source, or no vertical destination ticked).
     pub state: Option<CutState>,
-    /// ffmpeg was found on this computer (cutting needs it).
-    pub ffmpeg: bool,
+    /// Whether ffmpeg is here or being fetched (cutting needs it).
+    pub ffmpeg: crate::ffmpeg_get::FfmpegState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -303,6 +303,10 @@ pub(crate) struct GoLive {
     paused: Mutex<HashMap<String, Health>>,
     /// The cutter for the vertical picture, while it runs (A2.4).
     cut: Mutex<Option<CutRun>>,
+    /// The engine's data folder (where fetched ffmpeg lives).
+    data_dir: Mutex<Option<std::path::PathBuf>>,
+    /// Fetching ffmpeg: progress or why it failed (`None`: not fetching).
+    ffmpeg_fetch: Mutex<Option<crate::ffmpeg_get::FfmpegState>>,
 }
 
 #[derive(Debug)]
@@ -328,6 +332,8 @@ impl Default for GoLive {
             protector: Mutex::new(Default::default()),
             paused: Mutex::new(HashMap::new()),
             cut: Mutex::new(None),
+            data_dir: Mutex::new(None),
+            ffmpeg_fetch: Mutex::new(None),
         }
     }
 }
@@ -392,6 +398,10 @@ fn vertical_key(main: &str) -> String {
     format!("{main}v")
 }
 
+pub(crate) fn refused_pub(code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> EngineError {
+    refused(code, message, hint)
+}
+
 fn refused(code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> EngineError {
     EngineError::Refused { status: 422, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
@@ -411,6 +421,9 @@ impl Engine {
                 tracing::error!(error = %e, "the Go live setting couldn't be read")
             }
             Err(e) => tracing::error!(error = %e, "the Go live setting couldn't be read"),
+        }
+        if let Ok(dir) = self.db(|s| Ok(s.dir().to_path_buf())).await {
+            *lock(&self.golive().data_dir) = Some(dir);
         }
         let key = match self.ingest_key() {
             Ok(k) => k,
@@ -442,6 +455,35 @@ impl Engine {
             ingest.run(never).await;
         });
         tokio::spawn(run(self.clone()));
+    }
+
+    pub(crate) fn golive_data_dir(&self) -> Option<std::path::PathBuf> {
+        lock(&self.golive().data_dir).clone()
+    }
+
+    pub(crate) fn golive_ffmpeg_fetch(&self) -> Option<crate::ffmpeg_get::FfmpegState> {
+        lock(&self.golive().ffmpeg_fetch).clone()
+    }
+
+    /// Marks ffmpeg as being fetched unless it already is (one check under one lock, so two
+    /// requests at once start one download). True when this caller should fetch it.
+    pub(crate) fn claim_ffmpeg_fetch(&self) -> bool {
+        use crate::ffmpeg_get::FfmpegState;
+        let mut f = lock(&self.golive().ffmpeg_fetch);
+        if matches!(*f, Some(FfmpegState::Downloading { .. })) {
+            return false;
+        }
+        *f = Some(FfmpegState::Downloading { percent: 0 });
+        true
+    }
+
+    pub(crate) fn set_golive_ffmpeg_fetch(&self, s: Option<crate::ffmpeg_get::FfmpegState>) {
+        *lock(&self.golive().ffmpeg_fetch) = s;
+        self.send_golive();
+    }
+
+    pub(crate) fn send_golive_pub(&self) {
+        self.send_golive();
     }
 
     /// This install's key for the local ingest, made once and kept in the secret store.
@@ -547,7 +589,7 @@ impl Engine {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
                 state: lock(&g.cut).as_ref().map(|c| c.state.borrow().clone()),
-                ffmpeg: find_ffmpeg().is_some(),
+                ffmpeg: self.ffmpeg_state(),
             },
         }
     }
@@ -733,7 +775,7 @@ impl Engine {
             "golive",
             &serde_json::json!({ "live": v.live, "stats": v.stats, "vertical_live": v.vertical_live,
                                   "vertical_stats": v.vertical_stats, "destinations": v.destinations,
-                                  "cut_state": v.cut.state }),
+                                  "cut_state": v.cut.state, "ffmpeg": v.cut.ffmpeg }),
         ));
     }
 
@@ -1095,7 +1137,7 @@ impl Engine {
         if !wanted || lock(&g.cut).is_some() {
             return;
         }
-        let Some(ffmpeg) = find_ffmpeg() else { return };
+        let Some(ffmpeg) = self.ffmpeg_path() else { return };
         let Ok((server, key)) = self.golive_vertical_ingest().await else { return };
         let (stop, stop_rx) = watch::channel(false);
         let (state_tx, state) = watch::channel(CutState::Waiting);
@@ -1121,12 +1163,9 @@ impl Engine {
 
     /// Picks where the vertical picture comes from.
     pub async fn set_vertical_source(&self, source: VerticalSource) -> Result<GoLiveConfig, EngineError> {
-        if source == VerticalSource::Cut && find_ffmpeg().is_none() {
-            return Err(refused(
-                "ffmpeg_missing",
-                "Cutting the vertical picture needs ffmpeg, and it isn't on this computer.",
-                "Install ffmpeg (on a Mac: brew install ffmpeg), then try again, or use OBS's vertical canvas.",
-            ));
+        // Cutting needs ffmpeg: fetched now if it isn't here (the cut starts once it is).
+        if source == VerticalSource::Cut && self.ffmpeg_path().is_none() {
+            self.get_ffmpeg().await?;
         }
         let cfg = {
             let _one_at_a_time = self.config_lock().await;

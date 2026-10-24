@@ -30,6 +30,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
         .route("/golive/picture", get(picture))
+        .route("/golive/ffmpeg", post(get_ffmpeg))
         .route("/golive/vertical/obs/restore", post(restore_vertical))
         .route("/golive/resume/{id}", post(resume))
 }
@@ -157,4 +158,9 @@ async fn vertical_cut(
 /// What's on air in OBS, for marking the camera and game (A2.4).
 async fn picture(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.golive_picture().await?))
+}
+
+/// Fetches ffmpeg for cutting the vertical picture (once; the cut starts when it's ready).
+async fn get_ffmpeg(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.get_ffmpeg().await?)))
 }
