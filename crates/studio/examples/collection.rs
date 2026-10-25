@@ -75,7 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("audio: {:?}", c.audio("Gameplay")?);
     println!("filters on Tone: {:?}", c.filters("Tone")?);
 
-    let rec = studio.record(&out.join("collection.mp4"), "obs_x264")?;
+    let rec =
+        studio.record(&out.join("collection.mp4"), &ferrocast_studio::EncodeSettings::with_encoder("obs_x264"))?;
     // The meter needs a moment of sound.
     let names = vec!["Tone".to_string()];
     c.levels(&names);
@@ -113,6 +114,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(back.transition(), TransitionInfo { kind: "fade_transition".into(), ms: 500 });
     back.remove_scene("Gameplay 2")?;
     assert!(back.remove_scene("Nope").is_err());
+    // Engine stats, the listening device, a new canvas, and a paused MKV recording.
+    let st = studio.stats();
+    println!("stats: {st:?}");
+    assert!(st.fps > 1.0 && st.frames > 0, "the engine renders");
+    println!("outputs: {:?}", studio.kinds().outputs.iter().map(|k| k.id.as_str()).collect::<Vec<_>>());
+    let devices = studio.monitoring_devices();
+    println!("monitoring devices: {} (now {:?})", devices.len(), studio.monitoring_device());
+    studio.set_canvas(Canvas { width: 1280, height: 720, fps: 60 }, &paths.renderer)?;
+    assert_eq!(studio.canvas().fps, 60);
+    let mut enc = ferrocast_studio::EncodeSettings::with_encoder("obs_x264");
+    enc.quality = Some(18);
+    enc.scale = Some((640, 360));
+    let rec = studio.record(&out.join("paused.mov"), &enc)?;
+    std::thread::sleep(Duration::from_millis(1000));
+    rec.pause(true)?;
+    assert!(rec.stats().paused);
+    assert!(
+        studio.set_canvas(Canvas { width: 1920, height: 1080, fps: 30 }, &paths.renderer).is_err(),
+        "no canvas change while recording"
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    rec.pause(false)?;
+    std::thread::sleep(Duration::from_millis(1000));
+    println!("record: {:?}", rec.stats());
+    rec.stop();
     drop(back);
     drop(studio);
     println!("saved, loaded back the same, closed cleanly");

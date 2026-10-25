@@ -57,6 +57,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/filters/{filter}/options", get(engine_filter_options))
         .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
         .route("/studio/engine/levels", post(engine_levels))
+        .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
+        .route("/studio/engine/stats", get(engine_stats))
+        .route("/studio/engine/record", post(engine_record))
+        .route("/studio/engine/record/pause", post(engine_record_pause))
+        .route("/studio/engine/monitoring", get(engine_monitoring))
         // chatbot
         .route("/counters", get(counters).post(create_counter))
         .route("/counters/{name}", put(update_counter).delete(delete_counter))
@@ -554,6 +559,41 @@ async fn engine_set_channel(
 
 async fn engine_clear_channel(State(app): State<AppState>, Path(channel): Path<u32>) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetChannel { channel, device: None }).await
+}
+
+async fn engine_settings(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_settings().await?)))
+}
+
+/// `PUT /studio/engine/settings` (the whole object; missing fields take their defaults) →
+/// `{ settings, restart }`.
+async fn engine_set_settings(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::studio_host::StudioSettings>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_set_settings(b).await?))
+}
+
+async fn engine_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_stats().await?))
+}
+
+#[derive(Deserialize)]
+struct OnBody {
+    on: bool,
+}
+
+async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+async fn engine_record_pause(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<StatusCode> {
+    app.engine.studio_record_pause(b.on).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_monitoring(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_monitoring().await?))
 }
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.

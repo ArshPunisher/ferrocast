@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     studio.set_program(&scene);
     // Chromium takes a moment to start and draw.
     std::thread::sleep(Duration::from_secs(3));
-    let rec = studio.record(&out.join("browser.mp4"), "obs_x264")?;
+    let rec = studio.record(&out.join("browser.mp4"), &ferrocast_studio::EncodeSettings::with_encoder("obs_x264"))?;
     std::thread::sleep(Duration::from_secs(4));
     rec.stop();
     drop(scene);

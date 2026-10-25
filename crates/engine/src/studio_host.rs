@@ -31,6 +31,9 @@ pub struct PreviewRect {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// The page's visible height (`window.innerHeight`); 0 or missing if unknown.
+    #[serde(default)]
+    pub vh: f64,
 }
 
 impl PreviewRect {
@@ -38,6 +41,9 @@ impl PreviewRect {
         let ok = |v: f64, lo: f64, hi: f64| v.is_finite() && (lo..=hi).contains(&v);
         if !(ok(self.x, -20_000.0, 20_000.0) && ok(self.y, -20_000.0, 20_000.0)) {
             return Err("rect: the box is off the window.".into());
+        }
+        if !ok(self.vh, 0.0, 16_384.0) {
+            return Err("rect: vh is the page's height, 0 to 16384.".into());
         }
         if !(ok(self.w, 1.0, 16_384.0) && ok(self.h, 1.0, 16_384.0)) {
             return Err("rect: the box must be 1 to 16384 pixels wide and high.".into());
@@ -63,11 +69,178 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Does one thing to the scene collection (checked before it gets here) and answers what
     /// it shows; changes are saved by the host.
     async fn act(&self, act: StudioAct) -> Result<Value, String>;
+    /// The Studio's settings (saved by the host; defaults the first time).
+    async fn settings(&self) -> StudioSettings;
+    /// Saves and applies them (checked before they get here) → what applies only after
+    /// Ferrocast restarts, in words, if anything.
+    async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String>;
+    /// `{ engine: { cpu, fps, frame_ms, lagged, frames, memory_mb }, canvas, stream, record }`.
+    async fn stats(&self) -> Result<Value, String>;
+    /// Starts or stops recording → the recording's stats (null when stopped) and its file.
+    async fn record(&self, on: bool) -> Result<Value, String>;
+    async fn record_pause(&self, on: bool) -> Result<(), String>;
+    /// `{ devices: { name, id }[], current: { name, id } }` for "Hear it".
+    async fn monitoring(&self) -> Result<Value, String>;
     /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String>;
     async fn stream_stop(&self) -> Result<(), String>;
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
+}
+
+/// How the Studio streams, records and runs. Every field has a default, so an older or
+/// partial file still reads.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StudioSettings {
+    /// "hardware" (Apple VideoToolbox, NVENC…) or "software" (x264).
+    pub encoder: String,
+    pub video_kbps: u32,
+    /// Varying bitrate instead of steady (CBR is what platforms ask for).
+    pub vbr: bool,
+    /// Seconds between keyframes; 0 lets the encoder pick.
+    pub keyframe_s: u32,
+    /// "high", "main" or "baseline".
+    pub profile: String,
+    pub bframes: bool,
+    /// Send at this size instead of the canvas's.
+    pub scale: Option<[u32; 2]>,
+    pub audio_kbps: u32,
+    /// The canvas: what's composed.
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Where recordings go (absolute); None is the Movies folder's Ferrocast folder.
+    pub record_folder: Option<String>,
+    /// "mp4" or "mov" (both crash-safe).
+    pub record_format: String,
+    /// "stream" (same as the stream), "high" (near-lossless), "lossless".
+    pub record_quality: String,
+    pub reconnect: bool,
+    pub reconnect_every_s: u32,
+    pub reconnect_tries: u32,
+    /// Viewers see everything this many seconds later (0: off).
+    pub delay_s: u32,
+    /// 44100 or 48000 (applies after a restart).
+    pub sample_rate: u32,
+    pub stereo: bool,
+    /// The device "Hear it" plays on: (name, id); None is the system's.
+    pub monitoring: Option<(String, String)>,
+    /// What each shortcut does: action → keys ("CmdOrCtrl+Shift+L"). Actions: go_live,
+    /// end_stream, record, pause_record, scene:<name>, mute:<sound>, push_to_talk:<sound>.
+    pub hotkeys: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for StudioSettings {
+    fn default() -> Self {
+        StudioSettings {
+            encoder: "hardware".into(),
+            video_kbps: 6000,
+            vbr: false,
+            keyframe_s: 2,
+            profile: "high".into(),
+            bframes: true,
+            scale: None,
+            audio_kbps: 160,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            record_folder: None,
+            record_format: "mp4".into(),
+            record_quality: "stream".into(),
+            reconnect: true,
+            reconnect_every_s: 2,
+            reconnect_tries: 25,
+            delay_s: 0,
+            sample_rate: 48000,
+            stereo: true,
+            monitoring: None,
+            hotkeys: Default::default(),
+        }
+    }
+}
+
+impl StudioSettings {
+    /// Refuses a value outside what OBS takes, naming the field and what's allowed.
+    pub fn check(&self) -> Result<(), EngineError> {
+        let bad = |m: &str| Err(EngineError::Invalid(m.into()));
+        if !["hardware", "software"].contains(&self.encoder.as_str()) {
+            return bad("encoder: hardware or software.");
+        }
+        if !(500..=60_000).contains(&self.video_kbps) {
+            return bad("video_kbps: 500 to 60000.");
+        }
+        if self.keyframe_s > 10 {
+            return bad("keyframe_s: 0 (auto) to 10.");
+        }
+        if !["high", "main", "baseline"].contains(&self.profile.as_str()) {
+            return bad("profile: high, main or baseline.");
+        }
+        if let Some([w, h]) = self.scale
+            && !((128..=7680).contains(&w) && (72..=4320).contains(&h) && w.is_multiple_of(2) && h.is_multiple_of(2))
+        {
+            return bad("scale: even sizes from 128x72 to 7680x4320.");
+        }
+        if ![64, 96, 128, 160, 192, 256, 320].contains(&self.audio_kbps) {
+            return bad("audio_kbps: 64, 96, 128, 160, 192, 256 or 320.");
+        }
+        if !((320..=7680).contains(&self.width) && (240..=4320).contains(&self.height))
+            || !self.width.is_multiple_of(2)
+            || !self.height.is_multiple_of(2)
+        {
+            return bad("width, height: even sizes from 320x240 to 7680x4320.");
+        }
+        if ![24, 25, 30, 48, 50, 60, 120].contains(&self.fps) {
+            return bad("fps: 24, 25, 30, 48, 50, 60 or 120.");
+        }
+        if let Some(f) = &self.record_folder
+            && (f.len() > 1024 || !std::path::Path::new(f).is_absolute())
+        {
+            return bad("record_folder: a full folder path.");
+        }
+        if !["mp4", "mov"].contains(&self.record_format.as_str()) {
+            return bad("record_format: mp4 or mov.");
+        }
+        if !["stream", "high", "lossless"].contains(&self.record_quality.as_str()) {
+            return bad("record_quality: stream, high or lossless.");
+        }
+        if !(1..=60).contains(&self.reconnect_every_s) || !(1..=10_000).contains(&self.reconnect_tries) {
+            return bad("reconnect: every 1 to 60 s, 1 to 10000 tries.");
+        }
+        if self.delay_s > 1800 {
+            return bad("delay_s: 0 to 1800.");
+        }
+        if ![44_100, 48_000].contains(&self.sample_rate) {
+            return bad("sample_rate: 44100 or 48000.");
+        }
+        if let Some((n, i)) = &self.monitoring
+            && (n.len() > 256 || i.len() > 512)
+        {
+            return bad("monitoring: a device from the list.");
+        }
+        if self.hotkeys.len() > 200 {
+            return bad("hotkeys: up to 200.");
+        }
+        for (action, keys) in &self.hotkeys {
+            let known = ["go_live", "end_stream", "record", "pause_record"].contains(&action.as_str())
+                || ["scene:", "mute:", "push_to_talk:"]
+                    .iter()
+                    .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()));
+            if !known {
+                return bad(
+                    "hotkeys: go_live, end_stream, record, pause_record, scene:, mute: or push_to_talk: a name.",
+                );
+            }
+            if keys.is_empty()
+                || keys.len() > 64
+                // Named keys (Space, Comma, F9…) joined with +: nothing else.
+                || !keys.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+            {
+                return bad("hotkeys: keys like CmdOrCtrl+Shift+L.");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A change to one source in a scene (`POST …/items/{id}/edit` `{ "do": "lock" }`).
@@ -420,6 +593,34 @@ impl Engine {
         self.studio_host()?.defaults(kind.to_string()).await.map_err(failed)
     }
 
+    pub async fn studio_settings(&self) -> Result<StudioSettings, EngineError> {
+        Ok(self.studio_host()?.settings().await)
+    }
+
+    /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
+    pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
+        s.check()?;
+        let host = self.studio_host()?;
+        let restart = host.set_settings(s).await.map_err(failed)?;
+        Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
+    }
+
+    pub async fn studio_stats(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.stats().await.map_err(failed)
+    }
+
+    pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
+        self.studio_host()?.record(on).await.map_err(failed)
+    }
+
+    pub async fn studio_record_pause(&self, on: bool) -> Result<(), EngineError> {
+        self.studio_host()?.record_pause(on).await.map_err(failed)
+    }
+
+    pub async fn studio_monitoring(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.monitoring().await.map_err(failed)
+    }
+
     /// Does one thing to the scene collection, after checking it.
     pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
         act.check()?;
@@ -529,6 +730,24 @@ mod tests {
         async fn defaults(&self, _kind: String) -> Result<Value, String> {
             Ok(serde_json::json!({}))
         }
+        async fn settings(&self) -> StudioSettings {
+            StudioSettings::default()
+        }
+        async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record(&self, on: bool) -> Result<Value, String> {
+            Ok(serde_json::json!({ "on": on }))
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "devices": [] }))
+        }
         async fn act(&self, act: StudioAct) -> Result<Value, String> {
             self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
             Ok(serde_json::to_value(act).unwrap_or_default())
@@ -573,7 +792,7 @@ mod tests {
         for bad in ["", "a b", "../x", &"x".repeat(200)] {
             assert!(matches!(e.studio_options(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0 };
+        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0 };
         e.studio_preview(Some(r)).await.unwrap();
         e.studio_preview(None).await.unwrap();
         for bad in [
@@ -581,6 +800,7 @@ mod tests {
             PreviewRect { h: f64::NAN, ..r },
             PreviewRect { x: f64::INFINITY, ..r },
             PreviewRect { w: 99_999.0, ..r },
+            PreviewRect { vh: -1.0, ..r },
         ] {
             assert!(matches!(e.studio_preview(Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
@@ -624,6 +844,42 @@ mod tests {
         .unwrap();
         assert_eq!(fake.acts.lock().unwrap().len(), 3, "only good acts reach the app");
         assert!(StudioAct::Levels { names: vec![] }.check().is_ok());
+        // Settings: the defaults pass, and every field outside what OBS takes is refused.
+        let d = StudioSettings::default();
+        assert!(d.check().is_ok());
+        assert!(e.studio_set_settings(d.clone()).await.unwrap()["restart"].is_null());
+        let mut hk = d.clone();
+        hk.hotkeys.insert("scene:Just chatting".into(), "Alt+2".into());
+        hk.hotkeys.insert("push_to_talk:Mic".into(), "Alt+Space".into());
+        assert!(hk.check().is_ok(), "{:?}", hk.check());
+        for (field, bad) in [
+            ("encoder", StudioSettings { encoder: "gpu".into(), ..d.clone() }),
+            ("video_kbps", StudioSettings { video_kbps: 90_000, ..d.clone() }),
+            ("keyframe_s", StudioSettings { keyframe_s: 30, ..d.clone() }),
+            ("profile", StudioSettings { profile: "ultra".into(), ..d.clone() }),
+            ("scale", StudioSettings { scale: Some([1281, 720]), ..d.clone() }),
+            ("audio_kbps", StudioSettings { audio_kbps: 100, ..d.clone() }),
+            ("width", StudioSettings { width: 100, ..d.clone() }),
+            ("fps", StudioSettings { fps: 59, ..d.clone() }),
+            ("record_folder", StudioSettings { record_folder: Some("relative/path".into()), ..d.clone() }),
+            ("record_format", StudioSettings { record_format: "mkv".into(), ..d.clone() }),
+            ("record_quality", StudioSettings { record_quality: "ultra".into(), ..d.clone() }),
+            ("reconnect", StudioSettings { reconnect_every_s: 0, ..d.clone() }),
+            ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
+            ("sample_rate", StudioSettings { sample_rate: 96_000, ..d.clone() }),
+        ] {
+            let err = e.studio_set_settings(bad).await.unwrap_err();
+            assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{field}: {err:?}");
+        }
+        let mut bad = d.clone();
+        bad.hotkeys.insert("explode".into(), "F9".into());
+        assert!(bad.check().is_err());
+        let mut bad = d.clone();
+        bad.hotkeys.insert("record".into(), "F9; rm".into());
+        assert!(bad.check().is_err());
+        // A file from an older version (fields missing) still reads, with defaults.
+        let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
+        assert_eq!((old.video_kbps, old.fps), (4500, 30));
         assert!(
             !StudioAct::Audio { scene: "x".into() }.changes() && StudioAct::RemoveScene { scene: "x".into() }.changes()
         );

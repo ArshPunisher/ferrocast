@@ -568,6 +568,12 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/channels/3", json!({ "kind": "coreaudio_input_capture", "name": "Mic" })).await,
         r.delete("/studio/engine/channels/3").await,
         r.post("/studio/engine/levels", json!({ "names": ["Mic"] })).await,
+        r.get("/studio/engine/settings").await,
+        r.put("/studio/engine/settings", json!({ "video_kbps": 4500 })).await,
+        r.get("/studio/engine/stats").await,
+        r.post("/studio/engine/record", json!({ "on": true })).await,
+        r.post("/studio/engine/record/pause", json!({ "on": true })).await,
+        r.get("/studio/engine/monitoring").await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -588,6 +594,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.put("/studio/engine/transition", json!({ "kind": "fade_transition", "ms": 999999 })).await, "too long"),
         (r.put("/studio/engine/channels/9", json!({ "kind": "x", "name": "Mic" })).await, "channel 9"),
         (r.post("/studio/engine/sources/Mic/filters/Gate/edit", json!({ "do": "lock" })).await, "filters don't lock"),
+        (r.put("/studio/engine/settings", json!({ "video_kbps": 1 })).await, "bitrate too low"),
+        (r.put("/studio/engine/settings", json!({ "fps": "sixty" })).await, "fps not a number"),
+        (r.post("/studio/engine/record", json!({})).await, "record without on"),
     ] {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
     }

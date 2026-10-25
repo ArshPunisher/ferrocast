@@ -520,7 +520,7 @@ impl Collection {
 
     fn fit(&self, item: *mut ffi::ObsSceneItem) {
         let a = self.api();
-        let c = self.studio.inner.canvas;
+        let c = self.studio.canvas();
         a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
         a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_SCALE_INNER);

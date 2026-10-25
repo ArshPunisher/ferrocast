@@ -143,6 +143,10 @@ pub struct OptionInfo {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub step: Option<f64>,
+    /// A number OBS shows as a slider.
+    pub slider: bool,
+    /// A number's unit as OBS writes it after the value (" dB", " ms", "%"), or "".
+    pub suffix: String,
     /// A list's choices, as shown.
     pub choices: Vec<String>,
     /// The value saved for each choice (same order): a number, text or true/false.
@@ -170,6 +174,19 @@ fn kind_name(t: c_int) -> &'static str {
     }
 }
 
+/// How sound is set up: 48 kHz stereo unless asked otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSetup {
+    pub sample_rate: u32,
+    pub stereo: bool,
+}
+
+impl Default for AudioSetup {
+    fn default() -> Self {
+        AudioSetup { sample_rate: 48_000, stereo: true }
+    }
+}
+
 /// A box inside a window, in points from its top-left corner (the page's own coordinates).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
@@ -177,6 +194,11 @@ pub struct Rect {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// The page's visible height (`window.innerHeight`), or 0 if unknown. The page can draw
+    /// under a see-through title bar, so its top sits that far inside the webview; counting
+    /// up from the webview's bottom by this height finds it (2.1: the preview sat a title bar
+    /// too high).
+    pub vh: f64,
 }
 
 /// OBS's engine, running. Cheap to clone (one engine, shared); scenes, recordings and
@@ -190,17 +212,25 @@ pub struct Studio {
 #[derive(Debug)]
 struct Inner {
     api: Api,
-    canvas: Canvas,
+    canvas: std::cell::Cell<Canvas>,
+    /// libobs's CPU meter for this process (`os_cpu_usage_info`).
+    cpu: *mut ffi::CpuUsage,
 }
 
 impl Studio {
     /// Loads libobs, starts it with `canvas`, and loads every plugin but the interface-only
     /// ones. `config` holds the plugins' own settings and caches.
     pub fn start(paths: &Paths, canvas: Canvas, config: &Path) -> Result<Studio, StudioError> {
+        Self::start_with(paths, canvas, AudioSetup::default(), config)
+    }
+
+    /// As [`Studio::start`], with the sound's sample rate and channels (fixed until the
+    /// process ends: libobs sets sound up once).
+    pub fn start_with(paths: &Paths, canvas: Canvas, audio: AudioSetup, config: &Path) -> Result<Studio, StudioError> {
         if RUNNING.swap(true, Ordering::SeqCst) {
             return Err(StudioError::AlreadyRunning);
         }
-        match Self::start_inner(paths, canvas, config) {
+        match Self::start_inner(paths, canvas, audio, config) {
             Ok(s) => Ok(s),
             Err(e) => {
                 RUNNING.store(false, Ordering::SeqCst);
@@ -209,7 +239,7 @@ impl Studio {
         }
     }
 
-    fn start_inner(paths: &Paths, canvas: Canvas, config: &Path) -> Result<Studio, StudioError> {
+    fn start_inner(paths: &Paths, canvas: Canvas, audio: AudioSetup, config: &Path) -> Result<Studio, StudioError> {
         let api = Api::load(&paths.libobs, paths.deps.as_deref()).map_err(StudioError::Load)?;
         api.base_set_log_handler(Some(ffi::log_to_tracing), ptr::null_mut());
         let _ = std::fs::create_dir_all(config);
@@ -221,7 +251,10 @@ impl Studio {
         let data = cstr(&paths.data);
         api.obs_add_data_path(data.as_ptr());
 
-        let audio = ffi::AudioInfo { samples_per_sec: 48_000, speakers: ffi::SPEAKERS_STEREO };
+        let audio = ffi::AudioInfo {
+            samples_per_sec: audio.sample_rate,
+            speakers: if audio.stereo { ffi::SPEAKERS_STEREO } else { ffi::SPEAKERS_MONO },
+        };
         if !api.obs_reset_audio(&audio) {
             api.obs_shutdown();
             return Err(StudioError::Audio);
@@ -255,11 +288,89 @@ impl Studio {
         }
         api.obs_load_all_modules();
         api.obs_post_load_modules();
-        Ok(Studio { inner: std::rc::Rc::new(Inner { api, canvas }) })
+        let cpu = api.os_cpu_usage_info_start();
+        Ok(Studio { inner: std::rc::Rc::new(Inner { api, canvas: std::cell::Cell::new(canvas), cpu }) })
     }
 
     pub fn canvas(&self) -> Canvas {
-        self.inner.canvas
+        self.inner.canvas.get()
+    }
+
+    /// Changes the canvas (size, frame rate). Refused while streaming or recording, as OBS
+    /// does; a preview made before shows the old size until it's made again.
+    pub fn set_canvas(&self, canvas: Canvas, renderer: &Path) -> Result<(), StudioError> {
+        if canvas == self.canvas() {
+            return Ok(());
+        }
+        if !(320..=7680).contains(&canvas.width)
+            || !(240..=4320).contains(&canvas.height)
+            || !(1..=240).contains(&canvas.fps)
+        {
+            return Err(StudioError::Failed("canvas: 320x240 to 7680x4320, 1 to 240 fps.".into()));
+        }
+        let module = cstr(&renderer.display().to_string());
+        let mut video = ffi::VideoInfo {
+            graphics_module: module.as_ptr(),
+            fps_num: canvas.fps,
+            fps_den: 1,
+            base_width: canvas.width,
+            base_height: canvas.height,
+            output_width: canvas.width,
+            output_height: canvas.height,
+            output_format: ffi::VIDEO_FORMAT_NV12,
+            adapter: 0,
+            gpu_conversion: true,
+            colorspace: ffi::VIDEO_CS_709,
+            range: ffi::VIDEO_RANGE_PARTIAL,
+            scale_type: ffi::OBS_SCALE_BICUBIC,
+        };
+        match self.inner.api.obs_reset_video(&mut video) {
+            ffi::OBS_VIDEO_SUCCESS => {
+                self.inner.canvas.set(canvas);
+                Ok(())
+            }
+            ffi::OBS_VIDEO_CURRENTLY_ACTIVE => Err(StudioError::Failed(
+                "The picture size can't change while streaming or recording. Stop first.".into(),
+            )),
+            code => Err(StudioError::Video(code)),
+        }
+    }
+
+    /// How the engine is doing now.
+    pub fn stats(&self) -> EngineStats {
+        let a = &self.inner.api;
+        EngineStats {
+            cpu: if self.inner.cpu.is_null() { 0.0 } else { a.os_cpu_usage_info_query(self.inner.cpu) },
+            fps: a.obs_get_active_fps(),
+            frame_ms: a.obs_get_average_frame_time_ns() as f64 / 1_000_000.0,
+            lagged: a.obs_get_lagged_frames(),
+            frames: a.obs_get_total_frames(),
+            memory_mb: a.os_get_proc_resident_size() / (1024 * 1024),
+        }
+    }
+
+    /// Where "Hear it" plays: every output device (name, id); "default" is the system's.
+    pub fn monitoring_devices(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        self.inner
+            .api
+            .obs_enum_audio_monitoring_devices(ffi::collect_devices, &mut out as *mut _ as *mut std::ffi::c_void);
+        out
+    }
+
+    pub fn monitoring_device(&self) -> (String, String) {
+        let (mut name, mut id) = (ptr::null(), ptr::null());
+        self.inner.api.obs_get_audio_monitoring_device(&mut name, &mut id);
+        (text(name), text(id))
+    }
+
+    pub fn set_monitoring_device(&self, name: &str, id: &str) -> Result<(), StudioError> {
+        let (n, i) = (cstr(name), cstr(id));
+        if self.inner.api.obs_set_audio_monitoring_device(n.as_ptr(), i.as_ptr()) {
+            Ok(())
+        } else {
+            Err(StudioError::Failed(format!("the device \"{name}\" can't play sound")))
+        }
     }
 
     /// libobs's version ("32.2.2").
@@ -358,6 +469,12 @@ impl Studio {
         while !p.is_null() {
             let t = a.obs_property_get_type(p);
             let kind = kind_name(t);
+            // A number OBS shows as a slider, and its unit (" dB", " ms", "%").
+            let (slider, suffix) = match kind {
+                "int" => (a.obs_property_int_type(p) == 1, text(a.obs_property_int_suffix(p))),
+                "float" => (a.obs_property_float_type(p) == 1, text(a.obs_property_float_suffix(p))),
+                _ => (false, String::new()),
+            };
             let (min, max, step) = match kind {
                 "int" => (
                     Some(f64::from(a.obs_property_int_min(p))),
@@ -403,6 +520,8 @@ impl Studio {
                 min,
                 max,
                 step,
+                slider,
+                suffix: suffix.trim().to_string(),
                 choices,
                 values,
                 group,
@@ -439,16 +558,28 @@ impl Studio {
         (self.inner.api.obs_get_total_frames(), self.inner.api.obs_get_lagged_frames())
     }
 
-    /// Starts recording what's on air to `path` (MP4 with OBS's own writer: no helper program
-    /// needed), with `video_encoder` (`obs_x264`, `com.apple.videotoolbox.videoencoder.ave.avc`…)
-    /// and AAC sound.
-    pub fn record(&self, path: &Path, video_encoder: &str) -> Result<Recording, StudioError> {
+    /// Starts recording what's on air to `path` (`.mp4` or `.mov`, OBS's own crash-safe hybrid
+    /// writers); video as `enc` says, AAC sound.
+    pub fn record(&self, path: &Path, enc: &EncodeSettings) -> Result<Recording, StudioError> {
         let a = &self.inner.api;
-        let (venc, aenc) = self.encoders(video_encoder, None, 160)?;
+        let (venc, aenc) = self.encoders(enc)?;
         let settings = a.obs_data_create();
         let (k, v) = (cstr("path"), cstr(&path.display().to_string()));
         a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
-        let (oid, oname) = (cstr("mp4_output"), cstr("ferrocast-record"));
+        // OBS's own hybrid writers: the file stays playable if the app or the Mac stops. (MKV
+        // needs OBS's separate mux program, which only runs next to OBS's own executable.)
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let id = match ext.as_str() {
+            "mp4" => "mp4_output",
+            "mov" => "mov_output",
+            _ => {
+                a.obs_data_release(settings);
+                a.obs_encoder_release(venc);
+                a.obs_encoder_release(aenc);
+                return Err(StudioError::Failed("recordings are MP4 or MOV".into()));
+            }
+        };
+        let (oid, oname) = (cstr(id), cstr("ferrocast-record"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
         a.obs_data_release(settings);
         let rec = Recording { studio: self.clone(), out, venc, aenc };
@@ -466,11 +597,11 @@ impl Studio {
         Ok(rec)
     }
 
-    /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output, with
-    /// its reconnects: every 2 s, up to 25 times). Stops when the handle is dropped.
+    /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output), with
+    /// its reconnects and delay as `s` says. Stops when the handle is dropped.
     pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<Streaming, StudioError> {
         let a = &self.inner.api;
-        let (venc, aenc) = self.encoders(&s.video_encoder, Some((s.video_kbps, s.keyframe_s)), s.audio_kbps)?;
+        let (venc, aenc) = self.encoders(&s.encode)?;
         let settings = a.obs_data_create();
         for (k, v) in [("server", server), ("key", key)] {
             let (k, v) = (cstr(k), cstr(v));
@@ -488,7 +619,13 @@ impl Studio {
         a.obs_output_set_video_encoder(out, venc);
         a.obs_output_set_audio_encoder(out, aenc, 0);
         a.obs_output_set_service(out, service);
-        a.obs_output_set_reconnect_settings(out, 25, 2);
+        match s.reconnect {
+            Some((retries, every_s)) => a.obs_output_set_reconnect_settings(out, retries as c_int, every_s as c_int),
+            None => a.obs_output_set_reconnect_settings(out, 0, 0),
+        }
+        if s.delay_s > 0 {
+            a.obs_output_set_delay(out, s.delay_s, ffi::OBS_OUTPUT_DELAY_PRESERVE);
+        }
         if !a.obs_output_start(out) {
             let why = text(a.obs_output_get_last_error(out));
             return Err(StudioError::Failed(if why.is_empty() {
@@ -500,28 +637,57 @@ impl Studio {
         Ok(stream)
     }
 
-    /// A video encoder (CBR at `video` = (kbps, keyframe seconds), or the encoder's own
-    /// defaults) and an AAC audio encoder, tied to the canvas.
-    fn encoders(
-        &self,
-        video_encoder: &str,
-        video: Option<(u32, u32)>,
-        audio_kbps: u32,
-    ) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
+    /// The video encoder `e` describes and an AAC audio encoder, tied to the canvas.
+    fn encoders(&self, e: &EncodeSettings) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
         let a = &self.inner.api;
         let vs = a.obs_data_create();
-        if let Some((kbps, keyint)) = video {
-            let (b, r, k, cbr) = (cstr("bitrate"), cstr("rate_control"), cstr("keyint_sec"), cstr("CBR"));
-            a.obs_data_set_int(vs, b.as_ptr(), i64::from(kbps));
-            a.obs_data_set_string(vs, r.as_ptr(), cbr.as_ptr());
-            a.obs_data_set_int(vs, k.as_ptr(), i64::from(keyint));
+        let set_int = |k: &str, v: i64| {
+            let k = cstr(k);
+            a.obs_data_set_int(vs, k.as_ptr(), v);
+        };
+        let set_str = |k: &str, v: &str| {
+            let (k, v) = (cstr(k), cstr(v));
+            a.obs_data_set_string(vs, k.as_ptr(), v.as_ptr());
+        };
+        let x264 = e.video_encoder == "obs_x264";
+        match e.quality {
+            // A bitrate, steady (CBR) or varying around it (VBR).
+            None => {
+                set_int("bitrate", i64::from(e.video_kbps));
+                set_str("rate_control", if e.vbr { "VBR" } else { "CBR" });
+            }
+            // Constant quality for recordings: 0 lossless … 51 worst (x264 CRF); VideoToolbox
+            // takes 0-100, higher better.
+            Some(q) => {
+                set_str("rate_control", "CRF");
+                if x264 {
+                    set_int("crf", i64::from(q.min(51)));
+                } else {
+                    set_int("quality", i64::from(100 - (q.min(51) * 100 / 51)));
+                }
+            }
         }
-        let (vid, vname) = (cstr(video_encoder), cstr("ferrocast-video"));
+        set_int("keyint_sec", i64::from(e.keyframe_s));
+        set_str("profile", &e.profile);
+        if x264 {
+            set_str("preset", if e.quality == Some(0) { "ultrafast" } else { "veryfast" });
+            if !e.bframes {
+                set_str("x264opts", "bframes=0");
+            }
+        } else {
+            let k = cstr("bframes");
+            a.obs_data_set_bool(vs, k.as_ptr(), e.bframes);
+        }
+        let (vid, vname) = (cstr(&e.video_encoder), cstr("ferrocast-video"));
         let venc = a.obs_video_encoder_create(vid.as_ptr(), vname.as_ptr(), vs, ptr::null_mut());
         a.obs_data_release(vs);
         if venc.is_null() {
-            return Err(StudioError::Failed(format!("the encoder \"{video_encoder}\" isn't available")));
+            return Err(StudioError::Failed(format!("the encoder \"{}\" isn't available", e.video_encoder)));
         }
+        if let Some((w, h)) = e.scale {
+            a.obs_encoder_set_scaled_size(venc, w, h);
+        }
+        let audio_kbps = e.audio_kbps;
         let as_ = a.obs_data_create();
         let b = cstr("bitrate");
         a.obs_data_set_int(as_, b.as_ptr(), i64::from(audio_kbps));
@@ -555,7 +721,7 @@ impl Studio {
             let RawWindowHandle::AppKit(h) = window else {
                 return Err(StudioError::Failed("that isn't a macOS window".into()));
             };
-            let view = ffi::mac::child_view(h.ns_view.as_ptr(), rect.x, rect.y, rect.w, rect.h)
+            let view = ffi::mac::child_view(h.ns_view.as_ptr(), rect.x, rect.y, rect.w, rect.h, rect.vh)
                 .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?;
             let (cx, cy) = px(rect, scale);
             let init = ffi::GsInitData {
@@ -567,15 +733,14 @@ impl Studio {
                 zsformat: ffi::GS_ZS_NONE,
                 adapter: 0,
             };
-            let display = self.inner.api.obs_display_create(&init, 0x0000_00ff);
+            // The clear colour (0xAABBGGRR) is the Studio's stage, #0a0b0d, never red.
+            let display = self.inner.api.obs_display_create(&init, 0xFF0D_0B0A);
             if display.is_null() {
                 view.remove();
                 return Err(StudioError::Failed("the preview couldn't be made".into()));
             }
-            let state = Box::new(ffi::DrawState {
-                api: &self.inner.api,
-                base: (self.inner.canvas.width, self.inner.canvas.height),
-            });
+            let state =
+                Box::new(ffi::DrawState { api: &self.inner.api, base: (self.canvas().width, self.canvas().height) });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
             Ok(Preview { studio: self.clone(), display, state, view, scale })
@@ -610,7 +775,7 @@ impl Preview {
     pub fn set_rect(&mut self, rect: Rect, scale: f64) {
         self.scale = scale;
         #[cfg(target_os = "macos")]
-        self.view.set_frame(rect.x, rect.y, rect.w, rect.h);
+        self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
         let (cx, cy) = px(rect, scale);
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
@@ -636,6 +801,9 @@ impl Drop for Inner {
         // canvas holds scenes, and one left alive is freed after its plugin unloaded (a text
         // source crashed in FreeType that way, 25 Oct). Then let the destroy thread finish.
         self.api.obs_wait_for_destroy_queue();
+        if !self.cpu.is_null() {
+            self.api.os_cpu_usage_info_destroy(self.cpu);
+        }
         std::thread::sleep(Duration::from_millis(100));
         self.api.obs_shutdown();
         RUNNING.store(false, Ordering::SeqCst);
@@ -791,7 +959,7 @@ impl Scene {
         if item.is_null() {
             return Ok(());
         }
-        let c = self.studio.inner.canvas;
+        let c = self.studio.canvas();
         a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
         a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_SCALE_INNER);
@@ -843,6 +1011,38 @@ impl Recording {
     pub fn stop(self) {
         drop(self);
     }
+
+    pub fn pause(&self, on: bool) -> Result<(), StudioError> {
+        if self.studio.inner.api.obs_output_pause(self.out, on) {
+            Ok(())
+        } else {
+            Err(StudioError::Failed("This recording can't pause.".into()))
+        }
+    }
+
+    pub fn stats(&self) -> RecordStats {
+        let a = &self.studio.inner.api;
+        RecordStats {
+            active: a.obs_output_active(self.out),
+            paused: a.obs_output_paused(self.out),
+            bytes: a.obs_output_get_total_bytes(self.out),
+            frames: u32::try_from(a.obs_output_get_total_frames(self.out)).unwrap_or(0),
+        }
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
+        (!e.is_empty()).then_some(e)
+    }
+}
+
+/// How a recording is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RecordStats {
+    pub active: bool,
+    pub paused: bool,
+    pub bytes: u64,
+    pub frames: u32,
 }
 
 impl Drop for Recording {
@@ -861,15 +1061,65 @@ impl Drop for Recording {
     }
 }
 
-/// What a stream sends.
+/// How video and sound are encoded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamSettings {
+pub struct EncodeSettings {
     /// An encoder id from `kinds().encoders` (`obs_x264`, VideoToolbox's…).
     pub video_encoder: String,
     pub video_kbps: u32,
-    pub audio_kbps: u32,
-    /// Seconds between keyframes (platforms ask for 2).
+    /// Varying bitrate (VBR) instead of steady (CBR).
+    pub vbr: bool,
+    /// Constant quality instead of a bitrate (recordings): 0 is lossless, 18 very high.
+    pub quality: Option<u32>,
+    /// Seconds between keyframes (platforms ask for 2; 0 lets the encoder pick).
     pub keyframe_s: u32,
+    /// "high", "main" or "baseline".
+    pub profile: String,
+    pub bframes: bool,
+    /// Sent at this size instead of the canvas's.
+    pub scale: Option<(u32, u32)>,
+    pub audio_kbps: u32,
+}
+
+impl EncodeSettings {
+    /// This encoder at 6000 kbps CBR, 2 s keyframes, high profile, AAC 160.
+    pub fn with_encoder(id: &str) -> EncodeSettings {
+        EncodeSettings {
+            video_encoder: id.into(),
+            video_kbps: 6000,
+            vbr: false,
+            quality: None,
+            keyframe_s: 2,
+            profile: "high".into(),
+            bframes: true,
+            scale: None,
+            audio_kbps: 160,
+        }
+    }
+}
+
+/// What a stream sends, and what it does when the connection drops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSettings {
+    pub encode: EncodeSettings,
+    /// Tries again (retries, every n seconds) when the connection drops; None gives up.
+    pub reconnect: Option<(u32, u32)>,
+    /// Viewers see it this many seconds later (0: no delay).
+    pub delay_s: u32,
+}
+
+/// The engine's own load.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EngineStats {
+    /// Ferrocast's CPU use, % of one machine.
+    pub cpu: f64,
+    pub fps: f64,
+    /// Average time to render a frame.
+    pub frame_ms: f64,
+    /// Frames rendered late since start, and all frames.
+    pub lagged: u32,
+    pub frames: u32,
+    pub memory_mb: u64,
 }
 
 /// How a stream is going.
@@ -956,7 +1206,7 @@ mod tests {
 
     #[test]
     fn preview_sizes_are_device_pixels() {
-        let r = Rect { x: 10.0, y: 20.0, w: 640.0, h: 360.0 };
+        let r = Rect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0 };
         assert_eq!(px(r, 2.0), (1280, 720));
         assert_eq!(px(r, f64::NAN), (640, 360), "a bad scale is 1");
         assert_eq!(px(Rect { w: 0.0, h: -5.0, ..r }, 1.0), (1, 1), "never zero");

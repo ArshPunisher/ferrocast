@@ -61,7 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (150.0, 290.0),
     )?;
     studio.set_program(&scene);
-    let preview = studio.preview(handle, Rect { x: 20.0, y: 20.0, w: 640.0, h: 360.0 }, window.backingScaleFactor())?;
+    let preview =
+        studio.preview(handle, Rect { x: 20.0, y: 20.0, w: 640.0, h: 360.0, vh: 0.0 }, window.backingScaleFactor())?;
     println!("preview on; window {}", window.windowNumber());
 
     // Screenshot of just this window after 3 s, while the run loop keeps it drawing.

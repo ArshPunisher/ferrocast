@@ -25,6 +25,7 @@ opaque!(
     ObsDisplay,
     ObsDataArray,
     ObsVolmeter,
+    CpuUsage,
     VideoT,
     AudioT
 );
@@ -84,6 +85,7 @@ pub const VIDEO_FORMAT_NV12: c_int = 2;
 pub const VIDEO_CS_709: c_int = 2;
 pub const VIDEO_RANGE_PARTIAL: c_int = 1;
 pub const OBS_SCALE_BICUBIC: c_int = 2;
+pub const SPEAKERS_MONO: c_int = 1;
 pub const SPEAKERS_STEREO: c_int = 2;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const GS_BGRA: c_int = 5;
@@ -112,6 +114,10 @@ pub const OBS_FADER_LOG: c_int = 2;
 pub const OBS_TRANSITION_MODE_AUTO: c_int = 0;
 /// `media-io/audio-io.h`: the meter callback's arrays hold this many channels.
 pub const MAX_AUDIO_CHANNELS: usize = 8;
+/// `obs_output_set_delay`: a reconnect keeps the delay's cut-off point.
+pub const OBS_OUTPUT_DELAY_PRESERVE: u32 = 1;
+/// `obs_reset_video`: outputs are running.
+pub const OBS_VIDEO_CURRENTLY_ACTIVE: c_int = -4;
 pub const LOG_ERROR: c_int = 100;
 pub const LOG_WARNING: c_int = 200;
 pub const LOG_INFO: c_int = 300;
@@ -123,6 +129,7 @@ pub type SourceEnumCb = unsafe extern "C" fn(*mut ObsSource, *mut ObsSource, *mu
 pub type LoadSourceCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource);
 pub type SaveFilterCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource) -> bool;
 pub type VolmeterCb = unsafe extern "C" fn(*mut c_void, *const f32, *const f32, *const f32);
+pub type AudioDeviceCb = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool;
 
 macro_rules! api {
     ($( $name:ident : fn($($arg:ident : $a:ty),*) $(-> $r:ty)?; )*) => {
@@ -234,6 +241,10 @@ api! {
     obs_property_float_min: fn(a: *mut ObsProperty) -> f64;
     obs_property_float_max: fn(a: *mut ObsProperty) -> f64;
     obs_property_float_step: fn(a: *mut ObsProperty) -> f64;
+    obs_property_int_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_float_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_int_suffix: fn(a: *mut ObsProperty) -> *const c_char;
+    obs_property_float_suffix: fn(a: *mut ObsProperty) -> *const c_char;
     obs_data_create_from_json: fn(a: *const c_char) -> *mut ObsData;
     obs_data_create: fn() -> *mut ObsData;
     obs_data_release: fn(a: *mut ObsData);
@@ -344,6 +355,19 @@ api! {
     obs_data_set_array: fn(a: *mut ObsData, b: *const c_char, c: *mut ObsDataArray);
     obs_data_get_array: fn(a: *mut ObsData, b: *const c_char) -> *mut ObsDataArray;
     obs_data_array_release: fn(a: *mut ObsDataArray);
+    obs_output_pause: fn(a: *mut ObsOutput, b: bool) -> bool;
+    obs_output_paused: fn(a: *const ObsOutput) -> bool;
+    obs_output_set_delay: fn(a: *mut ObsOutput, b: u32, c: u32);
+    obs_encoder_set_scaled_size: fn(a: *mut ObsEncoder, b: u32, c: u32);
+    os_cpu_usage_info_start: fn() -> *mut CpuUsage;
+    os_cpu_usage_info_query: fn(a: *mut CpuUsage) -> f64;
+    os_cpu_usage_info_destroy: fn(a: *mut CpuUsage);
+    os_get_proc_resident_size: fn() -> u64;
+    obs_get_active_fps: fn() -> f64;
+    obs_get_average_frame_time_ns: fn() -> u64;
+    obs_set_audio_monitoring_device: fn(a: *const c_char, b: *const c_char) -> bool;
+    obs_enum_audio_monitoring_devices: fn(a: AudioDeviceCb, b: *mut c_void);
+    obs_get_audio_monitoring_device: fn(a: *mut *const c_char, b: *mut *const c_char);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
@@ -511,6 +535,16 @@ pub(crate) unsafe extern "C" fn save_unless_listed(param: *mut c_void, source: *
     !skip.contains(&source)
 }
 
+/// `obs_enum_audio_monitoring_devices` callback: collects (name, id) into the `Vec` behind
+/// `param`.
+pub(crate) unsafe extern "C" fn collect_devices(param: *mut c_void, name: *const c_char, id: *const c_char) -> bool {
+    // SAFETY: `param` is the `&mut Vec` lib.rs passes for the synchronous enum call; libobs's
+    // strings are valid during it and copied at once.
+    let out = unsafe { &mut *(param as *mut Vec<(String, String)>) };
+    out.push((text(name), text(id)));
+    true
+}
+
 /// One sound's level, dBFS, for its first two channels (left, right).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Level {
@@ -580,15 +614,40 @@ pub(crate) mod mac {
         view: Retained<NSView>,
     }
 
-    fn frame(parent: &NSView, x: f64, y: f64, w: f64, h: f64) -> NSRect {
+    /// Where the web page sits inside `parent`: the largest view in it (the webview; a preview
+    /// is always smaller). The page can start below the window's title bar, so its box, not
+    /// the parent's, is what page coordinates count from (2.1: the preview sat a title bar
+    /// too high and covered the buttons above it).
+    fn page(parent: &NSView, except: Option<&NSView>) -> NSRect {
+        let mut best = parent.bounds();
+        let mut area = 0.0;
+        for v in parent.subviews().iter() {
+            if except.is_some_and(|e| std::ptr::eq(e, &*v)) {
+                continue;
+            }
+            let f = v.frame();
+            let a = f.size.width * f.size.height;
+            if a > area {
+                area = a;
+                best = f;
+            }
+        }
+        best
+    }
+
+    fn frame(parent: &NSView, except: Option<&NSView>, x: f64, y: f64, w: f64, h: f64, vh: f64) -> NSRect {
+        let p = page(parent, except);
+        // The page's visible top: `vh` up from the webview's bottom (it can be lower than the
+        // webview's top when the page draws under the title bar).
+        let vh = if vh > 0.0 && vh <= p.size.height { vh } else { p.size.height };
         // AppKit counts from the bottom unless the view is flipped; the page counts from the top.
-        let top = if parent.isFlipped() { y } else { parent.frame().size.height - y - h };
-        NSRect::new(NSPoint::new(x, top), NSSize::new(w.max(1.0), h.max(1.0)))
+        let top = if parent.isFlipped() { p.origin.y + (p.size.height - vh) + y } else { p.origin.y + vh - y - h };
+        NSRect::new(NSPoint::new(p.origin.x + x, top), NSSize::new(w.max(1.0), h.max(1.0)))
     }
 
     /// Adds a view over `parent` (an `NSView *` the window toolkit handed out) at the rectangle.
     /// None off the main thread (AppKit allows views only there).
-    pub fn child_view(parent: *mut c_void, x: f64, y: f64, w: f64, h: f64) -> Option<ChildView> {
+    pub fn child_view(parent: *mut c_void, x: f64, y: f64, w: f64, h: f64, vh: f64) -> Option<ChildView> {
         let mtm = MainThreadMarker::new()?;
         if parent.is_null() {
             return None;
@@ -596,7 +655,7 @@ pub(crate) mod mac {
         // SAFETY: `parent` is the live NSView from the window toolkit's raw handle (Tauri/tao),
         // used on the main thread while that window exists.
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
-        let view = NSView::initWithFrame(NSView::alloc(mtm), frame(parent, x, y, w, h));
+        let view = NSView::initWithFrame(NSView::alloc(mtm), frame(parent, None, x, y, w, h, vh));
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
         // AppKit would keep it from the bottom and slide it over the page above (2.1 test).
@@ -613,13 +672,13 @@ pub(crate) mod mac {
         }
 
         /// Moves and resizes it (the page's box moved). Main thread only; ignored elsewhere.
-        pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+        pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64, vh: f64) {
             if MainThreadMarker::new().is_none() {
                 return;
             }
             // SAFETY: on the main thread (checked above); `superview` only reads the view tree.
             if let Some(parent) = unsafe { self.view.superview() } {
-                self.view.setFrame(frame(&parent, x, y, w, h));
+                self.view.setFrame(frame(&parent, Some(&self.view), x, y, w, h, vh));
             }
         }
 

@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.remove("Removed box")?;
     println!("now: {:?}", scene.sources());
     studio.set_program(&scene);
-    let rec = studio.record(&out.join("scene.mp4"), "obs_x264")?;
+    let rec = studio.record(&out.join("scene.mp4"), &ferrocast_studio::EncodeSettings::with_encoder("obs_x264"))?;
     std::thread::sleep(Duration::from_secs(2));
     rec.stop();
     drop(scene);

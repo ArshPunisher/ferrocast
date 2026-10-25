@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     studio.set_program(&scene);
     let file = out.join("probe.mp4");
-    let rec = studio.record(&file, "obs_x264")?;
+    let rec = studio.record(&file, &ferrocast_studio::EncodeSettings::with_encoder("obs_x264"))?;
     std::thread::sleep(Duration::from_secs(5));
     rec.stop();
     let (frames, lagged) = studio.frames();

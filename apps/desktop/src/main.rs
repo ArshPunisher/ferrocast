@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod studio;
+mod studio_keys;
 
 use ferrocast_engine::Engine;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
@@ -96,6 +97,10 @@ fn main() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
+                    // The Studio's own shortcuts (push to talk also acts on letting go).
+                    if studio_keys::handle(app, shortcut, event.state()) {
+                        return;
+                    }
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
@@ -122,7 +127,17 @@ fn main() {
             };
             let engine = running.engine.clone();
             app.manage(running);
+            app.manage(studio_keys::StudioKeys::new(engine.clone()));
             engine.set_studio_host(Arc::new(studio::DesktopStudio::new(app.handle().clone(), dir.clone())));
+            // The Studio's saved shortcuts work from the start, Studio running or not.
+            {
+                let (app, engine) = (app.handle().clone(), engine.clone());
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(s) = engine.studio_settings().await {
+                        studio_keys::apply(&app, &s.hotkeys);
+                    }
+                });
+            }
             let shell = Arc::new(Shell::default());
             shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
             app.manage(shell.clone());
@@ -621,7 +636,12 @@ fn show_window(app: &AppHandle) {
     let Some(running) = app.try_state::<Running>() else {
         return;
     };
-    let Ok(url) = format!("{}/app/", running.base).parse() else {
+    // Dev builds only: FERROCAST_DEBUG_ROUTE (e.g. #/studio/golive) opens there, for testing.
+    #[cfg(debug_assertions)]
+    let route = std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")).unwrap_or_default();
+    #[cfg(not(debug_assertions))]
+    let route = String::new();
+    let Ok(url) = format!("{}/app/{route}", running.base).parse() else {
         return;
     };
     let api = serde_json::to_string(&running.base).unwrap_or_default();
