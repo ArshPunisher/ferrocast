@@ -78,9 +78,12 @@ const PLAYER_MISSING: &str = "Install playerctl so Ferrocast can see what your m
 #[cfg(not(target_os = "linux"))]
 const PLAYER_MISSING: &str = "The music player couldn't be asked.";
 
-/// Spotify first, then Music; neither is opened if it isn't running.
+/// Spotify first, then Music; neither is opened if it isn't running. A player macOS won't let
+/// Ferrocast ask (-1743, Automation not allowed) says `denied`, so the dashboard can say how to
+/// allow it instead of showing nothing.
 #[cfg(target_os = "macos")]
 const MAC_SCRIPT: &str = r"function run() {
+  let denied = false
   for (const id of ['Spotify', 'Music']) {
     try {
       const a = Application(id)
@@ -88,9 +91,11 @@ const MAC_SCRIPT: &str = r"function run() {
       if (String(a.playerState()) !== 'playing') continue
       const t = a.currentTrack()
       return ['playing', t.name(), t.artist()].join('\n')
-    } catch (e) {}
+    } catch (e) {
+      if (e.errorNumber === -1743 || /not allowed|-1743/i.test(String(e))) denied = true
+    }
   }
-  return 'stopped'
+  return denied ? 'denied' : 'stopped'
 }";
 
 #[cfg(windows)]
@@ -109,7 +114,11 @@ $p = Await ($s.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSyste
 pub(crate) async fn from_player() -> Result<Song, String> {
     #[cfg(target_os = "macos")]
     {
-        run("osascript", &["-l", "JavaScript", "-e", MAC_SCRIPT]).await.map(|o| parse_player(&o))
+        let out = run("osascript", &["-l", "JavaScript", "-e", MAC_SCRIPT]).await?;
+        if out.trim() == "denied" {
+            return Err(PLAYER_REFUSED.into());
+        }
+        Ok(parse_player(&out))
     }
     #[cfg(windows)]
     {
