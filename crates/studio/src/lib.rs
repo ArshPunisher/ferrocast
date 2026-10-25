@@ -156,9 +156,16 @@ pub struct Rect {
     pub h: f64,
 }
 
-/// OBS's engine, running.
-#[derive(Debug)]
+/// OBS's engine, running. Cheap to clone (one engine, shared); scenes, recordings and
+/// previews hold it too, so libobs shuts down only after the last of them is gone. Not `Send`:
+/// it lives on one thread (the app's main thread, which the preview needs on macOS).
+#[derive(Debug, Clone)]
 pub struct Studio {
+    inner: std::rc::Rc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
     api: Api,
     canvas: Canvas,
 }
@@ -225,16 +232,16 @@ impl Studio {
         }
         api.obs_load_all_modules();
         api.obs_post_load_modules();
-        Ok(Studio { api, canvas })
+        Ok(Studio { inner: std::rc::Rc::new(Inner { api, canvas }) })
     }
 
     pub fn canvas(&self) -> Canvas {
-        self.canvas
+        self.inner.canvas
     }
 
     /// libobs's version ("32.2.2").
     pub fn version(&self) -> String {
-        text(self.api.obs_get_version_string())
+        text(self.inner.api.obs_get_version_string())
     }
 
     /// Every kind the loaded plugins offer.
@@ -247,20 +254,20 @@ impl Studio {
                     break;
                 }
                 let name = if encoder {
-                    text(self.api.obs_encoder_get_display_name(id))
+                    text(self.inner.api.obs_encoder_get_display_name(id))
                 } else {
-                    text(self.api.obs_source_get_display_name(id))
+                    text(self.inner.api.obs_source_get_display_name(id))
                 };
                 out.push(Kind { id: text(id), name });
             }
             out
         };
         Kinds {
-            inputs: list(&|i, p| self.api.obs_enum_input_types(i, p), false),
-            filters: list(&|i, p| self.api.obs_enum_filter_types(i, p), false),
-            transitions: list(&|i, p| self.api.obs_enum_transition_types(i, p), false),
-            encoders: list(&|i, p| self.api.obs_enum_encoder_types(i, p), true),
-            outputs: list(&|i, p| self.api.obs_enum_output_types(i, p), false)
+            inputs: list(&|i, p| self.inner.api.obs_enum_input_types(i, p), false),
+            filters: list(&|i, p| self.inner.api.obs_enum_filter_types(i, p), false),
+            transitions: list(&|i, p| self.inner.api.obs_enum_transition_types(i, p), false),
+            encoders: list(&|i, p| self.inner.api.obs_enum_encoder_types(i, p), true),
+            outputs: list(&|i, p| self.inner.api.obs_enum_output_types(i, p), false)
                 .into_iter()
                 .map(|k| Kind { name: k.id.clone(), ..k })
                 .collect(),
@@ -273,21 +280,21 @@ impl Studio {
     pub fn options(&self, kind: &str) -> Result<Vec<OptionInfo>, StudioError> {
         let id = cstr(kind);
         let name = cstr("ferrocast-probe");
-        let src = self.api.obs_source_create_private(id.as_ptr(), name.as_ptr(), ptr::null_mut());
+        let src = self.inner.api.obs_source_create_private(id.as_ptr(), name.as_ptr(), ptr::null_mut());
         if src.is_null() {
             return Err(StudioError::Failed(format!("OBS has no source kind \"{kind}\".")));
         }
-        let props = self.api.obs_source_properties(src);
+        let props = self.inner.api.obs_source_properties(src);
         let out = if props.is_null() { Vec::new() } else { self.read_options(props) };
         if !props.is_null() {
-            self.api.obs_properties_destroy(props);
+            self.inner.api.obs_properties_destroy(props);
         }
-        self.api.obs_source_release(src);
+        self.inner.api.obs_source_release(src);
         Ok(out)
     }
 
     fn read_options(&self, props: *mut ffi::ObsProperties) -> Vec<OptionInfo> {
-        let a = &self.api;
+        let a = &self.inner.api;
         let mut out = Vec::new();
         let mut p = a.obs_properties_first(props);
         while !p.is_null() {
@@ -338,30 +345,35 @@ impl Studio {
     }
 
     /// A new, empty scene.
-    pub fn scene(&self, name: &str) -> Result<Scene<'_>, StudioError> {
+    pub fn scene(&self, name: &str) -> Result<Scene, StudioError> {
         let n = cstr(name);
-        let s = self.api.obs_scene_create(n.as_ptr());
+        let s = self.inner.api.obs_scene_create(n.as_ptr());
         if s.is_null() {
             return Err(StudioError::Failed(format!("the scene \"{name}\" couldn't be made")));
         }
-        Ok(Scene { studio: self, ptr: s, sources: std::cell::RefCell::new(Vec::new()) })
+        Ok(Scene { studio: self.clone(), ptr: s, sources: std::cell::RefCell::new(Vec::new()) })
     }
 
     /// Puts a scene on air (what's recorded and streamed).
-    pub fn set_program(&self, scene: &Scene<'_>) {
-        self.api.obs_set_output_source(0, self.api.obs_scene_get_source(scene.ptr));
+    pub fn set_program(&self, scene: &Scene) {
+        self.inner.api.obs_set_output_source(0, self.inner.api.obs_scene_get_source(scene.ptr));
+    }
+
+    /// Takes whatever is on air off (nothing is recorded or streamed until a scene goes back).
+    pub fn clear_program(&self) {
+        self.inner.api.obs_set_output_source(0, ptr::null_mut());
     }
 
     /// Frames drawn since start, and how many were late.
     pub fn frames(&self) -> (u32, u32) {
-        (self.api.obs_get_total_frames(), self.api.obs_get_lagged_frames())
+        (self.inner.api.obs_get_total_frames(), self.inner.api.obs_get_lagged_frames())
     }
 
     /// Starts recording what's on air to `path` (MP4 with OBS's own writer: no helper program
     /// needed), with `video_encoder` (`obs_x264`, `com.apple.videotoolbox.videoencoder.ave.avc`…)
     /// and AAC sound.
-    pub fn record(&self, path: &Path, video_encoder: &str) -> Result<Recording<'_>, StudioError> {
-        let a = &self.api;
+    pub fn record(&self, path: &Path, video_encoder: &str) -> Result<Recording, StudioError> {
+        let a = &self.inner.api;
         let (vid, vname) = (cstr(video_encoder), cstr("ferrocast-video"));
         let venc = a.obs_video_encoder_create(vid.as_ptr(), vname.as_ptr(), ptr::null_mut(), ptr::null_mut());
         if venc.is_null() {
@@ -388,7 +400,7 @@ impl Studio {
         let (oid, oname) = (cstr("mp4_output"), cstr("ferrocast-record"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
         a.obs_data_release(settings);
-        let rec = Recording { studio: self, out, venc, aenc };
+        let rec = Recording { studio: self.clone(), out, venc, aenc };
         if out.is_null() {
             return Err(StudioError::Failed("the recorder couldn't be made".into()));
         }
@@ -408,7 +420,7 @@ impl Studio {
     /// Shows what's on air at `rect` inside `window` (the raw handle the window toolkit gives,
     /// e.g. Tauri's), drawn by libobs straight into a native view: no copies through the page.
     /// `scale` is the screen's pixels per point (2 on a Retina display). macOS, main thread.
-    pub fn preview(&self, window: RawWindowHandle, rect: Rect, scale: f64) -> Result<Preview<'_>, StudioError> {
+    pub fn preview(&self, window: RawWindowHandle, rect: Rect, scale: f64) -> Result<Preview, StudioError> {
         #[cfg(target_os = "macos")]
         {
             let RawWindowHandle::AppKit(h) = window else {
@@ -426,15 +438,18 @@ impl Studio {
                 zsformat: ffi::GS_ZS_NONE,
                 adapter: 0,
             };
-            let display = self.api.obs_display_create(&init, 0x0000_00ff);
+            let display = self.inner.api.obs_display_create(&init, 0x0000_00ff);
             if display.is_null() {
                 view.remove();
                 return Err(StudioError::Failed("the preview couldn't be made".into()));
             }
-            let state = Box::new(ffi::DrawState { api: &self.api, base: (self.canvas.width, self.canvas.height) });
+            let state = Box::new(ffi::DrawState {
+                api: &self.inner.api,
+                base: (self.inner.canvas.width, self.inner.canvas.height),
+            });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
-            self.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
-            Ok(Preview { studio: self, display, state, view, scale })
+            self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
+            Ok(Preview { studio: self.clone(), display, state, view, scale })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -452,8 +467,8 @@ fn px(rect: Rect, scale: f64) -> (u32, u32) {
 
 /// A live preview in a window. Removed when dropped.
 #[derive(Debug)]
-pub struct Preview<'a> {
-    studio: &'a Studio,
+pub struct Preview {
+    studio: Studio,
     display: *mut ffi::ObsDisplay,
     state: Box<ffi::DrawState>,
     #[cfg(target_os = "macos")]
@@ -461,20 +476,20 @@ pub struct Preview<'a> {
     scale: f64,
 }
 
-impl Preview<'_> {
+impl Preview {
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: Rect, scale: f64) {
         self.scale = scale;
         #[cfg(target_os = "macos")]
         self.view.set_frame(rect.x, rect.y, rect.w, rect.h);
         let (cx, cy) = px(rect, scale);
-        self.studio.api.obs_display_resize(self.display, cx, cy);
+        self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
 }
 
-impl Drop for Preview<'_> {
+impl Drop for Preview {
     fn drop(&mut self) {
-        let a = &self.studio.api;
+        let a = &self.studio.inner.api;
         let param = &*self.state as *const ffi::DrawState as *mut std::ffi::c_void;
         a.obs_display_remove_draw_callback(self.display, ffi::draw_main, param);
         a.obs_display_destroy(self.display);
@@ -483,7 +498,7 @@ impl Drop for Preview<'_> {
     }
 }
 
-impl Drop for Studio {
+impl Drop for Inner {
     fn drop(&mut self) {
         // Nothing on air; then sources finish being torn down on libobs's own thread before the
         // plugins unload (a text source freed after FreeType went away crashed, 25 Oct spike).
@@ -500,14 +515,14 @@ impl Drop for Studio {
 
 /// A scene. Released when dropped (sources in it stay while the scene does).
 #[derive(Debug)]
-pub struct Scene<'a> {
-    studio: &'a Studio,
+pub struct Scene {
+    studio: Studio,
     ptr: *mut ffi::ObsScene,
     /// Our own reference to each source added, so they can be removed and released with it.
     sources: std::cell::RefCell<Vec<*mut ffi::ObsSource>>,
 }
 
-impl Scene<'_> {
+impl Scene {
     /// Adds a new source of `kind` named `name`, with OBS settings as JSON (the same keys OBS
     /// saves in its scene collections), at `pos` on the canvas.
     pub fn add(
@@ -517,7 +532,7 @@ impl Scene<'_> {
         settings: &serde_json::Value,
         pos: (f32, f32),
     ) -> Result<(), StudioError> {
-        let a = &self.studio.api;
+        let a = &self.studio.inner.api;
         let json = cstr(&settings.to_string());
         let data = a.obs_data_create_from_json(json.as_ptr());
         let (id, n) = (cstr(kind), cstr(name));
@@ -541,11 +556,11 @@ impl Scene<'_> {
     }
 }
 
-impl Drop for Scene<'_> {
+impl Drop for Scene {
     fn drop(&mut self) {
         // As OBS's own app clears a scene collection: remove each source and the scene (libobs 32
         // keeps scenes in its canvas until removed), then let go of our references.
-        let a = &self.studio.api;
+        let a = &self.studio.inner.api;
         for src in self.sources.borrow_mut().drain(..) {
             a.obs_source_remove(src);
             a.obs_source_release(src);
@@ -557,23 +572,23 @@ impl Drop for Scene<'_> {
 
 /// A recording. Stops (and waits for the file to be finished) when dropped.
 #[derive(Debug)]
-pub struct Recording<'a> {
-    studio: &'a Studio,
+pub struct Recording {
+    studio: Studio,
     out: *mut ffi::ObsOutput,
     venc: *mut ffi::ObsEncoder,
     aenc: *mut ffi::ObsEncoder,
 }
 
-impl Recording<'_> {
+impl Recording {
     /// Stops and waits up to 10 s for the file to be written out.
     pub fn stop(self) {
         drop(self);
     }
 }
 
-impl Drop for Recording<'_> {
+impl Drop for Recording {
     fn drop(&mut self) {
-        let a = &self.studio.api;
+        let a = &self.studio.inner.api;
         if !self.out.is_null() {
             a.obs_output_stop(self.out);
             let until = Instant::now() + Duration::from_secs(10);
