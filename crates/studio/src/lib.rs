@@ -8,6 +8,7 @@
 
 mod collection;
 mod ffi;
+pub mod import;
 
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
     AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, SourceUse,
-    TransitionInfo,
+    TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
 

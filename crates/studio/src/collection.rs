@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::Mutex;
 
@@ -50,8 +50,13 @@ pub struct ItemInfo {
     /// It makes sound (shows in the mixer).
     pub audio: bool,
     pub group: bool,
+    /// How it mixes with what's under it: one of [`BLENDS`].
+    pub blend: String,
     pub children: Vec<ItemInfo>,
 }
+
+/// `enum obs_blending_type`, in order.
+pub const BLENDS: [&str; 7] = ["normal", "additive", "subtract", "screen", "multiply", "lighten", "darken"];
 
 /// A change to one item in a scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +72,38 @@ pub enum ItemEdit {
     Down,
     Top,
     Bottom,
+    /// Fills the screen, ignoring its shape.
+    Stretch,
+    /// Moves it to the middle of the screen, its size kept.
+    Center,
+    /// Back to its own size at the top left, not turned or flipped.
+    Reset,
+    FlipH,
+    FlipV,
+    RotateCw,
+    RotateCcw,
+    Rotate180,
+    /// A copy of the source (its own settings and filters) just above it.
+    Duplicate,
+    BlendNormal,
+    BlendAdditive,
+    BlendSubtract,
+    BlendScreen,
+    BlendMultiply,
+    BlendLighten,
+    BlendDarken,
+}
+
+/// Something to do with a Web page source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAct {
+    /// Puts the page in a window to click and type in.
+    Interact,
+    /// Takes it back off-screen.
+    Stop,
+    /// Loads it again.
+    Reload,
 }
 
 /// Who hears a sound besides the stream ("Hear it" in the mixer).
@@ -142,7 +179,12 @@ struct Meter {
     studio: Studio,
     vm: *mut ffi::ObsVolmeter,
     cell: Box<Mutex<Level>>,
+    /// Last asked for: a meter nobody reads for a while goes.
+    read: std::time::Instant,
 }
+
+/// How long a meter nobody reads is kept (several screens may each read their own sounds).
+const METER_KEPT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Meter {
     fn param(&self) -> *mut c_void {
@@ -440,6 +482,10 @@ impl Collection {
             locked: a.obs_sceneitem_locked(item),
             audio: a.obs_source_get_output_flags(src) & ffi::OBS_SOURCE_AUDIO != 0,
             group,
+            blend: BLENDS
+                .get(usize::try_from(a.obs_sceneitem_get_blending_mode(item)).unwrap_or(0))
+                .unwrap_or(&BLENDS[0])
+                .to_string(),
             children: if group {
                 self.group_items(item).into_iter().rev().map(|i| self.info(i)).collect()
             } else {
@@ -528,9 +574,98 @@ impl Collection {
         a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
     }
 
+    /// Puts the item's anchor at its middle without moving it on screen, so flips and turns
+    /// happen in place (as OBS does).
+    fn anchor_middle(&self, item: *mut ffi::ObsSceneItem) {
+        let a = self.api();
+        let mut m = ffi::Matrix4::default();
+        a.obs_sceneitem_get_box_transform(item, &mut m);
+        let mid = ffi::Vec2 { x: (m.x.x + m.y.x) * 0.5 + m.t.x, y: (m.x.y + m.y.y) * 0.5 + m.t.y };
+        a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_CENTER);
+        a.obs_sceneitem_set_pos(item, &mid);
+    }
+
+    fn scale_by(&self, item: *mut ffi::ObsSceneItem, x: f32, y: f32) {
+        let a = self.api();
+        self.anchor_middle(item);
+        let mut s = ffi::Vec2 { x: 1.0, y: 1.0 };
+        a.obs_sceneitem_get_scale(item, &mut s);
+        a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: s.x * x, y: s.y * y });
+    }
+
+    fn turn(&self, item: *mut ffi::ObsSceneItem, deg: f32) {
+        let a = self.api();
+        self.anchor_middle(item);
+        a.obs_sceneitem_set_rot(item, (a.obs_sceneitem_get_rot(item) + deg).rem_euclid(360.0));
+    }
+
+    /// A copy of the item's source, named like it ("Camera 2"), just above it in the scene
+    /// with the same place, size, turn and blending.
+    fn duplicate(&self, scene: &str, item: *mut ffi::ObsSceneItem) -> Result<(), StudioError> {
+        let a = self.api();
+        let s = self.scene_ptr(scene)?;
+        let src = a.obs_sceneitem_get_source(item);
+        let base = text(a.obs_source_get_name(src));
+        let mut n = 2;
+        let name = loop {
+            let c = format!("{base} {n}");
+            if self.name_free(&c).is_ok() {
+                break c;
+            }
+            n += 1;
+        };
+        let cn = cstr(&name);
+        let mut copy = a.obs_source_duplicate(src, cn.as_ptr(), false);
+        // Kinds that can't be duplicated (web pages) hand back the same source: make a new
+        // one of the kind from its settings instead, and give it the same filters.
+        if copy == src {
+            a.obs_source_release(copy);
+            let data = a.obs_source_get_settings(src);
+            copy = a.obs_source_create(a.obs_source_get_id(src), cn.as_ptr(), data, ptr::null_mut());
+            if !data.is_null() {
+                a.obs_data_release(data);
+            }
+            if !copy.is_null() {
+                a.obs_source_copy_filters(copy, src);
+            }
+        }
+        if copy.is_null() {
+            return Err(StudioError::Failed(format!("\"{base}\" couldn't be copied")));
+        }
+        let new = a.obs_scene_add(s, copy);
+        a.obs_source_release(copy);
+        if new.is_null() {
+            return Err(StudioError::Failed(format!("\"{name}\" couldn't be put in the scene")));
+        }
+        let mut v = ffi::Vec2 { x: 0.0, y: 0.0 };
+        a.obs_sceneitem_get_pos(item, &mut v);
+        a.obs_sceneitem_set_pos(new, &v);
+        a.obs_sceneitem_get_scale(item, &mut v);
+        a.obs_sceneitem_set_scale(new, &v);
+        a.obs_sceneitem_get_bounds(item, &mut v);
+        a.obs_sceneitem_set_bounds(new, &v);
+        a.obs_sceneitem_set_alignment(new, a.obs_sceneitem_get_alignment(item));
+        a.obs_sceneitem_set_bounds_type(new, a.obs_sceneitem_get_bounds_type(item));
+        a.obs_sceneitem_set_bounds_alignment(new, a.obs_sceneitem_get_bounds_alignment(item));
+        a.obs_sceneitem_set_rot(new, a.obs_sceneitem_get_rot(item));
+        a.obs_sceneitem_set_blending_mode(new, a.obs_sceneitem_get_blending_mode(item));
+        a.obs_sceneitem_set_visible(new, a.obs_sceneitem_visible(item));
+        // New items go on top: walk it down to just above the original.
+        let ids: Vec<i64> = self.raw_items(s).into_iter().map(|i| a.obs_sceneitem_get_id(i)).collect();
+        let (orig, made) = (a.obs_sceneitem_get_id(item), a.obs_sceneitem_get_id(new));
+        if let (Some(o), Some(m)) = (ids.iter().position(|x| *x == orig), ids.iter().position(|x| *x == made)) {
+            for _ in (o + 1)..m {
+                a.obs_sceneitem_set_order(new, ffi::OBS_ORDER_MOVE_DOWN);
+            }
+        }
+        Ok(())
+    }
+
     pub fn edit_item(&self, scene: &str, id: i64, edit: ItemEdit) -> Result<(), StudioError> {
         let item = self.item(scene, id)?;
         let a = self.api();
+        let c = self.studio.canvas();
+        let blend = |m: c_int| a.obs_sceneitem_set_blending_mode(item, m);
         match edit {
             ItemEdit::Show | ItemEdit::Hide => {
                 a.obs_sceneitem_set_visible(item, edit == ItemEdit::Show);
@@ -544,6 +679,37 @@ impl Collection {
             ItemEdit::Down => a.obs_sceneitem_set_order(item, ffi::OBS_ORDER_MOVE_DOWN),
             ItemEdit::Top => a.obs_sceneitem_set_order(item, ffi::OBS_ORDER_MOVE_TOP),
             ItemEdit::Bottom => a.obs_sceneitem_set_order(item, ffi::OBS_ORDER_MOVE_BOTTOM),
+            ItemEdit::Stretch => {
+                a.obs_sceneitem_set_rot(item, 0.0);
+                a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
+                a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_STRETCH);
+                a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
+            }
+            ItemEdit::Center => {
+                a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_CENTER);
+                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: c.width as f32 / 2.0, y: c.height as f32 / 2.0 });
+            }
+            ItemEdit::Reset => {
+                a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_NONE);
+                a.obs_sceneitem_set_rot(item, 0.0);
+                a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: 1.0, y: 1.0 });
+                a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
+            }
+            ItemEdit::FlipH => self.scale_by(item, -1.0, 1.0),
+            ItemEdit::FlipV => self.scale_by(item, 1.0, -1.0),
+            ItemEdit::RotateCw => self.turn(item, 90.0),
+            ItemEdit::RotateCcw => self.turn(item, -90.0),
+            ItemEdit::Rotate180 => self.turn(item, 180.0),
+            ItemEdit::Duplicate => self.duplicate(scene, item)?,
+            ItemEdit::BlendNormal => blend(0),
+            ItemEdit::BlendAdditive => blend(1),
+            ItemEdit::BlendSubtract => blend(2),
+            ItemEdit::BlendScreen => blend(3),
+            ItemEdit::BlendMultiply => blend(4),
+            ItemEdit::BlendLighten => blend(5),
+            ItemEdit::BlendDarken => blend(6),
         }
         Ok(())
     }
@@ -753,7 +919,8 @@ impl Collection {
     pub fn levels(&self, names: &[String]) -> HashMap<String, LevelInfo> {
         let a = self.api();
         let mut meters = self.meters.borrow_mut();
-        meters.retain(|k, _| names.contains(k));
+        let now = std::time::Instant::now();
+        meters.retain(|k, m| names.contains(k) || now.duration_since(m.read) < METER_KEPT);
         let mut out = HashMap::new();
         for name in names {
             if !meters.contains_key(name) {
@@ -766,10 +933,14 @@ impl Collection {
                     studio: self.studio.clone(),
                     vm,
                     cell: Box::new(Mutex::new(Level { peak: [SILENT; 2], magnitude: [SILENT; 2] })),
+                    read: now,
                 };
                 a.obs_volmeter_add_callback(vm, ffi::store_level, m.param());
                 a.obs_volmeter_attach_source(vm, src.ptr);
                 meters.insert(name.clone(), m);
+            }
+            if let Some(m) = meters.get_mut(name) {
+                m.read = now;
             }
             if let Some(l) = meters.get(name).and_then(|m| m.cell.lock().ok().map(|l| *l)) {
                 out.insert(name.clone(), LevelInfo { peak: l.peak.map(db), magnitude: l.magnitude.map(db) });
@@ -836,6 +1007,56 @@ impl Collection {
         let src = self.source(name)?;
         let f = self.filter(&src, filter)?;
         self.api().obs_source_filter_remove(src.ptr, f.ptr);
+        Ok(())
+    }
+
+    /// Clicks, stops clicking or reloads a Web page source.
+    pub fn web(&self, name: &str, what: WebAct) -> Result<(), StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        #[cfg(target_os = "macos")]
+        if text(a.obs_source_get_id(src.ptr)) == crate::WEB_PAGE_KIND {
+            let data = a.obs_obj_get_data(src.ptr);
+            ffi::web::act(
+                data,
+                match what {
+                    WebAct::Interact => ffi::web::Do::Interact(name.to_string()),
+                    WebAct::Stop => ffi::web::Do::Stop,
+                    WebAct::Reload => ffi::web::Do::Reload,
+                },
+            );
+            return Ok(());
+        }
+        // OBS's own Browser source (Windows): reload through its "Refresh cache" button.
+        if text(a.obs_source_get_id(src.ptr)) == "browser_source" && what == WebAct::Reload {
+            let props = a.obs_source_properties(src.ptr);
+            if !props.is_null() {
+                let key = cstr("refreshnocache");
+                let p = a.obs_properties_get(props, key.as_ptr());
+                if !p.is_null() {
+                    a.obs_property_button_clicked(p, src.ptr.cast());
+                }
+                a.obs_properties_destroy(props);
+            }
+            return Ok(());
+        }
+        if text(a.obs_source_get_id(src.ptr)) == "browser_source" {
+            return Err(StudioError::Failed(
+                "Clicking into OBS's own Browser source isn't here yet. It can be reloaded.".into(),
+            ));
+        }
+        let _ = what;
+        Err(StudioError::Failed(format!("\"{name}\" isn't a web page.")))
+    }
+
+    /// Copies every filter of `from` onto `name`, after its own.
+    pub fn paste_filters(&self, name: &str, from: &str) -> Result<(), StudioError> {
+        let dst = self.source(name)?;
+        let src = self.source(from)?;
+        if dst.ptr == src.ptr {
+            return Err(StudioError::Failed("Pick another source to paste its filters onto.".into()));
+        }
+        self.api().obs_source_copy_filters(dst.ptr, src.ptr);
         Ok(())
     }
 

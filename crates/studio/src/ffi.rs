@@ -65,6 +65,26 @@ pub struct Vec2 {
     pub y: f32,
 }
 
+/// `struct vec4` (SSE-aligned).
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Vec4 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+/// `struct matrix4`: a point maps to `x * px + y * py + t`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Matrix4 {
+    pub x: Vec4,
+    pub y: Vec4,
+    pub z: Vec4,
+    pub t: Vec4,
+}
+
 /// `struct gs_init_data`: on macOS the window is an `NSView *`, on Windows an `HWND`.
 #[repr(C)]
 #[derive(Debug)]
@@ -98,6 +118,8 @@ pub const OBS_VIDEO_SUCCESS: c_int = 0;
 /// `obs-source.h`: a kind replaced by a newer version, and one only for OBS's own use.
 pub const OBS_SOURCE_DEPRECATED: u32 = 1 << 8;
 pub const OBS_SOURCE_CAP_DISABLED: u32 = 1 << 10;
+pub const OBS_BOUNDS_NONE: c_int = 0;
+pub const OBS_BOUNDS_STRETCH: c_int = 1;
 pub const OBS_BOUNDS_SCALE_INNER: c_int = 2;
 pub const OBS_ALIGN_CENTER: u32 = 0;
 pub const OBS_ALIGN_LEFT: u32 = 1;
@@ -223,6 +245,8 @@ api! {
     obs_properties_first: fn(a: *mut ObsProperties) -> *mut ObsProperty;
     obs_property_next: fn(a: *mut *mut ObsProperty) -> bool;
     obs_properties_destroy: fn(a: *mut ObsProperties);
+    obs_properties_get: fn(a: *mut ObsProperties, b: *const c_char) -> *mut ObsProperty;
+    obs_property_button_clicked: fn(a: *mut ObsProperty, b: *mut c_void) -> bool;
     obs_property_name: fn(a: *mut ObsProperty) -> *const c_char;
     obs_property_description: fn(a: *mut ObsProperty) -> *const c_char;
     obs_property_long_description: fn(a: *mut ObsProperty) -> *const c_char;
@@ -263,6 +287,23 @@ api! {
     obs_sceneitem_set_bounds_type: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_set_bounds_alignment: fn(a: *mut ObsSceneItem, b: u32);
     obs_sceneitem_set_bounds: fn(a: *mut ObsSceneItem, b: *const Vec2);
+    obs_sceneitem_get_pos: fn(a: *const ObsSceneItem, b: *mut Vec2);
+    obs_sceneitem_get_scale: fn(a: *const ObsSceneItem, b: *mut Vec2);
+    obs_sceneitem_set_scale: fn(a: *mut ObsSceneItem, b: *const Vec2);
+    obs_sceneitem_get_rot: fn(a: *const ObsSceneItem) -> f32;
+    obs_sceneitem_set_rot: fn(a: *mut ObsSceneItem, b: f32);
+    obs_sceneitem_get_alignment: fn(a: *const ObsSceneItem) -> u32;
+    obs_sceneitem_get_bounds_type: fn(a: *const ObsSceneItem) -> c_int;
+    obs_sceneitem_get_bounds_alignment: fn(a: *const ObsSceneItem) -> u32;
+    obs_sceneitem_get_bounds: fn(a: *const ObsSceneItem, b: *mut Vec2);
+    obs_sceneitem_get_box_transform: fn(a: *const ObsSceneItem, b: *mut Matrix4);
+    obs_sceneitem_set_blending_mode: fn(a: *mut ObsSceneItem, b: c_int);
+    obs_sceneitem_get_blending_mode: fn(a: *const ObsSceneItem) -> c_int;
+    obs_source_copy_filters: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_source_output_audio: fn(a: *mut ObsSource, b: *const c_void);
+    obs_obj_get_data: fn(a: *mut ObsSource) -> *mut c_void;
+    os_gettime_ns: fn() -> u64;
+    obs_source_duplicate: fn(a: *mut ObsSource, b: *const c_char, c: bool) -> *mut ObsSource;
     obs_sceneitem_set_visible: fn(a: *mut ObsSceneItem, b: bool) -> bool;
     obs_sceneitem_visible: fn(a: *const ObsSceneItem) -> bool;
     obs_sceneitem_remove: fn(a: *mut ObsSceneItem);
@@ -722,13 +763,17 @@ pub(crate) mod web {
 
     use block2::RcBlock;
     use dispatch2::{DispatchQueue, DispatchTime};
+    use std::sync::Weak;
+
+    use base64::Engine as _;
     use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{MainThreadMarker, MainThreadOnly, msg_send};
-    use objc2_app_kit::{NSBackingStoreType, NSImage, NSWindow, NSWindowStyleMask};
+    use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2_app_kit::{NSBackingStoreType, NSImage, NSScreen, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask};
     use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest};
     use objc2_web_kit::{
-        WKInactiveSchedulingPolicy, WKSnapshotConfiguration, WKUserScript, WKUserScriptInjectionTime, WKWebView,
+        WKAudiovisualMediaTypes, WKInactiveSchedulingPolicy, WKScriptMessage, WKScriptMessageHandler,
+        WKSnapshotConfiguration, WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView,
         WKWebViewConfiguration,
     };
 
@@ -771,14 +816,257 @@ pub(crate) mod web {
         w: AtomicU32,
         h: AtomicU32,
         fps: AtomicU32,
+        /// The libobs source the page's sound goes out through; null once it's going.
+        source: Mutex<SrcPtr>,
     }
+
+    struct SrcPtr(*mut ObsSource);
+    // SAFETY: only used under the Mutex, and only while libobs keeps the source (cleared in
+    // `destroy` before libobs frees it).
+    unsafe impl Send for SrcPtr {}
 
     /// The off-screen window and its web view. Main thread only.
     struct Page {
         window: Retained<NSWindow>,
+        /// Holds the web view; scaled to fit the screen while the page is being clicked.
+        holder: Retained<NSView>,
         view: Retained<WKWebView>,
         css: String,
         url: String,
+        size: (u32, u32),
+        /// On screen, to click and type in ("Interact"), with this title.
+        interact: Option<String>,
+        /// Kept alive with the page: WebKit and AppKit hold these weakly or until removed.
+        tap: Retained<AudioTap>,
+        closer: Option<Retained<WindowCloser>>,
+    }
+
+    /// The name pages post their sound to.
+    const AUDIO_HANDLER: &str = "ferrocastAudio";
+
+    /// Runs first in every page and frame: sends what the page plays (Web Audio and audio or
+    /// video elements) to Ferrocast instead of the speakers, as 16-bit stereo chunks, so it
+    /// goes into the stream through the mixer like OBS's "Control audio via OBS".
+    const AUDIO_SCRIPT: &str = r#"(function () {
+  if (window.__ferrocastAudio) return
+  window.__ferrocastAudio = true
+  var h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ferrocastAudio
+  var AC = window.AudioContext || window.webkitAudioContext
+  if (!h || !AC) return
+  var connect = AudioNode.prototype.connect
+  var disconnect = AudioNode.prototype.disconnect
+  var taps = new WeakMap()
+  function send(rate, l, r) {
+    var n = l.length, out = new Int16Array(n * 2), loud = false
+    for (var i = 0; i < n; i++) {
+      var a = l[i], b = r[i]
+      if (a !== 0 || b !== 0) loud = true
+      a = a < -1 ? -1 : a > 1 ? 1 : a
+      b = b < -1 ? -1 : b > 1 ? 1 : b
+      out[2 * i] = a * 32767
+      out[2 * i + 1] = b * 32767
+    }
+    if (!loud) return
+    var bytes = new Uint8Array(out.buffer), s = ''
+    for (var j = 0; j < bytes.length; j += 0x8000)
+      s += String.fromCharCode.apply(null, bytes.subarray(j, j + 0x8000))
+    h.postMessage(rate + ':' + btoa(s))
+  }
+  function tap(ctx) {
+    var t = taps.get(ctx)
+    if (t) return t
+    t = ctx.createScriptProcessor(2048, 2, 2)
+    var mute = ctx.createGain()
+    mute.gain.value = 0
+    connect.call(t, mute)
+    connect.call(mute, ctx.destination)
+    t.onaudioprocess = function (e) {
+      var b = e.inputBuffer, l = b.getChannelData(0)
+      send(ctx.sampleRate, l, b.numberOfChannels > 1 ? b.getChannelData(1) : l)
+    }
+    taps.set(ctx, t)
+    return t
+  }
+  AudioNode.prototype.connect = function (dest) {
+    if (dest instanceof AudioDestinationNode) {
+      var args = Array.prototype.slice.call(arguments)
+      args[0] = tap(this.context)
+      connect.apply(this, args)
+      return dest
+    }
+    return connect.apply(this, arguments)
+  }
+  AudioNode.prototype.disconnect = function (dest) {
+    if (dest instanceof AudioDestinationNode) {
+      var args = Array.prototype.slice.call(arguments)
+      args[0] = tap(this.context)
+      return disconnect.apply(this, args)
+    }
+    return disconnect.apply(this, arguments)
+  }
+  var shared = null, routed = new WeakSet()
+  function route(el) {
+    if (!(el instanceof HTMLMediaElement) || routed.has(el)) return
+    routed.add(el)
+    try {
+      shared = shared || new AC()
+      shared.createMediaElementSource(el).connect(shared.destination)
+      if (shared.state === 'suspended') shared.resume()
+    } catch (e) {}
+  }
+  var play = HTMLMediaElement.prototype.play
+  HTMLMediaElement.prototype.play = function () {
+    route(this)
+    return play.apply(this, arguments)
+  }
+  document.addEventListener('play', function (e) { route(e.target) }, true)
+})()"#;
+
+    /// `struct obs_source_audio`.
+    #[repr(C)]
+    struct SourceAudio {
+        data: [*const u8; 8],
+        frames: u32,
+        speakers: c_int,
+        format: c_int,
+        samples_per_sec: u32,
+        timestamp: u64,
+    }
+    const SPEAKERS_STEREO: c_int = 2;
+    const AUDIO_FORMAT_16BIT: c_int = 2;
+
+    /// One chunk from the page ("48000:<base64 of 16-bit stereo>") into the source's sound.
+    fn feed(shared: &Shared, msg: &str) {
+        let Some(a) = api() else { return };
+        let Some((rate, b64)) = msg.split_once(':') else { return };
+        let Ok(rate) = rate.parse::<u32>() else { return };
+        if !(8_000..=192_000).contains(&rate) {
+            return;
+        }
+        let Ok(pcm) = base64::engine::general_purpose::STANDARD.decode(b64) else { return };
+        let frames = (pcm.len() / 4) as u32;
+        if frames == 0 {
+            return;
+        }
+        let Ok(src) = shared.source.lock() else { return };
+        if src.0.is_null() {
+            return;
+        }
+        let span = u64::from(frames) * 1_000_000_000 / u64::from(rate);
+        let mut data = [std::ptr::null::<u8>(); 8];
+        data[0] = pcm.as_ptr();
+        let audio = SourceAudio {
+            data,
+            frames,
+            speakers: SPEAKERS_STEREO,
+            format: AUDIO_FORMAT_16BIT,
+            samples_per_sec: rate,
+            timestamp: a.os_gettime_ns().saturating_sub(span),
+        };
+        a.obs_source_output_audio(src.0, (&audio as *const SourceAudio).cast());
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; AudioTap doesn't implement Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastWebAudioTap"]
+        #[ivars = Arc<Shared>]
+        struct AudioTap;
+
+        unsafe impl NSObjectProtocol for AudioTap {}
+
+        unsafe impl WKScriptMessageHandler for AudioTap {
+            #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+            fn did_receive(&self, _ucc: &WKUserContentController, message: &WKScriptMessage) {
+                // SAFETY: the message is live for this call; its body is a JS string here.
+                let body = unsafe { message.body() };
+                if let Ok(s) = body.downcast::<NSString>() {
+                    feed(self.ivars(), &s.to_string());
+                }
+            }
+        }
+    );
+
+    impl AudioTap {
+        fn new(mtm: MainThreadMarker, shared: Arc<Shared>) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(shared);
+            // SAFETY: NSObject's init on a freshly allocated object.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    type PageSlot = Arc<Mutex<Option<OnMain<Page>>>>;
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; WindowCloser doesn't implement Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastWebWindowCloser"]
+        #[ivars = Weak<Mutex<Option<OnMain<Page>>>>]
+        struct WindowCloser;
+
+        unsafe impl NSObjectProtocol for WindowCloser {}
+
+        unsafe impl NSWindowDelegate for WindowCloser {
+            /// The close button puts the page back off-screen instead of closing it.
+            #[unsafe(method(windowShouldClose:))]
+            fn window_should_close(&self, _w: &NSWindow) -> bool {
+                if let Some(page) = self.ivars().upgrade() {
+                    let job = OnMain(page);
+                    DispatchQueue::main().exec_async(move || {
+                        let OnMain(page) = job;
+                        if let Ok(mut p) = page.lock()
+                            && let Some(OnMain(p)) = p.as_mut()
+                        {
+                            place(p, None);
+                        }
+                    });
+                }
+                false
+            }
+        }
+    );
+
+    impl WindowCloser {
+        fn new(mtm: MainThreadMarker, page: &PageSlot) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(Arc::downgrade(page));
+            // SAFETY: NSObject's init on a freshly allocated object.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    /// Off-screen at full size, or (with a title) on screen to click, scaled to fit.
+    fn place(p: &mut Page, interact: Option<String>) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let (w, h) = (f64::from(p.size.0), f64::from(p.size.1));
+        let full = NSSize::new(w, h);
+        p.view.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), full));
+        match &interact {
+            Some(title) => {
+                let fit = NSScreen::mainScreen(mtm).map(|s| s.visibleFrame().size).unwrap_or(full);
+                let k = (fit.width * 0.9 / w).min(fit.height * 0.85 / h).min(1.0);
+                let shown = NSSize::new((w * k).round(), (h * k).round());
+                p.window.setStyleMask(
+                    NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable,
+                );
+                p.window.setTitle(&NSString::from_str(title));
+                p.window.setContentSize(shown);
+                p.holder.setFrameSize(shown);
+                p.holder.setBoundsSize(full);
+                p.window.center();
+                p.window.makeKeyAndOrderFront(None);
+            }
+            None => {
+                p.window.setStyleMask(NSWindowStyleMask::Borderless);
+                p.window.setContentSize(full);
+                p.holder.setFrameSize(full);
+                p.holder.setBoundsSize(full);
+                p.window.setFrameOrigin(NSPoint::new(-20_000.0, -20_000.0));
+                p.window.orderBack(None);
+            }
+        }
+        p.interact = interact;
     }
 
     /// Carries main-thread objects to the main queue; they're only used there.
@@ -819,7 +1107,15 @@ pub(crate) mod web {
         )
     }
 
-    fn open(mtm: MainThreadMarker, url: &str, w: u32, h: u32, css: &str) -> Option<Page> {
+    fn open(
+        mtm: MainThreadMarker,
+        slot: &PageSlot,
+        shared: &Arc<Shared>,
+        url: &str,
+        w: u32,
+        h: u32,
+        css: &str,
+    ) -> Option<Page> {
         let rect = NSRect::new(NSPoint::new(-20_000.0, -20_000.0), NSSize::new(f64::from(w), f64::from(h)));
         // SAFETY: AppKit window creation on the main thread (mtm) with valid arguments.
         let window = unsafe {
@@ -838,6 +1134,8 @@ pub(crate) mod web {
         // made only where the object answers to it (respondsToSelector:).
         let view = unsafe {
             let cfg = WKWebViewConfiguration::new(mtm);
+            // Sound plays without a click (it goes to the mixer, not the speakers).
+            cfg.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::None);
             // The page keeps running though its window is off-screen: macOS 14+ says so in
             // public (inactiveSchedulingPolicy = none) …
             let prefs = cfg.preferences();
@@ -861,10 +1159,31 @@ pub(crate) mod web {
             let key = NSString::from_str("drawsBackground");
             let _: () = msg_send![&*view, setValue: &*no, forKey: &*key];
         }
-        window.setContentView(Some(&view));
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), frame);
+        holder.addSubview(&view);
+        window.setContentView(Some(&holder));
+        let tap = AudioTap::new(mtm, shared.clone());
+        let closer = WindowCloser::new(mtm, slot);
+        window.setDelegate(Some(ProtocolObject::from_ref(&*closer)));
         window.orderBack(None);
-        let page = Page { window, view, css: css.to_string(), url: String::new() };
-        let mut page = page;
+        let mut page = Page {
+            window,
+            holder,
+            view,
+            css: css.to_string(),
+            url: String::new(),
+            size: (w, h),
+            interact: None,
+            tap,
+            closer: Some(closer),
+        };
+        // SAFETY: registering a message handler on the live view's controller, main thread.
+        unsafe {
+            page.view
+                .configuration()
+                .userContentController()
+                .addScriptMessageHandler_name(ProtocolObject::from_ref(&*page.tap), &NSString::from_str(AUDIO_HANDLER));
+        }
         load(&mut page, url, css);
         Some(page)
     }
@@ -876,6 +1195,13 @@ pub(crate) mod web {
         unsafe {
             let ucc = view.configuration().userContentController();
             ucc.removeAllUserScripts();
+            let audio = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
+                WKUserScript::alloc(mtm),
+                &NSString::from_str(AUDIO_SCRIPT),
+                WKUserScriptInjectionTime::AtDocumentStart,
+                false,
+            );
+            ucc.addUserScript(&audio);
             if !css.trim().is_empty() {
                 let src = NSString::from_str(&css_script(css));
                 let script = WKUserScript::initWithSource_injectionTime_forMainFrameOnly(
@@ -904,10 +1230,47 @@ pub(crate) mod web {
         }
     }
 
-    fn resize(page: &Page, w: u32, h: u32) {
-        let size = NSSize::new(f64::from(w), f64::from(h));
-        page.window.setContentSize(size);
-        page.view.setFrameSize(size);
+    fn resize(page: &mut Page, w: u32, h: u32) {
+        if page.size == (w, h) {
+            return;
+        }
+        page.size = (w, h);
+        let at = page.interact.clone();
+        place(page, at);
+    }
+
+    /// Something to do with a page: put it on screen to click (with the window's title), take
+    /// it back, or load it again.
+    pub(crate) enum Do {
+        Interact(String),
+        Stop,
+        Reload,
+    }
+
+    /// Does it to the page behind a source's data (from `obs_obj_get_data`).
+    pub(crate) fn act(data: *mut c_void, what: Do) {
+        if data.is_null() {
+            return;
+        }
+        // SAFETY: `data` is a live Source of this kind (the caller checked the kind and holds
+        // the source); only its Arc'd page is cloned here.
+        let page = unsafe { &*data.cast::<Source>() }.page.clone();
+        let job = OnMain((page, what));
+        DispatchQueue::main().exec_async(move || {
+            let OnMain((page, what)) = job;
+            let Ok(mut p) = page.lock() else { return };
+            let Some(OnMain(p)) = p.as_mut() else { return };
+            match what {
+                Do::Interact(title) => place(p, Some(title)),
+                Do::Stop => place(p, None),
+                Do::Reload => {
+                    // SAFETY: reload of the live view on the main thread.
+                    unsafe {
+                        let _ = p.view.reload();
+                    }
+                }
+            }
+        });
     }
 
     /// Copies a snapshot into the frame: drawn into a BGRA buffer of the source's size, then
@@ -1000,7 +1363,7 @@ pub(crate) mod web {
         NAME.as_ptr()
     }
 
-    unsafe extern "C" fn create(settings: *mut ObsData, _src: *mut ObsSource) -> *mut c_void {
+    unsafe extern "C" fn create(settings: *mut ObsData, obs: *mut ObsSource) -> *mut c_void {
         let (url, w, h, css, fps) = settings_of(settings);
         let shared = Arc::new(Shared {
             frame: Mutex::new(Frame::default()),
@@ -1009,13 +1372,14 @@ pub(crate) mod web {
             w: AtomicU32::new(w),
             h: AtomicU32::new(h),
             fps: AtomicU32::new(fps),
+            source: Mutex::new(SrcPtr(obs)),
         });
-        let page: Arc<Mutex<Option<OnMain<Page>>>> = Arc::new(Mutex::new(None));
+        let page: PageSlot = Arc::new(Mutex::new(None));
         let job = OnMain((page.clone(), shared.clone()));
         let make = move || {
             let OnMain((page, shared)) = job;
             if let Some(mtm) = MainThreadMarker::new()
-                && let Some(p) = open(mtm, &url, w, h, &css)
+                && let Some(p) = open(mtm, &page, &shared, &url, w, h, &css)
                 && let Ok(mut slot) = page.lock()
             {
                 *slot = Some(OnMain(p));
@@ -1035,13 +1399,25 @@ pub(crate) mod web {
         // SAFETY: `data` is the Box made in `create`, handed back once by libobs.
         let src = unsafe { Box::from_raw(data.cast::<Source>()) };
         src.shared.alive.store(false, Ordering::Release);
+        if let Ok(mut s) = src.shared.source.lock() {
+            s.0 = std::ptr::null_mut();
+        }
         // The web view and its window go on the main thread.
         let job = OnMain(src.page.clone());
         DispatchQueue::main().exec_async(move || {
             let OnMain(page) = job;
             if let Ok(mut p) = page.lock()
-                && let Some(OnMain(p)) = p.take()
+                && let Some(OnMain(mut p)) = p.take()
             {
+                // SAFETY: undoing what `open` registered, on the live objects, main thread.
+                unsafe {
+                    p.view
+                        .configuration()
+                        .userContentController()
+                        .removeScriptMessageHandlerForName(&NSString::from_str(AUDIO_HANDLER));
+                }
+                p.window.setDelegate(None);
+                p.closer = None;
                 p.window.close();
             }
         });
@@ -1178,7 +1554,7 @@ pub(crate) mod web {
         let info = SourceInfo {
             id: KIND.as_ptr(),
             kind: 0,
-            output_flags: OBS_SOURCE_VIDEO | OBS_SOURCE_DO_NOT_DUPLICATE,
+            output_flags: OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE,
             get_name: Some(get_name),
             create: Some(create),
             destroy: Some(destroy),
@@ -1197,8 +1573,9 @@ pub(crate) mod web {
         api.obs_register_source_s((&info as *const SourceInfo).cast(), std::mem::size_of::<SourceInfo>());
     }
 
-    /// `obs-source.h`: the kind draws a picture; it can't be duplicated.
+    /// `obs-source.h`: the kind draws a picture and makes sound; it can't be duplicated.
     const OBS_SOURCE_VIDEO: u32 = 1 << 0;
+    const OBS_SOURCE_AUDIO: u32 = 1 << 1;
     const OBS_SOURCE_DO_NOT_DUPLICATE: u32 = 1 << 7;
 
     /// The few CoreGraphics calls the snapshot copy needs.
