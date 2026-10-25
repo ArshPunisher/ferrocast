@@ -244,11 +244,18 @@ async fn signups_are_rate_limited_per_address() {
     let kick = fake_kick().await;
     let r = relay(&kick).await;
     let http = reqwest::Client::new();
-    let mut last = 0;
-    for _ in 0..12 {
-        last = http.post(format!("{}/v1/installs", r.base)).send().await.unwrap().status().as_u16();
+    // The limit is 10 per clock minute; a slow run can cross a minute boundary, so send 21:
+    // however they split across two minutes, one of them gets an 11th and is refused.
+    let mut refused = false;
+    for _ in 0..21 {
+        let status = http.post(format!("{}/v1/installs", r.base)).send().await.unwrap().status().as_u16();
+        assert!(status == 201 || status == 429, "{status}");
+        if status == 429 {
+            refused = true;
+            break;
+        }
     }
-    assert_eq!(last, 429);
+    assert!(refused, "the 11th signup in a minute is refused");
 }
 
 #[test]
