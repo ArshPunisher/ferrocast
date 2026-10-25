@@ -441,7 +441,8 @@ async fn sixty_requests_a_minute_per_subscription_then_429() {
     let other = w.pro("i3", "sub_2");
     let mut ok = 0;
     let mut limited = None;
-    for i in 0..70 {
+    // Up to two windows' worth: a minute can roll over once mid-test (slow CI runners).
+    for i in 0..130 {
         // Two PCs on one subscription share the rate.
         let a = if i % 2 == 0 { &auth } else { &second };
         let res = w.http.get(format!("{}/v1/pro/history", w.base)).bearer_auth(a).send().await.unwrap();
