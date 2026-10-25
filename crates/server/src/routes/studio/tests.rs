@@ -538,6 +538,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 640, "h": 360 } })).await,
         r.get("/studio/engine/kinds/color_source_v3/defaults").await,
         r.get("/studio/engine/sources").await,
+        r.get("/studio/engine/stream").await,
+        r.post("/studio/engine/stream", json!({ "on": false })).await,
         r.post("/studio/engine/sources", json!({ "kind": "color_source", "name": "Back" })).await,
         r.get("/studio/engine/sources/Back/settings").await,
         r.get("/studio/engine/sources/Back/options").await,

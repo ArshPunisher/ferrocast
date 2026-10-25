@@ -423,26 +423,7 @@ impl Studio {
     /// and AAC sound.
     pub fn record(&self, path: &Path, video_encoder: &str) -> Result<Recording, StudioError> {
         let a = &self.inner.api;
-        let (vid, vname) = (cstr(video_encoder), cstr("ferrocast-video"));
-        let venc = a.obs_video_encoder_create(vid.as_ptr(), vname.as_ptr(), ptr::null_mut(), ptr::null_mut());
-        if venc.is_null() {
-            return Err(StudioError::Failed(format!("the encoder \"{video_encoder}\" isn't available")));
-        }
-        let aname = cstr("ferrocast-audio");
-        let mut aenc = ptr::null_mut();
-        for id in ["ffmpeg_aac", "CoreAudio_AAC"] {
-            let aid = cstr(id);
-            aenc = a.obs_audio_encoder_create(aid.as_ptr(), aname.as_ptr(), ptr::null_mut(), 0, ptr::null_mut());
-            if !aenc.is_null() {
-                break;
-            }
-        }
-        if aenc.is_null() {
-            a.obs_encoder_release(venc);
-            return Err(StudioError::Failed("no AAC encoder is available".into()));
-        }
-        a.obs_encoder_set_video(venc, a.obs_get_video());
-        a.obs_encoder_set_audio(aenc, a.obs_get_audio());
+        let (venc, aenc) = self.encoders(video_encoder, None, 160)?;
         let settings = a.obs_data_create();
         let (k, v) = (cstr("path"), cstr(&path.display().to_string()));
         a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
@@ -462,6 +443,84 @@ impl Studio {
             )));
         }
         Ok(rec)
+    }
+
+    /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output, with
+    /// its reconnects: every 2 s, up to 25 times). Stops when the handle is dropped.
+    pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<Streaming, StudioError> {
+        let a = &self.inner.api;
+        let (venc, aenc) = self.encoders(&s.video_encoder, Some((s.video_kbps, s.keyframe_s)), s.audio_kbps)?;
+        let settings = a.obs_data_create();
+        for (k, v) in [("server", server), ("key", key)] {
+            let (k, v) = (cstr(k), cstr(v));
+            a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
+        }
+        let (sid, sname) = (cstr("rtmp_custom"), cstr("ferrocast-service"));
+        let service = a.obs_service_create(sid.as_ptr(), sname.as_ptr(), settings, ptr::null_mut());
+        a.obs_data_release(settings);
+        let (oid, oname) = (cstr("rtmp_output"), cstr("ferrocast-stream"));
+        let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), ptr::null_mut(), ptr::null_mut());
+        let stream = Streaming { studio: self.clone(), out, service, venc, aenc };
+        if service.is_null() || out.is_null() {
+            return Err(StudioError::Failed("the stream output couldn't be made".into()));
+        }
+        a.obs_output_set_video_encoder(out, venc);
+        a.obs_output_set_audio_encoder(out, aenc, 0);
+        a.obs_output_set_service(out, service);
+        a.obs_output_set_reconnect_settings(out, 25, 2);
+        if !a.obs_output_start(out) {
+            let why = text(a.obs_output_get_last_error(out));
+            return Err(StudioError::Failed(if why.is_empty() {
+                "the stream didn't start: the server refused or couldn't be reached".into()
+            } else {
+                format!("the stream didn't start: {why}")
+            }));
+        }
+        Ok(stream)
+    }
+
+    /// A video encoder (CBR at `video` = (kbps, keyframe seconds), or the encoder's own
+    /// defaults) and an AAC audio encoder, tied to the canvas.
+    fn encoders(
+        &self,
+        video_encoder: &str,
+        video: Option<(u32, u32)>,
+        audio_kbps: u32,
+    ) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
+        let a = &self.inner.api;
+        let vs = a.obs_data_create();
+        if let Some((kbps, keyint)) = video {
+            let (b, r, k, cbr) = (cstr("bitrate"), cstr("rate_control"), cstr("keyint_sec"), cstr("CBR"));
+            a.obs_data_set_int(vs, b.as_ptr(), i64::from(kbps));
+            a.obs_data_set_string(vs, r.as_ptr(), cbr.as_ptr());
+            a.obs_data_set_int(vs, k.as_ptr(), i64::from(keyint));
+        }
+        let (vid, vname) = (cstr(video_encoder), cstr("ferrocast-video"));
+        let venc = a.obs_video_encoder_create(vid.as_ptr(), vname.as_ptr(), vs, ptr::null_mut());
+        a.obs_data_release(vs);
+        if venc.is_null() {
+            return Err(StudioError::Failed(format!("the encoder \"{video_encoder}\" isn't available")));
+        }
+        let as_ = a.obs_data_create();
+        let b = cstr("bitrate");
+        a.obs_data_set_int(as_, b.as_ptr(), i64::from(audio_kbps));
+        let aname = cstr("ferrocast-audio");
+        let mut aenc = ptr::null_mut();
+        for id in ["ffmpeg_aac", "CoreAudio_AAC"] {
+            let aid = cstr(id);
+            aenc = a.obs_audio_encoder_create(aid.as_ptr(), aname.as_ptr(), as_, 0, ptr::null_mut());
+            if !aenc.is_null() {
+                break;
+            }
+        }
+        a.obs_data_release(as_);
+        if aenc.is_null() {
+            a.obs_encoder_release(venc);
+            return Err(StudioError::Failed("no AAC encoder is available".into()));
+        }
+        a.obs_encoder_set_video(venc, a.obs_get_video());
+        a.obs_encoder_set_audio(aenc, a.obs_get_audio());
+        Ok((venc, aenc))
     }
 }
 
@@ -775,6 +834,75 @@ impl Drop for Recording {
                 std::thread::sleep(Duration::from_millis(50));
             }
             a.obs_output_release(self.out);
+        }
+        a.obs_encoder_release(self.venc);
+        a.obs_encoder_release(self.aenc);
+    }
+}
+
+/// What a stream sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSettings {
+    /// An encoder id from `kinds().encoders` (`obs_x264`, VideoToolbox's…).
+    pub video_encoder: String,
+    pub video_kbps: u32,
+    pub audio_kbps: u32,
+    /// Seconds between keyframes (platforms ask for 2).
+    pub keyframe_s: u32,
+}
+
+/// How a stream is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StreamStats {
+    pub active: bool,
+    pub reconnecting: bool,
+    pub bytes: u64,
+    pub frames: u32,
+    pub dropped: u32,
+}
+
+/// A stream in progress. Dropping it stops it (and waits up to 10 s for that).
+#[derive(Debug)]
+pub struct Streaming {
+    studio: Studio,
+    out: *mut ffi::ObsOutput,
+    service: *mut ffi::ObsService,
+    venc: *mut ffi::ObsEncoder,
+    aenc: *mut ffi::ObsEncoder,
+}
+
+impl Streaming {
+    pub fn stats(&self) -> StreamStats {
+        let a = &self.studio.inner.api;
+        StreamStats {
+            active: a.obs_output_active(self.out),
+            reconnecting: a.obs_output_reconnecting(self.out),
+            bytes: a.obs_output_get_total_bytes(self.out),
+            frames: u32::try_from(a.obs_output_get_total_frames(self.out)).unwrap_or(0),
+            dropped: u32::try_from(a.obs_output_get_frames_dropped(self.out)).unwrap_or(0),
+        }
+    }
+
+    /// The reason OBS gave for the last failure, if any.
+    pub fn last_error(&self) -> Option<String> {
+        let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
+        (!e.is_empty()).then_some(e)
+    }
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        let a = &self.studio.inner.api;
+        if !self.out.is_null() {
+            a.obs_output_stop(self.out);
+            let until = Instant::now() + Duration::from_secs(10);
+            while a.obs_output_active(self.out) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            a.obs_output_release(self.out);
+        }
+        if !self.service.is_null() {
+            a.obs_service_release(self.service);
         }
         a.obs_encoder_release(self.venc);
         a.obs_encoder_release(self.aenc);

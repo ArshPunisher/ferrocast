@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{AddSource, PreviewRect, STOPPED, SourceEdit, StudioHost, StudioStatus};
-use ferrocast_studio::{Canvas, Paths, Preview, Rect, Scene, Studio};
+use ferrocast_studio::{Canvas, Paths, Preview, Rect, Scene, StreamSettings, Streaming, Studio};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
@@ -23,6 +23,7 @@ struct Held {
     studio: Option<Studio>,
     scene: Option<Scene>,
     preview: Option<Preview>,
+    stream: Option<Streaming>,
     renderer: &'static str,
 }
 
@@ -49,6 +50,28 @@ fn obs_paths() -> Option<(Paths, &'static str)> {
     {
         None
     }
+}
+
+/// What the Studio streams into Go live with: the Mac's hardware H.264 when there is one,
+/// else x264. Go live sends it on as it comes, so this is what viewers get (Twitch takes up
+/// to 6000 kbps; Kick refuses over 8000, 25 Oct).
+fn stream_settings(studio: &Studio) -> StreamSettings {
+    const HARDWARE: &str = "com.apple.videotoolbox.videoencoder.ave.avc";
+    let hardware = studio.kinds().encoders.iter().any(|e| e.id == HARDWARE);
+    StreamSettings {
+        video_encoder: if hardware { HARDWARE } else { "obs_x264" }.into(),
+        video_kbps: 6000,
+        audio_kbps: 160,
+        keyframe_s: 2,
+    }
+}
+
+fn stats_of(s: &Streaming) -> Value {
+    let mut v = serde_json::to_value(s.stats()).unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("error".into(), s.last_error().map_or(Value::Null, Value::String));
+    }
+    v
 }
 
 const NO_OBS: &str = "The Studio preview uses OBS's engine from the OBS installed on this computer. Install OBS 32 or newer (obsproject.com), then try again.";
@@ -143,7 +166,8 @@ impl StudioHost for DesktopStudio {
 
     async fn stop(&self) -> Result<StudioStatus, String> {
         self.on_main(|h| {
-            // The preview and the scene go; the engine stays loaded for the next Start.
+            // The stream, the preview and the scene go; the engine stays loaded for the next Start.
+            h.stream = None;
             h.preview = None;
             if let Some(s) = h.studio.as_ref() {
                 s.clear_program();
@@ -245,5 +269,34 @@ impl StudioHost for DesktopStudio {
             .map_err(|e| e.to_string())
         })
         .await
+    }
+
+    async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let studio = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
+                return Ok(stats_of(s));
+            }
+            // A stopped or failed one goes first: one output at a time.
+            h.stream = None;
+            let settings = stream_settings(studio);
+            tracing::info!(encoder = %settings.video_encoder, kbps = settings.video_kbps, "the Studio starts streaming into Go live");
+            let stream = studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?;
+            let v = stats_of(&stream);
+            h.stream = Some(stream);
+            Ok(v)
+        })
+        .await?
+    }
+
+    async fn stream_stop(&self) -> Result<(), String> {
+        self.on_main(|h| {
+            h.stream = None;
+        })
+        .await
+    }
+
+    async fn stream_stats(&self) -> Result<Value, String> {
+        self.on_main(|h| h.stream.as_ref().map_or(Value::Null, stats_of)).await
     }
 }

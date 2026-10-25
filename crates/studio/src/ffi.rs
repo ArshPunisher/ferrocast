@@ -21,6 +21,7 @@ opaque!(
     ObsProperty,
     ObsEncoder,
     ObsOutput,
+    ObsService,
     ObsDisplay,
     VideoT,
     AudioT
@@ -215,6 +216,8 @@ api! {
     obs_data_create: fn() -> *mut ObsData;
     obs_data_release: fn(a: *mut ObsData);
     obs_data_set_string: fn(a: *mut ObsData, b: *const c_char, c: *const c_char);
+    obs_data_set_int: fn(a: *mut ObsData, b: *const c_char, c: i64);
+    obs_data_set_bool: fn(a: *mut ObsData, b: *const c_char, c: bool);
     obs_scene_create: fn(a: *const c_char) -> *mut ObsScene;
     obs_scene_release: fn(a: *mut ObsScene);
     obs_scene_add: fn(a: *mut ObsScene, b: *mut ObsSource) -> *mut ObsSceneItem;
@@ -250,6 +253,14 @@ api! {
     obs_output_active: fn(a: *const ObsOutput) -> bool;
     obs_output_get_last_error: fn(a: *mut ObsOutput) -> *const c_char;
     obs_output_release: fn(a: *mut ObsOutput);
+    obs_output_set_service: fn(a: *mut ObsOutput, b: *mut ObsService);
+    obs_output_set_reconnect_settings: fn(a: *mut ObsOutput, b: c_int, c: c_int);
+    obs_output_reconnecting: fn(a: *const ObsOutput) -> bool;
+    obs_output_get_total_bytes: fn(a: *const ObsOutput) -> u64;
+    obs_output_get_total_frames: fn(a: *const ObsOutput) -> c_int;
+    obs_output_get_frames_dropped: fn(a: *const ObsOutput) -> c_int;
+    obs_service_create: fn(a: *const c_char, b: *const c_char, c: *mut ObsData, d: *mut ObsData) -> *mut ObsService;
+    obs_service_release: fn(a: *mut ObsService);
     obs_get_total_frames: fn() -> u32;
     obs_get_lagged_frames: fn() -> u32;
     obs_display_create: fn(a: *const GsInitData, b: u32) -> *mut ObsDisplay;

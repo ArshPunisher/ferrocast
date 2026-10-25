@@ -70,6 +70,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Changes only the keys given.
     async fn update_source(&self, name: String, settings: Value) -> Result<(), String>;
     async fn edit_source(&self, name: String, edit: SourceEdit) -> Result<(), String>;
+    /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
+    async fn stream_start(&self, server: String, key: String) -> Result<Value, String>;
+    async fn stream_stop(&self) -> Result<(), String>;
+    /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
+    async fn stream_stats(&self) -> Result<Value, String>;
 }
 
 /// `POST /studio/engine/sources`.
@@ -210,6 +215,22 @@ impl Engine {
         self.studio_host()?.edit_source(name.to_string(), edit).await.map_err(failed)
     }
 
+    /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
+    /// to every destination switched on, as a stream from OBS would.
+    pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
+        let host = self.studio_host()?;
+        if !on {
+            host.stream_stop().await.map_err(failed)?;
+            return Ok(Value::Null);
+        }
+        let (server, key) = self.golive_ingest().await?;
+        host.stream_start(server, key).await.map_err(failed)
+    }
+
+    pub async fn studio_stream_stats(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.stream_stats().await.map_err(failed)
+    }
+
     pub async fn studio_preview(&self, rect: Option<PreviewRect>) -> Result<(), EngineError> {
         if let Some(r) = &rect {
             r.validate().map_err(EngineError::Invalid)?;
@@ -304,6 +325,15 @@ mod tests {
         }
         async fn edit_source(&self, _name: String, _edit: SourceEdit) -> Result<(), String> {
             Ok(())
+        }
+        async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
+            Ok(serde_json::json!({ "server": server, "key_len": key.len() }))
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
         }
     }
 

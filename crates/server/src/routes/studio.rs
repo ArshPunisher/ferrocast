@@ -30,6 +30,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/kinds/{id}/options", get(engine_options))
         .route("/studio/engine/preview", put(engine_preview))
         .route("/studio/engine/kinds/{id}/defaults", get(engine_defaults))
+        .route("/studio/engine/stream", get(engine_stream_stats).post(engine_stream))
         .route("/studio/engine/sources", get(engine_sources).post(engine_add_source))
         .route("/studio/engine/sources/{name}/settings", get(engine_source_settings).put(engine_update_source))
         .route("/studio/engine/sources/{name}/options", get(engine_source_options))
@@ -281,6 +282,19 @@ struct PreviewBody {
 async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview(b.rect).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct StreamBody {
+    on: bool,
+}
+
+async fn engine_stream(State(app): State<AppState>, Body(b): Body<StreamBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_stream(b.on).await?))
+}
+
+async fn engine_stream_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_stream_stats().await?))
 }
 
 async fn engine_defaults(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
