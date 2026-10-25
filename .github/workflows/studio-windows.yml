@@ -2,7 +2,8 @@ name: Studio on Windows
 
 # The Studio's engine spike on Windows (2.1, Track B): loads OBS's obs.dll from OBS's own
 # portable zip, lists every kind, records 5 s through D3D11 (WARP, Windows's software
-# renderer: runners have no GPU) and keeps the video. There's no Windows PC to test on, so
+# renderer: runners have no GPU), then shows a page in OBS's Browser source (Chromium) and
+# records that too; both videos are kept. There's no Windows PC to test on, so
 # this is where the Windows engine is checked. Only when the Studio crate changes.
 
 on:
@@ -50,6 +51,13 @@ jobs:
           $env:FERROCAST_LOG = "info"
           cargo run --locked -p ferrocast-studio --example probe -- "$env:RUNNER_TEMP\probe" d3d11 noopts
           if (-not (Test-Path "$env:RUNNER_TEMP\probe\probe.mp4")) { throw "no recording" }
+      - name: OBS's Browser source (Chromium) in the Studio
+        shell: pwsh
+        run: |
+          $env:FERROCAST_OBS_DIR = "$env:RUNNER_TEMP\obs"
+          $env:FERROCAST_LOG = "info"
+          cargo run --locked -p ferrocast-studio --example browser -- "$env:RUNNER_TEMP\probe"
+          if (-not (Test-Path "$env:RUNNER_TEMP\probe\browser.mp4")) { throw "no browser recording" }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
