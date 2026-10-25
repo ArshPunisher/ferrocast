@@ -103,7 +103,11 @@ fn handle(state: &Arc<Mutex<FakeObs>>, kind: &str, data: &Value) -> (bool, Value
         "SetInputSettings" => {
             let uuid = data["inputUuid"].as_str().unwrap_or("");
             if let Some(i) = s.inputs.iter_mut().find(|(_, u, _)| u == uuid) {
-                i.2 = data["inputSettings"].clone();
+                // `overlay: true` merges into what's there, like OBS; otherwise it replaces.
+                match (data["overlay"].as_bool(), i.2.as_object_mut(), data["inputSettings"].as_object()) {
+                    (Some(true), Some(cur), Some(new)) => cur.extend(new.clone()),
+                    _ => i.2 = data["inputSettings"].clone(),
+                }
                 (true, Value::Null)
             } else {
                 (false, Value::Null)
@@ -151,6 +155,7 @@ async fn adds_then_updates_in_place_then_adds_to_a_new_scene() {
         assert_eq!(s.inputs[0].2["url"], "http://127.0.0.1:47820/o/bbb/");
         assert_eq!(s.inputs[0].2["width"], 1280);
         assert_eq!(s.inputs[0].2["shutdown"], false);
+        // Made with its sounds going through OBS; the update leaves that as the streamer has it.
         assert_eq!(s.inputs[0].2["reroute_audio"], true, "a new source's sounds go through OBS");
     }
     st.lock().unwrap().scene = ("Just Chatting".into(), "22222222-2222-4222-8222-222222222222".into());
