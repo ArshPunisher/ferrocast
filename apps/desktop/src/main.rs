@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod studio;
+
 use ferrocast_engine::Engine;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -120,6 +122,7 @@ fn main() {
             };
             let engine = running.engine.clone();
             app.manage(running);
+            engine.set_studio_host(Arc::new(studio::DesktopStudio::new(app.handle().clone(), dir.clone())));
             let shell = Arc::new(Shell::default());
             shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
             app.manage(shell.clone());
@@ -546,7 +549,13 @@ async fn start(dir: &std::path::Path) -> Result<Running, String> {
     let server = ferrocast_server::serve(engine.clone(), opts)
         .await
         .map_err(|e| format!("The local server couldn't start: {e}"))?;
-    Ok(Running { engine, base: server.base_url(), token: server.sessions.desktop_token().to_string() })
+    let token = server.sessions.desktop_token().to_string();
+    // Dev builds only: tests drive this window's engine from outside (never in a release).
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("FERROCAST_DEBUG_TOKEN_FILE") {
+        let _ = std::fs::write(path, format!("{} {}", server.base_url(), token));
+    }
+    Ok(Running { engine, base: server.base_url(), token })
 }
 
 /// Only web pages leave the app; `file:`, `javascript:` and custom schemes never do.

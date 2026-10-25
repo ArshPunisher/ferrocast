@@ -19,6 +19,7 @@ ferrocast-youtube = { path = "crates/youtube" }
 ferrocast-kick = { path = "crates/kick" }
 ferrocast-obs = { path = "crates/obs" }
 ferrocast-golive = { path = "crates/golive" }
+ferrocast-studio = { path = "crates/studio" }
 ferrocast-secrets = { path = "crates/secrets" }
 ferrocast-engine = { path = "crates/engine" }
 ferrocast-server = { path = "crates/server" }

@@ -20,6 +20,9 @@ tauri-build = { version = "2", features = [] }
 ferrocast-core.workspace = true
 ferrocast-engine.workspace = true
 ferrocast-server.workspace = true
+ferrocast-studio.workspace = true
+raw-window-handle = "0.6"
+async-trait = "0.1"
 tokio.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
