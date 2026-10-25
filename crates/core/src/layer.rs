@@ -275,7 +275,7 @@ pub fn validate(config: &Value) -> Check {
         }
         "music" => {
             one_of(obj, path, "look", &["wave", "pulse"])?;
-            for c in ["color", "color2", "text_color"] {
+            for c in ["color", "color2", "text_color", "background"] {
                 opt_color(obj, path, c)?;
             }
             if let Some(f) = opt_str(obj, path, "font")? {
@@ -477,6 +477,7 @@ mod tests {
             (json!({ "type": "fx", "preset": "hex", "speed": 9 }), "config.speed"),
             (json!({ "type": "fx", "preset": "hex", "color": "url(x)" }), "config.color"),
             (json!({ "type": "music", "look": "ring" }), "config.look"),
+            (json!({ "type": "music", "background": "url(x)" }), "config.background"),
             (json!({ "type": "music", "font": "a;b" }), "config.font"),
             (json!({ "type": "sound", "on_show": "airhorn" }), "config.on_show"),
             (json!({ "type": "sound", "loop": "whoosh" }), "config.loop"),
