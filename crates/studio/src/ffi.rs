@@ -132,7 +132,7 @@ macro_rules! api {
                 // what couldn't load before it is tried again after.
                 let (mut _deps, left) = deps.map(load_deps).unwrap_or_default();
                 // SAFETY: loading libobs runs its initialisers, which only set up its own state.
-                let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+                let lib = unsafe { open(path) }.map_err(|e| e.to_string())?;
                 _deps.extend(load_all(left).0);
                 let fns = Fns {
                     $(
@@ -279,6 +279,25 @@ api! {
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
 /// dependency isn't loaded yet fails the first round and loads in a later one.
+/// Opens a library. On Windows its own folder is searched for what it depends on (obs.dll's
+/// ffmpeg DLLs sit next to it), as `LoadLibrary` doesn't by default.
+///
+/// # Safety
+/// Loading runs the library's initialisers; callers only open OBS's own libraries.
+unsafe fn open(path: &Path) -> Result<Library, libloading::Error> {
+    #[cfg(windows)]
+    {
+        use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library as WinLibrary};
+        // SAFETY: as for this function.
+        unsafe { WinLibrary::load_with_flags(path, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(Library::from)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: as for this function.
+        unsafe { Library::new(path) }
+    }
+}
+
 /// Loads what it can of OBS's bundled libraries → (loaded, the ones that couldn't load yet).
 fn load_deps(dir: &Path) -> (Vec<Library>, Vec<std::path::PathBuf>) {
     // Loose libraries (ffmpeg, x264…) and the frameworks plugins link by @rpath: Qt, which
@@ -291,7 +310,7 @@ fn load_deps(dir: &Path) -> (Vec<Library>, Vec<std::path::PathBuf>) {
             r.flatten()
                 .map(|e| e.path())
                 .filter_map(|p| match p.extension().and_then(|x| x.to_str()) {
-                    Some("dylib") => Some(p),
+                    Some("dylib" | "dll") => Some(p),
                     Some("framework") => {
                         let name = p.file_stem()?.to_str()?.to_string();
                         let bin = p.join(&name);
@@ -314,7 +333,7 @@ fn load_all(mut left: Vec<std::path::PathBuf>) -> (Vec<Library>, Vec<std::path::
         left.retain(|p| {
             // SAFETY: these are OBS's own bundled libraries (ffmpeg, x264, mbedtls, srt, Qt…);
             // loading them only runs their initialisers.
-            match unsafe { Library::new(p) } {
+            match unsafe { open(p) } {
                 Ok(l) => {
                     loaded.push(l);
                     false

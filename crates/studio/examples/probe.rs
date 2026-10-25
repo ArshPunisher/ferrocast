@@ -1,7 +1,8 @@
-//! Runs OBS's engine from an installed OBS.app (macOS) and checks the Studio crate end to end:
-//! every kind with its options, a scene, and a 5 s recording.
+//! Runs OBS's engine from an installed OBS (OBS.app on macOS; on Windows the folder in
+//! `FERROCAST_OBS_DIR`, an install or OBS's portable zip) and checks the Studio crate end to
+//! end: every kind with its options, a scene, and a 5 s recording.
 //!
-//!   cargo run -p ferrocast-studio --example probe -- <out dir> [metal|opengl]
+//!   cargo run -p ferrocast-studio --example probe -- <out dir> [metal|opengl] [noopts]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,15 +11,30 @@ use ferrocast_studio::{Canvas, Paths, Studio};
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("FERROCAST_LOG").unwrap_or_else(|_| "warn".into()))
+        .init();
     let mut args = std::env::args().skip(1);
     let out = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let metal = args.next().as_deref() != Some("opengl");
     let read_options = args.next().as_deref() != Some("noopts");
     std::fs::create_dir_all(&out)?;
-    let paths = Paths::from_obs_app(std::path::Path::new("/Applications/OBS.app/Contents"), metal);
+    let paths = if cfg!(windows) {
+        let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| r"C:\Program Files\obs-studio".into());
+        Paths::from_obs_windows(std::path::Path::new(&dir))
+    } else {
+        Paths::from_obs_app(std::path::Path::new("/Applications/OBS.app/Contents"), metal)
+    };
     let canvas = Canvas { width: 1280, height: 720, fps: 30 };
     let studio = Studio::start(&paths, canvas, &out.join("plugin-config"))?;
-    println!("libobs {} on {}", studio.version(), if metal { "Metal" } else { "OpenGL" });
+    let renderer = if cfg!(windows) {
+        "D3D11"
+    } else if metal {
+        "Metal"
+    } else {
+        "OpenGL"
+    };
+    println!("libobs {} on {renderer}", studio.version());
 
     let k = studio.kinds();
     println!(

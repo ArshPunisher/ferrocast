@@ -55,8 +55,8 @@ pub struct Paths {
     pub plugin_bin: String,
     /// Plugin data, `%module%` likewise.
     pub plugin_data: String,
-    /// Libraries libobs finds by `@rpath`, loaded first (an OBS.app's Frameworks). None when
-    /// they sit where libobs looks (inside Ferrocast.app).
+    /// Libraries libobs and its plugins link to, loaded first (an OBS.app's Frameworks, or
+    /// OBS's `bin/64bit` on Windows). None when they sit where libobs looks.
     pub deps: Option<PathBuf>,
 }
 
@@ -72,6 +72,22 @@ impl Paths {
             plugin_bin: format!("{c}/PlugIns/%module%.plugin/Contents/MacOS/"),
             plugin_data: format!("{c}/PlugIns/%module%.plugin/Contents/Resources/"),
             deps: Some(fw),
+        }
+    }
+
+    /// An OBS install or portable folder on Windows: `root` holds `bin`, `data` and
+    /// `obs-plugins`. D3D11 is OBS's renderer there (WARP, Windows's software one, where
+    /// there's no GPU).
+    pub fn from_obs_windows(root: &Path) -> Paths {
+        let r = root.display();
+        let bin = root.join("bin").join("64bit");
+        Paths {
+            libobs: bin.join("obs.dll"),
+            renderer: bin.join("libobs-d3d11.dll"),
+            data: format!("{r}/data/libobs/"),
+            plugin_bin: format!("{r}/obs-plugins/64bit/"),
+            plugin_data: format!("{r}/data/obs-plugins/%module%/"),
+            deps: Some(bin),
         }
     }
 }
@@ -919,6 +935,9 @@ mod tests {
         assert_eq!(p.libobs, Path::new("/Applications/OBS.app/Contents/Frameworks/libobs.framework/Versions/A/libobs"));
         assert!(p.renderer.ends_with("libobs-metal.dylib"));
         assert!(p.plugin_bin.contains("%module%.plugin/Contents/MacOS/"));
+        let w = Paths::from_obs_windows(Path::new("C:/obs"));
+        assert!(w.libobs.ends_with("bin/64bit/obs.dll") && w.renderer.ends_with("libobs-d3d11.dll"));
+        assert_eq!(w.plugin_data, "C:/obs/data/obs-plugins/%module%/");
         assert!(p.data.ends_with('/'));
     }
 

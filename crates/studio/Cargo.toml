@@ -27,6 +27,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+# The examples print libobs's own log (FERROCAST_LOG=info).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # The workspace forbids unsafe code. Calling libobs needs it, so here it is denied instead and
 # allowed in src/ffi.rs only, each block with its SAFETY reason (LESSONS R-73).

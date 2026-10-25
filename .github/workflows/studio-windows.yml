@@ -1,0 +1,58 @@
+name: Studio on Windows
+
+# The Studio's engine spike on Windows (2.1, Track B): loads OBS's obs.dll from OBS's own
+# portable zip, lists every kind, records 5 s through D3D11 (WARP, Windows's software
+# renderer: runners have no GPU) and keeps the video. There's no Windows PC to test on, so
+# this is where the Windows engine is checked. Only when the Studio crate changes.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - crates/studio/**
+      - .github/workflows/studio-windows.yml
+
+concurrency:
+  group: studio-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  OBS_VERSION: 32.2.2
+  # sha256 of OBS-Studio-32.2.2-Windows-x64.zip from obsproject/obs-studio's release.
+  OBS_SHA256: 4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1
+
+jobs:
+  probe:
+    name: libobs on Windows (D3D11)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: OBS's portable zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
+          gh release download $env:OBS_VERSION -R obsproject/obs-studio -p $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:OBS_SHA256) { throw "OBS zip checksum mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\obs"
+      - name: Probe (every kind, a scene, a 5 s recording)
+        shell: pwsh
+        run: |
+          $env:FERROCAST_OBS_DIR = "$env:RUNNER_TEMP\obs"
+          $env:FERROCAST_LOG = "info"
+          cargo run --locked -p ferrocast-studio --example probe -- "$env:RUNNER_TEMP\probe" d3d11 noopts
+          if (-not (Test-Path "$env:RUNNER_TEMP\probe\probe.mp4")) { throw "no recording" }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: studio-windows-probe
+          path: ${{ runner.temp }}/probe
+          if-no-files-found: ignore
