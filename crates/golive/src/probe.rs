@@ -182,10 +182,18 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
     }
     // The measured rate includes audio (up to about 320 kbps).
     if stats.kbps > max_kbps + 400 {
+        // Kick cuts a stream over its limit (seen 25 Oct: it dropped and reconnected every 15 s at
+        // 12,000 kbps); Twitch and YouTube take it and their viewers may see it stutter.
+        let then = if s == Service::Kick {
+            "Kick cuts it off, so it keeps dropping and reconnecting"
+        } else {
+            "viewers may see it stutter"
+        };
         out.push(format!(
-            "{name} takes up to {} of video; you're sending {}. Lower the bitrate in OBS, or viewers may see it stutter.",
+            "{name} takes up to {} of video; you're sending {}. Set Bitrate to {} or less in OBS (Settings, Output), or {then}.",
             kbps_text(max_kbps),
-            kbps_text(stats.kbps)
+            kbps_text(stats.kbps),
+            kbps_text(max_kbps.saturating_sub(500)),
         ));
     }
     out
@@ -282,6 +290,12 @@ mod tests {
         // A 2.2 s gap is an encoder rounding, not a problem.
         let near = StreamStats { keyframe_interval_ms: Some(2200), ..good };
         assert!(rules(&near, Service::Twitch).is_empty());
+        // Over Kick's limit (the 25 Oct test: 12,001 kbps): it says Kick cuts it, and the number to set.
+        let fast = StreamStats { kbps: 12_001, ..good };
+        let k = rules(&fast, Service::Kick);
+        assert_eq!(k.len(), 1);
+        assert!(k[0].contains("Set Bitrate to 7,500 kbps or less") && k[0].contains("keeps dropping"), "{k:?}");
+        assert!(rules(&fast, Service::Twitch)[0].contains("stutter"));
     }
 
     #[test]
