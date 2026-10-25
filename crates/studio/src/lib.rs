@@ -124,6 +124,8 @@ pub struct OptionInfo {
     pub step: Option<f64>,
     /// A list's choices, as shown.
     pub choices: Vec<String>,
+    /// The value saved for each choice (same order): a number, text or true/false.
+    pub values: Vec<serde_json::Value>,
     /// A group's own options.
     pub group: Vec<OptionInfo>,
 }
@@ -244,14 +246,20 @@ impl Studio {
         text(self.inner.api.obs_get_version_string())
     }
 
-    /// Every kind the loaded plugins offer.
+    /// Every kind the loaded plugins offer. Like OBS's Add menu, source kinds replaced by a
+    /// newer version or kept for OBS's own use are left out.
     pub fn kinds(&self) -> Kinds {
-        let list = |f: &dyn Fn(usize, *mut *const std::ffi::c_char) -> bool, encoder: bool| {
+        // `source`: input, filter and transition kinds, which have source flags.
+        let list = |f: &dyn Fn(usize, *mut *const std::ffi::c_char) -> bool, encoder: bool, source: bool| {
             let mut out = Vec::new();
             for i in 0.. {
                 let mut id = ptr::null();
                 if !f(i, &mut id) {
                     break;
+                }
+                let flags = if source { self.inner.api.obs_get_source_output_flags(id) } else { 0 };
+                if flags & (ffi::OBS_SOURCE_DEPRECATED | ffi::OBS_SOURCE_CAP_DISABLED) != 0 {
+                    continue;
                 }
                 let name = if encoder {
                     text(self.inner.api.obs_encoder_get_display_name(id))
@@ -263,15 +271,28 @@ impl Studio {
             out
         };
         Kinds {
-            inputs: list(&|i, p| self.inner.api.obs_enum_input_types(i, p), false),
-            filters: list(&|i, p| self.inner.api.obs_enum_filter_types(i, p), false),
-            transitions: list(&|i, p| self.inner.api.obs_enum_transition_types(i, p), false),
-            encoders: list(&|i, p| self.inner.api.obs_enum_encoder_types(i, p), true),
-            outputs: list(&|i, p| self.inner.api.obs_enum_output_types(i, p), false)
+            inputs: list(&|i, p| self.inner.api.obs_enum_input_types(i, p), false, true),
+            filters: list(&|i, p| self.inner.api.obs_enum_filter_types(i, p), false, true),
+            transitions: list(&|i, p| self.inner.api.obs_enum_transition_types(i, p), false, true),
+            encoders: list(&|i, p| self.inner.api.obs_enum_encoder_types(i, p), true, false),
+            outputs: list(&|i, p| self.inner.api.obs_enum_output_types(i, p), false, false)
                 .into_iter()
                 .map(|k| Kind { name: k.id.clone(), ..k })
                 .collect(),
         }
+    }
+
+    /// The settings a new source of `kind` starts with (what OBS fills in for keys not given).
+    pub fn defaults(&self, kind: &str) -> Result<serde_json::Value, StudioError> {
+        let a = &self.inner.api;
+        let id = cstr(kind);
+        let data = a.obs_get_source_defaults(id.as_ptr());
+        if data.is_null() {
+            return Err(StudioError::Failed(format!("OBS has no source kind \"{kind}\".")));
+        }
+        let json = text(a.obs_data_get_json_with_defaults(data));
+        a.obs_data_release(data);
+        serde_json::from_str(&json).map_err(|e| StudioError::Failed(format!("OBS's settings didn't read: {e}")))
     }
 
     /// Every option of a kind of source or filter, read from a private (unlisted) source the
@@ -284,13 +305,29 @@ impl Studio {
         if src.is_null() {
             return Err(StudioError::Failed(format!("OBS has no source kind \"{kind}\".")));
         }
-        let props = self.inner.api.obs_source_properties(src);
-        let out = if props.is_null() { Vec::new() } else { self.read_options(props) };
-        if !props.is_null() {
-            self.inner.api.obs_properties_destroy(props);
-        }
+        let out = self.source_options(src, false);
         self.inner.api.obs_source_release(src);
         Ok(out)
+    }
+
+    /// A source's options; with `current`, as they look for its own settings (OBS shows or
+    /// hides some options, and fills some lists, from what's chosen).
+    fn source_options(&self, src: *mut ffi::ObsSource, current: bool) -> Vec<OptionInfo> {
+        let a = &self.inner.api;
+        let props = a.obs_source_properties(src);
+        if props.is_null() {
+            return Vec::new();
+        }
+        if current {
+            let data = a.obs_source_get_settings(src);
+            if !data.is_null() {
+                a.obs_properties_apply_settings(props, data);
+                a.obs_data_release(data);
+            }
+        }
+        let out = self.read_options(props);
+        a.obs_properties_destroy(props);
+        out
     }
 
     fn read_options(&self, props: *mut ffi::ObsProperties) -> Vec<OptionInfo> {
@@ -313,10 +350,21 @@ impl Studio {
                 ),
                 _ => (None, None, None),
             };
-            let choices = if kind == "list" {
-                (0..a.obs_property_list_item_count(p)).map(|i| text(a.obs_property_list_item_name(p, i))).collect()
+            let (choices, values) = if kind == "list" {
+                let format = a.obs_property_list_format(p);
+                (0..a.obs_property_list_item_count(p))
+                    .map(|i| {
+                        let value = match format {
+                            1 => serde_json::json!(a.obs_property_list_item_int(p, i)),
+                            2 => serde_json::json!(a.obs_property_list_item_float(p, i)),
+                            4 => serde_json::json!(a.obs_property_list_item_bool(p, i)),
+                            _ => serde_json::json!(text(a.obs_property_list_item_string(p, i))),
+                        };
+                        (text(a.obs_property_list_item_name(p, i)), value)
+                    })
+                    .unzip()
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             let group = if kind == "group" {
                 let g = a.obs_property_group_content(p);
@@ -335,6 +383,7 @@ impl Studio {
                 max,
                 step,
                 choices,
+                values,
                 group,
             });
             if !a.obs_property_next(&mut p) {
@@ -513,6 +562,24 @@ impl Drop for Inner {
     }
 }
 
+/// A source in a scene, as listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceInfo {
+    pub name: String,
+    /// Its kind's id (`color_source`, `screen_capture`…).
+    pub kind: String,
+    pub visible: bool,
+}
+
+/// A source name: 1 to 100 letters on one line (OBS's own names stay unique per scene).
+pub fn check_name(name: &str) -> Result<(), StudioError> {
+    let n = name.chars().count();
+    if n == 0 || n > 100 || name.trim() != name || name.chars().any(char::is_control) {
+        return Err(StudioError::Failed("name: 1 to 100 letters on one line.".into()));
+    }
+    Ok(())
+}
+
 /// A scene. Released when dropped (sources in it stay while the scene does).
 #[derive(Debug)]
 pub struct Scene {
@@ -524,7 +591,7 @@ pub struct Scene {
 
 impl Scene {
     /// Adds a new source of `kind` named `name`, with OBS settings as JSON (the same keys OBS
-    /// saves in its scene collections), at `pos` on the canvas.
+    /// saves in its scene collections), at `pos` on the canvas. Names are unique in a scene.
     pub fn add(
         &self,
         kind: &str,
@@ -532,7 +599,11 @@ impl Scene {
         settings: &serde_json::Value,
         pos: (f32, f32),
     ) -> Result<(), StudioError> {
+        check_name(name)?;
         let a = &self.studio.inner.api;
+        if !self.item(name).is_null() {
+            return Err(StudioError::Failed(format!("name: there's already a source called \"{name}\" here.")));
+        }
         let json = cstr(&settings.to_string());
         let data = a.obs_data_create_from_json(json.as_ptr());
         let (id, n) = (cstr(kind), cstr(name));
@@ -549,9 +620,117 @@ impl Scene {
             a.obs_source_release(src);
             return Err(StudioError::Failed(format!("\"{name}\" couldn't be put in the scene")));
         }
-        // Kept until the scene goes, which removes and releases it.
+        // Kept until it's removed or the scene goes, which removes and releases it.
         self.sources.borrow_mut().push(src);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: pos.0, y: pos.1 });
+        Ok(())
+    }
+
+    fn item(&self, name: &str) -> *mut ffi::ObsSceneItem {
+        let n = cstr(name);
+        self.studio.inner.api.obs_scene_find_source(self.ptr, n.as_ptr())
+    }
+
+    fn source(&self, name: &str) -> Result<*mut ffi::ObsSource, StudioError> {
+        let a = &self.studio.inner.api;
+        self.sources
+            .borrow()
+            .iter()
+            .copied()
+            .find(|s| text(a.obs_source_get_name(*s)) == name)
+            .ok_or_else(|| StudioError::Failed(format!("there's no source called \"{name}\" here")))
+    }
+
+    /// The sources in the scene, bottom first.
+    pub fn sources(&self) -> Vec<SourceInfo> {
+        let a = &self.studio.inner.api;
+        self.sources
+            .borrow()
+            .iter()
+            .map(|s| {
+                let name = text(a.obs_source_get_name(*s));
+                let item = self.item(&name);
+                SourceInfo {
+                    kind: text(a.obs_source_get_id(*s)),
+                    visible: !item.is_null() && a.obs_sceneitem_visible(item),
+                    name,
+                }
+            })
+            .collect()
+    }
+
+    /// A source's options, as they look for its settings now.
+    pub fn options(&self, name: &str) -> Result<Vec<OptionInfo>, StudioError> {
+        Ok(self.studio.source_options(self.source(name)?, true))
+    }
+
+    /// A source's settings (JSON), its kind's defaults filled in for keys never set.
+    pub fn settings(&self, name: &str) -> Result<serde_json::Value, StudioError> {
+        let a = &self.studio.inner.api;
+        let data = a.obs_source_get_settings(self.source(name)?);
+        if data.is_null() {
+            return Ok(serde_json::json!({}));
+        }
+        let json = text(a.obs_data_get_json_with_defaults(data));
+        a.obs_data_release(data);
+        serde_json::from_str(&json).map_err(|e| StudioError::Failed(format!("OBS's settings didn't read: {e}")))
+    }
+
+    /// Changes a source's settings: only the keys given, the rest stay (as OBS's dialog does).
+    pub fn update(&self, name: &str, settings: &serde_json::Value) -> Result<(), StudioError> {
+        if !settings.is_object() {
+            return Err(StudioError::Failed("settings: an object of OBS setting keys and values.".into()));
+        }
+        let a = &self.studio.inner.api;
+        let src = self.source(name)?;
+        let json = cstr(&settings.to_string());
+        let data = a.obs_data_create_from_json(json.as_ptr());
+        if data.is_null() {
+            return Err(StudioError::Failed("settings: OBS couldn't read them.".into()));
+        }
+        a.obs_source_update(src, data);
+        a.obs_data_release(data);
+        Ok(())
+    }
+
+    /// Shows or hides a source.
+    pub fn set_visible(&self, name: &str, visible: bool) -> Result<(), StudioError> {
+        self.source(name)?;
+        let item = self.item(name);
+        if !item.is_null() {
+            self.studio.inner.api.obs_sceneitem_set_visible(item, visible);
+        }
+        Ok(())
+    }
+
+    /// Fits a source inside the canvas, centred, keeping its shape (OBS's "Fit to screen").
+    pub fn fit(&self, name: &str) -> Result<(), StudioError> {
+        self.source(name)?;
+        let a = &self.studio.inner.api;
+        let item = self.item(name);
+        if item.is_null() {
+            return Ok(());
+        }
+        let c = self.studio.inner.canvas;
+        a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
+        a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_SCALE_INNER);
+        a.obs_sceneitem_set_bounds_alignment(item, ffi::OBS_ALIGN_CENTER);
+        a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
+        Ok(())
+    }
+
+    /// Takes a source out of the scene and away.
+    pub fn remove(&self, name: &str) -> Result<(), StudioError> {
+        let src = self.source(name)?;
+        let a = &self.studio.inner.api;
+        let item = self.item(name);
+        if !item.is_null() {
+            a.obs_sceneitem_remove(item);
+        }
+        a.obs_source_remove(src);
+        a.obs_source_release(src);
+        self.sources.borrow_mut().retain(|s| *s != src);
         Ok(())
     }
 }
@@ -629,6 +808,14 @@ mod tests {
         assert_eq!(px(r, 2.0), (1280, 720));
         assert_eq!(px(r, f64::NAN), (640, 360), "a bad scale is 1");
         assert_eq!(px(Rect { w: 0.0, h: -5.0, ..r }, 1.0), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn source_names_are_checked() {
+        assert!(check_name("Webcam").is_ok());
+        for bad in ["", " lead", "a\nb", &"x".repeat(101)] {
+            assert!(check_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

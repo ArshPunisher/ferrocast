@@ -87,6 +87,13 @@ pub const GS_BGRA: c_int = 5;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const GS_ZS_NONE: c_int = 0;
 pub const OBS_VIDEO_SUCCESS: c_int = 0;
+/// `obs-source.h`: a kind replaced by a newer version, and one only for OBS's own use.
+pub const OBS_SOURCE_DEPRECATED: u32 = 1 << 8;
+pub const OBS_SOURCE_CAP_DISABLED: u32 = 1 << 10;
+pub const OBS_BOUNDS_SCALE_INNER: c_int = 2;
+pub const OBS_ALIGN_CENTER: u32 = 0;
+pub const OBS_ALIGN_LEFT: u32 = 1;
+pub const OBS_ALIGN_TOP: u32 = 1 << 2;
 pub const LOG_ERROR: c_int = 100;
 pub const LOG_WARNING: c_int = 200;
 pub const LOG_INFO: c_int = 300;
@@ -169,6 +176,8 @@ api! {
     obs_enum_encoder_types: fn(a: usize, b: *mut *const c_char) -> bool;
     obs_enum_output_types: fn(a: usize, b: *mut *const c_char) -> bool;
     obs_source_get_display_name: fn(a: *const c_char) -> *const c_char;
+    obs_get_source_output_flags: fn(a: *const c_char) -> u32;
+    obs_get_source_defaults: fn(a: *const c_char) -> *mut ObsData;
     obs_encoder_get_display_name: fn(a: *const c_char) -> *const c_char;
     obs_source_create: fn(a: *const c_char, b: *const c_char, c: *mut ObsData, d: *mut ObsData) -> *mut ObsSource;
     obs_source_create_private: fn(a: *const c_char, b: *const c_char, c: *mut ObsData) -> *mut ObsSource;
@@ -186,6 +195,12 @@ api! {
     obs_property_enabled: fn(a: *mut ObsProperty) -> bool;
     obs_property_list_item_count: fn(a: *mut ObsProperty) -> usize;
     obs_property_list_item_name: fn(a: *mut ObsProperty, b: usize) -> *const c_char;
+    obs_property_list_format: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_list_item_int: fn(a: *mut ObsProperty, b: usize) -> i64;
+    obs_property_list_item_float: fn(a: *mut ObsProperty, b: usize) -> f64;
+    obs_property_list_item_string: fn(a: *mut ObsProperty, b: usize) -> *const c_char;
+    obs_property_list_item_bool: fn(a: *mut ObsProperty, b: usize) -> bool;
+    obs_properties_apply_settings: fn(a: *mut ObsProperties, b: *mut ObsData);
     obs_property_group_content: fn(a: *mut ObsProperty) -> *mut ObsProperties;
     obs_property_int_min: fn(a: *mut ObsProperty) -> c_int;
     obs_property_int_max: fn(a: *mut ObsProperty) -> c_int;
@@ -202,6 +217,20 @@ api! {
     obs_scene_add: fn(a: *mut ObsScene, b: *mut ObsSource) -> *mut ObsSceneItem;
     obs_scene_get_source: fn(a: *const ObsScene) -> *mut ObsSource;
     obs_sceneitem_set_pos: fn(a: *mut ObsSceneItem, b: *const Vec2);
+    obs_sceneitem_set_alignment: fn(a: *mut ObsSceneItem, b: u32);
+    obs_sceneitem_set_bounds_type: fn(a: *mut ObsSceneItem, b: c_int);
+    obs_sceneitem_set_bounds_alignment: fn(a: *mut ObsSceneItem, b: u32);
+    obs_sceneitem_set_bounds: fn(a: *mut ObsSceneItem, b: *const Vec2);
+    obs_sceneitem_set_visible: fn(a: *mut ObsSceneItem, b: bool) -> bool;
+    obs_sceneitem_visible: fn(a: *const ObsSceneItem) -> bool;
+    obs_sceneitem_remove: fn(a: *mut ObsSceneItem);
+    obs_scene_find_source: fn(a: *mut ObsScene, b: *const c_char) -> *mut ObsSceneItem;
+    obs_source_update: fn(a: *mut ObsSource, b: *mut ObsData);
+    obs_source_get_settings: fn(a: *const ObsSource) -> *mut ObsData;
+    obs_source_get_name: fn(a: *const ObsSource) -> *const c_char;
+    obs_source_get_id: fn(a: *const ObsSource) -> *const c_char;
+    obs_data_get_json: fn(a: *mut ObsData) -> *const c_char;
+    obs_data_get_json_with_defaults: fn(a: *mut ObsData) -> *const c_char;
     obs_set_output_source: fn(a: u32, b: *mut ObsSource);
     obs_get_video: fn() -> *mut VideoT;
     obs_get_audio: fn() -> *mut AudioT;
