@@ -5,5 +5,10 @@
   <!-- Shown when Ferrocast first asks Spotify or Music which song plays (Settings, Music). -->
   <key>NSAppleEventsUsageDescription</key>
   <string>Ferrocast reads the song playing in Spotify or Music to show it on your stream screens.</string>
+  <!-- Shown when a Studio camera or microphone source is first added (Studio, Without OBS). -->
+  <key>NSCameraUsageDescription</key>
+  <string>Ferrocast shows your camera on stream when you add a camera source in the Studio.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Ferrocast puts your microphone on stream when you add a microphone source in the Studio.</string>
 </dict>
 </plist>
