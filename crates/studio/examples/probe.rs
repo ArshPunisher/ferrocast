@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.add(
         "text_ft2_source",
         "Title",
-        &json!({ "text": "Ferrocast Studio (Rust)", "font": { "face": "Helvetica", "size": 96 } }),
+        &json!({ "text": "Ferrocast Studio (Rust)", "font": { "face": if cfg!(windows) { "Arial" } else { "Helvetica" }, "size": 96 } }),
         (120.0, 300.0),
     )?;
     studio.set_program(&scene);
