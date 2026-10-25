@@ -89,3 +89,10 @@ The rules we build by. Each one comes from a real incident, bug or user complain
 - **R-70** **Documented local API + open export formats**; never gatekeep data to block competitors.
 - **R-71** **Bus factor ≥ 2**: two maintainers with release keys; publish a succession plan.
 - **R-72** **Launch channels**: not r/Twitch (it bans all tool promotion since 1 Sep 2026). Use r/obs, r/streaming (check rules), GitHub, Discord. Open source, signed and auditable is our answer to the "AI-coded tool" distrust. Don't headline Kick to Twitch audiences.
+
+## 9. The Studio (libobs, 2.1)
+- **R-73** **`unsafe` lives in one file**: `crates/studio/src/ffi.rs` (libobs and AppKit calls), each block with its SAFETY reason; the crate denies it everywhere else and the workspace still forbids it. Raw libobs calls are crate-private; only the safe API is public.
+- **R-74** **libobs is loaded at runtime** (`libloading`), never linked: Ferrocast builds and runs where OBS's engine isn't present, and a failed load is a plain error.
+- **R-75** **Options come from a live source.** Camera, capture card, screen and some filters crash when asked for their options by kind alone; OBS's own dialog always asks an instance (`obs_source_properties`). Interface-only plugins (frontend-tools, the DeckLink/AJA UIs, obs-websocket) are disabled: they need OBS's Qt window.
+- **R-76** **Remove before release.** libobs 32 keeps scenes in its canvas: `obs_source_remove` every scene and source before letting go, or it's freed after its plugin unloaded (a text source crashed in FreeType at shutdown). `obs_wait_for_destroy_queue` alone isn't enough.
+

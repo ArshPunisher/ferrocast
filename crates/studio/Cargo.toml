@@ -1,0 +1,42 @@
+[package]
+name = "ferrocast-studio"
+description = "The Studio's engine: OBS's libobs and its plugins, loaded at runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+libloading = "0.8"
+raw-window-handle = "0.6"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSThread"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "objc2-core-foundation"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSApplication", "NSRunningApplication", "NSGraphics"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSThread", "NSDate", "NSRunLoop", "NSString"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# The workspace forbids unsafe code. Calling libobs needs it, so here it is denied instead and
+# allowed in src/ffi.rs only, each block with its SAFETY reason (LESSONS R-73).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"
