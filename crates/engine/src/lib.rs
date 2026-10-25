@@ -49,6 +49,7 @@ mod snapshot;
 pub mod speech;
 mod starter;
 pub mod studio;
+pub mod studio_host;
 mod timers;
 mod updates;
 pub use updates::{
@@ -190,6 +191,8 @@ struct Inner {
     golive: golive::GoLive,
     /// Music for the screens: the beat OBS hears and the song (Settings › Music).
     music: music::Music,
+    /// The Studio's engine, run by the desktop app (2.1, Track B).
+    studio_host: studio_host::Slot,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -319,6 +322,7 @@ impl Engine {
                 smart: Mutex::new(Default::default()),
                 golive: Default::default(),
                 music: Default::default(),
+                studio_host: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));

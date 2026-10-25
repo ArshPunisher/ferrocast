@@ -595,6 +595,18 @@ Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/con
 - The song, every 3 s (5 s on Windows): `player` asks Spotify, then Music (macOS; neither is opened, and macOS asks once to allow it), the system's media controls (Windows) or playerctl (Linux); `file` reads the first line as the song and the second as the artist (never split on dashes), up to 4 KB.
 - `playing`: the player says it plays, or OBS heard `beat_input` louder than -46 dB in the last 2.5 s; with a file and no `beat_input`, a song in the file. `level` is 0 while not playing.
 
+### Studio engine (2.1 preview, Track B: stream without OBS)
+OBS's own libobs and plugins, run by the **desktop app** on its main thread (STUDIO-PARITY.md, `crates/studio`). For the preview it uses the OBS installed on the computer (32 or newer). The headless server and browsers have no engine: every route but GET answers 422 `studio_unavailable`. Phones (Dashboard anywhere) are refused all of them.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/v1/studio/engine` | `{ available, running, version: string \| null, renderer: "opengl" \| "metal" \| null, detail: string \| null }` |
+| POST | `/api/v1/studio/engine/start` | Loads the engine (once; it stays loaded until Ferrocast quits, as libobs can't restart in one process) and puts a scene on air → status. 422 `studio_failed` with the reason |
+| POST | `/api/v1/studio/engine/stop` | Takes the scene and the preview away → status |
+| GET | `/api/v1/studio/engine/kinds` | `{ inputs, filters, transitions, encoders, outputs: { id, name }[] }` from the loaded plugins. 409 `studio_stopped` |
+| GET | `/api/v1/studio/engine/kinds/{id}/options` | `{ key, label, kind, help, visible, enabled, min, max, step, choices, group }[]`, read from a live private source (some plugins can't describe themselves without one). 400 for a bad id, 409 `studio_stopped` |
+| PUT | `/api/v1/studio/engine/preview` | `{ rect: { x, y, w, h } \| null }` (CSS pixels in the desktop window) → 204. The app draws libobs's picture into a native view over that box; null takes it away. 400 for a box off the window or 0 / over 16384 px |
+
 ### Studio (streamer tools, all free)
 Production helpers that run on the streamer's PC. OBS requests use the OBS details above; when OBS can't be reached every OBS route answers 422 `obs_unreachable` (`obs_password`, or `obs_refused` for an unknown scene/source) with a hint. Settings PUTs save only the fields sent; 400 names the field.
 

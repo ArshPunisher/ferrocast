@@ -80,6 +80,10 @@ pub const OWNER_ALLOWED: &[Rule] = &[
 
 /// What an owner's phone may never do (`*` as the method: any method).
 pub const OWNER_DENIED: &[Rule] = &[
+    // The Studio's engine runs in the desktop window on the PC: a phone can't place its preview
+    // there or start and stop it.
+    ("*", "/studio/engine"),
+    ("*", "/studio/engine/**"),
     // Accounts and sign-ins, and pairing more browsers.
     ("*", "/accounts"),
     ("*", "/accounts/**"),
@@ -327,6 +331,10 @@ mod tests {
             ("GET", "/golive/ingest"),
             ("POST", "/golive/destinations"),
             ("DELETE", "/golive/destinations/c_1"),
+            ("GET", "/studio/engine"),
+            ("POST", "/studio/engine/start"),
+            ("PUT", "/studio/engine/preview"),
+            ("GET", "/studio/engine/kinds/color_source/options"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

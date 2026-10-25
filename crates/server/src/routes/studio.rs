@@ -22,6 +22,13 @@ use crate::extract::Body;
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
+        // the Studio's engine (2.1): libobs in the desktop app
+        .route("/studio/engine", get(engine_status))
+        .route("/studio/engine/start", post(engine_start))
+        .route("/studio/engine/stop", post(engine_stop))
+        .route("/studio/engine/kinds", get(engine_kinds))
+        .route("/studio/engine/kinds/{id}/options", get(engine_options))
+        .route("/studio/engine/preview", put(engine_preview))
         // chatbot
         .route("/counters", get(counters).post(create_counter))
         .route("/counters/{name}", put(update_counter).delete(delete_counter))
@@ -238,6 +245,37 @@ async fn delete_preset(State(app): State<AppState>, Path(id): Path<String>) -> A
 
 async fn show(State(app): State<AppState>) -> Json<Value> {
     Json(json!({ "show": app.engine.show_run() }))
+}
+
+async fn engine_status(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.studio_status().await))
+}
+
+async fn engine_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_start().await?)))
+}
+
+async fn engine_stop(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_stop().await?)))
+}
+
+async fn engine_kinds(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_kinds().await?))
+}
+
+async fn engine_options(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_options(&id).await?))
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    rect: Option<ferrocast_engine::studio_host::PreviewRect>,
+}
+
+/// `PUT /studio/engine/preview` `{ rect: {x, y, w, h} | null }`: the preview over the page's box.
+async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
+    app.engine.studio_preview(b.rect).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn show_config(State(app): State<AppState>) -> Json<Value> {

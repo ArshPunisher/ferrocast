@@ -524,3 +524,23 @@ async fn smoke_every_studio_screen_loads() {
         let _: Value = res.json().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn the_studio_engine_needs_the_desktop_app() {
+    let r = start().await;
+    let (s, v) = body(r.get("/studio/engine").await).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["available"], false);
+    assert!(v["detail"].as_str().is_some_and(|d| d.contains("Ferrocast app")), "{v}");
+    for res in [
+        r.post("/studio/engine/start", json!({})).await,
+        r.get("/studio/engine/kinds").await,
+        r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 640, "h": 360 } })).await,
+    ] {
+        assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
+    }
+    // Bad input is refused before anything else.
+    assert_eq!(code(r.get("/studio/engine/kinds/..%2Fx/options").await).await.0, StatusCode::BAD_REQUEST);
+    let bad = r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 0, "h": 360 } })).await;
+    assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
+}
