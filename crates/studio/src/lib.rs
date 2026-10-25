@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use raw_window_handle::RawWindowHandle;
 use serde::{Deserialize, Serialize};
 
+/// The kind id of Ferrocast's Web page source (macOS; OBS's Browser source keys).
+pub const WEB_PAGE_KIND: &str = "ferrocast_web";
+
 pub use collection::{
     AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, SourceUse,
     TransitionInfo,
@@ -289,7 +292,11 @@ impl Studio {
         api.obs_load_all_modules();
         api.obs_post_load_modules();
         let cpu = api.os_cpu_usage_info_start();
-        Ok(Studio { inner: std::rc::Rc::new(Inner { api, canvas: std::cell::Cell::new(canvas), cpu }) })
+        let inner = std::rc::Rc::new(Inner { api, canvas: std::cell::Cell::new(canvas), cpu });
+        // Ferrocast's own Web page source (WebKit), in place of OBS's Chromium one (R-78).
+        #[cfg(target_os = "macos")]
+        ffi::web::register(&inner.api);
+        Ok(Studio { inner })
     }
 
     pub fn canvas(&self) -> Canvas {

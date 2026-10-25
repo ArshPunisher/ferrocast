@@ -1875,10 +1875,13 @@ dependencies = [
 name = "ferrocast-studio"
 version = "2.0.0"
 dependencies = [
+ "block2",
+ "dispatch2",
  "libloading 0.8.9",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "objc2-web-kit",
  "raw-window-handle",
  "serde",
  "serde_json",
