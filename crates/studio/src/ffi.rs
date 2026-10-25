@@ -23,6 +23,8 @@ opaque!(
     ObsOutput,
     ObsService,
     ObsDisplay,
+    ObsDataArray,
+    ObsVolmeter,
     VideoT,
     AudioT
 );
@@ -95,12 +97,32 @@ pub const OBS_BOUNDS_SCALE_INNER: c_int = 2;
 pub const OBS_ALIGN_CENTER: u32 = 0;
 pub const OBS_ALIGN_LEFT: u32 = 1;
 pub const OBS_ALIGN_TOP: u32 = 1 << 2;
+/// `obs-source.h`: the kind makes sound.
+pub const OBS_SOURCE_AUDIO: u32 = 1 << 1;
+/// `enum obs_order_movement`.
+pub const OBS_ORDER_MOVE_UP: c_int = 0;
+pub const OBS_ORDER_MOVE_DOWN: c_int = 1;
+pub const OBS_ORDER_MOVE_TOP: c_int = 2;
+pub const OBS_ORDER_MOVE_BOTTOM: c_int = 3;
+/// `enum obs_scene_duplicate_type`: the copy shows the same sources.
+pub const OBS_SCENE_DUP_REFS: c_int = 0;
+/// `enum obs_fader_type`: dB on a log scale, as OBS's mixer.
+pub const OBS_FADER_LOG: c_int = 2;
+/// `enum obs_transition_mode`.
+pub const OBS_TRANSITION_MODE_AUTO: c_int = 0;
+/// `media-io/audio-io.h`: the meter callback's arrays hold this many channels.
+pub const MAX_AUDIO_CHANNELS: usize = 8;
 pub const LOG_ERROR: c_int = 100;
 pub const LOG_WARNING: c_int = 200;
 pub const LOG_INFO: c_int = 300;
 
 pub type LogHandler = unsafe extern "C" fn(c_int, *const c_char, *mut c_void, *mut c_void);
 pub type DrawCallback = unsafe extern "C" fn(*mut c_void, u32, u32);
+pub type SceneItemCb = unsafe extern "C" fn(*mut ObsScene, *mut ObsSceneItem, *mut c_void) -> bool;
+pub type SourceEnumCb = unsafe extern "C" fn(*mut ObsSource, *mut ObsSource, *mut c_void);
+pub type LoadSourceCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource);
+pub type SaveFilterCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource) -> bool;
+pub type VolmeterCb = unsafe extern "C" fn(*mut c_void, *const f32, *const f32, *const f32);
 
 macro_rules! api {
     ($( $name:ident : fn($($arg:ident : $a:ty),*) $(-> $r:ty)?; )*) => {
@@ -275,6 +297,53 @@ api! {
     gs_projection_pop: fn();
     gs_ortho: fn(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32);
     gs_set_viewport: fn(a: c_int, b: c_int, c: c_int, d: c_int);
+    obs_save_sources_filtered: fn(a: SaveFilterCb, b: *mut c_void) -> *mut ObsDataArray;
+    obs_load_sources: fn(a: *mut ObsDataArray, b: Option<LoadSourceCb>, c: *mut c_void);
+    obs_save_source: fn(a: *mut ObsSource) -> *mut ObsData;
+    obs_load_source: fn(a: *mut ObsData) -> *mut ObsSource;
+    obs_get_source_by_name: fn(a: *const c_char) -> *mut ObsSource;
+    obs_source_get_ref: fn(a: *mut ObsSource) -> *mut ObsSource;
+    obs_get_output_source: fn(a: u32) -> *mut ObsSource;
+    obs_scene_from_source: fn(a: *const ObsSource) -> *mut ObsScene;
+    obs_group_from_source: fn(a: *const ObsSource) -> *mut ObsScene;
+    obs_source_is_scene: fn(a: *const ObsSource) -> bool;
+    obs_scene_enum_items: fn(a: *mut ObsScene, b: SceneItemCb, c: *mut c_void);
+    obs_sceneitem_group_enum_items: fn(a: *mut ObsSceneItem, b: SceneItemCb, c: *mut c_void);
+    obs_sceneitem_get_source: fn(a: *const ObsSceneItem) -> *mut ObsSource;
+    obs_sceneitem_get_id: fn(a: *const ObsSceneItem) -> i64;
+    obs_scene_find_sceneitem_by_id: fn(a: *mut ObsScene, b: i64) -> *mut ObsSceneItem;
+    obs_sceneitem_set_locked: fn(a: *mut ObsSceneItem, b: bool) -> bool;
+    obs_sceneitem_locked: fn(a: *const ObsSceneItem) -> bool;
+    obs_sceneitem_set_order: fn(a: *mut ObsSceneItem, b: c_int);
+    obs_sceneitem_is_group: fn(a: *mut ObsSceneItem) -> bool;
+    obs_scene_duplicate: fn(a: *mut ObsScene, b: *const c_char, c: c_int) -> *mut ObsScene;
+    obs_source_set_name: fn(a: *mut ObsSource, b: *const c_char);
+    obs_source_get_output_flags: fn(a: *const ObsSource) -> u32;
+    obs_source_set_volume: fn(a: *mut ObsSource, b: f32);
+    obs_source_get_volume: fn(a: *const ObsSource) -> f32;
+    obs_source_set_muted: fn(a: *mut ObsSource, b: bool);
+    obs_source_muted: fn(a: *const ObsSource) -> bool;
+    obs_source_set_monitoring_type: fn(a: *mut ObsSource, b: c_int);
+    obs_source_get_monitoring_type: fn(a: *const ObsSource) -> c_int;
+    obs_source_enum_filters: fn(a: *mut ObsSource, b: SourceEnumCb, c: *mut c_void);
+    obs_source_filter_add: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_source_filter_remove: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_source_filter_set_order: fn(a: *mut ObsSource, b: *mut ObsSource, c: c_int);
+    obs_source_get_filter_by_name: fn(a: *mut ObsSource, b: *const c_char) -> *mut ObsSource;
+    obs_source_set_enabled: fn(a: *mut ObsSource, b: bool);
+    obs_source_enabled: fn(a: *const ObsSource) -> bool;
+    obs_volmeter_create: fn(a: c_int) -> *mut ObsVolmeter;
+    obs_volmeter_destroy: fn(a: *mut ObsVolmeter);
+    obs_volmeter_attach_source: fn(a: *mut ObsVolmeter, b: *mut ObsSource) -> bool;
+    obs_volmeter_add_callback: fn(a: *mut ObsVolmeter, b: VolmeterCb, c: *mut c_void);
+    obs_volmeter_remove_callback: fn(a: *mut ObsVolmeter, b: VolmeterCb, c: *mut c_void);
+    obs_db_to_mul: fn(a: f32) -> f32;
+    obs_mul_to_db: fn(a: f32) -> f32;
+    obs_transition_start: fn(a: *mut ObsSource, b: c_int, c: u32, d: *mut ObsSource) -> bool;
+    obs_transition_set: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_data_set_array: fn(a: *mut ObsData, b: *const c_char, c: *mut ObsDataArray);
+    obs_data_get_array: fn(a: *mut ObsData, b: *const c_char) -> *mut ObsDataArray;
+    obs_data_array_release: fn(a: *mut ObsDataArray);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
@@ -391,6 +460,78 @@ pub(crate) extern "C" fn log_to_tracing(level: c_int, fmt: *const c_char, args: 
         LOG_WARNING => tracing::warn!(target: "libobs", "{line}"),
         LOG_INFO => tracing::info!(target: "libobs", "{line}"),
         _ => tracing::debug!(target: "libobs", "{line}"),
+    }
+}
+
+/// Collects the items `obs_scene_enum_items` or `obs_sceneitem_group_enum_items` walks
+/// (bottom first) into the `Vec<*mut ObsSceneItem>` behind `param`.
+pub(crate) unsafe extern "C" fn collect_items(_s: *mut ObsScene, item: *mut ObsSceneItem, param: *mut c_void) -> bool {
+    // SAFETY: `param` is the `&mut Vec` collection.rs passes for the length of this enum call,
+    // which libobs makes on the calling thread before returning.
+    let out = unsafe { &mut *(param as *mut Vec<*mut ObsSceneItem>) };
+    out.push(item);
+    true
+}
+
+/// Collects a source's filters (in order) into the `Vec<*mut ObsSource>` behind `param`.
+pub(crate) unsafe extern "C" fn collect_filters(_parent: *mut ObsSource, filter: *mut ObsSource, param: *mut c_void) {
+    // SAFETY: as for `collect_items`: a `&mut Vec` alive for the synchronous enum call.
+    let out = unsafe { &mut *(param as *mut Vec<*mut ObsSource>) };
+    out.push(filter);
+}
+
+/// What `keep_scenes` needs while a collection loads.
+pub(crate) struct LoadCtx {
+    pub api: *const Api,
+    /// Scenes loaded, each with a reference of our own.
+    pub scenes: Vec<*mut ObsSource>,
+}
+
+/// `obs_load_sources` callback: keeps a reference to every scene loaded (libobs releases its
+/// own when loading ends; a scene with no holder would go).
+pub(crate) unsafe extern "C" fn keep_scenes(param: *mut c_void, source: *mut ObsSource) {
+    // SAFETY: `param` is the `&mut LoadCtx` collection.rs passes for the synchronous
+    // `obs_load_sources` call; its Api outlives the call.
+    let ctx = unsafe { &mut *(param as *mut LoadCtx) };
+    // SAFETY: as above.
+    let api = unsafe { &*ctx.api };
+    if api.obs_source_is_scene(source) {
+        let r = api.obs_source_get_ref(source);
+        if !r.is_null() {
+            ctx.scenes.push(r);
+        }
+    }
+}
+
+/// `obs_save_sources_filtered` callback: saves every source but those listed (the global
+/// audio devices, saved under their own keys as OBS does).
+pub(crate) unsafe extern "C" fn save_unless_listed(param: *mut c_void, source: *mut ObsSource) -> bool {
+    // SAFETY: `param` is the `&Vec` collection.rs passes for the synchronous save call.
+    let skip = unsafe { &*(param as *const Vec<*mut ObsSource>) };
+    !skip.contains(&source)
+}
+
+/// One sound's level, dBFS, for its first two channels (left, right).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level {
+    pub peak: [f32; 2],
+    pub magnitude: [f32; 2],
+}
+
+/// Volume meter callback (libobs's audio thread): stores the latest level.
+pub(crate) unsafe extern "C" fn store_level(param: *mut c_void, mag: *const f32, peak: *const f32, _input: *const f32) {
+    // SAFETY: `param` is the boxed Mutex<Level> a Meter in collection.rs registered and keeps
+    // until it has removed this callback (libobs then makes no more calls); the arrays hold
+    // MAX_AUDIO_CHANNELS floats each during the call.
+    let (cell, mag, peak) = unsafe {
+        (
+            &*(param as *const std::sync::Mutex<Level>),
+            std::slice::from_raw_parts(mag, MAX_AUDIO_CHANNELS),
+            std::slice::from_raw_parts(peak, MAX_AUDIO_CHANNELS),
+        )
+    };
+    if let Ok(mut l) = cell.lock() {
+        *l = Level { peak: [peak[0], peak[1]], magnitude: [mag[0], mag[1]] };
     }
 }
 

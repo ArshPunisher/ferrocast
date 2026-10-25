@@ -6,6 +6,7 @@
 //! libobs is one global engine per process: [`Studio::start`] refuses a second one, and
 //! dropping the [`Studio`] shuts it down after every scene, source and output is released.
 
+mod collection;
 mod ffi;
 
 use std::ffi::c_int;
@@ -17,6 +18,9 @@ use std::time::{Duration, Instant};
 use raw_window_handle::RawWindowHandle;
 use serde::{Deserialize, Serialize};
 
+pub use collection::{
+    AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, TransitionInfo,
+};
 use ffi::{Api, cstr, text};
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
