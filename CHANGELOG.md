@@ -5,6 +5,13 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.12
+
+- Starting soon stays a plain screen when no music plays: the music panel comes and goes with
+  the music.
+- Long titles on the new themes get smaller instead of wrapping onto the line below.
+- Fixes found testing beta.11 in OBS.
+
 ## 2.0.0-beta.11
 
 - Eleven new themes with a live world behind every break screen: Hex Pulse, Night Drive,
