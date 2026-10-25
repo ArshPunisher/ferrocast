@@ -18,6 +18,30 @@ of it:
 | Options UI | Each source's and filter's settings | **One generic renderer for `obs_properties`** (bool, int, float, text, path, list, color, font, button, editable list, frame rate, group): every option of every plugin appears with no per-plugin work, so tiny options can't be forgotten |
 | App (frontend) | Settings pages, menus, docks, studio mode, multiview, projectors, hotkeys, profiles, scene collections, importers, stats, undo (Appendix B) | Built by us, item by item, against Appendix B. This is the real work |
 
+### Browser source: needs a decision (25 Oct)
+
+obs-browser loads (Qt and obs-frontend-api are preloaded from OBS.app) but can't run inside
+Ferrocast yet, for two reasons found on 25 Oct:
+
+1. It looks for Chromium (CEF) and its four helper apps in **Ferrocast's own** `Contents/Frameworks`
+   (next to the running program), not in OBS.app. The shipped app would have to carry them
+   (about 250 MB, the size OBS.app spends on them).
+2. With CEF linked beside a dev build it aborts at start (SIGTRAP): Chromium on macOS needs the
+   app's `NSApplication` to implement its `CrAppProtocol` / `CrAppControlProtocol`, which OBS's
+   Qt app does and Tauri's doesn't; CEF's message loop also has to be pumped on the main thread.
+
+Two ways forward:
+
+| | A. Bundle CEF like OBS | B. Browser source on the system WebKit |
+|---|---|---|
+| What | Ship CEF + helpers in Ferrocast.app, add the CrApp methods to Tauri's NSApplication class at start, pump CEF's loop | A Ferrocast source (libobs `obs_source_info`) that draws a WKWebView offscreen and hands frames to libobs |
+| Same as OBS | Yes, page for page (same Chromium) | Nearly: WebKit, not Chromium (a few CSS or codec differences; OBS's `window.obsstudio` API to be provided by us) |
+| Size | +~250 MB download | +0 |
+| Risk | CEF inside a non-CEF app on macOS: crash-prone, every CEF update | Our own code to keep up, but small and in our hands |
+
+Ferrocast's own overlays work either way. Recommended: **B first** (small, ours), keep A for
+pages that only work in Chromium. Until then the Studio shows sources without the Browser kind.
+
 ## Checklist by area
 
 Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ already in Ferrocast

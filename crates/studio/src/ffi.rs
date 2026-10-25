@@ -127,9 +127,12 @@ macro_rules! api {
             /// libraries libobs finds by `@rpath` (an OBS.app's Frameworks): loaded first, so
             /// they're found from any program. Ferrocast.app carries its own where libobs looks.
             pub(crate) fn load(path: &Path, deps: Option<&Path>) -> Result<Api, String> {
-                let _deps = deps.map(load_deps).unwrap_or_default();
+                // libobs needs ffmpeg loaded first; some deps (obs-frontend-api) need libobs:
+                // what couldn't load before it is tried again after.
+                let (mut _deps, left) = deps.map(load_deps).unwrap_or_default();
                 // SAFETY: loading libobs runs its initialisers, which only set up its own state.
                 let lib = unsafe { Library::new(path) }.map_err(|e| e.to_string())?;
+                _deps.extend(load_all(left).0);
                 let fns = Fns {
                     $(
                         // SAFETY: the symbol has exactly this C signature in libobs 32.2's
@@ -265,16 +268,41 @@ api! {
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
 /// dependency isn't loaded yet fails the first round and loads in a later one.
-fn load_deps(dir: &Path) -> Vec<Library> {
-    let mut left: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map(|r| r.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "dylib")).collect())
+/// Loads what it can of OBS's bundled libraries → (loaded, the ones that couldn't load yet).
+fn load_deps(dir: &Path) -> (Vec<Library>, Vec<std::path::PathBuf>) {
+    // Loose libraries (ffmpeg, x264…) and the frameworks plugins link by @rpath: Qt, which
+    // obs-frontend-api, obs-browser and obs-vst need at load time even with no window, and
+    // Syphon. Not libobs (loaded on its own), CEF (obs-browser loads it itself) or Sparkle
+    // (OBS's updater).
+    const SKIP: [&str; 3] = ["libobs", "Chromium Embedded Framework", "Sparkle"];
+    let left: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|r| {
+            r.flatten()
+                .map(|e| e.path())
+                .filter_map(|p| match p.extension().and_then(|x| x.to_str()) {
+                    Some("dylib") => Some(p),
+                    Some("framework") => {
+                        let name = p.file_stem()?.to_str()?.to_string();
+                        let bin = p.join(&name);
+                        (!SKIP.contains(&name.as_str()) && bin.exists()).then_some(bin)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
         .unwrap_or_default();
+    load_all(left)
+}
+
+/// Loads each library, retrying the failed ones while that loads more (they depend on each
+/// other in any order) → (loaded, still not loadable).
+fn load_all(mut left: Vec<std::path::PathBuf>) -> (Vec<Library>, Vec<std::path::PathBuf>) {
     let mut loaded = Vec::new();
     loop {
         let before = left.len();
         left.retain(|p| {
-            // SAFETY: these are OBS's own bundled libraries (ffmpeg, x264, mbedtls, srt…); loading
-            // them only runs their initialisers.
+            // SAFETY: these are OBS's own bundled libraries (ffmpeg, x264, mbedtls, srt, Qt…);
+            // loading them only runs their initialisers.
             match unsafe { Library::new(p) } {
                 Ok(l) => {
                     loaded.push(l);
@@ -287,7 +315,7 @@ fn load_deps(dir: &Path) -> Vec<Library> {
             break;
         }
     }
-    loaded
+    (loaded, left)
 }
 
 /// A Rust string as a C string (an interior NUL is cut there, never a crash).
