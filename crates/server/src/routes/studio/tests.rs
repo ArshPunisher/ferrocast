@@ -536,11 +536,22 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/start", json!({})).await,
         r.get("/studio/engine/kinds").await,
         r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 640, "h": 360 } })).await,
+        r.get("/studio/engine/kinds/color_source_v3/defaults").await,
+        r.get("/studio/engine/sources").await,
+        r.post("/studio/engine/sources", json!({ "kind": "color_source", "name": "Back" })).await,
+        r.get("/studio/engine/sources/Back/settings").await,
+        r.get("/studio/engine/sources/Back/options").await,
+        r.put("/studio/engine/sources/Back/settings", json!({ "settings": { "color": 1 } })).await,
+        r.post("/studio/engine/sources/Back/edit", json!({ "do": "fit" })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
     // Bad input is refused before anything else.
     assert_eq!(code(r.get("/studio/engine/kinds/..%2Fx/options").await).await.0, StatusCode::BAD_REQUEST);
     let bad = r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 0, "h": 360 } })).await;
+    assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
+    let bad = r.post("/studio/engine/sources", json!({ "kind": "color_source", "name": "" })).await;
+    assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
+    let bad = r.post("/studio/engine/sources/Back/edit", json!({ "do": "explode" })).await;
     assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
 }

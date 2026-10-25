@@ -29,6 +29,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/kinds", get(engine_kinds))
         .route("/studio/engine/kinds/{id}/options", get(engine_options))
         .route("/studio/engine/preview", put(engine_preview))
+        .route("/studio/engine/kinds/{id}/defaults", get(engine_defaults))
+        .route("/studio/engine/sources", get(engine_sources).post(engine_add_source))
+        .route("/studio/engine/sources/{name}/settings", get(engine_source_settings).put(engine_update_source))
+        .route("/studio/engine/sources/{name}/options", get(engine_source_options))
+        .route("/studio/engine/sources/{name}/edit", post(engine_edit_source))
         // chatbot
         .route("/counters", get(counters).post(create_counter))
         .route("/counters/{name}", put(update_counter).delete(delete_counter))
@@ -275,6 +280,52 @@ struct PreviewBody {
 /// `PUT /studio/engine/preview` `{ rect: {x, y, w, h} | null }`: the preview over the page's box.
 async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview(b.rect).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_defaults(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_defaults(&id).await?))
+}
+
+async fn engine_sources(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_sources().await?))
+}
+
+async fn engine_add_source(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::studio_host::AddSource>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    Ok((StatusCode::CREATED, Json(app.engine.studio_add_source(b).await?)))
+}
+
+async fn engine_source_settings(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_source_settings(&name).await?))
+}
+
+async fn engine_source_options(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_source_options(&name).await?))
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    settings: Value,
+}
+
+async fn engine_update_source(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<SettingsBody>,
+) -> ApiResult<StatusCode> {
+    app.engine.studio_update_source(&name, b.settings).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_edit_source(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<ferrocast_engine::studio_host::SourceEdit>,
+) -> ApiResult<StatusCode> {
+    app.engine.studio_edit_source(&name, b).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

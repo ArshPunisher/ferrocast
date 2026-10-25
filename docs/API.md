@@ -604,8 +604,13 @@ OBS's own libobs and plugins, run by the **desktop app** on its main thread (STU
 | POST | `/api/v1/studio/engine/start` | Loads the engine (once; it stays loaded until Ferrocast quits, as libobs can't restart in one process) and puts a scene on air → status. 422 `studio_failed` with the reason |
 | POST | `/api/v1/studio/engine/stop` | Takes the scene and the preview away → status |
 | GET | `/api/v1/studio/engine/kinds` | `{ inputs, filters, transitions, encoders, outputs: { id, name }[] }` from the loaded plugins. 409 `studio_stopped` |
-| GET | `/api/v1/studio/engine/kinds/{id}/options` | `{ key, label, kind, help, visible, enabled, min, max, step, choices, group }[]`, read from a live private source (some plugins can't describe themselves without one). 400 for a bad id, 409 `studio_stopped` |
+| GET | `/api/v1/studio/engine/kinds/{id}/options` | `{ key, label, kind, help, visible, enabled, min, max, step, choices, values /* each choice's saved value */, group }[]`, read from a live private source (some plugins can't describe themselves without one). 400 for a bad id, 409 `studio_stopped` |
 | PUT | `/api/v1/studio/engine/preview` | `{ rect: { x, y, w, h } \| null }` (CSS pixels in the desktop window) → 204. The app draws libobs's picture into a native view over that box; null takes it away. 400 for a box off the window or 0 / over 16384 px |
+| GET | `/api/v1/studio/engine/kinds/{id}/defaults` | The settings a new source of that kind starts with (OBS's defaults). 400 for a bad id, 409 `studio_stopped` |
+| GET / POST | `/api/v1/studio/engine/sources` | The scene on air's sources, bottom first: `{ name, kind, visible }[]`. POST `{ kind, name /* 1–100, one line, unique */, settings?: object /* OBS's own keys, ≤ 256 KB */, fit?: boolean }` → 201 `{ source, settings }` (settings as OBS filled them in, defaults included). 409 `studio_name_taken`, 422 `studio_failed` for a kind OBS can't make |
+| GET / PUT | `/api/v1/studio/engine/sources/{name}/settings` | The source's settings object; PUT `{ settings: object }` changes only the keys sent → 204. 404 `studio_no_source` |
+| GET | `/api/v1/studio/engine/sources/{name}/options` | The source's options as they look for its settings now (OBS shows, hides and fills some from what's chosen). 404 `studio_no_source` |
+| POST | `/api/v1/studio/engine/sources/{name}/edit` | `{ do: "show" \| "hide" \| "fit" \| "remove" }` → 204 (fit scales it into the canvas, keeping its shape). 404 `studio_no_source` |
 
 ### Studio (streamer tools, all free)
 Production helpers that run on the streamer's PC. OBS requests use the OBS details above; when OBS can't be reached every OBS route answers 422 `obs_unreachable` (`obs_password`, or `obs_refused` for an unknown scene/source) with a hint. Settings PUTs save only the fields sent; 400 names the field.

@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use ferrocast_engine::studio_host::{PreviewRect, StudioHost, StudioStatus};
+use ferrocast_engine::studio_host::{AddSource, PreviewRect, STOPPED, SourceEdit, StudioHost, StudioStatus};
 use ferrocast_studio::{Canvas, Paths, Preview, Rect, Scene, Studio};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -76,6 +76,14 @@ impl DesktopStudio {
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
+    /// Runs `f` on the scene on air (main thread), or answers that the Studio isn't started.
+    async fn on_scene<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Scene) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        self.on_main(|h| f(h.scene.as_ref().ok_or(STOPPED)?)).await?
+    }
+
     fn status_of(h: &Held) -> StudioStatus {
         let found = obs_paths().is_some();
         StudioStatus {
@@ -112,7 +120,7 @@ impl StudioHost for DesktopStudio {
             let scene = studio.scene("Studio").map_err(|e| e.to_string())?;
             scene
                 .add(
-                    "color_source",
+                    "color_source_v3",
                     "Background",
                     &json!({ "color": 0xFF_1A_12_0Eu32, "width": 1920, "height": 1080 }),
                     (0.0, 0.0),
@@ -120,7 +128,7 @@ impl StudioHost for DesktopStudio {
                 .map_err(|e| e.to_string())?;
             scene
                 .add(
-                    "text_ft2_source",
+                    "text_ft2_source_v2",
                     "Title",
                     &json!({ "text": "Ferrocast Studio", "font": { "face": "Helvetica", "size": 140 } }),
                     (440.0, 450.0),
@@ -148,7 +156,7 @@ impl StudioHost for DesktopStudio {
 
     async fn kinds(&self) -> Result<Value, String> {
         self.on_main(|h| {
-            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(ferrocast_engine::studio_host::STOPPED)?;
+            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             serde_json::to_value(s.kinds()).map_err(|e| e.to_string())
         })
         .await?
@@ -156,7 +164,7 @@ impl StudioHost for DesktopStudio {
 
     async fn options(&self, kind: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(ferrocast_engine::studio_host::STOPPED)?;
+            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             let opts = s.options(&kind).map_err(|e| e.to_string())?;
             serde_json::to_value(opts).map_err(|e| e.to_string())
         })
@@ -177,11 +185,65 @@ impl StudioHost for DesktopStudio {
                 p.set_rect(rect, scale);
                 return Ok(());
             }
-            let studio = h.scene.as_ref().and(h.studio.as_ref()).ok_or(ferrocast_engine::studio_host::STOPPED)?;
+            let studio = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
             h.preview = Some(studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?);
             Ok(())
         })
         .await?
+    }
+
+    async fn defaults(&self, kind: String) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            s.defaults(&kind).map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    async fn sources(&self) -> Result<Value, String> {
+        self.on_scene(|s| serde_json::to_value(s.sources()).map_err(|e| e.to_string())).await
+    }
+
+    async fn add_source(&self, add: AddSource) -> Result<Value, String> {
+        self.on_scene(move |s| {
+            s.add(&add.kind, &add.name, &add.settings, (0.0, 0.0)).map_err(|e| e.to_string())?;
+            if add.fit {
+                s.fit(&add.name).map_err(|e| e.to_string())?;
+            }
+            let entry = s.sources().into_iter().find(|i| i.name == add.name);
+            let settings = s.settings(&add.name).map_err(|e| e.to_string())?;
+            Ok(json!({ "source": entry, "settings": settings }))
+        })
+        .await
+    }
+
+    async fn source_settings(&self, name: String) -> Result<Value, String> {
+        self.on_scene(move |s| s.settings(&name).map_err(|e| e.to_string())).await
+    }
+
+    async fn source_options(&self, name: String) -> Result<Value, String> {
+        self.on_scene(move |s| {
+            let opts = s.options(&name).map_err(|e| e.to_string())?;
+            serde_json::to_value(opts).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    async fn update_source(&self, name: String, settings: Value) -> Result<(), String> {
+        self.on_scene(move |s| s.update(&name, &settings).map_err(|e| e.to_string())).await
+    }
+
+    async fn edit_source(&self, name: String, edit: SourceEdit) -> Result<(), String> {
+        self.on_scene(move |s| {
+            match edit {
+                SourceEdit::Show => s.set_visible(&name, true),
+                SourceEdit::Hide => s.set_visible(&name, false),
+                SourceEdit::Fit => s.fit(&name),
+                SourceEdit::Remove => s.remove(&name),
+            }
+            .map_err(|e| e.to_string())
+        })
+        .await
     }
 }

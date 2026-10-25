@@ -58,6 +58,66 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn options(&self, kind: String) -> Result<Value, String>;
     /// Shows the preview at the box in the dashboard window, or hides it (None).
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String>;
+    /// The settings a new source of `kind` starts with.
+    async fn defaults(&self, kind: String) -> Result<Value, String>;
+    /// The sources in the scene on air (`ferrocast_studio::SourceInfo[]`), bottom first.
+    async fn sources(&self) -> Result<Value, String>;
+    /// Adds a source; `fit` fits it to the screen. Answers its entry (as listed) and settings.
+    async fn add_source(&self, add: AddSource) -> Result<Value, String>;
+    async fn source_settings(&self, name: String) -> Result<Value, String>;
+    /// A source's options as they look for its settings now (`OptionInfo[]`).
+    async fn source_options(&self, name: String) -> Result<Value, String>;
+    /// Changes only the keys given.
+    async fn update_source(&self, name: String, settings: Value) -> Result<(), String>;
+    async fn edit_source(&self, name: String, edit: SourceEdit) -> Result<(), String>;
+}
+
+/// `POST /studio/engine/sources`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AddSource {
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub settings: Value,
+    #[serde(default)]
+    pub fit: bool,
+}
+
+/// What can be done to a source besides its settings (`POST …/edit` `{ "do": "fit" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "do")]
+pub enum SourceEdit {
+    Show,
+    Hide,
+    Fit,
+    Remove,
+}
+
+/// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
+fn check_kind(kind: &str) -> Result<(), EngineError> {
+    if kind.is_empty() || kind.len() > 128 || !kind.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
+        return Err(EngineError::Invalid("kind: an OBS source or filter id, like color_source.".into()));
+    }
+    Ok(())
+}
+
+/// A source name: 1 to 100 letters on one line.
+fn check_source_name(name: &str) -> Result<(), EngineError> {
+    let n = name.chars().count();
+    if n == 0 || n > 100 || name.trim() != name || name.chars().any(char::is_control) {
+        return Err(EngineError::Invalid("name: 1 to 100 letters on one line.".into()));
+    }
+    Ok(())
+}
+
+fn check_settings(v: &Value) -> Result<(), EngineError> {
+    if !(v.is_object() || v.is_null()) {
+        return Err(EngineError::Invalid("settings: an object of OBS setting keys and values.".into()));
+    }
+    if v.to_string().len() > 256 * 1024 {
+        return Err(EngineError::Invalid("settings: up to 256 KB.".into()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -103,13 +163,51 @@ impl Engine {
     }
 
     pub async fn studio_options(&self, kind: &str) -> Result<Value, EngineError> {
-        if kind.is_empty()
-            || kind.len() > 128
-            || !kind.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
-        {
-            return Err(EngineError::Invalid("kind: an OBS source or filter id, like color_source.".into()));
-        }
+        check_kind(kind)?;
         self.studio_host()?.options(kind.to_string()).await.map_err(failed)
+    }
+
+    pub async fn studio_defaults(&self, kind: &str) -> Result<Value, EngineError> {
+        check_kind(kind)?;
+        self.studio_host()?.defaults(kind.to_string()).await.map_err(failed)
+    }
+
+    pub async fn studio_sources(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.sources().await.map_err(failed)
+    }
+
+    pub async fn studio_add_source(&self, mut add: AddSource) -> Result<Value, EngineError> {
+        check_kind(&add.kind)?;
+        check_source_name(&add.name)?;
+        check_settings(&add.settings)?;
+        if add.settings.is_null() {
+            add.settings = serde_json::json!({});
+        }
+        self.studio_host()?.add_source(add).await.map_err(failed)
+    }
+
+    pub async fn studio_source_settings(&self, name: &str) -> Result<Value, EngineError> {
+        check_source_name(name)?;
+        self.studio_host()?.source_settings(name.to_string()).await.map_err(failed)
+    }
+
+    pub async fn studio_source_options(&self, name: &str) -> Result<Value, EngineError> {
+        check_source_name(name)?;
+        self.studio_host()?.source_options(name.to_string()).await.map_err(failed)
+    }
+
+    pub async fn studio_update_source(&self, name: &str, settings: Value) -> Result<(), EngineError> {
+        check_source_name(name)?;
+        if !settings.is_object() {
+            return Err(EngineError::Invalid("settings: an object of OBS setting keys and values.".into()));
+        }
+        check_settings(&settings)?;
+        self.studio_host()?.update_source(name.to_string(), settings).await.map_err(failed)
+    }
+
+    pub async fn studio_edit_source(&self, name: &str, edit: SourceEdit) -> Result<(), EngineError> {
+        check_source_name(name)?;
+        self.studio_host()?.edit_source(name.to_string(), edit).await.map_err(failed)
     }
 
     pub async fn studio_preview(&self, rect: Option<PreviewRect>) -> Result<(), EngineError> {
@@ -124,22 +222,36 @@ impl Engine {
 pub const STOPPED: &str = "Start the Studio first.";
 
 fn failed(message: String) -> EngineError {
-    if message == STOPPED {
-        return EngineError::Refused {
-            status: 409,
-            code: "studio_stopped",
-            message,
-            hint: "Press Start in Studio, Without OBS.".into(),
-            retry_after: None,
-        };
-    }
-    EngineError::Refused {
-        status: 422,
-        code: "studio_failed",
+    let refused = |status, code, message: String, hint: &str| EngineError::Refused {
+        status,
+        code,
         message,
-        hint: "Make sure OBS 32 or newer is installed, then try again.".into(),
+        hint: hint.into(),
         retry_after: None,
+    };
+    if message == STOPPED {
+        return refused(409, "studio_stopped", message, "Press Start in Studio, Without OBS.");
     }
+    // OBS's errors come as sentence fragments ("there's no source…"): start them as sentences.
+    let mut message = message.strip_prefix("name: ").map(str::to_string).unwrap_or(message);
+    if let Some(c) = message.chars().next().filter(char::is_ascii_lowercase) {
+        message.replace_range(..1, &c.to_ascii_uppercase().to_string());
+    }
+    if !message.ends_with('.') {
+        message.push('.');
+    }
+    if message.starts_with("There's no source called") {
+        return refused(404, "studio_no_source", message, "Refresh the list of sources.");
+    }
+    if message.contains("already a source called") {
+        return refused(409, "studio_name_taken", message, "Pick another name.");
+    }
+    refused(
+        422,
+        "studio_failed",
+        message,
+        "Check the settings and try again. If it keeps failing, make sure OBS 32 or newer is installed.",
+    )
 }
 
 #[cfg(test)]
@@ -170,6 +282,27 @@ mod tests {
         }
         async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String> {
             self.rects.lock().unwrap_or_else(|p| p.into_inner()).push(rect);
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn sources(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn add_source(&self, add: AddSource) -> Result<Value, String> {
+            Ok(serde_json::json!({ "name": add.name, "kind": add.kind, "settings": add.settings }))
+        }
+        async fn source_settings(&self, name: String) -> Result<Value, String> {
+            Ok(serde_json::json!({ "name": name }))
+        }
+        async fn source_options(&self, _name: String) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn update_source(&self, _name: String, _settings: Value) -> Result<(), String> {
+            Ok(())
+        }
+        async fn edit_source(&self, _name: String, _edit: SourceEdit) -> Result<(), String> {
             Ok(())
         }
     }
@@ -215,5 +348,39 @@ mod tests {
             assert!(matches!(e.studio_preview(Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
         assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r), None], "only good boxes reach the app");
+
+        let add = |kind: &str, name: &str, settings: Value| AddSource {
+            kind: kind.into(),
+            name: name.into(),
+            settings,
+            fit: true,
+        };
+        let made = e.studio_add_source(add("color_source", "Background", Value::Null)).await.unwrap();
+        assert_eq!(made["settings"], serde_json::json!({}), "no settings is an empty object");
+        for (bad, field) in [
+            (add("../x", "A", serde_json::json!({})), "kind"),
+            (add("color_source", "", serde_json::json!({})), "name"),
+            (add("color_source", " lead", serde_json::json!({})), "name"),
+            (add("color_source", "A", serde_json::json!([1])), "settings"),
+            (add("color_source", "A", serde_json::json!({ "x": "y".repeat(300_000) })), "settings"),
+        ] {
+            let err = e.studio_add_source(bad).await.unwrap_err();
+            assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{err:?}");
+        }
+        assert!(e.studio_update_source("Background", serde_json::json!("red")).await.is_err());
+        e.studio_update_source("Background", serde_json::json!({ "color": 1 })).await.unwrap();
+        e.studio_edit_source("Background", SourceEdit::Fit).await.unwrap();
+        assert!(e.studio_edit_source("a\nb", SourceEdit::Remove).await.is_err());
+
+        for (msg, status) in [
+            ("there's no source called \"X\" here", 404),
+            ("name: there's already a source called \"X\" here.", 409),
+            ("the encoder \"x\" isn't available", 422),
+        ] {
+            let EngineError::Refused { status: got, message, .. } = failed(msg.into()) else { panic!() };
+            assert_eq!(got, status, "{msg}");
+            assert!(message.ends_with('.') && !message.starts_with(char::is_lowercase), "{message}");
+            assert!(!message.starts_with("Name:"), "{message}");
+        }
     }
 }
