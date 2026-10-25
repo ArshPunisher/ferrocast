@@ -5,6 +5,11 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0-beta.13
+
+- The sound element uses real recordings: a whoosh, a riser, a cinematic hit, a clock tick, a
+  chime and a glitch, plus rain, cold wind, a soft pad and a city at night as loops.
+
 ## 2.0.0-beta.12
 
 - Starting soon stays a plain screen when no music plays: the music panel comes and goes with
