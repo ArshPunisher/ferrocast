@@ -16,6 +16,8 @@ use ferrocast_core::stream_info::{Preset, StreamInfo};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, StudioAct};
+
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::extract::Body;
@@ -31,10 +33,30 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/preview", put(engine_preview))
         .route("/studio/engine/kinds/{id}/defaults", get(engine_defaults))
         .route("/studio/engine/stream", get(engine_stream_stats).post(engine_stream))
-        .route("/studio/engine/sources", get(engine_sources).post(engine_add_source))
+        .route("/studio/engine/scenes", get(engine_scenes).post(engine_add_scene))
+        .route("/studio/engine/scenes/{scene}", delete(engine_remove_scene))
+        .route("/studio/engine/scenes/{scene}/duplicate", post(engine_duplicate_scene))
+        .route("/studio/engine/scenes/{scene}/move", post(engine_move_scene))
+        .route("/studio/engine/scenes/{scene}/current", post(engine_set_current))
+        .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
+        .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
+        .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
+        .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/sources", get(engine_sources))
+        .route("/studio/engine/sources/{name}/rename", post(engine_rename))
         .route("/studio/engine/sources/{name}/settings", get(engine_source_settings).put(engine_update_source))
         .route("/studio/engine/sources/{name}/options", get(engine_source_options))
-        .route("/studio/engine/sources/{name}/edit", post(engine_edit_source))
+        .route("/studio/engine/sources/{name}/audio", put(engine_set_audio))
+        .route("/studio/engine/sources/{name}/filters", get(engine_filters).post(engine_add_filter))
+        .route("/studio/engine/sources/{name}/filters/{filter}", delete(engine_remove_filter))
+        .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
+        .route(
+            "/studio/engine/sources/{name}/filters/{filter}/settings",
+            get(engine_filter_settings).put(engine_update_filter),
+        )
+        .route("/studio/engine/sources/{name}/filters/{filter}/options", get(engine_filter_options))
+        .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
+        .route("/studio/engine/levels", post(engine_levels))
         // chatbot
         .route("/counters", get(counters).post(create_counter))
         .route("/counters/{name}", put(update_counter).delete(delete_counter))
@@ -301,23 +323,29 @@ async fn engine_defaults(State(app): State<AppState>, Path(id): Path<String>) ->
     Ok(Json(app.engine.studio_defaults(&id).await?))
 }
 
-async fn engine_sources(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.studio_sources().await?))
+async fn act(app: &AppState, a: StudioAct) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_act(a).await?))
 }
 
-async fn engine_add_source(
-    State(app): State<AppState>,
-    Body(b): Body<ferrocast_engine::studio_host::AddSource>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    Ok((StatusCode::CREATED, Json(app.engine.studio_add_source(b).await?)))
+async fn act_done(app: &AppState, a: StudioAct) -> ApiResult<StatusCode> {
+    app.engine.studio_act(a).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn engine_source_settings(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.studio_source_settings(&name).await?))
+#[derive(Deserialize)]
+struct NameBody {
+    name: String,
 }
 
-async fn engine_source_options(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.studio_source_options(&name).await?))
+#[derive(Deserialize)]
+struct MoveBody {
+    to: usize,
+}
+
+#[derive(Deserialize)]
+struct DoBody<T> {
+    #[serde(rename = "do")]
+    what: T,
 }
 
 #[derive(Deserialize)]
@@ -325,22 +353,212 @@ struct SettingsBody {
     settings: Value,
 }
 
+/// `POST …/items`: a new source, or (`existing`) one from another scene.
+#[derive(Deserialize)]
+struct AddItemBody {
+    existing: Option<String>,
+    #[serde(flatten)]
+    source: Option<NewSource>,
+    #[serde(default)]
+    fit: bool,
+}
+
+#[derive(Deserialize)]
+struct AudioBody {
+    volume_db: Option<f32>,
+    muted: Option<bool>,
+    monitor: Option<Monitor>,
+}
+
+#[derive(Deserialize)]
+struct LevelsBody {
+    names: Vec<String>,
+}
+
+/// `GET /studio/engine/scenes` → `{ scenes, current, transition }`.
+async fn engine_scenes(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Scenes).await
+}
+
+async fn engine_add_scene(
+    State(app): State<AppState>,
+    Body(b): Body<NameBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::AddScene { name: b.name }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_remove_scene(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::RemoveScene { scene }).await
+}
+
+async fn engine_duplicate_scene(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<NameBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::DuplicateScene { scene, name: b.name }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_move_scene(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<MoveBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::MoveScene { scene, to: b.to }).await
+}
+
+/// Puts a scene on air through the transition.
+async fn engine_set_current(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetCurrent { scene }).await
+}
+
+#[derive(Deserialize)]
+struct TransitionBody {
+    kind: String,
+    ms: u32,
+}
+
+async fn engine_transition(State(app): State<AppState>, Body(b): Body<TransitionBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTransition { kind: b.kind, ms: b.ms }).await
+}
+
+async fn engine_items(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Items { scene }).await
+}
+
+async fn engine_add_item(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<AddItemBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let a = match (b.existing, b.source) {
+        (Some(name), _) => StudioAct::AddExisting { scene, name },
+        (None, Some(source)) => StudioAct::AddSource { scene, source, fit: b.fit },
+        (None, None) => {
+            return Err(ApiError::invalid("kind and name for a new source, or existing for one already made."));
+        }
+    };
+    let Json(v) = act(&app, a).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_edit_item(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<DoBody<ItemEdit>>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::EditItem { scene, id, edit: b.what }).await
+}
+
+async fn engine_audio(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Audio { scene }).await
+}
+
+/// `GET /studio/engine/sources`: every source, with the scenes it's in.
+async fn engine_sources(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Sources).await
+}
+
+async fn engine_rename(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<NameBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::Rename { name, new_name: b.name }).await
+}
+
+async fn engine_source_settings(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Settings { name }).await
+}
+
+async fn engine_source_options(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Options { name }).await
+}
+
 async fn engine_update_source(
     State(app): State<AppState>,
     Path(name): Path<String>,
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
-    app.engine.studio_update_source(&name, b.settings).await?;
-    Ok(StatusCode::NO_CONTENT)
+    act_done(&app, StudioAct::Update { name, settings: b.settings }).await
 }
 
-async fn engine_edit_source(
+async fn engine_set_audio(
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Body(b): Body<ferrocast_engine::studio_host::SourceEdit>,
+    Body(b): Body<AudioBody>,
 ) -> ApiResult<StatusCode> {
-    app.engine.studio_edit_source(&name, b).await?;
-    Ok(StatusCode::NO_CONTENT)
+    act_done(&app, StudioAct::SetAudio { name, volume_db: b.volume_db, muted: b.muted, monitor: b.monitor }).await
+}
+
+async fn engine_filters(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Filters { name }).await
+}
+
+async fn engine_add_filter(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(filter): Body<NewSource>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::AddFilter { name, filter }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_remove_filter(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::RemoveFilter { name, filter }).await
+}
+
+async fn engine_edit_filter(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+    Body(b): Body<DoBody<FilterEdit>>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::EditFilter { name, filter, edit: b.what }).await
+}
+
+async fn engine_filter_settings(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterSettings { name, filter }).await
+}
+
+async fn engine_filter_options(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterOptions { name, filter }).await
+}
+
+async fn engine_update_filter(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+    Body(b): Body<SettingsBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::UpdateFilter { name, filter, settings: b.settings }).await
+}
+
+/// A global sound device (every scene) on channel 1 to 6.
+async fn engine_set_channel(
+    State(app): State<AppState>,
+    Path(channel): Path<u32>,
+    Body(device): Body<NewSource>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetChannel { channel, device: Some(device) }).await
+}
+
+async fn engine_clear_channel(State(app): State<AppState>, Path(channel): Path<u32>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetChannel { channel, device: None }).await
+}
+
+/// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
+async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Levels { names: b.names }).await
 }
 
 async fn show_config(State(app): State<AppState>) -> Json<Value> {

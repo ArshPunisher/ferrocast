@@ -608,10 +608,29 @@ OBS's own libobs and plugins, run by the **desktop app** on its main thread (STU
 | PUT | `/api/v1/studio/engine/preview` | `{ rect: { x, y, w, h } \| null }` (CSS pixels in the desktop window) → 204. The app draws libobs's picture into a native view over that box; null takes it away. 400 for a box off the window or 0 / over 16384 px |
 | GET | `/api/v1/studio/engine/kinds/{id}/defaults` | The settings a new source of that kind starts with (OBS's defaults). 400 for a bad id, 409 `studio_stopped` |
 | GET / POST | `/api/v1/studio/engine/stream` | GET → `{ active, reconnecting, bytes, frames, dropped, error: string \| null } \| null` (null: not streaming). POST `{ on }` starts or stops streaming the Studio into this PC's Go live ingest (H.264 6000 kbps CBR, 2 s keyframes, AAC 160; the Mac's hardware encoder when there is one) → the same stats, or null when stopped. Go live then sends it on to the destinations switched on, as it does a stream from OBS. 422 `golive_off` when the local ingest didn't start, 409 `studio_stopped` |
-| GET / POST | `/api/v1/studio/engine/sources` | The scene on air's sources, bottom first: `{ name, kind, visible }[]`. POST `{ kind, name /* 1–100, one line, unique */, settings?: object /* OBS's own keys, ≤ 256 KB */, fit?: boolean }` → 201 `{ source, settings }` (settings as OBS filled them in, defaults included). 409 `studio_name_taken`, 422 `studio_failed` for a kind OBS can't make |
+| GET / POST | `/api/v1/studio/engine/scenes` | `{ scenes: { name, items, current }[] /* in order */, current, transition: { kind, ms } }`. POST `{ name }` adds an empty scene at the end → 201. Names are unique across scenes and sources (as in OBS): 409 `studio_name_taken` |
+| DELETE | `/api/v1/studio/engine/scenes/{scene}` | → 204. If it was on air, the one before it goes on. 409 `studio_last_scene` for the only scene, 404 `studio_no_scene` |
+| POST | `/api/v1/studio/engine/scenes/{scene}/duplicate` | `{ name }` → 201: a copy right after it, showing the same sources |
+| POST | `/api/v1/studio/engine/scenes/{scene}/move` | `{ to }` (0 is the top) → 204 |
+| POST | `/api/v1/studio/engine/scenes/{scene}/current` | Puts the scene on air through the transition → 204 |
+| PUT | `/api/v1/studio/engine/transition` | `{ kind /* fade_transition, cut_transition, swipe_transition… */, ms /* 0–20000 */ }` → 204. 422 `studio_failed` for a kind OBS doesn't have |
+| GET / POST | `/api/v1/studio/engine/scenes/{scene}/items` | The scene's sources, top first: `{ id, name, kind, visible, locked, audio, group, children /* a group's own items */ }[]`. POST `{ kind, name /* 1–100, one line */, settings?: object /* OBS's own keys, ≤ 256 KB */, fit?: boolean }` → 201 `{ item, settings }` (settings as OBS filled them in); or `{ existing: name }` adds a source from another scene → 201 `{ item }`. 409 `studio_name_taken`, 422 `studio_failed` for a kind OBS can't make |
+| POST | `/api/v1/studio/engine/scenes/{scene}/items/{id}/edit` | `{ do: "show" \| "hide" \| "lock" \| "unlock" \| "fit" \| "remove" \| "up" \| "down" \| "top" \| "bottom" }` → 204 (fit scales it into the canvas, keeping its shape; remove takes it out of this scene). 404 `studio_no_source` for an unknown id |
+| GET | `/api/v1/studio/engine/scenes/{scene}/audio` | The scene's mixer: the global devices first, then its own sounds (groups included): `{ name, kind, channel: 1–6 \| null, volume_db /* -100–26 */, muted, monitor: "off" \| "only_me" \| "me_and_stream" }[]` |
+| GET | `/api/v1/studio/engine/sources` | Every source in a scene: `{ name, kind, scenes: string[] }[]` (for adding one again) |
+| POST | `/api/v1/studio/engine/sources/{name}/rename` | `{ name }` → 204 (scenes too). 409 `studio_name_taken` |
 | GET / PUT | `/api/v1/studio/engine/sources/{name}/settings` | The source's settings object; PUT `{ settings: object }` changes only the keys sent → 204. 404 `studio_no_source` |
 | GET | `/api/v1/studio/engine/sources/{name}/options` | The source's options as they look for its settings now (OBS shows, hides and fills some from what's chosen). 404 `studio_no_source` |
-| POST | `/api/v1/studio/engine/sources/{name}/edit` | `{ do: "show" \| "hide" \| "fit" \| "remove" }` → 204 (fit scales it into the canvas, keeping its shape). 404 `studio_no_source` |
+| PUT | `/api/v1/studio/engine/sources/{name}/audio` | `{ volume_db?, muted?, monitor? }` (any of them) → 204. 400 outside -100–26 dB |
+| GET / POST | `/api/v1/studio/engine/sources/{name}/filters` | `{ name, kind, enabled }[]` in the order they run. POST `{ kind, name, settings? }` adds one at the end → 201. 409 `studio_name_taken` for a filter name used on this source |
+| DELETE | `/api/v1/studio/engine/sources/{name}/filters/{filter}` | → 204. 404 `studio_no_filter` |
+| POST | `/api/v1/studio/engine/sources/{name}/filters/{filter}/edit` | `{ do: "enable" \| "disable" \| "up" \| "down" \| "top" \| "bottom" }` → 204 |
+| GET / PUT | `/api/v1/studio/engine/sources/{name}/filters/{filter}/settings` | As a source's settings |
+| GET | `/api/v1/studio/engine/sources/{name}/filters/{filter}/options` | As a source's options |
+| PUT / DELETE | `/api/v1/studio/engine/channels/{channel}` | A global sound device heard in every scene: 1 and 2 desktop sound, 3 to 6 mics. PUT `{ kind, name, settings? }` → 204 (replaces what was there); DELETE takes it off → 204. 400 for a channel outside 1–6 |
+| POST | `/api/v1/studio/engine/levels` | `{ names: string[] /* ≤ 64 */ }` → `{ [name]: { peak: [l, r], magnitude: [l, r] } }` in dBFS (-100 is silence). A meter starts on the first ask, so the first answer can be silent; poll it (a few times a second) while the mixer shows. |
+
+The scenes are saved after every change, in OBS's own scene-collection format (`scene_order`, `current_scene`, `sources`, `DesktopAudioDevice1`…), in the app's data folder (`studio/scenes.json`). The sources and their filters, volume and monitoring come back at the next Start.
 
 ### Studio (streamer tools, all free)
 Production helpers that run on the streamer's PC. OBS requests use the OBS details above; when OBS can't be reached every OBS route answers 422 `obs_unreachable` (`obs_password`, or `obs_refused` for an unknown scene/source) with a hint. Settings PUTs save only the fields sent; 400 names the field.

@@ -540,11 +540,34 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.get("/studio/engine/sources").await,
         r.get("/studio/engine/stream").await,
         r.post("/studio/engine/stream", json!({ "on": false })).await,
-        r.post("/studio/engine/sources", json!({ "kind": "color_source", "name": "Back" })).await,
         r.get("/studio/engine/sources/Back/settings").await,
         r.get("/studio/engine/sources/Back/options").await,
         r.put("/studio/engine/sources/Back/settings", json!({ "settings": { "color": 1 } })).await,
-        r.post("/studio/engine/sources/Back/edit", json!({ "do": "fit" })).await,
+        r.get("/studio/engine/scenes").await,
+        r.post("/studio/engine/scenes", json!({ "name": "Gameplay" })).await,
+        r.delete("/studio/engine/scenes/Gameplay").await,
+        r.post("/studio/engine/scenes/Gameplay/duplicate", json!({ "name": "Gameplay 2" })).await,
+        r.post("/studio/engine/scenes/Gameplay/move", json!({ "to": 0 })).await,
+        r.post("/studio/engine/scenes/Just%20chatting/current", json!({})).await,
+        r.get("/studio/engine/scenes/Gameplay/items").await,
+        r.post("/studio/engine/scenes/Gameplay/items", json!({ "kind": "color_source", "name": "Back" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items", json!({ "existing": "Back" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "lock" })).await,
+        r.get("/studio/engine/scenes/Gameplay/audio").await,
+        r.put("/studio/engine/transition", json!({ "kind": "fade_transition", "ms": 300 })).await,
+        r.post("/studio/engine/sources/Back/rename", json!({ "name": "Front" })).await,
+        r.put("/studio/engine/sources/Mic/audio", json!({ "volume_db": -6.0, "muted": true, "monitor": "only_me" }))
+            .await,
+        r.get("/studio/engine/sources/Mic/filters").await,
+        r.post("/studio/engine/sources/Mic/filters", json!({ "kind": "noise_gate_filter", "name": "Gate" })).await,
+        r.delete("/studio/engine/sources/Mic/filters/Gate").await,
+        r.post("/studio/engine/sources/Mic/filters/Gate/edit", json!({ "do": "disable" })).await,
+        r.get("/studio/engine/sources/Mic/filters/Gate/settings").await,
+        r.put("/studio/engine/sources/Mic/filters/Gate/settings", json!({ "settings": {} })).await,
+        r.get("/studio/engine/sources/Mic/filters/Gate/options").await,
+        r.put("/studio/engine/channels/3", json!({ "kind": "coreaudio_input_capture", "name": "Mic" })).await,
+        r.delete("/studio/engine/channels/3").await,
+        r.post("/studio/engine/levels", json!({ "names": ["Mic"] })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -552,8 +575,20 @@ async fn the_studio_engine_needs_the_desktop_app() {
     assert_eq!(code(r.get("/studio/engine/kinds/..%2Fx/options").await).await.0, StatusCode::BAD_REQUEST);
     let bad = r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 0, "h": 360 } })).await;
     assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
-    let bad = r.post("/studio/engine/sources", json!({ "kind": "color_source", "name": "" })).await;
-    assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
-    let bad = r.post("/studio/engine/sources/Back/edit", json!({ "do": "explode" })).await;
-    assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);
+    for (bad, what) in [
+        (
+            r.post("/studio/engine/scenes/Gameplay/items", json!({ "kind": "color_source", "name": "" })).await,
+            "empty name",
+        ),
+        (r.post("/studio/engine/scenes/Gameplay/items", json!({ "fit": true })).await, "nothing to add"),
+        (r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "explode" })).await, "unknown edit"),
+        (r.post("/studio/engine/scenes/Gameplay/items/x/edit", json!({ "do": "lock" })).await, "id not a number"),
+        (r.put("/studio/engine/sources/Mic/audio", json!({ "volume_db": 99 })).await, "too loud"),
+        (r.put("/studio/engine/sources/Mic/audio", json!({ "monitor": "everyone" })).await, "unknown monitor"),
+        (r.put("/studio/engine/transition", json!({ "kind": "fade_transition", "ms": 999999 })).await, "too long"),
+        (r.put("/studio/engine/channels/9", json!({ "kind": "x", "name": "Mic" })).await, "channel 9"),
+        (r.post("/studio/engine/sources/Mic/filters/Gate/edit", json!({ "do": "lock" })).await, "filters don't lock"),
+    ] {
+        assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
+    }
 }

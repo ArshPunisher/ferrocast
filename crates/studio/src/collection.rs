@@ -94,6 +94,14 @@ pub struct AudioInfo {
     pub monitor: Monitor,
 }
 
+/// A source and the scenes it's in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceUse {
+    pub name: String,
+    pub kind: String,
+    pub scenes: Vec<String>,
+}
+
 /// A filter on a source, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilterInfo {
@@ -538,6 +546,37 @@ impl Collection {
             ItemEdit::Bottom => a.obs_sceneitem_set_order(item, ffi::OBS_ORDER_MOVE_BOTTOM),
         }
         Ok(())
+    }
+
+    /// Every source in a scene (groups included), with the scenes it's in, in scene order.
+    pub fn sources(&self) -> Vec<SourceUse> {
+        let a = self.api();
+        let mut out: Vec<SourceUse> = Vec::new();
+        for s in self.scenes.borrow().iter() {
+            let scene = text(a.obs_source_get_name(*s));
+            let mut items = Vec::new();
+            for i in self.raw_items(a.obs_scene_from_source(*s)) {
+                items.push(i);
+                if a.obs_sceneitem_is_group(i) {
+                    items.extend(self.group_items(i));
+                }
+            }
+            for i in items.into_iter().rev() {
+                let src = a.obs_sceneitem_get_source(i);
+                if a.obs_source_is_scene(src) {
+                    continue;
+                }
+                let name = text(a.obs_source_get_name(src));
+                match out.iter_mut().find(|u| u.name == name) {
+                    Some(u) if !u.scenes.contains(&scene) => u.scenes.push(scene.clone()),
+                    Some(_) => {}
+                    None => {
+                        out.push(SourceUse { name, kind: text(a.obs_source_get_id(src)), scenes: vec![scene.clone()] })
+                    }
+                }
+            }
+        }
+        out
     }
 
     // ---- Source settings ----

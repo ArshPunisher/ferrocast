@@ -19,7 +19,8 @@ use raw_window_handle::RawWindowHandle;
 use serde::{Deserialize, Serialize};
 
 pub use collection::{
-    AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, TransitionInfo,
+    AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, SourceUse,
+    TransitionInfo,
 };
 use ffi::{Api, cstr, text};
 

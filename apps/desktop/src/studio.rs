@@ -8,8 +8,12 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use ferrocast_engine::studio_host::{AddSource, PreviewRect, STOPPED, SourceEdit, StudioHost, StudioStatus};
-use ferrocast_studio::{Canvas, Paths, Preview, Rect, Scene, StreamSettings, Streaming, Studio};
+use ferrocast_engine::studio_host::{
+    FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, STOPPED, StudioAct, StudioHost, StudioStatus,
+};
+use ferrocast_studio::{
+    Canvas, Collection, ItemEdit, Monitor, Paths, Preview, Rect, StreamSettings, Streaming, Studio, TransitionInfo,
+};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
@@ -17,11 +21,11 @@ use tauri::{AppHandle, Manager};
 ///
 /// libobs loads once and stays until Ferrocast quits: it can't be shut down and started again
 /// in one process (the second shutdown crashed in FreeType's cleanup, 25 Oct; OBS never does
-/// it either). Stop takes the scene and preview away; Start puts them back on the same engine.
+/// it either). Stop takes the scenes and preview away; Start loads them back on the same engine.
 #[derive(Default)]
 struct Held {
     studio: Option<Studio>,
-    scene: Option<Scene>,
+    collection: Option<Collection>,
     preview: Option<Preview>,
     stream: Option<Streaming>,
     renderer: &'static str,
@@ -74,6 +78,111 @@ fn stats_of(s: &Streaming) -> Value {
     v
 }
 
+/// The scenes a new collection starts with, empty: the dashboard shows what to add.
+const FIRST_SCENE: &str = "Main";
+/// The collection's name in its file (OBS shows it when the file is imported there).
+const COLLECTION: &str = "Ferrocast";
+
+fn item_edit(e: Edit) -> ItemEdit {
+    match e {
+        Edit::Show => ItemEdit::Show,
+        Edit::Hide => ItemEdit::Hide,
+        Edit::Lock => ItemEdit::Lock,
+        Edit::Unlock => ItemEdit::Unlock,
+        Edit::Fit => ItemEdit::Fit,
+        Edit::Remove => ItemEdit::Remove,
+        Edit::Up => ItemEdit::Up,
+        Edit::Down => ItemEdit::Down,
+        Edit::Top => ItemEdit::Top,
+        Edit::Bottom => ItemEdit::Bottom,
+    }
+}
+
+macro_rules! to_json {
+    ($v:expr) => {
+        serde_json::to_value($v).map_err(|e| e.to_string())
+    };
+}
+
+/// Does one act on the collection → what it shows (null for a change).
+fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::StudioError> {
+    use StudioAct as A;
+    let done = |r: Result<(), ferrocast_studio::StudioError>| r.map(|()| Value::Null);
+    let v = |x: Result<Value, String>| x.map_err(ferrocast_studio::StudioError::Failed);
+    match act {
+        A::Scenes => v(to_json!(json!({ "scenes": c.scenes(), "current": c.current(), "transition": c.transition() }))),
+        A::AddScene { name } => done(c.add_scene(&name)),
+        A::DuplicateScene { scene, name } => done(c.duplicate_scene(&scene, &name)),
+        A::RemoveScene { scene } => done(c.remove_scene(&scene)),
+        A::MoveScene { scene, to } => done(c.move_scene(&scene, to)),
+        A::SetCurrent { scene } => done(c.set_current(&scene)),
+        A::SetTransition { kind, ms } => done(c.set_transition(&TransitionInfo { kind, ms })),
+        A::Items { scene } => v(to_json!(c.items(&scene)?)),
+        A::AddSource { scene, source, fit } => {
+            let item = c.add_source(&scene, &source.kind, &source.name, &source.settings, fit)?;
+            let settings = c.settings(&source.name)?;
+            v(to_json!(json!({ "item": item, "settings": settings })))
+        }
+        A::AddExisting { scene, name } => v(to_json!(json!({ "item": c.add_existing(&scene, &name)? }))),
+        A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
+        A::Sources => v(to_json!(c.sources())),
+        A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
+        A::Settings { name } => c.settings(&name),
+        A::Options { name } => v(to_json!(c.options(&name)?)),
+        A::Update { name, settings } => done(c.update(&name, &settings)),
+        A::Audio { scene } => v(to_json!(c.audio(&scene)?)),
+        A::SetAudio { name, volume_db, muted, monitor } => {
+            if let Some(d) = volume_db {
+                c.set_volume(&name, d)?;
+            }
+            if let Some(m) = muted {
+                c.set_muted(&name, m)?;
+            }
+            if let Some(m) = monitor {
+                let m = match m {
+                    Hear::Off => Monitor::Off,
+                    Hear::OnlyMe => Monitor::OnlyMe,
+                    Hear::MeAndStream => Monitor::MeAndStream,
+                };
+                c.set_monitor(&name, m)?;
+            }
+            Ok(Value::Null)
+        }
+        A::SetChannel { channel, device } => {
+            done(c.set_channel(channel, device.as_ref().map(|d| (d.kind.as_str(), d.name.as_str(), &d.settings))))
+        }
+        A::Levels { names } => v(to_json!(c.levels(&names))),
+        A::Filters { name } => v(to_json!(c.filters(&name)?)),
+        A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
+        A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
+        A::EditFilter { name, filter, edit } => done(match edit {
+            FilterEdit::Enable => c.set_filter_enabled(&name, &filter, true),
+            FilterEdit::Disable => c.set_filter_enabled(&name, &filter, false),
+            FilterEdit::Up => c.move_filter(&name, &filter, ItemEdit::Up),
+            FilterEdit::Down => c.move_filter(&name, &filter, ItemEdit::Down),
+            FilterEdit::Top => c.move_filter(&name, &filter, ItemEdit::Top),
+            FilterEdit::Bottom => c.move_filter(&name, &filter, ItemEdit::Bottom),
+        }),
+        A::FilterSettings { name, filter } => c.filter_settings(&name, &filter),
+        A::FilterOptions { name, filter } => v(to_json!(c.filter_options(&name, &filter)?)),
+        A::UpdateFilter { name, filter, settings } => done(c.update_filter(&name, &filter, &settings)),
+    }
+}
+
+/// Writes the collection next to the plugins' config, whole or not at all (a new file, then
+/// renamed over the old one).
+fn save(c: &Collection, file: &std::path::Path) {
+    let doc = c.save(COLLECTION);
+    let tmp = file.with_extension("json.tmp");
+    let written = serde_json::to_vec_pretty(&doc)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, file));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "the Studio's scenes couldn't be saved");
+    }
+}
+
 const NO_OBS: &str = "The Studio preview uses OBS's engine from the OBS installed on this computer. Install OBS 32 or newer (obsproject.com), then try again.";
 
 #[derive(Debug, Clone)]
@@ -99,21 +208,17 @@ impl DesktopStudio {
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
-    /// Runs `f` on the scene on air (main thread), or answers that the Studio isn't started.
-    async fn on_scene<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Scene) -> Result<T, String> + Send + 'static,
-    ) -> Result<T, String> {
-        self.on_main(|h| f(h.scene.as_ref().ok_or(STOPPED)?)).await?
+    fn scenes_file(&self) -> PathBuf {
+        self.data.join("studio").join("scenes.json")
     }
 
     fn status_of(h: &Held) -> StudioStatus {
         let found = obs_paths().is_some();
         StudioStatus {
             available: found,
-            running: h.scene.is_some(),
-            version: h.scene.as_ref().and(h.studio.as_ref()).map(Studio::version),
-            renderer: h.scene.as_ref().map(|_| h.renderer.to_string()),
+            running: h.collection.is_some(),
+            version: h.collection.as_ref().and(h.studio.as_ref()).map(Studio::version),
+            renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
             detail: (!found).then(|| NO_OBS.into()),
         }
     }
@@ -127,8 +232,9 @@ impl StudioHost for DesktopStudio {
 
     async fn start(&self) -> Result<StudioStatus, String> {
         let config = self.data.join("studio");
+        let file = self.scenes_file();
         self.on_main(move |h| {
-            if h.scene.is_some() {
+            if h.collection.is_some() {
                 return Ok(Self::status_of(h));
             }
             if h.studio.is_none() {
@@ -139,40 +245,36 @@ impl StudioHost for DesktopStudio {
                 h.studio = Some(studio);
             }
             let studio = h.studio.as_ref().ok_or("The Studio's engine isn't loaded.")?;
-            // Something to see until scenes are built in the Studio (next steps).
-            let scene = studio.scene("Studio").map_err(|e| e.to_string())?;
-            scene
-                .add(
-                    "color_source_v3",
-                    "Background",
-                    &json!({ "color": 0xFF_1A_12_0Eu32, "width": 1920, "height": 1080 }),
-                    (0.0, 0.0),
-                )
-                .map_err(|e| e.to_string())?;
-            scene
-                .add(
-                    "text_ft2_source_v2",
-                    "Title",
-                    &json!({ "text": "Ferrocast Studio", "font": { "face": "Helvetica", "size": 140 } }),
-                    (440.0, 450.0),
-                )
-                .map_err(|e| e.to_string())?;
-            studio.set_program(&scene);
-            h.scene = Some(scene);
+            // The saved scenes, or one empty scene the first time. A file that doesn't read is
+            // kept aside (never overwritten) and the Studio starts fresh.
+            let saved = std::fs::read(&file).ok().map(|b| serde_json::from_slice::<Value>(&b));
+            let collection = match saved {
+                Some(Ok(doc)) => Collection::load(studio, &doc, FIRST_SCENE),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "the Studio's scenes didn't read; starting with a new set");
+                    let _ = std::fs::rename(&file, file.with_extension("json.unreadable"));
+                    Collection::new(studio, FIRST_SCENE)
+                }
+                None => Collection::new(studio, FIRST_SCENE),
+            }
+            .map_err(|e| e.to_string())?;
+            save(&collection, &file);
+            h.collection = Some(collection);
             Ok(Self::status_of(h))
         })
         .await?
     }
 
     async fn stop(&self) -> Result<StudioStatus, String> {
-        self.on_main(|h| {
-            // The stream, the preview and the scene go; the engine stays loaded for the next Start.
+        let file = self.scenes_file();
+        self.on_main(move |h| {
+            // The stream, the preview and the scenes go (saved first); the engine stays loaded
+            // for the next Start.
             h.stream = None;
             h.preview = None;
-            if let Some(s) = h.studio.as_ref() {
-                s.clear_program();
+            if let Some(c) = h.collection.take() {
+                save(&c, &file);
             }
-            h.scene = None;
             Self::status_of(h)
         })
         .await
@@ -180,7 +282,7 @@ impl StudioHost for DesktopStudio {
 
     async fn kinds(&self) -> Result<Value, String> {
         self.on_main(|h| {
-            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             serde_json::to_value(s.kinds()).map_err(|e| e.to_string())
         })
         .await?
@@ -188,7 +290,7 @@ impl StudioHost for DesktopStudio {
 
     async fn options(&self, kind: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             let opts = s.options(&kind).map_err(|e| e.to_string())?;
             serde_json::to_value(opts).map_err(|e| e.to_string())
         })
@@ -209,7 +311,7 @@ impl StudioHost for DesktopStudio {
                 p.set_rect(rect, scale);
                 return Ok(());
             }
-            let studio = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
             h.preview = Some(studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?);
             Ok(())
@@ -219,61 +321,29 @@ impl StudioHost for DesktopStudio {
 
     async fn defaults(&self, kind: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let s = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             s.defaults(&kind).map_err(|e| e.to_string())
         })
         .await?
     }
 
-    async fn sources(&self) -> Result<Value, String> {
-        self.on_scene(|s| serde_json::to_value(s.sources()).map_err(|e| e.to_string())).await
-    }
-
-    async fn add_source(&self, add: AddSource) -> Result<Value, String> {
-        self.on_scene(move |s| {
-            s.add(&add.kind, &add.name, &add.settings, (0.0, 0.0)).map_err(|e| e.to_string())?;
-            if add.fit {
-                s.fit(&add.name).map_err(|e| e.to_string())?;
+    async fn act(&self, act: StudioAct) -> Result<Value, String> {
+        let file = self.scenes_file();
+        self.on_main(move |h| {
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let changes = act.changes();
+            let out = run(c, act).map_err(|e| e.to_string());
+            if changes && out.is_ok() {
+                save(c, &file);
             }
-            let entry = s.sources().into_iter().find(|i| i.name == add.name);
-            let settings = s.settings(&add.name).map_err(|e| e.to_string())?;
-            Ok(json!({ "source": entry, "settings": settings }))
+            out
         })
-        .await
-    }
-
-    async fn source_settings(&self, name: String) -> Result<Value, String> {
-        self.on_scene(move |s| s.settings(&name).map_err(|e| e.to_string())).await
-    }
-
-    async fn source_options(&self, name: String) -> Result<Value, String> {
-        self.on_scene(move |s| {
-            let opts = s.options(&name).map_err(|e| e.to_string())?;
-            serde_json::to_value(opts).map_err(|e| e.to_string())
-        })
-        .await
-    }
-
-    async fn update_source(&self, name: String, settings: Value) -> Result<(), String> {
-        self.on_scene(move |s| s.update(&name, &settings).map_err(|e| e.to_string())).await
-    }
-
-    async fn edit_source(&self, name: String, edit: SourceEdit) -> Result<(), String> {
-        self.on_scene(move |s| {
-            match edit {
-                SourceEdit::Show => s.set_visible(&name, true),
-                SourceEdit::Hide => s.set_visible(&name, false),
-                SourceEdit::Fit => s.fit(&name),
-                SourceEdit::Remove => s.remove(&name),
-            }
-            .map_err(|e| e.to_string())
-        })
-        .await
+        .await?
     }
 
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let studio = h.scene.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
                 return Ok(stats_of(s));
             }

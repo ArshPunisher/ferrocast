@@ -60,16 +60,9 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String>;
     /// The settings a new source of `kind` starts with.
     async fn defaults(&self, kind: String) -> Result<Value, String>;
-    /// The sources in the scene on air (`ferrocast_studio::SourceInfo[]`), bottom first.
-    async fn sources(&self) -> Result<Value, String>;
-    /// Adds a source; `fit` fits it to the screen. Answers its entry (as listed) and settings.
-    async fn add_source(&self, add: AddSource) -> Result<Value, String>;
-    async fn source_settings(&self, name: String) -> Result<Value, String>;
-    /// A source's options as they look for its settings now (`OptionInfo[]`).
-    async fn source_options(&self, name: String) -> Result<Value, String>;
-    /// Changes only the keys given.
-    async fn update_source(&self, name: String, settings: Value) -> Result<(), String>;
-    async fn edit_source(&self, name: String, edit: SourceEdit) -> Result<(), String>;
+    /// Does one thing to the scene collection (checked before it gets here) and answers what
+    /// it shows; changes are saved by the host.
+    async fn act(&self, act: StudioAct) -> Result<Value, String>;
     /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String>;
     async fn stream_stop(&self) -> Result<(), String>;
@@ -77,25 +70,275 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stream_stats(&self) -> Result<Value, String>;
 }
 
-/// `POST /studio/engine/sources`.
+/// A change to one source in a scene (`POST …/items/{id}/edit` `{ "do": "lock" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemEdit {
+    Show,
+    Hide,
+    Lock,
+    Unlock,
+    Fit,
+    Remove,
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+/// A change to a filter (`POST …/filters/{filter}/edit` `{ "do": "disable" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterEdit {
+    Enable,
+    Disable,
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+/// Who hears a sound besides the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Monitor {
+    Off,
+    OnlyMe,
+    MeAndStream,
+}
+
+/// A new source: its kind, name and OBS settings.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct AddSource {
+pub struct NewSource {
     pub kind: String,
     pub name: String,
     #[serde(default)]
     pub settings: Value,
-    #[serde(default)]
-    pub fit: bool,
 }
 
-/// What can be done to a source besides its settings (`POST …/edit` `{ "do": "fit" }`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case", tag = "do")]
-pub enum SourceEdit {
-    Show,
-    Hide,
-    Fit,
-    Remove,
+/// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
+/// refuses bad input before the host sees it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "act")]
+pub enum StudioAct {
+    /// `{ scenes, current, transition }`.
+    Scenes,
+    AddScene {
+        name: String,
+    },
+    DuplicateScene {
+        scene: String,
+        name: String,
+    },
+    RemoveScene {
+        scene: String,
+    },
+    MoveScene {
+        scene: String,
+        to: usize,
+    },
+    /// Puts a scene on air through the transition.
+    SetCurrent {
+        scene: String,
+    },
+    SetTransition {
+        kind: String,
+        ms: u32,
+    },
+    /// A scene's sources, top first.
+    Items {
+        scene: String,
+    },
+    AddSource {
+        scene: String,
+        source: NewSource,
+        fit: bool,
+    },
+    /// Adds a source from another scene (the same source, shown in both).
+    AddExisting {
+        scene: String,
+        name: String,
+    },
+    EditItem {
+        scene: String,
+        id: i64,
+        edit: ItemEdit,
+    },
+    /// Every source, with the scenes it's in.
+    Sources,
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    Settings {
+        name: String,
+    },
+    Options {
+        name: String,
+    },
+    Update {
+        name: String,
+        settings: Value,
+    },
+    /// The mixer for a scene: the global devices, then its own sounds.
+    Audio {
+        scene: String,
+    },
+    SetAudio {
+        name: String,
+        volume_db: Option<f32>,
+        muted: Option<bool>,
+        monitor: Option<Monitor>,
+    },
+    /// A global device on channel 1 to 6 (1, 2 desktop sound; 3 to 6 mics), or none.
+    SetChannel {
+        channel: u32,
+        device: Option<NewSource>,
+    },
+    /// Levels now, dBFS, for these sounds.
+    Levels {
+        names: Vec<String>,
+    },
+    Filters {
+        name: String,
+    },
+    AddFilter {
+        name: String,
+        filter: NewSource,
+    },
+    RemoveFilter {
+        name: String,
+        filter: String,
+    },
+    EditFilter {
+        name: String,
+        filter: String,
+        edit: FilterEdit,
+    },
+    FilterSettings {
+        name: String,
+        filter: String,
+    },
+    FilterOptions {
+        name: String,
+        filter: String,
+    },
+    UpdateFilter {
+        name: String,
+        filter: String,
+        settings: Value,
+    },
+}
+
+impl StudioAct {
+    /// Refuses bad input with the field and what's allowed.
+    pub fn check(&mut self) -> Result<(), EngineError> {
+        use StudioAct as A;
+        let new = |n: &mut NewSource| -> Result<(), EngineError> {
+            check_kind(&n.kind)?;
+            check_source_name(&n.name)?;
+            check_settings(&n.settings)?;
+            if n.settings.is_null() {
+                n.settings = serde_json::json!({});
+            }
+            Ok(())
+        };
+        let object = |v: &Value| -> Result<(), EngineError> {
+            if !v.is_object() {
+                return Err(EngineError::Invalid("settings: an object of OBS setting keys and values.".into()));
+            }
+            check_settings(v)
+        };
+        match self {
+            A::Scenes | A::Sources => Ok(()),
+            A::AddScene { name } => check_source_name(name),
+            A::RemoveScene { scene }
+            | A::MoveScene { scene, .. }
+            | A::SetCurrent { scene }
+            | A::Items { scene }
+            | A::Audio { scene } => check_source_name(scene),
+            A::DuplicateScene { scene, name } | A::AddExisting { scene, name } => {
+                check_source_name(scene)?;
+                check_source_name(name)
+            }
+            A::SetTransition { kind, ms } => {
+                check_kind(kind)?;
+                if *ms > 20_000 {
+                    return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                Ok(())
+            }
+            A::AddSource { scene, source, .. } => {
+                check_source_name(scene)?;
+                new(source)
+            }
+            A::EditItem { scene, .. } => check_source_name(scene),
+            A::Rename { name, new_name } => {
+                check_source_name(name)?;
+                check_source_name(new_name)
+            }
+            A::Settings { name } | A::Options { name } | A::Filters { name } => check_source_name(name),
+            A::Update { name, settings } => {
+                check_source_name(name)?;
+                object(settings)
+            }
+            A::SetAudio { name, volume_db, .. } => {
+                check_source_name(name)?;
+                if let Some(v) = volume_db
+                    && !(v.is_finite() && (-100.0..=26.0).contains(v))
+                {
+                    return Err(EngineError::Invalid("volume_db: -100 to 26.".into()));
+                }
+                Ok(())
+            }
+            A::SetChannel { channel, device } => {
+                if !(1..=6).contains(channel) {
+                    return Err(EngineError::Invalid("channel: 1 to 6.".into()));
+                }
+                device.as_mut().map(new).transpose().map(|_| ())
+            }
+            A::Levels { names } => {
+                if names.len() > 64 {
+                    return Err(EngineError::Invalid("names: up to 64 sounds at once.".into()));
+                }
+                names.iter().try_for_each(|n| check_source_name(n))
+            }
+            A::AddFilter { name, filter } => {
+                check_source_name(name)?;
+                new(filter)
+            }
+            A::RemoveFilter { name, filter }
+            | A::EditFilter { name, filter, .. }
+            | A::FilterSettings { name, filter }
+            | A::FilterOptions { name, filter } => {
+                check_source_name(name)?;
+                check_source_name(filter)
+            }
+            A::UpdateFilter { name, filter, settings } => {
+                check_source_name(name)?;
+                check_source_name(filter)?;
+                object(settings)
+            }
+        }
+    }
+
+    /// It changes the collection (the host saves it after).
+    pub fn changes(&self) -> bool {
+        use StudioAct as A;
+        !matches!(
+            self,
+            A::Scenes
+                | A::Items { .. }
+                | A::Sources
+                | A::Settings { .. }
+                | A::Options { .. }
+                | A::Audio { .. }
+                | A::Levels { .. }
+                | A::Filters { .. }
+                | A::FilterSettings { .. }
+                | A::FilterOptions { .. }
+        )
+    }
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
@@ -177,42 +420,10 @@ impl Engine {
         self.studio_host()?.defaults(kind.to_string()).await.map_err(failed)
     }
 
-    pub async fn studio_sources(&self) -> Result<Value, EngineError> {
-        self.studio_host()?.sources().await.map_err(failed)
-    }
-
-    pub async fn studio_add_source(&self, mut add: AddSource) -> Result<Value, EngineError> {
-        check_kind(&add.kind)?;
-        check_source_name(&add.name)?;
-        check_settings(&add.settings)?;
-        if add.settings.is_null() {
-            add.settings = serde_json::json!({});
-        }
-        self.studio_host()?.add_source(add).await.map_err(failed)
-    }
-
-    pub async fn studio_source_settings(&self, name: &str) -> Result<Value, EngineError> {
-        check_source_name(name)?;
-        self.studio_host()?.source_settings(name.to_string()).await.map_err(failed)
-    }
-
-    pub async fn studio_source_options(&self, name: &str) -> Result<Value, EngineError> {
-        check_source_name(name)?;
-        self.studio_host()?.source_options(name.to_string()).await.map_err(failed)
-    }
-
-    pub async fn studio_update_source(&self, name: &str, settings: Value) -> Result<(), EngineError> {
-        check_source_name(name)?;
-        if !settings.is_object() {
-            return Err(EngineError::Invalid("settings: an object of OBS setting keys and values.".into()));
-        }
-        check_settings(&settings)?;
-        self.studio_host()?.update_source(name.to_string(), settings).await.map_err(failed)
-    }
-
-    pub async fn studio_edit_source(&self, name: &str, edit: SourceEdit) -> Result<(), EngineError> {
-        check_source_name(name)?;
-        self.studio_host()?.edit_source(name.to_string(), edit).await.map_err(failed)
+    /// Does one thing to the scene collection, after checking it.
+    pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
+        act.check()?;
+        self.studio_host()?.act(act).await.map_err(failed)
     }
 
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
@@ -251,7 +462,7 @@ fn failed(message: String) -> EngineError {
         retry_after: None,
     };
     if message == STOPPED {
-        return refused(409, "studio_stopped", message, "Press Start in Studio, Without OBS.");
+        return refused(409, "studio_stopped", message, "Press Start in Studio, Go live.");
     }
     // OBS's errors come as sentence fragments ("there's no source…"): start them as sentences.
     let mut message = message.strip_prefix("name: ").map(str::to_string).unwrap_or(message);
@@ -261,11 +472,20 @@ fn failed(message: String) -> EngineError {
     if !message.ends_with('.') {
         message.push('.');
     }
-    if message.starts_with("There's no source called") {
+    if message.starts_with("There's no source") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
-    if message.contains("already a source called") {
+    if message.starts_with("There's no scene called") {
+        return refused(404, "studio_no_scene", message, "Refresh the list of scenes.");
+    }
+    if message.starts_with("There's no filter called") {
+        return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
+    }
+    if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
+    }
+    if message.contains("at least one scene") {
+        return refused(409, "studio_last_scene", message, "Add another scene first.");
     }
     refused(
         422,
@@ -282,6 +502,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct Fake {
         rects: std::sync::Mutex<Vec<Option<PreviewRect>>>,
+        acts: std::sync::Mutex<Vec<StudioAct>>,
     }
 
     #[async_trait::async_trait]
@@ -308,23 +529,9 @@ mod tests {
         async fn defaults(&self, _kind: String) -> Result<Value, String> {
             Ok(serde_json::json!({}))
         }
-        async fn sources(&self) -> Result<Value, String> {
-            Ok(serde_json::json!([]))
-        }
-        async fn add_source(&self, add: AddSource) -> Result<Value, String> {
-            Ok(serde_json::json!({ "name": add.name, "kind": add.kind, "settings": add.settings }))
-        }
-        async fn source_settings(&self, name: String) -> Result<Value, String> {
-            Ok(serde_json::json!({ "name": name }))
-        }
-        async fn source_options(&self, _name: String) -> Result<Value, String> {
-            Ok(serde_json::json!([]))
-        }
-        async fn update_source(&self, _name: String, _settings: Value) -> Result<(), String> {
-            Ok(())
-        }
-        async fn edit_source(&self, _name: String, _edit: SourceEdit) -> Result<(), String> {
-            Ok(())
+        async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
+            Ok(serde_json::to_value(act).unwrap_or_default())
         }
         async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
             Ok(serde_json::json!({ "server": server, "key_len": key.len() }))
@@ -379,32 +586,56 @@ mod tests {
         }
         assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r), None], "only good boxes reach the app");
 
-        let add = |kind: &str, name: &str, settings: Value| AddSource {
-            kind: kind.into(),
-            name: name.into(),
-            settings,
-            fit: true,
-        };
-        let made = e.studio_add_source(add("color_source", "Background", Value::Null)).await.unwrap();
-        assert_eq!(made["settings"], serde_json::json!({}), "no settings is an empty object");
+        let src =
+            |kind: &str, name: &str, settings: Value| NewSource { kind: kind.into(), name: name.into(), settings };
+        let add = |source| StudioAct::AddSource { scene: "Gameplay".into(), source, fit: true };
+        let made = e.studio_act(add(src("color_source", "Background", Value::Null))).await.unwrap();
+        assert_eq!(made["source"]["settings"], serde_json::json!({}), "no settings is an empty object");
         for (bad, field) in [
-            (add("../x", "A", serde_json::json!({})), "kind"),
-            (add("color_source", "", serde_json::json!({})), "name"),
-            (add("color_source", " lead", serde_json::json!({})), "name"),
-            (add("color_source", "A", serde_json::json!([1])), "settings"),
-            (add("color_source", "A", serde_json::json!({ "x": "y".repeat(300_000) })), "settings"),
+            (add(src("../x", "A", serde_json::json!({}))), "kind"),
+            (add(src("color_source", "", serde_json::json!({}))), "name"),
+            (add(src("color_source", " lead", serde_json::json!({}))), "name"),
+            (add(src("color_source", "A", serde_json::json!([1]))), "settings"),
+            (add(src("color_source", "A", serde_json::json!({ "x": "y".repeat(300_000) }))), "settings"),
+            (StudioAct::Update { name: "A".into(), settings: serde_json::json!("red") }, "settings"),
+            (StudioAct::SetTransition { kind: "fade_transition".into(), ms: 60_000 }, "ms"),
+            (
+                StudioAct::SetAudio { name: "Mic".into(), volume_db: Some(f32::NAN), muted: None, monitor: None },
+                "volume_db",
+            ),
+            (
+                StudioAct::SetAudio { name: "Mic".into(), volume_db: Some(40.0), muted: None, monitor: None },
+                "volume_db",
+            ),
+            (StudioAct::SetChannel { channel: 7, device: None }, "channel"),
+            (StudioAct::Levels { names: vec!["x".into(); 65] }, "names"),
+            (StudioAct::Items { scene: "a\nb".into() }, "name"),
+            (StudioAct::AddFilter { name: "Mic".into(), filter: src("bad id", "Gate", Value::Null) }, "kind"),
         ] {
-            let err = e.studio_add_source(bad).await.unwrap_err();
+            let err = e.studio_act(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{err:?}");
         }
-        assert!(e.studio_update_source("Background", serde_json::json!("red")).await.is_err());
-        e.studio_update_source("Background", serde_json::json!({ "color": 1 })).await.unwrap();
-        e.studio_edit_source("Background", SourceEdit::Fit).await.unwrap();
-        assert!(e.studio_edit_source("a\nb", SourceEdit::Remove).await.is_err());
+        e.studio_act(StudioAct::EditItem { scene: "Gameplay".into(), id: 3, edit: ItemEdit::Lock }).await.unwrap();
+        e.studio_act(StudioAct::SetChannel {
+            channel: 3,
+            device: Some(src("coreaudio_input_capture", "Mic", Value::Null)),
+        })
+        .await
+        .unwrap();
+        assert_eq!(fake.acts.lock().unwrap().len(), 3, "only good acts reach the app");
+        assert!(StudioAct::Levels { names: vec![] }.check().is_ok());
+        assert!(
+            !StudioAct::Audio { scene: "x".into() }.changes() && StudioAct::RemoveScene { scene: "x".into() }.changes()
+        );
 
         for (msg, status) in [
             ("there's no source called \"X\" here", 404),
-            ("name: there's already a source called \"X\" here.", 409),
+            ("there's no source with id 4 in \"Gameplay\"", 404),
+            ("there's no scene called \"X\"", 404),
+            ("there's no filter called \"Gate\" on this source", 404),
+            ("name: there's already a source or scene called \"X\".", 409),
+            ("name: there's already a filter called \"X\" here.", 409),
+            ("A collection keeps at least one scene. Add another first.", 409),
             ("the encoder \"x\" isn't available", 422),
         ] {
             let EngineError::Refused { status: got, message, .. } = failed(msg.into()) else { panic!() };
