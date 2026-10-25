@@ -54,6 +54,7 @@ async fn the_beat_comes_from_the_obs_source_picked() {
     let m = music_frame(&mut rx, |d| d["playing"] == true).await;
     // -20 dB from Desktop Audio, not the mic's 0.9.
     assert!((m["level"].as_f64().unwrap() - 0.6).abs() < 0.02, "{m}");
+    assert!(m["level"].to_string().len() <= 4, "two places, as JSON shows it: {m}");
     assert_eq!(m["title"], Value::Null);
 
     // The music stops: "playing" ends a little later (quiet bars aren't the end of a song).

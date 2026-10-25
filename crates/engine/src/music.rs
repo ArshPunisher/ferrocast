@@ -85,8 +85,8 @@ impl MusicConfig {
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct MusicNow {
     pub playing: bool,
-    /// 0 to 1, how loud it looks.
-    pub level: f32,
+    /// 0 to 1, how loud it looks, to two places (an f64, so JSON says 0.34, not 0.3400000035).
+    pub level: f64,
     pub title: Option<String>,
     pub artist: Option<String>,
 }
@@ -143,7 +143,7 @@ fn now_of(cfg: &MusicConfig, live: &Live, at: Instant) -> MusicNow {
     let on = playing(cfg, live, at);
     MusicNow {
         playing: on,
-        level: if on { (live.level * 100.0).round() / 100.0 } else { 0.0 },
+        level: if on { (f64::from(live.level) * 100.0).round() / 100.0 } else { 0.0 },
         title: live.song.title.clone(),
         artist: live.song.artist.clone(),
     }
