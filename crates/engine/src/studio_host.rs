@@ -86,6 +86,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stream_stop(&self) -> Result<(), String>;
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
+    /// OBS's scene collections on this computer: `{ id, name, scenes, sources }[]`.
+    async fn obs_collections(&self) -> Result<Value, String>;
+    /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
+    /// the old scenes are kept in a file first) → what came in.
+    async fn import_obs(&self, id: String) -> Result<Value, String>;
 }
 
 /// How the Studio streams, records and runs. Every field has a default, so an older or
@@ -257,6 +262,22 @@ pub enum ItemEdit {
     Down,
     Top,
     Bottom,
+    Stretch,
+    Center,
+    Reset,
+    FlipH,
+    FlipV,
+    RotateCw,
+    RotateCcw,
+    Rotate180,
+    Duplicate,
+    BlendNormal,
+    BlendAdditive,
+    BlendSubtract,
+    BlendScreen,
+    BlendMultiply,
+    BlendLighten,
+    BlendDarken,
 }
 
 /// A change to a filter (`POST …/filters/{filter}/edit` `{ "do": "disable" }`).
@@ -269,6 +290,15 @@ pub enum FilterEdit {
     Down,
     Top,
     Bottom,
+}
+
+/// Something to do with a Web page source (`POST …/sources/{name}/web` `{ "do": "reload" }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAct {
+    Interact,
+    Stop,
+    Reload,
 }
 
 /// Who hears a sound besides the stream.
@@ -401,6 +431,16 @@ pub enum StudioAct {
         filter: String,
         settings: Value,
     },
+    /// Clicks into, stops clicking or reloads a Web page source.
+    Web {
+        name: String,
+        what: WebAct,
+    },
+    /// Copies every filter of `from` onto `name` (OBS's Copy / Paste Filters).
+    PasteFilters {
+        name: String,
+        from: String,
+    },
 }
 
 impl StudioAct {
@@ -491,6 +531,15 @@ impl StudioAct {
                 check_source_name(name)?;
                 check_source_name(filter)?;
                 object(settings)
+            }
+            A::Web { name, .. } => check_source_name(name),
+            A::PasteFilters { name, from } => {
+                check_source_name(name)?;
+                check_source_name(from)?;
+                if name == from {
+                    return Err(EngineError::Invalid("from: another source than the one pasted onto.".into()));
+                }
+                Ok(())
             }
         }
     }
@@ -617,6 +666,35 @@ impl Engine {
         self.studio_host()?.record_pause(on).await.map_err(failed)
     }
 
+    /// OBS's scene collections, to import one.
+    pub async fn studio_obs_collections(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.obs_collections().await.map_err(failed)
+    }
+
+    /// Brings in OBS's scene collection `id` in place of the Studio's scenes.
+    pub async fn studio_import_obs(&self, id: &str) -> Result<Value, EngineError> {
+        let ok = id.len() <= 128
+            && !id.is_empty()
+            && !id.starts_with('.')
+            && id.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'));
+        if !ok {
+            return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
+        }
+        let host = self.studio_host()?;
+        let list = host.obs_collections().await.map_err(failed)?;
+        let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
+        if !known {
+            return Err(EngineError::Refused {
+                status: 404,
+                code: "studio_no_obs_collection",
+                message: format!("OBS has no scene collection \"{id}\"."),
+                hint: "Pick one from the list.".into(),
+                retry_after: None,
+            });
+        }
+        host.import_obs(id.to_string()).await.map_err(failed)
+    }
+
     pub async fn studio_monitoring(&self) -> Result<Value, EngineError> {
         self.studio_host()?.monitoring().await.map_err(failed)
     }
@@ -684,6 +762,15 @@ fn failed(message: String) -> EngineError {
     }
     if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
+    }
+    if message.contains("isn't here yet") {
+        return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
+    }
+    if message.contains("isn't a web page") {
+        return refused(400, "studio_not_web_page", message, "Pick a Web page source.");
+    }
+    if message.contains("Stop streaming and recording") {
+        return refused(409, "studio_busy", message, "Stop the stream and the recording, then try again.");
     }
     if message.contains("at least one scene") {
         return refused(409, "studio_last_scene", message, "Add another scene first.");
@@ -761,6 +848,12 @@ mod tests {
         async fn stream_stats(&self) -> Result<Value, String> {
             Ok(Value::Null)
         }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([{ "id": "Untitled", "name": "Untitled", "scenes": 2, "sources": 3 }]))
+        }
+        async fn import_obs(&self, id: String) -> Result<Value, String> {
+            Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
+        }
     }
 
     async fn engine() -> (Engine, tempfile::TempDir) {
@@ -778,6 +871,29 @@ mod tests {
         assert!(!s.available && s.detail.as_deref() == Some(NONE));
         let err = e.studio_start().await.unwrap_err();
         assert!(matches!(err, EngineError::Refused { status: 422, code: "studio_unavailable", .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn obs_collections_import_only_by_a_listed_id() {
+        let (e, _d) = engine().await;
+        e.set_studio_host(Arc::new(Fake::default()));
+        assert_eq!(e.studio_obs_collections().await.unwrap()[0]["id"], "Untitled");
+        assert_eq!(e.studio_import_obs("Untitled").await.unwrap()["scenes"], 2);
+        let gone = e.studio_import_obs("Other").await.unwrap_err();
+        assert!(matches!(gone, EngineError::Refused { status: 404, code: "studio_no_obs_collection", .. }));
+        for bad in ["../Untitled", "", ".x", "a/b"] {
+            assert!(matches!(e.studio_import_obs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
+        }
+        let mut same = StudioAct::PasteFilters { name: "Mic".into(), from: "Mic".into() };
+        assert!(matches!(same.check(), Err(EngineError::Invalid(_))));
+        assert!(matches!(
+            failed("\"Cam\" isn't a web page.".into()),
+            EngineError::Refused { status: 400, code: "studio_not_web_page", .. }
+        ));
+        assert!(matches!(
+            failed("Stop streaming and recording before bringing in scenes.".into()),
+            EngineError::Refused { status: 409, code: "studio_busy", .. }
+        ));
     }
 
     #[tokio::test]

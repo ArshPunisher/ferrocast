@@ -574,6 +574,13 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/record", json!({ "on": true })).await,
         r.post("/studio/engine/record/pause", json!({ "on": true })).await,
         r.get("/studio/engine/monitoring").await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "flip_h" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "blend_multiply" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "duplicate" })).await,
+        r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Cam" })).await,
+        r.post("/studio/engine/sources/Alerts/web", json!({ "do": "interact" })).await,
+        r.get("/studio/engine/obs-collections").await,
+        r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -597,6 +604,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.put("/studio/engine/settings", json!({ "video_kbps": 1 })).await, "bitrate too low"),
         (r.put("/studio/engine/settings", json!({ "fps": "sixty" })).await, "fps not a number"),
         (r.post("/studio/engine/record", json!({})).await, "record without on"),
+        (r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Mic" })).await, "paste onto itself"),
+        (r.post("/studio/engine/sources/Alerts/web", json!({ "do": "click" })).await, "unknown web act"),
+        (r.post("/studio/engine/obs-collections/import", json!({ "id": "../x" })).await, "id with a path"),
+        (r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "blend_glow" })).await, "unknown blend"),
     ] {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
     }

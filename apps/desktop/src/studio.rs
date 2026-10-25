@@ -171,6 +171,15 @@ const FIRST_SCENE: &str = "Main";
 /// The collection's name in its file (OBS shows it when the file is imported there).
 const COLLECTION: &str = "Ferrocast";
 
+fn web_act(w: ferrocast_engine::studio_host::WebAct) -> ferrocast_studio::WebAct {
+    use ferrocast_engine::studio_host::WebAct as W;
+    match w {
+        W::Interact => ferrocast_studio::WebAct::Interact,
+        W::Stop => ferrocast_studio::WebAct::Stop,
+        W::Reload => ferrocast_studio::WebAct::Reload,
+    }
+}
+
 fn item_edit(e: Edit) -> ItemEdit {
     match e {
         Edit::Show => ItemEdit::Show,
@@ -183,6 +192,22 @@ fn item_edit(e: Edit) -> ItemEdit {
         Edit::Down => ItemEdit::Down,
         Edit::Top => ItemEdit::Top,
         Edit::Bottom => ItemEdit::Bottom,
+        Edit::Stretch => ItemEdit::Stretch,
+        Edit::Center => ItemEdit::Center,
+        Edit::Reset => ItemEdit::Reset,
+        Edit::FlipH => ItemEdit::FlipH,
+        Edit::FlipV => ItemEdit::FlipV,
+        Edit::RotateCw => ItemEdit::RotateCw,
+        Edit::RotateCcw => ItemEdit::RotateCcw,
+        Edit::Rotate180 => ItemEdit::Rotate180,
+        Edit::Duplicate => ItemEdit::Duplicate,
+        Edit::BlendNormal => ItemEdit::BlendNormal,
+        Edit::BlendAdditive => ItemEdit::BlendAdditive,
+        Edit::BlendSubtract => ItemEdit::BlendSubtract,
+        Edit::BlendScreen => ItemEdit::BlendScreen,
+        Edit::BlendMultiply => ItemEdit::BlendMultiply,
+        Edit::BlendLighten => ItemEdit::BlendLighten,
+        Edit::BlendDarken => ItemEdit::BlendDarken,
     }
 }
 
@@ -243,6 +268,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::Filters { name } => v(to_json!(c.filters(&name)?)),
         A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
+        A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
+        A::Web { name, what } => done(c.web(&name, web_act(what))),
         A::EditFilter { name, filter, edit } => done(match edit {
             FilterEdit::Enable => c.set_filter_enabled(&name, &filter, true),
             FilterEdit::Disable => c.set_filter_enabled(&name, &filter, false),
@@ -561,6 +588,70 @@ impl StudioHost for DesktopStudio {
                 studio.monitoring_devices().into_iter().map(|(name, id)| json!({ "name": name, "id": id })).collect();
             let (name, id) = studio.monitoring_device();
             Ok(json!({ "devices": devices, "current": { "name": name, "id": id } }))
+        })
+        .await?
+    }
+
+    async fn obs_collections(&self) -> Result<Value, String> {
+        let Some(dir) = ferrocast_studio::import::obs_scenes_dir() else { return Ok(json!([])) };
+        let list = tokio::task::spawn_blocking(move || ferrocast_studio::import::list(&dir))
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(list).map_err(|e| e.to_string())
+    }
+
+    async fn import_obs(&self, id: String) -> Result<Value, String> {
+        let dir =
+            ferrocast_studio::import::obs_scenes_dir().ok_or("OBS's scene collections aren't on this computer.")?;
+        let file = self.scenes_file();
+        self.on_main(move |h| {
+            if h.stream.is_some() || h.record.is_some() {
+                return Err("Stop streaming and recording before bringing in scenes.".to_string());
+            }
+            let mut doc = ferrocast_studio::import::read(&dir, &id).map_err(|e| e.to_string())?;
+            let known = h
+                .studio
+                .as_ref()
+                .filter(|_| h.collection.is_some())
+                .map(|s| s.kinds().inputs.into_iter().map(|k| k.id).collect::<std::collections::BTreeSet<_>>());
+            let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+            let report = ferrocast_studio::import::convert(&mut doc, web, known.as_ref());
+            // The scenes there are now are kept next to them, dated, before anything changes.
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            if let Some(c) = &h.collection {
+                save(c, &file);
+            }
+            if file.exists() {
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let keep = file.with_file_name(format!("scenes-before-import-{stamp}.json"));
+                std::fs::copy(&file, &keep).map_err(|e| format!("The current scenes couldn't be kept aside: {e}"))?;
+            }
+            match (h.studio.as_ref(), h.collection.is_some()) {
+                (Some(studio), true) => {
+                    // The old scenes go first: libobs keeps one collection's sources at a time.
+                    let old = h.collection.take().map(|c| c.save(COLLECTION));
+                    match Collection::load(studio, &doc, FIRST_SCENE) {
+                        Ok(c) => {
+                            save(&c, &file);
+                            h.collection = Some(c);
+                        }
+                        Err(e) => {
+                            if let Some(old) = old {
+                                h.collection = Collection::load(studio, &old, FIRST_SCENE).ok();
+                            }
+                            return Err(e.to_string());
+                        }
+                    }
+                }
+                _ => {
+                    // Not running: it's what the next Start loads.
+                    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
+                    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+                }
+            }
+            serde_json::to_value(&report).map_err(|e| e.to_string())
         })
         .await?
     }

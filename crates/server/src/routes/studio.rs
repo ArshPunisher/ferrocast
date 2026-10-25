@@ -16,7 +16,7 @@ use ferrocast_core::stream_info::{Preset, StreamInfo};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, StudioAct};
+use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, StudioAct, WebAct};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -49,6 +49,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/audio", put(engine_set_audio))
         .route("/studio/engine/sources/{name}/filters", get(engine_filters).post(engine_add_filter))
         .route("/studio/engine/sources/{name}/filters/{filter}", delete(engine_remove_filter))
+        .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
+        .route("/studio/engine/sources/{name}/web", post(engine_web))
+        .route("/studio/engine/obs-collections", get(engine_obs_collections))
+        .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
         .route(
             "/studio/engine/sources/{name}/filters/{filter}/settings",
@@ -516,6 +520,40 @@ async fn engine_remove_filter(
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::RemoveFilter { name, filter }).await
+}
+
+#[derive(Deserialize)]
+struct FromBody {
+    from: String,
+}
+
+async fn engine_obs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_obs_collections().await?))
+}
+
+#[derive(Deserialize)]
+struct IdBody {
+    id: String,
+}
+
+async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_import_obs(&b.id).await?))
+}
+
+async fn engine_web(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<DoBody<WebAct>>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::Web { name, what: b.what }).await
+}
+
+async fn engine_paste_filters(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<FromBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::PasteFilters { name, from: b.from }).await
 }
 
 async fn engine_edit_filter(
