@@ -430,7 +430,7 @@ pub(crate) mod mac {
 
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::NSView;
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     /// A child view of the window's content, in top-left coordinates like the web page.
@@ -457,6 +457,11 @@ pub(crate) mod mac {
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
         let view = NSView::initWithFrame(NSView::alloc(mtm), frame(parent, x, y, w, h));
         view.setWantsLayer(true);
+        // Kept the same distance from the top when the window's height changes: unflipped,
+        // AppKit would keep it from the bottom and slide it over the page above (2.1 test).
+        if !parent.isFlipped() {
+            view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+        }
         parent.addSubview(&view);
         Some(ChildView { view })
     }
