@@ -36,7 +36,19 @@ pub struct SceneInfo {
     pub items: usize,
     /// On air.
     pub current: bool,
+    /// Its own way in, instead of the Studio's (OBS's "Transition Override").
+    pub transition: Option<TransitionInfo>,
 }
+
+/// OBS's names for its transitions, which a scene's override is saved by, with their kinds.
+const TRANSITION_NAMES: [(&str, &str); 6] = [
+    ("fade_transition", "Fade"),
+    ("cut_transition", "Cut"),
+    ("swipe_transition", "Swipe"),
+    ("slide_transition", "Slide"),
+    ("fade_to_color_transition", "Fade to Color"),
+    ("wipe_transition", "Luma Wipe"),
+];
 
 /// A source in a scene, top first. A group lists its own items.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,11 +64,16 @@ pub struct ItemInfo {
     pub group: bool,
     /// How it mixes with what's under it: one of [`BLENDS`].
     pub blend: String,
+    /// How it's scaled: one of [`SCALE_FILTERS`].
+    pub scale_filter: String,
     pub children: Vec<ItemInfo>,
 }
 
 /// `enum obs_blending_type`, in order.
 pub const BLENDS: [&str; 7] = ["normal", "additive", "subtract", "screen", "multiply", "lighten", "darken"];
+
+/// `enum obs_scale_type`, in order.
+pub const SCALE_FILTERS: [&str; 6] = ["off", "point", "bicubic", "bilinear", "lanczos", "area"];
 
 /// A change to one item in a scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +109,12 @@ pub enum ItemEdit {
     BlendMultiply,
     BlendLighten,
     BlendDarken,
+    ScaleOff,
+    ScalePoint,
+    ScaleBicubic,
+    ScaleBilinear,
+    ScaleLanczos,
+    ScaleArea,
 }
 
 /// Something to do with a Web page source.
@@ -232,6 +255,8 @@ pub struct Collection {
     /// The transition on air (private; channel 0), our reference.
     transition: RefCell<*mut ffi::ObsSource>,
     transition_info: RefCell<TransitionInfo>,
+    /// The kind of the transition on air now (a scene's override can differ from the Studio's).
+    active_kind: RefCell<String>,
     meters: RefCell<HashMap<String, Meter>>,
 }
 
@@ -257,6 +282,7 @@ impl Collection {
             current: RefCell::new(ptr::null_mut()),
             transition: RefCell::new(ptr::null_mut()),
             transition_info: RefCell::new(TransitionInfo { kind: "fade_transition".into(), ms: 300 }),
+            active_kind: RefCell::new(String::new()),
             meters: RefCell::new(HashMap::new()),
         };
         c.make_transition("fade_transition")?;
@@ -279,6 +305,7 @@ impl Collection {
             a.obs_transition_set(t, cur);
         }
         a.obs_set_output_source(0, t);
+        self.active_kind.replace(kind.to_string());
         let old = self.transition.replace(t);
         if !old.is_null() {
             a.obs_source_release(old);
@@ -341,6 +368,7 @@ impl Collection {
                 name: text(a.obs_source_get_name(*s)),
                 items: self.raw_items(a.obs_scene_from_source(*s)).len(),
                 current: *s == cur,
+                transition: self.scene_transition(*s),
             })
             .collect()
     }
@@ -417,8 +445,68 @@ impl Collection {
     /// Puts a scene on air through the transition.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
         let src = self.scene_src(name)?;
-        let ms = self.transition_info.borrow().ms;
-        self.go(src, ms);
+        // The scene's own transition if it has one, else the Studio's.
+        let studio = self.transition_info.borrow().clone();
+        let mut want = self.scene_transition(src).unwrap_or_else(|| studio.clone());
+        if want.kind != *self.active_kind.borrow() && self.make_transition(&want.kind).is_err() {
+            // The scene's own transition isn't on this computer: the Studio's goes instead.
+            tracing::warn!(scene = name, kind = want.kind, "a scene's transition isn't available; using the Studio's");
+            want = studio;
+            if want.kind != *self.active_kind.borrow() {
+                self.make_transition(&want.kind)?;
+            }
+        }
+        self.go(src, want.ms);
+        Ok(())
+    }
+
+    /// A scene's own transition, saved as OBS saves it (its private "transition" and
+    /// "transition_duration"), so collections from OBS keep theirs.
+    fn scene_transition(&self, scene: *mut ffi::ObsSource) -> Option<TransitionInfo> {
+        let a = self.api();
+        let d = a.obs_source_get_private_settings(scene);
+        if d.is_null() {
+            return None;
+        }
+        let name = text(a.obs_data_get_string(d, c"transition".as_ptr()));
+        let ms = a.obs_data_get_int(d, c"transition_duration".as_ptr());
+        a.obs_data_release(d);
+        let kind = TRANSITION_NAMES.iter().find(|(_, n)| *n == name)?.0;
+        // OBS leaves the duration out when it's the default (300 ms); Cut takes none.
+        let ms = if kind == "cut_transition" {
+            0
+        } else if ms > 0 {
+            ms.min(20_000) as u32
+        } else {
+            300
+        };
+        Some(TransitionInfo { kind: kind.into(), ms })
+    }
+
+    /// Gives a scene its own transition, or (None) takes it away.
+    pub fn set_scene_transition(&self, scene: &str, t: Option<&TransitionInfo>) -> Result<(), StudioError> {
+        let src = self.scene_src(scene)?;
+        let (name, ms) = match t {
+            Some(t) => {
+                if t.ms > 20_000 {
+                    return Err(StudioError::Failed("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                let n = TRANSITION_NAMES.iter().find(|(k, _)| *k == t.kind).map(|(_, n)| *n).ok_or_else(|| {
+                    StudioError::Failed("kind: fade, cut, swipe, slide, fade to colour or wipe.".into())
+                })?;
+                (n, i64::from(t.ms))
+            }
+            None => ("", 0),
+        };
+        let a = self.api();
+        let d = a.obs_source_get_private_settings(src);
+        if d.is_null() {
+            return Err(StudioError::Failed(format!("\"{scene}\" couldn't keep its transition")));
+        }
+        let n = cstr(name);
+        a.obs_data_set_string(d, c"transition".as_ptr(), n.as_ptr());
+        a.obs_data_set_int(d, c"transition_duration".as_ptr(), ms);
+        a.obs_data_release(d);
         Ok(())
     }
 
@@ -430,7 +518,7 @@ impl Collection {
         if t.ms > 20_000 {
             return Err(StudioError::Failed("ms: a transition lasts 0 to 20000 ms.".into()));
         }
-        if t.kind != self.transition_info.borrow().kind {
+        if t.kind != *self.active_kind.borrow() {
             self.make_transition(&t.kind)?;
         }
         self.transition_info.replace(t.clone());
@@ -485,6 +573,10 @@ impl Collection {
             blend: BLENDS
                 .get(usize::try_from(a.obs_sceneitem_get_blending_mode(item)).unwrap_or(0))
                 .unwrap_or(&BLENDS[0])
+                .to_string(),
+            scale_filter: SCALE_FILTERS
+                .get(usize::try_from(a.obs_sceneitem_get_scale_filter(item)).unwrap_or(0))
+                .unwrap_or(&SCALE_FILTERS[0])
                 .to_string(),
             children: if group {
                 self.group_items(item).into_iter().rev().map(|i| self.info(i)).collect()
@@ -710,6 +802,12 @@ impl Collection {
             ItemEdit::BlendMultiply => blend(4),
             ItemEdit::BlendLighten => blend(5),
             ItemEdit::BlendDarken => blend(6),
+            ItemEdit::ScaleOff => a.obs_sceneitem_set_scale_filter(item, 0),
+            ItemEdit::ScalePoint => a.obs_sceneitem_set_scale_filter(item, 1),
+            ItemEdit::ScaleBicubic => a.obs_sceneitem_set_scale_filter(item, 2),
+            ItemEdit::ScaleBilinear => a.obs_sceneitem_set_scale_filter(item, 3),
+            ItemEdit::ScaleLanczos => a.obs_sceneitem_set_scale_filter(item, 4),
+            ItemEdit::ScaleArea => a.obs_sceneitem_set_scale_filter(item, 5),
         }
         Ok(())
     }
@@ -1007,6 +1105,33 @@ impl Collection {
         let src = self.source(name)?;
         let f = self.filter(&src, filter)?;
         self.api().obs_source_filter_remove(src.ptr, f.ptr);
+        Ok(())
+    }
+
+    /// A picture of a scene (at the canvas size) or a source (at its own size), saved as a
+    /// PNG at `path`.
+    pub fn screenshot(&self, name: &str, path: &std::path::Path) -> Result<(), StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        let (w, h) = if a.obs_source_is_scene(src.ptr) {
+            let c = self.studio.canvas();
+            (c.width, c.height)
+        } else {
+            (a.obs_source_get_width(src.ptr), a.obs_source_get_height(src.ptr))
+        };
+        if w == 0 || h == 0 {
+            return Err(StudioError::Failed(format!("\"{name}\" has nothing to show yet.")));
+        }
+        let px = ffi::snapshot(a, src.ptr, w, h)
+            .ok_or_else(|| StudioError::Failed(format!("\"{name}\" couldn't be drawn for a screenshot")))?;
+        let file = std::fs::File::create(path)
+            .map_err(|e| StudioError::Failed(format!("the screenshot couldn't be saved ({e})")))?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()
+            .and_then(|mut wr| wr.write_image_data(&px))
+            .map_err(|e| StudioError::Failed(format!("the screenshot couldn't be saved ({e})")))?;
         Ok(())
     }
 

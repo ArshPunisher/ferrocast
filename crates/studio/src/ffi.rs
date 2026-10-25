@@ -27,6 +27,8 @@ opaque!(
     ObsVolmeter,
     CpuUsage,
     GsTexture,
+    GsTexrender,
+    GsStagesurf,
     GsEffect,
     GsEparam,
     VideoT,
@@ -300,6 +302,28 @@ api! {
     obs_sceneitem_set_blending_mode: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_get_blending_mode: fn(a: *const ObsSceneItem) -> c_int;
     obs_source_copy_filters: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_source_get_width: fn(a: *mut ObsSource) -> u32;
+    obs_source_get_height: fn(a: *mut ObsSource) -> u32;
+    obs_source_video_render: fn(a: *mut ObsSource);
+    obs_source_inc_showing: fn(a: *mut ObsSource);
+    obs_source_dec_showing: fn(a: *mut ObsSource);
+    gs_texrender_create: fn(a: c_int, b: c_int) -> *mut GsTexrender;
+    gs_texrender_destroy: fn(a: *mut GsTexrender);
+    gs_texrender_begin: fn(a: *mut GsTexrender, b: u32, c: u32) -> bool;
+    gs_texrender_end: fn(a: *mut GsTexrender);
+    gs_texrender_get_texture: fn(a: *const GsTexrender) -> *mut GsTexture;
+    gs_clear: fn(a: u32, b: *const Vec4, c: f32, d: u8);
+    gs_blend_state_push: fn();
+    gs_blend_state_pop: fn();
+    gs_blend_function: fn(a: c_int, b: c_int);
+    gs_stagesurface_create: fn(a: u32, b: u32, c: c_int) -> *mut GsStagesurf;
+    gs_stagesurface_destroy: fn(a: *mut GsStagesurf);
+    gs_stage_texture: fn(a: *mut GsStagesurf, b: *const GsTexture);
+    gs_stagesurface_map: fn(a: *mut GsStagesurf, b: *mut *mut u8, c: *mut u32) -> bool;
+    gs_stagesurface_unmap: fn(a: *mut GsStagesurf);
+    obs_source_get_private_settings: fn(a: *mut ObsSource) -> *mut ObsData;
+    obs_sceneitem_set_scale_filter: fn(a: *mut ObsSceneItem, b: c_int);
+    obs_sceneitem_get_scale_filter: fn(a: *const ObsSceneItem) -> c_int;
     obs_source_output_audio: fn(a: *mut ObsSource, b: *const c_void);
     obs_obj_get_data: fn(a: *mut ObsSource) -> *mut c_void;
     os_gettime_ns: fn() -> u64;
@@ -748,6 +772,59 @@ pub(crate) mod mac {
             }
         }
     }
+}
+
+/// `enum gs_color_format` GS_RGBA, `GS_CLEAR_COLOR`, blend one/zero.
+const GS_RGBA: c_int = 3;
+const GS_CLEAR_COLOR: u32 = 1;
+const GS_BLEND_ZERO: c_int = 0;
+const GS_BLEND_ONE: c_int = 1;
+
+/// Draws a source (a scene or anything else) once at `w`×`h` and reads it back as RGBA rows,
+/// as OBS's own screenshot does. Waits for the graphics thread (main thread is fine).
+pub(crate) fn snapshot(api: &Api, src: *mut ObsSource, w: u32, h: u32) -> Option<Vec<u8>> {
+    if src.is_null() || w == 0 || h == 0 || w > 16_384 || h > 16_384 {
+        return None;
+    }
+    api.obs_enter_graphics();
+    let tr = api.gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    let mut out = None;
+    if !tr.is_null() && api.gs_texrender_begin(tr, w, h) {
+        let zero = Vec4::default();
+        api.gs_clear(GS_CLEAR_COLOR, &zero, 0.0, 0);
+        api.gs_ortho(0.0, w as f32, 0.0, h as f32, -100.0, 100.0);
+        api.gs_blend_state_push();
+        api.gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+        api.obs_source_inc_showing(src);
+        api.obs_source_video_render(src);
+        api.obs_source_dec_showing(src);
+        api.gs_blend_state_pop();
+        api.gs_texrender_end(tr);
+        let stage = api.gs_stagesurface_create(w, h, GS_RGBA);
+        if !stage.is_null() {
+            api.gs_stage_texture(stage, api.gs_texrender_get_texture(tr));
+            let (mut data, mut line) = (std::ptr::null_mut::<u8>(), 0u32);
+            if api.gs_stagesurface_map(stage, &mut data, &mut line) {
+                let row = w as usize * 4;
+                if !data.is_null() && line as usize >= row {
+                    let mut px = Vec::with_capacity(row * h as usize);
+                    for y in 0..h as usize {
+                        // SAFETY: libobs maps h rows of `line` bytes each (line >= w*4) until unmap.
+                        let r = unsafe { std::slice::from_raw_parts(data.add(y * line as usize), row) };
+                        px.extend_from_slice(r);
+                    }
+                    out = Some(px);
+                }
+                api.gs_stagesurface_unmap(stage);
+            }
+            api.gs_stagesurface_destroy(stage);
+        }
+    }
+    if !tr.is_null() {
+        api.gs_texrender_destroy(tr);
+    }
+    api.obs_leave_graphics();
+    out
 }
 
 /// Ferrocast's Web page source (2.1, the Browser source on macOS's own WebKit; LESSONS R-78):
