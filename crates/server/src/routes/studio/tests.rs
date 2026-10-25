@@ -580,6 +580,14 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Cam" })).await,
         r.post("/studio/engine/sources/Alerts/web", json!({ "do": "interact" })).await,
         r.get("/studio/engine/obs-collections").await,
+        r.post("/studio/engine/sources/Gameplay/screenshot", json!({})).await,
+        r.put(
+            "/studio/engine/scenes/Gameplay/transition",
+            json!({ "transition": { "kind": "cut_transition", "ms": 0 } }),
+        )
+        .await,
+        r.put("/studio/engine/scenes/Gameplay/transition", json!({ "transition": null })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "scale_lanczos" })).await,
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
@@ -607,6 +615,22 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Mic" })).await, "paste onto itself"),
         (r.post("/studio/engine/sources/Alerts/web", json!({ "do": "click" })).await, "unknown web act"),
         (r.post("/studio/engine/obs-collections/import", json!({ "id": "../x" })).await, "id with a path"),
+        (
+            r.put(
+                "/studio/engine/scenes/Gameplay/transition",
+                json!({ "transition": { "kind": "fade_transition", "ms": 99999 } }),
+            )
+            .await,
+            "scene transition too long",
+        ),
+        (
+            r.put(
+                "/studio/engine/scenes/Gameplay/transition",
+                json!({ "transition": { "kind": "x_transition", "ms": 1 } }),
+            )
+            .await,
+            "unknown scene transition",
+        ),
         (r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "blend_glow" })).await, "unknown blend"),
     ] {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");

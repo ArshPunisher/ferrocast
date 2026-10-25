@@ -208,6 +208,12 @@ fn item_edit(e: Edit) -> ItemEdit {
         Edit::BlendMultiply => ItemEdit::BlendMultiply,
         Edit::BlendLighten => ItemEdit::BlendLighten,
         Edit::BlendDarken => ItemEdit::BlendDarken,
+        Edit::ScaleOff => ItemEdit::ScaleOff,
+        Edit::ScalePoint => ItemEdit::ScalePoint,
+        Edit::ScaleBicubic => ItemEdit::ScaleBicubic,
+        Edit::ScaleBilinear => ItemEdit::ScaleBilinear,
+        Edit::ScaleLanczos => ItemEdit::ScaleLanczos,
+        Edit::ScaleArea => ItemEdit::ScaleArea,
     }
 }
 
@@ -230,6 +236,9 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::MoveScene { scene, to } => done(c.move_scene(&scene, to)),
         A::SetCurrent { scene } => done(c.set_current(&scene)),
         A::SetTransition { kind, ms } => done(c.set_transition(&TransitionInfo { kind, ms })),
+        A::SetSceneTransition { scene, transition } => {
+            done(c.set_scene_transition(&scene, transition.map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).as_ref()))
+        }
         A::Items { scene } => v(to_json!(c.items(&scene)?)),
         A::AddSource { scene, source, fit } => {
             let item = c.add_source(&scene, &source.kind, &source.name, &source.settings, fit)?;
@@ -270,6 +279,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
         A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
         A::Web { name, what } => done(c.web(&name, web_act(what))),
+        // Handled in `act`, which knows where recordings go.
+        A::Screenshot { .. } => Ok(Value::Null),
         A::EditFilter { name, filter, edit } => done(match edit {
             FilterEdit::Enable => c.set_filter_enabled(&name, &filter, true),
             FilterEdit::Disable => c.set_filter_enabled(&name, &filter, false),
@@ -466,7 +477,24 @@ impl StudioHost for DesktopStudio {
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
         let file = self.scenes_file();
+        let data = self.data.clone();
         self.on_main(move |h| {
+            if let StudioAct::Screenshot { name } = &act {
+                // Next to the recordings, as OBS does.
+                let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
+                let c = h.collection.as_ref().ok_or(STOPPED)?;
+                std::fs::create_dir_all(&folder).map_err(|e| format!("The screenshot folder couldn't be made: {e}"))?;
+                let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+                // Two in the same second get their own files.
+                let mut path = folder.join(format!("Screenshot {stamp}.png"));
+                let mut n = 2;
+                while path.exists() {
+                    path = folder.join(format!("Screenshot {stamp} ({n}).png"));
+                    n += 1;
+                }
+                c.screenshot(name, &path).map_err(|e| e.to_string())?;
+                return Ok(json!({ "file": path.display().to_string() }));
+            }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let changes = act.changes();
             let out = run(c, act).map_err(|e| e.to_string());

@@ -16,7 +16,7 @@ use ferrocast_core::stream_info::{Preset, StreamInfo};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, StudioAct, WebAct};
+use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, SceneTransition, StudioAct, WebAct};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -42,6 +42,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/scenes/{scene}/transition", put(engine_scene_transition))
         .route("/studio/engine/sources", get(engine_sources))
         .route("/studio/engine/sources/{name}/rename", post(engine_rename))
         .route("/studio/engine/sources/{name}/settings", get(engine_source_settings).put(engine_update_source))
@@ -51,6 +52,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/filters/{filter}", delete(engine_remove_filter))
         .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
         .route("/studio/engine/sources/{name}/web", post(engine_web))
+        .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
@@ -433,6 +435,19 @@ async fn engine_transition(State(app): State<AppState>, Body(b): Body<Transition
     act_done(&app, StudioAct::SetTransition { kind: b.kind, ms: b.ms }).await
 }
 
+#[derive(Deserialize)]
+struct SceneTransitionBody {
+    transition: Option<SceneTransition>,
+}
+
+async fn engine_scene_transition(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<SceneTransitionBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetSceneTransition { scene, transition: b.transition }).await
+}
+
 async fn engine_items(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::Items { scene }).await
 }
@@ -538,6 +553,10 @@ struct IdBody {
 
 async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_obs(&b.id).await?))
+}
+
+async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Screenshot { name }).await
 }
 
 async fn engine_web(

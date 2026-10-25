@@ -278,6 +278,12 @@ pub enum ItemEdit {
     BlendMultiply,
     BlendLighten,
     BlendDarken,
+    ScaleOff,
+    ScalePoint,
+    ScaleBicubic,
+    ScaleBilinear,
+    ScaleLanczos,
+    ScaleArea,
 }
 
 /// A change to a filter (`POST …/filters/{filter}/edit` `{ "do": "disable" }`).
@@ -290,6 +296,13 @@ pub enum FilterEdit {
     Down,
     Top,
     Bottom,
+}
+
+/// A transition: its kind and how long it takes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SceneTransition {
+    pub kind: String,
+    pub ms: u32,
 }
 
 /// Something to do with a Web page source (`POST …/sources/{name}/web` `{ "do": "reload" }`).
@@ -347,6 +360,11 @@ pub enum StudioAct {
     SetTransition {
         kind: String,
         ms: u32,
+    },
+    /// A scene's own transition (OBS's Transition Override), or none to use the Studio's.
+    SetSceneTransition {
+        scene: String,
+        transition: Option<SceneTransition>,
     },
     /// A scene's sources, top first.
     Items {
@@ -431,6 +449,10 @@ pub enum StudioAct {
         filter: String,
         settings: Value,
     },
+    /// A PNG of a scene or source, saved where recordings go → `{ file }`.
+    Screenshot {
+        name: String,
+    },
     /// Clicks into, stops clicking or reloads a Web page source.
     Web {
         name: String,
@@ -473,6 +495,28 @@ impl StudioAct {
             A::DuplicateScene { scene, name } | A::AddExisting { scene, name } => {
                 check_source_name(scene)?;
                 check_source_name(name)
+            }
+            A::SetSceneTransition { scene, transition } => {
+                check_source_name(scene)?;
+                if let Some(t) = transition {
+                    const KINDS: [&str; 6] = [
+                        "fade_transition",
+                        "cut_transition",
+                        "swipe_transition",
+                        "slide_transition",
+                        "fade_to_color_transition",
+                        "wipe_transition",
+                    ];
+                    if !KINDS.contains(&t.kind.as_str()) {
+                        return Err(EngineError::Invalid(
+                            "kind: fade, cut, swipe, slide, fade to colour or wipe transition.".into(),
+                        ));
+                    }
+                    if t.ms > 20_000 {
+                        return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                    }
+                }
+                Ok(())
             }
             A::SetTransition { kind, ms } => {
                 check_kind(kind)?;
@@ -532,7 +576,7 @@ impl StudioAct {
                 check_source_name(filter)?;
                 object(settings)
             }
-            A::Web { name, .. } => check_source_name(name),
+            A::Web { name, .. } | A::Screenshot { name } => check_source_name(name),
             A::PasteFilters { name, from } => {
                 check_source_name(name)?;
                 check_source_name(from)?;
@@ -557,6 +601,7 @@ impl StudioAct {
                 | A::Audio { .. }
                 | A::Levels { .. }
                 | A::Filters { .. }
+                | A::Screenshot { .. }
                 | A::FilterSettings { .. }
                 | A::FilterOptions { .. }
         )
