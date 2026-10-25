@@ -5,6 +5,47 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.0.0
+
+**Go live everywhere.** Stream once from OBS, and Ferrocast sends it to Twitch, YouTube and Kick
+at the same time, plus any server of your own.
+
+- No stream keys to paste: Ferrocast gets each one itself. One click points OBS at Ferrocast,
+  one click puts it back. Reconnect Twitch and Kick once so Ferrocast may read the key.
+- Test your upload first: Ferrocast says in plain words how many platforms fit.
+- While live, each platform has its own health line. One that drops reconnects by itself and
+  never stops the others. If your upload can't carry them all, the bottom one pauses for a
+  while so the others stay smooth, then comes back.
+- Each platform's rules are checked against what OBS really sends, with the number to set.
+  Kick takes up to 8,000 kbps: above that it keeps dropping.
+- Give Twitch, YouTube or Kick its own title, category or tags.
+- Vertical streams: YouTube Shorts live (or your own server) next to your normal stream, from
+  OBS's vertical canvas or cut from your stream on your graphics card.
+- A note if Aitum Multistream also sends to a platform, so nobody gets your stream twice.
+
+**Themes in OBS.** Put a theme into OBS in one click: a scene per screen with your own game
+and camera scene under it, Start show set up, old StreamElements or Streamlabs widgets hidden.
+Make it yours changes the colour, font, your name and logo everywhere. Take it out removes only
+what Ferrocast added.
+
+**Eleven new themes** with a live world behind every break screen: Hex Pulse, Night Drive,
+Wasteland, Circuit, Neon Tunnel, Night Dunes, Lava Forge, Arena Lights, Code Rain City, Orbit
+and Deep Sonar. Each has eight screens, with Getting ready, Paused and Offline added.
+
+**Music and sound on your screens.**
+
+- The wave player or a heartbeat line with the song, shown only while music plays, and
+  backgrounds that move with the beat. Settings, Music picks where the beat and the song come
+  from (Spotify or Music on a Mac, your player on Windows, or a text file).
+- A sound element for any screen: a whoosh or riser when it comes on, rain or a soft pad behind
+  it, ticks in a timer's last ten seconds and a hit at zero. Real recordings, free to use.
+- Timers have six looks: digital, thin, ring, bar, flip cards and words.
+- Start show's countdown: choose what happens at zero (switch scene, unmute, start streaming or
+  recording, a chat message, a marker), each on or off.
+
+**Also:** Simple and Advanced in Studio, much less text (explanations behind an (i)), and a
+log file in Ferrocast's data folder for looking into problems.
+
 ## 2.0.0-beta.13
 
 - The sound element uses real recordings: a whoosh, a riser, a cinematic hit, a clock tick, a
