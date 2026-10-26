@@ -16,7 +16,9 @@ use ferrocast_core::stream_info::{Preset, StreamInfo};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use ferrocast_engine::studio_host::{FilterEdit, ItemEdit, Monitor, NewSource, SceneTransition, StudioAct, WebAct};
+use ferrocast_engine::studio_host::{
+    AudioChange, FilterEdit, ItemEdit, NewSource, SceneTransition, StudioAct, StudioModeOptions, WebAct,
+};
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -49,9 +51,16 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
+        .route("/studio/engine/studio-mode/options", put(engine_studio_options))
+        .route("/studio/engine/studio-mode/swap", post(engine_swap_scenes))
+        .route("/studio/engine/studio-mode/tbar", put(engine_tbar))
+        .route("/studio/engine/black", post(engine_fade_to_black))
+        .route("/studio/engine/scenes/{scene}/items/{id}/transition", put(engine_item_transition))
+        .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
         .route("/studio/engine/redo", post(engine_redo))
+        .route("/studio/engine/history", get(engine_history))
         .route("/studio/engine/pick-file", post(engine_pick_file))
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
@@ -406,13 +415,6 @@ struct AddItemBody {
 }
 
 #[derive(Deserialize)]
-struct AudioBody {
-    volume_db: Option<f32>,
-    muted: Option<bool>,
-    monitor: Option<Monitor>,
-}
-
-#[derive(Deserialize)]
 struct LevelsBody {
     names: Vec<String>,
 }
@@ -575,6 +577,71 @@ async fn engine_transition_now(State(app): State<AppState>, Body(b): Body<QuickB
     act_done(&app, StudioAct::TransitionNow { quick: b.quick }).await
 }
 
+/// `PUT /studio/engine/studio-mode/options` `{ swap, duplicate_scene, duplicate_sources, double_click }`.
+async fn engine_studio_options(
+    State(app): State<AppState>,
+    Body(options): Body<StudioModeOptions>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetStudioOptions { options }).await
+}
+
+/// `POST /studio/engine/studio-mode/swap`: the preview and what's on air swap, with a cut.
+async fn engine_swap_scenes(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SwapScenes).await
+}
+
+#[derive(Deserialize)]
+struct TBarBody {
+    at: f32,
+    #[serde(default)]
+    release: bool,
+}
+
+/// `PUT /studio/engine/studio-mode/tbar` `{ at, release? }` → `{ active, at }`.
+async fn engine_tbar(State(app): State<AppState>, Body(b): Body<TBarBody>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::TBar { at: b.at, release: b.release }).await
+}
+
+#[derive(Deserialize)]
+struct ItemTransitionBody {
+    show: bool,
+    transition: Option<SceneTransition>,
+}
+
+/// `PUT /studio/engine/scenes/{scene}/items/{id}/transition` `{ show, transition }` (null: none).
+async fn engine_item_transition(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<ItemTransitionBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetItemTransition { scene, id, show: b.show, transition: b.transition }).await
+}
+
+#[derive(Deserialize)]
+struct DeinterlaceBody {
+    mode: String,
+    #[serde(default = "yes")]
+    top_field_first: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `PUT /studio/engine/sources/{name}/deinterlace` `{ mode, top_field_first? }`.
+async fn engine_deinterlace(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<DeinterlaceBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetDeinterlace { name, mode: b.mode, top_field_first: b.top_field_first }).await
+}
+
+/// `POST /studio/engine/black` → `{ black }`: fades to black, or back.
+async fn engine_fade_to_black(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FadeToBlack).await
+}
+
 #[derive(Deserialize)]
 struct QuickListBody {
     list: Vec<SceneTransition>,
@@ -591,6 +658,11 @@ async fn engine_undo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 
 async fn engine_redo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::Redo).await
+}
+
+/// `GET /studio/engine/history` → `{ undo: [labels], redo: [labels] }`, newest first.
+async fn engine_history(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::History).await
 }
 
 #[derive(Deserialize)]
@@ -750,9 +822,9 @@ async fn engine_update_source(
 async fn engine_set_audio(
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Body(b): Body<AudioBody>,
+    Body(change): Body<AudioChange>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::SetAudio { name, volume_db: b.volume_db, muted: b.muted, monitor: b.monitor }).await
+    act_done(&app, StudioAct::SetAudio { name, change }).await
 }
 
 async fn engine_filters(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {

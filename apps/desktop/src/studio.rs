@@ -14,7 +14,7 @@ use ferrocast_engine::studio_host::{
 };
 use ferrocast_studio::{
     AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
-    Recording, Rect, StreamSettings, Streaming, Studio, TransitionInfo,
+    Recording, Rect, StreamSettings, Streaming, Studio, StudioOptions, TransitionInfo,
 };
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -321,10 +321,29 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             "scenes": c.scenes(),
             "current": c.current(),
             "transition": c.transition(),
-            // Studio Mode's preview (null when it's off) and its quick transitions.
+            // Studio Mode's preview (null when it's off), its quick transitions and options.
             "preview": c.preview_scene(),
             "quick": c.quick_transitions(),
+            "studio_options": c.studio_options(),
+            "tbar": c.tbar_state(),
+            "black": c.is_black(),
         }))),
+        A::SetStudioOptions { options: o } => done(c.set_studio_options(StudioOptions {
+            swap: o.swap,
+            duplicate_scene: o.duplicate_scene,
+            duplicate_sources: o.duplicate_sources,
+            double_click: o.double_click,
+        })),
+        A::SwapScenes => done(c.swap_scenes()),
+        A::SetItemTransition { scene, id, show, transition } => done(c.set_item_transition(
+            &scene,
+            id,
+            show,
+            transition.map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).as_ref(),
+        )),
+        A::SetDeinterlace { name, mode, top_field_first } => done(c.set_deinterlace(&name, &mode, top_field_first)),
+        A::FadeToBlack => Ok(json!({ "black": c.fade_to_black()? })),
+        A::TBar { at, release } => v(to_json!(c.tbar(at, release)?)),
         A::StudioMode { on } => {
             c.set_studio_mode(on);
             Ok(Value::Null)
@@ -359,14 +378,26 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::Options { name } => v(to_json!(c.options(&name)?)),
         A::Update { name, settings } => done(c.update(&name, &settings)),
         A::Audio { scene } => v(to_json!(c.audio(&scene)?)),
-        A::SetAudio { name, volume_db, muted, monitor } => {
-            if let Some(d) = volume_db {
+        A::SetAudio { name, change } => {
+            if let Some(d) = change.volume_db {
                 c.set_volume(&name, d)?;
             }
-            if let Some(m) = muted {
+            if let Some(m) = change.muted {
                 c.set_muted(&name, m)?;
             }
-            if let Some(m) = monitor {
+            if let Some(b) = change.balance {
+                c.set_balance(&name, b)?;
+            }
+            if let Some(ms) = change.sync_ms {
+                c.set_sync(&name, ms)?;
+            }
+            if let Some(m) = change.mono {
+                c.set_mono(&name, m)?;
+            }
+            if let Some(t) = &change.tracks {
+                c.set_tracks(&name, t)?;
+            }
+            if let Some(m) = change.monitor {
                 let m = match m {
                     Hear::Off => Monitor::Off,
                     Hear::OnlyMe => Monitor::OnlyMe,
@@ -410,7 +441,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             v(to_json!(c.set_transform(&scene, id, &t)?))
         }
         // Handled in `act`, which holds the preview and the history.
-        A::Select { .. } | A::Undo | A::Redo => Ok(Value::Null),
+        A::Select { .. } | A::Undo | A::Redo | A::History => Ok(Value::Null),
         A::Web { name, what } => done(c.web(&name, web_act(what))),
         // Handled in `act`, which knows where recordings go.
         A::Screenshot { .. } => Ok(Value::Null),
@@ -730,8 +761,15 @@ impl StudioHost for DesktopStudio {
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let changes = act.changes();
+            if act == StudioAct::History {
+                let (undo, redo) = h.history.list();
+                return Ok(json!({ "undo": undo, "redo": redo }));
+            }
             if matches!(act, StudioAct::Undo | StudioAct::Redo) {
-                let done = if act == StudioAct::Undo { h.history.undo(c) } else { h.history.redo(c) }?;
+                let done = if act == StudioAct::Undo { h.history.undo(c) } else { h.history.redo(c) };
+                // A scene that came back or went changes what the pictures show.
+                sync_views(h);
+                let done = done?;
                 save(c, &file);
                 refresh_projectors(h);
                 let (undo, redo) = h.history.labels();

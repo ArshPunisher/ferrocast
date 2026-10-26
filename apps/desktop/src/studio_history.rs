@@ -1,12 +1,15 @@
-//! Undo and redo for sources in scenes, as OBS's Edit menu has them: moving, resizing and Edit
+//! Undo and redo, as OBS's Edit menu has them. Sources in scenes: moving, resizing and Edit
 //! Transform, show and hide, lock, order, fit, flips and turns, blending and scaling, adding,
-//! duplicating and removing. Each step remembers the items as they were (a removed source is
-//! held, so it can come back); undoing one remembers them as they are, for redo.
+//! duplicating and removing. Scenes: adding, copying, removing, reordering, renaming and their
+//! own transition. Filters (every change), a source's settings, and its sound (volume, mute,
+//! monitoring, balance, sync, mono, tracks). Each step remembers things as they were (a removed
+//! source or scene is held, so it can come back); undoing one remembers them as they are, for
+//! redo.
 
 use std::time::{Duration, Instant};
 
 use ferrocast_engine::studio_host::{ItemEdit as Edit, StudioAct};
-use ferrocast_studio::{Collection, ItemEdit, ItemSnap};
+use ferrocast_studio::{AudioSnap, Collection, FilterSnap, ItemEdit, ItemSnap, SceneSnap, TransitionInfo};
 use serde_json::Value;
 
 /// Steps kept each way.
@@ -22,6 +25,24 @@ enum Change {
     Item(ItemSnap),
     /// This item wasn't there: take it out.
     Gone { scene: String, id: i64 },
+    /// Bring this removed scene back.
+    SceneBack(SceneSnap),
+    /// This scene wasn't there: take it out.
+    SceneGone(String),
+    /// Put this scene back at this place in the list.
+    SceneAt(String, usize),
+    /// Rename the first back to the second.
+    Rename(String, String),
+    /// Put this source's filters back.
+    Filters(FilterSnap),
+    /// Put this source's settings back.
+    Settings(String, Value),
+    /// Put this sound's mixer settings back.
+    Audio(AudioSnap),
+    /// Give this scene back its own transition (or none).
+    SceneTransition(String, Option<TransitionInfo>),
+    /// Put this source's deinterlacing back (mode, top field first).
+    Deinterlace(String, String, bool),
 }
 
 #[derive(Debug)]
@@ -123,7 +144,7 @@ impl History {
             }
             StudioAct::SetTransform { scene, id, .. } => {
                 let key = ("transform", scene.clone(), *id);
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.at.elapsed() < MERGE) {
+                if self.joins(&key) {
                     return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
                 }
                 let snap = c.snap(scene, *id).ok()?;
@@ -137,8 +158,122 @@ impl History {
                 added: Some((scene.clone(), c.item_ids(scene).ok()?)),
                 ..fresh(format!("Add {name}"), Vec::new(), None, false)
             }),
+            StudioAct::SetItemTransition { scene, id, show, .. } => {
+                let snap = c.snap(scene, *id).ok()?;
+                let what = if *show { "Show" } else { "Hide" };
+                Some(fresh(format!("{what} transition of {}", snap.name), vec![Change::Item(snap)], None, false))
+            }
+            StudioAct::SetDeinterlace { name, .. } => {
+                let (mode, top) = c.deinterlace_of(name).ok()?;
+                Some(fresh(
+                    format!("Deinterlacing of {name}"),
+                    vec![Change::Deinterlace(name.clone(), mode, top)],
+                    None,
+                    false,
+                ))
+            }
+            StudioAct::AddScene { name } => {
+                Some(fresh(format!("Add scene {name}"), vec![Change::SceneGone(name.clone())], None, false))
+            }
+            StudioAct::DuplicateScene { scene, name } => {
+                Some(fresh(format!("Copy scene {scene}"), vec![Change::SceneGone(name.clone())], None, false))
+            }
+            StudioAct::RemoveScene { scene } => {
+                let snap = c.snap_scene(scene).ok()?;
+                Some(fresh(format!("Remove scene {scene}"), vec![Change::SceneBack(snap)], None, false))
+            }
+            StudioAct::MoveScene { scene, .. } => {
+                let at = c.scene_index(scene).ok()?;
+                Some(fresh(format!("Reorder {scene}"), vec![Change::SceneAt(scene.clone(), at)], None, false))
+            }
+            StudioAct::Rename { name, new_name } if name != new_name => {
+                Some(fresh(format!("Rename {name}"), vec![Change::Rename(new_name.clone(), name.clone())], None, false))
+            }
+            StudioAct::SetSceneTransition { scene, .. } => {
+                let t = c.scene_transition_of(scene).ok()?;
+                Some(fresh(
+                    format!("Change transition of {scene}"),
+                    vec![Change::SceneTransition(scene.clone(), t)],
+                    None,
+                    false,
+                ))
+            }
+            StudioAct::Update { name, .. } => {
+                let key = ("settings", name.clone(), 0);
+                if self.joins(&key) {
+                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                }
+                let was = c.snap_settings(name).ok()?;
+                Some(fresh(
+                    format!("Change settings of {name}"),
+                    vec![Change::Settings(name.clone(), was)],
+                    Some(key),
+                    false,
+                ))
+            }
+            // Shortcuts (mute, push-to-talk) aren't undo steps, as in OBS.
+            StudioAct::SetAudio { change, .. } if change.by_shortcut => None,
+            StudioAct::SetAudio { name, change } => {
+                let key = ("audio", name.clone(), 0);
+                // A volume or balance slider's moves are one step.
+                let slide = change.volume_db.is_some() || change.balance.is_some() || change.sync_ms.is_some();
+                if slide && self.joins(&key) {
+                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                }
+                let label = match (change.muted, change.mono) {
+                    (Some(true), _) => format!("Mute {name}"),
+                    (Some(false), _) => format!("Unmute {name}"),
+                    (_, Some(_)) => format!("Change mono of {name}"),
+                    _ if change.monitor.is_some() => format!("Change monitoring of {name}"),
+                    _ if change.tracks.is_some() => format!("Change tracks of {name}"),
+                    _ if change.balance.is_some() => format!("Change balance of {name}"),
+                    _ if change.sync_ms.is_some() => format!("Change sync of {name}"),
+                    _ => format!("Change volume of {name}"),
+                };
+                let snap = c.snap_audio(name).ok()?;
+                Some(fresh(label, vec![Change::Audio(snap)], slide.then_some(key), false))
+            }
+            StudioAct::AddFilter { name, filter } => self.filters(c, name, format!("Add filter {}", filter.name), None),
+            StudioAct::RemoveFilter { name, filter } => self.filters(c, name, format!("Remove filter {filter}"), None),
+            StudioAct::EditFilter { name, filter, .. } => {
+                self.filters(c, name, format!("Change filter {filter}"), None)
+            }
+            StudioAct::PasteFilters { name, from } => {
+                self.filters(c, name, format!("Paste filters from {from} to {name}"), None)
+            }
+            StudioAct::UpdateFilter { name, filter, .. } => {
+                let key = ("filter", format!("{name}\n{filter}"), 0);
+                if self.joins(&key) {
+                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                }
+                self.filters(c, name, format!("Change filter {filter}"), Some(key))
+            }
             _ => None,
         }
+    }
+
+    /// Whether an act on `key` joins the newest step (a slider still moving).
+    fn joins(&self, key: &(&'static str, String, i64)) -> bool {
+        self.undo.last().is_some_and(|s| s.key.as_ref() == Some(key) && s.at.elapsed() < MERGE)
+    }
+
+    fn filters(
+        &self,
+        c: &Collection,
+        name: &str,
+        label: String,
+        key: Option<(&'static str, String, i64)>,
+    ) -> Option<Before> {
+        let snap = c.snap_filters(name).ok()?;
+        Some(Before {
+            label,
+            changes: vec![Change::Filters(snap)],
+            key,
+            join: false,
+            added: None,
+            closes: false,
+            open: false,
+        })
     }
 
     /// Records the step once the act ran (nothing if it failed).
@@ -236,6 +371,14 @@ impl History {
         (self.undo.last().map(|s| s.label.as_str()), self.redo.last().map(|s| s.label.as_str()))
     }
 
+    /// Every step each way, newest first, for the history list.
+    pub fn list(&self) -> (Vec<&str>, Vec<&str>) {
+        (
+            self.undo.iter().rev().map(|s| s.label.as_str()).collect(),
+            self.redo.iter().rev().map(|s| s.label.as_str()).collect(),
+        )
+    }
+
     /// Forgets everything (the scenes were replaced or the Studio stopped).
     pub fn clear(&mut self) {
         self.undo.clear();
@@ -260,6 +403,49 @@ fn apply(c: &Collection, change: Change) -> Result<(Change, Option<Remap>), Stri
             let now = c.snap(&scene, id).map_err(|e| e.to_string())?;
             c.edit_item(&scene, id, ItemEdit::Remove).map_err(|e| e.to_string())?;
             Ok((Change::Item(now), None))
+        }
+        Change::SceneBack(snap) => {
+            c.restore_scene(&snap).map_err(|e| e.to_string())?;
+            Ok((Change::SceneGone(snap.name.clone()), None))
+        }
+        Change::SceneGone(name) => {
+            let now = c.snap_scene(&name).map_err(|e| e.to_string())?;
+            c.remove_scene(&name).map_err(|e| e.to_string())?;
+            Ok((Change::SceneBack(now), None))
+        }
+        Change::SceneAt(name, at) => {
+            let now = c.scene_index(&name).map_err(|e| e.to_string())?;
+            c.move_scene(&name, at).map_err(|e| e.to_string())?;
+            Ok((Change::SceneAt(name, now), None))
+        }
+        Change::Rename(from, to) => {
+            c.rename(&from, &to).map_err(|e| e.to_string())?;
+            Ok((Change::Rename(to, from), None))
+        }
+        Change::Filters(snap) => {
+            let now = c.snap_filters(&snap.source).map_err(|e| e.to_string())?;
+            c.restore_filters(&snap).map_err(|e| e.to_string())?;
+            Ok((Change::Filters(now), None))
+        }
+        Change::Settings(name, was) => {
+            let now = c.snap_settings(&name).map_err(|e| e.to_string())?;
+            c.restore_settings(&name, &was).map_err(|e| e.to_string())?;
+            Ok((Change::Settings(name, now), None))
+        }
+        Change::Audio(snap) => {
+            let now = c.snap_audio(&snap.source).map_err(|e| e.to_string())?;
+            c.restore_audio(&snap).map_err(|e| e.to_string())?;
+            Ok((Change::Audio(now), None))
+        }
+        Change::Deinterlace(name, mode, top) => {
+            let (now, now_top) = c.deinterlace_of(&name).map_err(|e| e.to_string())?;
+            c.set_deinterlace(&name, &mode, top).map_err(|e| e.to_string())?;
+            Ok((Change::Deinterlace(name, now, now_top), None))
+        }
+        Change::SceneTransition(scene, t) => {
+            let now = c.scene_transition_of(&scene).map_err(|e| e.to_string())?;
+            c.set_scene_transition(&scene, t.as_ref()).map_err(|e| e.to_string())?;
+            Ok((Change::SceneTransition(scene, now), None))
         }
     }
 }

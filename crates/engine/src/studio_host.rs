@@ -575,6 +575,41 @@ pub enum WebAct {
     Reload,
 }
 
+/// OBS's deinterlacing modes.
+pub const DEINTERLACE_MODES: [&str; 9] =
+    ["off", "discard", "retro", "blend", "blend_2x", "linear", "linear_2x", "yadif", "yadif_2x"];
+
+/// Studio Mode's options, as OBS has them under the Transition button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StudioModeOptions {
+    /// After a transition, the preview shows what was on air.
+    pub swap: bool,
+    /// What goes on air is a copy: moving or hiding sources in the preview doesn't touch it.
+    pub duplicate_scene: bool,
+    /// The copy has its own copies of the sources too.
+    pub duplicate_sources: bool,
+    /// A double-click on a scene sends it on air.
+    pub double_click: bool,
+}
+
+/// What to change in a sound's mixer settings (anything left out stays).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct AudioChange {
+    pub volume_db: Option<f32>,
+    pub muted: Option<bool>,
+    pub monitor: Option<Monitor>,
+    /// Left to right, 0 to 1.
+    pub balance: Option<f32>,
+    /// Heard this much later (negative: earlier), -950 to 20000 ms.
+    pub sync_ms: Option<i64>,
+    pub mono: Option<bool>,
+    /// The audio tracks (1 to 6) it's mixed into.
+    pub tracks: Option<Vec<u8>>,
+    /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
+    #[serde(skip)]
+    pub by_shortcut: bool,
+}
+
 /// Who hears a sound besides the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -668,9 +703,7 @@ pub enum StudioAct {
     },
     SetAudio {
         name: String,
-        volume_db: Option<f32>,
-        muted: Option<bool>,
-        monitor: Option<Monitor>,
+        change: AudioChange,
     },
     /// A global device on channel 1 to 6 (1, 2 desktop sound; 3 to 6 mics), or none.
     SetChannel {
@@ -773,10 +806,40 @@ pub enum StudioAct {
     SetQuickTransitions {
         list: Vec<SceneTransition>,
     },
+    /// How an item appears when shown (`show`) or goes when hidden, or at once (None).
+    SetItemTransition {
+        scene: String,
+        id: i64,
+        show: bool,
+        transition: Option<SceneTransition>,
+    },
+    /// How video from a device or file is deinterlaced: off, discard, retro, blend, blend_2x,
+    /// linear, linear_2x, yadif or yadif_2x.
+    SetDeinterlace {
+        name: String,
+        mode: String,
+        top_field_first: bool,
+    },
+    /// How Studio Mode sends scenes on air (swap, duplicate scene and sources, double-click).
+    SetStudioOptions {
+        options: StudioModeOptions,
+    },
+    /// Swaps the preview and what's on air, with a cut.
+    SwapScenes,
+    /// Fades what's on air to black, or back → `{ black }`.
+    FadeToBlack,
+    /// Moves the T-bar to `at` (0 on air, 1 preview); `release` when let go → `{ active, at }`.
+    TBar {
+        at: f32,
+        #[serde(default)]
+        release: bool,
+    },
     /// Undoes the newest change to sources → `{ done, undo, redo }` (labels, or null).
     Undo,
     /// Does again what was undone → `{ done, undo, redo }`.
     Redo,
+    /// Every step Undo and Redo can take → `{ undo: [labels], redo: [labels] }`, newest first.
+    History,
     /// Outlines an item in the preview, or nothing (`scene` and `id` null).
     Select {
         scene: Option<String>,
@@ -850,12 +913,27 @@ impl StudioAct {
                 check_source_name(name)?;
                 object(settings)
             }
-            A::SetAudio { name, volume_db, .. } => {
+            A::SetAudio { name, change: c } => {
                 check_source_name(name)?;
-                if let Some(v) = volume_db
-                    && !(v.is_finite() && (-100.0..=26.0).contains(v))
+                if let Some(v) = c.volume_db
+                    && !(v.is_finite() && (-100.0..=26.0).contains(&v))
                 {
                     return Err(EngineError::Invalid("volume_db: -100 to 26.".into()));
+                }
+                if let Some(b) = c.balance
+                    && !(b.is_finite() && (0.0..=1.0).contains(&b))
+                {
+                    return Err(EngineError::Invalid("balance: 0 (left) to 1 (right).".into()));
+                }
+                if let Some(ms) = c.sync_ms
+                    && !(-950..=20_000).contains(&ms)
+                {
+                    return Err(EngineError::Invalid("sync_ms: -950 to 20000 ms.".into()));
+                }
+                if let Some(t) = &c.tracks
+                    && (t.len() > 6 || t.iter().any(|n| !(1..=6).contains(n)))
+                {
+                    return Err(EngineError::Invalid("tracks: numbers 1 to 6.".into()));
                 }
                 Ok(())
             }
@@ -908,7 +986,25 @@ impl StudioAct {
                 Ok(())
             }
             A::Transform { scene, .. } => check_source_name(scene),
-            A::Undo | A::Redo | A::StudioMode { .. } => Ok(()),
+            A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
+            A::SwapScenes | A::FadeToBlack => Ok(()),
+            A::SetItemTransition { scene, transition, .. } => {
+                check_source_name(scene)?;
+                transition.iter().try_for_each(check_transition)
+            }
+            A::SetDeinterlace { name, mode, .. } => {
+                check_source_name(name)?;
+                if !DEINTERLACE_MODES.contains(&mode.as_str()) {
+                    return Err(EngineError::Invalid(format!("mode: one of {}.", DEINTERLACE_MODES.join(", "))));
+                }
+                Ok(())
+            }
+            A::TBar { at, .. } => {
+                if !(at.is_finite() && (0.0..=1.0).contains(at)) {
+                    return Err(EngineError::Invalid("at: 0 to 1.".into()));
+                }
+                Ok(())
+            }
             A::SetPreview { scene } => check_source_name(scene),
             A::TransitionNow { quick } => quick.iter().try_for_each(check_transition),
             A::SetQuickTransitions { list } => {
@@ -939,8 +1035,8 @@ impl StudioAct {
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
-        if let A::SetItemBox { save, .. } = self {
-            return *save;
+        if let A::SetItemBox { save: last, .. } | A::TBar { release: last, .. } = self {
+            return *last;
         }
         !matches!(
             self,
@@ -958,6 +1054,7 @@ impl StudioAct {
                 | A::Select { .. }
                 | A::Transform { .. }
                 | A::TransitionSettings { .. }
+                | A::History
         )
     }
 }
@@ -1565,11 +1662,17 @@ mod tests {
             (StudioAct::Update { name: "A".into(), settings: serde_json::json!("red") }, "settings"),
             (StudioAct::SetTransition { kind: "fade_transition".into(), ms: 60_000 }, "ms"),
             (
-                StudioAct::SetAudio { name: "Mic".into(), volume_db: Some(f32::NAN), muted: None, monitor: None },
+                StudioAct::SetAudio {
+                    name: "Mic".into(),
+                    change: AudioChange { volume_db: Some(f32::NAN), ..Default::default() },
+                },
                 "volume_db",
             ),
             (
-                StudioAct::SetAudio { name: "Mic".into(), volume_db: Some(40.0), muted: None, monitor: None },
+                StudioAct::SetAudio {
+                    name: "Mic".into(),
+                    change: AudioChange { volume_db: Some(40.0), ..Default::default() },
+                },
                 "volume_db",
             ),
             (StudioAct::SetChannel { channel: 7, device: None }, "channel"),

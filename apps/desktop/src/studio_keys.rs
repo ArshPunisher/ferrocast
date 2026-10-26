@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-use ferrocast_engine::studio_host::StudioAct;
+use ferrocast_engine::studio_host::{AudioChange, StudioAct};
 use ferrocast_engine::{Engine, EngineError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
@@ -95,9 +95,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         a => {
             let audio = |name: &str, muted: bool| StudioAct::SetAudio {
                 name: name.to_string(),
-                volume_db: None,
-                muted: Some(muted),
-                monitor: None,
+                change: AudioChange { muted: Some(muted), by_shortcut: true, ..Default::default() },
             };
             if let Some(scene) = a.strip_prefix("scene:") {
                 engine.studio_act(StudioAct::SetCurrent { scene: scene.to_string() }).await?;
