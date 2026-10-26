@@ -48,16 +48,16 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 (Track A or earlier). Each line ends with how Ferrocast does it better, when it can.
 
 ### Scenes and sources
-- [ ] P1 Scenes: add, rename, duplicate, delete, reorder, scene filters. *Better: start from
+- [x] P1 Scenes: add, rename, duplicate, delete, reorder, scene filters (26 Oct; grid mode too). *Better: start from
   ready screens (themes, 8 screens) instead of an empty scene.*
 - [ ] P1 Sources: add (new or existing), rename, duplicate (reference or copy), delete, reorder,
   show/hide, lock, groups and nested scenes, "Paste (Reference/Duplicate)", copy/paste filters.
-- [ ] P1 Transform: position, rotation, size, crop, bounds (8 kinds), alignment (9 points),
+- [x] P1 Transform: position, rotation, size, crop, bounds (8 kinds), alignment (9 points),
   flip, fit/stretch/center to screen, reset, copy/paste transform, edit transform dialog,
   snapping (screen, sources, center) with sensitivity.
 - [ ] P2 Per item: blending mode (8) and method, scale filtering (6), deinterlacing (7 modes,
   field order), show/hide transitions with duration, "Resize output (canvas) to source size".
-- [ ] P1 Properties, filters, interact (browser and windows), screenshot of a source, open
+- [x] P1 Properties, filters, interact (browser and windows), screenshot of a source, open
   source projector, "Hide in mixer".
 - [ ] P2 Missing files dialog (find, replace, search folder). *Better: found automatically by
   name in the folders you choose.*
@@ -90,8 +90,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   whatever the computer has (NVIDIA, or a built-in model on Mac).*
 
 ### Transitions
-- [ ] P1 Cut, fade, swipe, slide, fade to color, luma wipe, stinger (video, transition point,
-  audio fade style, track matte), duration, per-scene override, quick transitions.
+- [x] P1 Cut, fade, swipe, slide, fade to color, luma wipe, stinger (video, transition point,
+  audio fade style, track matte), duration, per-scene override (26 Oct). Quick transitions
+  still to come.
 - [ ] P2 Studio mode: preview/program, transition button, T-bar, swap, duplicate scene,
   "Transition on double click". *Better: our motion themes ship matching stingers.*
 
@@ -125,10 +126,12 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [ ] P1 Settings: General (language, theme, tray, confirmations, snapping, projectors, system
   tray), Hotkeys (every action, search, duplicates warning), Accessibility (colors, meters),
   Appearance (themes, font size, density).
+- [x] Projectors (window or full screen per display, Esc to leave) and a multiview (click to
+  switch), 26 Oct.
 - [ ] P2 Docks (lock, reset, custom browser docks), Stats dock (CPU, memory, disk, FPS, render
   lag, encoding lag, dropped frames per output), multiview (layouts, labels), projectors
   (fullscreen per monitor, windowed, always on top).
-- [ ] P1 Undo/redo for every change. *Better: a history list you can step back through.*
+- [x] P1 Undo/redo (26 Oct: every change to sources; scene and filter changes still to come). *Better: a history list you can step back through.*
 - [ ] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
   plugin manager, safe mode, "show recording/streaming in title bar".
 - [ ] P1 *Better: settings search; plain-language errors with the fix (R-08); a phone as a
