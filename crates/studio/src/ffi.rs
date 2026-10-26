@@ -223,6 +223,8 @@ macro_rules! api {
             _lib: Library,
             _deps: Vec<Library>,
             fns: Fns,
+            /// Functions only newer libobs has (looked up, not required).
+            pub(crate) newer: Newer,
         }
 
         impl std::fmt::Debug for Api {
@@ -252,7 +254,8 @@ macro_rules! api {
                         },
                     )*
                 };
-                Ok(Api { _lib: lib, _deps, fns })
+                let newer = Newer::load(&lib);
+                Ok(Api { _lib: lib, _deps, fns, newer })
             }
 
             $(
@@ -266,6 +269,83 @@ macro_rules! api {
             )*
         }
     };
+}
+
+/// `struct obs_runtime_module_info` (libobs 33): a folder of modules and what kind they are.
+#[repr(C)]
+pub(crate) struct RuntimeModuleInfo {
+    pub binary: *const c_char,
+    pub data: *const c_char,
+    pub kind: c_int,
+    pub name: *const c_char,
+}
+
+/// `struct obs_module_failure_info`.
+#[repr(C)]
+pub(crate) struct ModuleFailureInfo {
+    pub failed_modules: *mut *mut c_char,
+    pub count: usize,
+}
+
+/// `enum obs_runtime_module_type` OBS_MODULE_TYPE_PLUGIN.
+pub(crate) const OBS_MODULE_TYPE_PLUGIN: c_int = 2;
+
+/// libobs functions that only some versions have.
+pub(crate) struct Newer {
+    /// libobs 33+: loads the modules found at a path. Its `obs_load_all_modules` does nothing,
+    /// and its core-module loader looks inside the running app's own bundle (Ferrocast's, not
+    /// OBS's), so OBS's plugins are loaded through this instead.
+    pub load_plugins: Option<unsafe extern "C" fn(*mut RuntimeModuleInfo, *mut ModuleFailureInfo)>,
+    pub failure_free: Option<unsafe extern "C" fn(*mut ModuleFailureInfo)>,
+}
+
+impl Newer {
+    fn load(lib: &Library) -> Newer {
+        // SAFETY: when present, these symbols have exactly these C signatures in libobs 33's
+        // obs.h; the pointers stay valid while `lib` lives, as long as `Api`.
+        unsafe {
+            Newer {
+                load_plugins: lib
+                    .get::<unsafe extern "C" fn(*mut RuntimeModuleInfo, *mut ModuleFailureInfo)>(b"obs_load_plugins\0")
+                    .ok()
+                    .map(|f| *f),
+                failure_free: lib
+                    .get::<unsafe extern "C" fn(*mut ModuleFailureInfo)>(b"obs_module_failure_info_free\0")
+                    .ok()
+                    .map(|f| *f),
+            }
+        }
+    }
+}
+
+/// Loads OBS's plugins from where OBS keeps them. libobs 33 split loading into core modules,
+/// which it looks for inside the running app (Ferrocast, where there are none), and plugins by
+/// path; its old `obs_load_all_modules` does nothing. So with 33+ every module is loaded as a
+/// plugin from OBS's folder; with older libobs as before.
+pub(crate) fn load_modules(api: &Api, places: &[(&std::ffi::CStr, &std::ffi::CStr)]) {
+    let Some(load) = api.newer.load_plugins else {
+        api.obs_load_all_modules();
+        return;
+    };
+    for (bin, data) in places {
+        let mut info = RuntimeModuleInfo {
+            binary: bin.as_ptr(),
+            data: data.as_ptr(),
+            kind: OBS_MODULE_TYPE_PLUGIN,
+            name: std::ptr::null(),
+        };
+        let mut failed = ModuleFailureInfo { failed_modules: std::ptr::null_mut(), count: 0 };
+        // SAFETY: both structs are as libobs 33 declares them and outlive the call; the paths
+        // are C strings that live past it (libobs copies what it keeps).
+        unsafe { load(&mut info, &mut failed) };
+        if failed.count > 0 {
+            tracing::warn!(count = failed.count, "some OBS plugins didn't load");
+        }
+        if let Some(free) = api.newer.failure_free {
+            // SAFETY: frees what obs_load_plugins filled in, once.
+            unsafe { free(&mut failed) };
+        }
+    }
 }
 
 api! {

@@ -68,6 +68,9 @@ pub struct Paths {
     pub plugin_bin: String,
     /// Plugin data, `%module%` likewise.
     pub plugin_data: String,
+    /// OBS 33's own modules where they're apart from plugins (Windows: `core/%module%/`), with
+    /// their data; None where they sit with the plugins (macOS) or OBS is older.
+    pub core: Option<(String, String)>,
     /// Libraries libobs and its plugins link to, loaded first (an OBS.app's Frameworks, or
     /// OBS's `bin/64bit` on Windows). None when they sit where libobs looks.
     pub deps: Option<PathBuf>,
@@ -84,6 +87,7 @@ impl Paths {
             data: format!("{c}/Frameworks/libobs.framework/Resources/"),
             plugin_bin: format!("{c}/PlugIns/%module%.plugin/Contents/MacOS/"),
             plugin_data: format!("{c}/PlugIns/%module%.plugin/Contents/Resources/"),
+            core: None,
             deps: Some(fw),
         }
     }
@@ -100,6 +104,8 @@ impl Paths {
             data: format!("{r}/data/libobs/"),
             plugin_bin: format!("{r}/obs-plugins/64bit/"),
             plugin_data: format!("{r}/data/obs-plugins/%module%/"),
+            // OBS 33 moved its own modules here; older installs don't have the folder.
+            core: Some((format!("{r}/core/%module%/"), format!("{r}/core/%module%/data"))),
             deps: Some(bin),
         }
     }
@@ -354,7 +360,10 @@ impl Studio {
             let name = cstr(m);
             api.obs_add_disabled_module(name.as_ptr());
         }
-        api.obs_load_all_modules();
+        let core = paths.core.as_ref().map(|(b, d)| (cstr(b), cstr(d)));
+        let mut places = vec![(bin.as_c_str(), pdata.as_c_str())];
+        places.extend(core.as_ref().map(|(b, d)| (b.as_c_str(), d.as_c_str())));
+        ffi::load_modules(&api, &places);
         api.obs_post_load_modules();
         let cpu = api.os_cpu_usage_info_start();
         let inner = std::rc::Rc::new(Inner {
