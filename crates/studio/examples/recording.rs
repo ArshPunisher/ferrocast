@@ -103,6 +103,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(fmt["format"]["format_name"].as_str().unwrap_or("").contains("mp4"), "{fmt}");
     assert!(studio.remux(&mkv, &mp4, |_| true).is_err(), "never over a file that's there");
     assert!(studio.record_to(&mkv, &RecordPlan { format: "avi".into(), ..plan("mkv") }).is_err());
+    // HLS: a playlist and its segments; and an MP4 with muxer settings of the streamer's own.
+    let hls = RecordPlan { tracks: vec![1], ..plan("hls") };
+    let m3u8 = studio.record_path(&hls);
+    assert_eq!(m3u8.extension().and_then(|e| e.to_str()), Some("m3u8"));
+    let rec = studio.record_to(&m3u8, &hls)?;
+    std::thread::sleep(Duration::from_secs(4));
+    drop(rec);
+    let playlist = std::fs::read_to_string(&m3u8)?;
+    assert!(playlist.contains("#EXTM3U") && playlist.contains(".ts"), "{playlist}");
+    let tuned = RecordPlan { name: "Tuned".into(), muxer: "movflags=+faststart".into(), ..plan("mp4") };
+    let file = studio.record_path(&tuned);
+    let rec = studio.record_to(&file, &tuned)?;
+    std::thread::sleep(Duration::from_secs(2));
+    drop(rec);
+    assert!(probe(&file, "-show_format")["format"]["duration"].as_str().is_some(), "plays");
     drop(c);
     drop(studio);
     println!("names, two tracks, a chapter, a split, MKV and a remux all work");

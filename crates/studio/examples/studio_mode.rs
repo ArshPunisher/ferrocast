@@ -147,6 +147,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(lv.get("Tone").is_some_and(|l| l.peak[0] > -60.0), "true peak reads the tone: {lv:?}");
     c.set_true_peak(false);
 
+    // OBS's blending method: sRGB off, and back.
+    c.edit_item("Next", box_id, ferrocast_studio::ItemEdit::BlendMethodSrgbOff)?;
+    assert!(c.items("Next")?.iter().any(|i| i.id == box_id && i.srgb_off));
+    c.edit_item("Next", box_id, ferrocast_studio::ItemEdit::BlendMethodDefault)?;
+    assert!(c.items("Next")?.iter().any(|i| i.id == box_id && !i.srgb_off));
+
     // Show and hide transitions, and deinterlacing (video from a file only).
     c.set_item_transition("Next", box_id, true, Some(&TransitionInfo { kind: "fade_transition".into(), ms: 700 }))?;
     c.set_item_transition("Next", box_id, false, Some(&TransitionInfo { kind: "swipe_transition".into(), ms: 250 }))?;

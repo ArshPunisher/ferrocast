@@ -494,6 +494,8 @@ api! {
     obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
     obs_view_create: fn() -> *mut ObsView;
+    obs_sceneitem_set_blending_method: fn(a: *mut ObsSceneItem, b: c_int);
+    obs_sceneitem_get_blending_method: fn(a: *mut ObsSceneItem) -> c_int;
     obs_source_media_play_pause: fn(a: *mut ObsSource, b: bool);
     obs_source_media_restart: fn(a: *mut ObsSource);
     obs_source_media_stop: fn(a: *mut ObsSource);

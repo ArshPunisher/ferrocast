@@ -737,8 +737,12 @@ impl Studio {
             "mp4" => ("mp4_output", ""),
             "mov" => ("mov_output", ""),
             "fmp4" | "fmov" => ("ffmpeg_muxer", "movflags=frag_keyframe+empty_moov+delay_moov"),
-            "mkv" | "flv" | "ts" => ("ffmpeg_muxer", ""),
-            f => return Err(StudioError::Failed(format!("format: mp4, mov, fmp4, fmov, mkv, flv or ts, not \"{f}\""))),
+            "mkv" | "flv" | "ts" | "hls" => ("ffmpeg_muxer", ""),
+            f => {
+                return Err(StudioError::Failed(format!(
+                    "format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls, not \"{f}\""
+                )));
+            }
         };
         if id == "ffmpeg_muxer" && !Studio::muxer_ready() {
             return Err(StudioError::Failed(
@@ -765,8 +769,10 @@ impl Studio {
             a.obs_data_set_bool(settings, k.as_ptr(), v);
         };
         set_str("path", &path.display().to_string());
+        // OBS's own muxer settings for the format, then the streamer's (ffmpeg's key=value).
+        let muxer = [muxer, plan.muxer.trim()].iter().filter(|m| !m.is_empty()).copied().collect::<Vec<_>>().join(" ");
         if !muxer.is_empty() {
-            set_str("muxer_settings", muxer);
+            set_str("muxer_settings", &muxer);
         }
         // Splitting: each part is named like the first, in the same folder.
         set_bool("split_file", true);
@@ -1953,6 +1959,10 @@ pub struct RecordPlan {
     /// Audio tracks (1 to 6) in the file; empty is track 1.
     pub tracks: Vec<u8>,
     pub encode: EncodeSettings,
+    /// ffmpeg muxer settings of the streamer's own (`key=value` pairs, space apart), as OBS's
+    /// "Custom Muxer Settings".
+    #[serde(default)]
+    pub muxer: String,
 }
 
 impl Default for RecordPlan {
@@ -1967,6 +1977,7 @@ impl Default for RecordPlan {
             split_mb: 0,
             tracks: vec![1],
             encode: EncodeSettings::with_encoder("obs_x264"),
+            muxer: String::new(),
         }
     }
 }
@@ -1977,6 +1988,7 @@ impl RecordPlan {
         match self.format.as_str() {
             "fmp4" => "mp4",
             "fmov" => "mov",
+            "hls" => "m3u8",
             f => f,
         }
     }

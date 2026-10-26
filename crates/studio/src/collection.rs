@@ -69,6 +69,8 @@ pub struct ItemInfo {
     pub blend: String,
     /// How it's scaled: one of [`SCALE_FILTERS`].
     pub scale_filter: String,
+    /// Blending with sRGB off (OBS's "SRGB Off" blending method).
+    pub srgb_off: bool,
     /// Where it is on the canvas, in pixels: its box's two sides and its first corner,
     /// `[side_x.x, side_x.y, side_y.x, side_y.y, corner.x, corner.y]` (a point (u, v) of the
     /// box, each 0 to 1, is at `corner + u * side_x + v * side_y`). In a group, inside it.
@@ -136,6 +138,7 @@ pub struct ItemSnap {
     visible: bool,
     locked: bool,
     blend: c_int,
+    blend_method: c_int,
     scale_filter: c_int,
     show: Option<TransitionInfo>,
     hide: Option<TransitionInfo>,
@@ -280,6 +283,10 @@ pub enum ItemEdit {
     BlendMultiply,
     BlendLighten,
     BlendDarken,
+    /// OBS's Blending Method: the usual one, or with sRGB off (old blending, for some
+    /// effects).
+    BlendMethodDefault,
+    BlendMethodSrgbOff,
     ScaleOff,
     ScalePoint,
     ScaleBicubic,
@@ -1233,6 +1240,7 @@ impl Collection {
                 .get(usize::try_from(a.obs_sceneitem_get_scale_filter(item)).unwrap_or(0))
                 .unwrap_or(&SCALE_FILTERS[0])
                 .to_string(),
+            srgb_off: a.obs_sceneitem_get_blending_method(item) == 1,
             frame: self.place(item).frame(),
             children: if group {
                 self.group_items(item).into_iter().rev().map(|i| self.info(i)).collect()
@@ -1545,6 +1553,8 @@ impl Collection {
             ItemEdit::BlendMultiply => blend(4),
             ItemEdit::BlendLighten => blend(5),
             ItemEdit::BlendDarken => blend(6),
+            ItemEdit::BlendMethodDefault => a.obs_sceneitem_set_blending_method(item, 0),
+            ItemEdit::BlendMethodSrgbOff => a.obs_sceneitem_set_blending_method(item, 1),
             ItemEdit::ScaleOff => a.obs_sceneitem_set_scale_filter(item, 0),
             ItemEdit::ScalePoint => a.obs_sceneitem_set_scale_filter(item, 1),
             ItemEdit::ScaleBicubic => a.obs_sceneitem_set_scale_filter(item, 2),
@@ -1665,6 +1675,7 @@ impl Collection {
             visible: a.obs_sceneitem_visible(item),
             locked: a.obs_sceneitem_locked(item),
             blend: a.obs_sceneitem_get_blending_mode(item),
+            blend_method: a.obs_sceneitem_get_blending_method(item),
             scale_filter: a.obs_sceneitem_get_scale_filter(item),
             show: self.item_transition(item, true),
             hide: self.item_transition(item, false),
@@ -1693,6 +1704,7 @@ impl Collection {
         a.obs_sceneitem_set_visible(item, snap.visible);
         a.obs_sceneitem_set_locked(item, snap.locked);
         a.obs_sceneitem_set_blending_mode(item, snap.blend);
+        a.obs_sceneitem_set_blending_method(item, snap.blend_method);
         a.obs_sceneitem_set_scale_filter(item, snap.scale_filter);
         a.obs_sceneitem_set_order_position(item, c_int::try_from(snap.order).unwrap_or(0));
         for (show, t) in [(true, &snap.show), (false, &snap.hide)] {
