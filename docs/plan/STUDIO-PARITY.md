@@ -73,8 +73,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   with delays, monitoring (off / monitor only / monitor and output), monitoring device.
 - [x] P2 Advanced audio: balance, mono, sync offset, tracks 1 to 6 per source (26 Oct evening: one table for every sound, cards on a phone).
 - [x] P1 Audio settings: sample rate, channels (mono to 7.1), global devices (2 desktop, 4 mic),
-  meter decay and peak meter type, low-latency buffering. (26 Oct; meter decay, peak type and
-  low-latency buffering still to come.)
+  meter decay and peak meter type, low-latency buffering. (26 Oct; meter decay and true peak done too; the mixer can show only sounds making sound. Low-latency buffering (Windows) not yet.)
 - [ ] P1 Filters: noise suppression (RNNoise, Speex, NVIDIA), noise gate, gain, compressor,
   upward compressor, expander, limiter, 3-band EQ, invert polarity, VST 2.
   *Better: "Make my mic sound good" adds the right chain from a 5-second check, and warns while

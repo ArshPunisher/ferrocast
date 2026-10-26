@@ -214,6 +214,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     match made {
         Ok(c) => {
             save(&c, to);
+            c.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             h.collection = Some(c);
             refresh_projectors(h);
             sync_views(h);
@@ -772,6 +773,7 @@ impl StudioHost for DesktopStudio {
             }
             .map_err(|e| e.to_string())?;
             save(&collection, &file);
+            collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             h.collection = Some(collection);
             Ok(Self::status_of(h))
         })
@@ -962,6 +964,9 @@ impl StudioHost for DesktopStudio {
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
                     if studio.set_monitoring_device(&name, &id).is_err() {
                         notes.push(format!("{name} can't play sound; the system's device is used."));
+                    }
+                    if let Some(c) = &h.collection {
+                        c.set_true_peak(s.true_peak);
                     }
                     if h.audio.is_some_and(|a| {
                         a.sample_rate != s.sample_rate

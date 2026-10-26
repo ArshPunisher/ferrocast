@@ -496,6 +496,8 @@ pub struct StudioSettings {
     /// A surround layout instead of `stereo` ("2.1", "4.0", "4.1", "5.1", "7.1"; applies after
     /// a restart); None follows `stereo`.
     pub speakers: Option<String>,
+    /// Meters read true peak instead of sample peak (OBS's Peak Meter Type).
+    pub true_peak: bool,
 }
 
 impl Default for StudioSettings {
@@ -538,6 +540,7 @@ impl Default for StudioSettings {
             replay_mb: 0,
             replay_format: "mp4".into(),
             speakers: None,
+            true_peak: false,
         }
     }
 }
