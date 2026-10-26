@@ -1565,9 +1565,13 @@ async fn go_live_routes_refuse_what_is_wrong() {
         error_code(r.raw(reqwest::Method::PUT, "/api/v1/golive/destinations", "{nope").await).await.0,
         StatusCode::BAD_REQUEST
     );
-    // A custom server must be rtmp:// or rtmps://, named, with a key.
+    // A custom server is rtmp://, rtmps:// (with a key), or srt://, rist:// or WebRTC over
+    // https:// (plain http only on this PC, never with a user name); always named.
     for body in [
-        json!({ "name": "Backup", "url": "https://example.com/live", "key": "k" }),
+        json!({ "name": "Backup", "url": "ftp://example.com/live", "key": "k" }),
+        json!({ "name": "Backup", "url": "http://example.com/whip", "key": "k" }),
+        json!({ "name": "Backup", "url": "https://me:pw@example.com/whip", "key": "" }),
+        json!({ "name": "Backup", "url": "rtmp://example.com/live", "key": "" }),
         json!({ "name": "", "url": "rtmp://example.com/live", "key": "k" }),
         json!({ "name": "Backup", "url": "rtmp://example.com/live", "key": "has space" }),
         json!({ "name": "x".repeat(41), "url": "rtmp://example.com/live", "key": "k" }),
