@@ -140,6 +140,8 @@ pub struct Crop {
 }
 /// `obs-source.h`: the kind makes sound.
 pub const OBS_SOURCE_AUDIO: u32 = 1 << 1;
+/// `OBS_SOURCE_ASYNC`: frames come from a device or file (what deinterlacing applies to).
+pub const OBS_SOURCE_ASYNC: u32 = 1 << 2;
 /// `enum obs_order_movement`.
 pub const OBS_ORDER_MOVE_UP: c_int = 0;
 pub const OBS_ORDER_MOVE_DOWN: c_int = 1;
@@ -147,10 +149,19 @@ pub const OBS_ORDER_MOVE_TOP: c_int = 2;
 pub const OBS_ORDER_MOVE_BOTTOM: c_int = 3;
 /// `enum obs_scene_duplicate_type`: the copy shows the same sources.
 pub const OBS_SCENE_DUP_REFS: c_int = 0;
+/// A private copy showing the same sources (Studio Mode's "Duplicate scene").
+pub const OBS_SCENE_DUP_PRIVATE_REFS: c_int = 2;
+/// A private copy with private copies of its sources ("Duplicate sources").
+pub const OBS_SCENE_DUP_PRIVATE_COPY: c_int = 3;
+/// `OBS_TRANSITION_SOURCE_A`: what a transition goes from.
+pub const OBS_TRANSITION_SOURCE_A: c_int = 0;
 /// `enum obs_fader_type`: dB on a log scale, as OBS's mixer.
 pub const OBS_FADER_LOG: c_int = 2;
 /// `enum obs_transition_mode`.
 pub const OBS_TRANSITION_MODE_AUTO: c_int = 0;
+pub const OBS_TRANSITION_MODE_MANUAL: c_int = 1;
+/// `OBS_SOURCE_FLAG_FORCE_MONO`.
+pub const OBS_SOURCE_FLAG_FORCE_MONO: u32 = 1 << 1;
 /// `media-io/audio-io.h`: the meter callback's arrays hold this many channels.
 pub const MAX_AUDIO_CHANNELS: usize = 8;
 /// `obs_output_set_delay`: a reconnect keeps the delay's cut-off point.
@@ -426,6 +437,26 @@ api! {
     obs_source_get_filter_by_name: fn(a: *mut ObsSource, b: *const c_char) -> *mut ObsSource;
     obs_source_set_enabled: fn(a: *mut ObsSource, b: bool);
     obs_source_enabled: fn(a: *const ObsSource) -> bool;
+    obs_source_reset_settings: fn(a: *mut ObsSource, b: *mut ObsData);
+    obs_source_set_balance_value: fn(a: *mut ObsSource, b: f32);
+    obs_source_get_balance_value: fn(a: *const ObsSource) -> f32;
+    obs_source_set_sync_offset: fn(a: *mut ObsSource, b: i64);
+    obs_source_get_sync_offset: fn(a: *const ObsSource) -> i64;
+    obs_source_set_flags: fn(a: *mut ObsSource, b: u32);
+    obs_source_get_flags: fn(a: *const ObsSource) -> u32;
+    obs_source_set_audio_mixers: fn(a: *mut ObsSource, b: u32);
+    obs_source_get_audio_mixers: fn(a: *const ObsSource) -> u32;
+    obs_source_set_deinterlace_mode: fn(a: *mut ObsSource, b: c_int);
+    obs_source_get_deinterlace_mode: fn(a: *const ObsSource) -> c_int;
+    obs_source_set_deinterlace_field_order: fn(a: *mut ObsSource, b: c_int);
+    obs_source_get_deinterlace_field_order: fn(a: *const ObsSource) -> c_int;
+    obs_sceneitem_set_transition: fn(a: *mut ObsSceneItem, b: bool, c: *mut ObsSource);
+    obs_sceneitem_get_transition: fn(a: *mut ObsSceneItem, b: bool) -> *mut ObsSource;
+    obs_sceneitem_set_transition_duration: fn(a: *mut ObsSceneItem, b: bool, c: u32);
+    obs_sceneitem_get_transition_duration: fn(a: *mut ObsSceneItem, b: bool) -> u32;
+    obs_transition_set_manual_time: fn(a: *mut ObsSource, b: f32);
+    obs_transition_set_manual_torque: fn(a: *mut ObsSource, b: f32, c: f32);
+    obs_transition_get_time: fn(a: *mut ObsSource) -> f32;
     obs_volmeter_create: fn(a: c_int) -> *mut ObsVolmeter;
     obs_volmeter_destroy: fn(a: *mut ObsVolmeter);
     obs_volmeter_attach_source: fn(a: *mut ObsVolmeter, b: *mut ObsSource) -> bool;
@@ -436,6 +467,7 @@ api! {
     obs_transition_start: fn(a: *mut ObsSource, b: c_int, c: u32, d: *mut ObsSource) -> bool;
     obs_transition_set: fn(a: *mut ObsSource, b: *mut ObsSource);
     obs_transition_get_active_source: fn(a: *mut ObsSource) -> *mut ObsSource;
+    obs_transition_get_source: fn(a: *mut ObsSource, b: c_int) -> *mut ObsSource;
     obs_data_set_array: fn(a: *mut ObsData, b: *const c_char, c: *mut ObsDataArray);
     obs_data_get_array: fn(a: *mut ObsData, b: *const c_char) -> *mut ObsDataArray;
     obs_data_array_release: fn(a: *mut ObsDataArray);
@@ -640,12 +672,12 @@ pub(crate) unsafe extern "C" fn keep_scenes(param: *mut c_void, source: *mut Obs
     }
 }
 
-/// `obs_save_sources_filtered` callback: saves every source but those listed (the global
-/// audio devices, saved under their own keys as OBS does).
-pub(crate) unsafe extern "C" fn save_unless_listed(param: *mut c_void, source: *mut ObsSource) -> bool {
+/// `obs_save_sources_filtered` callback: saves only the sources listed (those in use; a
+/// source held only by an undo step isn't saved).
+pub(crate) unsafe extern "C" fn save_only_listed(param: *mut c_void, source: *mut ObsSource) -> bool {
     // SAFETY: `param` is the `&Vec` collection.rs passes for the synchronous save call.
-    let skip = unsafe { &*(param as *const Vec<*mut ObsSource>) };
-    !skip.contains(&source)
+    let keep = unsafe { &*(param as *const Vec<*mut ObsSource>) };
+    keep.contains(&source)
 }
 
 /// `obs_enum_audio_monitoring_devices` callback: collects (name, id) into the `Vec` behind

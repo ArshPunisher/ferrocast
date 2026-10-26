@@ -74,7 +74,18 @@ pub struct ItemInfo {
     /// box, each 0 to 1, is at `corner + u * side_x + v * side_y`). In a group, inside it.
     pub frame: [f32; 6],
     pub children: Vec<ItemInfo>,
+    /// How it appears when shown, and goes when hidden (None: at once).
+    pub show_transition: Option<TransitionInfo>,
+    pub hide_transition: Option<TransitionInfo>,
+    /// For video from a device or file: one of [`DEINTERLACE`]; None for other sources.
+    pub deinterlace: Option<String>,
+    /// Deinterlacing takes the top field first (else the bottom).
+    pub top_field_first: bool,
 }
+
+/// `enum obs_deinterlace_mode`, in order.
+pub const DEINTERLACE: [&str; 9] =
+    ["off", "discard", "retro", "blend", "blend_2x", "linear", "linear_2x", "yadif", "yadif_2x"];
 
 /// `enum obs_bounds_type`, in order: none, stretch, fit inside (scale inner), fill (scale
 /// outer), to width, to height, shrink only (max only).
@@ -124,6 +135,9 @@ pub struct ItemSnap {
     locked: bool,
     blend: c_int,
     scale_filter: c_int,
+    show: Option<TransitionInfo>,
+    hide: Option<TransitionInfo>,
+    deinterlace: (c_int, c_int),
 }
 
 impl std::fmt::Debug for ItemSnap {
@@ -136,6 +150,51 @@ impl Drop for ItemSnap {
     fn drop(&mut self) {
         self.studio.inner.api.obs_source_release(self.src);
     }
+}
+
+/// A scene as it was, to bring back once it's removed (undo): OBS's saved form of it, its
+/// place in the list, and its sources held so they outlive it.
+pub struct SceneSnap {
+    studio: Studio,
+    data: Value,
+    pub name: String,
+    index: usize,
+    /// Each held source with its name when the scene was removed.
+    held: Vec<(*mut ffi::ObsSource, String)>,
+}
+
+impl std::fmt::Debug for SceneSnap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SceneSnap").field("name", &self.name).field("index", &self.index).finish()
+    }
+}
+
+impl Drop for SceneSnap {
+    fn drop(&mut self) {
+        for (s, _) in &self.held {
+            self.studio.inner.api.obs_source_release(*s);
+        }
+    }
+}
+
+/// A source's filters as they were (kind, name, settings, on), in order, to put back (undo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterSnap {
+    pub source: String,
+    filters: Vec<(String, String, Value, bool)>,
+}
+
+/// A sound's mixer state as it was, to put back (undo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSnap {
+    pub source: String,
+    volume: f32,
+    muted: bool,
+    monitor: c_int,
+    balance: f32,
+    sync: i64,
+    flags: u32,
+    mixers: u32,
 }
 
 /// `enum obs_blending_type`, in order.
@@ -221,6 +280,14 @@ pub struct AudioInfo {
     pub volume_db: f32,
     pub muted: bool,
     pub monitor: Monitor,
+    /// Left to right, 0 to 1 (0.5 is the middle).
+    pub balance: f32,
+    /// Heard this much later (negative: earlier), ms.
+    pub sync_ms: i64,
+    /// Both speakers get the same sound.
+    pub mono: bool,
+    /// The audio tracks (1 to 6) it's mixed into.
+    pub tracks: Vec<u8>,
 }
 
 /// A source and the scenes it's in.
@@ -307,6 +374,11 @@ fn monitor_of(t: i32) -> Monitor {
     }
 }
 
+/// Track numbers (1 to 6) from libobs's mixer bits.
+fn tracks_of(mask: u32) -> Vec<u8> {
+    (1..=6u8).filter(|t| mask & 1 << (t - 1) != 0).collect()
+}
+
 fn no_scene(name: &str) -> StudioError {
     StudioError::Failed(format!("there's no scene called \"{name}\""))
 }
@@ -334,6 +406,47 @@ pub struct Collection {
     preview: RefCell<*mut ffi::ObsSource>,
     /// OBS's quick transitions: one-click ways to send the preview on air.
     quick: RefCell<Vec<TransitionInfo>>,
+    studio_options: RefCell<StudioOptions>,
+    /// A T-bar drag under way: the scene on air before it (to go back to if it's let go near
+    /// the start).
+    tbar: RefCell<Option<*mut ffi::ObsSource>>,
+    /// Faded to black: the scene that was on air, to fade back to.
+    black: RefCell<Option<*mut ffi::ObsSource>>,
+    /// The last transition was driven by the T-bar (libobs then reports the bar's place, not
+    /// a time).
+    by_hand: RefCell<bool>,
+}
+
+/// How Studio Mode sends the preview on air (OBS's options under the Transition button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StudioOptions {
+    /// After a transition the preview shows what was on air (so the two swap).
+    pub swap: bool,
+    /// What goes on air is a copy of the scene: moving, hiding or showing its sources in the
+    /// preview doesn't touch the stream.
+    pub duplicate_scene: bool,
+    /// The copy has copies of the sources too, so their settings can change without the
+    /// stream seeing it (uses more of the computer; captures and media can't be copied).
+    pub duplicate_sources: bool,
+    /// A double-click on a scene sends it on air.
+    pub double_click: bool,
+}
+
+impl Default for StudioOptions {
+    fn default() -> Self {
+        // OBS's defaults.
+        StudioOptions { swap: true, duplicate_scene: true, duplicate_sources: false, double_click: false }
+    }
+}
+
+/// Where a T-bar drag stands.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TBarState {
+    /// Still held between both scenes.
+    pub active: bool,
+    /// 0 (the scene on air) to 1 (the preview).
+    pub at: f32,
 }
 
 /// The quick transitions a new collection starts with, as OBS's.
@@ -371,6 +484,10 @@ impl Collection {
             transition_settings: RefCell::new(HashMap::new()),
             preview: RefCell::new(ptr::null_mut()),
             quick: RefCell::new(default_quick()),
+            studio_options: RefCell::new(StudioOptions::default()),
+            tbar: RefCell::new(None),
+            black: RefCell::new(None),
+            by_hand: RefCell::new(false),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -392,9 +509,14 @@ impl Collection {
         if t.is_null() {
             return Err(StudioError::Failed(format!("the transition \"{kind}\" isn't available")));
         }
-        let cur = *self.current.borrow();
-        if !cur.is_null() {
-            a.obs_transition_set(t, cur);
+        // The new one starts on what the old one shows (a Studio Mode copy, or black).
+        let old = *self.transition.borrow();
+        let on = if old.is_null() { ptr::null_mut() } else { a.obs_transition_get_active_source(old) };
+        if !on.is_null() {
+            a.obs_transition_set(t, on);
+            a.obs_source_release(on);
+        } else if old.is_null() && !self.current.borrow().is_null() {
+            a.obs_transition_set(t, *self.current.borrow());
         }
         a.obs_set_output_source(0, t);
         self.active_kind.replace(kind.to_string());
@@ -418,9 +540,55 @@ impl Collection {
 
     fn name_free(&self, name: &str) -> Result<(), StudioError> {
         check_name(name)?;
-        if self.find(name).is_some() {
-            return Err(StudioError::Failed(format!("name: there's already a source or scene called \"{name}\".")));
+        if let Some(src) = self.find(name) {
+            if self.in_use().contains(&src.ptr) {
+                return Err(StudioError::Failed(format!("name: there's already a source or scene called \"{name}\".")));
+            }
+            // Only an undo step holds it (it was removed): it steps aside under another name,
+            // and gets its own back if the step is undone.
+            let mut n = 1;
+            let aside = loop {
+                let candidate = format!("{name} (removed {n})");
+                if self.find(&candidate).is_none() {
+                    break candidate;
+                }
+                n += 1;
+            };
+            self.api().obs_source_set_name(src.ptr, cstr(&aside).as_ptr());
         }
+        Ok(())
+    }
+
+    /// Every source in use: the scenes, what's in them (groups included) and the global devices.
+    fn in_use(&self) -> Vec<*mut ffi::ObsSource> {
+        let a = self.api();
+        let mut out: Vec<*mut ffi::ObsSource> = self.scenes.borrow().clone();
+        for s in self.scenes.borrow().iter() {
+            for i in self.raw_items(a.obs_scene_from_source(*s)) {
+                out.push(a.obs_sceneitem_get_source(i));
+                if a.obs_sceneitem_is_group(i) {
+                    out.extend(self.group_items(i).into_iter().map(|g| a.obs_sceneitem_get_source(g)));
+                }
+            }
+        }
+        for (ch, _) in CHANNEL_KEYS {
+            let src = a.obs_get_output_source(ch);
+            if !src.is_null() {
+                out.push(src);
+                a.obs_source_release(src);
+            }
+        }
+        out
+    }
+
+    /// A source an undo step held gets its own name back (if no source in use took it).
+    fn reclaim_name(&self, src: *mut ffi::ObsSource, name: &str) -> Result<(), StudioError> {
+        let a = self.api();
+        if text(a.obs_source_get_name(src)) == name {
+            return Ok(());
+        }
+        self.name_free(name)?;
+        a.obs_source_set_name(src, cstr(name).as_ptr());
         Ok(())
     }
 
@@ -442,10 +610,47 @@ impl Collection {
     fn go(&self, scene: *mut ffi::ObsSource, ms: u32) {
         let a = self.api();
         let t = *self.transition.borrow();
-        if ms == 0 || !a.obs_transition_start(t, ffi::OBS_TRANSITION_MODE_AUTO, ms, scene) {
-            a.obs_transition_set(t, scene);
+        let send = self.on_air_copy(scene);
+        let to = send.unwrap_or(scene);
+        if ms == 0 || !a.obs_transition_start(t, ffi::OBS_TRANSITION_MODE_AUTO, ms, to) {
+            a.obs_transition_set(t, to);
+        }
+        self.by_hand.replace(false);
+        // The transition holds the copy now.
+        if let Some(copy) = send {
+            a.obs_source_release(copy);
         }
         self.current.replace(scene);
+        self.black.replace(None);
+        // A switch made elsewhere (a shortcut, a multiview click) ends any T-bar drag.
+        self.tbar.replace(None);
+    }
+
+    /// In Studio Mode with "Duplicate scene" on, a private copy of `scene` to send on air (our
+    /// reference), so editing the preview doesn't touch the stream.
+    fn on_air_copy(&self, scene: *mut ffi::ObsSource) -> Option<*mut ffi::ObsSource> {
+        let o = *self.studio_options.borrow();
+        if self.preview.borrow().is_null() || !o.duplicate_scene {
+            return None;
+        }
+        let a = self.api();
+        let how = if o.duplicate_sources { ffi::OBS_SCENE_DUP_PRIVATE_COPY } else { ffi::OBS_SCENE_DUP_PRIVATE_REFS };
+        let copy = a.obs_scene_duplicate(a.obs_scene_from_source(scene), a.obs_source_get_name(scene), how);
+        if copy.is_null() {
+            return None;
+        }
+        let src = a.obs_source_get_ref(a.obs_scene_get_source(copy));
+        a.obs_scene_release(copy);
+        (!src.is_null()).then_some(src)
+    }
+
+    /// A timed transition is still under way (a held T-bar is `tbar`).
+    fn transitioning(&self) -> bool {
+        if *self.by_hand.borrow() {
+            return false;
+        }
+        let t = self.api().obs_transition_get_time(*self.transition.borrow());
+        t > 0.0 && t < 1.0
     }
 
     // ---- Scenes ----
@@ -514,11 +719,20 @@ impl Collection {
         if self.scenes.borrow().len() == 1 {
             return Err(StudioError::Failed("A collection keeps at least one scene. Add another first.".into()));
         }
+        if self.tbar.borrow().is_some() {
+            return Err(StudioError::Failed("Let go of the T-bar first.".into()));
+        }
         let at = self.index_of(name)?;
         self.scenes.borrow_mut().remove(at);
         if *self.current.borrow() == src {
             let next = self.scenes.borrow()[at.saturating_sub(1)];
-            self.go(next, 0);
+            if self.black.borrow().is_some() {
+                // Stays black: fading back brings the next one in.
+                self.current.replace(next);
+                self.black.replace(Some(next));
+            } else {
+                self.go(next, 0);
+            }
         }
         if *self.preview.borrow() == src {
             let next = *self.current.borrow();
@@ -568,11 +782,187 @@ impl Collection {
 
     /// Turns Studio Mode on (the preview starts as what's on air) or off.
     pub fn set_studio_mode(&self, on: bool) {
-        let next = if on { *self.current.borrow() } else { ptr::null_mut() };
-        if on && !self.preview.borrow().is_null() {
+        if on == !self.preview.borrow().is_null() {
             return;
         }
+        let next = if on { *self.current.borrow() } else { ptr::null_mut() };
         self.preview.replace(next);
+        self.tbar.replace(None);
+        if self.black.borrow().is_none() {
+            // On: what's on air becomes a copy (with "Duplicate scene"); off: the scene itself.
+            // The picture doesn't change.
+            let cur = *self.current.borrow();
+            self.go(cur, 0);
+        }
+    }
+
+    pub fn studio_options(&self) -> StudioOptions {
+        *self.studio_options.borrow()
+    }
+
+    /// Changes how Studio Mode sends scenes on air. A change to copying puts what's on air
+    /// again (as OBS does), never mid-transition.
+    pub fn set_studio_options(&self, o: StudioOptions) -> Result<(), StudioError> {
+        let was = self.studio_options.replace(o);
+        let copying = |o: StudioOptions| (o.duplicate_scene, o.duplicate_scene && o.duplicate_sources);
+        if copying(was) != copying(o) && !self.preview.borrow().is_null() && self.black.borrow().is_none() {
+            if self.tbar.borrow().is_some() || self.transitioning() {
+                self.studio_options.replace(was);
+                return Err(StudioError::Failed("Wait for the transition to end, then change this.".into()));
+            }
+            let cur = *self.current.borrow();
+            self.go(cur, 0);
+        }
+        Ok(())
+    }
+
+    /// Swaps the preview and what's on air, with a cut (Studio Mode).
+    pub fn swap_scenes(&self) -> Result<(), StudioError> {
+        let pre = *self.preview.borrow();
+        if pre.is_null() {
+            return Err(StudioError::Failed("Studio Mode is off.".into()));
+        }
+        if self.tbar.borrow().is_some() || self.transitioning() {
+            return Err(StudioError::Failed("Wait for the transition to end.".into()));
+        }
+        let cur = *self.current.borrow();
+        self.go(pre, 0);
+        self.preview.replace(cur);
+        Ok(())
+    }
+
+    /// Fades what's on air to black, or back from black to it.
+    pub fn fade_to_black(&self) -> Result<bool, StudioError> {
+        if self.tbar.borrow().is_some() {
+            return Err(StudioError::Failed("Let go of the T-bar first.".into()));
+        }
+        let a = self.api();
+        let ms = self.transition_info.borrow().ms.max(300);
+        if self.black.borrow().is_some() {
+            // Back to the scene on air.
+            let cur = *self.current.borrow();
+            self.go_kind_fade(ms, cur);
+            self.black.replace(None);
+            return Ok(false);
+        }
+        // A cut can't fade: a fade does it.
+        if *self.active_kind.borrow() == "cut_transition" {
+            self.make_transition("fade_transition")?;
+        }
+        let t = *self.transition.borrow();
+        if !a.obs_transition_start(t, ffi::OBS_TRANSITION_MODE_AUTO, ms, ptr::null_mut()) {
+            a.obs_transition_set(t, ptr::null_mut());
+        }
+        self.by_hand.replace(false);
+        self.black.replace(Some(*self.current.borrow()));
+        Ok(true)
+    }
+
+    /// Faded to black now.
+    pub fn is_black(&self) -> bool {
+        self.black.borrow().is_some()
+    }
+
+    fn go_kind_fade(&self, ms: u32, scene: *mut ffi::ObsSource) {
+        if *self.active_kind.borrow() == "cut_transition" {
+            let _ = self.make_transition("fade_transition");
+        }
+        self.go(scene, ms);
+    }
+
+    /// Moves Studio Mode's T-bar to `at` (0 is what's on air, 1 the preview). The first move
+    /// starts a hand-driven transition; letting go (`release`) near either end finishes it or
+    /// goes back, anywhere else holds both scenes mixed, as OBS does.
+    pub fn tbar(&self, at: f32, release: bool) -> Result<TBarState, StudioError> {
+        let pre = *self.preview.borrow();
+        if pre.is_null() {
+            return Err(StudioError::Failed("Studio Mode is off.".into()));
+        }
+        if !at.is_finite() || !(0.0..=1.0).contains(&at) {
+            return Err(StudioError::Failed("at: 0 to 1.".into()));
+        }
+        let a = self.api();
+        if self.tbar.borrow().is_none() {
+            if release {
+                return Ok(TBarState { active: false, at: 0.0 });
+            }
+            let cur = *self.current.borrow();
+            if (pre == cur && !self.studio_options.borrow().duplicate_scene) || self.transitioning() {
+                return Ok(TBarState { active: false, at: 0.0 });
+            }
+            // The scene's own transition, else the Studio's; a cut or stinger can't be held
+            // part way, so a fade drives the T-bar instead.
+            let by_hand = |k: &str| k != "cut_transition" && k != "obs_stinger_transition";
+            let studio = self.transition_info.borrow().clone();
+            let kind = self
+                .scene_transition(pre)
+                .map(|t| t.kind)
+                .filter(|k| by_hand(k))
+                .or_else(|| by_hand(&studio.kind).then(|| studio.kind.clone()))
+                .unwrap_or_else(|| "fade_transition".into());
+            if kind != *self.active_kind.borrow() && self.make_transition(&kind).is_err() {
+                self.make_transition("fade_transition")?;
+            }
+            let t = *self.transition.borrow();
+            a.obs_transition_set_manual_torque(t, 8.0, 0.05);
+            let send = self.on_air_copy(pre);
+            let started = a.obs_transition_start(t, ffi::OBS_TRANSITION_MODE_MANUAL, 300, send.unwrap_or(pre));
+            if let Some(copy) = send {
+                a.obs_source_release(copy);
+            }
+            if !started {
+                return Ok(TBarState { active: false, at: 0.0 });
+            }
+            self.tbar.replace(Some(cur));
+            self.by_hand.replace(true);
+            self.current.replace(pre);
+            self.black.replace(None);
+        }
+        let t = *self.transition.borrow();
+        if !release {
+            a.obs_transition_set_manual_time(t, at.clamp(0.01, 0.99));
+            return Ok(TBarState { active: true, at });
+        }
+        if at >= 0.9 {
+            a.obs_transition_set_manual_time(t, 1.0);
+            let was = self.tbar.replace(None);
+            if let Some(old) = was {
+                self.swap_after(old);
+            }
+            Ok(TBarState { active: false, at: 0.0 })
+        } else if at <= 0.1 {
+            // Back to what was on air (OBS once kept the preview as "on air" here).
+            let src = a.obs_transition_get_source(t, ffi::OBS_TRANSITION_SOURCE_A);
+            a.obs_transition_set(t, src);
+            if !src.is_null() {
+                a.obs_source_release(src);
+            }
+            if let Some(old) = self.tbar.replace(None) {
+                self.current.replace(old);
+            }
+            Ok(TBarState { active: false, at: 0.0 })
+        } else {
+            a.obs_transition_set_manual_time(t, at);
+            Ok(TBarState { active: true, at })
+        }
+    }
+
+    /// Where the T-bar stands now.
+    pub fn tbar_state(&self) -> TBarState {
+        if self.tbar.borrow().is_none() {
+            return TBarState { active: false, at: 0.0 };
+        }
+        TBarState { active: true, at: self.api().obs_transition_get_time(*self.transition.borrow()) }
+    }
+
+    /// With "Swap" on, the preview shows what was on air before (if it's still a scene).
+    fn swap_after(&self, old: *mut ffi::ObsSource) {
+        if !self.studio_options.borrow().swap || self.preview.borrow().is_null() {
+            return;
+        }
+        if old != *self.current.borrow() && self.scenes.borrow().contains(&old) {
+            self.preview.replace(old);
+        }
     }
 
     /// Picks the scene Studio Mode's preview shows (to edit, then send on air).
@@ -592,9 +982,21 @@ impl Collection {
         if pre.is_null() {
             return Err(StudioError::Failed("Studio Mode is off.".into()));
         }
+        if self.tbar.borrow().is_some() {
+            return Err(StudioError::Failed("Let go of the T-bar first.".into()));
+        }
+        // One at a time, as in OBS: a click mid-transition does nothing.
+        if self.transitioning() {
+            return Ok(());
+        }
+        let old = *self.current.borrow();
+        // Nothing would change on air.
+        if old == pre && !self.studio_options.borrow().duplicate_scene && self.black.borrow().is_none() {
+            return Ok(());
+        }
         let name = text(self.api().obs_source_get_name(pre));
         match quick {
-            None => self.set_current(&name),
+            None => self.set_current(&name)?,
             Some(t) => {
                 if t.ms > 20_000 {
                     return Err(StudioError::Failed("ms: a transition lasts 0 to 20000 ms.".into()));
@@ -603,9 +1005,10 @@ impl Collection {
                     self.make_transition(&t.kind)?;
                 }
                 self.go(pre, if t.kind == "cut_transition" { 0 } else { t.ms });
-                Ok(())
             }
         }
+        self.swap_after(old);
+        Ok(())
     }
 
     pub fn quick_transitions(&self) -> Vec<TransitionInfo> {
@@ -784,7 +1187,93 @@ impl Collection {
             } else {
                 Vec::new()
             },
+            show_transition: self.item_transition(item, true),
+            hide_transition: self.item_transition(item, false),
+            deinterlace: (a.obs_source_get_output_flags(src) & ffi::OBS_SOURCE_ASYNC != 0).then(|| {
+                DEINTERLACE
+                    .get(usize::try_from(a.obs_source_get_deinterlace_mode(src)).unwrap_or(0))
+                    .unwrap_or(&DEINTERLACE[0])
+                    .to_string()
+            }),
+            top_field_first: a.obs_source_get_deinterlace_field_order(src) == 0,
         }
+    }
+
+    /// An item's show (or hide) transition.
+    fn item_transition(&self, item: *mut ffi::ObsSceneItem, show: bool) -> Option<TransitionInfo> {
+        let a = self.api();
+        let t = a.obs_sceneitem_get_transition(item, show);
+        if t.is_null() {
+            return None;
+        }
+        Some(TransitionInfo {
+            kind: text(a.obs_source_get_id(t)),
+            ms: a.obs_sceneitem_get_transition_duration(item, show),
+        })
+    }
+
+    /// Gives an item a transition for when it's shown (or hidden), or none (`None`). It uses
+    /// that kind's settings as the Studio has them.
+    pub fn set_item_transition(
+        &self,
+        scene: &str,
+        id: i64,
+        show: bool,
+        t: Option<&TransitionInfo>,
+    ) -> Result<(), StudioError> {
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        let Some(t) = t else {
+            a.obs_sceneitem_set_transition(item, show, ptr::null_mut());
+            return Ok(());
+        };
+        if t.ms > 20_000 {
+            return Err(StudioError::Failed("ms: a transition lasts 0 to 20000 ms.".into()));
+        }
+        if !TRANSITION_NAMES.iter().any(|(k, _)| *k == t.kind) {
+            return Err(StudioError::Failed("kind: fade, cut, swipe, slide, fade to colour, wipe or stinger.".into()));
+        }
+        let settings = self.transition_settings.borrow().get(&t.kind).cloned();
+        let data = settings.map_or(ptr::null_mut(), |v| a.obs_data_create_from_json(cstr(&v.to_string()).as_ptr()));
+        let (k, n) = (cstr(&t.kind), cstr(if show { "Show transition" } else { "Hide transition" }));
+        let src = a.obs_source_create_private(k.as_ptr(), n.as_ptr(), data);
+        if !data.is_null() {
+            a.obs_data_release(data);
+        }
+        if src.is_null() {
+            return Err(StudioError::Failed(format!("the transition \"{}\" isn't available", t.kind)));
+        }
+        a.obs_sceneitem_set_transition(item, show, src);
+        a.obs_source_release(src);
+        a.obs_sceneitem_set_transition_duration(item, show, t.ms);
+        Ok(())
+    }
+
+    /// A source's deinterlacing now: its mode and whether the top field goes first.
+    pub fn deinterlace_of(&self, name: &str) -> Result<(String, bool), StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        let m = usize::try_from(a.obs_source_get_deinterlace_mode(src.ptr)).unwrap_or(0);
+        Ok((
+            DEINTERLACE.get(m).unwrap_or(&DEINTERLACE[0]).to_string(),
+            a.obs_source_get_deinterlace_field_order(src.ptr) == 0,
+        ))
+    }
+
+    /// How video from a device or file is deinterlaced (one of [`DEINTERLACE`]).
+    pub fn set_deinterlace(&self, name: &str, mode: &str, top_field_first: bool) -> Result<(), StudioError> {
+        let m = DEINTERLACE
+            .iter()
+            .position(|d| *d == mode)
+            .ok_or_else(|| StudioError::Failed(format!("deinterlace: one of {}.", DEINTERLACE.join(", "))))?;
+        let src = self.source(name)?;
+        let a = self.api();
+        if a.obs_source_get_output_flags(src.ptr) & ffi::OBS_SOURCE_ASYNC == 0 {
+            return Err(StudioError::Failed(format!("\"{name}\" isn't video from a device or file.")));
+        }
+        a.obs_source_set_deinterlace_mode(src.ptr, c_int::try_from(m).unwrap_or(0));
+        a.obs_source_set_deinterlace_field_order(src.ptr, if top_field_first { 0 } else { 1 });
+        Ok(())
     }
 
     /// A scene's sources, top first (as OBS lists them).
@@ -1124,6 +1613,9 @@ impl Collection {
             locked: a.obs_sceneitem_locked(item),
             blend: a.obs_sceneitem_get_blending_mode(item),
             scale_filter: a.obs_sceneitem_get_scale_filter(item),
+            show: self.item_transition(item, true),
+            hide: self.item_transition(item, false),
+            deinterlace: (a.obs_source_get_deinterlace_mode(src), a.obs_source_get_deinterlace_field_order(src)),
         })
     }
 
@@ -1135,6 +1627,7 @@ impl Collection {
         let item = match self.raw_items(s).into_iter().find(|i| a.obs_sceneitem_get_id(*i) == snap.id) {
             Some(i) => i,
             None => {
+                self.reclaim_name(snap.src, &snap.name)?;
                 let i = a.obs_scene_add(s, snap.src);
                 if i.is_null() {
                     return Err(StudioError::Failed(format!("\"{}\" couldn't be put back", snap.name)));
@@ -1149,13 +1642,222 @@ impl Collection {
         a.obs_sceneitem_set_blending_mode(item, snap.blend);
         a.obs_sceneitem_set_scale_filter(item, snap.scale_filter);
         a.obs_sceneitem_set_order_position(item, c_int::try_from(snap.order).unwrap_or(0));
+        for (show, t) in [(true, &snap.show), (false, &snap.hide)] {
+            if self.item_transition(item, show) != *t {
+                self.set_item_transition(&snap.scene, id, show, t.as_ref())?;
+            }
+        }
+        if a.obs_source_get_output_flags(snap.src) & ffi::OBS_SOURCE_ASYNC != 0 {
+            a.obs_source_set_deinterlace_mode(snap.src, snap.deinterlace.0);
+            a.obs_source_set_deinterlace_field_order(snap.src, snap.deinterlace.1);
+        }
         Ok(id)
+    }
+
+    /// Remembers a scene as it is now, to bring it back after it's removed.
+    pub fn snap_scene(&self, name: &str) -> Result<SceneSnap, StudioError> {
+        let src = self.scene_src(name)?;
+        let a = self.api();
+        let d = a.obs_save_source(src);
+        let mut data = self.data_json(d);
+        if !d.is_null() {
+            a.obs_data_release(d);
+        }
+        // It comes back as a new scene, with its own id.
+        if let Some(o) = data.as_object_mut() {
+            o.remove("uuid");
+        }
+        let mut held = Vec::new();
+        for i in self.raw_items(a.obs_scene_from_source(src)) {
+            let mut all = vec![i];
+            if a.obs_sceneitem_is_group(i) {
+                all.extend(self.group_items(i));
+            }
+            for i in all {
+                let r = a.obs_source_get_ref(a.obs_sceneitem_get_source(i));
+                if !r.is_null() {
+                    held.push((r, text(a.obs_source_get_name(r))));
+                }
+            }
+        }
+        Ok(SceneSnap { studio: self.studio.clone(), data, name: name.to_string(), index: self.index_of(name)?, held })
+    }
+
+    /// Brings back a removed scene at its old place in the list.
+    pub fn restore_scene(&self, snap: &SceneSnap) -> Result<(), StudioError> {
+        self.name_free(&snap.name)?;
+        // Its sources first get their names back (items find them by id either way).
+        for (src, name) in &snap.held {
+            self.reclaim_name(*src, name)?;
+        }
+        let a = self.api();
+        let s = cstr(&json!({ "sources": [snap.data] }).to_string());
+        let holder = a.obs_data_create_from_json(s.as_ptr());
+        if holder.is_null() {
+            return Err(StudioError::Failed(format!("\"{}\" couldn't be read back", snap.name)));
+        }
+        let arr = a.obs_data_get_array(holder, c"sources".as_ptr());
+        let mut ctx = ffi::LoadCtx { api: a as *const Api, scenes: Vec::new() };
+        if !arr.is_null() {
+            a.obs_load_sources(arr, Some(ffi::keep_scenes), &mut ctx as *mut _ as *mut c_void);
+            a.obs_data_array_release(arr);
+        }
+        a.obs_data_release(holder);
+        let mut loaded = ctx.scenes.into_iter();
+        let Some(src) = loaded.next() else {
+            return Err(StudioError::Failed(format!("\"{}\" couldn't be brought back", snap.name)));
+        };
+        for extra in loaded {
+            a.obs_source_release(extra);
+        }
+        let mut v = self.scenes.borrow_mut();
+        let at = snap.index.min(v.len());
+        v.insert(at, src);
+        Ok(())
+    }
+
+    /// Remembers a source's filters as they are now.
+    pub fn snap_filters(&self, name: &str) -> Result<FilterSnap, StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        let filters = self
+            .raw_filters(src.ptr)
+            .into_iter()
+            .map(|f| {
+                (
+                    text(a.obs_source_get_id(f)),
+                    text(a.obs_source_get_name(f)),
+                    self.own_settings(f),
+                    a.obs_source_enabled(f),
+                )
+            })
+            .collect();
+        Ok(FilterSnap { source: name.to_string(), filters })
+    }
+
+    /// Puts a source's filters back as `snap` remembers them. Filters still there keep running
+    /// (their settings are put back); missing ones are made again, extra ones go.
+    pub fn restore_filters(&self, snap: &FilterSnap) -> Result<(), StudioError> {
+        let src = self.source(&snap.source)?;
+        let a = self.api();
+        for f in self.raw_filters(src.ptr) {
+            let n = text(a.obs_source_get_name(f));
+            let k = text(a.obs_source_get_id(f));
+            if !snap.filters.iter().any(|(kind, name, ..)| *name == n && *kind == k) {
+                a.obs_source_filter_remove(src.ptr, f);
+            }
+        }
+        // In order, each to the end: libobs keeps its list the other way round.
+        for (kind, name, settings, on) in &snap.filters {
+            let have = self.filter(&src, name).ok().filter(|f| text(a.obs_source_get_id(f.ptr)) == *kind);
+            let f = match have {
+                Some(f) => {
+                    self.reset_of(f.ptr, settings)?;
+                    f
+                }
+                None => {
+                    if let Ok(other) = self.filter(&src, name) {
+                        a.obs_source_filter_remove(src.ptr, other.ptr);
+                    }
+                    self.add_filter(&snap.source, kind, name, settings)?;
+                    self.filter(&src, name)?
+                }
+            };
+            a.obs_source_set_enabled(f.ptr, *on);
+            a.obs_source_filter_set_order(src.ptr, f.ptr, ffi::OBS_ORDER_MOVE_BOTTOM);
+        }
+        Ok(())
+    }
+
+    /// A source's own settings (what was set, not OBS's defaults), to put back later.
+    pub fn snap_settings(&self, name: &str) -> Result<Value, StudioError> {
+        let src = self.source(name)?;
+        Ok(self.own_settings(src.ptr))
+    }
+
+    /// Puts a source's settings back exactly (keys not in `settings` return to OBS's defaults).
+    pub fn restore_settings(&self, name: &str, settings: &Value) -> Result<(), StudioError> {
+        let src = self.source(name)?;
+        self.reset_of(src.ptr, settings)
+    }
+
+    fn own_settings(&self, src: *mut ffi::ObsSource) -> Value {
+        let a = self.api();
+        let d = a.obs_source_get_settings(src);
+        let v = self.data_json(d);
+        if !d.is_null() {
+            a.obs_data_release(d);
+        }
+        if v.is_object() { v } else { json!({}) }
+    }
+
+    fn reset_of(&self, src: *mut ffi::ObsSource, settings: &Value) -> Result<(), StudioError> {
+        let a = self.api();
+        let data = a.obs_data_create_from_json(cstr(&settings.to_string()).as_ptr());
+        if data.is_null() {
+            return Err(StudioError::Failed("settings: OBS couldn't read them.".into()));
+        }
+        a.obs_source_reset_settings(src, data);
+        a.obs_data_release(data);
+        Ok(())
+    }
+
+    /// Remembers a sound's mixer state as it is now.
+    pub fn snap_audio(&self, name: &str) -> Result<AudioSnap, StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        Ok(AudioSnap {
+            source: name.to_string(),
+            volume: a.obs_source_get_volume(src.ptr),
+            muted: a.obs_source_muted(src.ptr),
+            monitor: a.obs_source_get_monitoring_type(src.ptr),
+            balance: a.obs_source_get_balance_value(src.ptr),
+            sync: a.obs_source_get_sync_offset(src.ptr),
+            flags: a.obs_source_get_flags(src.ptr),
+            mixers: a.obs_source_get_audio_mixers(src.ptr),
+        })
+    }
+
+    pub fn restore_audio(&self, snap: &AudioSnap) -> Result<(), StudioError> {
+        let src = self.source(&snap.source)?;
+        let a = self.api();
+        a.obs_source_set_volume(src.ptr, snap.volume);
+        a.obs_source_set_muted(src.ptr, snap.muted);
+        a.obs_source_set_monitoring_type(src.ptr, snap.monitor);
+        a.obs_source_set_balance_value(src.ptr, snap.balance);
+        a.obs_source_set_sync_offset(src.ptr, snap.sync);
+        a.obs_source_set_flags(src.ptr, snap.flags);
+        a.obs_source_set_audio_mixers(src.ptr, snap.mixers);
+        Ok(())
+    }
+
+    /// A scene's own transition now (to put back).
+    pub fn scene_transition_of(&self, scene: &str) -> Result<Option<TransitionInfo>, StudioError> {
+        Ok(self.scene_transition(self.scene_src(scene)?))
+    }
+
+    /// Where a scene is in the list (0 is the top).
+    pub fn scene_index(&self, name: &str) -> Result<usize, StudioError> {
+        self.index_of(name)
     }
 
     /// The ids of a scene's top-level items (to find what an act added).
     pub fn item_ids(&self, scene: &str) -> Result<Vec<i64>, StudioError> {
         let s = self.scene_ptr(scene)?;
         Ok(self.raw_items(s).into_iter().map(|i| self.api().obs_sceneitem_get_id(i)).collect())
+    }
+
+    /// What's on air is a private copy of the scene (Studio Mode's "Duplicate scene"), to check.
+    #[doc(hidden)]
+    pub fn on_air_is_copy(&self) -> bool {
+        let a = self.api();
+        let on = a.obs_transition_get_active_source(*self.transition.borrow());
+        if on.is_null() {
+            return false;
+        }
+        let copy = !self.scenes.borrow().contains(&on);
+        a.obs_source_release(on);
+        copy
     }
 
     /// The item's box as libobs last worked it out (on a frame), to check [`ItemInfo::frame`].
@@ -1274,7 +1976,65 @@ impl Collection {
             volume_db: db(a.obs_mul_to_db(a.obs_source_get_volume(src))),
             muted: a.obs_source_muted(src),
             monitor: monitor_of(a.obs_source_get_monitoring_type(src)),
+            balance: a.obs_source_get_balance_value(src),
+            sync_ms: a.obs_source_get_sync_offset(src) / 1_000_000,
+            mono: a.obs_source_get_flags(src) & ffi::OBS_SOURCE_FLAG_FORCE_MONO != 0,
+            tracks: tracks_of(a.obs_source_get_audio_mixers(src)),
         }
+    }
+
+    /// One sound's mixer state.
+    pub fn audio_of(&self, name: &str) -> Result<AudioInfo, StudioError> {
+        let src = self.source(name)?;
+        let ch = CHANNEL_KEYS.iter().map(|(c, _)| *c).find(|c| {
+            let s = self.api().obs_get_output_source(*c);
+            let same = s == src.ptr;
+            if !s.is_null() {
+                self.api().obs_source_release(s);
+            }
+            same
+        });
+        Ok(self.audio_info(src.ptr, ch))
+    }
+
+    /// Left to right, 0 to 1.
+    pub fn set_balance(&self, name: &str, balance: f32) -> Result<(), StudioError> {
+        if !balance.is_finite() || !(0.0..=1.0).contains(&balance) {
+            return Err(StudioError::Failed("balance: 0 (left) to 1 (right).".into()));
+        }
+        let src = self.source(name)?;
+        self.api().obs_source_set_balance_value(src.ptr, balance);
+        Ok(())
+    }
+
+    /// Delays (or, negative, brings forward) a sound to line it up with the picture.
+    pub fn set_sync(&self, name: &str, ms: i64) -> Result<(), StudioError> {
+        if !(-950..=20_000).contains(&ms) {
+            return Err(StudioError::Failed("sync_ms: -950 to 20000 ms.".into()));
+        }
+        let src = self.source(name)?;
+        self.api().obs_source_set_sync_offset(src.ptr, ms * 1_000_000);
+        Ok(())
+    }
+
+    pub fn set_mono(&self, name: &str, mono: bool) -> Result<(), StudioError> {
+        let src = self.source(name)?;
+        let a = self.api();
+        let f = a.obs_source_get_flags(src.ptr);
+        let f = if mono { f | ffi::OBS_SOURCE_FLAG_FORCE_MONO } else { f & !ffi::OBS_SOURCE_FLAG_FORCE_MONO };
+        a.obs_source_set_flags(src.ptr, f);
+        Ok(())
+    }
+
+    /// The audio tracks (1 to 6) a sound goes into.
+    pub fn set_tracks(&self, name: &str, tracks: &[u8]) -> Result<(), StudioError> {
+        if tracks.iter().any(|t| !(1..=6).contains(t)) {
+            return Err(StudioError::Failed("tracks: numbers 1 to 6.".into()));
+        }
+        let src = self.source(name)?;
+        let mask = tracks.iter().fold(0u32, |m, t| m | 1 << (t - 1));
+        self.api().obs_source_set_audio_mixers(src.ptr, mask);
+        Ok(())
     }
 
     /// The global devices (every scene).
@@ -1628,7 +2388,8 @@ impl Collection {
             skip.push(src);
             a.obs_source_release(src);
         }
-        let arr = a.obs_save_sources_filtered(ffi::save_unless_listed, &skip as *const _ as *mut c_void);
+        let keep: Vec<_> = self.in_use().into_iter().filter(|s| !skip.contains(s)).collect();
+        let arr = a.obs_save_sources_filtered(ffi::save_only_listed, &keep as *const _ as *mut c_void);
         let holder = a.obs_data_create();
         let key = cstr("sources");
         a.obs_data_set_array(holder, key.as_ptr(), arr);
@@ -1665,6 +2426,7 @@ impl Collection {
                 "transition_settings": settings,
                 "quick_transitions": self.quick_transitions(),
                 "studio_mode": self.preview_scene(),
+                "studio_options": self.studio_options(),
             }),
         );
         // OBS keeps Studio Mode's preview as the "current scene".
@@ -1773,6 +2535,12 @@ impl Collection {
             let _ = c.set_quick_transitions(&q);
         }
         // Studio Mode comes back with its preview.
+        if let Some(o) = doc
+            .pointer("/ferrocast/studio_options")
+            .and_then(|o| serde_json::from_value::<StudioOptions>(o.clone()).ok())
+        {
+            c.studio_options.replace(o);
+        }
         if let Some(p) = doc.pointer("/ferrocast/studio_mode").and_then(Value::as_str) {
             c.set_studio_mode(true);
             let _ = c.set_preview(p);
