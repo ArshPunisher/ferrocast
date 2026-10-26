@@ -25,6 +25,7 @@ raw-window-handle = "0.6"
 async-trait = "0.1"
 tokio.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
@@ -44,6 +45,7 @@ tauri-plugin-dialog = "2"
 # A mock app runs the real updater plugin against local feeds (main.rs tests).
 tauri = { version = "2", features = ["tray-icon", "test"] }
 base64 = "0.22"
+tempfile = "3"
 
 [lints]
 workspace = true

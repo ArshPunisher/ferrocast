@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, StudioAct, StudioHost,
-    StudioSettings, StudioStatus,
+    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, ShelfAct, StudioAct,
+    StudioHost, StudioSettings, StudioStatus,
 };
 use ferrocast_studio::{
     AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
 use crate::studio_history::History;
+use crate::studio_library::{self as library, Kind};
 
 /// Everything libobs-related, on the main thread only.
 ///
@@ -134,8 +135,63 @@ fn record_encode(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
     e
 }
 
+/// The scene collection in use now. Switches happen on the main thread, so read it there.
+fn scenes_file(data: &std::path::Path) -> PathBuf {
+    library::load(data).current_file(data, Kind::Collections)
+}
+
+/// The profile in use now.
 fn settings_file(data: &std::path::Path) -> PathBuf {
-    data.join("studio").join("settings.json")
+    library::load(data).current_file(data, Kind::Profiles)
+}
+
+/// Takes back an entry that was just made, with its file (its switch failed).
+fn forget(data: &std::path::Path, kind: Kind, id: &str) {
+    let mut lib = library::load(data);
+    lib.shelf_mut(kind).list.retain(|e| e.id != id);
+    library::save(data, &lib);
+    let _ = std::fs::remove_file(library::file(data, kind, id));
+}
+
+/// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
+/// set with one empty scene). If `to` won't load, the old ones come back.
+fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    let Some(studio) = h.studio.clone().filter(|_| h.collection.is_some()) else {
+        // Not running: the next Start loads it.
+        return Ok(());
+    };
+    // libobs keeps one collection's sources at a time: the old ones go first, with the undo
+    // steps that hold them and the projectors that show them.
+    let old = h.collection.take().map(|c| {
+        save(&c, from);
+        c.save(COLLECTION)
+    });
+    h.history.clear();
+    h.selected = None;
+    // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
+    let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
+        Some(Ok(d)) => Collection::load(&studio, &d, FIRST_SCENE),
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, file = %to.display(), "a scene collection didn't read; kept aside");
+            let _ = std::fs::rename(to, to.with_extension("json.unreadable"));
+            Collection::new(&studio, FIRST_SCENE)
+        }
+        None => Collection::new(&studio, FIRST_SCENE),
+    };
+    match made {
+        Ok(c) => {
+            save(&c, to);
+            h.collection = Some(c);
+            refresh_projectors(h);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(old) = old {
+                h.collection = Collection::load(&studio, &old, FIRST_SCENE).ok();
+            }
+            Err(format!("That scene collection didn't load: {e}"))
+        }
+    }
 }
 
 /// The saved settings, or the defaults (an unreadable file is left as it is).
@@ -395,8 +451,51 @@ impl DesktopStudio {
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
-    fn scenes_file(&self) -> PathBuf {
-        self.data.join("studio").join("scenes.json")
+    /// Puts collection or profile `id` in use. A running Studio swaps its scenes at once; a
+    /// profile's settings are applied as Settings applies them (refused while live).
+    async fn switch(&self, kind: Kind, id: &str) -> Result<(), String> {
+        let data = self.data.clone();
+        let mut lib = library::load(&data);
+        if lib.shelf(kind).get(id).is_none() {
+            return Err(format!("There's no {} with the id \"{id}\".", kind.noun()));
+        }
+        if lib.shelf(kind).current == id {
+            return Ok(());
+        }
+        let from = lib.current_file(&data, kind);
+        let before = lib.shelf(kind).current.clone();
+        lib.shelf_mut(kind).current = id.to_string();
+        let to = lib.current_file(&data, kind);
+        match kind {
+            Kind::Collections => {
+                library::save(&data, &lib);
+                let swapped = self.on_main(move |h| swap_collection(h, &from, &to)).await?;
+                if let Err(e) = swapped {
+                    lib.collections.current = before;
+                    library::save(&data, &lib);
+                    return Err(e);
+                }
+                Ok(())
+            }
+            Kind::Profiles => {
+                let busy = self.on_main(|h| h.stream.is_some() || h.record.is_some()).await?;
+                if busy {
+                    return Err("Stop streaming and recording before changing profiles.".into());
+                }
+                let next = std::fs::read(&to)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<StudioSettings>(&b).ok())
+                    .filter(|s| s.check().is_ok())
+                    .unwrap_or_default();
+                library::save(&data, &lib);
+                if let Err(e) = self.set_settings(next).await {
+                    lib.profiles.current = before;
+                    library::save(&data, &lib);
+                    return Err(e);
+                }
+                Ok(())
+            }
+        }
     }
 
     fn status_of(h: &Held) -> StudioStatus {
@@ -419,9 +518,10 @@ impl StudioHost for DesktopStudio {
 
     async fn start(&self) -> Result<StudioStatus, String> {
         let config = self.data.join("studio");
-        let file = self.scenes_file();
         let data = self.data.clone();
         self.on_main(move |h| {
+            // Read here, on the main thread, so a switch can't slip in between (CodeRabbit).
+            let file = scenes_file(&data);
             if h.collection.is_some() {
                 return Ok(Self::status_of(h));
             }
@@ -464,8 +564,9 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stop(&self) -> Result<StudioStatus, String> {
-        let file = self.scenes_file();
+        let data = self.data.clone();
         self.on_main(move |h| {
+            let file = scenes_file(&data);
             // The stream, the recording, the preview and the scenes go (saved first); the engine
             // stays loaded for the next Start.
             h.stream = None;
@@ -529,9 +630,9 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
-        let file = self.scenes_file();
         let data = self.data.clone();
         self.on_main(move |h| {
+            let file = scenes_file(&data);
             if let StudioAct::Screenshot { name } = &act {
                 // Next to the recordings, as OBS does.
                 let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
@@ -709,60 +810,150 @@ impl StudioHost for DesktopStudio {
     async fn import_obs(&self, id: String) -> Result<Value, String> {
         let dir =
             ferrocast_studio::import::obs_scenes_dir().ok_or("OBS's scene collections aren't on this computer.")?;
-        let file = self.scenes_file();
-        self.on_main(move |h| {
-            if h.stream.is_some() || h.record.is_some() {
-                return Err("Stop streaming and recording before bringing in scenes.".to_string());
+        let doc = ferrocast_studio::import::read(&dir, &id).map_err(|e| e.to_string())?;
+        // A new scene collection of the same name (the Studio's own stay as they are).
+        let name = doc.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+        self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
+    }
+
+    async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+        let kind = Kind::parse(&kind).ok_or("kind: collections or profiles.")?;
+        let data = self.data.clone();
+        let missing = |id: &str| format!("There's no {} with the id \"{id}\".", kind.noun());
+        match act {
+            ShelfAct::List => Ok(json!(library::load(&data).shelf(kind))),
+            ShelfAct::Rename { id, name } => {
+                let name = library::check_name(&name)?;
+                let mut lib = library::load(&data);
+                let shelf = lib.shelf_mut(kind);
+                if shelf.list.iter().any(|e| e.id != id && e.name.eq_ignore_ascii_case(&name)) {
+                    return Err(format!("There's already a {} called \"{name}\".", kind.noun()));
+                }
+                let entry = shelf.list.iter_mut().find(|e| e.id == id).ok_or_else(|| missing(&id))?;
+                entry.name = name;
+                library::save(&data, &lib);
+                Ok(Value::Null)
             }
-            let mut doc = ferrocast_studio::import::read(&dir, &id).map_err(|e| e.to_string())?;
-            let known = h
-                .studio
-                .as_ref()
-                .filter(|_| h.collection.is_some())
-                .map(|s| s.kinds().inputs.into_iter().map(|k| k.id).collect::<std::collections::BTreeSet<_>>());
-            let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
-            let report = ferrocast_studio::import::convert(&mut doc, web, known.as_ref());
-            // The scenes there are now are kept next to them, dated, before anything changes.
-            if let Some(parent) = file.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            ShelfAct::Remove { id } => {
+                let mut lib = library::load(&data);
+                let shelf = lib.shelf_mut(kind);
+                let entry = shelf.get(&id).ok_or_else(|| missing(&id))?.clone();
+                if shelf.current == id {
+                    return Err(format!("\"{}\" is in use now.", entry.name));
+                }
+                shelf.list.retain(|e| e.id != id);
+                // Kept aside, dated, not deleted.
+                let file = library::file(&data, kind, &id);
+                if file.exists() {
+                    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                    let _ = std::fs::rename(&file, file.with_extension(format!("json.removed-{stamp}")));
+                }
+                library::save(&data, &lib);
+                Ok(Value::Null)
             }
-            if let Some(c) = &h.collection {
-                save(c, &file);
-            }
-            if file.exists() {
-                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                let keep = file.with_file_name(format!("scenes-before-import-{stamp}.json"));
-                std::fs::copy(&file, &keep).map_err(|e| format!("The current scenes couldn't be kept aside: {e}"))?;
-            }
-            match (h.studio.as_ref(), h.collection.is_some()) {
-                (Some(studio), true) => {
-                    // The old scenes go first: libobs keeps one collection's sources at a time.
-                    // Their undo steps hold the old sources: they go too.
-                    h.history.clear();
-                    let old = h.collection.take().map(|c| c.save(COLLECTION));
-                    match Collection::load(studio, &doc, FIRST_SCENE) {
-                        Ok(c) => {
-                            save(&c, &file);
-                            h.collection = Some(c);
-                            refresh_projectors(h);
+            ShelfAct::Export { id } => {
+                let lib = library::load(&data);
+                let entry = lib.shelf(kind).get(&id).ok_or_else(|| missing(&id))?.clone();
+                let file = library::file(&data, kind, &id);
+                if kind == Kind::Collections && lib.collections.current == id {
+                    // The one in use is saved as it is now.
+                    let f = file.clone();
+                    self.on_main(move |h| {
+                        if let Some(c) = &h.collection {
+                            save(c, &f);
                         }
-                        Err(e) => {
-                            if let Some(old) = old {
-                                h.collection = Collection::load(studio, &old, FIRST_SCENE).ok();
+                    })
+                    .await?;
+                }
+                let doc = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                Ok(match (kind, doc) {
+                    (_, Some(mut d)) => {
+                        if kind == Kind::Collections
+                            && let Some(o) = d.as_object_mut()
+                        {
+                            o.insert("name".into(), json!(entry.name));
+                        }
+                        d
+                    }
+                    (Kind::Collections, None) => json!({ "name": entry.name, "sources": [] }),
+                    (Kind::Profiles, None) => {
+                        serde_json::to_value(StudioSettings::default()).map_err(|e| e.to_string())?
+                    }
+                })
+            }
+            ShelfAct::New { name, copy } => {
+                let name = library::check_name(&name)?;
+                let mut lib = library::load(&data);
+                if lib.shelf(kind).list.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
+                    return Err(format!("There's already a {} called \"{name}\".", kind.noun()));
+                }
+                let id = lib.shelf(kind).new_id(&name);
+                if copy {
+                    let from = lib.current_file(&data, kind);
+                    if kind == Kind::Collections {
+                        let f = from.clone();
+                        self.on_main(move |h| {
+                            if let Some(c) = &h.collection {
+                                save(c, &f);
                             }
-                            return Err(e.to_string());
+                        })
+                        .await?;
+                    }
+                    let to = library::file(&data, kind, &id);
+                    if from.exists() {
+                        if let Some(dir) = to.parent() {
+                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                         }
+                        std::fs::copy(&from, &to).map_err(|e| format!("The copy couldn't be made: {e}"))?;
                     }
                 }
-                _ => {
-                    // Not running: it's what the next Start loads.
-                    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-                    std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+                lib.shelf_mut(kind).list.push(library::Entry { id: id.clone(), name });
+                library::save(&data, &lib);
+                if let Err(e) = self.switch(kind, &id).await {
+                    // Not half made: a retry with the same name works.
+                    forget(&data, kind, &id);
+                    return Err(e);
                 }
+                Ok(json!({ "id": id }))
             }
-            serde_json::to_value(&report).map_err(|e| e.to_string())
-        })
-        .await?
+            ShelfAct::Switch { id } => {
+                self.switch(kind, &id).await?;
+                Ok(json!({ "id": id }))
+            }
+            ShelfAct::Import { name, mut doc } => {
+                let name = library::check_name(&name)?;
+                let mut lib = library::load(&data);
+                let name = lib.collections.free_name(&name);
+                let id = lib.collections.new_id(&name);
+                // OBS's Browser sources become Web page sources here; note kinds this OBS lacks.
+                let known = self
+                    .on_main(|h| {
+                        h.studio.as_ref().filter(|_| h.collection.is_some()).map(|s| {
+                            s.kinds().inputs.into_iter().map(|k| k.id).collect::<std::collections::BTreeSet<_>>()
+                        })
+                    })
+                    .await?;
+                let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+                let mut report = ferrocast_studio::import::convert(&mut doc, web, known.as_ref());
+                report.name = name.clone();
+                if let Some(o) = doc.as_object_mut() {
+                    o.insert("name".into(), json!(name));
+                }
+                let file = library::file(&data, Kind::Collections, &id);
+                save_json(&file, &doc);
+                lib.collections.list.push(library::Entry { id: id.clone(), name });
+                library::save(&data, &lib);
+                if let Err(e) = self.switch(Kind::Collections, &id).await {
+                    forget(&data, Kind::Collections, &id);
+                    return Err(e);
+                }
+                let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("id".into(), json!(id));
+                }
+                Ok(v)
+            }
+        }
     }
 
     async fn pick_file(&self, pick: FilePick) -> Result<Value, String> {
