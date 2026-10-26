@@ -433,6 +433,7 @@ api! {
     obs_mul_to_db: fn(a: f32) -> f32;
     obs_transition_start: fn(a: *mut ObsSource, b: c_int, c: u32, d: *mut ObsSource) -> bool;
     obs_transition_set: fn(a: *mut ObsSource, b: *mut ObsSource);
+    obs_transition_get_active_source: fn(a: *mut ObsSource) -> *mut ObsSource;
     obs_data_set_array: fn(a: *mut ObsData, b: *const c_char, c: *mut ObsDataArray);
     obs_data_get_array: fn(a: *mut ObsData, b: *const c_char) -> *mut ObsDataArray;
     obs_data_array_release: fn(a: *mut ObsDataArray);
@@ -804,6 +805,213 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
 }
 
 /// The native view a preview draws into, inside the window the dashboard lives in (macOS).
+/// What a projector shows, read by its draw callback (graphics thread) under the lock. Every
+/// source here holds a reference; scenes are also "showing" so their sources draw.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum Show {
+    Program,
+    One(*mut ObsSource),
+    /// Each scene with its name label (a private text source), and the "On air" label.
+    Multi {
+        cells: Vec<(*mut ObsSource, *mut ObsSource)>,
+        air: *mut ObsSource,
+    },
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct ProjectorState {
+    pub api: *const Api,
+    pub base: (u32, u32),
+    pub show: std::sync::Mutex<Show>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl Show {
+    /// Lets go of every source (main thread, with the draw callback unable to read it).
+    pub(crate) fn release(&mut self, api: &Api) {
+        match std::mem::replace(self, Show::Program) {
+            Show::Program => {}
+            Show::One(src) => {
+                api.obs_source_dec_showing(src);
+                api.obs_source_release(src);
+            }
+            Show::Multi { cells, air } => {
+                for (scene, label) in cells {
+                    api.obs_source_dec_showing(scene);
+                    api.obs_source_release(scene);
+                    api.obs_source_release(label);
+                }
+                api.obs_source_release(air);
+            }
+        }
+    }
+}
+
+/// A source by name, with our reference and showing (so it draws while projected).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn shown_source(api: &Api, name: &str) -> Option<*mut ObsSource> {
+    let n = cstr(name);
+    let src = api.obs_get_source_by_name(n.as_ptr());
+    if src.is_null() {
+        return None;
+    }
+    api.obs_source_inc_showing(src);
+    Some(src)
+}
+
+/// A label for a multiview: white bold text, drawn by OBS's own text source.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn label(api: &Api, text: &str) -> *mut ObsSource {
+    let settings = serde_json::json!({
+        "text": text,
+        "font": { "face": "Helvetica Neue", "size": 64, "style": "Bold", "flags": 1 },
+        "color1": 0xFFFF_FFFFu32,
+        "color2": 0xFFFF_FFFFu32,
+    });
+    let json = cstr(&settings.to_string());
+    let data = api.obs_data_create_from_json(json.as_ptr());
+    let (id, name) = (cstr("text_ft2_source_v2"), cstr(&format!("Multiview label {text}")));
+    let src = api.obs_source_create_private(id.as_ptr(), name.as_ptr(), data);
+    if !data.is_null() {
+        api.obs_data_release(data);
+    }
+    src
+}
+
+/// Draws into `a` (pixels from the top left) a picture `w`×`h` units big, as `f` draws it.
+fn region(api: &Api, a: crate::projector::Area, w: f32, h: f32, f: impl Fn()) {
+    if a.w < 1.0 || a.h < 1.0 || w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    api.gs_viewport_push();
+    api.gs_projection_push();
+    api.gs_set_viewport(a.x.round() as c_int, a.y.round() as c_int, a.w.round() as c_int, a.h.round() as c_int);
+    api.gs_ortho(0.0, w, 0.0, h, -100.0, 100.0);
+    f();
+    api.gs_projection_pop();
+    api.gs_viewport_pop();
+}
+
+/// A filled box (pixels), in the current pixel-sized projection.
+fn fill(api: &Api, c: &Vec4, a: crate::projector::Area) {
+    let effect = api.obs_get_base_effect(OBS_EFFECT_SOLID);
+    if effect.is_null() || a.w <= 0.0 || a.h <= 0.0 {
+        return;
+    }
+    // Set for every draw: ending the technique puts it back to white (R-79).
+    api.gs_effect_set_vec4(api.gs_effect_get_param_by_name(effect, c"color".as_ptr()), c);
+    api.gs_matrix_push();
+    api.gs_matrix_translate3f(a.x, a.y, 0.0);
+    api.gs_matrix_scale3f(a.w, a.h, 1.0);
+    while api.gs_effect_loop(effect, c"Solid".as_ptr()) {
+        api.gs_draw_sprite(std::ptr::null_mut(), 0, 1, 1);
+    }
+    api.gs_matrix_pop();
+}
+
+/// A frame `t` pixels thick just inside `a`.
+fn frame(api: &Api, c: &Vec4, a: crate::projector::Area, t: f32) {
+    use crate::projector::Area as A;
+    fill(api, c, A { h: t, ..a });
+    fill(api, c, A { y: a.y + a.h - t, h: t, ..a });
+    fill(api, c, A { w: t, ..a });
+    fill(api, c, A { x: a.x + a.w - t, w: t, ..a });
+}
+
+/// A name bar along the bottom of `a`: the label centred on a dark (or red, on air) band.
+fn name_bar(api: &Api, a: crate::projector::Area, label: *mut ObsSource, band: &Vec4) {
+    use crate::projector::Area as A;
+    let bar = (a.h * 0.12).clamp(14.0, 34.0);
+    let strip = A { y: a.y + a.h - bar, h: bar, ..a };
+    fill(api, band, strip);
+    if label.is_null() {
+        return;
+    }
+    let (tw, th) = (api.obs_source_get_width(label) as f32, api.obs_source_get_height(label) as f32);
+    if tw <= 0.0 || th <= 0.0 {
+        return;
+    }
+    let k = (bar * 0.7 / th).min(a.w * 0.92 / tw);
+    let (w, h) = (tw * k, th * k);
+    let at = A { x: a.x + (a.w - w) / 2.0, y: strip.y + (bar - h) / 2.0, w, h };
+    region(api, at, tw, th, || api.obs_source_video_render(label));
+}
+
+/// OBS's on-air red.
+const RED: Vec4 = Vec4 { x: 0.86, y: 0.15, z: 0.15, w: 1.0 };
+
+/// Draws a projector: what's on air, one source, or a multiview (each fitted, letterboxed).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: u32) {
+    use crate::projector::{Area, multiview};
+    // SAFETY: `param` is the boxed ProjectorState registered with this callback; lib.rs keeps
+    // it, and the Studio owning the Api, alive until the callback is removed.
+    let st = unsafe { &*(param as *const ProjectorState) };
+    // SAFETY: as above.
+    let api = unsafe { &*st.api };
+    let Ok(show) = st.show.lock() else { return };
+    let (bw, bh) = (st.base.0.max(1) as f32, st.base.1.max(1) as f32);
+    let whole = Area { x: 0.0, y: 0.0, w: cx as f32, h: cy as f32 };
+    match &*show {
+        Show::Program => region(api, whole.fit(bw / bh), bw, bh, || api.obs_render_main_texture()),
+        Show::One(src) => {
+            let (sw, sh) = (api.obs_source_get_width(*src) as f32, api.obs_source_get_height(*src) as f32);
+            if sw > 0.0 && sh > 0.0 {
+                region(api, whole.fit(sw / sh), sw, sh, || api.obs_source_video_render(*src));
+            }
+        }
+        Show::Multi { cells, air } => {
+            let (top, areas) = multiview(cells.len(), whole.w, whole.h, bw / bh);
+            // The scene on air: the transition's active source (our reference, let go below).
+            let t = api.obs_get_output_source(0);
+            let on = if t.is_null() { std::ptr::null_mut() } else { api.obs_transition_get_active_source(t) };
+            if !t.is_null() {
+                api.obs_source_release(t);
+            }
+            // Each box gets a black ground first, so empty scenes still show where they are.
+            let pixels = |f: &dyn Fn()| {
+                api.gs_viewport_push();
+                api.gs_projection_push();
+                api.gs_set_viewport(0, 0, cx as c_int, cy as c_int);
+                api.gs_ortho(0.0, whole.w, 0.0, whole.h, -100.0, 100.0);
+                f();
+                api.gs_projection_pop();
+                api.gs_viewport_pop();
+            };
+            let black = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+            pixels(&|| {
+                fill(api, &black, top);
+                for a in &areas {
+                    fill(api, &black, *a);
+                }
+            });
+            region(api, top, bw, bh, || api.obs_render_main_texture());
+            for (a, (scene, _)) in areas.iter().zip(cells) {
+                region(api, *a, bw, bh, || api.obs_source_video_render(*scene));
+            }
+            // Frames and names on top, in pixels.
+            pixels(&|| {
+                let dark = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.62 };
+                let thin = (whole.h / 360.0).max(1.0);
+                frame(api, &RED, top, 2.0 * thin);
+                name_bar(api, top, *air, &RED);
+                for (a, (scene, label)) in areas.iter().zip(cells) {
+                    let live = !on.is_null() && *scene == on;
+                    if live {
+                        frame(api, &RED, *a, 2.0 * thin);
+                    }
+                    name_bar(api, *a, *label, if live { &RED } else { &dark });
+                }
+            });
+            if !on.is_null() {
+                api.obs_source_release(on);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {
     use std::ffi::c_void;
@@ -1847,6 +2055,257 @@ pub(crate) mod web {
             ) -> *mut c_void;
             pub fn CGContextDrawImage(c: *mut c_void, rect: CGRect, image: *mut c_void);
             pub fn CGContextRelease(c: *mut c_void);
+        }
+    }
+}
+
+/// Projector windows (macOS): titled and resizable, or borderless over a whole display.
+#[cfg(target_os = "macos")]
+pub(crate) mod projector_window {
+    use std::rc::Rc;
+
+    use dispatch2::DispatchQueue;
+    use objc2::rc::Retained;
+    use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2_app_kit::{
+        NSBackingStoreType, NSEvent, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
+        NSWindowDelegate, NSWindowStyleMask,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+    /// What a projector window tells its owner.
+    pub struct Hooks {
+        /// A click at (x, y) in a view `w`×`h` points big, from its top left.
+        pub click: Box<dyn Fn(f64, f64, f64, f64)>,
+        /// Closed (its close button, or Esc full screen): the owner drops it.
+        pub close: Box<dyn Fn()>,
+        /// The view's new size in pixels.
+        pub resize: Box<dyn Fn(u32, u32)>,
+    }
+
+    /// Carries main-thread values to the main queue, where alone they're used.
+    struct OnMain<T>(T);
+    // SAFETY: made on the main thread and only used in closures the main queue runs.
+    unsafe impl<T> Send for OnMain<T> {}
+
+    /// Runs `f` on the main queue after the current event (never inside AppKit's callback, so
+    /// the window can go away safely).
+    fn later(hooks: &Rc<Hooks>, f: fn(&Hooks)) {
+        let job = OnMain(hooks.clone());
+        DispatchQueue::main().exec_async(move || {
+            // The whole wrapper moves in (a closure would otherwise take just its field).
+            let job = job;
+            f(&job.0);
+        });
+    }
+
+    define_class!(
+        // SAFETY: NSView allows subclassing; ProjectorView doesn't implement Drop.
+        #[unsafe(super(NSView, NSResponder, NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastProjectorView"]
+        #[ivars = Rc<Hooks>]
+        struct ProjectorView;
+
+        impl ProjectorView {
+            #[unsafe(method(acceptsFirstResponder))]
+            fn accepts_first_responder(&self) -> bool {
+                true
+            }
+
+            #[unsafe(method(acceptsFirstMouse:))]
+            fn accepts_first_mouse(&self, _e: Option<&NSEvent>) -> bool {
+                true
+            }
+
+            #[unsafe(method(mouseDown:))]
+            fn mouse_down(&self, e: &NSEvent) {
+                let p = self.convertPoint_fromView(e.locationInWindow(), None);
+                let b = self.bounds();
+                // Unflipped: AppKit counts up from the bottom.
+                (self.ivars().click)(p.x, b.size.height - p.y, b.size.width, b.size.height);
+            }
+
+            #[unsafe(method(keyDown:))]
+            fn key_down(&self, e: &NSEvent) {
+                // Esc leaves a full-screen projector (OBS's key for it).
+                if e.keyCode() == 53 {
+                    later(self.ivars(), |h| (h.close)());
+                }
+            }
+
+            #[unsafe(method(setFrameSize:))]
+            fn set_frame_size(&self, size: NSSize) {
+                // SAFETY: NSView's own setFrameSize: on this view, with the size AppKit gave.
+                let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+                let px = self.convertSizeToBacking(size);
+                (self.ivars().resize)(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
+            }
+        }
+    );
+
+    define_class!(
+        // SAFETY: NSWindow allows subclassing; ProjectorWin adds no ivars, no Drop.
+        #[unsafe(super(NSWindow, NSResponder, NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastProjectorWindow"]
+        struct ProjectorWin;
+
+        impl ProjectorWin {
+            /// A borderless window takes keys too (Esc), like OBS's full-screen projector.
+            #[unsafe(method(canBecomeKeyWindow))]
+            fn can_become_key(&self) -> bool {
+                true
+            }
+        }
+    );
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; Closer doesn't implement Drop.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastProjectorCloser"]
+        #[ivars = Rc<Hooks>]
+        struct Closer;
+
+        unsafe impl NSObjectProtocol for Closer {}
+
+        unsafe impl NSWindowDelegate for Closer {
+            /// The close button asks the owner to drop the projector (which closes it).
+            #[unsafe(method(windowShouldClose:))]
+            fn window_should_close(&self, _w: &NSWindow) -> bool {
+                later(self.ivars(), |h| (h.close)());
+                false
+            }
+        }
+    );
+
+    thread_local! {
+        /// Where the next projector window's top left goes (main thread).
+        static CASCADE: std::cell::Cell<Option<NSPoint>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// An open projector window.
+    pub struct Win {
+        window: Retained<ProjectorWin>,
+        view: Retained<ProjectorView>,
+        _closer: Retained<Closer>,
+    }
+
+    /// The displays, the main one first as macOS lists them: (name, width, height in points).
+    pub fn screens() -> Vec<(String, f64, f64)> {
+        let Some(mtm) = MainThreadMarker::new() else { return Vec::new() };
+        NSScreen::screens(mtm)
+            .iter()
+            .map(|s| {
+                let f = s.frame();
+                (s.localizedName().to_string(), f.size.width, f.size.height)
+            })
+            .collect()
+    }
+
+    /// Opens one: full screen on display `screen` (borderless, over the menu bar), or a window
+    /// the shape `aspect` (width / height). None off the main thread or for no such display.
+    pub fn open(title: &str, aspect: f64, screen: Option<usize>, hooks: Hooks) -> Option<Win> {
+        let mtm = MainThreadMarker::new()?;
+        let hooks = Rc::new(hooks);
+        let full = match screen {
+            Some(i) => {
+                let all = NSScreen::screens(mtm);
+                if i >= all.count() {
+                    return None;
+                }
+                Some(all.objectAtIndex(i).frame())
+            }
+            None => None,
+        };
+        let (rect, style) = match full {
+            Some(f) => (f, NSWindowStyleMask::Borderless),
+            None => {
+                let w = 960.0;
+                let h = (w / if aspect > 0.0 { aspect } else { 16.0 / 9.0 }).round();
+                (
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+                    NSWindowStyleMask::Titled
+                        | NSWindowStyleMask::Closable
+                        | NSWindowStyleMask::Miniaturizable
+                        | NSWindowStyleMask::Resizable,
+                )
+            }
+        };
+        let alloc = ProjectorWin::alloc(mtm).set_ivars(());
+        // SAFETY: NSWindow's designated initialiser on a freshly allocated ProjectorWin, on the
+        // main thread, with valid arguments.
+        let window: Retained<ProjectorWin> = unsafe {
+            msg_send![super(alloc), initWithContentRect: rect, styleMask: style, backing: NSBackingStoreType::Buffered, defer: false]
+        };
+        // SAFETY: the window is ours (its Retained releases it), not released on close.
+        unsafe { window.setReleasedWhenClosed(false) };
+        let content = NSRect::new(NSPoint::new(0.0, 0.0), rect.size);
+        let alloc = ProjectorView::alloc(mtm).set_ivars(hooks.clone());
+        // SAFETY: NSView's designated initialiser on a freshly allocated ProjectorView.
+        let view: Retained<ProjectorView> = unsafe { msg_send![super(alloc), initWithFrame: content] };
+        view.setWantsLayer(true);
+        window.setContentView(Some(&view));
+        let closer: Retained<Closer> = {
+            let alloc = Closer::alloc(mtm).set_ivars(hooks);
+            // SAFETY: NSObject's init on a freshly allocated object.
+            unsafe { msg_send![super(alloc), init] }
+        };
+        window.setDelegate(Some(ProtocolObject::from_ref(&*closer)));
+        window.setTitle(&NSString::from_str(title));
+        if full.is_some() {
+            // Over the menu bar and the Dock, on every Space, as OBS's full-screen projector.
+            window.setLevel(25);
+            window.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary,
+            );
+            window.setFrame_display(rect, true);
+        } else {
+            window.setContentAspectRatio(NSSize::new(aspect.max(0.1), 1.0));
+            // Each new window steps down and right from the last, as macOS cascades them.
+            CASCADE.with(|at| match at.get() {
+                Some(p) => at.set(Some(window.cascadeTopLeftFromPoint(p))),
+                None => {
+                    window.center();
+                    let f = window.frame();
+                    at.set(Some(window.cascadeTopLeftFromPoint(NSPoint::new(f.origin.x, f.origin.y + f.size.height))));
+                }
+            });
+        }
+        window.makeKeyAndOrderFront(None);
+        window.makeFirstResponder(Some(&view));
+        Some(Win { window, view, _closer: closer })
+    }
+
+    impl std::fmt::Debug for Win {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Win").finish_non_exhaustive()
+        }
+    }
+
+    impl Win {
+        pub fn view_ptr(&self) -> *mut std::ffi::c_void {
+            Retained::as_ptr(&self.view) as *mut std::ffi::c_void
+        }
+
+        pub fn number(&self) -> isize {
+            self.window.windowNumber()
+        }
+
+        /// The view's size in pixels now.
+        pub fn pixels(&self) -> (u32, u32) {
+            let px = self.view.convertSizeToBacking(self.view.bounds().size);
+            (px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32)
+        }
+
+        pub fn close(&self) {
+            if MainThreadMarker::new().is_some() {
+                self.window.setDelegate(None);
+                self.window.orderOut(None);
+                self.window.close();
+            }
         }
     }
 }

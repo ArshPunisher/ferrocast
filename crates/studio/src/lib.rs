@@ -9,6 +9,7 @@
 mod collection;
 mod ffi;
 pub mod import;
+pub mod projector;
 
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,7 @@ pub use collection::{
     TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
+pub use projector::{ProjectorOf, Screen};
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -830,6 +832,220 @@ impl Drop for Preview {
         a.obs_display_destroy(self.display);
         #[cfg(target_os = "macos")]
         self.view.remove();
+    }
+}
+
+/// The displays a full-screen projector can go on (macOS; none elsewhere yet). Main thread.
+pub fn screens() -> Vec<Screen> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::projector_window::screens()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, w, h))| Screen {
+                index,
+                name,
+                width: w.round() as u32,
+                height: h.round() as u32,
+                main: index == 0,
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+impl Studio {
+    /// What a projector of `of` draws, holding its sources (`scenes` for a multiview).
+    #[cfg(target_os = "macos")]
+    fn show(&self, of: &ProjectorOf, scenes: &[String]) -> Result<ffi::Show, StudioError> {
+        let a = &self.inner.api;
+        Ok(match of {
+            ProjectorOf::Program => ffi::Show::Program,
+            ProjectorOf::Source(name) => ffi::Show::One(
+                ffi::shown_source(a, name)
+                    .ok_or_else(|| StudioError::Failed(format!("there's no source called \"{name}\"")))?,
+            ),
+            ProjectorOf::Multiview => ffi::Show::Multi {
+                cells: scenes.iter().filter_map(|n| ffi::shown_source(a, n).map(|s| (s, ffi::label(a, n)))).collect(),
+                air: ffi::label(a, "On air"),
+            },
+        })
+    }
+
+    /// Opens a projector of `of`: full screen on display `screen` (from [`screens`]), or in a
+    /// window. A multiview shows `scenes` in order and calls `on_pick` with the one clicked.
+    /// `on_close` runs when its window is closed (or Esc full screen): drop it then. macOS,
+    /// main thread.
+    pub fn projector(
+        &self,
+        of: &ProjectorOf,
+        scenes: &[String],
+        screen: Option<usize>,
+        on_close: Box<dyn Fn()>,
+        on_pick: Box<dyn Fn(String)>,
+    ) -> Result<Projector, StudioError> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::cell::{Cell, RefCell};
+            use std::rc::Rc;
+            let a = &self.inner.api;
+            let base = (self.canvas().width.max(1), self.canvas().height.max(1));
+            let canvas_aspect = f64::from(base.0) / f64::from(base.1);
+            let show = self.show(of, scenes)?;
+            let aspect = match &show {
+                ffi::Show::One(src) => {
+                    let (w, h) = (a.obs_source_get_width(*src), a.obs_source_get_height(*src));
+                    if w > 0 && h > 0 { f64::from(w) / f64::from(h) } else { canvas_aspect }
+                }
+                _ => canvas_aspect,
+            };
+            let names = Rc::new(RefCell::new(if *of == ProjectorOf::Multiview { scenes.to_vec() } else { Vec::new() }));
+            let display: Rc<Cell<*mut ffi::ObsDisplay>> = Rc::new(Cell::new(ptr::null_mut()));
+            let hooks = {
+                let (names, display, studio) = (names.clone(), display.clone(), self.clone());
+                let multiview = *of == ProjectorOf::Multiview;
+                ffi::projector_window::Hooks {
+                    click: Box::new(move |x, y, w, h| {
+                        if !multiview {
+                            return;
+                        }
+                        let names = names.borrow();
+                        let at = projector::multiview_hit(
+                            names.len(),
+                            w as f32,
+                            h as f32,
+                            canvas_aspect as f32,
+                            x as f32,
+                            y as f32,
+                        );
+                        if let Some(n) = at.and_then(|i| names.get(i)) {
+                            on_pick(n.clone());
+                        }
+                    }),
+                    close: on_close,
+                    resize: Box::new(move |w, h| {
+                        let d = display.get();
+                        if !d.is_null() {
+                            studio.inner.api.obs_display_resize(d, w, h);
+                        }
+                    }),
+                }
+            };
+            let title = match of {
+                ProjectorOf::Program => "On air".to_string(),
+                ProjectorOf::Source(n) => n.clone(),
+                ProjectorOf::Multiview => "Multiview".to_string(),
+            };
+            let mut show = show;
+            let Some(win) = ffi::projector_window::open(&title, aspect, screen, hooks) else {
+                show.release(a);
+                return Err(StudioError::Failed("That display isn't there any more.".into()));
+            };
+            let (cx, cy) = win.pixels();
+            let init = ffi::GsInitData {
+                window: win.view_ptr(),
+                cx,
+                cy,
+                num_backbuffers: 0,
+                format: ffi::GS_BGRA,
+                zsformat: ffi::GS_ZS_NONE,
+                adapter: 0,
+            };
+            let d = a.obs_display_create(&init, 0xFF0D_0B0A);
+            if d.is_null() {
+                win.close();
+                show.release(a);
+                return Err(StudioError::Failed("the projector couldn't be made".into()));
+            }
+            display.set(d);
+            let state = Box::new(ffi::ProjectorState { api: a, base, show: std::sync::Mutex::new(show) });
+            let param = &*state as *const ffi::ProjectorState as *mut std::ffi::c_void;
+            a.obs_display_add_draw_callback(d, ffi::draw_projector, param);
+            Ok(Projector { studio: self.clone(), display: d, state, win, names, shared_display: display })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (of, scenes, screen, on_close, on_pick);
+            Err(StudioError::Failed("projectors aren't on this system yet".into()))
+        }
+    }
+}
+
+/// A projector window. Closes when dropped.
+#[derive(Debug)]
+pub struct Projector {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    studio: Studio,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    display: *mut ffi::ObsDisplay,
+    #[cfg(target_os = "macos")]
+    state: Box<ffi::ProjectorState>,
+    #[cfg(target_os = "macos")]
+    win: ffi::projector_window::Win,
+    #[cfg(target_os = "macos")]
+    names: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// The display as the window's resize hook sees it; emptied before the display goes.
+    #[cfg(target_os = "macos")]
+    shared_display: std::rc::Rc<std::cell::Cell<*mut ffi::ObsDisplay>>,
+}
+
+impl Projector {
+    /// Its window's number (to screenshot it in checks). macOS.
+    #[doc(hidden)]
+    pub fn window_number(&self) -> isize {
+        #[cfg(target_os = "macos")]
+        {
+            self.win.number()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// A multiview follows the scenes as they change (added, removed, renamed, moved).
+    pub fn set_scenes(&self, scenes: &[String]) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.names.borrow().is_empty()
+                && !matches!(*self.state.show.lock().unwrap_or_else(|e| e.into_inner()), ffi::Show::Multi { .. })
+            {
+                return;
+            }
+            if *self.names.borrow() == scenes {
+                return;
+            }
+            let Ok(next) = self.studio.show(&ProjectorOf::Multiview, scenes) else { return };
+            let a = &self.studio.inner.api;
+            if let Ok(mut show) = self.state.show.lock() {
+                show.release(a);
+                *show = next;
+            }
+            *self.names.borrow_mut() = scenes.to_vec();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = scenes;
+    }
+}
+
+impl Drop for Projector {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let a = &self.studio.inner.api;
+            // A resize arriving while the window closes must not reach a destroyed display.
+            self.shared_display.set(ptr::null_mut());
+            let param = &*self.state as *const ffi::ProjectorState as *mut std::ffi::c_void;
+            a.obs_display_remove_draw_callback(self.display, ffi::draw_projector, param);
+            a.obs_display_destroy(self.display);
+            if let Ok(mut show) = self.state.show.lock() {
+                show.release(a);
+            }
+            self.win.close();
+        }
     }
 }
 
