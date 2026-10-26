@@ -133,7 +133,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   Import from OBS (26 Oct). Streamlabs Desktop, XSplit, Twitch Studio still to come.
 - [ ] P1 Settings: General (language, theme, tray, confirmations, snapping, projectors, system
   tray), Hotkeys (every action, search, duplicates warning), Accessibility (colors, meters),
-  Appearance (themes, font size, density).
+  Appearance (themes, font size, density). (26 Oct: Hotkeys done: every OBS action incl.
+  show/hide, filters, media, quick transitions, push to mute, with search; a key moved from
+  another action says so. Media controls in the Sources menu too.)
 - [x] Projectors (window or full screen per display, Esc to leave) and a multiview (click to
   switch), 26 Oct.
 - [ ] P2 Docks (lock, reset, custom browser docks), Stats dock (CPU, memory, disk, FPS, render
