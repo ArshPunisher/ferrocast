@@ -149,6 +149,9 @@ jobs:
           mkdir -p target/universal-apple-darwin/release
           lipo -create -output target/universal-apple-darwin/release/obs-ffmpeg-mux \
             target/aarch64-apple-darwin/release/obs-ffmpeg-mux target/x86_64-apple-darwin/release/obs-ffmpeg-mux
+          # Signed as the app is: signing the app checks every binary inside it is signed.
+          codesign --force --options runtime --sign "${APPLE_SIGNING_IDENTITY:--}" \
+            target/universal-apple-darwin/release/obs-ffmpeg-mux
       - name: Build the app
         shell: bash
         env:
