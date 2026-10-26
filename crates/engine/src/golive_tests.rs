@@ -419,3 +419,170 @@ async fn aitum_multistream_outputs_are_found_and_named() {
 fn the_relays_kick_scopes_are_the_apps() {
     assert_eq!(ferrocast_relay::KICK_SCOPES, ferrocast_kick::SCOPES);
 }
+
+/// A Studio that's streaming and sends to direct servers (SRT, RIST, WebRTC) on request.
+#[derive(Debug, Default)]
+struct DirectStudio {
+    started: std::sync::Mutex<Vec<(String, String, String)>>,
+    stopped: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::studio_host::StudioHost for DirectStudio {
+    async fn status(&self) -> crate::studio_host::StudioStatus {
+        Default::default()
+    }
+    async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Err("n/a".into())
+    }
+    async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Err("n/a".into())
+    }
+    async fn kinds(&self) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn options(&self, _kind: String) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn act(&self, _act: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn settings(&self) -> crate::studio_host::StudioSettings {
+        Default::default()
+    }
+    async fn set_settings(&self, _s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn record(&self, _on: bool) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn stream_start(&self, _server: String, _key: String) -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+        Ok(serde_json::Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<serde_json::Value, String> {
+        Err("n/a".into())
+    }
+    async fn direct_start(&self, id: String, url: String, key: String) -> Result<(), String> {
+        self.started.lock().unwrap().push((id, url, key));
+        Ok(())
+    }
+    async fn direct_stop(&self, id: String) -> Result<(), String> {
+        self.stopped.lock().unwrap().push(id);
+        Ok(())
+    }
+    async fn direct_stats(&self, id: String) -> Result<serde_json::Value, String> {
+        let on = self.started.lock().unwrap().iter().any(|s| s.0 == id) && !self.stopped.lock().unwrap().contains(&id);
+        Ok(if on {
+            json!({ "active": true, "reconnecting": false, "bytes": 250_000, "dropped": 0 })
+        } else {
+            json!(null)
+        })
+    }
+}
+
+#[tokio::test]
+async fn srt_rist_and_webrtc_servers_go_straight_from_the_studio() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::Obs;
+    let (e, _dir) = engine().await;
+    // Their key may be empty; they send the main picture only; a whole address is needed.
+    let srt =
+        e.add_golive_destination("Studio SRT", "srt://192.0.2.7:9000?latency=200", "", Canvas::Main).await.unwrap();
+    assert_eq!(srt.url.as_deref(), Some("srt://192.0.2.7:9000?latency=200"));
+    let whip = e
+        .add_golive_destination("Cam WHIP", "https://whip.example.com/live/whip", "token-1", Canvas::Main)
+        .await
+        .unwrap();
+    assert!(e.add_golive_destination("V", "srt://192.0.2.7:9000", "", Canvas::Vertical).await.is_err());
+    assert!(e.add_golive_destination("Bad", "srt:// spaced host", "", Canvas::Main).await.is_err());
+    assert!(e.add_golive_destination("Who", "https://me:pw@whip.example.com/w", "", Canvas::Main).await.is_err());
+    assert!(
+        e.add_golive_destination("Plain", "http://whip.example.com/w", "t", Canvas::Main).await.is_err(),
+        "WebRTC needs https off this PC"
+    );
+    assert_eq!(crate::golive::direct_kind("http://127.0.0.1:8889/w/whip"), Some("whip"));
+    assert_eq!(crate::golive::direct_kind("http://localhost.evil.com/w"), None);
+    assert!(
+        e.add_golive_destination("Empty", "rtmp://192.0.2.7/app", "", Canvas::Main).await.is_err(),
+        "RTMP keeps needing a key"
+    );
+    let order: Vec<(String, bool)> =
+        e.golive_view().await.destinations.iter().map(|d| (d.id.clone(), d.id == srt.id || d.id == whip.id)).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let v = e.golive_view().await;
+    let row = v.destinations.iter().find(|d| d.id == srt.id).unwrap();
+    assert_eq!((row.direct, row.account.as_deref()), (Some("srt"), Some("192.0.2.7:9000")));
+
+    // Live through OBS (not the Studio): they say why they can't start.
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let obs = Obs::publish(port, "live", &key).await.unwrap();
+    let mut why = None;
+    for _ in 0..100 {
+        why = e.golive_view().await.destinations.iter().find(|d| d.id == srt.id).and_then(|d| d.blocked.clone());
+        if why.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(why.unwrap().contains("Ferrocast picture"));
+    drop(obs);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // With the Studio streaming, each is started there with its key and shows as live.
+    let studio = Arc::new(DirectStudio::default());
+    e.set_studio_host(studio.clone());
+    let obs = Obs::publish(port, "live", &key).await.unwrap();
+    let mut live = false;
+    for _ in 0..200 {
+        let v = e.golive_view().await;
+        live = [&srt.id, &whip.id].iter().all(|id| {
+            v.destinations
+                .iter()
+                .find(|d| &d.id == *id)
+                .and_then(|d| d.health.as_ref())
+                .is_some_and(|h| h.state == ferrocast_golive::PushState::Live)
+        });
+        if live {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(live, "both show as live");
+    let started = studio.started.lock().unwrap().clone();
+    assert!(started.contains(&(whip.id.clone(), "https://whip.example.com/live/whip".into(), "token-1".into())));
+    assert!(started.iter().any(|s| s.0 == srt.id && s.2.is_empty()));
+    // The stream ends: the Studio stops sending to them.
+    drop(obs);
+    for _ in 0..200 {
+        if studio.stopped.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(studio.stopped.lock().unwrap().len(), 2);
+}

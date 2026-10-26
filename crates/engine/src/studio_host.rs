@@ -90,6 +90,18 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stream_stop(&self) -> Result<(), String>;
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
+    /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
+    /// when the Studio isn't streaming.
+    async fn direct_start(&self, _id: String, _url: String, _key: String) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    async fn direct_stop(&self, _id: String) -> Result<(), String> {
+        Ok(())
+    }
+    /// One direct destination's `ferrocast_studio::StreamStats`, or null.
+    async fn direct_stats(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
     /// OBS's scene collections on this computer: `{ id, name, scenes, sources }[]`.
     async fn obs_collections(&self) -> Result<Value, String>;
     /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
@@ -1110,7 +1122,7 @@ impl Engine {
         *self.inner.studio_host.host.write().unwrap_or_else(|p| p.into_inner()) = Some(host);
     }
 
-    fn studio_host(&self) -> Result<Arc<dyn StudioHost>, EngineError> {
+    pub(crate) fn studio_host(&self) -> Result<Arc<dyn StudioHost>, EngineError> {
         self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone().ok_or(EngineError::Refused {
             status: 422,
             code: "studio_unavailable",

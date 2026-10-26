@@ -67,13 +67,47 @@ pub struct DestinationConfig {
     /// Custom servers only: the name the streamer gave it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Custom servers only: `rtmp://` or `rtmps://` (the key is a secret, not here).
+    /// Custom servers only: `rtmp://` or `rtmps://`, or `srt://`, `rist://` or an `https://`
+    /// WebRTC (WHIP) address sent straight from the Ferrocast Studio (the key is a secret,
+    /// not here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_main")]
     pub canvas: Canvas,
 }
+
+/// A server address the Studio sends to itself (SRT, RIST, WebRTC/WHIP), not an RTMP
+/// forwarder: "srt", "rist" or "whip".
+pub fn direct_kind(url: &str) -> Option<&'static str> {
+    let u = url.trim().to_ascii_lowercase();
+    if u.starts_with("srt://") {
+        Some("srt")
+    } else if u.starts_with("rist://") {
+        Some("rist")
+    } else if u.starts_with("https://") || is_local_http(&u) {
+        Some("whip")
+    } else {
+        None
+    }
+}
+
+/// `http://` on this computer only (a local WHIP server); anywhere else WebRTC needs https.
+fn is_local_http(u: &str) -> bool {
+    ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|p| u.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with([':', '/'])))
+}
+
+/// A direct address's host and port, for the list.
+fn direct_host(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://")?.1;
+    let host = rest.split(['/', '?']).next()?;
+    (!host.is_empty()).then(|| host.chars().take(80).collect())
+}
+
+/// How often a direct destination's health is read from the Studio.
+const DIRECT_EVERY: Duration = Duration::from_secs(1);
 
 /// YouTube Shorts live: the vertical stream's platform destination.
 pub const YOUTUBE_VERTICAL: &str = "youtube_vertical";
@@ -368,6 +402,10 @@ pub struct DestinationView {
     pub blocked: Option<String>,
     /// Its rules broken by the stream OBS is sending.
     pub rules: Vec<String>,
+    /// Sent straight from the Ferrocast Studio by this protocol ("srt", "rist", "whip");
+    /// absent for RTMP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct: Option<&'static str>,
 }
 
 /// Go live's runtime state, one per engine.
@@ -699,7 +737,13 @@ impl Engine {
                         let c = st.connectors.get(crate::platform_key(p));
                         (self.connector(p).is_some(), c.and_then(|c| c.account.as_ref()).map(|a| a.name.clone()))
                     }
-                    None => (true, d.url.as_deref().and_then(|u| Target::parse(u).ok()).map(|t| t.host)),
+                    None => (
+                        true,
+                        d.url.as_deref().and_then(|u| match direct_kind(u) {
+                            Some(_) => direct_host(u),
+                            None => Target::parse(u).ok().map(|t| t.host),
+                        }),
+                    ),
                 };
                 DestinationView {
                     id: d.id.clone(),
@@ -719,6 +763,7 @@ impl Engine {
                         (true, Canvas::Main) => probe::rules(&stats, d.kind),
                         (true, Canvas::Vertical) => probe::rules(&vertical_stats, d.kind),
                     },
+                    direct: d.url.as_deref().and_then(direct_kind),
                 }
             })
             .collect();
@@ -975,9 +1020,34 @@ impl Engine {
         if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
             return Err(EngineError::Invalid("name: 1 to 40 characters.".into()));
         }
-        let target = Target::parse(url).map_err(|e| EngineError::Invalid(format!("url: {e}")))?;
+        let direct = direct_kind(url);
+        let url = match direct {
+            // SRT, RIST and WebRTC go straight from the Studio's main picture.
+            Some(_) => {
+                let u = url.trim();
+                if u.len() > 512
+                    || u.chars().any(|c| c.is_control() || c.is_whitespace())
+                    || direct_host(u).is_none_or(|h| h.contains('@'))
+                {
+                    return Err(EngineError::Invalid(
+                        "url: a whole address like srt://host:port, rist://host:port or https://host/whip, without a user name.".into(),
+                    ));
+                }
+                if canvas != Canvas::Main {
+                    return Err(EngineError::Invalid(
+                        "canvas: SRT, RIST and WebRTC send the main picture only.".into(),
+                    ));
+                }
+                u.to_string()
+            }
+            None => Target::parse(url).map_err(|e| EngineError::Invalid(format!("url: {e}")))?.tc_url,
+        };
         let key = key.trim();
-        if key.is_empty() || key.len() > 512 || key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        // The key is a stream id, passphrase or token there, and may be left empty.
+        if (key.is_empty() && direct.is_none())
+            || key.len() > 512
+            || key.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
             return Err(EngineError::Invalid("key: the stream key the server gave you, without spaces.".into()));
         }
         let one_at_a_time = self.config_lock().await;
@@ -996,7 +1066,7 @@ impl Engine {
             id,
             kind: Service::Custom,
             name: Some(name.to_string()),
-            url: Some(target.tc_url.clone()),
+            url: Some(url),
             enabled: true,
             canvas,
         };
@@ -1132,6 +1202,12 @@ impl Engine {
                 need_kbps: if d.canvas == Canvas::Vertical { need_vertical } else { need_main },
                 problem: None,
             };
+            // SRT, RIST and WebRTC servers aren't RTMP: no delay check, but their need counts.
+            if let Some(u) = d.url.as_deref().filter(|u| direct_kind(u).is_some()) {
+                row.server = direct_host(u);
+                rows.push(row);
+                continue;
+            }
             // YouTube's vertical stream is made when it's first needed, not for a check.
             let resolved = if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
                 match self.connector(Platform::Youtube) {
@@ -1375,6 +1451,9 @@ impl Engine {
     }
 
     async fn start_destination(&self, d: &DestinationConfig) {
+        if let Some(url) = d.url.as_deref().filter(|u| direct_kind(u).is_some()) {
+            return self.start_direct(d, url.to_string()).await;
+        }
         let g = self.golive();
         match self.resolve(d).await {
             Ok(dest) => {
@@ -1390,6 +1469,79 @@ impl Engine {
                 lock(&g.blocked).insert(d.id.clone(), reason);
             }
         }
+    }
+
+    /// Sends the Studio's stream straight to an SRT, RIST or WebRTC server, and reads its
+    /// health every second until it's stopped.
+    async fn start_direct(&self, d: &DestinationConfig, url: String) {
+        let g = self.golive();
+        let key = self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
+        let started = match self.studio_host() {
+            Ok(host) => host.direct_start(d.id.clone(), url, key).await.map(|()| host),
+            Err(_) => Err(String::new()),
+        };
+        let host = match started {
+            Ok(h) => h,
+            Err(why) => {
+                let reason = if why.is_empty() || why.contains("isn't streaming") {
+                    "SRT, RIST and WebRTC go straight from the Ferrocast Studio: go live with the Ferrocast picture."
+                        .to_string()
+                } else {
+                    format!("Couldn't start: {why}")
+                };
+                tracing::info!(dest = %d.id, %reason, "Go live: a direct destination can't start");
+                lock(&g.blocked).insert(d.id.clone(), reason);
+                return;
+            }
+        };
+        lock(&g.blocked).remove(&d.id);
+        let now_ms = || u64::try_from(now().0).unwrap_or(0);
+        let (health_tx, health) =
+            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, since_ms: now_ms() });
+        let (stop, mut stop_rx) = watch::channel(false);
+        let id = d.id.clone();
+        tokio::spawn(async move {
+            let mut last_bytes = 0u64;
+            let mut tick = tokio::time::interval(DIRECT_EVERY);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stop_rx.changed() => break,
+                }
+                if *stop_rx.borrow() {
+                    break;
+                }
+                let st = host.direct_stats(id.clone()).await.unwrap_or(serde_json::Value::Null);
+                if st.is_null() {
+                    // The Studio stopped streaming: Go live stops this one too.
+                    break;
+                }
+                let bytes = st["bytes"].as_u64().unwrap_or(0);
+                let kbps = u32::try_from(bytes.saturating_sub(last_bytes) * 8 / 1000).unwrap_or(u32::MAX);
+                last_bytes = bytes;
+                let state = if st["reconnecting"].as_bool().unwrap_or(false) {
+                    PushState::Reconnecting {
+                        attempt: 0,
+                        retry_in_ms: 0,
+                        reason: "The server dropped the connection; trying again.".into(),
+                    }
+                } else if st["active"].as_bool().unwrap_or(false) {
+                    PushState::Live
+                } else {
+                    PushState::Connecting
+                };
+                health_tx.send_modify(|h| {
+                    if std::mem::discriminant(&h.state) != std::mem::discriminant(&state) {
+                        h.since_ms = now_ms();
+                    }
+                    h.state = state;
+                    h.kbps = kbps;
+                    h.dropped = st["dropped"].as_u64().unwrap_or(0);
+                });
+            }
+            let _ = host.direct_stop(id).await;
+        });
+        lock(&g.running).insert(d.id.clone(), Running { stop, health });
     }
 
     /// Turns upload protection on or off. Off brings every paused destination back.

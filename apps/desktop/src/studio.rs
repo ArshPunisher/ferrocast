@@ -1217,4 +1217,27 @@ impl StudioHost for DesktopStudio {
     async fn stream_stats(&self) -> Result<Value, String> {
         self.on_main(|h| h.stream.as_ref().map_or(Value::Null, stats_of)).await
     }
+
+    async fn direct_start(&self, id: String, url: String, key: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            let s = h.stream.as_mut().filter(|s| s.stats().active).ok_or("The Studio isn't streaming.")?;
+            tracing::info!(dest = %id, "the Studio sends straight to a server (SRT, RIST or WebRTC)");
+            s.add_direct(&id, &url, &key).map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    async fn direct_stop(&self, id: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            if let Some(s) = h.stream.as_mut() {
+                s.remove_direct(&id);
+            }
+        })
+        .await
+    }
+
+    async fn direct_stats(&self, id: String) -> Result<Value, String> {
+        self.on_main(move |h| h.stream.as_ref().and_then(|s| s.direct_stats(&id)).map_or(Value::Null, |st| json!(st)))
+            .await
+    }
 }
