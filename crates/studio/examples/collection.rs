@@ -143,7 +143,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_millis(1500));
     rec.stop();
 
+    // Each transition keeps its own settings, saved as OBS saves them.
+    c.set_transition_settings("swipe_transition", &json!({ "direction": "right" }))?;
+    c.set_transition_settings(
+        "obs_stinger_transition",
+        &json!({ "path": tone.display().to_string(), "transition_point": 200 }),
+    )?;
+    assert!(c.set_transition_settings("boom_transition", &json!({})).is_err(), "only real transitions");
+    c.set_transition(&TransitionInfo { kind: "swipe_transition".into(), ms: 400 })?;
+    c.set_current("Gameplay 2")?;
+    std::thread::sleep(Duration::from_millis(500));
+    c.set_transition(&TransitionInfo { kind: "fade_transition".into(), ms: 500 })?;
     let saved = c.save("Test");
+    let list = saved["transitions"].as_array().ok_or("transitions")?;
+    assert_eq!(list.len(), 2, "both kinds' settings saved: {list:?}");
+    assert!(list.iter().any(|t| t["id"] == "obs_stinger_transition" && t["name"] == "Stinger"));
     std::fs::write(out.join("collection.json"), serde_json::to_string_pretty(&saved)?)?;
     let before =
         (c.scenes(), c.items("Gameplay")?, c.items("Just chatting")?, c.filters("Background")?, c.audio("Gameplay")?);
@@ -167,6 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(back.transition(), TransitionInfo { kind: "fade_transition".into(), ms: 500 });
     back.remove_scene("Gameplay 2")?;
     assert!(back.remove_scene("Nope").is_err());
+    assert_eq!(back.transition_settings("swipe_transition")["direction"], "right", "settings come back");
+    assert_eq!(back.transition_settings("obs_stinger_transition")["transition_point"], 200);
     // Engine stats, the listening device, a new canvas, and a paused MKV recording.
     let st = studio.stats();
     println!("stats: {st:?}");
@@ -193,6 +209,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("record: {:?}", rec.stats());
     rec.stop();
     drop(back);
+    // A collection saved by OBS: its stinger is the transition in use, with its settings.
+    let obs = json!({
+        "name": "From OBS",
+        "sources": [],
+        "current_transition": "My stinger",
+        "transition_duration": 300,
+        "transitions": [{ "name": "My stinger", "id": "obs_stinger_transition", "settings": { "path": tone.display().to_string() } }],
+    });
+    let from_obs = Collection::load(&studio, &obs, "Scene")?;
+    assert_eq!(from_obs.transition().kind, "obs_stinger_transition");
+    assert_eq!(from_obs.transition_settings("obs_stinger_transition")["path"], tone.display().to_string());
+    drop(from_obs);
     drop(studio);
     println!("saved, loaded back the same, closed cleanly");
     Ok(())

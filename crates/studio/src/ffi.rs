@@ -477,6 +477,7 @@ api! {
     obs_property_path_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_path_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_property_editable_list_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_group_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_editable_list_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_enter_graphics: fn();
     obs_leave_graphics: fn();

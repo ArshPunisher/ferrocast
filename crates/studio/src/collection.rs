@@ -41,13 +41,14 @@ pub struct SceneInfo {
 }
 
 /// OBS's names for its transitions, which a scene's override is saved by, with their kinds.
-const TRANSITION_NAMES: [(&str, &str); 6] = [
+const TRANSITION_NAMES: [(&str, &str); 7] = [
     ("fade_transition", "Fade"),
     ("cut_transition", "Cut"),
     ("swipe_transition", "Swipe"),
     ("slide_transition", "Slide"),
     ("fade_to_color_transition", "Fade to Color"),
     ("wipe_transition", "Luma Wipe"),
+    ("obs_stinger_transition", "Stinger"),
 ];
 
 /// A source in a scene, top first. A group lists its own items.
@@ -324,6 +325,9 @@ pub struct Collection {
     /// The kind of the transition on air now (a scene's override can differ from the Studio's).
     active_kind: RefCell<String>,
     meters: RefCell<HashMap<String, Meter>>,
+    /// Each transition kind's own settings (a stinger's video, a swipe's direction…), used
+    /// whenever that kind is made.
+    transition_settings: RefCell<HashMap<String, Value>>,
 }
 
 impl std::fmt::Debug for Collection {
@@ -350,6 +354,7 @@ impl Collection {
             transition_info: RefCell::new(TransitionInfo { kind: "fade_transition".into(), ms: 300 }),
             active_kind: RefCell::new(String::new()),
             meters: RefCell::new(HashMap::new()),
+            transition_settings: RefCell::new(HashMap::new()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -362,7 +367,12 @@ impl Collection {
     fn make_transition(&self, kind: &str) -> Result<(), StudioError> {
         let a = self.api();
         let (id, n) = (cstr(kind), cstr("Transition"));
-        let t = a.obs_source_create_private(id.as_ptr(), n.as_ptr(), ptr::null_mut());
+        let settings = self.transition_settings.borrow().get(kind).cloned();
+        let data = settings.map_or(ptr::null_mut(), |v| a.obs_data_create_from_json(cstr(&v.to_string()).as_ptr()));
+        let t = a.obs_source_create_private(id.as_ptr(), n.as_ptr(), data);
+        if !data.is_null() {
+            a.obs_data_release(data);
+        }
         if t.is_null() {
             return Err(StudioError::Failed(format!("the transition \"{kind}\" isn't available")));
         }
@@ -588,6 +598,40 @@ impl Collection {
             self.make_transition(&t.kind)?;
         }
         self.transition_info.replace(t.clone());
+        Ok(())
+    }
+
+    /// A transition kind's own settings (only what was set; OBS fills in the rest).
+    pub fn transition_settings(&self, kind: &str) -> Value {
+        self.transition_settings.borrow().get(kind).cloned().unwrap_or_else(|| json!({}))
+    }
+
+    /// Changes the keys given of a transition kind's settings; the one on air takes them at once.
+    pub fn set_transition_settings(&self, kind: &str, settings: &Value) -> Result<(), StudioError> {
+        let Some(patch) = settings.as_object() else {
+            return Err(StudioError::Failed("settings: an object of OBS's keys.".into()));
+        };
+        if !TRANSITION_NAMES.iter().any(|(k, _)| *k == kind) {
+            return Err(StudioError::Failed(format!("\"{kind}\" isn't a transition here")));
+        }
+        let merged = {
+            let mut all = self.transition_settings.borrow_mut();
+            let entry = all.entry(kind.to_string()).or_insert_with(|| json!({}));
+            if let Some(obj) = entry.as_object_mut() {
+                for (k, v) in patch {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            entry.clone()
+        };
+        if *self.active_kind.borrow() == kind {
+            let a = self.api();
+            let data = a.obs_data_create_from_json(cstr(&merged.to_string()).as_ptr());
+            if !data.is_null() {
+                a.obs_source_update(*self.transition.borrow(), data);
+                a.obs_data_release(data);
+            }
+        }
         Ok(())
     }
 
@@ -1511,10 +1555,20 @@ impl Collection {
             Value::Array(self.scenes().into_iter().map(|s| json!({ "name": s.name })).collect()),
         );
         doc.insert("sources".into(), sources);
-        doc.insert("current_transition".into(), json!(if t.kind == "cut_transition" { "Cut" } else { "Fade" }));
+        let obs_name = |k: &str| TRANSITION_NAMES.iter().find(|(id, _)| *id == k).map_or("Fade", |(_, n)| *n);
+        doc.insert("current_transition".into(), json!(obs_name(&t.kind)));
         doc.insert("transition_duration".into(), json!(t.ms));
-        doc.insert("transitions".into(), json!([]));
-        doc.insert("ferrocast".into(), json!({ "transition": t }));
+        // As OBS keeps them, so OBS opens these with their settings too.
+        let settings = self.transition_settings.borrow().clone();
+        let mut kinds: Vec<&String> = settings.keys().collect();
+        kinds.sort();
+        doc.insert(
+            "transitions".into(),
+            Value::Array(
+                kinds.iter().map(|k| json!({ "name": obs_name(k), "id": k, "settings": settings[*k] })).collect(),
+            ),
+        );
+        doc.insert("ferrocast".into(), json!({ "transition": t, "transition_settings": settings }));
         Value::Object(doc)
     }
 
@@ -1565,13 +1619,43 @@ impl Collection {
         if c.scenes.borrow().is_empty() {
             c.add_scene(first_scene)?;
         }
+        // Each kind's settings: Ferrocast's own, or OBS's list of transitions (first of a kind).
+        let mut kept: HashMap<String, Value> = doc
+            .pointer("/ferrocast/transition_settings")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().filter(|(_, v)| v.is_object()).map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        let obs_list = doc.get("transitions").and_then(Value::as_array).cloned().unwrap_or_default();
+        for t in &obs_list {
+            if let (Some(id), Some(set)) = (t.get("id").and_then(Value::as_str), t.get("settings"))
+                && set.is_object()
+                && TRANSITION_NAMES.iter().any(|(k, _)| *k == id)
+            {
+                kept.entry(id.to_string()).or_insert_with(|| set.clone());
+            }
+        }
+        c.transition_settings.replace(kept);
+        // OBS names the one in use; its list (or OBS's own names) gives the kind.
+        let obs_current = doc.get("current_transition").and_then(Value::as_str).and_then(|name| {
+            obs_list
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|t| t.get("id").and_then(Value::as_str))
+                .or_else(|| TRANSITION_NAMES.iter().find(|(_, n)| *n == name).map(|(k, _)| *k))
+                .filter(|k| TRANSITION_NAMES.iter().any(|(id, _)| id == k))
+                .map(str::to_string)
+        });
         if let Some(t) =
             doc.pointer("/ferrocast/transition").and_then(|t| serde_json::from_value::<TransitionInfo>(t.clone()).ok())
         {
             // An unknown kind keeps the fade.
             let _ = c.set_transition(&t);
-        } else if let Some(ms) = doc.get("transition_duration").and_then(Value::as_u64) {
-            let _ = c.set_transition(&TransitionInfo { kind: "fade_transition".into(), ms: ms.min(20_000) as u32 });
+        } else {
+            let ms = doc.get("transition_duration").and_then(Value::as_u64).unwrap_or(300).min(20_000) as u32;
+            let kind = obs_current.unwrap_or_else(|| "fade_transition".into());
+            if c.set_transition(&TransitionInfo { kind, ms }).is_err() {
+                let _ = c.set_transition(&TransitionInfo { kind: "fade_transition".into(), ms });
+            }
         }
         let want = doc
             .get("current_program_scene")

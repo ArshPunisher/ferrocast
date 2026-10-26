@@ -159,6 +159,8 @@ pub struct OptionInfo {
     pub values: Vec<serde_json::Value>,
     /// A group's own options.
     pub group: Vec<OptionInfo>,
+    /// A group with an on/off switch of its own (its key holds true or false).
+    pub checkable: bool,
     /// A path's kind: "file", "save" or "folder"; an editable list's: "files" (files, or
     /// files and addresses) or "" (plain text, as for anything else).
     pub path: &'static str,
@@ -540,7 +542,10 @@ impl Studio {
             } else {
                 ("", String::new())
             };
+            // enum obs_group_type: OBS_GROUP_CHECKABLE is 2.
+            let checkable = kind == "group" && a.obs_property_group_type(p) == 2;
             out.push(OptionInfo {
+                checkable,
                 path,
                 filter,
                 key: text(a.obs_property_name(p)),
