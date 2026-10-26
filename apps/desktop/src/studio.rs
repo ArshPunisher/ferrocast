@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, STOPPED, StudioAct, StudioHost, StudioSettings,
-    StudioStatus,
+    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, STOPPED, StudioAct, StudioHost,
+    StudioSettings, StudioStatus,
 };
 use ferrocast_studio::{
     AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Recording, Rect, StreamSettings,
@@ -38,6 +38,8 @@ struct Held {
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     settings: Option<StudioSettings>,
     renderer: &'static str,
+    /// The item outlined in the preview (scene, id), kept when the preview is made again.
+    selected: Option<(String, i64)>,
 }
 
 thread_local! {
@@ -278,6 +280,9 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
         A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
+        A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
+        // Handled in `act`, which holds the preview.
+        A::Select { .. } => Ok(Value::Null),
         A::Web { name, what } => done(c.web(&name, web_act(what))),
         // Handled in `act`, which knows where recordings go.
         A::Screenshot { .. } => Ok(Value::Null),
@@ -315,7 +320,9 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    h.preview = Some(studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?);
+    let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+    h.preview = Some(p);
     Ok(())
 }
 
@@ -494,6 +501,13 @@ impl StudioHost for DesktopStudio {
                 }
                 c.screenshot(name, &path).map_err(|e| e.to_string())?;
                 return Ok(json!({ "file": path.display().to_string() }));
+            }
+            if let StudioAct::Select { scene, id } = &act {
+                h.selected = scene.clone().zip(*id);
+                if let Some(p) = &h.preview {
+                    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+                }
+                return Ok(Value::Null);
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let changes = act.changes();
@@ -682,6 +696,75 @@ impl StudioHost for DesktopStudio {
             serde_json::to_value(&report).map_err(|e| e.to_string())
         })
         .await?
+    }
+
+    async fn pick_file(&self, pick: FilePick) -> Result<Value, String> {
+        use tauri_plugin_dialog::DialogExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut d = self.app.dialog().file();
+        if let Some(w) = self.app.get_webview_window("main") {
+            d = d.set_parent(&w);
+        }
+        for (name, exts) in pick.filters() {
+            let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
+            d = d.add_filter(name, &exts);
+        }
+        let text =
+            |p: tauri_plugin_dialog::FilePath| p.into_path().ok().map(|p| Value::String(p.display().to_string()));
+        let one = move |p: Option<tauri_plugin_dialog::FilePath>| {
+            let _ = tx.send(p.and_then(text).unwrap_or(Value::Null));
+        };
+        match pick.kind.as_str() {
+            "save" => d.save_file(one),
+            "folder" => d.pick_folder(one),
+            "files" => {
+                let (many_tx, many_rx) = tokio::sync::oneshot::channel();
+                d.pick_files(move |ps| {
+                    let v = ps.map_or(Value::Null, |ps| Value::Array(ps.into_iter().filter_map(text).collect()));
+                    let _ = many_tx.send(v);
+                });
+                return many_rx.await.map_err(|_| "The file dialog closed without an answer.".to_string());
+            }
+            _ => d.pick_file(one),
+        }
+        rx.await.map_err(|_| "The file dialog closed without an answer.".to_string())
+    }
+
+    async fn screen_access(&self) -> Result<Value, String> {
+        Ok(json!({ "granted": ferrocast_studio::screen_access() }))
+    }
+
+    async fn fix_screen_access(&self) -> Result<Value, String> {
+        #[cfg(target_os = "macos")]
+        {
+            // System Settings can show Ferrocast switched on for an older build (each unsigned
+            // update is a new app to macOS); forgetting that answer lets macOS ask this one.
+            let id = self.app.config().identifier.clone();
+            let reset = std::process::Command::new("/usr/bin/tccutil").args(["reset", "ScreenCapture", &id]).output();
+            if let Err(e) = reset {
+                tracing::warn!(error = %e, "tccutil couldn't run");
+            }
+            let granted = self.on_main(|_| ferrocast_studio::request_screen_access()).await?;
+            Ok(json!({ "granted": granted }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(json!({ "granted": true }))
+        }
+    }
+
+    async fn restart(&self) -> Result<(), String> {
+        let busy = self.on_main(|h| h.stream.is_some() || h.record.is_some()).await?;
+        if busy {
+            return Err("Stop streaming and recording before Ferrocast opens again.".into());
+        }
+        let app = self.app.clone();
+        // A moment for the answer to reach the page first.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            app.restart();
+        });
+        Ok(())
     }
 
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {

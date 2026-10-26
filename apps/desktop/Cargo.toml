@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 # Local date and time for recording file names.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tauri-plugin-dialog = "2"
 
 [dev-dependencies]
 # A mock app runs the real updater plugin against local feeds (main.rs tests).
