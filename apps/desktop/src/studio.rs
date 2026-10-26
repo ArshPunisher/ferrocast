@@ -1121,7 +1121,17 @@ impl StudioHost for DesktopStudio {
             }
             let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
             let shows = source.map_or(ferrocast_studio::CameraShows::Program, ferrocast_studio::CameraShows::Source);
-            let cam = studio.virtual_camera(&shows).map_err(|e| e.to_string())?;
+            let cam = studio.virtual_camera(&shows).map_err(|e| {
+                let e = e.to_string();
+                // macOS lets only OBS itself turn its camera on: say so plainly.
+                if cfg!(target_os = "macos") && e.contains("not installed") {
+                    "On a Mac the virtual camera works from OBS itself for now: macOS lets only OBS \
+                     turn its camera on. Start the virtual camera in OBS instead."
+                        .to_string()
+                } else {
+                    e
+                }
+            })?;
             h.virtualcam = Some(cam);
             Ok(json!({ "active": true }))
         })
