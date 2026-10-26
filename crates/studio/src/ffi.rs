@@ -307,6 +307,7 @@ api! {
     obs_sceneitem_get_rot: fn(a: *const ObsSceneItem) -> f32;
     obs_sceneitem_get_crop: fn(a: *const ObsSceneItem, b: *mut Crop);
     obs_sceneitem_set_crop: fn(a: *mut ObsSceneItem, b: *const Crop);
+    obs_sceneitem_set_order_position: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_set_rot: fn(a: *mut ObsSceneItem, b: f32);
     obs_sceneitem_get_alignment: fn(a: *const ObsSceneItem) -> u32;
     obs_sceneitem_get_bounds_type: fn(a: *const ObsSceneItem) -> c_int;

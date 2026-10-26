@@ -106,6 +106,35 @@ pub struct Transform {
     pub height: u32,
 }
 
+/// An item as it was, to put back (undo): its source (held, so a removed one can come back),
+/// place in the scene's order, transform and switches.
+pub struct ItemSnap {
+    studio: Studio,
+    src: *mut ffi::ObsSource,
+    pub scene: String,
+    pub id: i64,
+    pub name: String,
+    /// From the bottom of the scene (0 is the lowest).
+    order: usize,
+    transform: Transform,
+    visible: bool,
+    locked: bool,
+    blend: c_int,
+    scale_filter: c_int,
+}
+
+impl std::fmt::Debug for ItemSnap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ItemSnap").field("scene", &self.scene).field("id", &self.id).field("name", &self.name).finish()
+    }
+}
+
+impl Drop for ItemSnap {
+    fn drop(&mut self) {
+        self.studio.inner.api.obs_source_release(self.src);
+    }
+}
+
 /// `enum obs_blending_type`, in order.
 pub const BLENDS: [&str; 7] = ["normal", "additive", "subtract", "screen", "multiply", "lighten", "darken"];
 
@@ -933,6 +962,66 @@ impl Collection {
         a.obs_sceneitem_set_alignment(item, t.alignment);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: t.x, y: t.y });
         Ok(self.info(item))
+    }
+
+    /// Remembers an item as it is now (a top-level item of `scene`), to put back later.
+    pub fn snap(&self, scene: &str, id: i64) -> Result<ItemSnap, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        let items = self.raw_items(s);
+        let order = items
+            .iter()
+            .position(|i| self.api().obs_sceneitem_get_id(*i) == id)
+            .ok_or_else(|| StudioError::Failed(format!("there's no source with id {id} in \"{scene}\"")))?;
+        let item = items[order];
+        let a = self.api();
+        let src = a.obs_source_get_ref(a.obs_sceneitem_get_source(item));
+        if src.is_null() {
+            return Err(StudioError::Failed("that source is being removed".into()));
+        }
+        Ok(ItemSnap {
+            studio: self.studio.clone(),
+            src,
+            scene: scene.to_string(),
+            id,
+            name: text(a.obs_source_get_name(src)),
+            order,
+            transform: self.transform(scene, id)?,
+            visible: a.obs_sceneitem_visible(item),
+            locked: a.obs_sceneitem_locked(item),
+            blend: a.obs_sceneitem_get_blending_mode(item),
+            scale_filter: a.obs_sceneitem_get_scale_filter(item),
+        })
+    }
+
+    /// Puts an item back as `snap` remembers it, adding its source to the scene again if the
+    /// item was removed. Returns its id now (new if it was added again).
+    pub fn restore(&self, snap: &ItemSnap) -> Result<i64, StudioError> {
+        let s = self.scene_ptr(&snap.scene)?;
+        let a = self.api();
+        let item = match self.raw_items(s).into_iter().find(|i| a.obs_sceneitem_get_id(*i) == snap.id) {
+            Some(i) => i,
+            None => {
+                let i = a.obs_scene_add(s, snap.src);
+                if i.is_null() {
+                    return Err(StudioError::Failed(format!("\"{}\" couldn't be put back", snap.name)));
+                }
+                i
+            }
+        };
+        let id = a.obs_sceneitem_get_id(item);
+        self.set_transform(&snap.scene, id, &snap.transform)?;
+        a.obs_sceneitem_set_visible(item, snap.visible);
+        a.obs_sceneitem_set_locked(item, snap.locked);
+        a.obs_sceneitem_set_blending_mode(item, snap.blend);
+        a.obs_sceneitem_set_scale_filter(item, snap.scale_filter);
+        a.obs_sceneitem_set_order_position(item, c_int::try_from(snap.order).unwrap_or(0));
+        Ok(id)
+    }
+
+    /// The ids of a scene's top-level items (to find what an act added).
+    pub fn item_ids(&self, scene: &str) -> Result<Vec<i64>, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        Ok(self.raw_items(s).into_iter().map(|i| self.api().obs_sceneitem_get_id(i)).collect())
     }
 
     /// The item's box as libobs last worked it out (on a frame), to check [`ItemInfo::frame`].
