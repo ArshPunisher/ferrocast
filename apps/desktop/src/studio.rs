@@ -1274,6 +1274,23 @@ impl StudioHost for DesktopStudio {
         self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
     }
 
+    async fn streamlabs_collections(&self) -> Result<Value, String> {
+        let Some(dir) = ferrocast_studio::streamlabs::scenes_dir() else { return Ok(json!([])) };
+        let list = tokio::task::spawn_blocking(move || ferrocast_studio::streamlabs::list(&dir))
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(list).map_err(|e| e.to_string())
+    }
+
+    async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
+        let dir = ferrocast_studio::streamlabs::scenes_dir()
+            .ok_or("Streamlabs' scene collections aren't on this computer.")?;
+        let doc = ferrocast_studio::streamlabs::read(&dir, &id).map_err(|e| e.to_string())?;
+        let name = doc.get("name").and_then(Value::as_str).unwrap_or("Streamlabs scenes").to_string();
+        // From here on it's an OBS collection: the same import, web pages and missing kinds.
+        self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
+    }
+
     async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
         let kind = Kind::parse(&kind).ok_or("kind: collections or profiles.")?;
         let data = self.data.clone();

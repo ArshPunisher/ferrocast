@@ -141,6 +141,15 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
     /// the old scenes are kept in a file first) → what came in.
     async fn import_obs(&self, id: String) -> Result<Value, String>;
+    /// Streamlabs Desktop's scene collections on this computer, like `obs_collections`.
+    async fn streamlabs_collections(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Adds Streamlabs' collection `id` as a new scene collection (turned into OBS's format,
+    /// then imported as OBS's) → what came in.
+    async fn import_streamlabs(&self, _id: String) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// A file dialog on this computer → the path picked (a list for "files"), or null when
     /// it's cancelled.
     async fn pick_file(&self, _pick: FilePick) -> Result<Value, String> {
@@ -1561,13 +1570,33 @@ impl Engine {
         self.studio_host()?.obs_collections().await.map_err(failed)
     }
 
+    /// Streamlabs Desktop's scene collections, to import one.
+    pub async fn studio_streamlabs_collections(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.streamlabs_collections().await.map_err(failed)
+    }
+
+    /// Brings in Streamlabs' scene collection `id` as a new scene collection.
+    pub async fn studio_import_streamlabs(&self, id: &str) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
+        }
+        let host = self.studio_host()?;
+        let list = host.streamlabs_collections().await.map_err(failed)?;
+        if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
+            return Err(EngineError::Refused {
+                status: 404,
+                code: "studio_no_obs_collection",
+                message: "Streamlabs has no such scene collection.".into(),
+                hint: "Pick one from the list.".into(),
+                retry_after: None,
+            });
+        }
+        host.import_streamlabs(id.to_string()).await.map_err(failed)
+    }
+
     /// Brings in OBS's scene collection `id` in place of the Studio's scenes.
     pub async fn studio_import_obs(&self, id: &str) -> Result<Value, EngineError> {
-        let ok = id.len() <= 128
-            && !id.is_empty()
-            && !id.starts_with('.')
-            && id.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'));
-        if !ok {
+        if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
         let host = self.studio_host()?;
@@ -1836,6 +1865,14 @@ pub fn redact_log_line(line: &str) -> String {
         words.push(w);
     }
     words.join(" ")
+}
+
+/// Another app's collection id is a plain file name: no path, no leading dot.
+fn collection_id_ok(id: &str) -> bool {
+    id.len() <= 128
+        && !id.is_empty()
+        && !id.starts_with('.')
+        && id.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'))
 }
 
 /// A web window's title and address, checked: only http(s) pages, never a local file or script.

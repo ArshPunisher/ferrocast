@@ -97,6 +97,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
+        .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
+        .route("/studio/engine/streamlabs-collections/import", post(engine_import_streamlabs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
         .route(
             "/studio/engine/sources/{name}/filters/{filter}/settings",
@@ -935,6 +937,14 @@ struct IdBody {
 
 async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_obs(&b.id).await?))
+}
+
+async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_streamlabs_collections().await?))
+}
+
+async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_import_streamlabs(&b.id).await?))
 }
 
 async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {

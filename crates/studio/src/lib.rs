@@ -10,6 +10,7 @@ mod collection;
 mod ffi;
 pub mod import;
 pub mod projector;
+pub mod streamlabs;
 
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};

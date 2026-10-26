@@ -130,7 +130,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 
 ### App
 - [x] P1 Profiles and scene collections: new, duplicate, rename, remove, import, export.
-  Import from OBS (26 Oct). Streamlabs Desktop, XSplit, Twitch Studio still to come.
+  Import from OBS (26 Oct) and from Streamlabs Desktop (26 Oct, its format turned into OBS's as
+  OBS's importer does; Windows devices come in to be picked again). XSplit and Twitch Studio
+  (discontinued) not planned.
 - [ ] P1 Settings: General (language, theme, tray, confirmations, snapping, projectors, system
   tray), Hotkeys (every action, search, duplicates warning), Accessibility (colors, meters),
   Appearance (themes, font size, density). (26 Oct: Hotkeys done: every OBS action incl.
