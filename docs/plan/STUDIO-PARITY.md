@@ -121,8 +121,8 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [ ] P2 Virtual camera (scene, source or program output). Remux dialog.
 
 ### App
-- [ ] P1 Profiles and scene collections: new, duplicate, rename, remove, import, export.
-  Import from OBS, Streamlabs Desktop, XSplit, Twitch Studio.
+- [x] P1 Profiles and scene collections: new, duplicate, rename, remove, import, export.
+  Import from OBS (26 Oct). Streamlabs Desktop, XSplit, Twitch Studio still to come.
 - [ ] P1 Settings: General (language, theme, tray, confirmations, snapping, projectors, system
   tray), Hotkeys (every action, search, duplicates warning), Accessibility (colors, meters),
   Appearance (themes, font size, density).
