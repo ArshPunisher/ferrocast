@@ -437,6 +437,11 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             double_click: o.double_click,
         })),
         A::SwapScenes => done(c.swap_scenes()),
+        A::MissingFiles => v(to_json!(c.missing_files())),
+        A::ReplaceFile { source, parent, kind, key, path, to } => done(c.replace_file(
+            &ferrocast_studio::MissingFile { source, parent, kind, key, label: String::new(), path },
+            &to,
+        )),
         A::SetItemTransition { scene, id, show, transition } => done(c.set_item_transition(
             &scene,
             id,
@@ -715,7 +720,8 @@ impl StudioHost for DesktopStudio {
                 let (paths, renderer) = obs_paths().ok_or(NO_OBS)?;
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
                 let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-                let audio = AudioSetup { sample_rate: s.sample_rate, stereo: s.stereo };
+                let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
+                let audio = AudioSetup { sample_rate: s.sample_rate, stereo: s.stereo, layout };
                 let studio = Studio::start_with(&paths, canvas, audio, &config).map_err(|e| e.to_string())?;
                 tracing::info!(version = %studio.version(), renderer, "the Studio's engine loaded");
                 if let Some((name, id)) = &s.monitoring
@@ -930,7 +936,11 @@ impl StudioHost for DesktopStudio {
                     if studio.set_monitoring_device(&name, &id).is_err() {
                         notes.push(format!("{name} can't play sound; the system's device is used."));
                     }
-                    if h.audio.is_some_and(|a| a.sample_rate != s.sample_rate || a.stereo != s.stereo) {
+                    if h.audio.is_some_and(|a| {
+                        a.sample_rate != s.sample_rate
+                            || a.stereo != s.stereo
+                            || a.layout != s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name)
+                    }) {
                         notes.push("Sound changes apply after Ferrocast restarts.".into());
                     }
                 }
@@ -953,6 +963,11 @@ impl StudioHost for DesktopStudio {
     async fn stats(&self) -> Result<Value, String> {
         self.on_main(|h| {
             let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let disk_free = {
+                let folder = record_folder(&h.settings.clone().unwrap_or_default());
+                let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
+                studio.free_disk_mb(&at)
+            };
             Ok(json!({
                 "engine": studio.stats(),
                 // The scene on air, so the page notices switches made elsewhere (shortcuts,
@@ -963,6 +978,8 @@ impl StudioHost for DesktopStudio {
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
+                // Free space where recordings go (OBS's Stats shows it).
+                "disk_free_mb": disk_free,
                 "replay": h.replay.as_ref().map(|r| json!({
                     "active": r.active(),
                     "last": r.last_replay().map(|p| p.display().to_string()),
@@ -1115,6 +1132,25 @@ impl StudioHost for DesktopStudio {
             Ok(json!({ "to": to.display().to_string() }))
         })
         .await?
+    }
+
+    async fn find_missing(&self, folder: String) -> Result<Value, String> {
+        let names: Vec<String> = self
+            .on_main(|h| {
+                h.collection
+                    .as_ref()
+                    .map(|c| c.missing_files().into_iter().map(|m| m.path).collect())
+                    .unwrap_or_default()
+            })
+            .await?;
+        // A folder walk: off the main thread.
+        let found =
+            tokio::task::spawn_blocking(move || ferrocast_studio::find_files(std::path::Path::new(&folder), &names))
+                .await
+                .map_err(|e| e.to_string())?;
+        let found: serde_json::Map<String, Value> =
+            found.into_iter().map(|(k, v)| (k, Value::String(v.display().to_string()))).collect();
+        Ok(json!({ "found": found }))
     }
 
     async fn encoder_options(&self, id: String, settings: serde_json::Map<String, Value>) -> Result<Value, String> {

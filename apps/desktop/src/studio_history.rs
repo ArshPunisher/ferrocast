@@ -172,6 +172,19 @@ impl History {
                     false,
                 ))
             }
+            // A source's own file: its settings come back; a filter's: the source's filters.
+            StudioAct::ReplaceFile { source, parent, .. } if !source.is_empty() => match parent {
+                Some(p) => self.filters(c, p, format!("Replace a file of {source}"), None),
+                None => {
+                    let was = c.snap_settings(source).ok()?;
+                    Some(fresh(
+                        format!("Replace a file of {source}"),
+                        vec![Change::Settings(source.clone(), was)],
+                        None,
+                        false,
+                    ))
+                }
+            },
             StudioAct::AddScene { name } => {
                 Some(fresh(format!("Add scene {name}"), vec![Change::SceneGone(name.clone())], None, false))
             }

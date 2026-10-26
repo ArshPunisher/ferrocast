@@ -109,6 +109,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn remux(&self, _file: String) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Looks for the missing files by name under `folder` → `{ found: { path: new path } }`.
+    async fn find_missing(&self, _folder: String) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// An encoder's own options for `settings` → `{ options, values }` (values with defaults).
     async fn encoder_options(&self, _id: String, _settings: serde_json::Map<String, Value>) -> Result<Value, String> {
         Err(NOT_HERE.into())
@@ -467,6 +471,9 @@ pub struct StudioSettings {
     pub replay_seconds: u32,
     pub replay_mb: u32,
     pub replay_format: String,
+    /// A surround layout instead of `stereo` ("2.1", "4.0", "4.1", "5.1", "7.1"; applies after
+    /// a restart); None follows `stereo`.
+    pub speakers: Option<String>,
 }
 
 impl Default for StudioSettings {
@@ -508,6 +515,7 @@ impl Default for StudioSettings {
             replay_seconds: 30,
             replay_mb: 0,
             replay_format: "mp4".into(),
+            speakers: None,
         }
     }
 }
@@ -581,6 +589,11 @@ impl StudioSettings {
         }
         if !(5..=21_600).contains(&self.replay_seconds) || self.replay_mb > 1_000_000 {
             return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000).");
+        }
+        if let Some(l) = &self.speakers
+            && !["2.1", "4.0", "4.1", "5.1", "7.1"].contains(&l.as_str())
+        {
+            return bad("speakers: 2.1, 4.0, 4.1, 5.1 or 7.1 (or null for stereo or mono).");
         }
         if !["mp4", "mkv", "mov", "flv", "ts"].contains(&self.replay_format.as_str()) {
             return bad("replay_format: mp4, mkv, mov, flv or ts.");
@@ -942,6 +955,19 @@ pub enum StudioAct {
         mode: String,
         top_field_first: bool,
     },
+    /// Files sources, filters and transitions use that aren't on this computer →
+    /// `[{ source, parent, kind, key, label, path }]`.
+    MissingFiles,
+    /// Points a missing file's setting at `to`, or clears it (`to` empty).
+    ReplaceFile {
+        source: String,
+        #[serde(default)]
+        parent: Option<String>,
+        kind: String,
+        key: String,
+        path: String,
+        to: String,
+    },
     /// How Studio Mode sends scenes on air (swap, duplicate scene and sources, double-click).
     SetStudioOptions {
         options: StudioModeOptions,
@@ -1109,7 +1135,22 @@ impl StudioAct {
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
-            A::SwapScenes | A::FadeToBlack => Ok(()),
+            A::SwapScenes | A::FadeToBlack | A::MissingFiles => Ok(()),
+            A::ReplaceFile { source, parent, key, path, to, .. } => {
+                if !source.is_empty() {
+                    check_source_name(source)?;
+                }
+                if let Some(p) = parent {
+                    check_source_name(p)?;
+                }
+                if key.is_empty() || key.len() > 128 || path.len() > 4096 {
+                    return Err(EngineError::Invalid("key, path: the missing file as listed.".into()));
+                }
+                if !to.is_empty() && (to.len() > 4096 || !std::path::Path::new(to).is_absolute()) {
+                    return Err(EngineError::Invalid("to: a whole path to a file, or empty to clear it.".into()));
+                }
+                Ok(())
+            }
             A::SetItemTransition { scene, transition, .. } => {
                 check_source_name(scene)?;
                 transition.iter().try_for_each(check_transition)
@@ -1177,6 +1218,7 @@ impl StudioAct {
                 | A::Transform { .. }
                 | A::TransitionSettings { .. }
                 | A::History
+                | A::MissingFiles
         )
     }
 }
@@ -1308,6 +1350,14 @@ impl Engine {
             check_source_name(s)?;
         }
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
+    }
+
+    /// Searches a folder for the missing files (by file name).
+    pub async fn studio_find_missing(&self, folder: String) -> Result<Value, EngineError> {
+        if folder.len() > 4096 || !std::path::Path::new(&folder).is_absolute() {
+            return Err(EngineError::Invalid("folder: a whole folder path.".into()));
+        }
+        self.studio_host()?.find_missing(folder).await.map_err(failed)
     }
 
     pub async fn studio_record_split(&self) -> Result<(), EngineError> {

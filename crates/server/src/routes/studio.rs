@@ -106,6 +106,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/record/pause", post(engine_record_pause))
         .route("/studio/engine/record/split", post(engine_record_split))
         .route("/studio/engine/replay", post(engine_replay))
+        .route("/studio/engine/missing-files", get(engine_missing_files).put(engine_replace_file))
+        .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
@@ -959,6 +961,42 @@ struct OnBody {
 
 async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+/// `GET /studio/engine/missing-files` → the files sources use that aren't here.
+async fn engine_missing_files(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::MissingFiles).await
+}
+
+#[derive(Deserialize)]
+struct ReplaceFileBody {
+    source: String,
+    #[serde(default)]
+    parent: Option<String>,
+    kind: String,
+    key: String,
+    path: String,
+    to: String,
+}
+
+/// `PUT /studio/engine/missing-files` `{ source, parent?, kind, key, path, to }`: `to` empty
+/// clears it.
+async fn engine_replace_file(State(app): State<AppState>, Body(b): Body<ReplaceFileBody>) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::ReplaceFile { source: b.source, parent: b.parent, kind: b.kind, key: b.key, path: b.path, to: b.to },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct FolderBody {
+    folder: String,
+}
+
+/// `POST /studio/engine/missing-files/search` `{ folder }` → `{ found: { path: new path } }`.
+async fn engine_find_missing(State(app): State<AppState>, Body(b): Body<FolderBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_find_missing(b.folder).await?))
 }
 
 /// `POST /studio/engine/replay` `{ on }` → `{ active }`: OBS's replay buffer.
