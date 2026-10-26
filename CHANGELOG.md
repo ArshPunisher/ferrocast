@@ -5,6 +5,32 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.1.0
+
+**The Studio: stream without OBS.** Ferrocast now has OBS's own engine inside it. Studio,
+Go live, Ferrocast shows your scenes, sources, sound and the live picture in one window, and
+goes live to Twitch, YouTube and Kick straight from there.
+
+- Bring your setup: import your OBS scene collections, or Streamlabs Desktop's, in one click.
+  Missing files are found for you.
+- Everything OBS does: scenes and sources, groups, filters, transitions and stingers, Studio
+  Mode with a T-bar, projectors and a multiview, scene collections and profiles, every hotkey,
+  undo for everything with a history list.
+- Arrange it in the preview: drag sources, resize them by their handles, see every source's
+  outline in its own colour, zoom out to see what's off the screen. Drag a source up or down
+  in the list to put it on top.
+- Recording as OBS has it: MP4 and MOV that survive a crash, splitting, chapters, any
+  encoder, replay buffer and Save replay.
+- Send straight by SRT, RIST or WebRTC too, next to your platforms.
+- A mixer with true-peak meters, monitoring, advanced audio, and low latency sound.
+- Set up for me picks good settings for your computer and your upload. The log opens in the
+  app with your keys taken out.
+
+**Community** is cleaner: Poll, Giveaway and Goals side by side, your top viewers across the
+page, and long lists and settings open in a side panel with search.
+
+**Settings** use the whole window, and the page you're on is plain to see in orange.
+
 ## 2.0.0
 
 **Go live everywhere.** Stream once from OBS, and Ferrocast sends it to Twitch, YouTube and Kick
