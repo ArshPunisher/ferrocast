@@ -1085,6 +1085,12 @@ pub enum StudioAct {
         scene: String,
         name: String,
     },
+    /// Moves an item to place `to` in its list (0 is the top: on top of everything).
+    ItemOrder {
+        scene: String,
+        id: i64,
+        to: usize,
+    },
     /// Takes a group apart (its sources stay, in the scene).
     Ungroup {
         scene: String,
@@ -1296,6 +1302,13 @@ impl StudioAct {
                 check_source_name(name)
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
+            A::ItemOrder { scene, to, .. } => {
+                check_source_name(scene)?;
+                if *to > 10_000 {
+                    return Err(EngineError::Invalid("to: a place in the list, 0 to 10000.".into()));
+                }
+                Ok(())
+            }
             A::Media { name, seek_ms, .. } => {
                 check_source_name(name)?;
                 if seek_ms.is_some_and(|ms| !(0..=24 * 3_600_000).contains(&ms)) {

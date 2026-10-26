@@ -1454,6 +1454,44 @@ impl Collection {
         Ok(self.info(item))
     }
 
+    /// An item's place among its neighbours, counted from the top as the list shows them, and
+    /// its source's name (for undoing a reorder, in a group too).
+    pub fn item_place(&self, scene: &str, id: i64) -> Result<(usize, String), StudioError> {
+        let a = self.api();
+        let s = self.scene_ptr(scene)?;
+        let item = self.item(scene, id)?;
+        let top = self.raw_items(s);
+        let sib = if top.contains(&item) {
+            top
+        } else {
+            let g = a.obs_sceneitem_get_group(s, item);
+            if g.is_null() { top } else { self.group_items(g) }
+        };
+        let from_bottom = sib.iter().position(|i| *i == item).unwrap_or(0);
+        let name = text(a.obs_source_get_name(a.obs_sceneitem_get_source(item)));
+        Ok((sib.len().saturating_sub(1).saturating_sub(from_bottom), name))
+    }
+
+    /// Moves an item to place `to` among its neighbours (the scene's sources, or its group's),
+    /// counted from the top as the list shows them (0 is on top of everything). OBS's drag in
+    /// its Sources list.
+    pub fn item_order(&self, scene: &str, id: i64, to: usize) -> Result<(), StudioError> {
+        let a = self.api();
+        let s = self.scene_ptr(scene)?;
+        let item = self.item(scene, id)?;
+        let top = self.raw_items(s);
+        let n = if top.contains(&item) {
+            top.len()
+        } else {
+            let g = a.obs_sceneitem_get_group(s, item);
+            if g.is_null() { top.len() } else { self.group_items(g).len() }
+        };
+        // libobs counts from the bottom.
+        let pos = n.saturating_sub(1).saturating_sub(to.min(n.saturating_sub(1)));
+        a.obs_sceneitem_set_order_position(item, c_int::try_from(pos).unwrap_or(0));
+        Ok(())
+    }
+
     /// Takes a group apart: its sources stay where they are, in the scene (OBS's Ungroup).
     pub fn ungroup(&self, scene: &str, id: i64) -> Result<(), StudioError> {
         let item = self.item(scene, id)?;

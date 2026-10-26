@@ -460,6 +460,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::MissingFiles => v(to_json!(c.missing_files())),
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
+        A::ItemOrder { scene, id, to } => done(c.item_order(&scene, id, to)),
         A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
         A::PasteCopy { scene, name } => v(to_json!(c.paste_copy(&scene, &name)?)),
         A::Media { name, what, seek_ms } => {

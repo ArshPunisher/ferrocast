@@ -43,6 +43,8 @@ enum Change {
     SceneTransition(String, Option<TransitionInfo>),
     /// Put this source's deinterlacing back (mode, top field first).
     Deinterlace(String, String, bool),
+    /// Put this item back at this place among its neighbours (from the top).
+    Order { scene: String, id: i64, at: usize },
 }
 
 #[derive(Debug)]
@@ -133,6 +135,16 @@ impl History {
             StudioAct::EditItem { scene, id, edit } => {
                 let snap = c.snap(scene, *id).ok()?;
                 Some(fresh(format!("{} {}", verb(edit), snap.name), vec![Change::Item(snap)], None, false))
+            }
+            StudioAct::ItemOrder { scene, id, .. } => {
+                // Its place, not a snapshot: a source in a group can be reordered too.
+                let (at, name) = c.item_place(scene, *id).ok()?;
+                Some(fresh(
+                    format!("Reorder {name}"),
+                    vec![Change::Order { scene: scene.clone(), id: *id, at }],
+                    None,
+                    false,
+                ))
             }
             StudioAct::SetItemBox { scene, id, save, .. } => {
                 let key = ("box", scene.clone(), *id);
@@ -367,6 +379,7 @@ impl History {
                     match ch {
                         Change::Item(snap) if snap.scene == *scene && snap.id == *old => snap.id = *new,
                         Change::Gone { scene: sc, id } if sc == scene && *id == *old => *id = *new,
+                        Change::Order { scene: sc, id, .. } if sc == scene && *id == *old => *id = *new,
                         _ => {}
                     }
                 }
@@ -375,6 +388,7 @@ impl History {
                 match ch {
                     Change::Item(snap) if snap.scene == *scene && snap.id == *old => snap.id = *new,
                     Change::Gone { scene: sc, id } if sc == scene && *id == *old => *id = *new,
+                    Change::Order { scene: sc, id, .. } if sc == scene && *id == *old => *id = *new,
                     _ => {}
                 }
             }
@@ -459,6 +473,11 @@ fn apply(c: &Collection, change: Change) -> Result<(Change, Option<Remap>), Stri
             let now = c.snap_audio(&snap.source).map_err(|e| e.to_string())?;
             c.restore_audio(&snap).map_err(|e| e.to_string())?;
             Ok((Change::Audio(now), None))
+        }
+        Change::Order { scene, id, at } => {
+            let (now, _) = c.item_place(&scene, id).map_err(|e| e.to_string())?;
+            c.item_order(&scene, id, at).map_err(|e| e.to_string())?;
+            Ok((Change::Order { scene, id, at: now }, None))
         }
         Change::Deinterlace(name, mode, top) => {
             let (now, now_top) = c.deinterlace_of(&name).map_err(|e| e.to_string())?;

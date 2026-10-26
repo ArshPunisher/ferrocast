@@ -58,6 +58,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/transition", put(engine_item_transition))
         .route("/studio/engine/scenes/{scene}/items/{id}/group", put(engine_item_group))
         .route("/studio/engine/scenes/{scene}/items/{id}/ungroup", post(engine_ungroup))
+        .route("/studio/engine/scenes/{scene}/items/{id}/order", put(engine_item_order))
         .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
@@ -639,6 +640,20 @@ async fn engine_item_group(
     Body(b): Body<GroupBody>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetGroup { scene, id, group: b.group }).await
+}
+
+#[derive(Deserialize)]
+struct OrderBody {
+    to: usize,
+}
+
+/// `PUT …/items/{id}/order` `{ to }`: moves it to that place in the list (0: on top).
+async fn engine_item_order(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<OrderBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::ItemOrder { scene, id, to: b.to }).await
 }
 
 /// `POST …/items/{id}/ungroup`: the group goes; its sources stay in the scene.
