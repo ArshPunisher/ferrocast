@@ -39,6 +39,8 @@ struct Held {
     preview_at: Option<(Rect, f64)>,
     stream: Option<Streaming>,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
+    replay: Option<ferrocast_studio::ReplayBuffer>,
+    virtualcam: Option<ferrocast_studio::VirtualCamera>,
     settings: Option<StudioSettings>,
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
@@ -658,7 +660,11 @@ impl DesktopStudio {
                 Ok(())
             }
             Kind::Profiles => {
-                let busy = self.on_main(|h| h.stream.is_some() || h.record.is_some()).await?;
+                let busy = self
+                    .on_main(|h| {
+                        h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some()
+                    })
+                    .await?;
                 if busy {
                     return Err("Stop streaming and recording before changing profiles.".into());
                 }
@@ -751,6 +757,8 @@ impl StudioHost for DesktopStudio {
             // stays loaded for the next Start.
             h.stream = None;
             h.record = None;
+            h.replay = None;
+            h.virtualcam = None;
             h.preview = None;
             h.preview_at = None;
             h.program_view = None;
@@ -955,6 +963,12 @@ impl StudioHost for DesktopStudio {
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
+                "replay": h.replay.as_ref().map(|r| json!({
+                    "active": r.active(),
+                    "last": r.last_replay().map(|p| p.display().to_string()),
+                    "error": r.last_error(),
+                })),
+                "virtualcam": h.virtualcam.as_ref().map(|c| json!({ "active": c.active() })),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             }))
@@ -1008,6 +1022,64 @@ impl StudioHost for DesktopStudio {
             let v = record_stats(&r);
             h.record = Some(r);
             Ok(v)
+        })
+        .await?
+    }
+
+    async fn replay(&self, on: bool) -> Result<Value, String> {
+        self.on_main(move |h| {
+            if !on {
+                h.replay = None;
+                return Ok(json!({ "active": false }));
+            }
+            if h.replay.as_ref().is_some_and(|r| r.active()) {
+                return Ok(json!({ "active": true }));
+            }
+            h.replay = None;
+            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let s = h.settings.clone().unwrap_or_default();
+            let folder = record_folder(&s);
+            std::fs::create_dir_all(&folder)
+                .map_err(|e| format!("The recordings folder {} can't be made: {e}", folder.display()))?;
+            let plan = ferrocast_studio::ReplayPlan {
+                folder,
+                name: format!("Replay {}", s.record_name),
+                format: s.replay_format.clone(),
+                spaces: s.record_spaces,
+                seconds: s.replay_seconds,
+                mb: s.replay_mb,
+                tracks: s.record_tracks.clone(),
+                encode: record_encode(studio, &s),
+            };
+            let rb = studio.replay_buffer(&plan).map_err(|e| e.to_string())?;
+            tracing::info!(seconds = s.replay_seconds, "the Studio's replay buffer is on");
+            h.replay = Some(rb);
+            Ok(json!({ "active": true }))
+        })
+        .await?
+    }
+
+    async fn replay_save(&self) -> Result<Value, String> {
+        self.on_main(|h| {
+            let r = h.replay.as_ref().filter(|r| r.active()).ok_or("The replay buffer is off: turn it on first.")?;
+            r.save().map_err(|e| e.to_string())?;
+            // Written in the background: stats name it (`replay.last`) once it's there.
+            Ok(json!({ "file": null }))
+        })
+        .await?
+    }
+
+    async fn virtual_camera(&self, on: bool, source: Option<String>) -> Result<Value, String> {
+        self.on_main(move |h| {
+            h.virtualcam = None;
+            if !on {
+                return Ok(json!({ "active": false }));
+            }
+            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let shows = source.map_or(ferrocast_studio::CameraShows::Program, ferrocast_studio::CameraShows::Source);
+            let cam = studio.virtual_camera(&shows).map_err(|e| e.to_string())?;
+            h.virtualcam = Some(cam);
+            Ok(json!({ "active": true }))
         })
         .await?
     }
@@ -1335,7 +1407,9 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn restart(&self) -> Result<(), String> {
-        let busy = self.on_main(|h| h.stream.is_some() || h.record.is_some()).await?;
+        let busy = self
+            .on_main(|h| h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some())
+            .await?;
         if busy {
             return Err("Stop streaming and recording before Ferrocast opens again.".into());
         }

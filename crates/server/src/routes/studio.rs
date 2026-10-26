@@ -105,6 +105,9 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/record", post(engine_record))
         .route("/studio/engine/record/pause", post(engine_record_pause))
         .route("/studio/engine/record/split", post(engine_record_split))
+        .route("/studio/engine/replay", post(engine_replay))
+        .route("/studio/engine/replay/save", post(engine_replay_save))
+        .route("/studio/engine/virtualcam", post(engine_virtual_camera))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
@@ -956,6 +959,29 @@ struct OnBody {
 
 async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+/// `POST /studio/engine/replay` `{ on }` → `{ active }`: OBS's replay buffer.
+async fn engine_replay(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_replay(b.on).await?))
+}
+
+/// `POST /studio/engine/replay/save` → `{ file }`: the last seconds saved to a file.
+async fn engine_replay_save(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_replay_save().await?))
+}
+
+#[derive(Deserialize)]
+struct CameraBody {
+    on: bool,
+    /// One scene or source instead of what's on air.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// `POST /studio/engine/virtualcam` `{ on, source? }` → `{ active }`.
+async fn engine_virtual_camera(State(app): State<AppState>, Body(b): Body<CameraBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_virtual_camera(b.on, b.source).await?))
 }
 
 /// `POST /studio/engine/record/split`: the recording goes on in a new file.

@@ -92,6 +92,17 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
             let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
             engine.studio_record_pause(!paused).await?;
         }
+        "replay" => {
+            let on = engine.studio_stats().await?["replay"]["active"].as_bool().unwrap_or(false);
+            engine.studio_replay(!on).await?;
+        }
+        "save_replay" => {
+            engine.studio_replay_save().await?;
+        }
+        "virtualcam" => {
+            let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
+            engine.studio_virtual_camera(!on, None).await?;
+        }
         a => {
             let audio = |name: &str, muted: bool| StudioAct::SetAudio {
                 name: name.to_string(),

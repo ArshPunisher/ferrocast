@@ -83,6 +83,19 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
     async fn record_pause(&self, on: bool) -> Result<(), String>;
+    /// Starts or stops the replay buffer → `{ active }`.
+    async fn replay(&self, _on: bool) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Saves the replay buffer's last seconds to a file → `{ file }` (null until it's written).
+    async fn replay_save(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Starts the virtual camera showing what's on air (`source` None) or one scene or
+    /// source, or stops it → `{ active }`.
+    async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Starts a new file of the recording now (OBS's Split recording).
     async fn record_split(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -449,6 +462,11 @@ pub struct StudioSettings {
     pub record_tracks: Vec<u8>,
     /// An MKV, FLV or TS recording becomes an MP4 when it ends (the original is kept).
     pub record_remux: bool,
+    /// The replay buffer keeps the last this many seconds (5 to 21600), at most this many
+    /// megabytes (0: no limit), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
+    pub replay_seconds: u32,
+    pub replay_mb: u32,
+    pub replay_format: String,
 }
 
 impl Default for StudioSettings {
@@ -487,6 +505,9 @@ impl Default for StudioSettings {
             record_split_mb: 0,
             record_tracks: vec![1],
             record_remux: true,
+            replay_seconds: 30,
+            replay_mb: 0,
+            replay_format: "mp4".into(),
         }
     }
 }
@@ -558,6 +579,12 @@ impl StudioSettings {
         if self.record_split_minutes > 24 * 60 || self.record_split_mb > 1_000_000 {
             return bad("record_split: up to 1440 minutes or 1000000 MB (0: never).");
         }
+        if !(5..=21_600).contains(&self.replay_seconds) || self.replay_mb > 1_000_000 {
+            return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000).");
+        }
+        if !["mp4", "mkv", "mov", "flv", "ts"].contains(&self.replay_format.as_str()) {
+            return bad("replay_format: mp4, mkv, mov, flv or ts.");
+        }
         if self.record_tracks.is_empty()
             || self.record_tracks.len() > 6
             || self.record_tracks.iter().any(|t| !(1..=6).contains(t))
@@ -582,13 +609,14 @@ impl StudioSettings {
             return bad("hotkeys: up to 200.");
         }
         for (action, keys) in &self.hotkeys {
-            let known = ["go_live", "end_stream", "record", "pause_record"].contains(&action.as_str())
+            let known = ["go_live", "end_stream", "record", "pause_record", "replay", "save_replay", "virtualcam"]
+                .contains(&action.as_str())
                 || ["scene:", "mute:", "push_to_talk:"]
                     .iter()
                     .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()));
             if !known {
                 return bad(
-                    "hotkeys: go_live, end_stream, record, pause_record, scene:, mute: or push_to_talk: a name.",
+                    "hotkeys: go_live, end_stream, record, pause_record, replay, save_replay, virtualcam, scene:, mute: or push_to_talk: a name.",
                 );
             }
             if keys.is_empty()
@@ -1265,6 +1293,21 @@ impl Engine {
 
     pub async fn studio_record_pause(&self, on: bool) -> Result<(), EngineError> {
         self.studio_host()?.record_pause(on).await.map_err(failed)
+    }
+
+    pub async fn studio_replay(&self, on: bool) -> Result<Value, EngineError> {
+        self.studio_host()?.replay(on).await.map_err(failed)
+    }
+
+    pub async fn studio_replay_save(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.replay_save().await.map_err(failed)
+    }
+
+    pub async fn studio_virtual_camera(&self, on: bool, source: Option<String>) -> Result<Value, EngineError> {
+        if let Some(s) = &source {
+            check_source_name(s)?;
+        }
+        self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
     }
 
     pub async fn studio_record_split(&self) -> Result<(), EngineError> {
