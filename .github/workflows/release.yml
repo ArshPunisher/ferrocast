@@ -13,9 +13,12 @@ name: Release
 # Needs, in this repo's settings:
 #   secrets FERROCAST_YOUTUBE_CLIENT_SECRET, TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) for updates;
 #   variables FERROCAST_TWITCH_CLIENT_ID and FERROCAST_YOUTUBE_CLIENT_ID.
-# macOS builds are ad-hoc signed (no paid Apple account): people install with Homebrew
-# (packaging/homebrew) or open the DMG and press "Open Anyway" once. Windows builds are
-# unsigned until SignPath (R-61).
+#   secrets MACOS_SIGNING_P12 (base64) and MACOS_SIGNING_P12_PASSWORD: Ferrocast's own
+#   long-lived signing certificate (R-80). Without them macOS builds are ad-hoc signed again.
+# macOS builds are signed with that self-made certificate (no paid Apple account), so macOS
+# keeps Camera, Microphone and Screen Recording answers across updates; people still install
+# with Homebrew (packaging/homebrew) or open the DMG and press "Open Anyway" once. Windows
+# builds are unsigned until SignPath (R-61).
 
 on:
   push:
@@ -119,6 +122,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
+      - name: Signing identity (macOS)
+        if: matrix.name == 'macOS'
+        shell: bash
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          if [[ -z "$MACOS_SIGNING_P12" ]]; then
+            echo "::warning::No MACOS_SIGNING_P12: ad-hoc signed, so macOS forgets permissions on this update."
+            exit 0
+          fi
+          id=$(deploy/macos-signing.sh setup)
+          echo "APPLE_SIGNING_IDENTITY=$id" >> "$GITHUB_ENV"
       - name: Build the app
         shell: bash
         env:
@@ -145,6 +161,19 @@ jobs:
           if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           cargo tauri build ${{ matrix.args }} $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
+      - name: Remove the signing keychain
+        if: always() && matrix.name == 'macOS'
+        shell: bash
+        run: deploy/macos-signing.sh teardown || true
+      - name: Check the signature
+        if: matrix.name == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        shell: bash
+        # Every build must be the same app to macOS: signed by our certificate, not ad-hoc.
+        run: |
+          app=$(ls -d ${{ matrix.out }}/macos/*.app)
+          codesign --verify --deep --strict "$app"
+          codesign -d -r- "$app" 2>&1 | grep -q 'certificate root = H"2b833f5797f85453043b7c4ac7bc18d6d644bcef"' \
+            || { echo "::error::the app isn't signed with Ferrocast's certificate"; exit 1; }
       - name: Check the install window
         if: matrix.name == 'macOS'
         shell: bash

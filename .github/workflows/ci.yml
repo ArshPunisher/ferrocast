@@ -55,6 +55,7 @@ jobs:
           deploy/tests/deploy-relay-env.test.sh
           deploy/tests/dashboard-swap.test.sh
           deploy/tests/control-center-key.test.sh
+          deploy/tests/macos-signing.test.sh
 
   test:
     name: Tests (${{ matrix.os }})

@@ -30,6 +30,8 @@ summary says what went live, or that the previous version was put back.
 | `tests/razorpay-keys.test.sh` | CI, your Mac | Tests `razorpay-keys.sh` against a fake Razorpay |
 | `vault-key.sh` | server (`/opt/ferrocast-relay/vault-key.sh`) | Makes the relay's vault key (`RELAY_VAULT_KEY`) once, without ever showing it (below) |
 | `tests/vault-key.test.sh` | CI, your Mac | Tests `vault-key.sh` |
+| `macos-signing.sh` | CI (Release), your Mac | Puts Ferrocast's own signing certificate in a throwaway keychain for one macOS build (`setup`), then removes it (`teardown`); never prints it. Every build signed with it is the same app to macOS, so Camera, Microphone and Screen Recording stay allowed after updates |
+| `tests/macos-signing.test.sh` | CI, your Mac | Tests `macos-signing.sh` with a stand-in `security` |
 | `pro-keys.sh` | server (`/opt/ferrocast-relay/pro-keys.sh`) | Types Pro's service keys (Google voices, the Discord bot, the weekly email's Brevo key, the cloud bot's Twitch app and Google client, custom tip addresses' Cloudflare token and zone, Google sign-in for accounts with `--google`) with typing hidden, never showing them (below) |
 | `tests/pro-keys.test.sh` | CI, your Mac | Tests `pro-keys.sh` |
 | `pro-grant.sh` | server (`/opt/ferrocast-relay/pro-grant.sh`) | The owner's test Pro for one install, without Razorpay (below) |
