@@ -55,8 +55,8 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [x] P1 Transform: position, rotation, size, crop, bounds (8 kinds), alignment (9 points),
   flip, fit/stretch/center to screen, reset, copy/paste transform, edit transform dialog,
   snapping (screen, sources, center) with sensitivity.
-- [ ] P2 Per item: blending mode (8) and method, scale filtering (6), deinterlacing (7 modes,
-  field order), show/hide transitions with duration, "Resize output (canvas) to source size".
+- [x] P2 Per item: blending mode (8) and method, scale filtering (6), deinterlacing (7 modes,
+  field order), show/hide transitions with duration, "Resize output (canvas) to source size" (26 Oct evening; blending method still to come).
 - [x] P1 Properties, filters, interact (browser and windows), screenshot of a source, open
   source projector, "Hide in mixer".
 - [ ] P2 Missing files dialog (find, replace, search folder). *Better: found automatically by
@@ -70,7 +70,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 ### Audio
 - [ ] P1 Mixer: volume (dB/%), mute, meters (peak, input peak, RMS), push-to-talk and push-to-mute
   with delays, monitoring (off / monitor only / monitor and output), monitoring device.
-- [ ] P2 Advanced audio: balance, mono, sync offset, tracks 1 to 6 per source, active-only view.
+- [x] P2 Advanced audio: balance, mono, sync offset, tracks 1 to 6 per source (26 Oct evening: one table for every sound, cards on a phone).
 - [ ] P1 Audio settings: sample rate, channels (mono to 7.1), global devices (2 desktop, 4 mic),
   meter decay and peak meter type, low-latency buffering.
 - [ ] P1 Filters: noise suppression (RNNoise, Speex, NVIDIA), noise gate, gain, compressor,
@@ -92,8 +92,10 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 ### Transitions
 - [x] P1 Cut, fade, swipe, slide, fade to color, luma wipe, stinger (video, transition point,
   audio fade style, track matte), duration, per-scene override, quick transitions (26 Oct).
-- [x] P2 Studio mode: preview/program, transition button, quick transitions (26 Oct). T-bar,
-  swap, duplicate scene and "Transition on double click" still to come. *Better: our motion themes ship matching stingers.*
+- [x] P2 Studio mode: preview/program, transition button, quick transitions, T-bar (held, back,
+  finish as OBS), swap, duplicate scene and sources, swap after transition, transition on
+  double-click, fade to black (26 Oct). OBS's own bugs avoided: an aborted T-bar leaving the
+  wrong scene on air, a click mid-transition, the T-bar track acting on clicks. *Better: our motion themes ship matching stingers.*
 
 ### Streaming
 - ✅ Multistream to Twitch, YouTube, Kick and custom servers, health, reconnects, upload check,
@@ -130,7 +132,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [ ] P2 Docks (lock, reset, custom browser docks), Stats dock (CPU, memory, disk, FPS, render
   lag, encoding lag, dropped frames per output), multiview (layouts, labels), projectors
   (fullscreen per monitor, windowed, always on top).
-- [x] P1 Undo/redo (26 Oct: every change to sources; scene and filter changes still to come). *Better: a history list you can step back through.*
+- [x] P1 Undo/redo (26 Oct: sources, scenes, filters, settings, sound, item transitions, deinterlacing; shortcuts aren't steps). *Better: a history list you can step back through (done).*
 - [ ] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
   plugin manager, safe mode, "show recording/streaming in title bar".
 - [ ] P1 *Better: settings search; plain-language errors with the fix (R-08); a phone as a
