@@ -54,6 +54,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
         .route("/studio/engine/screens", get(engine_screens))
+        .route("/studio/engine/library/{kind}", get(engine_shelf_list).post(engine_shelf_new))
+        .route("/studio/engine/library/{kind}/current", put(engine_shelf_switch))
+        .route("/studio/engine/library/{kind}/import", post(engine_shelf_import))
+        .route("/studio/engine/library/{kind}/{id}", delete(engine_shelf_remove))
+        .route("/studio/engine/library/{kind}/{id}/rename", post(engine_shelf_rename))
+        .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
         .route(
@@ -590,6 +596,77 @@ async fn engine_projector(
 async fn engine_close_projectors(State(app): State<AppState>) -> ApiResult<StatusCode> {
     app.engine.studio_close_projectors().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+use ferrocast_engine::studio_host::ShelfAct;
+
+async fn engine_shelf_list(State(app): State<AppState>, Path(kind): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_shelf(&kind, ShelfAct::List).await?))
+}
+
+#[derive(Deserialize)]
+struct ShelfNewBody {
+    name: String,
+    #[serde(default)]
+    copy: bool,
+}
+
+/// `POST /studio/engine/library/{kind}` `{ name, copy? }` → 201 `{ id }`, switched to.
+async fn engine_shelf_new(
+    State(app): State<AppState>,
+    Path(kind): Path<String>,
+    Body(b): Body<ShelfNewBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let v = app.engine.studio_shelf(&kind, ShelfAct::New { name: b.name, copy: b.copy }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_shelf_switch(
+    State(app): State<AppState>,
+    Path(kind): Path<String>,
+    Body(b): Body<IdBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_shelf(&kind, ShelfAct::Switch { id: b.id }).await?))
+}
+
+async fn engine_shelf_rename(
+    State(app): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+    Body(b): Body<NameBody>,
+) -> ApiResult<StatusCode> {
+    app.engine.studio_shelf(&kind, ShelfAct::Rename { id, name: b.name }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_shelf_remove(
+    State(app): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    app.engine.studio_shelf(&kind, ShelfAct::Remove { id }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_shelf_export(
+    State(app): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_shelf(&kind, ShelfAct::Export { id }).await?))
+}
+
+#[derive(Deserialize)]
+struct ImportBody {
+    name: String,
+    doc: Value,
+}
+
+/// `POST /studio/engine/library/collections/import` `{ name, doc }` → 201, what came in.
+async fn engine_shelf_import(
+    State(app): State<AppState>,
+    Path(kind): Path<String>,
+    Body(b): Body<ImportBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let v = app.engine.studio_shelf(&kind, ShelfAct::Import { name: b.name, doc: b.doc }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
 }
 
 async fn engine_screens(State(app): State<AppState>) -> ApiResult<Json<Value>> {

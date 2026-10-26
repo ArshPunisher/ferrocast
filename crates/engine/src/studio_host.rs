@@ -121,6 +121,87 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn screens(&self) -> Result<Value, String> {
         Ok(serde_json::json!([]))
     }
+    /// Scene collections or profiles (`kind`): list, make, switch, rename, remove, export,
+    /// import.
+    async fn shelf(&self, _kind: String, _act: ShelfAct) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+}
+
+/// Something to do with the scene collections or profiles (OBS's menus of those names).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "act")]
+pub enum ShelfAct {
+    /// `{ current, list: { id, name }[] }`.
+    List,
+    /// A new one (empty, or a copy of the one in use), switched to → `{ id }`.
+    New {
+        name: String,
+        #[serde(default)]
+        copy: bool,
+    },
+    Switch {
+        id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    /// Not the one in use (switch first), nor the last.
+    Remove {
+        id: String,
+    },
+    /// The file as OBS writes it (a collection) or the settings (a profile).
+    Export {
+        id: String,
+    },
+    /// A collection file (OBS's or Ferrocast's) as a new collection, switched to → what came in.
+    Import {
+        name: String,
+        doc: Value,
+    },
+}
+
+impl ShelfAct {
+    pub fn check(&self, kind: &str) -> Result<(), EngineError> {
+        if !matches!(kind, "collections" | "profiles") {
+            return Err(EngineError::Invalid("kind: collections or profiles.".into()));
+        }
+        let name = |n: &str| {
+            let t = n.trim();
+            if t.is_empty() || t.chars().count() > 100 || t.chars().any(char::is_control) {
+                return Err(EngineError::Invalid("name: 1 to 100 characters.".into()));
+            }
+            Ok(())
+        };
+        let id = |i: &str| {
+            if i.is_empty() || i.len() > 64 || !i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(EngineError::Invalid("id: one from the list.".into()));
+            }
+            Ok(())
+        };
+        match self {
+            ShelfAct::List => Ok(()),
+            ShelfAct::New { name: n, .. } => name(n),
+            ShelfAct::Switch { id: i } | ShelfAct::Remove { id: i } | ShelfAct::Export { id: i } => id(i),
+            ShelfAct::Rename { id: i, name: n } => {
+                id(i)?;
+                name(n)
+            }
+            ShelfAct::Import { name: n, doc } => {
+                if kind != "collections" {
+                    return Err(EngineError::Invalid("Only scene collections can be imported.".into()));
+                }
+                name(n)?;
+                if !doc.get("sources").is_some_and(Value::is_array) {
+                    return Err(EngineError::Invalid(
+                        "doc: a scene collection file (OBS's, with a sources list).".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A projector to open: what's on air, one scene or source, or every scene (a multiview).
@@ -1034,6 +1115,12 @@ impl Engine {
         self.studio_host()?.close_projectors().await.map_err(failed)
     }
 
+    /// Scene collections or profiles: one act on that list.
+    pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
+        act.check(kind)?;
+        self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)
+    }
+
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {
         self.studio_host()?.screens().await.map_err(failed)
     }
@@ -1081,6 +1168,15 @@ fn failed(message: String) -> EngineError {
     }
     if message.starts_with("There's no filter called") {
         return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
+    }
+    if message.contains("already a scene collection called") || message.contains("already a profile called") {
+        return refused(409, "studio_name_taken", message, "Pick another name.");
+    }
+    if message.contains("in use now") {
+        return refused(409, "studio_in_use", message, "Switch to another one first.");
+    }
+    if message.contains("There's no scene collection") || message.contains("There's no profile") {
+        return refused(404, "studio_no_such", message, "Refresh the list.");
     }
     if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
@@ -1320,6 +1416,29 @@ mod tests {
         assert!(ts("swipe_transition", serde_json::json!({})).changes());
         for bad in [ts("explode_transition", serde_json::json!({})), ts("fade_transition", serde_json::json!(3))] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
+
+        // Collections and profiles: names, ids and import files are checked first.
+        let bad_shelf = [
+            ("collections", ShelfAct::New { name: " ".into(), copy: false }),
+            ("collections", ShelfAct::Switch { id: "../x".into() }),
+            ("profiles", ShelfAct::Import { name: "x".into(), doc: serde_json::json!({ "sources": [] }) }),
+            ("collections", ShelfAct::Import { name: "x".into(), doc: serde_json::json!({ "scenes": 1 }) }),
+            ("things", ShelfAct::List),
+        ];
+        for (kind, act) in bad_shelf {
+            assert!(matches!(e.studio_shelf(kind, act.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{act:?}");
+        }
+        assert!(matches!(
+            e.studio_shelf("collections", ShelfAct::List).await.unwrap_err(),
+            EngineError::Refused { code: "studio_not_here", .. }
+        ));
+        for (m, code) in [
+            ("There's already a scene collection called \"Show\".", "studio_name_taken"),
+            ("\"Show\" is in use now.", "studio_in_use"),
+            ("There's no profile with that id.", "studio_no_such"),
+        ] {
+            assert!(matches!(failed(m.into()), EngineError::Refused { code: c, .. } if c == code), "{m}");
         }
 
         // Projectors: what to show is checked first; hosts without windows say so.
