@@ -5,7 +5,7 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.1.0
+## 2.1.1
 
 **The Studio: stream without OBS.** Ferrocast now has OBS's own engine inside it. Studio,
 Go live, Ferrocast shows your scenes, sources, sound and the live picture in one window, and
@@ -23,6 +23,7 @@ goes live to Twitch, YouTube and Kick straight from there.
   encoder, replay buffer and Save replay.
 - Send straight by SRT, RIST or WebRTC too, next to your platforms.
 - A mixer with true-peak meters, monitoring, advanced audio, and low latency sound.
+- Works with OBS 32 and OBS 33.
 - Set up for me picks good settings for your computer and your upload. The log opens in the
   app with your keys taken out.
 
