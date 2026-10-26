@@ -618,8 +618,10 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
 fn save(c: &Collection, file: &std::path::Path) {
     let doc = c.save(COLLECTION);
     let tmp = file.with_extension("json.tmp");
-    let written = serde_json::to_vec_pretty(&doc)
-        .map_err(std::io::Error::other)
+    // On a new install the collections folder isn't there yet (2.1 found every save failing).
+    let folder = file.parent().map_or(Ok(()), std::fs::create_dir_all);
+    let written = folder
+        .and_then(|()| serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other))
         .and_then(|bytes| std::fs::write(&tmp, bytes))
         .and_then(|()| std::fs::rename(&tmp, file));
     if let Err(e) = written {
