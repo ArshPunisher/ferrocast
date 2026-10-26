@@ -45,6 +45,14 @@ struct Held {
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
     selected: Option<(String, i64)>,
+    /// The scene whose sources the preview outlines, each in its colour.
+    frames: Option<String>,
+    /// Where the canvas is inside the preview's box (points), when the page placed it.
+    preview_canvas: Option<(f64, f64, f64, f64)>,
+    /// The page's colour round the canvas (0xAABBGGRR), when it said.
+    preview_bg: Option<u32>,
+    /// The same for Studio Mode's picture of what's on air.
+    program_bg: Option<u32>,
     /// Undo and redo for sources.
     history: History,
     /// Studio Mode's picture of what's on air, beside the preview, and where it goes.
@@ -213,6 +221,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     });
     h.history.clear();
     h.selected = None;
+    h.frames = None;
     // The old scenes are going: the preview lets go of the one it shows (a scene of the same
     // name in the new set is another source).
     if let Some(p) = &h.preview {
@@ -646,7 +655,12 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    h.program_view = Some(studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?);
+    let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    // Made again (a new canvas size): the stage keeps the page's colour.
+    if let Some(c) = h.program_bg {
+        p.background(c);
+    }
+    h.program_view = Some(p);
     Ok(())
 }
 
@@ -656,8 +670,15 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    let mut p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    if let Some(c) = h.preview_canvas {
+        p.set_area(rect, c, scale);
+    }
     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+    p.frames(h.frames.as_deref());
+    if let Some(c) = h.preview_bg {
+        p.background(c);
+    }
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -867,9 +888,15 @@ impl StudioHost for DesktopStudio {
             h.program_at = Some((rect, scale));
             if let Some(p) = h.program_view.as_mut() {
                 p.set_rect(rect, scale);
-                return Ok(());
+            } else {
+                make_program_view(&app, h)?;
             }
-            make_program_view(&app, h)
+            // The stage round it matches the page's theme.
+            h.program_bg = r.bg_abgr();
+            if let (Some(p), Some(c)) = (h.program_view.as_ref(), h.program_bg) {
+                p.background(c);
+            }
+            Ok(())
         })
         .await?
     }
@@ -886,8 +913,16 @@ impl StudioHost for DesktopStudio {
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
             h.preview_at = Some((rect, scale));
+            h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
+            h.preview_bg = r.bg_abgr();
             if let Some(p) = h.preview.as_mut() {
-                p.set_rect(rect, scale);
+                if let Some(c) = h.preview_bg {
+                    p.background(c);
+                }
+                match h.preview_canvas {
+                    Some(c) => p.set_area(rect, c, scale),
+                    None => p.set_rect(rect, scale),
+                }
                 return Ok(());
             }
             make_preview(&app, h)
@@ -927,10 +962,12 @@ impl StudioHost for DesktopStudio {
                 .map_err(|e| e.to_string())?;
                 return Ok(json!({ "file": path.display().to_string() }));
             }
-            if let StudioAct::Select { scene, id } = &act {
+            if let StudioAct::Select { scene, id, frames } = &act {
                 h.selected = scene.clone().zip(*id);
+                h.frames = if *frames { scene.clone() } else { None };
                 if let Some(p) = &h.preview {
                     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+                    p.frames(h.frames.as_deref());
                 }
                 return Ok(Value::Null);
             }

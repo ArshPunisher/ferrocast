@@ -592,7 +592,13 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": null, "id": null })).await,
+        r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": null, "frames": true })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/order", json!({ "to": 0 })).await,
+        r.put(
+            "/studio/engine/preview",
+            json!({ "rect": { "x": 0, "y": 0, "w": 800, "h": 500, "canvas": { "x": 80, "y": 50, "w": 640, "h": 360 } } }),
+        )
+        .await,
         r.post("/studio/engine/pick-file", json!({ "kind": "file", "filter": "Images (*.png)" })).await,
         r.get("/studio/engine/screen-access").await,
         r.post("/studio/engine/screen-access/fix", json!({})).await,
@@ -628,6 +634,12 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/scenes/Gameplay/items/x/edit", json!({ "do": "lock" })).await, "id not a number"),
         (r.put("/studio/engine/scenes/Gameplay/items/3/order", json!({ "to": 20000 })).await, "place too far"),
         (r.put("/studio/engine/scenes/Gameplay/items/3/order", json!({ "to": -1 })).await, "place below 0"),
+        (r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": null })).await, "scene alone"),
+        (
+            r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 800, "h": 500, "canvas": { "x": 0, "y": 0, "w": 0, "h": 360 } } }))
+                .await,
+            "canvas 0 wide",
+        ),
         (r.put("/studio/engine/sources/Mic/audio", json!({ "volume_db": 99 })).await, "too loud"),
         (r.put("/studio/engine/sources/Mic/audio", json!({ "monitor": "everyone" })).await, "unknown monitor"),
         (r.put("/studio/engine/transition", json!({ "kind": "fade_transition", "ms": 999999 })).await, "too long"),

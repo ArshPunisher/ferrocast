@@ -1128,6 +1128,7 @@ impl Studio {
     pub fn preview(&self, window: RawWindowHandle, rect: Rect, scale: f64) -> Result<Preview, StudioError> {
         #[cfg(target_os = "macos")]
         {
+            let rect = with_edge(rect);
             let RawWindowHandle::AppKit(h) = window else {
                 return Err(StudioError::Failed("that isn't a macOS window".into()));
             };
@@ -1143,7 +1144,8 @@ impl Studio {
                 zsformat: ffi::GS_ZS_NONE,
                 adapter: 0,
             };
-            // The clear colour (0xAABBGGRR) is the Studio's stage, #0a0b0d, never red.
+            // The clear colour (0xAABBGGRR) is the Studio's stage, #0a0b0d, never red; the page
+            // sends its own colour (`background`) so the stage matches the theme.
             let display = self.inner.api.obs_display_create(&init, 0xFF0D_0B0A);
             if display.is_null() {
                 view.remove();
@@ -1154,6 +1156,9 @@ impl Studio {
                 base: (self.canvas().width, self.canvas().height),
                 selected: std::sync::Mutex::new(None),
                 scene: std::sync::Mutex::new(ptr::null_mut()),
+                edge: std::sync::atomic::AtomicU32::new(edge_px(scale)),
+                canvas: std::sync::Mutex::new(None),
+                frames: std::sync::Mutex::new(None),
             });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
@@ -1165,6 +1170,38 @@ impl Studio {
             Err(StudioError::Failed("the preview isn't on this system yet".into()))
         }
     }
+}
+
+/// libobs reads a display's colour as sRGB and clears with it in linear light, so a colour
+/// shows darker than asked (#23272e near black). Encoding it once more makes it show as asked.
+fn srgb_encoded(abgr: u32) -> u32 {
+    let enc = |c: u32| {
+        let v = c as f64 / 255.0;
+        let e = if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        (e * 255.0).round().clamp(0.0, 255.0) as u32
+    };
+    (abgr & 0xff00_0000) | enc(abgr >> 16 & 0xff) << 16 | enc(abgr >> 8 & 0xff) << 8 | enc(abgr & 0xff)
+}
+
+/// The margin round a preview's picture, in points, as OBS's own: the outline and handles of
+/// an item at the canvas's edge show in it instead of being cut off. The native view is this
+/// much bigger than the page's box on every side, so the picture stays exactly on the box.
+const PREVIEW_EDGE: f64 = 10.0;
+
+fn with_edge(r: Rect) -> Rect {
+    Rect {
+        x: r.x - PREVIEW_EDGE,
+        y: r.y - PREVIEW_EDGE,
+        w: r.w + 2.0 * PREVIEW_EDGE,
+        h: r.h + 2.0 * PREVIEW_EDGE,
+        vh: r.vh,
+    }
+}
+
+/// The margin in device pixels.
+fn edge_px(scale: f64) -> u32 {
+    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    (PREVIEW_EDGE * s).round() as u32
 }
 
 /// A rectangle in device pixels (at least 1x1).
@@ -1187,7 +1224,12 @@ pub struct Preview {
 impl Preview {
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: Rect, scale: f64) {
+        let rect = with_edge(rect);
         self.scale = scale;
+        if let Ok(mut g) = self.state.canvas.lock() {
+            *g = None;
+        }
+        self.state.edge.store(edge_px(scale), std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
         let (cx, cy) = px(rect, scale);
@@ -1228,6 +1270,33 @@ impl Preview {
         if let Ok(mut sel) = self.state.selected.lock() {
             *sel = pick;
         }
+    }
+
+    /// The colour round the canvas (0xAABBGGRR), to match the page's theme.
+    pub fn background(&self, abgr: u32) {
+        self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr));
+    }
+
+    /// Outlines every source of `scene` in its own colour, or none.
+    pub fn frames(&self, scene: Option<&str>) {
+        if let Ok(mut f) = self.state.frames.lock() {
+            *f = scene.map(cstr);
+        }
+    }
+
+    /// Covers `area` (the page's whole stage) and draws the canvas at `canvas` inside it
+    /// (points, from the area's top left): zoomed out, the outlines of what's off the canvas
+    /// show round it. Main thread.
+    pub fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+        self.scale = scale;
+        #[cfg(target_os = "macos")]
+        self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        let (cx, cy) = px(area, scale);
+        let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        if let Ok(mut g) = self.state.canvas.lock() {
+            *g = Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
+        }
+        self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
 }
 
@@ -2427,6 +2496,15 @@ impl Drop for Streaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_colour_is_encoded_for_libobs() {
+        // Black and white stay; a dark grey is lifted so it shows as asked.
+        assert_eq!(srgb_encoded(0xff00_0000), 0xff00_0000);
+        assert_eq!(srgb_encoded(0xffff_ffff), 0xffff_ffff);
+        let g = srgb_encoded(0xff2e_2723) & 0xff;
+        assert!((95..110).contains(&g), "{g}");
+    }
 
     #[test]
     fn obs_app_paths() {

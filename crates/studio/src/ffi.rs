@@ -421,6 +421,7 @@ api! {
     obs_get_total_frames: fn() -> u32;
     obs_get_lagged_frames: fn() -> u32;
     obs_display_create: fn(a: *const GsInitData, b: u32) -> *mut ObsDisplay;
+    obs_display_set_background_color: fn(a: *mut ObsDisplay, b: u32);
     obs_display_destroy: fn(a: *mut ObsDisplay);
     obs_display_resize: fn(a: *mut ObsDisplay, b: u32, c: u32);
     obs_display_add_draw_callback: fn(a: *mut ObsDisplay, b: DrawCallback, c: *mut c_void);
@@ -451,6 +452,7 @@ api! {
     obs_sceneitem_locked: fn(a: *const ObsSceneItem) -> bool;
     obs_sceneitem_set_order: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_is_group: fn(a: *mut ObsSceneItem) -> bool;
+    obs_sceneitem_get_draw_transform: fn(a: *mut ObsSceneItem, b: *mut Matrix4);
     obs_scene_duplicate: fn(a: *mut ObsScene, b: *const c_char, c: c_int) -> *mut ObsScene;
     obs_source_set_name: fn(a: *mut ObsSource, b: *const c_char);
     obs_source_get_output_flags: fn(a: *const ObsSource) -> u32;
@@ -576,11 +578,11 @@ api! {
     gs_effect_set_vec4: fn(a: *mut GsEparam, b: *const Vec4);
     obs_get_base_effect: fn(a: c_int) -> *mut GsEffect;
     obs_property_path_type: fn(a: *mut ObsProperty) -> c_int;
-    obs_property_path_filter: fn(a: *mut ObsProperty) -> *const c_char;
-    obs_property_editable_list_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_text_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_text_monospace: fn(a: *mut ObsProperty) -> bool;
     obs_property_text_set_monospace: fn(a: *mut ObsProperty, b: bool);
+    obs_property_path_filter: fn(a: *mut ObsProperty) -> *const c_char;
+    obs_property_editable_list_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_group_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_editable_list_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_enter_graphics: fn();
@@ -848,6 +850,88 @@ pub(crate) struct DrawState {
     /// A scene to show instead of what's on air (Studio Mode's preview): our reference, and
     /// showing. Null for what's on air.
     pub scene: std::sync::Mutex<*mut ObsSource>,
+    /// The margin round the picture, in device pixels: the view is bigger than the page's box
+    /// by this much on every side, for handles at the canvas's edge.
+    pub edge: std::sync::atomic::AtomicU32,
+    /// Where the canvas is inside the view (device pixels: x, y, w, h), when the page says;
+    /// else it's fitted inside the margin. Around it, outlines of what's off the canvas show.
+    pub canvas: std::sync::Mutex<Option<(f32, f32, f32, f32)>>,
+    /// A scene whose sources all get an outline, each in its own colour.
+    pub frames: std::sync::Mutex<Option<std::ffi::CString>>,
+}
+
+/// The colours of sources' outlines, picked by item id (`id % 8`); the page's list shows the
+/// same: orange, sky, lime, pink, amber, violet, teal, blue.
+pub const FRAME_COLORS: [(f32, f32, f32); 8] = [
+    (1.0, 0.353, 0.122),
+    (0.2, 0.831, 1.0),
+    (0.639, 0.902, 0.208),
+    (0.957, 0.447, 0.714),
+    (0.98, 0.8, 0.082),
+    (0.655, 0.545, 0.98),
+    (0.176, 0.831, 0.749),
+    (0.376, 0.647, 0.98),
+];
+
+fn frame_color(id: i64) -> Vec4 {
+    let (x, y, z) = FRAME_COLORS[id.rem_euclid(8) as usize];
+    Vec4 { x, y, z, w: 1.0 }
+}
+
+/// Every showing source's box in a scene, bottom first (groups' own sources too, placed by
+/// their group's transform as OBS's preview places them).
+struct AllBoxes<'a> {
+    api: &'a Api,
+    found: Vec<(i64, Matrix4)>,
+    /// While walking a group: the group's transform (its space to the canvas).
+    parent: Option<Matrix4>,
+}
+
+/// `g` after `m`: a box in a group's space put on the canvas (2D parts only).
+fn then(m: &Matrix4, g: &Matrix4) -> Matrix4 {
+    let map = |v: &Vec4, w: f32| Vec4 {
+        x: g.x.x * v.x + g.y.x * v.y + w * g.t.x,
+        y: g.x.y * v.x + g.y.y * v.y + w * g.t.y,
+        z: v.z,
+        w: v.w,
+    };
+    Matrix4 { x: map(&m.x, 0.0), y: map(&m.y, 0.0), z: m.z, t: map(&m.t, 1.0) }
+}
+
+unsafe extern "C" fn all_boxes_cb(_s: *mut ObsScene, item: *mut ObsSceneItem, param: *mut c_void) -> bool {
+    // SAFETY: `param` is the `&mut AllBoxes` all_boxes passes for this synchronous enum call.
+    let f = unsafe { &mut *(param as *mut AllBoxes) };
+    if f.api.obs_sceneitem_visible(item) {
+        let mut m = Matrix4::default();
+        f.api.obs_sceneitem_get_box_transform(item, &mut m);
+        let m = match &f.parent {
+            Some(g) => then(&m, g),
+            None => m,
+        };
+        f.found.push((f.api.obs_sceneitem_get_id(item), m));
+        if f.parent.is_none() && f.api.obs_sceneitem_is_group(item) {
+            let mut g = Matrix4::default();
+            f.api.obs_sceneitem_get_draw_transform(item, &mut g);
+            f.parent = Some(g);
+            f.api.obs_sceneitem_group_enum_items(item, all_boxes_cb, param);
+            f.parent = None;
+        }
+    }
+    true
+}
+
+fn all_boxes(api: &Api, scene: &std::ffi::CStr) -> Vec<(i64, Matrix4)> {
+    let src = api.obs_get_source_by_name(scene.as_ptr());
+    if src.is_null() {
+        return Vec::new();
+    }
+    let sc = api.obs_scene_from_source(src);
+    let mut f = AllBoxes { api, found: Vec::new(), parent: None };
+    if !sc.is_null() {
+        api.obs_scene_enum_items(sc, all_boxes_cb, &mut f as *mut AllBoxes as *mut c_void);
+    }
+    api.obs_source_release(src);
+    f.found
 }
 
 /// What `find_box` looks for and found.
@@ -892,8 +976,9 @@ fn item_box(api: &Api, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
 const OBS_EFFECT_SOLID: c_int = 3;
 
 /// Draws `m`'s box (a unit square mapped onto the canvas) as OBS's preview does: an outline
-/// and eight handles. `px` is one screen pixel in canvas units.
-fn draw_selection(api: &Api, m: &Matrix4, px: f32) {
+/// and, when `handles`, eight handles; in `rim`, the source's colour. `px` is one screen pixel
+/// in canvas units.
+fn draw_selection(api: &Api, m: &Matrix4, px: f32, rim: &Vec4, handles: bool, thick: f32) {
     let effect = api.obs_get_base_effect(OBS_EFFECT_SOLID);
     if effect.is_null() {
         return;
@@ -916,26 +1001,45 @@ fn draw_selection(api: &Api, m: &Matrix4, px: f32) {
         api.gs_matrix_pop();
     };
     let corners = [at(0.0, 0.0), at(1.0, 0.0), at(1.0, 1.0), at(0.0, 1.0)];
-    // Ferrocast's orange, #ff5a1f.
-    let orange = Vec4 { x: 1.0, y: 0.353, z: 0.122, w: 1.0 };
     let white = Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 };
     for i in 0..4 {
         let (a, b) = (corners[i], corners[(i + 1) % 4]);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len = (dx * dx + dy * dy).sqrt();
         if len > 0.0 {
-            quad(&orange, a.0, a.1, dy.atan2(dx), len, 2.0 * px);
+            quad(rim, a.0, a.1, dy.atan2(dx), len, thick * px);
         }
     }
-    // Handles: white squares with an orange rim, at the corners and the middle of each side.
-    let handles = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.0, 0.5)];
-    for (size, c) in [(10.0, &orange), (6.0, &white)] {
-        for (u, v) in handles {
+    if !handles {
+        return;
+    }
+    // Handles: white squares with a rim in the source's colour, at the corners and the middle
+    // of each side.
+    let spots = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.0, 0.5)];
+    for (size, c) in [(10.0, rim), (6.0, &white)] {
+        for (u, v) in spots {
             let (x, y) = at(u, v);
             let s = size * px;
             quad(c, x - s / 2.0, y, 0.0, s, s);
         }
     }
+}
+
+/// A black canvas under the picture, as OBS's DrawBackdrop: the canvas's own transparent parts
+/// show black, and its edge stands out from the stage round it.
+fn draw_backdrop(api: &Api, w: f32, h: f32) {
+    let effect = api.obs_get_base_effect(OBS_EFFECT_SOLID);
+    if effect.is_null() {
+        return;
+    }
+    let color = api.gs_effect_get_param_by_name(effect, c"color".as_ptr());
+    api.gs_effect_set_vec4(color, &Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 });
+    api.gs_matrix_push();
+    api.gs_matrix_scale3f(w, h, 1.0);
+    while api.gs_effect_loop(effect, c"Solid".as_ptr()) {
+        api.gs_draw_sprite(std::ptr::null_mut(), 0, 1, 1);
+    }
+    api.gs_matrix_pop();
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -947,13 +1051,28 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     // SAFETY: as above, the Api outlives every registered draw callback.
     let api = unsafe { &*st.api };
     let (bw, bh) = (st.base.0.max(1) as f32, st.base.1.max(1) as f32);
-    let scale = (cx as f32 / bw).min(cy as f32 / bh);
-    let (w, h) = ((bw * scale).round() as c_int, (bh * scale).round() as c_int);
-    let (x, y) = ((cx as c_int - w) / 2, (cy as c_int - h) / 2);
+    let placed = st.canvas.lock().ok().and_then(|g| *g);
+    let (x, y, w, h, scale) = match placed {
+        // Where the page put it (zoomed out, it leaves room to see what's off the canvas).
+        Some((px_, py, pw, ph)) if pw >= 1.0 && ph >= 1.0 => {
+            // The canvas's shape is kept: it fits the box the page gave.
+            let scale = (pw / bw).min(ph / bh);
+            (px_.round() as c_int, py.round() as c_int, pw.round() as c_int, (bh * scale).round() as c_int, scale)
+        }
+        _ => {
+            // The picture fits inside the margin; the margin is left for the selection's handles.
+            let edge = st.edge.load(std::sync::atomic::Ordering::Relaxed).min(cx / 4).min(cy / 4);
+            let (aw, ah) = (cx.saturating_sub(2 * edge).max(1), cy.saturating_sub(2 * edge).max(1));
+            let scale = (aw as f32 / bw).min(ah as f32 / bh);
+            let (w, h) = ((bw * scale).round() as c_int, (bh * scale).round() as c_int);
+            (((cx as c_int - w) / 2), ((cy as c_int - h) / 2), w, h, scale)
+        }
+    };
     api.gs_viewport_push();
     api.gs_projection_push();
     api.gs_ortho(0.0, bw, 0.0, bh, -100.0, 100.0);
     api.gs_set_viewport(x, y, w, h);
+    draw_backdrop(api, bw, bh);
     {
         // Held while drawing: Preview::show_scene can't release the source mid-render.
         let shown = st.scene.lock();
@@ -962,11 +1081,27 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
             _ => api.obs_render_main_texture(),
         }
     }
-    if let Ok(sel) = st.selected.lock()
-        && let Some((scene, id)) = sel.as_ref()
-        && let Some(m) = item_box(api, scene, *id)
+    // Outlines are drawn over the whole view, margin included, with the canvas where the
+    // picture is: what's off the canvas still shows its box.
+    let s = scale.max(1e-6);
+    api.gs_set_viewport(0, 0, cx as c_int, cy as c_int);
+    api.gs_ortho(-x as f32 / s, (cx as f32 - x as f32) / s, -y as f32 / s, (cy as f32 - y as f32) / s, -100.0, 100.0);
+    let picked = st.selected.lock().ok().and_then(|g| g.clone());
+    if let Ok(frames) = st.frames.lock()
+        && let Some(scene) = frames.as_ref()
     {
-        draw_selection(api, &m, 1.0 / scale.max(1e-6));
+        for (id, m) in all_boxes(api, scene) {
+            if picked.as_ref().is_some_and(|(_, p)| *p == id) {
+                continue;
+            }
+            draw_selection(api, &m, 1.0 / s, &frame_color(id), false, 1.5);
+        }
+    }
+    if let Some((scene, id)) = picked.as_ref()
+        && let Some(m) = item_box(api, scene, *id)
+            .or_else(|| all_boxes(api, scene).into_iter().find(|(i, _)| i == id).map(|(_, m)| m))
+    {
+        draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);
     }
     api.gs_projection_pop();
     api.gs_viewport_pop();

@@ -728,11 +728,13 @@ async fn engine_history(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 struct SelectBody {
     scene: Option<String>,
     id: Option<i64>,
+    #[serde(default)]
+    frames: bool,
 }
 
 /// `PUT /studio/engine/preview/selection` `{ scene, id }` (both null for none).
 async fn engine_select(State(app): State<AppState>, Body(b): Body<SelectBody>) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id }).await
+    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames }).await
 }
 
 /// `POST /studio/engine/pick-file` `{ kind, filter? }` → `{ path }` (null when cancelled).

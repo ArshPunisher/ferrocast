@@ -34,6 +34,32 @@ pub struct PreviewRect {
     /// The page's visible height (`window.innerHeight`); 0 or missing if unknown.
     #[serde(default)]
     pub vh: f64,
+    /// Where the canvas is inside the box (points from its top left). The box is then the
+    /// whole stage: zoomed out, the outlines of what's off the canvas show round it. Missing:
+    /// the canvas fills the box, with a small margin round it for handles.
+    #[serde(default)]
+    pub canvas: Option<CanvasBox>,
+    /// The page's colour round the canvas (0xRRGGBB), so the stage matches the theme;
+    /// missing: dark.
+    #[serde(default)]
+    pub bg: Option<u32>,
+}
+
+impl PreviewRect {
+    /// `bg` as libobs wants a display's colour (0xAABBGGRR).
+    pub fn bg_abgr(&self) -> Option<u32> {
+        let rgb = self.bg.filter(|c| *c <= 0xff_ffff)?;
+        let (r, g, b) = (rgb >> 16 & 0xff, rgb >> 8 & 0xff, rgb & 0xff);
+        Some(0xff00_0000 | b << 16 | g << 8 | r)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CanvasBox {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 impl PreviewRect {
@@ -47,6 +73,17 @@ impl PreviewRect {
         }
         if !(ok(self.w, 1.0, 16_384.0) && ok(self.h, 1.0, 16_384.0)) {
             return Err("rect: the box must be 1 to 16384 pixels wide and high.".into());
+        }
+        if let Some(c) = self.canvas
+            && !(ok(c.x, -20_000.0, 20_000.0)
+                && ok(c.y, -20_000.0, 20_000.0)
+                && ok(c.w, 1.0, 16_384.0)
+                && ok(c.h, 1.0, 16_384.0))
+        {
+            return Err("canvas: inside the box, 1 to 16384 pixels wide and high.".into());
+        }
+        if self.bg.is_some() && self.bg_abgr().is_none() {
+            return Err("bg: a colour, 0 to 0xFFFFFF.".into());
         }
         Ok(())
     }
@@ -1149,10 +1186,13 @@ pub enum StudioAct {
     Redo,
     /// Every step Undo and Redo can take → `{ undo: [labels], redo: [labels] }`, newest first.
     History,
-    /// Outlines an item in the preview, or nothing (`scene` and `id` null).
+    /// Outlines an item in the preview, or nothing (`scene` and `id` null); with `frames`,
+    /// every source of `scene` gets an outline in its own colour too.
     Select {
         scene: Option<String>,
         id: Option<i64>,
+        #[serde(default)]
+        frames: bool,
     },
 }
 
@@ -1367,10 +1407,13 @@ impl StudioAct {
                 check_source_name(scene)?;
                 transform.validate()
             }
-            A::Select { scene, id } => match (scene, id) {
+            A::Select { scene, id, frames } => match (scene, id) {
                 (Some(s), Some(_)) => check_source_name(s),
+                (Some(s), None) if *frames => check_source_name(s),
                 (None, None) => Ok(()),
-                _ => Err(EngineError::Invalid("scene, id: both, or neither to pick nothing.".into())),
+                _ => Err(EngineError::Invalid(
+                    "scene, id: both, or neither to pick nothing (a scene alone only with frames).".into(),
+                )),
             },
         }
     }
@@ -2139,15 +2182,16 @@ mod tests {
             bx("Main", f32::NAN, 0.0, 10.0, false),
             bx("Main", 0.0, 1e9, 10.0, false),
             bx("", 0.0, 0.0, 10.0, false),
-            StudioAct::Select { scene: Some("Main".into()), id: None },
+            StudioAct::Select { scene: Some("Main".into()), id: None, frames: false },
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
-        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3) };
+        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false };
         assert!(!pick.changes());
         e.studio_act(pick).await.unwrap();
-        e.studio_act(StudioAct::Select { scene: None, id: None }).await.unwrap();
-        assert_eq!(fake.acts.lock().unwrap().len(), 3);
+        e.studio_act(StudioAct::Select { scene: Some("Main".into()), id: None, frames: true }).await.unwrap();
+        e.studio_act(StudioAct::Select { scene: None, id: None, frames: false }).await.unwrap();
+        assert_eq!(fake.acts.lock().unwrap().len(), 4);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.
         let f = FilePick {
@@ -2282,15 +2326,24 @@ mod tests {
         for bad in ["", "a b", "../x", &"x".repeat(200)] {
             assert!(matches!(e.studio_options(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0 };
+        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0, canvas: None, bg: None };
         e.studio_preview(Some(r), Some(r)).await.unwrap();
         e.studio_preview(None, None).await.unwrap();
+        // The whole stage, with the canvas zoomed out inside it.
+        let staged = PreviewRect { canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }), ..r };
+        assert!(staged.validate().is_ok());
+        let light = PreviewRect { bg: Some(0xe7e9ee), ..r };
+        assert_eq!(light.bg_abgr(), Some(0xffee_e9e7));
+        let canvas = |w: f64, h: f64| PreviewRect { canvas: Some(CanvasBox { x: 0.0, y: 0.0, w, h }), ..r };
         for bad in [
             PreviewRect { w: 0.0, ..r },
             PreviewRect { h: f64::NAN, ..r },
             PreviewRect { x: f64::INFINITY, ..r },
             PreviewRect { w: 99_999.0, ..r },
             PreviewRect { vh: -1.0, ..r },
+            canvas(0.0, 270.0),
+            canvas(480.0, f64::NAN),
+            PreviewRect { bg: Some(0x0100_0000), ..r },
         ] {
             assert!(matches!(e.studio_preview(None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
