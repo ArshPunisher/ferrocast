@@ -494,6 +494,11 @@ api! {
     obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
     obs_view_create: fn() -> *mut ObsView;
+    obs_scene_add_group2: fn(a: *mut ObsScene, b: *const c_char, c: bool) -> *mut ObsSceneItem;
+    obs_sceneitem_group_ungroup2: fn(a: *mut ObsSceneItem, b: bool);
+    obs_sceneitem_group_add_item: fn(a: *mut ObsSceneItem, b: *mut ObsSceneItem);
+    obs_sceneitem_group_remove_item: fn(a: *mut ObsSceneItem, b: *mut ObsSceneItem);
+    obs_sceneitem_get_group: fn(a: *mut ObsScene, b: *mut ObsSceneItem) -> *mut ObsSceneItem;
     obs_sceneitem_set_blending_method: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_get_blending_method: fn(a: *mut ObsSceneItem) -> c_int;
     obs_source_media_play_pause: fn(a: *mut ObsSource, b: bool);

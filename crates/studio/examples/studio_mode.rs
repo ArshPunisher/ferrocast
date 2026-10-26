@@ -147,6 +147,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(lv.get("Tone").is_some_and(|l| l.peak[0] > -60.0), "true peak reads the tone: {lv:?}");
     c.set_true_peak(false);
 
+    // Groups: a new one, a source moved in and out, a group taken apart; a pasted copy.
+    let g = c.add_group("Next", "Group A")?;
+    assert!(g.group);
+    c.set_group("Next", box_id, Some(g.id))?;
+    let grouped = c.items("Next")?;
+    let gi = grouped.iter().find(|i| i.id == g.id).ok_or("group")?;
+    assert_eq!(gi.children.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["Box"], "{grouped:?}");
+    assert!(!grouped.iter().any(|i| i.name == "Box"), "Box is only inside the group");
+    let inner = gi.children[0].id;
+    c.set_group("Next", inner, None)?;
+    assert!(c.items("Next")?.iter().any(|i| i.name == "Box" && !i.group), "back out of the group");
+    let box_now = c.items("Next")?.into_iter().find(|i| i.name == "Box").ok_or("Box")?.id;
+    c.set_group("Next", box_now, Some(g.id))?;
+    c.ungroup("Next", g.id)?;
+    let after = c.items("Next")?;
+    assert!(after.iter().any(|i| i.name == "Box") && !after.iter().any(|i| i.group), "{after:?}");
+    assert!(c.set_group("Next", box_now, Some(box_now)).is_err() || c.ungroup("Next", 9999).is_err());
+    let copy = c.paste_copy("Later", "Box")?;
+    assert_eq!(copy.name, "Box 2");
+    assert_eq!(c.settings("Box 2")?["color"], c.settings("Box")?["color"], "a copy of its settings");
+    let box_id = c.items("Next")?.into_iter().find(|i| i.name == "Box").ok_or("Box")?.id;
+
     // OBS's blending method: sRGB off, and back.
     c.edit_item("Next", box_id, ferrocast_studio::ItemEdit::BlendMethodSrgbOff)?;
     assert!(c.items("Next")?.iter().any(|i| i.id == box_id && i.srgb_off));

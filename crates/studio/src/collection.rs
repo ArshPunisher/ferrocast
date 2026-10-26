@@ -1442,6 +1442,102 @@ impl Collection {
         a.obs_sceneitem_set_rot(item, (a.obs_sceneitem_get_rot(item) + deg).rem_euclid(360.0));
     }
 
+    /// A new, empty group on top of a scene (OBS's Add Group).
+    pub fn add_group(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        self.name_free(name)?;
+        let n = cstr(name);
+        let item = self.api().obs_scene_add_group2(s, n.as_ptr(), true);
+        if item.is_null() {
+            return Err(StudioError::Failed(format!("the group \"{name}\" couldn't be made")));
+        }
+        Ok(self.info(item))
+    }
+
+    /// Takes a group apart: its sources stay where they are, in the scene (OBS's Ungroup).
+    pub fn ungroup(&self, scene: &str, id: i64) -> Result<(), StudioError> {
+        let item = self.item(scene, id)?;
+        if !self.api().obs_sceneitem_is_group(item) {
+            return Err(StudioError::Failed("That isn't a group.".into()));
+        }
+        self.api().obs_sceneitem_group_ungroup2(item, true);
+        Ok(())
+    }
+
+    /// Moves an item into a group of the same scene (`group`), or out of its group (None),
+    /// keeping where it is on screen.
+    pub fn set_group(&self, scene: &str, id: i64, group: Option<i64>) -> Result<(), StudioError> {
+        let s = self.scene_ptr(scene)?;
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        let now = a.obs_sceneitem_get_group(s, item);
+        match group {
+            Some(g) => {
+                let target = self.item(scene, g)?;
+                if !a.obs_sceneitem_is_group(target) {
+                    return Err(StudioError::Failed("group: pick a group of this scene.".into()));
+                }
+                if a.obs_sceneitem_is_group(item) {
+                    return Err(StudioError::Failed("A group can't go inside another group.".into()));
+                }
+                if now != target {
+                    if !now.is_null() {
+                        a.obs_sceneitem_group_remove_item(now, item);
+                    }
+                    // Its id may change on the way out: find it again by source.
+                    let src = a.obs_sceneitem_get_source(item);
+                    let moved = self.raw_items(s).into_iter().find(|i| a.obs_sceneitem_get_source(*i) == src);
+                    a.obs_sceneitem_group_add_item(target, moved.unwrap_or(item));
+                }
+            }
+            None => {
+                if !now.is_null() {
+                    a.obs_sceneitem_group_remove_item(now, item);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pastes a copy of a source (OBS's Paste (Duplicate)): a new, independent source made
+    /// from it ("Camera 2"), on top of `scene`.
+    pub fn paste_copy(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        let src = self.source(name)?;
+        let a = self.api();
+        let mut n = 2;
+        let new_name = loop {
+            let c = format!("{name} {n}");
+            if self.name_free(&c).is_ok() {
+                break c;
+            }
+            n += 1;
+        };
+        let cn = cstr(&new_name);
+        let mut copy = a.obs_source_duplicate(src.ptr, cn.as_ptr(), false);
+        if copy == src.ptr {
+            // Kinds that can't be copied hand back the same source: one from its settings.
+            a.obs_source_release(copy);
+            let data = a.obs_source_get_settings(src.ptr);
+            copy = a.obs_source_create(a.obs_source_get_id(src.ptr), cn.as_ptr(), data, ptr::null_mut());
+            if !data.is_null() {
+                a.obs_data_release(data);
+            }
+            if !copy.is_null() {
+                a.obs_source_copy_filters(copy, src.ptr);
+            }
+        }
+        if copy.is_null() {
+            return Err(StudioError::Failed(format!("\"{name}\" couldn't be copied")));
+        }
+        let item = a.obs_scene_add(s, copy);
+        a.obs_source_release(copy);
+        if item.is_null() {
+            return Err(StudioError::Failed(format!("\"{new_name}\" couldn't be put in the scene")));
+        }
+        Ok(self.info(item))
+    }
+
     /// A copy of the item's source, named like it ("Camera 2"), just above it in the scene
     /// with the same place, size, turn and blending.
     fn duplicate(&self, scene: &str, item: *mut ffi::ObsSceneItem) -> Result<(), StudioError> {
