@@ -64,6 +64,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/redo", post(engine_redo))
         .route("/studio/engine/history", get(engine_history))
         .route("/studio/engine/pick-file", post(engine_pick_file))
+        .route("/studio/engine/web-window", post(engine_web_window))
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
         .route("/studio/engine/restart", post(engine_restart))
@@ -722,6 +723,19 @@ async fn engine_pick_file(
 ) -> ApiResult<Json<Value>> {
     let path = app.engine.studio_pick_file(b).await?;
     Ok(Json(serde_json::json!({ "path": path })))
+}
+
+#[derive(serde::Deserialize)]
+struct WebWindowBody {
+    name: String,
+    url: String,
+}
+
+/// `POST /studio/engine/web-window` `{ name, url }` → `{ ok: true }`: a web panel's page in a
+/// window of its own.
+async fn engine_web_window(State(app): State<AppState>, Body(b): Body<WebWindowBody>) -> ApiResult<Json<Value>> {
+    app.engine.studio_web_window(b.name, b.url).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn engine_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {

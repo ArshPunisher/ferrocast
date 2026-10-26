@@ -1440,6 +1440,36 @@ impl StudioHost for DesktopStudio {
         rx.await.map_err(|_| "The file dialog closed without an answer.".to_string())
     }
 
+    async fn web_window(&self, name: String, url: String) -> Result<(), String> {
+        use std::hash::{Hash, Hasher};
+        // One window per page, so it keeps its place (the window-state plugin keys on this).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        url.hash(&mut h);
+        let label = format!("web-{:016x}", h.finish());
+        if let Some(w) = self.app.get_webview_window(&label) {
+            let _ = w.unminimize();
+            let _ = w.show();
+            return w.set_focus().map_err(|e| e.to_string());
+        }
+        let page: tauri::Url = url.parse().map_err(|_| "That address isn't a web page.".to_string())?;
+        let opener = self.app.clone();
+        // A plain web page: no Ferrocast key and no app commands (remote pages get no IPC).
+        // Links that want a new window go to the browser.
+        tauri::WebviewWindowBuilder::new(&self.app, label, tauri::WebviewUrl::External(page))
+            .title(name)
+            .inner_size(420.0, 680.0)
+            .min_inner_size(260.0, 200.0)
+            .on_new_window(move |u, _features| {
+                if crate::is_web(&u) {
+                    crate::open_in_browser(&opener, &u);
+                }
+                tauri::webview::NewWindowResponse::Deny
+            })
+            .build()
+            .map(|_| ())
+            .map_err(|e| format!("The window didn't open: {e}"))
+    }
+
     async fn screen_access(&self) -> Result<Value, String> {
         Ok(json!({ "granted": ferrocast_studio::screen_access() }))
     }

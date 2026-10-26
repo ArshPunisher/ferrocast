@@ -146,6 +146,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn pick_file(&self, _pick: FilePick) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Opens a web page in a window of its own (a web panel whose site won't be shown inside
+    /// another page); the same page again brings its window forward.
+    async fn web_window(&self, _name: String, _url: String) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
     /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
     async fn screen_access(&self) -> Result<Value, String> {
         Ok(serde_json::json!({ "granted": true }))
@@ -1608,6 +1613,12 @@ impl Engine {
         self.studio_host()?.pick_file(pick).await.map_err(failed)
     }
 
+    /// A web panel's page in a window of its own, after checking it's a web page.
+    pub async fn studio_web_window(&self, name: String, url: String) -> Result<(), EngineError> {
+        let (name, url) = web_window_check(&name, &url)?;
+        self.studio_host()?.web_window(name, url).await.map_err(failed)
+    }
+
     pub async fn studio_screen_access(&self) -> Result<Value, EngineError> {
         self.studio_host()?.screen_access().await.map_err(failed)
     }
@@ -1730,6 +1741,19 @@ fn failed(message: String) -> EngineError {
     )
 }
 
+/// A web window's title and address, checked: only http(s) pages, never a local file or script.
+fn web_window_check(name: &str, url: &str) -> Result<(String, String), EngineError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err(EngineError::Invalid("name: 1 to 100 characters.".into()));
+    }
+    let u = reqwest::Url::parse(url.trim())
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some() && url.len() <= 4096)
+        .ok_or_else(|| EngineError::Invalid("url: a web address starting with https://.".into()))?;
+    Ok((name.to_string(), u.to_string()))
+}
+
 /// What starts and stops with the stream (OBS's "Automatically record when streaming" and its
 /// friends). The stream starts or ends either way, so what didn't follow comes back in words.
 async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> Option<String> {
@@ -1842,6 +1866,17 @@ mod tests {
         async fn import_obs(&self, id: String) -> Result<Value, String> {
             Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
         }
+    }
+
+    #[test]
+    fn web_windows_open_web_pages_only() {
+        let ok = web_window_check(" Chat ", "https://www.twitch.tv/popout/x/chat").unwrap();
+        assert_eq!(ok, ("Chat".to_string(), "https://www.twitch.tv/popout/x/chat".to_string()));
+        assert!(web_window_check("Local tool", "http://127.0.0.1:8080/").is_ok());
+        for bad in ["file:///etc/passwd", "javascript:alert(1)", "not a url", "https://"] {
+            assert!(web_window_check("x", bad).is_err(), "{bad}");
+        }
+        assert!(web_window_check("  ", "https://example.com").is_err());
     }
 
     #[tokio::test]

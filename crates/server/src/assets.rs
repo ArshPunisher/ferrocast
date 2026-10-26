@@ -23,10 +23,11 @@ struct Dashboard;
 #[folder = "$FERROCAST_WEB_DIR/overlays"]
 struct Overlays;
 
-/// The dashboard may load avatars and emotes from platform CDNs; scripts only from itself.
+/// The dashboard may load avatars and emotes from platform CDNs; scripts only from itself. Web
+/// panels (the Studio's custom browser docks) frame pages the user picked.
 const DASHBOARD_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https:; media-src 'self' blob: data:; font-src 'self' data:; \
-    connect-src 'self' ws://127.0.0.1:* ws://localhost:*; frame-src 'self'; frame-ancestors 'none'; \
+    connect-src 'self' ws://127.0.0.1:* ws://localhost:*; frame-src 'self' https: http:; frame-ancestors 'none'; \
     base-uri 'none'; form-action 'none'";
 
 /// Overlays: same, but they're embedded in OBS, never framed by websites.
