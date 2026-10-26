@@ -1446,6 +1446,22 @@ impl StudioHost for DesktopStudio {
         rx.await.map_err(|_| "The file dialog closed without an answer.".to_string())
     }
 
+    async fn log(&self, lines: usize) -> Result<Value, String> {
+        let file = self.data.join("logs").join("ferrocast.log");
+        let path = file.clone();
+        let tail = tokio::task::spawn_blocking(move || log_tail(&path, lines))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("The log can't be read: {e}"))?;
+        Ok(json!({ "file": file.display().to_string(), "lines": tail }))
+    }
+
+    async fn show_log(&self) -> Result<(), String> {
+        use tauri_plugin_opener::OpenerExt;
+        let file = self.data.join("logs").join("ferrocast.log");
+        self.app.opener().reveal_item_in_dir(&file).map_err(|e| format!("The log folder didn't open: {e}"))
+    }
+
     async fn web_window(&self, name: String, url: String) -> Result<(), String> {
         use std::hash::{Hash, Hasher};
         // One window per page, so it keeps its place (the window-state plugin keys on this).
@@ -1630,5 +1646,77 @@ impl StudioHost for DesktopStudio {
     async fn direct_stats(&self, id: String) -> Result<Value, String> {
         self.on_main(move |h| h.stream.as_ref().and_then(|s| s.direct_stats(&id)).map_or(Value::Null, |st| json!(st)))
             .await
+    }
+}
+
+/// The last `n` lines of a log file, reading only its end (logs grow to 5 MB): ANSI colour
+/// codes out, invalid UTF-8 shown as replacement characters.
+fn log_tail(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    // About 400 bytes a line is plenty; never more than 2 MB.
+    let want = (n as u64).saturating_mul(400).min(2 * 1024 * 1024).min(len);
+    // One byte before where reading starts: a newline there means a whole first line.
+    let start = len - want;
+    let from_line = if start == 0 {
+        true
+    } else {
+        f.seek(SeekFrom::Start(start - 1))?;
+        let mut b = [0u8];
+        f.read_exact(&mut b)?;
+        b[0] == b'\n'
+    };
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(want as usize);
+    f.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut all: Vec<&str> = text.lines().collect();
+    // Reading from the middle of a line: that part line is left out.
+    if !from_line && !all.is_empty() {
+        all.remove(0);
+    }
+    let from = all.len().saturating_sub(n);
+    Ok(all[from..].iter().map(|l| strip_ansi(l)).collect())
+}
+
+/// Removes terminal colour codes (`ESC [ ... m`).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_end_of_the_log_without_colour_codes() {
+        let dir = std::env::temp_dir().join(format!("fc-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ferrocast.log");
+        let body: String = (1..=3000).map(|i| format!("\u{1b}[2mline\u{1b}[0m {i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let tail = log_tail(&path, 3).unwrap();
+        assert_eq!(tail, ["line 2998", "line 2999", "line 3000"]);
+        assert_eq!(log_tail(&path, 5000).unwrap().len(), 3000);
+        assert!(log_tail(&dir.join("missing.log"), 3).is_err());
+        // Reading starts right after a newline: the first line read is whole and kept.
+        let even = dir.join("even.log");
+        std::fs::write(&even, format!("{}\n{}\n", "a".repeat(399), "b".repeat(399))).unwrap();
+        assert_eq!(log_tail(&even, 1).unwrap(), ["b".repeat(399)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

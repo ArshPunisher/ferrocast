@@ -65,6 +65,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/history", get(engine_history))
         .route("/studio/engine/pick-file", post(engine_pick_file))
         .route("/studio/engine/web-window", post(engine_web_window))
+        .route("/studio/engine/log", get(engine_log))
+        .route("/studio/engine/log/show", post(engine_show_log))
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
         .route("/studio/engine/restart", post(engine_restart))
@@ -723,6 +725,23 @@ async fn engine_pick_file(
 ) -> ApiResult<Json<Value>> {
     let path = app.engine.studio_pick_file(b).await?;
     Ok(Json(serde_json::json!({ "path": path })))
+}
+
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    lines: Option<usize>,
+}
+
+/// `GET /studio/engine/log?lines=` (default 500, at most 5000) → `{ file, lines }`, secrets
+/// taken out.
+async fn engine_log(State(app): State<AppState>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_log(q.lines.unwrap_or(500)).await?))
+}
+
+/// `POST /studio/engine/log/show` → 204: the log file in Finder or Explorer.
+async fn engine_show_log(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.studio_show_log().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Deserialize)]

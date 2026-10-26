@@ -146,6 +146,15 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn pick_file(&self, _pick: FilePick) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// The app's log, newest line last: up to `lines` of them (OBS's View Current Log) →
+    /// `{ file, lines }`. The engine takes secrets out before anyone sees them.
+    async fn log(&self, _lines: usize) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Shows the log file in Finder or Explorer (OBS's Show Log Files).
+    async fn show_log(&self) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
     /// Opens a web page in a window of its own (a web panel whose site won't be shown inside
     /// another page); the same page again brings its window forward.
     async fn web_window(&self, _name: String, _url: String) -> Result<(), String> {
@@ -1616,6 +1625,27 @@ impl Engine {
         self.studio_host()?.pick_file(pick).await.map_err(failed)
     }
 
+    /// The log's last `lines` lines (1 to 5000), stream keys, tokens and passwords taken out,
+    /// so it can be read on screen or pasted into a bug report.
+    pub async fn studio_log(&self, lines: usize) -> Result<Value, EngineError> {
+        if !(1..=5000).contains(&lines) {
+            return Err(EngineError::Invalid("lines: 1 to 5000.".into()));
+        }
+        let mut v = self.studio_host()?.log(lines).await.map_err(failed)?;
+        if let Some(list) = v.get_mut("lines").and_then(Value::as_array_mut) {
+            for l in list.iter_mut() {
+                if let Some(s) = l.as_str() {
+                    *l = Value::String(redact_log_line(s));
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    pub async fn studio_show_log(&self) -> Result<(), EngineError> {
+        self.studio_host()?.show_log().await.map_err(failed)
+    }
+
     /// A web panel's page in a window of its own, after checking it's a web page.
     pub async fn studio_web_window(&self, name: String, url: String) -> Result<(), EngineError> {
         let (name, url) = web_window_check(&name, &url)?;
@@ -1744,6 +1774,70 @@ fn failed(message: String) -> EngineError {
     )
 }
 
+/// Where a secret value written after a marker ends.
+fn value_end(s: &str) -> usize {
+    s.find(|c: char| c.is_whitespace() || "&\"',;)]}>".contains(c)).unwrap_or(s.len())
+}
+
+/// A word that looks like a key: long, letters and digits mixed (stream keys, tokens).
+fn looks_secret(w: &str) -> bool {
+    w.len() >= 16
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        && w.chars().any(|c| c.is_ascii_digit())
+        && w.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+const HIDDEN: &str = "•••";
+
+/// One log line with what could open an account taken out: stream keys, tokens, passwords,
+/// and the secret parts of stream addresses. A log pasted into a bug report stays safe.
+pub fn redact_log_line(line: &str) -> String {
+    const MARKERS: [&str; 10] =
+        ["key=", "token=", "passphrase=", "streamid=", "password=", "secret=", "pass=", "key:", "bearer ", "auth="];
+    let mut out = line.to_string();
+    // Values after a marker (case doesn't matter; the marker itself stays).
+    for m in MARKERS {
+        let mut from = 0;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(i) = lower[from..].find(m).map(|i| i + from) else { break };
+            let start = i + m.len();
+            let rest = &out[start..];
+            let rest_trim = rest.trim_start_matches(['"', '\'', ' ']);
+            let skip = rest.len() - rest_trim.len();
+            let end = value_end(rest_trim);
+            if end == 0 || rest_trim[..end] == *HIDDEN {
+                from = start;
+                continue;
+            }
+            out.replace_range(start + skip..start + skip + end, HIDDEN);
+            from = start + skip + HIDDEN.len();
+        }
+    }
+    // Key-like path parts of addresses (rtmp://host/app/<key>) and key-like words on their own.
+    let mut words: Vec<String> = Vec::new();
+    for word in out.split(' ') {
+        let w = if word.contains("://") {
+            let (scheme, rest) = word.split_once("://").unwrap_or((word, ""));
+            let mut parts = rest.split('/');
+            let host = parts.next().unwrap_or("");
+            let mut path: Vec<&str> = vec![host];
+            // RTMP: rtmp://host/app/<key>, so whatever follows the app is the key, however short.
+            let rtmp = scheme.to_ascii_lowercase().starts_with("rtmp");
+            path.extend(parts.enumerate().map(|(i, p)| {
+                if (rtmp && i >= 1 && !p.is_empty()) || looks_secret(p) || p.starts_with("live_") { HIDDEN } else { p }
+            }));
+            format!("{scheme}://{}", path.join("/"))
+        } else if looks_secret(word.trim_matches(|c: char| !c.is_ascii_alphanumeric())) || word.starts_with("live_") {
+            HIDDEN.to_string()
+        } else {
+            word.to_string()
+        };
+        words.push(w);
+    }
+    words.join(" ")
+}
+
 /// A web window's title and address, checked: only http(s) pages, never a local file or script.
 fn web_window_check(name: &str, url: &str) -> Result<(String, String), EngineError> {
     let name = name.trim();
@@ -1869,6 +1963,33 @@ mod tests {
         async fn import_obs(&self, id: String) -> Result<Value, String> {
             Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
         }
+    }
+
+    #[test]
+    fn logs_lose_their_secrets() {
+        let cases = [
+            (
+                "connect rtmp://live.twitch.tv/app/live_123456789_AbCdEfGhIjKlMnOp ok",
+                "connect rtmp://live.twitch.tv/app/••• ok",
+            ),
+            ("srt://1.2.3.4:9000?streamid=publish:abc123 latency=200", "srt://1.2.3.4:9000?streamid=••• latency=200"),
+            ("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y sent", "Authorization: Bearer ••• sent"),
+            ("whip token=abc&x=1 key=\"zz9\"", "whip token=•••&x=1 key=\"•••\""),
+            ("youtube key: abcd-efgh-ijkl-mnop-1234 used", "youtube key: ••• used"),
+            ("password=hunter2", "password=•••"),
+            // A short key in an RTMP address is still a key; the app part stays.
+            ("to rtmp://a.example/app/abc123def456", "to rtmp://a.example/app/•••"),
+            ("RTMPS://x.example:443/live/k1/extra", "RTMPS://x.example:443/live/•••/•••"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(redact_log_line(raw), want, "{raw}");
+        }
+        // Everyday lines stay as they are.
+        let plain = "INFO libobs: [ mac-avcapture ]: Selected device 'FaceTime HD Camera' 1920x1080 @ 30 fps";
+        assert_eq!(redact_log_line(plain), plain);
+        assert_eq!(redact_log_line(""), "");
+        // Already hidden values aren't hidden twice, and nothing loops.
+        assert_eq!(redact_log_line("key=••• key=x"), "key=••• key=•••");
     }
 
     #[test]
