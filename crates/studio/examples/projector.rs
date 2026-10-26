@@ -66,6 +66,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     c.add_scene("Purple")?;
     multi.set_scenes(&c.scenes().into_iter().map(|s| s.name).collect::<Vec<_>>());
     NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(1.0));
+    // Laid out with what's on air on the left, Studio Mode's preview above it, safe areas.
+    studio.set_multiview_look(ferrocast_studio::MultiviewLook {
+        layout: ferrocast_studio::MultiviewLayout::Left,
+        labels: true,
+        safe_areas: true,
+    });
+    multi.update(&c.scenes().into_iter().map(|s| s.name).collect::<Vec<_>>(), Some("Blue"));
+    let (num, shot) = (multi.window_number(), out.join("projector-multiview-left.png"));
+    let taker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = std::process::Command::new("screencapture").args(["-x", "-o", &format!("-l{num}")]).arg(&shot).status();
+    });
+    NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(3.0));
+    let _ = taker.join();
     drop((program, blue, multi));
     drop(c);
     drop(studio);

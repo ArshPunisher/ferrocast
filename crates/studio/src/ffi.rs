@@ -965,10 +965,13 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
 pub(crate) enum Show {
     Program,
     One(*mut ObsSource),
-    /// Each scene with its name label (a private text source), and the "On air" label.
+    /// Each scene with its name label (a private text source), and the "On air" label;
+    /// Studio Mode's preview scene with its label; how it's laid out.
     Multi {
         cells: Vec<(*mut ObsSource, *mut ObsSource)>,
         air: *mut ObsSource,
+        preview: Option<(*mut ObsSource, *mut ObsSource)>,
+        look: crate::projector::MultiviewLook,
     },
 }
 
@@ -990,8 +993,8 @@ impl Show {
                 api.obs_source_dec_showing(src);
                 api.obs_source_release(src);
             }
-            Show::Multi { cells, air } => {
-                for (scene, label) in cells {
+            Show::Multi { cells, air, preview, .. } => {
+                for (scene, label) in cells.into_iter().chain(preview) {
                     api.obs_source_dec_showing(scene);
                     api.obs_source_release(scene);
                     api.obs_source_release(label);
@@ -1098,7 +1101,7 @@ const RED: Vec4 = Vec4 { x: 0.86, y: 0.15, z: 0.15, w: 1.0 };
 /// Draws a projector: what's on air, one source, or a multiview (each fitted, letterboxed).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: u32) {
-    use crate::projector::{Area, multiview};
+    use crate::projector::{Area, multiview_in, safe_areas};
     // SAFETY: `param` is the boxed ProjectorState registered with this callback; lib.rs keeps
     // it, and the Studio owning the Api, alive until the callback is removed.
     let st = unsafe { &*(param as *const ProjectorState) };
@@ -1115,8 +1118,8 @@ pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: 
                 region(api, whole.fit(sw / sh), sw, sh, || api.obs_source_video_render(*src));
             }
         }
-        Show::Multi { cells, air } => {
-            let (top, areas) = multiview(cells.len(), whole.w, whole.h, bw / bh);
+        Show::Multi { cells, air, preview, look } => {
+            let (bigs, areas) = multiview_in(look.layout, preview.is_some(), cells.len(), whole.w, whole.h, bw / bh);
             // The scene on air: the transition's active source (our reference, let go below).
             let t = api.obs_get_output_source(0);
             let on = if t.is_null() { std::ptr::null_mut() } else { api.obs_transition_get_active_source(t) };
@@ -1135,27 +1138,67 @@ pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: 
             };
             let black = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
             pixels(&|| {
-                fill(api, &black, top);
-                for a in &areas {
+                for a in bigs.iter().chain(&areas) {
                     fill(api, &black, *a);
                 }
             });
-            region(api, top, bw, bh, || api.obs_render_main_texture());
+            // With a preview, it's the first big box; what's on air is the last.
+            let program = bigs.last().copied();
+            let pv = preview.as_ref().and_then(|p| bigs.first().filter(|_| bigs.len() == 2).map(|a| (*a, *p)));
+            if let Some((a, (scene, _))) = pv {
+                region(api, a, bw, bh, || api.obs_source_video_render(scene));
+            }
+            if let Some(a) = program {
+                region(api, a, bw, bh, || api.obs_render_main_texture());
+            }
             for (a, (scene, _)) in areas.iter().zip(cells) {
                 region(api, *a, bw, bh, || api.obs_source_video_render(*scene));
             }
-            // Frames and names on top, in pixels.
+            // Frames, names and safe areas on top, in pixels.
             pixels(&|| {
                 let dark = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.62 };
+                let green = Vec4 { x: 0.2, y: 0.75, z: 0.35, w: 1.0 };
+                let guide = Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 0.45 };
                 let thin = (whole.h / 360.0).max(1.0);
-                frame(api, &RED, top, 2.0 * thin);
-                name_bar(api, top, *air, &RED);
+                if let Some((a, (_, label))) = pv {
+                    frame(api, &green, a, 2.0 * thin);
+                    if look.labels {
+                        name_bar(api, a, label, &green);
+                    }
+                }
+                if let Some(a) = program {
+                    frame(api, &RED, a, 2.0 * thin);
+                    if look.labels {
+                        name_bar(api, a, *air, &RED);
+                    }
+                    if look.safe_areas {
+                        for s in safe_areas(a) {
+                            frame(api, &guide, s, thin);
+                        }
+                    }
+                }
                 for (a, (scene, label)) in areas.iter().zip(cells) {
                     let live = !on.is_null() && *scene == on;
+                    let next = pv.is_some_and(|(_, (p, _))| p == *scene);
                     if live {
                         frame(api, &RED, *a, 2.0 * thin);
+                    } else if next {
+                        frame(api, &green, *a, 2.0 * thin);
                     }
-                    name_bar(api, *a, *label, if live { &RED } else { &dark });
+                    if look.labels {
+                        name_bar(
+                            api,
+                            *a,
+                            *label,
+                            if live {
+                                &RED
+                            } else if next {
+                                &green
+                            } else {
+                                &dark
+                            },
+                        );
+                    }
                 }
             });
             if !on.is_null() {
@@ -2451,6 +2494,15 @@ pub(crate) mod projector_window {
         pub fn pixels(&self) -> (u32, u32) {
             let px = self.view.convertSizeToBacking(self.view.bounds().size);
             (px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32)
+        }
+
+        /// Keeps a windowed projector above other apps' windows (OBS's "Always on top"); a
+        /// full-screen one stays above everything anyway.
+        pub fn set_on_top(&self, on: bool) {
+            if MainThreadMarker::new().is_some() && self.window.level() != 25 {
+                // NSFloatingWindowLevel is 3; NSNormalWindowLevel 0.
+                self.window.setLevel(if on { 3 } else { 0 });
+            }
         }
 
         pub fn close(&self) {

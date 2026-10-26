@@ -29,7 +29,7 @@ pub use collection::{
     TBarState, Transform, TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
-pub use projector::{ProjectorOf, Screen};
+pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -267,6 +267,8 @@ pub struct Studio {
 struct Inner {
     api: Api,
     canvas: std::cell::Cell<Canvas>,
+    /// How multiviews are laid out (each projector takes it when made or updated).
+    multiview: std::cell::Cell<projector::MultiviewLook>,
     /// libobs's CPU meter for this process (`os_cpu_usage_info`).
     cpu: *mut ffi::CpuUsage,
 }
@@ -340,7 +342,12 @@ impl Studio {
         api.obs_load_all_modules();
         api.obs_post_load_modules();
         let cpu = api.os_cpu_usage_info_start();
-        let inner = std::rc::Rc::new(Inner { api, canvas: std::cell::Cell::new(canvas), cpu });
+        let inner = std::rc::Rc::new(Inner {
+            api,
+            canvas: std::cell::Cell::new(canvas),
+            multiview: std::cell::Cell::new(projector::MultiviewLook::default()),
+            cpu,
+        });
         // Ferrocast's own Web page source (WebKit), in place of OBS's Chromium one (R-78).
         #[cfg(target_os = "macos")]
         ffi::web::register(&inner.api);
@@ -1221,9 +1228,19 @@ pub fn screens() -> Vec<Screen> {
 }
 
 impl Studio {
-    /// What a projector of `of` draws, holding its sources (`scenes` for a multiview).
+    /// How multiviews are laid out from now on (open ones follow on their next update).
+    pub fn set_multiview_look(&self, look: projector::MultiviewLook) {
+        self.inner.multiview.set(look);
+    }
+
+    pub fn multiview_look(&self) -> projector::MultiviewLook {
+        self.inner.multiview.get()
+    }
+
+    /// What a projector of `of` draws, holding its sources (`scenes` for a multiview, and
+    /// Studio Mode's `preview` scene).
     #[cfg(target_os = "macos")]
-    fn show(&self, of: &ProjectorOf, scenes: &[String]) -> Result<ffi::Show, StudioError> {
+    fn show(&self, of: &ProjectorOf, scenes: &[String], preview: Option<&str>) -> Result<ffi::Show, StudioError> {
         let a = &self.inner.api;
         Ok(match of {
             ProjectorOf::Program => ffi::Show::Program,
@@ -1234,6 +1251,8 @@ impl Studio {
             ProjectorOf::Multiview => ffi::Show::Multi {
                 cells: scenes.iter().filter_map(|n| ffi::shown_source(a, n).map(|s| (s, ffi::label(a, n)))).collect(),
                 air: ffi::label(a, "On air"),
+                preview: preview.and_then(|n| ffi::shown_source(a, n).map(|s| (s, ffi::label(a, "Preview")))),
+                look: self.inner.multiview.get(),
             },
         })
     }
@@ -1257,7 +1276,7 @@ impl Studio {
             let a = &self.inner.api;
             let base = (self.canvas().width.max(1), self.canvas().height.max(1));
             let canvas_aspect = f64::from(base.0) / f64::from(base.1);
-            let show = self.show(of, scenes)?;
+            let show = self.show(of, scenes, None)?;
             let aspect = match &show {
                 ffi::Show::One(src) => {
                     let (w, h) = (a.obs_source_get_width(*src), a.obs_source_get_height(*src));
@@ -1266,9 +1285,11 @@ impl Studio {
                 _ => canvas_aspect,
             };
             let names = Rc::new(RefCell::new(if *of == ProjectorOf::Multiview { scenes.to_vec() } else { Vec::new() }));
+            // The layout clicks are read against (and whether a preview box is there).
+            let laid_out = Rc::new(Cell::new((self.inner.multiview.get(), false)));
             let display: Rc<Cell<*mut ffi::ObsDisplay>> = Rc::new(Cell::new(ptr::null_mut()));
             let hooks = {
-                let (names, display, studio) = (names.clone(), display.clone(), self.clone());
+                let (names, display, studio, laid) = (names.clone(), display.clone(), self.clone(), laid_out.clone());
                 let multiview = *of == ProjectorOf::Multiview;
                 ffi::projector_window::Hooks {
                     click: Box::new(move |x, y, w, h| {
@@ -1276,13 +1297,14 @@ impl Studio {
                             return;
                         }
                         let names = names.borrow();
-                        let at = projector::multiview_hit(
+                        let (look, preview) = laid.get();
+                        let at = projector::multiview_hit_in(
+                            look.layout,
+                            preview,
                             names.len(),
-                            w as f32,
-                            h as f32,
+                            (w as f32, h as f32),
                             canvas_aspect as f32,
-                            x as f32,
-                            y as f32,
+                            (x as f32, y as f32),
                         );
                         if let Some(n) = at.and_then(|i| names.get(i)) {
                             on_pick(n.clone());
@@ -1327,7 +1349,16 @@ impl Studio {
             let state = Box::new(ffi::ProjectorState { api: a, base, show: std::sync::Mutex::new(show) });
             let param = &*state as *const ffi::ProjectorState as *mut std::ffi::c_void;
             a.obs_display_add_draw_callback(d, ffi::draw_projector, param);
-            Ok(Projector { studio: self.clone(), display: d, state, win, names, shared_display: display })
+            Ok(Projector {
+                studio: self.clone(),
+                display: d,
+                state,
+                win,
+                names,
+                shared_display: display,
+                preview: RefCell::new(None),
+                laid_out,
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1353,6 +1384,12 @@ pub struct Projector {
     /// The display as the window's resize hook sees it; emptied before the display goes.
     #[cfg(target_os = "macos")]
     shared_display: std::rc::Rc<std::cell::Cell<*mut ffi::ObsDisplay>>,
+    /// A multiview's Studio Mode preview scene now.
+    #[cfg(target_os = "macos")]
+    preview: std::cell::RefCell<Option<String>>,
+    /// The layout clicks are read against, and whether a preview box shows.
+    #[cfg(target_os = "macos")]
+    laid_out: std::rc::Rc<std::cell::Cell<(projector::MultiviewLook, bool)>>,
 }
 
 impl Projector {
@@ -1369,8 +1406,28 @@ impl Projector {
         }
     }
 
+    /// Keeps a windowed projector above other windows, or not (OBS's "Always on top").
+    pub fn set_on_top(&self, on: bool) {
+        #[cfg(target_os = "macos")]
+        self.win.set_on_top(on);
+        #[cfg(not(target_os = "macos"))]
+        let _ = on;
+    }
+
     /// A multiview follows the scenes as they change (added, removed, renamed, moved).
     pub fn set_scenes(&self, scenes: &[String]) {
+        #[cfg(target_os = "macos")]
+        {
+            let preview = self.preview.borrow().clone();
+            self.update(scenes, preview.as_deref());
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = scenes;
+    }
+
+    /// A multiview follows the scenes, Studio Mode's preview (None when it's off) and the
+    /// Studio's multiview layout.
+    pub fn update(&self, scenes: &[String], preview: Option<&str>) {
         #[cfg(target_os = "macos")]
         {
             if self.names.borrow().is_empty()
@@ -1378,19 +1435,26 @@ impl Projector {
             {
                 return;
             }
-            if *self.names.borrow() == scenes {
+            let look = self.studio.multiview_look();
+            let same = *self.names.borrow() == scenes
+                && self.preview.borrow().as_deref() == preview
+                && self.laid_out.get().0 == look;
+            if same {
                 return;
             }
-            let Ok(next) = self.studio.show(&ProjectorOf::Multiview, scenes) else { return };
+            let Ok(next) = self.studio.show(&ProjectorOf::Multiview, scenes, preview) else { return };
+            let has_preview = matches!(&next, ffi::Show::Multi { preview: Some(_), .. });
             let a = &self.studio.inner.api;
             if let Ok(mut show) = self.state.show.lock() {
                 show.release(a);
                 *show = next;
             }
             *self.names.borrow_mut() = scenes.to_vec();
+            *self.preview.borrow_mut() = preview.map(String::from);
+            self.laid_out.set((look, has_preview));
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = scenes;
+        let _ = (scenes, preview);
     }
 }
 
