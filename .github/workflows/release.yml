@@ -135,6 +135,20 @@ jobs:
           fi
           id=$(deploy/macos-signing.sh setup)
           echo "APPLE_SIGNING_IDENTITY=$id" >> "$GITHUB_ENV"
+      # A universal build merges only the app's own binary; the bundler then looks for every
+      # other [[bin]] (the recording muxer) already merged in target/universal-apple-darwin.
+      - name: Universal helper binaries (macOS)
+        if: matrix.name == 'macOS'
+        shell: bash
+        env:
+          FERROCAST_WEB_DIST: ${{ github.workspace }}/ferrocast-web/dist
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p ferrocast-desktop --bin obs-ffmpeg-mux --target "$t"
+          done
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/obs-ffmpeg-mux \
+            target/aarch64-apple-darwin/release/obs-ffmpeg-mux target/x86_64-apple-darwin/release/obs-ffmpeg-mux
       - name: Build the app
         shell: bash
         env:
