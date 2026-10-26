@@ -508,6 +508,8 @@ pub struct StudioSettings {
     pub speakers: Option<String>,
     /// Meters read true peak instead of sample peak (OBS's Peak Meter Type).
     pub true_peak: bool,
+    /// OBS's Low Latency Audio Buffering (after a restart).
+    pub low_latency_audio: bool,
     /// Multiviews: what's on air "top", "bottom", "left" or "right" of the scenes, or
     /// "scenes_only"; names under each box; EBU R95 safe areas.
     pub multiview_layout: String,
@@ -574,6 +576,7 @@ impl Default for StudioSettings {
             replay_format: "mp4".into(),
             speakers: None,
             true_peak: false,
+            low_latency_audio: false,
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,

@@ -76,11 +76,15 @@ pub struct VideoInfo {
     pub scale_type: c_int,
 }
 
+/// `obs_audio_info2`: the sound setup with how far sources may fall behind (OBS 30+).
 #[repr(C)]
-#[derive(Debug)]
-pub struct AudioInfo {
+#[derive(Debug, Clone, Copy)]
+pub struct AudioInfo2 {
     pub samples_per_sec: u32,
     pub speakers: c_int,
+    /// 0 for libobs's own (about a second).
+    pub max_buffering_ms: u32,
+    pub fixed_buffering: bool,
 }
 
 #[repr(C)]
@@ -271,7 +275,8 @@ api! {
     obs_wait_for_destroy_queue: fn() -> bool;
     obs_get_version_string: fn() -> *const c_char;
     obs_add_data_path: fn(a: *const c_char);
-    obs_reset_audio: fn(a: *const AudioInfo) -> bool;
+    obs_reset_audio2: fn(a: *const AudioInfo2) -> bool;
+    obs_get_audio_info2: fn(a: *mut AudioInfo2) -> bool;
     obs_reset_video: fn(a: *mut VideoInfo) -> c_int;
     obs_add_module_path: fn(a: *const c_char, b: *const c_char);
     obs_add_disabled_module: fn(a: *const c_char);

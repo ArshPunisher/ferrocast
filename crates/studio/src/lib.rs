@@ -196,6 +196,9 @@ pub struct AudioSetup {
     pub stereo: bool,
     /// A surround layout instead; None follows `stereo`.
     pub layout: Option<Surround>,
+    /// OBS's Low Latency Audio Buffering: sound is held at most 20 ms for late sources
+    /// instead of growing to a second (less delay; a late source may crackle instead).
+    pub low_latency: bool,
 }
 
 /// Surround speaker layouts libobs mixes for.
@@ -224,7 +227,7 @@ impl Surround {
 
 impl Default for AudioSetup {
     fn default() -> Self {
-        AudioSetup { sample_rate: 48_000, stereo: true, layout: None }
+        AudioSetup { sample_rate: 48_000, stereo: true, layout: None, low_latency: false }
     }
 }
 
@@ -307,8 +310,14 @@ impl Studio {
         let data = cstr(&paths.data);
         api.obs_add_data_path(data.as_ptr());
 
-        let audio = ffi::AudioInfo { samples_per_sec: audio.sample_rate, speakers: speaker_layout(&audio) };
-        if !api.obs_reset_audio(&audio) {
+        // As OBS sets it up (OBSBasic::ResetAudio).
+        let audio = ffi::AudioInfo2 {
+            samples_per_sec: audio.sample_rate,
+            speakers: speaker_layout(&audio),
+            max_buffering_ms: if audio.low_latency { 20 } else { 0 },
+            fixed_buffering: audio.low_latency,
+        };
+        if !api.obs_reset_audio2(&audio) {
             api.obs_shutdown();
             return Err(StudioError::Audio);
         }
@@ -452,6 +461,13 @@ impl Studio {
     /// libobs's version ("32.2.2").
     pub fn version(&self) -> String {
         text(self.inner.api.obs_get_version_string())
+    }
+
+    /// How sound is held for late sources: `(most milliseconds, fixed)`; `(0, false)` is
+    /// libobs's own (it grows to about a second when a source runs late).
+    pub fn audio_buffering(&self) -> (u32, bool) {
+        let mut ai = ffi::AudioInfo2 { samples_per_sec: 0, speakers: 0, max_buffering_ms: 0, fixed_buffering: false };
+        if self.inner.api.obs_get_audio_info2(&mut ai) { (ai.max_buffering_ms, ai.fixed_buffering) } else { (0, false) }
     }
 
     /// Every kind the loaded plugins offer. Like OBS's Add menu, source kinds replaced by a

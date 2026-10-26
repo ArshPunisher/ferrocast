@@ -768,7 +768,12 @@ impl StudioHost for DesktopStudio {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
                 let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                 let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
-                let audio = AudioSetup { sample_rate: s.sample_rate, stereo: s.stereo, layout };
+                let audio = AudioSetup {
+                    sample_rate: s.sample_rate,
+                    stereo: s.stereo,
+                    layout,
+                    low_latency: s.low_latency_audio,
+                };
                 let studio = Studio::start_with(&paths, canvas, audio, &config).map_err(|e| e.to_string())?;
                 tracing::info!(version = %studio.version(), renderer, "the Studio's engine loaded");
                 studio.set_multiview_look(multiview_look(&s));
@@ -997,6 +1002,7 @@ impl StudioHost for DesktopStudio {
                         a.sample_rate != s.sample_rate
                             || a.stereo != s.stereo
                             || a.layout != s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name)
+                            || a.low_latency != s.low_latency_audio
                     }) {
                         notes.push("Sound changes apply after Ferrocast restarts.".into());
                     }
