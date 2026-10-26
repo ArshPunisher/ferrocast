@@ -780,6 +780,7 @@ impl Studio {
                 api: &self.inner.api,
                 base: (self.canvas().width, self.canvas().height),
                 selected: std::sync::Mutex::new(None),
+                scene: std::sync::Mutex::new(ptr::null_mut()),
             });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
@@ -820,6 +821,34 @@ impl Preview {
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
 
+    /// Shows scene `name` instead of what's on air (Studio Mode's preview), or (None) what's on
+    /// air again. Main thread.
+    pub fn show_scene(&self, name: Option<&str>) {
+        let a = &self.studio.inner.api;
+        let next = name.map_or(ptr::null_mut(), |n| {
+            let src = a.obs_get_source_by_name(cstr(n).as_ptr());
+            if !src.is_null() {
+                a.obs_source_inc_showing(src);
+            }
+            src
+        });
+        // The swap waits for a draw in progress; the old source goes only after it.
+        let old = match self.state.scene.lock() {
+            Ok(mut g) => std::mem::replace(&mut *g, next),
+            Err(e) => std::mem::replace(&mut *e.into_inner(), next),
+        };
+        if !old.is_null() {
+            a.obs_source_dec_showing(old);
+            a.obs_source_release(old);
+        }
+    }
+
+    /// The scene it shows instead of what's on air, if any.
+    pub fn shown_scene(&self) -> Option<String> {
+        let p = self.state.scene.lock().map(|g| *g).unwrap_or(ptr::null_mut());
+        (!p.is_null()).then(|| text(self.studio.inner.api.obs_source_get_name(p)))
+    }
+
     /// Outlines item `id` of `scene` with handles (as OBS marks the picked source), or nothing.
     pub fn select(&self, pick: Option<(&str, i64)>) {
         let pick = pick.map(|(scene, id)| (cstr(scene), id));
@@ -835,6 +864,11 @@ impl Drop for Preview {
         let param = &*self.state as *const ffi::DrawState as *mut std::ffi::c_void;
         a.obs_display_remove_draw_callback(self.display, ffi::draw_main, param);
         a.obs_display_destroy(self.display);
+        let shown = self.state.scene.lock().map(|g| *g).unwrap_or(ptr::null_mut());
+        if !shown.is_null() {
+            a.obs_source_dec_showing(shown);
+            a.obs_source_release(shown);
+        }
         #[cfg(target_os = "macos")]
         self.view.remove();
     }

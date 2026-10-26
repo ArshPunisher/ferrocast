@@ -36,6 +36,8 @@ pub struct SceneInfo {
     pub items: usize,
     /// On air.
     pub current: bool,
+    /// In Studio Mode's preview (what goes on air next).
+    pub preview: bool,
     /// Its own way in, instead of the Studio's (OBS's "Transition Override").
     pub transition: Option<TransitionInfo>,
 }
@@ -328,6 +330,18 @@ pub struct Collection {
     /// Each transition kind's own settings (a stinger's video, a swipe's direction…), used
     /// whenever that kind is made.
     transition_settings: RefCell<HashMap<String, Value>>,
+    /// Studio Mode's preview scene (one of `scenes`), or null when Studio Mode is off.
+    preview: RefCell<*mut ffi::ObsSource>,
+    /// OBS's quick transitions: one-click ways to send the preview on air.
+    quick: RefCell<Vec<TransitionInfo>>,
+}
+
+/// The quick transitions a new collection starts with, as OBS's.
+fn default_quick() -> Vec<TransitionInfo> {
+    vec![
+        TransitionInfo { kind: "cut_transition".into(), ms: 0 },
+        TransitionInfo { kind: "fade_transition".into(), ms: 300 },
+    ]
 }
 
 impl std::fmt::Debug for Collection {
@@ -355,6 +369,8 @@ impl Collection {
             active_kind: RefCell::new(String::new()),
             meters: RefCell::new(HashMap::new()),
             transition_settings: RefCell::new(HashMap::new()),
+            preview: RefCell::new(ptr::null_mut()),
+            quick: RefCell::new(default_quick()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -437,6 +453,7 @@ impl Collection {
     pub fn scenes(&self) -> Vec<SceneInfo> {
         let a = self.api();
         let cur = *self.current.borrow();
+        let pre = *self.preview.borrow();
         self.scenes
             .borrow()
             .iter()
@@ -444,6 +461,7 @@ impl Collection {
                 name: text(a.obs_source_get_name(*s)),
                 items: self.raw_items(a.obs_scene_from_source(*s)).len(),
                 current: *s == cur,
+                preview: *s == pre,
                 transition: self.scene_transition(*s),
             })
             .collect()
@@ -502,6 +520,10 @@ impl Collection {
             let next = self.scenes.borrow()[at.saturating_sub(1)];
             self.go(next, 0);
         }
+        if *self.preview.borrow() == src {
+            let next = *self.current.borrow();
+            self.preview.replace(next);
+        }
         let a = self.api();
         a.obs_source_remove(src);
         a.obs_source_release(src);
@@ -533,6 +555,74 @@ impl Collection {
             }
         }
         self.go(src, want.ms);
+        Ok(())
+    }
+
+    // ---- Studio Mode ----
+
+    /// Studio Mode's preview scene, or None when it's off.
+    pub fn preview_scene(&self) -> Option<String> {
+        let p = *self.preview.borrow();
+        (!p.is_null()).then(|| text(self.api().obs_source_get_name(p)))
+    }
+
+    /// Turns Studio Mode on (the preview starts as what's on air) or off.
+    pub fn set_studio_mode(&self, on: bool) {
+        let next = if on { *self.current.borrow() } else { ptr::null_mut() };
+        if on && !self.preview.borrow().is_null() {
+            return;
+        }
+        self.preview.replace(next);
+    }
+
+    /// Picks the scene Studio Mode's preview shows (to edit, then send on air).
+    pub fn set_preview(&self, name: &str) -> Result<(), StudioError> {
+        if self.preview.borrow().is_null() {
+            return Err(StudioError::Failed("Studio Mode is off.".into()));
+        }
+        let src = self.scene_src(name)?;
+        self.preview.replace(src);
+        Ok(())
+    }
+
+    /// Sends the preview on air: with `quick` (a quick transition), else as a click on the scene
+    /// would (its own transition, or the Studio's).
+    pub fn transition_now(&self, quick: Option<&TransitionInfo>) -> Result<(), StudioError> {
+        let pre = *self.preview.borrow();
+        if pre.is_null() {
+            return Err(StudioError::Failed("Studio Mode is off.".into()));
+        }
+        let name = text(self.api().obs_source_get_name(pre));
+        match quick {
+            None => self.set_current(&name),
+            Some(t) => {
+                if t.ms > 20_000 {
+                    return Err(StudioError::Failed("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                if t.kind != *self.active_kind.borrow() {
+                    self.make_transition(&t.kind)?;
+                }
+                self.go(pre, if t.kind == "cut_transition" { 0 } else { t.ms });
+                Ok(())
+            }
+        }
+    }
+
+    pub fn quick_transitions(&self) -> Vec<TransitionInfo> {
+        self.quick.borrow().clone()
+    }
+
+    /// Replaces the quick transitions (up to 10, each one of the Studio's transitions).
+    pub fn set_quick_transitions(&self, list: &[TransitionInfo]) -> Result<(), StudioError> {
+        if list.len() > 10 {
+            return Err(StudioError::Failed("Up to 10 quick transitions.".into()));
+        }
+        for t in list {
+            if !TRANSITION_NAMES.iter().any(|(k, _)| *k == t.kind) || t.ms > 20_000 {
+                return Err(StudioError::Failed(format!("\"{}\" isn't a transition here", t.kind)));
+            }
+        }
+        self.quick.replace(list.to_vec());
         Ok(())
     }
 
@@ -1568,7 +1658,19 @@ impl Collection {
                 kinds.iter().map(|k| json!({ "name": obs_name(k), "id": k, "settings": settings[*k] })).collect(),
             ),
         );
-        doc.insert("ferrocast".into(), json!({ "transition": t, "transition_settings": settings }));
+        doc.insert(
+            "ferrocast".into(),
+            json!({
+                "transition": t,
+                "transition_settings": settings,
+                "quick_transitions": self.quick_transitions(),
+                "studio_mode": self.preview_scene(),
+            }),
+        );
+        // OBS keeps Studio Mode's preview as the "current scene".
+        if let Some(p) = self.preview_scene() {
+            doc.insert("current_scene".into(), json!(p));
+        }
         Value::Object(doc)
     }
 
@@ -1664,6 +1766,17 @@ impl Collection {
             .and_then(|n| c.scene_src(n).ok());
         let first = c.scenes.borrow()[0];
         c.go(want.unwrap_or(first), 0);
+        if let Some(q) = doc
+            .pointer("/ferrocast/quick_transitions")
+            .and_then(|q| serde_json::from_value::<Vec<TransitionInfo>>(q.clone()).ok())
+        {
+            let _ = c.set_quick_transitions(&q);
+        }
+        // Studio Mode comes back with its preview.
+        if let Some(p) = doc.pointer("/ferrocast/studio_mode").and_then(Value::as_str) {
+            c.set_studio_mode(true);
+            let _ = c.set_preview(p);
+        }
         Ok(c)
     }
 }

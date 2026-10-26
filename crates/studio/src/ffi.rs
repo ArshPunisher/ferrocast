@@ -690,6 +690,9 @@ pub(crate) struct DrawState {
     pub base: (u32, u32),
     /// The item picked in the preview (its scene's name and its id), outlined with handles.
     pub selected: std::sync::Mutex<Option<(std::ffi::CString, i64)>>,
+    /// A scene to show instead of what's on air (Studio Mode's preview): our reference, and
+    /// showing. Null for what's on air.
+    pub scene: std::sync::Mutex<*mut ObsSource>,
 }
 
 /// What `find_box` looks for and found.
@@ -796,7 +799,14 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     api.gs_projection_push();
     api.gs_ortho(0.0, bw, 0.0, bh, -100.0, 100.0);
     api.gs_set_viewport(x, y, w, h);
-    api.obs_render_main_texture();
+    {
+        // Held while drawing: Preview::show_scene can't release the source mid-render.
+        let shown = st.scene.lock();
+        match shown.as_ref().map(|g| **g) {
+            Ok(scene) if !scene.is_null() => api.obs_source_video_render(scene),
+            _ => api.obs_render_main_texture(),
+        }
+    }
     if let Ok(sel) = st.selected.lock()
         && let Some((scene, id)) = sel.as_ref()
         && let Some(m) = item_box(api, scene, *id)

@@ -154,6 +154,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     c.set_current("Gameplay 2")?;
     std::thread::sleep(Duration::from_millis(500));
     c.set_transition(&TransitionInfo { kind: "fade_transition".into(), ms: 500 })?;
+    // Studio Mode: a preview to edit, sent on air with a quick transition; it's saved on.
+    assert!(c.set_preview("Gameplay").is_err(), "no preview while Studio Mode is off");
+    c.set_studio_mode(true);
+    c.set_preview("Just chatting")?;
+    c.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }))?;
+    assert_eq!(c.current(), "Just chatting");
+    c.set_preview("Gameplay")?;
+    c.set_quick_transitions(&[TransitionInfo { kind: "obs_stinger_transition".into(), ms: 0 }])?;
+    assert!(c.set_quick_transitions(&[TransitionInfo { kind: "boom".into(), ms: 0 }]).is_err());
+    c.transition_now(None)?;
+    assert_eq!(c.current(), "Gameplay", "Transition uses the scene's own way in, or the Studio's");
+    c.set_preview("Gameplay 2")?;
     let saved = c.save("Test");
     let list = saved["transitions"].as_array().ok_or("transitions")?;
     assert_eq!(list.len(), 2, "both kinds' settings saved: {list:?}");
@@ -179,7 +191,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(before.3, after.3, "filters come back");
     assert_eq!(before.4, after.4, "volume and monitoring come back");
     assert_eq!(back.transition(), TransitionInfo { kind: "fade_transition".into(), ms: 500 });
+    assert_eq!(back.preview_scene().as_deref(), Some("Gameplay 2"), "Studio Mode comes back with its preview");
+    assert_eq!(back.quick_transitions()[0].kind, "obs_stinger_transition");
     back.remove_scene("Gameplay 2")?;
+    assert_eq!(back.preview_scene().as_deref(), Some("Gameplay"), "a removed preview falls back to what's on air");
     assert!(back.remove_scene("Nope").is_err());
     assert_eq!(back.transition_settings("swipe_transition")["direction"], "right", "settings come back");
     assert_eq!(back.transition_settings("obs_stinger_transition")["transition_point"], 200);
