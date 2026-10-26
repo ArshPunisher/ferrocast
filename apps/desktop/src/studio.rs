@@ -56,14 +56,31 @@ struct Held {
 }
 
 /// A multiview follows the scenes after anything that changes them.
+/// How multiviews are laid out, from the settings.
+fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
+    use ferrocast_studio::MultiviewLayout as L;
+    ferrocast_studio::MultiviewLook {
+        layout: match s.multiview_layout.as_str() {
+            "bottom" => L::Bottom,
+            "left" => L::Left,
+            "right" => L::Right,
+            "scenes_only" => L::ScenesOnly,
+            _ => L::Top,
+        },
+        labels: s.multiview_labels,
+        safe_areas: s.multiview_safe_areas,
+    }
+}
+
 fn refresh_projectors(h: &Held) {
     if h.projectors.is_empty() {
         return;
     }
     if let Some(c) = &h.collection {
         let names: Vec<String> = c.scenes().into_iter().map(|s| s.name).collect();
+        let preview = c.preview_scene();
         for (_, p) in &h.projectors {
-            p.set_scenes(&names);
+            p.update(&names, preview.as_deref());
         }
     }
 }
@@ -748,6 +765,7 @@ impl StudioHost for DesktopStudio {
                 let audio = AudioSetup { sample_rate: s.sample_rate, stereo: s.stereo, layout };
                 let studio = Studio::start_with(&paths, canvas, audio, &config).map_err(|e| e.to_string())?;
                 tracing::info!(version = %studio.version(), renderer, "the Studio's engine loaded");
+                studio.set_multiview_look(multiview_look(&s));
                 if let Some((name, id)) = &s.monitoring
                     && let Err(e) = studio.set_monitoring_device(name, id)
                 {
@@ -968,6 +986,7 @@ impl StudioHost for DesktopStudio {
                     if let Some(c) = &h.collection {
                         c.set_true_peak(s.true_peak);
                     }
+                    studio.set_multiview_look(multiview_look(&s));
                     if h.audio.is_some_and(|a| {
                         a.sample_rate != s.sample_rate
                             || a.stereo != s.stereo
@@ -978,6 +997,8 @@ impl StudioHost for DesktopStudio {
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
                 h.settings = Some(s);
+                // Open multiviews take a new layout at once.
+                refresh_projectors(h);
                 Ok::<_, String>(notes)
             })
             .await??;
@@ -1456,19 +1477,34 @@ impl StudioHost for DesktopStudio {
                 });
                 drop(gone);
             });
-            // A click on a multiview scene puts it on air, through its transition.
+            // A click on a multiview scene puts it on air, through its transition; in Studio
+            // Mode it goes to the preview instead, as in OBS.
             let on_pick = Box::new(|scene: String| {
                 HELD.with(|h| {
                     let Ok(h) = h.try_borrow() else { return };
-                    if let Some(c) = &h.collection
-                        && let Err(e) = c.set_current(&scene)
-                    {
-                        tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
+                    if let Some(c) = &h.collection {
+                        let done =
+                            if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
+                        if let Err(e) = done {
+                            tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
+                        }
+                        let names: Vec<String> = c.scenes().into_iter().map(|s| s.name).collect();
+                        let preview = c.preview_scene();
+                        for (_, p) in &h.projectors {
+                            p.update(&names, preview.as_deref());
+                        }
                     }
                 });
             });
             let screen = p.screen.map(|s| s as usize);
             let made = studio.projector(&of, &scenes, screen, on_close, on_pick).map_err(|e| e.to_string())?;
+            if p.on_top {
+                made.set_on_top(true);
+            }
+            // A multiview shows Studio Mode's preview as soon as it opens.
+            if let Some(c) = &h.collection {
+                made.update(&scenes, c.preview_scene().as_deref());
+            }
             h.projectors.push((id, made));
             Ok(json!({ "id": id }))
         })

@@ -141,7 +141,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   lag, encoding lag, dropped frames per output), multiview (layouts, labels), projectors
   (fullscreen per monitor, windowed, always on top). (26 Oct: Stats done, opened from the
   stats bar, with how long the disk lasts at the recording's bitrate; docks lock and reset
-  done earlier; custom browser docks and multiview layouts still to come.)
+  done earlier; multiview layouts (above, below, left, right, scenes only), Studio Mode's
+  preview in it, names and safe areas, and projectors always on top done too; custom browser
+  docks still to come.)
 - [x] P1 Undo/redo (26 Oct: sources, scenes, filters, settings, sound, item transitions, deinterlacing; shortcuts aren't steps). *Better: a history list you can step back through (done).*
 - [ ] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
   plugin manager, safe mode, "show recording/streaming in title bar".

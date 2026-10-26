@@ -265,6 +265,9 @@ pub struct ProjectorReq {
     /// Full screen on this display (from the screens list), or a window when absent.
     #[serde(default)]
     pub screen: Option<u32>,
+    /// A window kept above other apps' windows (OBS's "Always on top").
+    #[serde(default)]
+    pub on_top: bool,
 }
 
 impl ProjectorReq {
@@ -498,6 +501,11 @@ pub struct StudioSettings {
     pub speakers: Option<String>,
     /// Meters read true peak instead of sample peak (OBS's Peak Meter Type).
     pub true_peak: bool,
+    /// Multiviews: what's on air "top", "bottom", "left" or "right" of the scenes, or
+    /// "scenes_only"; names under each box; EBU R95 safe areas.
+    pub multiview_layout: String,
+    pub multiview_labels: bool,
+    pub multiview_safe_areas: bool,
 }
 
 impl Default for StudioSettings {
@@ -541,6 +549,9 @@ impl Default for StudioSettings {
             replay_format: "mp4".into(),
             speakers: None,
             true_peak: false,
+            multiview_layout: "top".into(),
+            multiview_labels: true,
+            multiview_safe_areas: false,
         }
     }
 }
@@ -619,6 +630,9 @@ impl StudioSettings {
             && !["2.1", "4.0", "4.1", "5.1", "7.1"].contains(&l.as_str())
         {
             return bad("speakers: 2.1, 4.0, 4.1, 5.1 or 7.1 (or null for stereo or mono).");
+        }
+        if !["top", "bottom", "left", "right", "scenes_only"].contains(&self.multiview_layout.as_str()) {
+            return bad("multiview_layout: top, bottom, left, right or scenes_only.");
         }
         if !["mp4", "mkv", "mov", "flv", "ts"].contains(&self.replay_format.as_str()) {
             return bad("replay_format: mp4, mkv, mov, flv or ts.");
@@ -1886,6 +1900,7 @@ mod tests {
             what: what.into(),
             name: name.map(str::to_string),
             screen,
+            on_top: false,
         };
         for bad in [
             p("source", None, None),

@@ -703,7 +703,7 @@ async fn engine_fix_screen_access(State(app): State<AppState>) -> ApiResult<Json
     Ok(Json(app.engine.studio_fix_screen_access().await?))
 }
 
-/// `POST /studio/engine/projectors` `{ what, name?, screen? }` → 201 `{ id }`.
+/// `POST /studio/engine/projectors` `{ what, name?, screen?, on_top? }` → 201 `{ id }`.
 async fn engine_projector(
     State(app): State<AppState>,
     Body(b): Body<ferrocast_engine::studio_host::ProjectorReq>,
