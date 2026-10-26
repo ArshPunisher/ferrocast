@@ -601,6 +601,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.get("/studio/engine/screens").await,
         r.get("/studio/engine/scenes/Gameplay/items/3/transform").await,
         r.post("/studio/engine/undo", json!({})).await,
+        r.put("/studio/engine/studio-mode", json!({ "on": true })).await,
+        r.put("/studio/engine/studio-mode/preview", json!({ "scene": "Gameplay" })).await,
+        r.post("/studio/engine/studio-mode/transition", json!({})).await,
+        r.put("/studio/engine/quick-transitions", json!({ "list": [{ "kind": "cut_transition", "ms": 0 }] })).await,
         r.get("/studio/engine/transitions/obs_stinger_transition/settings").await,
         r.put("/studio/engine/transitions/obs_stinger_transition/settings", json!({ "settings": { "path": "/a.webm" } }))
             .await,
@@ -643,6 +647,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/projectors", json!({ "what": "wall" })).await, "unknown projector"),
         (r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0 })).await, "half a transform"),
         (r.get("/studio/engine/transitions/boom/settings").await, "not a transition"),
+        (
+            r.post("/studio/engine/studio-mode/transition", json!({ "quick": { "kind": "boom", "ms": 0 } })).await,
+            "bad quick",
+        ),
         (
             r.put(
                 "/studio/engine/scenes/Gameplay/transition",

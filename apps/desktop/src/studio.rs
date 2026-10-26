@@ -45,6 +45,9 @@ struct Held {
     selected: Option<(String, i64)>,
     /// Undo and redo for sources.
     history: History,
+    /// Studio Mode's picture of what's on air, beside the preview, and where it goes.
+    program_view: Option<Preview>,
+    program_at: Option<(Rect, f64)>,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
     projectors: Vec<(u64, Projector)>,
     last_projector: u64,
@@ -168,6 +171,11 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     });
     h.history.clear();
     h.selected = None;
+    // The old scenes are going: the preview lets go of the one it shows (a scene of the same
+    // name in the new set is another source).
+    if let Some(p) = &h.preview {
+        p.show_scene(None);
+    }
     // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
     let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
         Some(Ok(d)) => Collection::load(&studio, &d, FIRST_SCENE),
@@ -183,12 +191,14 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
             save(&c, to);
             h.collection = Some(c);
             refresh_projectors(h);
+            sync_views(h);
             Ok(())
         }
         Err(e) => {
             if let Some(old) = old {
                 h.collection = Collection::load(&studio, &old, FIRST_SCENE).ok();
             }
+            sync_views(h);
             Err(format!("That scene collection didn't load: {e}"))
         }
     }
@@ -307,7 +317,25 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
     let done = |r: Result<(), ferrocast_studio::StudioError>| r.map(|()| Value::Null);
     let v = |x: Result<Value, String>| x.map_err(ferrocast_studio::StudioError::Failed);
     match act {
-        A::Scenes => v(to_json!(json!({ "scenes": c.scenes(), "current": c.current(), "transition": c.transition() }))),
+        A::Scenes => v(to_json!(json!({
+            "scenes": c.scenes(),
+            "current": c.current(),
+            "transition": c.transition(),
+            // Studio Mode's preview (null when it's off) and its quick transitions.
+            "preview": c.preview_scene(),
+            "quick": c.quick_transitions(),
+        }))),
+        A::StudioMode { on } => {
+            c.set_studio_mode(on);
+            Ok(Value::Null)
+        }
+        A::SetPreview { scene } => done(c.set_preview(&scene)),
+        A::TransitionNow { quick } => {
+            done(c.transition_now(quick.map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).as_ref()))
+        }
+        A::SetQuickTransitions { list } => done(c.set_quick_transitions(
+            &list.into_iter().map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).collect::<Vec<_>>(),
+        )),
         A::AddScene { name } => done(c.add_scene(&name)),
         A::DuplicateScene { scene, name } => done(c.duplicate_scene(&scene, &name)),
         A::RemoveScene { scene } => done(c.remove_scene(&scene)),
@@ -414,6 +442,26 @@ fn save(c: &Collection, file: &std::path::Path) {
     }
 }
 
+/// The preview shows Studio Mode's preview scene, or what's on air when it's off.
+fn sync_views(h: &Held) {
+    let want = h.collection.as_ref().and_then(Collection::preview_scene);
+    if let Some(p) = &h.preview
+        && p.shown_scene() != want
+    {
+        p.show_scene(want.as_deref());
+    }
+}
+
+/// Makes Studio Mode's picture of what's on air at its last place (main thread).
+fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
+    let Some((rect, scale)) = h.program_at else { return Ok(()) };
+    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+    let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+    let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
+    h.program_view = Some(studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
 /// Makes the preview at its last place (main thread).
 fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
@@ -423,6 +471,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
     h.preview = Some(p);
+    sync_views(h);
     Ok(())
 }
 
@@ -573,6 +622,8 @@ impl StudioHost for DesktopStudio {
             h.record = None;
             h.preview = None;
             h.preview_at = None;
+            h.program_view = None;
+            h.program_at = None;
             h.projectors.clear();
             h.history.clear();
             if let Some(c) = h.collection.take() {
@@ -596,6 +647,27 @@ impl StudioHost for DesktopStudio {
             let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
             let opts = s.options(&kind).map_err(|e| e.to_string())?;
             serde_json::to_value(opts).map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
+        let app = self.app.clone();
+        self.on_main(move |h| {
+            let Some(r) = rect else {
+                h.program_view = None;
+                h.program_at = None;
+                return Ok(());
+            };
+            let rect = Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh };
+            let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+            let scale = window.scale_factor().unwrap_or(1.0);
+            h.program_at = Some((rect, scale));
+            if let Some(p) = h.program_view.as_mut() {
+                p.set_rect(rect, scale);
+                return Ok(());
+            }
+            make_program_view(&app, h)
         })
         .await?
     }
@@ -670,6 +742,7 @@ impl StudioHost for DesktopStudio {
             if let Some(b) = before {
                 h.history.after(c, b, &out);
             }
+            sync_views(h);
             if changes && out.is_ok() {
                 save(c, &file);
                 refresh_projectors(h);
@@ -700,6 +773,9 @@ impl StudioHost for DesktopStudio {
                         // The preview was made for the old size; projectors close.
                         if h.preview.take().is_some() {
                             let _ = make_preview(&app, h);
+                        }
+                        if h.program_view.take().is_some() {
+                            let _ = make_program_view(&app, h);
                         }
                         h.projectors.clear();
                     }

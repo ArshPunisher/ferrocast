@@ -46,6 +46,10 @@ pub(crate) fn routes() -> Router<AppState> {
             get(engine_item_transform).put(engine_set_item_transform),
         )
         .route("/studio/engine/preview/selection", put(engine_select))
+        .route("/studio/engine/studio-mode", put(engine_studio_mode))
+        .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
+        .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
+        .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
         .route("/studio/engine/redo", post(engine_redo))
         .route("/studio/engine/pick-file", post(engine_pick_file))
@@ -333,11 +337,14 @@ async fn engine_options(State(app): State<AppState>, Path(id): Path<String>) -> 
 #[derive(Deserialize)]
 struct PreviewBody {
     rect: Option<ferrocast_engine::studio_host::PreviewRect>,
+    /// Studio Mode's second box, for what's on air.
+    #[serde(default)]
+    program: Option<ferrocast_engine::studio_host::PreviewRect>,
 }
 
 /// `PUT /studio/engine/preview` `{ rect: {x, y, w, h} | null }`: the preview over the page's box.
 async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
-    app.engine.studio_preview(b.rect).await?;
+    app.engine.studio_preview(b.rect, b.program).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -546,6 +553,35 @@ async fn engine_set_transition_settings(
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetTransitionSettings { kind, settings: b.settings }).await
+}
+
+/// `PUT /studio/engine/studio-mode` `{ on }`.
+async fn engine_studio_mode(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::StudioMode { on: b.on }).await
+}
+
+async fn engine_set_preview(State(app): State<AppState>, Body(b): Body<SceneBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetPreview { scene: b.scene }).await
+}
+
+#[derive(Deserialize)]
+struct QuickBody {
+    #[serde(default)]
+    quick: Option<SceneTransition>,
+}
+
+/// `POST /studio/engine/studio-mode/transition` `{ quick? }`: the preview goes on air.
+async fn engine_transition_now(State(app): State<AppState>, Body(b): Body<QuickBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::TransitionNow { quick: b.quick }).await
+}
+
+#[derive(Deserialize)]
+struct QuickListBody {
+    list: Vec<SceneTransition>,
+}
+
+async fn engine_quick_transitions(State(app): State<AppState>, Body(b): Body<QuickListBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetQuickTransitions { list: b.list }).await
 }
 
 /// `POST /studio/engine/undo` → `{ done, undo, redo }`.

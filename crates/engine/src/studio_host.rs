@@ -64,6 +64,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn options(&self, kind: String) -> Result<Value, String>;
     /// Shows the preview at the box in the dashboard window, or hides it (None).
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String>;
+    /// Studio Mode's second picture, what's on air, over its own box (or none).
+    async fn program_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
     /// The settings a new source of `kind` starts with.
     async fn defaults(&self, kind: String) -> Result<Value, String>;
     /// Does one thing to the scene collection (checked before it gets here) and answers what
@@ -752,6 +756,23 @@ pub enum StudioAct {
         kind: String,
         settings: Value,
     },
+    /// Studio Mode on (its preview starts as what's on air) or off.
+    StudioMode {
+        on: bool,
+    },
+    /// The scene Studio Mode's preview shows, to edit before it goes on air.
+    SetPreview {
+        scene: String,
+    },
+    /// Sends the preview on air: with a quick transition, or as a click on the scene would.
+    TransitionNow {
+        #[serde(default)]
+        quick: Option<SceneTransition>,
+    },
+    /// OBS's quick transitions (up to 10).
+    SetQuickTransitions {
+        list: Vec<SceneTransition>,
+    },
     /// Undoes the newest change to sources → `{ done, undo, redo }` (labels, or null).
     Undo,
     /// Does again what was undone → `{ done, undo, redo }`.
@@ -887,7 +908,15 @@ impl StudioAct {
                 Ok(())
             }
             A::Transform { scene, .. } => check_source_name(scene),
-            A::Undo | A::Redo => Ok(()),
+            A::Undo | A::Redo | A::StudioMode { .. } => Ok(()),
+            A::SetPreview { scene } => check_source_name(scene),
+            A::TransitionNow { quick } => quick.iter().try_for_each(check_transition),
+            A::SetQuickTransitions { list } => {
+                if list.len() > 10 {
+                    return Err(EngineError::Invalid("list: up to 10 quick transitions.".into()));
+                }
+                list.iter().try_for_each(check_transition)
+            }
             A::TransitionSettings { kind } | A::SetTransitionSettings { kind, .. }
                 if !TRANSITION_KINDS.contains(&kind.as_str()) =>
             {
@@ -931,6 +960,17 @@ impl StudioAct {
                 | A::TransitionSettings { .. }
         )
     }
+}
+
+/// One of the Studio's transitions, 0 to 20 s long.
+fn check_transition(t: &SceneTransition) -> Result<(), EngineError> {
+    if !TRANSITION_KINDS.contains(&t.kind.as_str()) {
+        return Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()));
+    }
+    if t.ms > 20_000 {
+        return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+    }
+    Ok(())
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
@@ -1130,11 +1170,18 @@ impl Engine {
         self.studio_host()?.restart().await.map_err(failed)
     }
 
-    pub async fn studio_preview(&self, rect: Option<PreviewRect>) -> Result<(), EngineError> {
-        if let Some(r) = &rect {
+    /// The preview over the page's box, and in Studio Mode what's on air over a second one.
+    pub async fn studio_preview(
+        &self,
+        rect: Option<PreviewRect>,
+        program: Option<PreviewRect>,
+    ) -> Result<(), EngineError> {
+        for r in rect.iter().chain(program.iter()) {
             r.validate().map_err(EngineError::Invalid)?;
         }
-        self.studio_host()?.preview(rect).await.map_err(failed)
+        let host = self.studio_host()?;
+        host.preview(rect).await.map_err(failed)?;
+        host.program_view(program).await.map_err(failed)
     }
 }
 
@@ -1441,6 +1488,18 @@ mod tests {
             assert!(matches!(failed(m.into()), EngineError::Refused { code: c, .. } if c == code), "{m}");
         }
 
+        // Studio Mode: quick transitions are the Studio's own, 10 at most.
+        let q = |kind: &str, ms| SceneTransition { kind: kind.into(), ms };
+        e.studio_act(StudioAct::TransitionNow { quick: Some(q("cut_transition", 0)) }).await.unwrap();
+        for bad in [
+            StudioAct::TransitionNow { quick: Some(q("boom", 0)) },
+            StudioAct::SetQuickTransitions { list: vec![q("fade_transition", 300); 11] },
+            StudioAct::SetQuickTransitions { list: vec![q("fade_transition", 90_000)] },
+            StudioAct::SetPreview { scene: String::new() },
+        ] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
+
         // Projectors: what to show is checked first; hosts without windows say so.
         let p = |what: &str, name: Option<&str>, screen: Option<u32>| ProjectorReq {
             what: what.into(),
@@ -1479,8 +1538,8 @@ mod tests {
             assert!(matches!(e.studio_options(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
         let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0 };
-        e.studio_preview(Some(r)).await.unwrap();
-        e.studio_preview(None).await.unwrap();
+        e.studio_preview(Some(r), Some(r)).await.unwrap();
+        e.studio_preview(None, None).await.unwrap();
         for bad in [
             PreviewRect { w: 0.0, ..r },
             PreviewRect { h: f64::NAN, ..r },
@@ -1488,7 +1547,7 @@ mod tests {
             PreviewRect { w: 99_999.0, ..r },
             PreviewRect { vh: -1.0, ..r },
         ] {
-            assert!(matches!(e.studio_preview(Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
+            assert!(matches!(e.studio_preview(None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
         assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r), None], "only good boxes reach the app");
 
