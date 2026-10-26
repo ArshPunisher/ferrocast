@@ -596,6 +596,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.get("/studio/engine/screen-access").await,
         r.post("/studio/engine/screen-access/fix", json!({})).await,
         r.post("/studio/engine/restart", json!({})).await,
+        r.post("/studio/engine/projectors", json!({ "what": "multiview" })).await,
+        r.delete("/studio/engine/projectors").await,
+        r.get("/studio/engine/screens").await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -629,6 +632,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0 })).await, "no size"),
         (r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay" })).await, "scene without id"),
         (r.post("/studio/engine/pick-file", json!({ "kind": "run" })).await, "unknown dialog"),
+        (r.post("/studio/engine/projectors", json!({ "what": "source" })).await, "source without a name"),
+        (r.post("/studio/engine/projectors", json!({ "what": "wall" })).await, "unknown projector"),
         (
             r.put(
                 "/studio/engine/scenes/Gameplay/transition",

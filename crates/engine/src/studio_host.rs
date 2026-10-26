@@ -109,6 +109,49 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn restart(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
     }
+    /// Opens a projector window (OBS's projectors) → `{ id }`.
+    async fn projector(&self, _p: ProjectorReq) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Closes every projector.
+    async fn close_projectors(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// The displays a full-screen projector can go on: `{ index, name, width, height, main }[]`.
+    async fn screens(&self) -> Result<Value, String> {
+        Ok(serde_json::json!([]))
+    }
+}
+
+/// A projector to open: what's on air, one scene or source, or every scene (a multiview).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProjectorReq {
+    /// "program", "source" or "multiview".
+    pub what: String,
+    /// The scene or source, for "source".
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Full screen on this display (from the screens list), or a window when absent.
+    #[serde(default)]
+    pub screen: Option<u32>,
+}
+
+impl ProjectorReq {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        match (self.what.as_str(), &self.name) {
+            ("source", Some(n)) => check_source_name(n)?,
+            ("source", None) => return Err(EngineError::Invalid("name: the scene or source to show.".into())),
+            ("program" | "multiview", None) => {}
+            ("program" | "multiview", Some(_)) => {
+                return Err(EngineError::Invalid("name: only for what = source.".into()));
+            }
+            _ => return Err(EngineError::Invalid("what: program, source or multiview.".into())),
+        }
+        if self.screen.is_some_and(|s| s > 32) {
+            return Err(EngineError::Invalid("screen: one from the list of displays.".into()));
+        }
+        Ok(())
+    }
 }
 
 /// Hosts say this for what only the Ferrocast app on this computer can do.
@@ -878,6 +921,20 @@ impl Engine {
         self.studio_host()?.fix_screen_access().await.map_err(failed)
     }
 
+    /// Opens a projector (a window, or full screen on a display) → `{ id }`.
+    pub async fn studio_projector(&self, p: ProjectorReq) -> Result<Value, EngineError> {
+        p.validate()?;
+        self.studio_host()?.projector(p).await.map_err(failed)
+    }
+
+    pub async fn studio_close_projectors(&self) -> Result<(), EngineError> {
+        self.studio_host()?.close_projectors().await.map_err(failed)
+    }
+
+    pub async fn studio_screens(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.screens().await.map_err(failed)
+    }
+
     /// Opens Ferrocast again; refused while the Studio streams or records.
     pub async fn studio_restart(&self) -> Result<(), EngineError> {
         self.studio_host()?.restart().await.map_err(failed)
@@ -927,6 +984,9 @@ fn failed(message: String) -> EngineError {
     }
     if message.contains("isn't here yet") {
         return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
+    }
+    if message.contains("display isn't there") {
+        return refused(404, "studio_no_screen", message, "Pick a display from the list again.");
     }
     if message == NOT_HERE {
         return refused(
@@ -1113,6 +1173,30 @@ mod tests {
         assert!(matches!(not_here, EngineError::Refused { status: 422, code: "studio_not_here", .. }));
         assert_eq!(e.studio_screen_access().await.unwrap()["granted"], true);
         assert!(matches!(e.studio_restart().await.unwrap_err(), EngineError::Refused { code: "studio_not_here", .. }));
+
+        // Projectors: what to show is checked first; hosts without windows say so.
+        let p = |what: &str, name: Option<&str>, screen: Option<u32>| ProjectorReq {
+            what: what.into(),
+            name: name.map(str::to_string),
+            screen,
+        };
+        for bad in [
+            p("source", None, None),
+            p("program", Some("Main"), None),
+            p("wall", None, None),
+            p("multiview", None, Some(99)),
+            p("source", Some(""), None),
+        ] {
+            assert!(matches!(e.studio_projector(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
+        let none = e.studio_projector(p("multiview", None, Some(1))).await.unwrap_err();
+        assert!(matches!(none, EngineError::Refused { code: "studio_not_here", .. }));
+        assert_eq!(e.studio_screens().await.unwrap(), serde_json::json!([]));
+        e.studio_close_projectors().await.unwrap();
+        assert!(matches!(
+            failed("That display isn't there any more.".into()),
+            EngineError::Refused { status: 404, code: "studio_no_screen", .. }
+        ));
     }
 
     #[tokio::test]

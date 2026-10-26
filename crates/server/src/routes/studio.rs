@@ -46,6 +46,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
         .route("/studio/engine/restart", post(engine_restart))
+        .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
+        .route("/studio/engine/screens", get(engine_screens))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
         .route("/studio/engine/scenes/{scene}/transition", put(engine_scene_transition))
@@ -527,6 +529,23 @@ async fn engine_screen_access(State(app): State<AppState>) -> ApiResult<Json<Val
 
 async fn engine_fix_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_fix_screen_access().await?))
+}
+
+/// `POST /studio/engine/projectors` `{ what, name?, screen? }` → 201 `{ id }`.
+async fn engine_projector(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::studio_host::ProjectorReq>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    Ok((StatusCode::CREATED, Json(app.engine.studio_projector(b).await?)))
+}
+
+async fn engine_close_projectors(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.studio_close_projectors().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn engine_screens(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_screens().await?))
 }
 
 async fn engine_restart(State(app): State<AppState>) -> ApiResult<StatusCode> {
