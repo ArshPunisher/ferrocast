@@ -33,6 +33,7 @@ macro_rules! opaque {
     ($($n:ident),*) => { $( #[repr(C)] pub struct $n { _p: [u8; 0] } )* };
 }
 opaque!(
+    ObsView,
     ProcHandler,
     RemuxJob,
     ObsSource,
@@ -490,6 +491,12 @@ api! {
     media_remux_job_destroy: fn(a: *mut RemuxJob);
     obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
+    obs_view_create: fn() -> *mut ObsView;
+    obs_view_set_source: fn(a: *mut ObsView, b: u32, c: *mut ObsSource);
+    obs_view_add: fn(a: *mut ObsView) -> *mut VideoT;
+    obs_view_remove: fn(a: *mut ObsView);
+    obs_view_destroy: fn(a: *mut ObsView);
+    obs_output_set_media: fn(a: *mut ObsOutput, b: *mut VideoT, c: *mut AudioT);
     obs_encoder_defaults: fn(a: *const c_char) -> *mut ObsData;
     obs_volmeter_create: fn(a: c_int) -> *mut ObsVolmeter;
     obs_volmeter_destroy: fn(a: *mut ObsVolmeter);

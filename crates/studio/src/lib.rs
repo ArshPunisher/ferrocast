@@ -693,31 +693,7 @@ impl Studio {
         if tracks.iter().any(|t| !(1..=6).contains(t)) {
             return Err(StudioError::Failed("tracks: numbers 1 to 6.".into()));
         }
-        let (venc, aenc) = self.encoders(&plan.encode)?;
-        let mut audio = vec![aenc];
-        // Track 1's encoder is the first; the others mix their own track.
-        for t in tracks.iter().skip(1) {
-            match self.audio_encoder(plan.encode.audio_kbps, usize::from(t - 1)) {
-                Ok(e) => audio.push(e),
-                Err(err) => {
-                    a.obs_encoder_release(venc);
-                    audio.iter().for_each(|e| a.obs_encoder_release(*e));
-                    return Err(err);
-                }
-            }
-        }
-        if tracks[0] != 1 {
-            // The first encoder mixes track 1: make it mix the first track asked for.
-            a.obs_encoder_release(audio[0]);
-            match self.audio_encoder(plan.encode.audio_kbps, usize::from(tracks[0] - 1)) {
-                Ok(e) => audio[0] = e,
-                Err(err) => {
-                    a.obs_encoder_release(venc);
-                    audio.iter().skip(1).for_each(|e| a.obs_encoder_release(*e));
-                    return Err(err);
-                }
-            }
-        }
+        let (venc, audio) = self.encoders_for_tracks(&plan.encode, &tracks)?;
         let settings = a.obs_data_create();
         let set_str = |k: &str, v: &str| {
             let (k, v) = (cstr(k), cstr(v));
@@ -762,6 +738,120 @@ impl Studio {
             )));
         }
         Ok(rec)
+    }
+
+    /// Starts OBS's replay buffer: the last `plan.seconds` kept, saved on request (needs
+    /// OBS's mux helper beside this program).
+    pub fn replay_buffer(&self, plan: &ReplayPlan) -> Result<ReplayBuffer, StudioError> {
+        let a = &self.inner.api;
+        if !Studio::muxer_ready() {
+            return Err(StudioError::Failed("The replay buffer needs OBS's mux helper beside Ferrocast.".into()));
+        }
+        if !(5..=21_600).contains(&plan.seconds) {
+            return Err(StudioError::Failed("seconds: 5 to 21600.".into()));
+        }
+        if !["mkv", "mp4", "mov", "flv", "ts"].contains(&plan.format.as_str()) {
+            return Err(StudioError::Failed("format: mkv, mp4, mov, flv or ts.".into()));
+        }
+        let tracks: Vec<u8> = if plan.tracks.is_empty() { vec![1] } else { plan.tracks.clone() };
+        if tracks.iter().any(|t| !(1..=6).contains(t)) {
+            return Err(StudioError::Failed("tracks: numbers 1 to 6.".into()));
+        }
+        let (venc, audio) = self.encoders_for_tracks(&plan.encode, &tracks)?;
+        let settings = a.obs_data_create();
+        let set_str = |k: &str, v: &str| {
+            let (k, v) = (cstr(k), cstr(v));
+            a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
+        };
+        let set_int = |k: &str, v: i64| {
+            let k = cstr(k);
+            a.obs_data_set_int(settings, k.as_ptr(), v);
+        };
+        set_str("directory", &plan.folder.display().to_string());
+        set_str("format", &plan.name);
+        set_str("extension", &plan.format);
+        set_int("max_time_sec", i64::from(plan.seconds));
+        set_int("max_size_mb", i64::from(plan.mb));
+        let k = cstr("allow_spaces");
+        a.obs_data_set_bool(settings, k.as_ptr(), plan.spaces);
+        let (oid, oname) = (cstr("replay_buffer"), cstr("ferrocast-replay"));
+        let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
+        a.obs_data_release(settings);
+        let rb = ReplayBuffer { studio: self.clone(), out, venc, audio };
+        if out.is_null() {
+            return Err(StudioError::Failed("the replay buffer couldn't be made".into()));
+        }
+        a.obs_output_set_video_encoder(out, venc);
+        for (i, e) in rb.audio.iter().enumerate() {
+            a.obs_output_set_audio_encoder(out, *e, i);
+        }
+        if !a.obs_output_start(out) {
+            return Err(StudioError::Failed(format!(
+                "the replay buffer didn't start: {}",
+                text(a.obs_output_get_last_error(out))
+            )));
+        }
+        Ok(rb)
+    }
+
+    /// Starts OBS's virtual camera showing what's on air, or one scene or source.
+    pub fn virtual_camera(&self, shows: &CameraShows) -> Result<VirtualCamera, StudioError> {
+        let a = &self.inner.api;
+        let (oid, oname) = (cstr("virtualcam_output"), cstr("ferrocast-virtualcam"));
+        let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), ptr::null_mut(), ptr::null_mut());
+        if out.is_null() {
+            return Err(StudioError::Failed("OBS's virtual camera isn't available here".into()));
+        }
+        let mut cam = VirtualCamera { studio: self.clone(), out, view: ptr::null_mut() };
+        if let CameraShows::Source(name) = shows {
+            let n = cstr(name);
+            let src = a.obs_get_source_by_name(n.as_ptr());
+            if src.is_null() {
+                return Err(StudioError::Failed(format!("there's no scene or source called \"{name}\"")));
+            }
+            let view = a.obs_view_create();
+            a.obs_view_set_source(view, 0, src);
+            a.obs_source_release(src);
+            cam.view = view;
+            let video = a.obs_view_add(view);
+            if video.is_null() {
+                return Err(StudioError::Failed("the virtual camera's picture couldn't be made".into()));
+            }
+            a.obs_output_set_media(out, video, a.obs_get_audio());
+        }
+        if !a.obs_output_start(out) {
+            let why = text(a.obs_output_get_last_error(out));
+            return Err(StudioError::Failed(if why.is_empty() {
+                "the virtual camera didn't start".into()
+            } else {
+                format!("the virtual camera didn't start: {why}")
+            }));
+        }
+        Ok(cam)
+    }
+
+    /// The video encoder and one AAC encoder per audio track (1 to 6), in that order.
+    fn encoders_for_tracks(
+        &self,
+        e: &EncodeSettings,
+        tracks: &[u8],
+    ) -> Result<(*mut ffi::ObsEncoder, Vec<*mut ffi::ObsEncoder>), StudioError> {
+        let a = &self.inner.api;
+        let (venc, aenc) = self.encoders(e)?;
+        // The default sound encoder mixes track 1; each track gets its own instead.
+        a.obs_encoder_release(aenc);
+        let mut audio = Vec::new();
+        for t in tracks {
+            match self.audio_encoder(e.audio_kbps, usize::from(t - 1)) {
+                Ok(enc) => audio.push(enc),
+                Err(err) => {
+                    a.obs_encoder_release(venc);
+                    audio.iter().for_each(|x| a.obs_encoder_release(*x));
+                    return Err(err);
+                }
+            }
+        }
+        Ok((venc, audio))
     }
 
     /// An AAC encoder mixing audio track `mixer` (0 to 5).
@@ -1511,6 +1601,157 @@ pub struct Recording {
     /// One encoder per audio track recorded.
     audio: Vec<*mut ffi::ObsEncoder>,
     path: PathBuf,
+}
+
+/// What a replay buffer keeps and where it saves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPlan {
+    pub folder: PathBuf,
+    /// OBS's name pattern for saved replays.
+    pub name: String,
+    /// mkv, mp4, mov, flv or ts (through OBS's mux helper).
+    pub format: String,
+    pub spaces: bool,
+    /// The last this many seconds are kept (and at most this many megabytes, 0: no limit).
+    pub seconds: u32,
+    pub mb: u32,
+    pub tracks: Vec<u8>,
+    pub encode: EncodeSettings,
+}
+
+/// OBS's replay buffer: the last seconds kept in memory, saved to a file on request.
+#[derive(Debug)]
+pub struct ReplayBuffer {
+    studio: Studio,
+    out: *mut ffi::ObsOutput,
+    venc: *mut ffi::ObsEncoder,
+    audio: Vec<*mut ffi::ObsEncoder>,
+}
+
+impl ReplayBuffer {
+    pub fn active(&self) -> bool {
+        self.studio.inner.api.obs_output_active(self.out)
+    }
+
+    /// Saves what's kept so far to a file, written in the background ([`Self::last_replay`]
+    /// names it once it's done).
+    pub fn save(&self) -> Result<(), StudioError> {
+        let a = &self.studio.inner.api;
+        let ph = a.obs_output_get_proc_handler(self.out);
+        let mut stack = [0u8; 64];
+        let mut cd = ffi::CallData::fixed(&mut stack);
+        let n = cstr("save");
+        if ph.is_null() || !a.proc_handler_call(ph, n.as_ptr(), &mut cd) {
+            return Err(StudioError::Failed("The replay buffer couldn't save.".into()));
+        }
+        Ok(())
+    }
+
+    /// The last replay saved, if any.
+    pub fn last_replay(&self) -> Option<PathBuf> {
+        let a = &self.studio.inner.api;
+        let ph = a.obs_output_get_proc_handler(self.out);
+        if ph.is_null() {
+            return None;
+        }
+        let mut stack = [0u8; 4200];
+        let mut cd = ffi::CallData::fixed(&mut stack);
+        let n = cstr("get_last_replay");
+        if !a.proc_handler_call(ph, n.as_ptr(), &mut cd) {
+            return None;
+        }
+        let used = cd.size.min(stack.len());
+        calldata_string(&stack[..used], "path").filter(|p| !p.is_empty()).map(PathBuf::from)
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
+        (!e.is_empty()).then_some(e)
+    }
+}
+
+impl Drop for ReplayBuffer {
+    fn drop(&mut self) {
+        let a = &self.studio.inner.api;
+        if !self.out.is_null() {
+            stop_output(a, self.out);
+            a.obs_output_release(self.out);
+        }
+        a.obs_encoder_release(self.venc);
+        for e in &self.audio {
+            a.obs_encoder_release(*e);
+        }
+    }
+}
+
+/// A string from libobs's serialized call data (`[name size][name][data size][data]`…, ended
+/// by a zero size), read as bytes.
+fn calldata_string(stack: &[u8], name: &str) -> Option<String> {
+    let w = std::mem::size_of::<usize>();
+    let size_at = |i: usize| -> Option<usize> {
+        stack.get(i..i + w).map(|b| {
+            let mut a = [0u8; std::mem::size_of::<usize>()];
+            a.copy_from_slice(b);
+            usize::from_ne_bytes(a)
+        })
+    };
+    let mut i = 0;
+    loop {
+        let name_size = size_at(i)?;
+        if name_size == 0 {
+            return None;
+        }
+        i += w;
+        let key = stack.get(i..i + name_size)?;
+        i += name_size;
+        let data_size = size_at(i)?;
+        i += w;
+        let data = stack.get(i..i + data_size)?;
+        i += data_size;
+        if key.strip_suffix(&[0]).unwrap_or(key) == name.as_bytes() {
+            let s = data.strip_suffix(&[0]).unwrap_or(data);
+            return Some(String::from_utf8_lossy(s).into_owned());
+        }
+    }
+}
+
+/// What the virtual camera shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "what", content = "name")]
+pub enum CameraShows {
+    /// What's on air.
+    Program,
+    /// One scene or source (named), whatever is on air.
+    Source(String),
+}
+
+/// OBS's virtual camera: what's on air (or one scene or source) as a camera other apps see.
+#[derive(Debug)]
+pub struct VirtualCamera {
+    studio: Studio,
+    out: *mut ffi::ObsOutput,
+    view: *mut ffi::ObsView,
+}
+
+impl VirtualCamera {
+    pub fn active(&self) -> bool {
+        self.studio.inner.api.obs_output_active(self.out)
+    }
+}
+
+impl Drop for VirtualCamera {
+    fn drop(&mut self) {
+        let a = &self.studio.inner.api;
+        if !self.out.is_null() {
+            stop_output(a, self.out);
+            a.obs_output_release(self.out);
+        }
+        if !self.view.is_null() {
+            a.obs_view_remove(self.view);
+            a.obs_view_set_source(self.view, 0, ptr::null_mut());
+            a.obs_view_destroy(self.view);
+        }
+    }
 }
 
 /// Remuxes recordings, from any thread: OBS's media-remux (no encoding again).
