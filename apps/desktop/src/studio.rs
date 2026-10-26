@@ -9,12 +9,12 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, STOPPED, StudioAct, StudioHost,
+    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, StudioAct, StudioHost,
     StudioSettings, StudioStatus,
 };
 use ferrocast_studio::{
-    AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Recording, Rect, StreamSettings,
-    Streaming, Studio, TransitionInfo,
+    AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
+    Recording, Rect, StreamSettings, Streaming, Studio, TransitionInfo,
 };
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -40,6 +40,22 @@ struct Held {
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
     selected: Option<(String, i64)>,
+    /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
+    projectors: Vec<(u64, Projector)>,
+    last_projector: u64,
+}
+
+/// A multiview follows the scenes after anything that changes them.
+fn refresh_projectors(h: &Held) {
+    if h.projectors.is_empty() {
+        return;
+    }
+    if let Some(c) = &h.collection {
+        let names: Vec<String> = c.scenes().into_iter().map(|s| s.name).collect();
+        for (_, p) in &h.projectors {
+            p.set_scenes(&names);
+        }
+    }
 }
 
 thread_local! {
@@ -428,6 +444,7 @@ impl StudioHost for DesktopStudio {
             h.record = None;
             h.preview = None;
             h.preview_at = None;
+            h.projectors.clear();
             if let Some(c) = h.collection.take() {
                 save(&c, &file);
             }
@@ -514,6 +531,7 @@ impl StudioHost for DesktopStudio {
             let out = run(c, act).map_err(|e| e.to_string());
             if changes && out.is_ok() {
                 save(c, &file);
+                refresh_projectors(h);
             }
             out
         })
@@ -538,10 +556,11 @@ impl StudioHost for DesktopStudio {
                         let renderer = h.paths.as_ref().map(|p| p.renderer.clone()).unwrap_or_default();
                         // Refused while live or recording: nothing is saved then.
                         studio.set_canvas(canvas, &renderer).map_err(|e| e.to_string())?;
-                        // The preview was made for the old size.
+                        // The preview was made for the old size; projectors close.
                         if h.preview.take().is_some() {
                             let _ = make_preview(&app, h);
                         }
+                        h.projectors.clear();
                     }
                     let studio = h.studio.as_ref().ok_or("The Studio's engine isn't loaded.")?;
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
@@ -573,6 +592,9 @@ impl StudioHost for DesktopStudio {
             let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
             Ok(json!({
                 "engine": studio.stats(),
+                // The scene on air, so the page notices switches made elsewhere (shortcuts,
+                // a multiview click).
+                "scene": h.collection.as_ref().map(|c| c.current()),
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
@@ -678,6 +700,7 @@ impl StudioHost for DesktopStudio {
                         Ok(c) => {
                             save(&c, &file);
                             h.collection = Some(c);
+                            refresh_projectors(h);
                         }
                         Err(e) => {
                             if let Some(old) = old {
@@ -751,6 +774,55 @@ impl StudioHost for DesktopStudio {
         {
             Ok(json!({ "granted": true }))
         }
+    }
+
+    async fn projector(&self, p: ProjectorReq) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?.clone();
+            let scenes: Vec<String> =
+                h.collection.as_ref().map(|c| c.scenes().into_iter().map(|s| s.name).collect()).unwrap_or_default();
+            let of = match p.what.as_str() {
+                "program" => ProjectorOf::Program,
+                "multiview" => ProjectorOf::Multiview,
+                _ => ProjectorOf::Source(p.name.clone().unwrap_or_default()),
+            };
+            h.last_projector += 1;
+            let id = h.last_projector;
+            // Closed by its own button or Esc: out of the list (and dropped) after the borrow.
+            let on_close = Box::new(move || {
+                let gone = HELD.with(|h| {
+                    let mut h = h.try_borrow_mut().ok()?;
+                    let i = h.projectors.iter().position(|(pid, _)| *pid == id)?;
+                    Some(h.projectors.remove(i))
+                });
+                drop(gone);
+            });
+            // A click on a multiview scene puts it on air, through its transition.
+            let on_pick = Box::new(|scene: String| {
+                HELD.with(|h| {
+                    let Ok(h) = h.try_borrow() else { return };
+                    if let Some(c) = &h.collection
+                        && let Err(e) = c.set_current(&scene)
+                    {
+                        tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
+                    }
+                });
+            });
+            let screen = p.screen.map(|s| s as usize);
+            let made = studio.projector(&of, &scenes, screen, on_close, on_pick).map_err(|e| e.to_string())?;
+            h.projectors.push((id, made));
+            Ok(json!({ "id": id }))
+        })
+        .await?
+    }
+
+    async fn close_projectors(&self) -> Result<(), String> {
+        // Dropped on the main thread, where their windows live.
+        self.on_main(|h| h.projectors.clear()).await
+    }
+
+    async fn screens(&self) -> Result<Value, String> {
+        self.on_main(|_| serde_json::to_value(ferrocast_studio::screens()).map_err(|e| e.to_string())).await?
     }
 
     async fn restart(&self) -> Result<(), String> {
