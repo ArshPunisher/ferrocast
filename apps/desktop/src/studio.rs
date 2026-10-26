@@ -416,6 +416,8 @@ fn item_edit(e: Edit) -> ItemEdit {
         Edit::BlendMultiply => ItemEdit::BlendMultiply,
         Edit::BlendLighten => ItemEdit::BlendLighten,
         Edit::BlendDarken => ItemEdit::BlendDarken,
+        Edit::BlendMethodDefault => ItemEdit::BlendMethodDefault,
+        Edit::BlendMethodSrgbOff => ItemEdit::BlendMethodSrgbOff,
         Edit::ScaleOff => ItemEdit::ScaleOff,
         Edit::ScalePoint => ItemEdit::ScalePoint,
         Edit::ScaleBicubic => ItemEdit::ScaleBicubic,
@@ -1084,6 +1086,7 @@ impl StudioHost for DesktopStudio {
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(studio, &s),
+                muxer: s.record_muxer.clone(),
             };
             let file = studio.record_path(&plan);
             let rec = studio.record_to(&file, &plan).map_err(|e| e.to_string())?;

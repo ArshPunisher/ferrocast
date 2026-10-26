@@ -56,7 +56,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   flip, fit/stretch/center to screen, reset, copy/paste transform, edit transform dialog,
   snapping (screen, sources, center) with sensitivity.
 - [x] P2 Per item: blending mode (8) and method, scale filtering (6), deinterlacing (7 modes,
-  field order), show/hide transitions with duration, "Resize output (canvas) to source size" (26 Oct evening; blending method still to come).
+  field order), show/hide transitions with duration, "Resize output (canvas) to source size" (26 Oct, blending method too).
 - [x] P1 Properties, filters, interact (browser and windows), screenshot of a source, open
   source projector, "Hide in mixer".
 - [x] P2 Missing files dialog (find, replace, search folder). *Better: found automatically by
@@ -121,7 +121,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [x] P1 Recording: path, format (MKV, MP4, MOV, hybrid/fragmented MP4/MOV, FLV, TS, HLS),
   quality presets, encoder, tracks, custom muxer settings, split file (by time/size, manual),
   filename formatting with variables, overwrite, generate without spaces, auto-remux to MP4,
-  pause recording, chapter markers. (26 Oct; HLS and custom muxer settings not yet.)
+  pause recording, chapter markers. (26 Oct, HLS and custom muxer settings included.)
   *Better: a backup recording while live, and chapter markers from stream events (raids,
   big tips).*
 - ✅ Replay buffer and "Clip that" (Studio, today through OBS). In the Studio itself too (26 Oct: seconds, size, format, tracks, Save replay, shortcuts).

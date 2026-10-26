@@ -426,7 +426,7 @@ pub const HOTKEY_ACTIONS: [&str; 16] = [
 ];
 
 /// Recording formats: crash-safe MP4 and MOV, fragmented ones, and MKV, FLV and TS.
-pub const RECORD_FORMATS: [&str; 7] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts"];
+pub const RECORD_FORMATS: [&str; 8] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts", "hls"];
 
 /// How the Studio streams, records and runs. Every field has a default, so an older or
 /// partial file still reads.
@@ -491,6 +491,8 @@ pub struct StudioSettings {
     pub record_tracks: Vec<u8>,
     /// An MKV, FLV or TS recording becomes an MP4 when it ends (the original is kept).
     pub record_remux: bool,
+    /// ffmpeg muxer settings of the streamer's own for recordings (OBS's Custom Muxer Settings).
+    pub record_muxer: String,
     /// The replay buffer keeps the last this many seconds (5 to 21600), at most this many
     /// megabytes (0: no limit), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
     pub replay_seconds: u32,
@@ -544,6 +546,7 @@ impl Default for StudioSettings {
             record_split_mb: 0,
             record_tracks: vec![1],
             record_remux: true,
+            record_muxer: String::new(),
             replay_seconds: 30,
             replay_mb: 0,
             replay_format: "mp4".into(),
@@ -595,7 +598,7 @@ impl StudioSettings {
             return bad("record_folder: a full folder path.");
         }
         if !RECORD_FORMATS.contains(&self.record_format.as_str()) {
-            return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv or ts.");
+            return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls.");
         }
         if !["stream", "high", "lossless", "custom"].contains(&self.record_quality.as_str()) {
             return bad("record_quality: stream, high, lossless or custom.");
@@ -619,6 +622,9 @@ impl StudioSettings {
         let name = self.record_name.trim();
         if name.is_empty() || name.chars().count() > 120 || name.chars().any(|c| c.is_control() || "/\\:".contains(c)) {
             return bad("record_name: a file name pattern without / \\ or :, up to 120 characters.");
+        }
+        if self.record_muxer.len() > 512 || self.record_muxer.chars().any(char::is_control) {
+            return bad("record_muxer: up to 512 characters of ffmpeg's key=value settings.");
         }
         if self.record_split_minutes > 24 * 60 || self.record_split_mb > 1_000_000 {
             return bad("record_split: up to 1440 minutes or 1000000 MB (0: never).");
@@ -717,6 +723,8 @@ pub enum ItemEdit {
     BlendMultiply,
     BlendLighten,
     BlendDarken,
+    BlendMethodDefault,
+    BlendMethodSrgbOff,
     ScaleOff,
     ScalePoint,
     ScaleBicubic,

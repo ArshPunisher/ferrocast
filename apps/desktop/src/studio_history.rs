@@ -98,7 +98,9 @@ fn verb(e: &Edit) -> &'static str {
         | Edit::BlendScreen
         | Edit::BlendMultiply
         | Edit::BlendLighten
-        | Edit::BlendDarken => "Change blending of",
+        | Edit::BlendDarken
+        | Edit::BlendMethodDefault
+        | Edit::BlendMethodSrgbOff => "Change blending of",
         Edit::ScaleOff
         | Edit::ScalePoint
         | Edit::ScaleBicubic
