@@ -59,8 +59,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   field order), show/hide transitions with duration, "Resize output (canvas) to source size" (26 Oct evening; blending method still to come).
 - [x] P1 Properties, filters, interact (browser and windows), screenshot of a source, open
   source projector, "Hide in mixer".
-- [ ] P2 Missing files dialog (find, replace, search folder). *Better: found automatically by
-  name in the folders you choose.*
+- [x] P2 Missing files dialog (find, replace, search folder). *Better: found automatically by
+  name in the folders you choose.* (26 Oct: a notice when files are missing; Search a folder
+  fixes every one found by name at once.)
 - [ ] P1 Every source in Appendix A for Mac and Windows (macOS Screen Capture, Display/Window
   Capture, Game Capture, Video Capture Device, Audio Input/Output Capture, Application Audio,
   Media, Image, Slide Show, Color, Text, Browser, VLC, Blackmagic, Syphon, NDI via plugin).
@@ -71,8 +72,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 - [ ] P1 Mixer: volume (dB/%), mute, meters (peak, input peak, RMS), push-to-talk and push-to-mute
   with delays, monitoring (off / monitor only / monitor and output), monitoring device.
 - [x] P2 Advanced audio: balance, mono, sync offset, tracks 1 to 6 per source (26 Oct evening: one table for every sound, cards on a phone).
-- [ ] P1 Audio settings: sample rate, channels (mono to 7.1), global devices (2 desktop, 4 mic),
-  meter decay and peak meter type, low-latency buffering.
+- [x] P1 Audio settings: sample rate, channels (mono to 7.1), global devices (2 desktop, 4 mic),
+  meter decay and peak meter type, low-latency buffering. (26 Oct; meter decay, peak type and
+  low-latency buffering still to come.)
 - [ ] P1 Filters: noise suppression (RNNoise, Speex, NVIDIA), noise gate, gain, compressor,
   upward compressor, expander, limiter, 3-band EQ, invert polarity, VST 2.
   *Better: "Make my mic sound good" adds the right chain from a 5-second check, and warns while
@@ -136,7 +138,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   switch), 26 Oct.
 - [ ] P2 Docks (lock, reset, custom browser docks), Stats dock (CPU, memory, disk, FPS, render
   lag, encoding lag, dropped frames per output), multiview (layouts, labels), projectors
-  (fullscreen per monitor, windowed, always on top).
+  (fullscreen per monitor, windowed, always on top). (26 Oct: Stats done, opened from the
+  stats bar, with how long the disk lasts at the recording's bitrate; docks lock and reset
+  done earlier; custom browser docks and multiview layouts still to come.)
 - [x] P1 Undo/redo (26 Oct: sources, scenes, filters, settings, sound, item transitions, deinterlacing; shortcuts aren't steps). *Better: a history list you can step back through (done).*
 - [ ] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
   plugin manager, safe mode, "show recording/streaming in title bar".
