@@ -106,23 +106,25 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   Services and bandwidth test: Go live's platforms and upload check. Bind IP, TCP pacing and
   the RTMP network options only touch the Studio's hop to this PC, so not copied.)
 - [ ] P2 Twitch Enhanced Broadcasting (multitrack video), YouTube HDR/HEVC/AV1.
-- [ ] P1 Output: simple and advanced modes, encoder per output, rate control (CBR, VBR, CQP,
+- [x] P1 Output: simple and advanced modes, encoder per output, rate control (CBR, VBR, CQP,
   CRF, ABR), bitrate, keyframe interval, preset/tuning/profile, B-frames, lookahead,
   psycho-visual tuning, GPU selection, audio encoder and bitrate per track, rescale output.
+  (26 Oct: plain controls first, then "Every option of this encoder" from the encoder itself;
+  any encoder for the stream and the recording.)
   *Better: chosen by a speed and GPU test with the reason in words; "encoder overloaded" turns
   into a plain fix or an automatic step down.*
 - [ ] P1 Advanced: stream delay (and preserve cutoff point), automatic reconnect (retry delay,
   max retries), bind to IP, network optimisations, TCP pacing, low-latency mode.
 
 ### Recording, replay, virtual camera
-- [ ] P1 Recording: path, format (MKV, MP4, MOV, hybrid/fragmented MP4/MOV, FLV, TS, HLS),
+- [x] P1 Recording: path, format (MKV, MP4, MOV, hybrid/fragmented MP4/MOV, FLV, TS, HLS),
   quality presets, encoder, tracks, custom muxer settings, split file (by time/size, manual),
   filename formatting with variables, overwrite, generate without spaces, auto-remux to MP4,
-  pause recording, chapter markers.
+  pause recording, chapter markers. (26 Oct; HLS and custom muxer settings not yet.)
   *Better: a backup recording while live, and chapter markers from stream events (raids,
   big tips).*
 - ✅ Replay buffer and "Clip that" (Studio, today through OBS). P1 in the Studio itself.
-- [ ] P2 Virtual camera (scene, source or program output). Remux dialog.
+- [ ] P2 Virtual camera (scene, source or program output). Remux dialog (done 26 Oct).
 
 ### App
 - [x] P1 Profiles and scene collections: new, duplicate, rename, remove, import, export.
