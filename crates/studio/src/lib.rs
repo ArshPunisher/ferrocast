@@ -25,8 +25,8 @@ pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
     AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Collection, DEINTERLACE, FilterInfo, FilterSnap, ItemEdit, ItemInfo,
-    ItemSnap, LevelInfo, MissingFile, Monitor, SceneInfo, SceneSnap, SourceUse, StudioOptions, TBarState, Transform,
-    TransitionInfo, WebAct,
+    ItemSnap, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SceneSnap, SourceUse, StudioOptions,
+    TBarState, Transform, TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{ProjectorOf, Screen};

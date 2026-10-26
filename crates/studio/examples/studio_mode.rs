@@ -114,6 +114,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = c.audio_of("Tone")?;
     assert!(!a.muted && !a.mono && a.sync_ms == 0 && a.tracks == [1, 2, 3, 4, 5, 6], "{a:?}");
 
+    // Media controls: a looping file plays, pauses, plays again and restarts; a colour has none.
+    // (A file plays while its scene is shown.)
+    c.set_current("Next")?;
+    std::thread::sleep(Duration::from_millis(1200));
+    // The media thread takes each a moment.
+    let settles = |want: &str| -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..40 {
+            if c.media_state("Tone")?.state == want {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(format!("Tone never got to {want}").into())
+    };
+    settles("playing")?;
+    c.media("Tone", ferrocast_studio::MediaAct::Pause)?;
+    settles("paused")?;
+    c.media("Tone", ferrocast_studio::MediaAct::PlayPause)?;
+    settles("playing")?;
+    c.media("Tone", ferrocast_studio::MediaAct::Restart)?;
+    settles("playing")?;
+    assert!(c.media_state("Tone")?.duration_ms > 9_000, "a 10 s file");
+    assert!(c.media_state("Box").is_err(), "a colour has no media controls");
+    assert!(c.items("Next")?.iter().any(|i| i.name == "Tone" && i.media));
+
     // Show and hide transitions, and deinterlacing (video from a file only).
     c.set_item_transition("Next", box_id, true, Some(&TransitionInfo { kind: "fade_transition".into(), ms: 700 }))?;
     c.set_item_transition("Next", box_id, false, Some(&TransitionInfo { kind: "swipe_transition".into(), ms: 250 }))?;
@@ -211,9 +236,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(c.fade_to_black()?);
     assert!(c.is_black());
     std::thread::sleep(Duration::from_millis(600));
+    // A screenshot of what's on air is black now (a scene's own would still show it).
+    let shot = out.join("on-air.png");
+    c.screenshot_program(&shot)?;
+    let img = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&shot)?)).read_info()?;
+    let mut info = img;
+    let mut buf = vec![0; info.output_buffer_size()];
+    info.next_frame(&mut buf)?;
+    assert!(buf.chunks(4).all(|p| p[0] < 8 && p[1] < 8 && p[2] < 8), "black on air");
     assert!(!c.fade_to_black()?);
     assert!(!c.is_black());
     std::thread::sleep(Duration::from_millis(600));
+    c.screenshot_program(&shot)?;
+    let mut info = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&shot)?)).read_info()?;
+    let mut buf = vec![0; info.output_buffer_size()];
+    info.next_frame(&mut buf)?;
+    assert!(buf.chunks(4).any(|p| p[0] > 100 || p[1] > 100 || p[2] > 100), "the scene is back on air");
 
     // Off: the scene itself is on air again; the options are saved.
     c.set_studio_options(StudioOptions { double_click: true, ..StudioOptions::default() })?;

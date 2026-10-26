@@ -165,6 +165,8 @@ pub struct Crop {
 pub const OBS_SOURCE_AUDIO: u32 = 1 << 1;
 /// `OBS_SOURCE_ASYNC`: frames come from a device or file (what deinterlacing applies to).
 pub const OBS_SOURCE_ASYNC: u32 = 1 << 2;
+/// `OBS_SOURCE_CONTROLLABLE_MEDIA`: a video, playlist or slideshow with play controls.
+pub const OBS_SOURCE_CONTROLLABLE_MEDIA: u32 = 1 << 13;
 /// `enum obs_order_movement`.
 pub const OBS_ORDER_MOVE_UP: c_int = 0;
 pub const OBS_ORDER_MOVE_DOWN: c_int = 1;
@@ -492,6 +494,15 @@ api! {
     obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
     obs_view_create: fn() -> *mut ObsView;
+    obs_source_media_play_pause: fn(a: *mut ObsSource, b: bool);
+    obs_source_media_restart: fn(a: *mut ObsSource);
+    obs_source_media_stop: fn(a: *mut ObsSource);
+    obs_source_media_next: fn(a: *mut ObsSource);
+    obs_source_media_previous: fn(a: *mut ObsSource);
+    obs_source_media_get_duration: fn(a: *mut ObsSource) -> i64;
+    obs_source_media_get_time: fn(a: *mut ObsSource) -> i64;
+    obs_source_media_set_time: fn(a: *mut ObsSource, b: i64);
+    obs_source_media_get_state: fn(a: *mut ObsSource) -> c_int;
     os_get_free_disk_space: fn(a: *const c_char) -> u64;
     video_output_get_skipped_frames: fn(a: *const VideoT) -> u32;
     video_output_get_total_frames: fn(a: *const VideoT) -> u32;

@@ -81,6 +81,8 @@ pub struct ItemInfo {
     pub deinterlace: Option<String>,
     /// Deinterlacing takes the top field first (else the bottom).
     pub top_field_first: bool,
+    /// A video, playlist or slideshow with play controls.
+    pub media: bool,
 }
 
 /// `enum obs_deinterlace_mode`, in order.
@@ -198,6 +200,32 @@ pub struct MissingFile {
     pub label: String,
     pub path: String,
 }
+
+/// What to do to a video, playlist or slideshow (OBS's media controls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAct {
+    Play,
+    Pause,
+    /// Pause when playing, else play.
+    PlayPause,
+    Restart,
+    Stop,
+    Next,
+    Previous,
+}
+
+/// Where a video, playlist or slideshow is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaInfo {
+    /// none, playing, opening, buffering, paused, stopped, ended or error.
+    pub state: &'static str,
+    /// Played and total, ms (0 when unknown, as for a slideshow).
+    pub time_ms: i64,
+    pub duration_ms: i64,
+}
+
+const MEDIA_STATES: [&str; 8] = ["none", "playing", "opening", "buffering", "paused", "stopped", "ended", "error"];
 
 /// A sound's mixer state as it was, to put back (undo).
 #[derive(Debug, Clone, PartialEq)]
@@ -417,6 +445,9 @@ pub struct Collection {
     /// Each transition kind's own settings (a stinger's video, a swipe's direction…), used
     /// whenever that kind is made.
     transition_settings: RefCell<HashMap<String, Value>>,
+    /// Play or pause asked for lately, by source: libobs applies it on the next frame, so a
+    /// second press before then must not read the old state.
+    media_intent: RefCell<HashMap<String, (bool, std::time::Instant)>>,
     /// Studio Mode's preview scene (one of `scenes`), or null when Studio Mode is off.
     preview: RefCell<*mut ffi::ObsSource>,
     /// OBS's quick transitions: one-click ways to send the preview on air.
@@ -503,6 +534,7 @@ impl Collection {
             tbar: RefCell::new(None),
             black: RefCell::new(None),
             by_hand: RefCell::new(false),
+            media_intent: RefCell::new(HashMap::new()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -1211,6 +1243,7 @@ impl Collection {
                     .to_string()
             }),
             top_field_first: a.obs_source_get_deinterlace_field_order(src) == 0,
+            media: a.obs_source_get_output_flags(src) & ffi::OBS_SOURCE_CONTROLLABLE_MEDIA != 0,
         }
     }
 
@@ -1846,6 +1879,68 @@ impl Collection {
         Ok(())
     }
 
+    /// A video, playlist or slideshow's play controls (OBS's media controls).
+    pub fn media(&self, name: &str, what: MediaAct) -> Result<MediaInfo, StudioError> {
+        let src = self.media_source(name)?;
+        let a = self.api();
+        let pause = |p: bool| {
+            a.obs_source_media_play_pause(src.ptr, p);
+            self.media_intent.borrow_mut().insert(name.to_string(), (p, std::time::Instant::now()));
+        };
+        match what {
+            MediaAct::Play => pause(false),
+            MediaAct::Pause => pause(true),
+            MediaAct::PlayPause => {
+                // A press within a moment of the last goes the other way from it, not from
+                // the state libobs hasn't updated yet.
+                let recent = self
+                    .media_intent
+                    .borrow()
+                    .get(name)
+                    .filter(|(_, at)| at.elapsed() < std::time::Duration::from_millis(500))
+                    .map(|(p, _)| *p);
+                let paused_now = recent.unwrap_or_else(|| a.obs_source_media_get_state(src.ptr) != 1);
+                pause(!paused_now);
+            }
+            MediaAct::Restart => a.obs_source_media_restart(src.ptr),
+            MediaAct::Stop => a.obs_source_media_stop(src.ptr),
+            MediaAct::Next => a.obs_source_media_next(src.ptr),
+            MediaAct::Previous => a.obs_source_media_previous(src.ptr),
+        }
+        Ok(self.media_info(src.ptr))
+    }
+
+    /// Where a video, playlist or slideshow is.
+    pub fn media_state(&self, name: &str) -> Result<MediaInfo, StudioError> {
+        let src = self.media_source(name)?;
+        Ok(self.media_info(src.ptr))
+    }
+
+    /// Jumps a video to `ms` in.
+    pub fn media_seek(&self, name: &str, ms: i64) -> Result<MediaInfo, StudioError> {
+        let src = self.media_source(name)?;
+        self.api().obs_source_media_set_time(src.ptr, ms.max(0));
+        Ok(self.media_info(src.ptr))
+    }
+
+    fn media_source(&self, name: &str) -> Result<Ref<'_>, StudioError> {
+        let src = self.source(name)?;
+        if self.api().obs_source_get_output_flags(src.ptr) & ffi::OBS_SOURCE_CONTROLLABLE_MEDIA == 0 {
+            return Err(StudioError::Failed(format!("\"{name}\" isn't a video, playlist or slideshow.")));
+        }
+        Ok(src)
+    }
+
+    fn media_info(&self, src: *mut ffi::ObsSource) -> MediaInfo {
+        let a = self.api();
+        let state = usize::try_from(a.obs_source_media_get_state(src)).unwrap_or(0);
+        MediaInfo {
+            state: MEDIA_STATES.get(state).copied().unwrap_or("none"),
+            time_ms: a.obs_source_media_get_time(src).max(0),
+            duration_ms: a.obs_source_media_get_duration(src).max(0),
+        }
+    }
+
     /// Every file a source, filter or transition kind uses that isn't on this computer (OBS's
     /// Missing Files): file and folder options, and each file of a list (slideshows).
     pub fn missing_files(&self) -> Vec<MissingFile> {
@@ -2388,8 +2483,23 @@ impl Collection {
     /// PNG at `path`.
     pub fn screenshot(&self, name: &str, path: &std::path::Path) -> Result<(), StudioError> {
         let src = self.source(name)?;
+        self.screenshot_of(src.ptr, name, path)
+    }
+
+    /// A picture of what's on air exactly (black when faded, both scenes mid-transition), at
+    /// the canvas size, saved as a PNG at `path`.
+    pub fn screenshot_program(&self, path: &std::path::Path) -> Result<(), StudioError> {
+        let t = *self.transition.borrow();
+        self.screenshot_of(t, "what's on air", path)
+    }
+
+    fn screenshot_of(&self, src: *mut ffi::ObsSource, name: &str, path: &std::path::Path) -> Result<(), StudioError> {
+        let src = Ref { api: self.api(), ptr: self.api().obs_source_get_ref(src) };
+        if src.ptr.is_null() {
+            return Err(StudioError::Failed(format!("\"{name}\" has nothing to show yet.")));
+        }
         let a = self.api();
-        let (w, h) = if a.obs_source_is_scene(src.ptr) {
+        let (w, h) = if a.obs_source_is_scene(src.ptr) || src.ptr == *self.transition.borrow() {
             let c = self.studio.canvas();
             (c.width, c.height)
         } else {
