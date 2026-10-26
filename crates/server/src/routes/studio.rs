@@ -41,6 +41,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route(
+            "/studio/engine/scenes/{scene}/items/{id}/transform",
+            get(engine_item_transform).put(engine_set_item_transform),
+        )
         .route("/studio/engine/preview/selection", put(engine_select))
         .route("/studio/engine/pick-file", post(engine_pick_file))
         .route("/studio/engine/screen-access", get(engine_screen_access))
@@ -501,6 +505,22 @@ async fn engine_item_box(
     Body(b): Body<BoxBody>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetItemBox { scene, id, x: b.x, y: b.y, w: b.w, h: b.h, save: b.save }).await
+}
+
+async fn engine_item_transform(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Transform { scene, id }).await
+}
+
+/// `PUT …/items/{id}/transform` with the whole transform → the item.
+async fn engine_set_item_transform(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(transform): Body<ferrocast_engine::studio_host::ItemTransform>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetTransform { scene, id, transform }).await
 }
 
 #[derive(Deserialize)]

@@ -297,6 +297,28 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
         A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
+        A::Transform { scene, id } => v(to_json!(c.transform(&scene, id)?)),
+        A::SetTransform { scene, id, transform: t } => {
+            let t = ferrocast_studio::Transform {
+                x: t.x,
+                y: t.y,
+                rotation: t.rotation,
+                scale_x: t.scale_x,
+                scale_y: t.scale_y,
+                alignment: t.alignment,
+                bounds: t.bounds,
+                bounds_alignment: t.bounds_alignment,
+                bounds_width: t.bounds_width,
+                bounds_height: t.bounds_height,
+                crop_left: t.crop_left,
+                crop_top: t.crop_top,
+                crop_right: t.crop_right,
+                crop_bottom: t.crop_bottom,
+                width: t.width,
+                height: t.height,
+            };
+            v(to_json!(c.set_transform(&scene, id, &t)?))
+        }
         // Handled in `act`, which holds the preview.
         A::Select { .. } => Ok(Value::Null),
         A::Web { name, what } => done(c.web(&name, web_act(what))),

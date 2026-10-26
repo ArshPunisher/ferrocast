@@ -154,6 +154,67 @@ impl ProjectorReq {
     }
 }
 
+/// Everything OBS's Edit Transform dialog shows for an item (mirrors
+/// `ferrocast_studio::Transform`; `width` and `height` are the source's own size, only read).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ItemTransform {
+    pub x: f32,
+    pub y: f32,
+    pub rotation: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    pub alignment: u32,
+    pub bounds: String,
+    pub bounds_alignment: u32,
+    pub bounds_width: f32,
+    pub bounds_height: f32,
+    pub crop_left: i32,
+    pub crop_top: i32,
+    pub crop_right: i32,
+    pub crop_bottom: i32,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
+/// The kinds of bounding box, as OBS orders them.
+pub const BOUNDS_KINDS: [&str; 7] = ["none", "stretch", "fit", "fill", "width", "height", "max"];
+
+impl ItemTransform {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        let bad = |m: &str| Err(EngineError::Invalid(m.into()));
+        let far = |v: f32| !v.is_finite() || v.abs() > 100_000.0;
+        if far(self.x) || far(self.y) {
+            return bad("x, y: numbers from -100000 to 100000.");
+        }
+        if !self.rotation.is_finite() {
+            return bad("rotation: a number of degrees.");
+        }
+        let scale = |v: f32| v.is_finite() && v.abs() >= 0.0001 && v.abs() <= 1000.0;
+        if !scale(self.scale_x) || !scale(self.scale_y) {
+            return bad("scale_x, scale_y: from 0.0001 to 1000, either sign (minus flips).");
+        }
+        // Left and right (or top and bottom) at once isn't a point.
+        let point = |a: u32| a <= 15 && a & 3 != 3 && a & 12 != 12;
+        if !point(self.alignment) || !point(self.bounds_alignment) {
+            return bad("alignment, bounds_alignment: OBS's bits (0 middle; 1 left, 2 right, 4 top, 8 bottom).");
+        }
+        if !BOUNDS_KINDS.contains(&self.bounds.as_str()) {
+            return bad("bounds: none, stretch, fit, fill, width, height or max.");
+        }
+        let size = |v: f32| v.is_finite() && (0.0..=100_000.0).contains(&v);
+        if !size(self.bounds_width) || !size(self.bounds_height) {
+            return bad("bounds_width, bounds_height: from 0 to 100000.");
+        }
+        if [self.crop_left, self.crop_top, self.crop_right, self.crop_bottom].iter().any(|c| !(0..=100_000).contains(c))
+        {
+            return bad("crop_left, crop_top, crop_right, crop_bottom: from 0 to 100000 pixels.");
+        }
+        Ok(())
+    }
+}
+
 /// Hosts say this for what only the Ferrocast app on this computer can do.
 pub const NOT_HERE: &str = "That needs the Ferrocast app on this computer.";
 
@@ -579,6 +640,17 @@ pub enum StudioAct {
         #[serde(default)]
         save: bool,
     },
+    /// An item's transform, as OBS's Edit Transform shows it.
+    Transform {
+        scene: String,
+        id: i64,
+    },
+    /// Sets all of an item's transform → the item.
+    SetTransform {
+        scene: String,
+        id: i64,
+        transform: ItemTransform,
+    },
     /// Outlines an item in the preview, or nothing (`scene` and `id` null).
     Select {
         scene: Option<String>,
@@ -717,6 +789,11 @@ impl StudioAct {
                 }
                 Ok(())
             }
+            A::Transform { scene, .. } => check_source_name(scene),
+            A::SetTransform { scene, transform, .. } => {
+                check_source_name(scene)?;
+                transform.validate()
+            }
             A::Select { scene, id } => match (scene, id) {
                 (Some(s), Some(_)) => check_source_name(s),
                 (None, None) => Ok(()),
@@ -745,6 +822,7 @@ impl StudioAct {
                 | A::FilterSettings { .. }
                 | A::FilterOptions { .. }
                 | A::Select { .. }
+                | A::Transform { .. }
         )
     }
 }
@@ -1173,6 +1251,43 @@ mod tests {
         assert!(matches!(not_here, EngineError::Refused { status: 422, code: "studio_not_here", .. }));
         assert_eq!(e.studio_screen_access().await.unwrap()["granted"], true);
         assert!(matches!(e.studio_restart().await.unwrap_err(), EngineError::Refused { code: "studio_not_here", .. }));
+
+        // Edit Transform: every number is checked before the host.
+        let t = ItemTransform {
+            x: 10.0,
+            y: 20.0,
+            rotation: 450.0,
+            scale_x: -0.5,
+            scale_y: 0.5,
+            alignment: 5,
+            bounds: "fit".into(),
+            bounds_alignment: 0,
+            bounds_width: 1920.0,
+            bounds_height: 1080.0,
+            crop_left: 0,
+            crop_top: 10,
+            crop_right: 0,
+            crop_bottom: 0,
+            width: 0,
+            height: 0,
+        };
+        assert!(t.validate().is_ok());
+        let set = |t: ItemTransform| StudioAct::SetTransform { scene: "Main".into(), id: 3, transform: t };
+        assert!(set(t.clone()).changes());
+        assert!(!StudioAct::Transform { scene: "Main".into(), id: 3 }.changes());
+        e.studio_act(set(t.clone())).await.unwrap();
+        for bad in [
+            ItemTransform { scale_x: 0.0, ..t.clone() },
+            ItemTransform { alignment: 3, ..t.clone() },
+            ItemTransform { bounds_alignment: 12, ..t.clone() },
+            ItemTransform { bounds: "huge".into(), ..t.clone() },
+            ItemTransform { crop_left: -1, ..t.clone() },
+            ItemTransform { x: f32::INFINITY, ..t.clone() },
+            ItemTransform { rotation: f32::NAN, ..t.clone() },
+            ItemTransform { bounds_width: -5.0, ..t.clone() },
+        ] {
+            assert!(matches!(e.studio_act(set(bad.clone())).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
 
         // Projectors: what to show is checked first; hosts without windows say so.
         let p = |what: &str, name: Option<&str>, screen: Option<u32>| ProjectorReq {

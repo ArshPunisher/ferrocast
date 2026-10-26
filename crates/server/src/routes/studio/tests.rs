@@ -599,6 +599,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/projectors", json!({ "what": "multiview" })).await,
         r.delete("/studio/engine/projectors").await,
         r.get("/studio/engine/screens").await,
+        r.get("/studio/engine/scenes/Gameplay/items/3/transform").await,
+        r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0, "y": 0, "rotation": 0, "scale_x": 1, "scale_y": 1, "alignment": 5, "bounds": "none", "bounds_alignment": 0, "bounds_width": 0, "bounds_height": 0, "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0 })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -634,6 +636,7 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/pick-file", json!({ "kind": "run" })).await, "unknown dialog"),
         (r.post("/studio/engine/projectors", json!({ "what": "source" })).await, "source without a name"),
         (r.post("/studio/engine/projectors", json!({ "what": "wall" })).await, "unknown projector"),
+        (r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0 })).await, "half a transform"),
         (
             r.put(
                 "/studio/engine/scenes/Gameplay/transition",
