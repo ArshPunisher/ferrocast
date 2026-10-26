@@ -107,7 +107,11 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   RIST and WebRTC go straight from the Studio, alongside RTMP destinations, each with health.
   Services and bandwidth test: Go live's platforms and upload check. Bind IP, TCP pacing and
   the RTMP network options only touch the Studio's hop to this PC, so not copied.)
-- [ ] P2 Twitch Enhanced Broadcasting (multitrack video), YouTube HDR/HEVC/AV1.
+- [ ] P2 Twitch Enhanced Broadcasting (multitrack video), YouTube HDR/HEVC/AV1. (26 Oct:
+  parked for the owner. OBS asks Twitch's GetClientConfiguration with the stream key, runs
+  several encoders and sends them in one enhanced-RTMP stream straight to Twitch; the Studio
+  streams through Go live's relay, so it needs its own direct Twitch output, and it can only
+  be checked on a real Twitch channel going live. HEVC/AV1 encoders are already pickable.)
 - [x] P1 Output: simple and advanced modes, encoder per output, rate control (CBR, VBR, CQP,
   CRF, ABR), bitrate, keyframe interval, preset/tuning/profile, B-frames, lookahead,
   psycho-visual tuning, GPU selection, audio encoder and bitrate per track, rescale output.
@@ -154,8 +158,12 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   rest; sites that refuse to be framed open in a window of their own in the app. *Better:*
   Ferrocast's merged chat (Twitch, YouTube, Kick) and event feed are panels too.)
 - [x] P1 Undo/redo (26 Oct: sources, scenes, filters, settings, sound, item transitions, deinterlacing; shortcuts aren't steps). *Better: a history list you can step back through (done).*
-- [ ] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
-  plugin manager, safe mode, "show recording/streaming in title bar".
+- [x] P2 Auto-configuration wizard, log files (upload, view, crash reports), check for updates,
+  plugin manager, safe mode, "show recording/streaming in title bar". (26 Oct: Set up for me,
+  sharing the upload between platforms and keeping each platform's limit; the log in the app
+  with problems coloured and keys taken out, copied rather than uploaded; low latency audio
+  buffering. Check for updates is the app's own updater; crash reports and panics go to the
+  same log. Plugin manager and safe mode don't apply: the Studio loads OBS's own plugins.)
 - [ ] P1 *Better: settings search; plain-language errors with the fix (R-08); a phone as a
   remote and a preview (Dashboard anywhere, already there).*
 
