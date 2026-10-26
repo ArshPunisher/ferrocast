@@ -97,9 +97,12 @@ fn obs_paths() -> Option<(Paths, &'static str)> {
 /// How the settings ask to encode: the Mac's hardware H.264 (VideoToolbox) or x264.
 fn encode_of(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
     const HARDWARE: &str = "com.apple.videotoolbox.videoencoder.ave.avc";
-    let hardware = s.encoder == "hardware" && studio.kinds().encoders.iter().any(|e| e.id == HARDWARE);
+    let kinds = studio.kinds();
+    let hardware = s.encoder == "hardware" && kinds.encoders.iter().any(|e| e.id == HARDWARE);
+    // A particular encoder (HEVC, AV1…) when it's on this computer.
+    let chosen = s.video_encoder.as_ref().filter(|id| kinds.encoders.iter().any(|e| &e.id == *id));
     EncodeSettings {
-        video_encoder: if hardware { HARDWARE } else { "obs_x264" }.into(),
+        video_encoder: chosen.cloned().unwrap_or_else(|| if hardware { HARDWARE } else { "obs_x264" }.into()),
         video_kbps: s.video_kbps,
         vbr: s.vbr,
         quality: None,
@@ -108,6 +111,11 @@ fn encode_of(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
         bframes: s.bframes,
         scale: s.scale.map(|[w, h]| (w, h)),
         audio_kbps: s.audio_kbps,
+        extra: if chosen.is_some() || s.video_encoder.is_none() {
+            s.encoder_settings.clone()
+        } else {
+            Default::default()
+        },
     }
 }
 
@@ -130,6 +138,21 @@ fn record_encode(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
         "lossless" => {
             e.video_encoder = "obs_x264".into();
             e.quality = Some(0);
+            e.extra = Default::default();
+        }
+        // Its own encoder and options, as OBS's Advanced recording settings.
+        "custom" => {
+            let here = |id: &String| studio.kinds().encoders.iter().any(|k| &k.id == id);
+            match &s.record_encoder {
+                Some(id) if here(id) => {
+                    e.video_encoder = id.clone();
+                    e.extra = s.record_encoder_settings.clone();
+                }
+                // Picked for you: the stream's encoder, with these options.
+                None => e.extra = s.record_encoder_settings.clone(),
+                // An encoder from another computer: the stream's, without its options.
+                Some(_) => {}
+            }
         }
         _ => {}
     }
@@ -234,6 +257,83 @@ fn record_folder(s: &StudioSettings) -> PathBuf {
     s.record_folder.as_ref().map(PathBuf::from).unwrap_or_else(|| {
         dirs::video_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Movies")).join("Ferrocast")
     })
+}
+
+/// How the last remux went: `{ from, to, percent, done, error }`, or null.
+static REMUX: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn set_remux(v: Value) {
+    *REMUX.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+}
+
+/// The MP4 a remux of `from` makes: beside it, " (2)"… when one of that name is there.
+fn mp4_beside(from: &std::path::Path) -> PathBuf {
+    let stem = from.file_stem().and_then(|s| s.to_str()).unwrap_or("Recording").to_string();
+    let folder = from.parent().map(PathBuf::from).unwrap_or_default();
+    let mut to = folder.join(format!("{stem}.mp4"));
+    let mut n = 2;
+    while to.exists() || to == from {
+        to = folder.join(format!("{stem} ({n}).mp4"));
+        n += 1;
+    }
+    to
+}
+
+/// Remuxes each file to an MP4 beside it, one after another on a thread of its own (a long
+/// file needn't hold the app up) → the first new file.
+fn remux_in_background(remuxer: ferrocast_studio::Remuxer, files: Vec<PathBuf>) -> Result<PathBuf, String> {
+    if REMUX.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|v| v["done"] == false) {
+        return Err("A remux is already running; wait for it to end.".into());
+    }
+    let first = files.first().map(|f| mp4_beside(f)).ok_or("Nothing to remux.")?;
+    let (f, t) = (files[0].display().to_string(), first.display().to_string());
+    set_remux(json!({ "from": f, "to": t, "percent": 0.0, "done": false, "error": null }));
+    std::thread::spawn(move || {
+        let count = files.len();
+        let mut last = json!(null);
+        for (i, from) in files.into_iter().enumerate() {
+            let to = mp4_beside(&from);
+            let (f, t) = (from.display().to_string(), to.display().to_string());
+            let out = remuxer.remux(&from, &to, |pct| {
+                // Across all files: each is its share of the whole.
+                let whole = (i as f32 * 100.0 + pct) / count as f32;
+                set_remux(json!({ "from": f, "to": t, "percent": whole, "done": false, "error": null }));
+                true
+            });
+            let error = out.err().map(|e| e.to_string());
+            match &error {
+                Some(e) => tracing::warn!(file = %from.display(), error = %e, "a remux failed"),
+                None => tracing::info!(file = %to.display(), "remuxed to MP4"),
+            }
+            last = json!({ "from": f, "to": t, "percent": 100.0, "done": true, "error": error });
+            if error.is_some() {
+                break;
+            }
+        }
+        set_remux(last);
+    });
+    Ok(first)
+}
+
+/// The parts of a recording that started at `since` in `first`'s folder (a split makes more),
+/// oldest first.
+fn recording_parts(first: &std::path::Path, since: std::time::SystemTime) -> Vec<PathBuf> {
+    let ext = first.extension().map(|e| e.to_owned());
+    let mut parts: Vec<(std::time::SystemTime, PathBuf)> = first
+        .parent()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|e| e.to_owned()) == ext)
+        .filter_map(|p| {
+            let m = std::fs::metadata(&p).ok()?;
+            let at = m.created().or_else(|_| m.modified()).ok()?;
+            (at >= since || p == first).then_some((at, p))
+        })
+        .collect();
+    parts.sort();
+    parts.into_iter().map(|(_, p)| p).collect()
 }
 
 fn record_stats(r: &(Recording, PathBuf, std::time::Instant)) -> Value {
@@ -855,6 +955,8 @@ impl StudioHost for DesktopStudio {
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
+                // The last remux (OBS's Remux, or MKV made into MP4 after recording).
+                "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             }))
         })
         .await?
@@ -863,8 +965,20 @@ impl StudioHost for DesktopStudio {
     async fn record(&self, on: bool) -> Result<Value, String> {
         self.on_main(move |h| {
             if !on {
-                // Waits for the file to be finished.
-                h.record = None;
+                // Waits for the file to be finished; MKV, FLV and TS then become MP4 too.
+                let ended = h.record.take();
+                let s = h.settings.clone().unwrap_or_default();
+                if let (Some((rec, file, started)), Some(studio)) = (ended, h.studio.as_ref()) {
+                    drop(rec);
+                    // By the file's own type (the setting may have changed while recording).
+                    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if s.record_remux && ["mkv", "flv", "ts"].contains(&ext.as_str()) {
+                        // Every part, when it was split (a second's slack for the clock).
+                        let since =
+                            std::time::SystemTime::now() - started.elapsed() - std::time::Duration::from_secs(1);
+                        let _ = remux_in_background(studio.remuxer(), recording_parts(&file, since));
+                    }
+                }
                 return Ok(Value::Null);
             }
             if let Some(r) = h.record.as_ref().filter(|r| r.0.stats().active) {
@@ -876,20 +990,66 @@ impl StudioHost for DesktopStudio {
             let folder = record_folder(&s);
             std::fs::create_dir_all(&folder)
                 .map_err(|e| format!("The recordings folder {} can't be made: {e}", folder.display()))?;
-            let name = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
-            let mut file = folder.join(format!("{name}.{}", s.record_format));
-            for i in 2.. {
-                if !file.exists() {
-                    break;
-                }
-                file = folder.join(format!("{name} ({i}).{}", s.record_format));
-            }
-            let rec = studio.record(&file, &record_encode(studio, &s)).map_err(|e| e.to_string())?;
+            let plan = ferrocast_studio::RecordPlan {
+                folder,
+                name: s.record_name.clone(),
+                format: s.record_format.clone(),
+                spaces: s.record_spaces,
+                overwrite: s.record_overwrite,
+                split_minutes: s.record_split_minutes,
+                split_mb: s.record_split_mb,
+                tracks: s.record_tracks.clone(),
+                encode: record_encode(studio, &s),
+            };
+            let file = studio.record_path(&plan);
+            let rec = studio.record_to(&file, &plan).map_err(|e| e.to_string())?;
             tracing::info!(file = %file.display(), "the Studio is recording");
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
             h.record = Some(r);
             Ok(v)
+        })
+        .await?
+    }
+
+    async fn record_split(&self) -> Result<(), String> {
+        self.on_main(|h| {
+            let r = h.record.as_ref().ok_or("Nothing is recording.")?;
+            r.0.split().map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    async fn record_chapter(&self, name: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            let r = h.record.as_ref().ok_or("Nothing is recording.")?;
+            r.0.chapter(&name).map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    async fn remux(&self, file: String) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let studio = h.studio.as_ref().ok_or(STOPPED)?;
+            let from = PathBuf::from(&file);
+            // Any part of the recording under way (a split writes more beside the first).
+            if h.record
+                .as_ref()
+                .is_some_and(|r| r.1 == from || (r.1.parent() == from.parent() && r.1.extension() == from.extension()))
+            {
+                return Err("Wait until the recording ends to remux files of it.".to_string());
+            }
+            let to = remux_in_background(studio.remuxer(), vec![from])?;
+            Ok(json!({ "to": to.display().to_string() }))
+        })
+        .await?
+    }
+
+    async fn encoder_options(&self, id: String, settings: serde_json::Map<String, Value>) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let studio = h.studio.as_ref().ok_or(STOPPED)?;
+            let (options, values) = studio.encoder_options(&id, &settings).map_err(|e| e.to_string())?;
+            Ok(json!({ "options": options, "values": values }))
         })
         .await?
     }

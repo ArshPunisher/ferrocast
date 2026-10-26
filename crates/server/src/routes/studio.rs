@@ -104,6 +104,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
         .route("/studio/engine/record/pause", post(engine_record_pause))
+        .route("/studio/engine/record/split", post(engine_record_split))
+        .route("/studio/engine/record/chapter", post(engine_record_chapter))
+        .route("/studio/engine/remux", post(engine_remux))
+        .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
         .route("/studio/engine/monitoring", get(engine_monitoring))
         // chatbot
         .route("/counters", get(counters).post(create_counter))
@@ -952,6 +956,49 @@ struct OnBody {
 
 async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+/// `POST /studio/engine/record/split`: the recording goes on in a new file.
+async fn engine_record_split(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.studio_record_split().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ChapterBody {
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST /studio/engine/record/chapter` `{ name? }`: a chapter marker here (MP4, MOV).
+async fn engine_record_chapter(State(app): State<AppState>, Body(b): Body<ChapterBody>) -> ApiResult<StatusCode> {
+    app.engine.studio_record_chapter(b.name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RemuxBody {
+    file: String,
+}
+
+/// `POST /studio/engine/remux` `{ file }` → `{ to }`: an MP4 made beside it, in the background.
+async fn engine_remux(State(app): State<AppState>, Body(b): Body<RemuxBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_remux(b.file).await?))
+}
+
+#[derive(Deserialize)]
+struct EncoderSettingsBody {
+    #[serde(default)]
+    settings: serde_json::Map<String, Value>,
+}
+
+/// `POST /studio/engine/encoders/{id}/options` `{ settings }` → `{ options, values }`.
+async fn engine_encoder_options(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Body(b): Body<EncoderSettingsBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_encoder_options(id, b.settings).await?))
 }
 
 async fn engine_record_pause(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<StatusCode> {

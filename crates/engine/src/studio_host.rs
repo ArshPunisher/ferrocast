@@ -83,6 +83,23 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
     async fn record_pause(&self, on: bool) -> Result<(), String>;
+    /// Starts a new file of the recording now (OBS's Split recording).
+    async fn record_split(&self) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Marks a chapter in the recording (MP4 and MOV), named or numbered.
+    async fn record_chapter(&self, _name: String) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Remuxes a recording (MKV, FLV, TS) to MP4 beside it, in the background → `{ to }`;
+    /// how it goes is in stats as `remux`.
+    async fn remux(&self, _file: String) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// An encoder's own options for `settings` → `{ options, values }` (values with defaults).
+    async fn encoder_options(&self, _id: String, _settings: serde_json::Map<String, Value>) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// `{ devices: { name, id }[], current: { name, id } }` for "Hear it".
     async fn monitoring(&self) -> Result<Value, String>;
     /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
@@ -366,6 +383,9 @@ impl FilePick {
     }
 }
 
+/// Recording formats: crash-safe MP4 and MOV, fragmented ones, and MKV, FLV and TS.
+pub const RECORD_FORMATS: [&str; 7] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts"];
+
 /// How the Studio streams, records and runs. Every field has a default, so an older or
 /// partial file still reads.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -407,6 +427,28 @@ pub struct StudioSettings {
     /// What each shortcut does: action → keys ("CmdOrCtrl+Shift+L"). Actions: go_live,
     /// end_stream, record, pause_record, scene:<name>, mute:<sound>, push_to_talk:<sound>.
     pub hotkeys: std::collections::BTreeMap<String, String>,
+    /// A particular video encoder (an id from the Studio's encoders, e.g. HEVC or AV1) instead
+    /// of `encoder`'s pick.
+    pub video_encoder: Option<String>,
+    /// That encoder's own options (OBS's keys: preset, tune, x264opts, lookahead…), applied
+    /// over the ones above, as OBS's Advanced output mode.
+    pub encoder_settings: serde_json::Map<String, Value>,
+    /// The recording's encoder when `record_quality` is "custom", and its options.
+    pub record_encoder: Option<String>,
+    pub record_encoder_settings: serde_json::Map<String, Value>,
+    /// OBS's file name pattern (`%CCYY-%MM-%DD %hh-%mm-%ss`…).
+    pub record_name: String,
+    /// Spaces allowed in file names (else underscores).
+    pub record_spaces: bool,
+    /// A file of the same name is replaced (else " (2)" is added).
+    pub record_overwrite: bool,
+    /// A new file every this many minutes or megabytes (0: never).
+    pub record_split_minutes: u32,
+    pub record_split_mb: u32,
+    /// Audio tracks (1 to 6) the recording keeps.
+    pub record_tracks: Vec<u8>,
+    /// An MKV, FLV or TS recording becomes an MP4 when it ends (the original is kept).
+    pub record_remux: bool,
 }
 
 impl Default for StudioSettings {
@@ -434,6 +476,17 @@ impl Default for StudioSettings {
             stereo: true,
             monitoring: None,
             hotkeys: Default::default(),
+            video_encoder: None,
+            encoder_settings: Default::default(),
+            record_encoder: None,
+            record_encoder_settings: Default::default(),
+            record_name: "%CCYY-%MM-%DD %hh-%mm-%ss".into(),
+            record_spaces: true,
+            record_overwrite: false,
+            record_split_minutes: 0,
+            record_split_mb: 0,
+            record_tracks: vec![1],
+            record_remux: true,
         }
     }
 }
@@ -476,11 +529,40 @@ impl StudioSettings {
         {
             return bad("record_folder: a full folder path.");
         }
-        if !["mp4", "mov"].contains(&self.record_format.as_str()) {
-            return bad("record_format: mp4 or mov.");
+        if !RECORD_FORMATS.contains(&self.record_format.as_str()) {
+            return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv or ts.");
         }
-        if !["stream", "high", "lossless"].contains(&self.record_quality.as_str()) {
-            return bad("record_quality: stream, high or lossless.");
+        if !["stream", "high", "lossless", "custom"].contains(&self.record_quality.as_str()) {
+            return bad("record_quality: stream, high, lossless or custom.");
+        }
+        for (field, id) in [("video_encoder", &self.video_encoder), ("record_encoder", &self.record_encoder)] {
+            if let Some(id) = id
+                && (id.is_empty()
+                    || id.len() > 128
+                    || !id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)))
+            {
+                return Err(EngineError::Invalid(format!("{field}: an encoder id from the Studio's list.")));
+            }
+        }
+        for (field, map) in
+            [("encoder_settings", &self.encoder_settings), ("record_encoder_settings", &self.record_encoder_settings)]
+        {
+            if map.len() > 64 || serde_json::to_string(map).map_or(true, |j| j.len() > 16_384) {
+                return Err(EngineError::Invalid(format!("{field}: up to 64 of the encoder's own options.")));
+            }
+        }
+        let name = self.record_name.trim();
+        if name.is_empty() || name.chars().count() > 120 || name.chars().any(|c| c.is_control() || "/\\:".contains(c)) {
+            return bad("record_name: a file name pattern without / \\ or :, up to 120 characters.");
+        }
+        if self.record_split_minutes > 24 * 60 || self.record_split_mb > 1_000_000 {
+            return bad("record_split: up to 1440 minutes or 1000000 MB (0: never).");
+        }
+        if self.record_tracks.is_empty()
+            || self.record_tracks.len() > 6
+            || self.record_tracks.iter().any(|t| !(1..=6).contains(t))
+        {
+            return bad("record_tracks: 1 to 6 track numbers, 1 to 6.");
         }
         if !(1..=60).contains(&self.reconnect_every_s) || !(1..=10_000).contains(&self.reconnect_tries) {
             return bad("reconnect: every 1 to 60 s, 1 to 10000 tries.");
@@ -1185,6 +1267,42 @@ impl Engine {
         self.studio_host()?.record_pause(on).await.map_err(failed)
     }
 
+    pub async fn studio_record_split(&self) -> Result<(), EngineError> {
+        self.studio_host()?.record_split().await.map_err(failed)
+    }
+
+    pub async fn studio_record_chapter(&self, name: String) -> Result<(), EngineError> {
+        if name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(EngineError::Invalid("name: up to 100 characters, or empty for a number.".into()));
+        }
+        self.studio_host()?.record_chapter(name).await.map_err(failed)
+    }
+
+    /// Remuxes a recording to MP4 beside it (OBS's Remux), in the background.
+    pub async fn studio_remux(&self, file: String) -> Result<Value, EngineError> {
+        let p = std::path::Path::new(&file);
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if file.len() > 4096 || !p.is_absolute() || !["mkv", "flv", "ts", "mov", "mp4", "m3u8"].contains(&ext.as_str())
+        {
+            return Err(EngineError::Invalid("file: a whole path to an MKV, FLV, TS, MOV or MP4 recording.".into()));
+        }
+        self.studio_host()?.remux(file).await.map_err(failed)
+    }
+
+    pub async fn studio_encoder_options(
+        &self,
+        id: String,
+        settings: serde_json::Map<String, Value>,
+    ) -> Result<Value, EngineError> {
+        if id.is_empty() || id.len() > 128 || !id.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+            return Err(EngineError::Invalid("id: an encoder id from the Studio's list.".into()));
+        }
+        if settings.len() > 64 {
+            return Err(EngineError::Invalid("settings: up to 64 of the encoder's options.".into()));
+        }
+        self.studio_host()?.encoder_options(id, settings).await.map_err(failed)
+    }
+
     /// OBS's scene collections, to import one.
     pub async fn studio_obs_collections(&self) -> Result<Value, EngineError> {
         self.studio_host()?.obs_collections().await.map_err(failed)
@@ -1722,7 +1840,12 @@ mod tests {
             ("width", StudioSettings { width: 100, ..d.clone() }),
             ("fps", StudioSettings { fps: 59, ..d.clone() }),
             ("record_folder", StudioSettings { record_folder: Some("relative/path".into()), ..d.clone() }),
-            ("record_format", StudioSettings { record_format: "mkv".into(), ..d.clone() }),
+            ("record_format", StudioSettings { record_format: "avi".into(), ..d.clone() }),
+            ("record_name", StudioSettings { record_name: "a/b".into(), ..d.clone() }),
+            ("record_split", StudioSettings { record_split_minutes: 5000, ..d.clone() }),
+            ("record_tracks", StudioSettings { record_tracks: vec![0], ..d.clone() }),
+            ("record_tracks", StudioSettings { record_tracks: Vec::new(), ..d.clone() }),
+            ("video_encoder", StudioSettings { video_encoder: Some("bad id!".into()), ..d.clone() }),
             ("record_quality", StudioSettings { record_quality: "ultra".into(), ..d.clone() }),
             ("reconnect", StudioSettings { reconnect_every_s: 0, ..d.clone() }),
             ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
