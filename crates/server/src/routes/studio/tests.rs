@@ -600,6 +600,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.delete("/studio/engine/projectors").await,
         r.get("/studio/engine/screens").await,
         r.get("/studio/engine/scenes/Gameplay/items/3/transform").await,
+        r.post("/studio/engine/undo", json!({})).await,
+        r.post("/studio/engine/redo", json!({})).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0, "y": 0, "rotation": 0, "scale_x": 1, "scale_y": 1, "alignment": 5, "bounds": "none", "bounds_alignment": 0, "bounds_width": 0, "bounds_height": 0, "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0 })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));

@@ -46,6 +46,8 @@ pub(crate) fn routes() -> Router<AppState> {
             get(engine_item_transform).put(engine_set_item_transform),
         )
         .route("/studio/engine/preview/selection", put(engine_select))
+        .route("/studio/engine/undo", post(engine_undo))
+        .route("/studio/engine/redo", post(engine_redo))
         .route("/studio/engine/pick-file", post(engine_pick_file))
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
@@ -521,6 +523,15 @@ async fn engine_set_item_transform(
     Body(transform): Body<ferrocast_engine::studio_host::ItemTransform>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetTransform { scene, id, transform }).await
+}
+
+/// `POST /studio/engine/undo` → `{ done, undo, redo }`.
+async fn engine_undo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Undo).await
+}
+
+async fn engine_redo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Redo).await
 }
 
 #[derive(Deserialize)]

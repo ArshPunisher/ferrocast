@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod studio;
+mod studio_history;
 mod studio_keys;
 
 use ferrocast_engine::Engine;

@@ -651,6 +651,10 @@ pub enum StudioAct {
         id: i64,
         transform: ItemTransform,
     },
+    /// Undoes the newest change to sources → `{ done, undo, redo }` (labels, or null).
+    Undo,
+    /// Does again what was undone → `{ done, undo, redo }`.
+    Redo,
     /// Outlines an item in the preview, or nothing (`scene` and `id` null).
     Select {
         scene: Option<String>,
@@ -790,6 +794,7 @@ impl StudioAct {
                 Ok(())
             }
             A::Transform { scene, .. } => check_source_name(scene),
+            A::Undo | A::Redo => Ok(()),
             A::SetTransform { scene, transform, .. } => {
                 check_source_name(scene)?;
                 transform.validate()

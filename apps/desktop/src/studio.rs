@@ -19,6 +19,8 @@ use ferrocast_studio::{
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
+use crate::studio_history::History;
+
 /// Everything libobs-related, on the main thread only.
 ///
 /// libobs loads once and stays until Ferrocast quits: it can't be shut down and started again
@@ -40,6 +42,8 @@ struct Held {
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
     selected: Option<(String, i64)>,
+    /// Undo and redo for sources.
+    history: History,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
     projectors: Vec<(u64, Projector)>,
     last_projector: u64,
@@ -319,8 +323,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             };
             v(to_json!(c.set_transform(&scene, id, &t)?))
         }
-        // Handled in `act`, which holds the preview.
-        A::Select { .. } => Ok(Value::Null),
+        // Handled in `act`, which holds the preview and the history.
+        A::Select { .. } | A::Undo | A::Redo => Ok(Value::Null),
         A::Web { name, what } => done(c.web(&name, web_act(what))),
         // Handled in `act`, which knows where recordings go.
         A::Screenshot { .. } => Ok(Value::Null),
@@ -467,6 +471,7 @@ impl StudioHost for DesktopStudio {
             h.preview = None;
             h.preview_at = None;
             h.projectors.clear();
+            h.history.clear();
             if let Some(c) = h.collection.take() {
                 save(&c, &file);
             }
@@ -550,7 +555,18 @@ impl StudioHost for DesktopStudio {
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let changes = act.changes();
+            if matches!(act, StudioAct::Undo | StudioAct::Redo) {
+                let done = if act == StudioAct::Undo { h.history.undo(c) } else { h.history.redo(c) }?;
+                save(c, &file);
+                refresh_projectors(h);
+                let (undo, redo) = h.history.labels();
+                return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
+            }
+            let before = h.history.before(c, &act);
             let out = run(c, act).map_err(|e| e.to_string());
+            if let Some(b) = before {
+                h.history.after(c, b, &out);
+            }
             if changes && out.is_ok() {
                 save(c, &file);
                 refresh_projectors(h);
@@ -617,6 +633,8 @@ impl StudioHost for DesktopStudio {
                 // The scene on air, so the page notices switches made elsewhere (shortcuts,
                 // a multiview click).
                 "scene": h.collection.as_ref().map(|c| c.current()),
+                // What Undo and Redo would do (labels for the buttons).
+                "history": { "undo": h.history.labels().0, "redo": h.history.labels().1 },
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
@@ -717,6 +735,8 @@ impl StudioHost for DesktopStudio {
             match (h.studio.as_ref(), h.collection.is_some()) {
                 (Some(studio), true) => {
                     // The old scenes go first: libobs keeps one collection's sources at a time.
+                    // Their undo steps hold the old sources: they go too.
+                    h.history.clear();
                     let old = h.collection.take().map(|c| c.save(COLLECTION));
                     match Collection::load(studio, &doc, FIRST_SCENE) {
                         Ok(c) => {
