@@ -650,7 +650,8 @@ impl Studio {
         a.obs_data_release(settings);
         let (oid, oname) = (cstr("rtmp_output"), cstr("ferrocast-stream"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), ptr::null_mut(), ptr::null_mut());
-        let stream = Streaming { studio: self.clone(), out, service, venc, aenc };
+        let stream =
+            Streaming { studio: self.clone(), out, service, venc, aenc, settings: s.clone(), directs: Vec::new() };
         if service.is_null() || out.is_null() {
             return Err(StudioError::Failed("the stream output couldn't be made".into()));
         }
@@ -677,6 +678,15 @@ impl Studio {
 
     /// The video encoder `e` describes and an AAC audio encoder, tied to the canvas.
     fn encoders(&self, e: &EncodeSettings) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
+        self.encoders_for(e, false)
+    }
+
+    /// As [`Studio::encoders`]; `opus` makes the sound Opus (WebRTC takes only that).
+    fn encoders_for(
+        &self,
+        e: &EncodeSettings,
+        opus: bool,
+    ) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
         let a = &self.inner.api;
         let vs = a.obs_data_create();
         let set_int = |k: &str, v: i64| {
@@ -731,7 +741,8 @@ impl Studio {
         a.obs_data_set_int(as_, b.as_ptr(), i64::from(audio_kbps));
         let aname = cstr("ferrocast-audio");
         let mut aenc = ptr::null_mut();
-        for id in ["ffmpeg_aac", "CoreAudio_AAC"] {
+        let kinds: &[&str] = if opus { &["ffmpeg_opus"] } else { &["ffmpeg_aac", "CoreAudio_AAC"] };
+        for id in kinds {
             let aid = cstr(id);
             aenc = a.obs_audio_encoder_create(aid.as_ptr(), aname.as_ptr(), as_, 0, ptr::null_mut());
             if !aenc.is_null() {
@@ -741,7 +752,9 @@ impl Studio {
         a.obs_data_release(as_);
         if aenc.is_null() {
             a.obs_encoder_release(venc);
-            return Err(StudioError::Failed("no AAC encoder is available".into()));
+            return Err(StudioError::Failed(
+                if opus { "no Opus encoder is available" } else { "no AAC encoder is available" }.into(),
+            ));
         }
         a.obs_encoder_set_video(venc, a.obs_get_video());
         a.obs_encoder_set_audio(aenc, a.obs_get_audio());
@@ -1462,18 +1475,56 @@ pub struct Streaming {
     service: *mut ffi::ObsService,
     venc: *mut ffi::ObsEncoder,
     aenc: *mut ffi::ObsEncoder,
+    settings: StreamSettings,
+    /// Destinations sent straight from here (SRT, RIST, WebRTC), by id.
+    directs: Vec<Direct>,
+}
+
+/// How a destination is sent straight from the Studio (not through Go live's RTMP forwarders).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// `srt://host:port?…`; the key, if any, is the stream id.
+    Srt,
+    /// `rist://host:port?…`; the key, if any, is the passphrase.
+    Rist,
+    /// WebRTC by WHIP: an `https://` endpoint; the key, if any, is its bearer token.
+    Whip,
+}
+
+impl Protocol {
+    /// The protocol a server address asks for, or None for RTMP (and anything else).
+    pub fn of(url: &str) -> Option<Protocol> {
+        let u = url.trim().to_ascii_lowercase();
+        if u.starts_with("srt://") {
+            Some(Protocol::Srt)
+        } else if u.starts_with("rist://") {
+            Some(Protocol::Rist)
+        } else if u.starts_with("https://")
+            || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+                .iter()
+                .any(|p| u.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with([':', '/'])))
+        {
+            // Plain http only on this computer: a token never crosses the network unencrypted.
+            Some(Protocol::Whip)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Direct {
+    id: String,
+    out: *mut ffi::ObsOutput,
+    service: *mut ffi::ObsService,
+    /// WebRTC's own encoders (no B-frames, Opus); SRT and RIST share the stream's.
+    own: Option<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder)>,
 }
 
 impl Streaming {
     pub fn stats(&self) -> StreamStats {
-        let a = &self.studio.inner.api;
-        StreamStats {
-            active: a.obs_output_active(self.out),
-            reconnecting: a.obs_output_reconnecting(self.out),
-            bytes: a.obs_output_get_total_bytes(self.out),
-            frames: u32::try_from(a.obs_output_get_total_frames(self.out)).unwrap_or(0),
-            dropped: u32::try_from(a.obs_output_get_frames_dropped(self.out)).unwrap_or(0),
-        }
+        output_stats(&self.studio.inner.api, self.out)
     }
 
     /// The reason OBS gave for the last failure, if any.
@@ -1481,17 +1532,147 @@ impl Streaming {
         let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
         (!e.is_empty()).then_some(e)
     }
+
+    /// Also sends this stream straight to `url` by SRT, RIST or WebRTC (WHIP), as OBS's own
+    /// outputs do: SRT and RIST share this stream's encoding; WebRTC gets its own (no
+    /// B-frames, Opus sound). `key` is the stream id, passphrase or bearer token (may be
+    /// empty). One per id; adding an id again replaces it.
+    pub fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
+        let proto = Protocol::of(url)
+            .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
+        self.remove_direct(id);
+        let a = &self.studio.inner.api;
+        let settings = a.obs_data_create();
+        let set = |k: &str, v: &str| {
+            let (k, v) = (cstr(k), cstr(v));
+            a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
+        };
+        set("server", url.trim());
+        let (service_id, output_id) = match proto {
+            Protocol::Whip => {
+                set("bearer_token", key);
+                ("whip_custom", "whip_output")
+            }
+            Protocol::Srt | Protocol::Rist => {
+                set("key", key);
+                ("rtmp_custom", "ffmpeg_mpegts_muxer")
+            }
+        };
+        let (sid, sname) = (cstr(service_id), cstr(&format!("ferrocast-direct-{id}")));
+        let service = a.obs_service_create(sid.as_ptr(), sname.as_ptr(), settings, ptr::null_mut());
+        a.obs_data_release(settings);
+        let (oid, oname) = (cstr(output_id), cstr(&format!("ferrocast-direct-{id}")));
+        let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), ptr::null_mut(), ptr::null_mut());
+        let mut d = Direct { id: id.to_string(), out, service, own: None };
+        if service.is_null() || out.is_null() {
+            self.release_direct(&mut d);
+            return Err(StudioError::Failed(format!(
+                "{} isn't available in this OBS",
+                if proto == Protocol::Whip { "WebRTC (WHIP)" } else { "SRT and RIST" }
+            )));
+        }
+        let (venc, aenc) = if proto == Protocol::Whip {
+            let mut e = self.settings.encode.clone();
+            e.bframes = false;
+            match self.studio.encoders_for(&e, true) {
+                Ok(pair) => {
+                    d.own = Some(pair);
+                    pair
+                }
+                Err(err) => {
+                    self.release_direct(&mut d);
+                    return Err(err);
+                }
+            }
+        } else {
+            (self.venc, self.aenc)
+        };
+        a.obs_output_set_video_encoder(out, venc);
+        a.obs_output_set_audio_encoder(out, aenc, 0);
+        a.obs_output_set_service(out, service);
+        match self.settings.reconnect {
+            Some((retries, every_s)) => a.obs_output_set_reconnect_settings(out, retries as c_int, every_s as c_int),
+            None => a.obs_output_set_reconnect_settings(out, 0, 0),
+        }
+        if !a.obs_output_start(out) {
+            let why = text(a.obs_output_get_last_error(out));
+            self.release_direct(&mut d);
+            return Err(StudioError::Failed(if why.is_empty() {
+                "it didn't start: the server refused or couldn't be reached".into()
+            } else {
+                format!("it didn't start: {why}")
+            }));
+        }
+        self.directs.push(d);
+        Ok(())
+    }
+
+    /// Stops sending to one direct destination.
+    pub fn remove_direct(&mut self, id: &str) {
+        if let Some(i) = self.directs.iter().position(|d| d.id == id) {
+            let mut d = self.directs.remove(i);
+            self.release_direct(&mut d);
+        }
+    }
+
+    /// How a direct destination is going (None: not sending to it).
+    pub fn direct_stats(&self, id: &str) -> Option<StreamStats> {
+        let d = self.directs.iter().find(|d| d.id == id)?;
+        Some(output_stats(&self.studio.inner.api, d.out))
+    }
+
+    /// The ids sent to directly now.
+    pub fn direct_ids(&self) -> Vec<String> {
+        self.directs.iter().map(|d| d.id.clone()).collect()
+    }
+
+    fn release_direct(&self, d: &mut Direct) {
+        let a = &self.studio.inner.api;
+        if !d.out.is_null() {
+            stop_output(a, d.out);
+            a.obs_output_release(d.out);
+            d.out = ptr::null_mut();
+        }
+        if !d.service.is_null() {
+            a.obs_service_release(d.service);
+            d.service = ptr::null_mut();
+        }
+        if let Some((v, au)) = d.own.take() {
+            a.obs_encoder_release(v);
+            a.obs_encoder_release(au);
+        }
+    }
+}
+
+/// An output's state now.
+fn output_stats(a: &Api, out: *mut ffi::ObsOutput) -> StreamStats {
+    StreamStats {
+        active: a.obs_output_active(out),
+        reconnecting: a.obs_output_reconnecting(out),
+        bytes: a.obs_output_get_total_bytes(out),
+        frames: u32::try_from(a.obs_output_get_total_frames(out)).unwrap_or(0),
+        dropped: u32::try_from(a.obs_output_get_frames_dropped(out)).unwrap_or(0),
+    }
+}
+
+/// Stops an output and waits up to 10 s for it.
+fn stop_output(a: &Api, out: *mut ffi::ObsOutput) {
+    a.obs_output_stop(out);
+    let until = Instant::now() + Duration::from_secs(10);
+    while a.obs_output_active(out) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 impl Drop for Streaming {
     fn drop(&mut self) {
+        // The direct ones first: they share this stream's encoders.
+        for mut d in std::mem::take(&mut self.directs) {
+            self.release_direct(&mut d);
+        }
         let a = &self.studio.inner.api;
         if !self.out.is_null() {
-            a.obs_output_stop(self.out);
-            let until = Instant::now() + Duration::from_secs(10);
-            while a.obs_output_active(self.out) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            stop_output(a, self.out);
             a.obs_output_release(self.out);
         }
         if !self.service.is_null() {
