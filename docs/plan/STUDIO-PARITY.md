@@ -100,8 +100,11 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 ### Streaming
 - ✅ Multistream to Twitch, YouTube, Kick and custom servers, health, reconnects, upload check,
   upload protection, platform rules, per-platform info, vertical (Track A).
-- [ ] P1 Stream settings: services list, custom server (RTMP, RTMPS, SRT, RIST, WHIP/WebRTC),
-  auth, bandwidth test mode, "ignore streaming service setting recommendations".
+- [x] P1 Stream settings: services list, custom server (RTMP, RTMPS, SRT, RIST, WHIP/WebRTC),
+  auth, bandwidth test mode, "ignore streaming service setting recommendations". (26 Oct: SRT,
+  RIST and WebRTC go straight from the Studio, alongside RTMP destinations, each with health.
+  Services and bandwidth test: Go live's platforms and upload check. Bind IP, TCP pacing and
+  the RTMP network options only touch the Studio's hop to this PC, so not copied.)
 - [ ] P2 Twitch Enhanced Broadcasting (multitrack video), YouTube HDR/HEVC/AV1.
 - [ ] P1 Output: simple and advanced modes, encoder per output, rate control (CBR, VBR, CQP,
   CRF, ABR), bitrate, keyframe interval, preset/tuning/profile, B-frames, lookahead,
