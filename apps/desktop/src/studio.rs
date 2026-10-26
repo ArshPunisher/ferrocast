@@ -302,6 +302,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
         A::Transform { scene, id } => v(to_json!(c.transform(&scene, id)?)),
+        A::TransitionSettings { kind } => Ok(c.transition_settings(&kind)),
+        A::SetTransitionSettings { kind, settings } => done(c.set_transition_settings(&kind, &settings)),
         A::SetTransform { scene, id, transform: t } => {
             let t = ferrocast_studio::Transform {
                 x: t.x,

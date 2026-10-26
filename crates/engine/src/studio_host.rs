@@ -178,6 +178,17 @@ pub struct ItemTransform {
     pub height: u32,
 }
 
+/// The transitions the Studio offers (OBS's own kinds).
+pub const TRANSITION_KINDS: [&str; 7] = [
+    "fade_transition",
+    "cut_transition",
+    "swipe_transition",
+    "slide_transition",
+    "fade_to_color_transition",
+    "wipe_transition",
+    "obs_stinger_transition",
+];
+
 /// The kinds of bounding box, as OBS orders them.
 pub const BOUNDS_KINDS: [&str; 7] = ["none", "stretch", "fit", "fill", "width", "height", "max"];
 
@@ -651,6 +662,15 @@ pub enum StudioAct {
         id: i64,
         transform: ItemTransform,
     },
+    /// A transition kind's own settings (a stinger's video, a swipe's direction).
+    TransitionSettings {
+        kind: String,
+    },
+    /// Changes the keys given of a transition kind's settings.
+    SetTransitionSettings {
+        kind: String,
+        settings: Value,
+    },
     /// Undoes the newest change to sources → `{ done, undo, redo }` (labels, or null).
     Undo,
     /// Does again what was undone → `{ done, undo, redo }`.
@@ -696,17 +716,9 @@ impl StudioAct {
             A::SetSceneTransition { scene, transition } => {
                 check_source_name(scene)?;
                 if let Some(t) = transition {
-                    const KINDS: [&str; 6] = [
-                        "fade_transition",
-                        "cut_transition",
-                        "swipe_transition",
-                        "slide_transition",
-                        "fade_to_color_transition",
-                        "wipe_transition",
-                    ];
-                    if !KINDS.contains(&t.kind.as_str()) {
+                    if !TRANSITION_KINDS.contains(&t.kind.as_str()) {
                         return Err(EngineError::Invalid(
-                            "kind: fade, cut, swipe, slide, fade to colour or wipe transition.".into(),
+                            "kind: fade, cut, swipe, slide, fade to colour, wipe or stinger transition.".into(),
                         ));
                     }
                     if t.ms > 20_000 {
@@ -795,6 +807,13 @@ impl StudioAct {
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo => Ok(()),
+            A::TransitionSettings { kind } | A::SetTransitionSettings { kind, .. }
+                if !TRANSITION_KINDS.contains(&kind.as_str()) =>
+            {
+                Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()))
+            }
+            A::TransitionSettings { .. } => Ok(()),
+            A::SetTransitionSettings { settings, .. } => check_settings(settings),
             A::SetTransform { scene, transform, .. } => {
                 check_source_name(scene)?;
                 transform.validate()
@@ -828,6 +847,7 @@ impl StudioAct {
                 | A::FilterOptions { .. }
                 | A::Select { .. }
                 | A::Transform { .. }
+                | A::TransitionSettings { .. }
         )
     }
 }
@@ -1292,6 +1312,14 @@ mod tests {
             ItemTransform { bounds_width: -5.0, ..t.clone() },
         ] {
             assert!(matches!(e.studio_act(set(bad.clone())).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
+
+        // Transition settings: only the Studio's transitions, with an object of settings.
+        let ts = |kind: &str, settings| StudioAct::SetTransitionSettings { kind: kind.into(), settings };
+        e.studio_act(ts("obs_stinger_transition", serde_json::json!({ "path": "/a.webm" }))).await.unwrap();
+        assert!(ts("swipe_transition", serde_json::json!({})).changes());
+        for bad in [ts("explode_transition", serde_json::json!({})), ts("fade_transition", serde_json::json!(3))] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
 
         // Projectors: what to show is checked first; hosts without windows say so.

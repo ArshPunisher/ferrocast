@@ -56,6 +56,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/screens", get(engine_screens))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route(
+            "/studio/engine/transitions/{kind}/settings",
+            get(engine_transition_settings).put(engine_set_transition_settings),
+        )
         .route("/studio/engine/scenes/{scene}/transition", put(engine_scene_transition))
         .route("/studio/engine/sources", get(engine_sources))
         .route("/studio/engine/sources/{name}/rename", post(engine_rename))
@@ -523,6 +527,19 @@ async fn engine_set_item_transform(
     Body(transform): Body<ferrocast_engine::studio_host::ItemTransform>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetTransform { scene, id, transform }).await
+}
+
+async fn engine_transition_settings(State(app): State<AppState>, Path(kind): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::TransitionSettings { kind }).await
+}
+
+/// `PUT /studio/engine/transitions/{kind}/settings` `{ settings }`: changes only the keys sent.
+async fn engine_set_transition_settings(
+    State(app): State<AppState>,
+    Path(kind): Path<String>,
+    Body(b): Body<SettingsBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTransitionSettings { kind, settings: b.settings }).await
 }
 
 /// `POST /studio/engine/undo` → `{ done, undo, redo }`.
