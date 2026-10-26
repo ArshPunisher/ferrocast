@@ -156,6 +156,14 @@ impl History {
                 added: Some((scene.clone(), c.item_ids(scene).ok()?)),
                 ..fresh(format!("Add {}", source.name), Vec::new(), None, false)
             }),
+            StudioAct::AddGroup { scene, name } => Some(Before {
+                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
+                ..fresh(format!("Add group {name}"), Vec::new(), None, false)
+            }),
+            StudioAct::PasteCopy { scene, name } => Some(Before {
+                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
+                ..fresh(format!("Paste a copy of {name}"), Vec::new(), None, false)
+            }),
             StudioAct::AddExisting { scene, name } => Some(Before {
                 added: Some((scene.clone(), c.item_ids(scene).ok()?)),
                 ..fresh(format!("Add {name}"), Vec::new(), None, false)

@@ -1021,6 +1021,28 @@ pub enum StudioAct {
         mode: String,
         top_field_first: bool,
     },
+    /// A new, empty group on top of a scene → the item.
+    AddGroup {
+        scene: String,
+        name: String,
+    },
+    /// Takes a group apart (its sources stay, in the scene).
+    Ungroup {
+        scene: String,
+        id: i64,
+    },
+    /// Moves an item into a group of the scene, or out of its group (`group` None).
+    SetGroup {
+        scene: String,
+        id: i64,
+        group: Option<i64>,
+    },
+    /// A new, independent copy of a source on top of a scene (OBS's Paste (Duplicate)) → the
+    /// item.
+    PasteCopy {
+        scene: String,
+        name: String,
+    },
     /// A video, playlist or slideshow's play controls → `{ state, time_ms, duration_ms }`;
     /// `what` None only reads them, `seek_ms` jumps a video.
     Media {
@@ -1210,6 +1232,11 @@ impl StudioAct {
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
             A::SwapScenes | A::FadeToBlack | A::MissingFiles | A::ScreenshotProgram => Ok(()),
+            A::AddGroup { scene, name } | A::PasteCopy { scene, name } => {
+                check_source_name(scene)?;
+                check_source_name(name)
+            }
+            A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
             A::Media { name, seek_ms, .. } => {
                 check_source_name(name)?;
                 if seek_ms.is_some_and(|ms| !(0..=24 * 3_600_000).contains(&ms)) {

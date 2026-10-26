@@ -50,8 +50,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 ### Scenes and sources
 - [x] P1 Scenes: add, rename, duplicate, delete, reorder, scene filters (26 Oct; grid mode too). *Better: start from
   ready screens (themes, 8 screens) instead of an empty scene.*
-- [ ] P1 Sources: add (new or existing), rename, duplicate (reference or copy), delete, reorder,
+- [x] P1 Sources: add (new or existing), rename, duplicate (reference or copy), delete, reorder,
   show/hide, lock, groups and nested scenes, "Paste (Reference/Duplicate)", copy/paste filters.
+  (26 Oct: groups made, filled, emptied and taken apart; Paste and Paste a copy.)
 - [x] P1 Transform: position, rotation, size, crop, bounds (8 kinds), alignment (9 points),
   flip, fit/stretch/center to screen, reset, copy/paste transform, edit transform dialog,
   snapping (screen, sources, center) with sensitivity.

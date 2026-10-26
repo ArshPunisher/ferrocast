@@ -458,6 +458,10 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         })),
         A::SwapScenes => done(c.swap_scenes()),
         A::MissingFiles => v(to_json!(c.missing_files())),
+        A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
+        A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
+        A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
+        A::PasteCopy { scene, name } => v(to_json!(c.paste_copy(&scene, &name)?)),
         A::Media { name, what, seek_ms } => {
             use ferrocast_engine::studio_host::MediaAct as M;
             use ferrocast_studio::MediaAct as S;

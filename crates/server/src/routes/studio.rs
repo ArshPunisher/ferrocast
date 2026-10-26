@@ -56,6 +56,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/studio-mode/tbar", put(engine_tbar))
         .route("/studio/engine/black", post(engine_fade_to_black))
         .route("/studio/engine/scenes/{scene}/items/{id}/transition", put(engine_item_transition))
+        .route("/studio/engine/scenes/{scene}/items/{id}/group", put(engine_item_group))
+        .route("/studio/engine/scenes/{scene}/items/{id}/ungroup", post(engine_ungroup))
         .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
@@ -418,6 +420,12 @@ struct SettingsBody {
 #[derive(Deserialize)]
 struct AddItemBody {
     existing: Option<String>,
+    /// With `existing`: a new copy of it instead of the same source (OBS's Paste (Duplicate)).
+    #[serde(default)]
+    copy: bool,
+    /// A new, empty group of this name.
+    #[serde(default)]
+    group: Option<String>,
     #[serde(flatten)]
     source: Option<NewSource>,
     #[serde(default)]
@@ -501,6 +509,8 @@ async fn engine_add_item(
     Body(b): Body<AddItemBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let a = match (b.existing, b.source) {
+        _ if b.group.is_some() => StudioAct::AddGroup { scene, name: b.group.unwrap_or_default() },
+        (Some(name), _) if b.copy => StudioAct::PasteCopy { scene, name },
         (Some(name), _) => StudioAct::AddExisting { scene, name },
         (None, Some(source)) => StudioAct::AddSource { scene, source, fit: b.fit },
         (None, None) => {
@@ -610,6 +620,25 @@ struct TBarBody {
 /// `PUT /studio/engine/studio-mode/tbar` `{ at, release? }` → `{ active, at }`.
 async fn engine_tbar(State(app): State<AppState>, Body(b): Body<TBarBody>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::TBar { at: b.at, release: b.release }).await
+}
+
+#[derive(Deserialize)]
+struct GroupBody {
+    group: Option<i64>,
+}
+
+/// `PUT …/items/{id}/group` `{ group }`: into that group of the scene, or out (null).
+async fn engine_item_group(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<GroupBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetGroup { scene, id, group: b.group }).await
+}
+
+/// `POST …/items/{id}/ungroup`: the group goes; its sources stay in the scene.
+async fn engine_ungroup(State(app): State<AppState>, Path((scene, id)): Path<(String, i64)>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::Ungroup { scene, id }).await
 }
 
 #[derive(Deserialize)]
