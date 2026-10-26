@@ -1,11 +1,14 @@
 //! The Studio's keyboard shortcuts (2.1): global, like OBS's hotkeys, so they work while a
-//! game has the keyboard. Each is an action from the Studio's settings: go live, end the
-//! stream, record, pause, a scene, mute a sound, or push to talk (held down).
+//! game has the keyboard. Each is an action from the Studio's settings, as OBS has them:
+//! streaming, recording (pause, split, chapter), replay buffer, virtual camera, Studio Mode
+//! (Transition, quick transitions, swap, fade to black), a scene, a source's show and hide, a
+//! filter on or off, media controls, screenshots, undo, mute, push to talk and push to mute
+//! (held down).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-use ferrocast_engine::studio_host::{AudioChange, StudioAct};
+use ferrocast_engine::studio_host::{AudioChange, FilterEdit, ItemEdit, MediaAct, StudioAct};
 use ferrocast_engine::{Engine, EngineError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
@@ -68,8 +71,8 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
     };
     let pressed = state == ShortcutState::Pressed;
     tracing::debug!(action, pressed, "a Studio shortcut");
-    // Only push to talk acts on letting go.
-    if !pressed && !action.starts_with("push_to_talk:") {
+    // Only push to talk and push to mute act on letting go.
+    if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
         return true;
     }
     let _ = keys.queue.send((action, pressed));
@@ -103,13 +106,85 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
             let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
             engine.studio_virtual_camera(!on, None).await?;
         }
+        "split_record" => engine.studio_record_split().await?,
+        "chapter" => engine.studio_record_chapter(String::new()).await?,
+        "studio_mode" => {
+            let on = !engine.studio_act(StudioAct::Scenes).await?["preview"].is_null();
+            engine.studio_act(StudioAct::StudioMode { on: !on }).await?;
+        }
+        "transition" => {
+            engine.studio_act(StudioAct::TransitionNow { quick: None }).await?;
+        }
+        "swap_scenes" => {
+            engine.studio_act(StudioAct::SwapScenes).await?;
+        }
+        "fade_to_black" => {
+            engine.studio_act(StudioAct::FadeToBlack).await?;
+        }
+        "screenshot" => {
+            engine.studio_act(StudioAct::ScreenshotProgram).await?;
+        }
+        "undo" => {
+            engine.studio_act(StudioAct::Undo).await?;
+        }
+        "redo" => {
+            engine.studio_act(StudioAct::Redo).await?;
+        }
         a => {
             let audio = |name: &str, muted: bool| StudioAct::SetAudio {
                 name: name.to_string(),
                 change: AudioChange { muted: Some(muted), by_shortcut: true, ..Default::default() },
             };
+            let pair = |p: &str| a.strip_prefix(p).and_then(|r| r.split_once('\n'));
             if let Some(scene) = a.strip_prefix("scene:") {
                 engine.studio_act(StudioAct::SetCurrent { scene: scene.to_string() }).await?;
+            } else if let Some(n) = a.strip_prefix("quick:").and_then(|n| n.parse::<usize>().ok()) {
+                // Quick transitions are numbered from 1, as they're listed.
+                let scenes = engine.studio_act(StudioAct::Scenes).await?;
+                if let Some(q) = scenes["quick"].get(n.saturating_sub(1)) {
+                    let quick = serde_json::from_value(q.clone()).ok();
+                    engine.studio_act(StudioAct::TransitionNow { quick }).await?;
+                }
+            } else if let Some((scene, source)) = pair("show:").or_else(|| pair("hide:")) {
+                let items = engine.studio_act(StudioAct::Items { scene: scene.to_string() }).await?;
+                // Inside a group too.
+                let flat: Vec<&Value> = items
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
+                    .collect();
+                let id = flat.iter().find(|i| i["name"] == Value::String(source.into())).and_then(|i| i["id"].as_i64());
+                if let Some(id) = id {
+                    let edit = if a.starts_with("show:") { ItemEdit::Show } else { ItemEdit::Hide };
+                    engine.studio_act(StudioAct::EditItem { scene: scene.to_string(), id, edit }).await?;
+                }
+            } else if let Some((source, filter)) = pair("filter:") {
+                let list = engine.studio_act(StudioAct::Filters { name: source.to_string() }).await?;
+                let on = list
+                    .as_array()
+                    .and_then(|l| l.iter().find(|f| f["name"] == Value::String(filter.into())))
+                    .and_then(|f| f["enabled"].as_bool())
+                    .unwrap_or(false);
+                let edit = if on { FilterEdit::Disable } else { FilterEdit::Enable };
+                engine
+                    .studio_act(StudioAct::EditFilter { name: source.to_string(), filter: filter.to_string(), edit })
+                    .await?;
+            } else if let Some(name) = a.strip_prefix("screenshot:") {
+                engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
+            } else if let Some((what, name)) = a.strip_prefix("media_").and_then(|r| r.split_once(':')) {
+                let what = match what {
+                    "play_pause" => MediaAct::PlayPause,
+                    "restart" => MediaAct::Restart,
+                    "stop" => MediaAct::Stop,
+                    "next" => MediaAct::Next,
+                    "previous" => MediaAct::Previous,
+                    _ => return Ok(()),
+                };
+                engine.studio_act(StudioAct::Media { name: name.to_string(), what: Some(what), seek_ms: None }).await?;
+            } else if let Some(name) = a.strip_prefix("push_to_mute:") {
+                // Held: muted; let go: heard.
+                engine.studio_act(audio(name, pressed)).await?;
             } else if let Some(name) = a.strip_prefix("mute:") {
                 let muted = muted(engine, name).await?;
                 engine.studio_act(audio(name, !muted)).await?;

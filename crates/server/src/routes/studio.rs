@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use ferrocast_engine::studio_host::{
-    AudioChange, FilterEdit, ItemEdit, NewSource, SceneTransition, StudioAct, StudioModeOptions, WebAct,
+    AudioChange, FilterEdit, ItemEdit, MediaAct, NewSource, SceneTransition, StudioAct, StudioModeOptions, WebAct,
 };
 
 use crate::AppState;
@@ -107,6 +107,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/record/split", post(engine_record_split))
         .route("/studio/engine/replay", post(engine_replay))
         .route("/studio/engine/missing-files", get(engine_missing_files).put(engine_replace_file))
+        .route("/studio/engine/sources/{name}/media", get(engine_media_state).post(engine_media))
         .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
@@ -961,6 +962,29 @@ struct OnBody {
 
 async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+/// `GET /studio/engine/sources/{name}/media` → `{ state, time_ms, duration_ms }`.
+async fn engine_media_state(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Media { name, what: None, seek_ms: None }).await
+}
+
+#[derive(Deserialize)]
+struct MediaBody {
+    #[serde(rename = "do", default)]
+    what: Option<MediaAct>,
+    #[serde(default)]
+    seek_ms: Option<i64>,
+}
+
+/// `POST /studio/engine/sources/{name}/media` `{ do?: play | pause | play_pause | restart | stop
+/// | next | previous, seek_ms? }` → where it is now.
+async fn engine_media(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<MediaBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Media { name, what: b.what, seek_ms: b.seek_ms }).await
 }
 
 /// `GET /studio/engine/missing-files` → the files sources use that aren't here.

@@ -400,6 +400,28 @@ impl FilePick {
     }
 }
 
+/// Shortcut actions with no name in them (OBS's hotkeys). Others: scene:, mute:,
+/// push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide: <scene>\n<source>;
+/// filter: <source>\n<filter>; quick: <1 to 10>.
+pub const HOTKEY_ACTIONS: [&str; 16] = [
+    "go_live",
+    "end_stream",
+    "record",
+    "pause_record",
+    "split_record",
+    "chapter",
+    "replay",
+    "save_replay",
+    "virtualcam",
+    "studio_mode",
+    "transition",
+    "swap_scenes",
+    "fade_to_black",
+    "screenshot",
+    "undo",
+    "redo",
+];
+
 /// Recording formats: crash-safe MP4 and MOV, fragmented ones, and MKV, FLV and TS.
 pub const RECORD_FORMATS: [&str; 7] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts"];
 
@@ -622,15 +644,19 @@ impl StudioSettings {
             return bad("hotkeys: up to 200.");
         }
         for (action, keys) in &self.hotkeys {
-            let known = ["go_live", "end_stream", "record", "pause_record", "replay", "save_replay", "virtualcam"]
-                .contains(&action.as_str())
-                || ["scene:", "mute:", "push_to_talk:"]
+            let known = HOTKEY_ACTIONS.contains(&action.as_str())
+                || ["scene:", "mute:", "push_to_talk:", "push_to_mute:", "media_play_pause:", "media_restart:", "media_stop:", "media_next:", "media_previous:", "screenshot:"]
                     .iter()
-                    .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()));
+                    .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()))
+                // A source in a scene, a filter on a source: two names, a line apart.
+                || ["show:", "hide:", "filter:"].iter().any(|p| {
+                    action.strip_prefix(p).and_then(|r| r.split_once('\n')).is_some_and(|(x, y)| {
+                        check_source_name(x).is_ok() && check_source_name(y).is_ok()
+                    })
+                })
+                || action.strip_prefix("quick:").and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=10).contains(&n));
             if !known {
-                return bad(
-                    "hotkeys: go_live, end_stream, record, pause_record, replay, save_replay, virtualcam, scene:, mute: or push_to_talk: a name.",
-                );
+                return bad("hotkeys: one of the Studio's shortcut actions (see API.md).");
             }
             if keys.is_empty()
                 || keys.len() > 64
@@ -708,6 +734,19 @@ pub enum WebAct {
     Interact,
     Stop,
     Reload,
+}
+
+/// What to do to a video, playlist or slideshow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAct {
+    Play,
+    Pause,
+    PlayPause,
+    Restart,
+    Stop,
+    Next,
+    Previous,
 }
 
 /// OBS's deinterlacing modes.
@@ -882,6 +921,8 @@ pub enum StudioAct {
     Screenshot {
         name: String,
     },
+    /// A PNG of exactly what's on air (black when faded, mid-transition as it is) → `{ file }`.
+    ScreenshotProgram,
     /// Clicks into, stops clicking or reloads a Web page source.
     Web {
         name: String,
@@ -954,6 +995,14 @@ pub enum StudioAct {
         name: String,
         mode: String,
         top_field_first: bool,
+    },
+    /// A video, playlist or slideshow's play controls → `{ state, time_ms, duration_ms }`;
+    /// `what` None only reads them, `seek_ms` jumps a video.
+    Media {
+        name: String,
+        what: Option<MediaAct>,
+        #[serde(default)]
+        seek_ms: Option<i64>,
     },
     /// Files sources, filters and transitions use that aren't on this computer →
     /// `[{ source, parent, kind, key, label, path }]`.
@@ -1135,7 +1184,14 @@ impl StudioAct {
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
-            A::SwapScenes | A::FadeToBlack | A::MissingFiles => Ok(()),
+            A::SwapScenes | A::FadeToBlack | A::MissingFiles | A::ScreenshotProgram => Ok(()),
+            A::Media { name, seek_ms, .. } => {
+                check_source_name(name)?;
+                if seek_ms.is_some_and(|ms| !(0..=24 * 3_600_000).contains(&ms)) {
+                    return Err(EngineError::Invalid("seek_ms: 0 to 24 hours.".into()));
+                }
+                Ok(())
+            }
             A::ReplaceFile { source, parent, key, path, to, .. } => {
                 if !source.is_empty() {
                     check_source_name(source)?;
@@ -1212,6 +1268,7 @@ impl StudioAct {
                 | A::Levels { .. }
                 | A::Filters { .. }
                 | A::Screenshot { .. }
+                | A::ScreenshotProgram
                 | A::FilterSettings { .. }
                 | A::FilterOptions { .. }
                 | A::Select { .. }
@@ -1219,6 +1276,7 @@ impl StudioAct {
                 | A::TransitionSettings { .. }
                 | A::History
                 | A::MissingFiles
+                | A::Media { .. }
         )
     }
 }
@@ -1922,7 +1980,26 @@ mod tests {
         let mut hk = d.clone();
         hk.hotkeys.insert("scene:Just chatting".into(), "Alt+2".into());
         hk.hotkeys.insert("push_to_talk:Mic".into(), "Alt+Space".into());
+        // OBS's other hotkeys: Studio Mode, quick transitions, show/hide, filters, media.
+        for (action, keys) in [
+            ("transition", "Alt+T"),
+            ("quick:3", "Alt+3"),
+            ("show:Gameplay\nCamera", "Alt+C"),
+            ("hide:Gameplay\nCamera", "Alt+Shift+C"),
+            ("filter:Mic\nGate", "Alt+G"),
+            ("media_restart:Intro", "Alt+R"),
+            ("push_to_mute:Mic", "Alt+M"),
+            ("split_record", "Alt+S"),
+            ("undo", "Alt+Z"),
+        ] {
+            hk.hotkeys.insert(action.into(), keys.into());
+        }
         assert!(hk.check().is_ok(), "{:?}", hk.check());
+        for action in ["quick:11", "quick:0", "show:only one name", "media_explode:Intro", "filter:\nGate"] {
+            let mut bad = d.clone();
+            bad.hotkeys.insert(action.into(), "F8".into());
+            assert!(bad.check().is_err(), "{action} is refused");
+        }
         for (field, bad) in [
             ("encoder", StudioSettings { encoder: "gpu".into(), ..d.clone() }),
             ("video_kbps", StudioSettings { video_kbps: 90_000, ..d.clone() }),

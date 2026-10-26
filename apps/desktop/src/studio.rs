@@ -438,6 +438,29 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         })),
         A::SwapScenes => done(c.swap_scenes()),
         A::MissingFiles => v(to_json!(c.missing_files())),
+        A::Media { name, what, seek_ms } => {
+            use ferrocast_engine::studio_host::MediaAct as M;
+            use ferrocast_studio::MediaAct as S;
+            if let Some(ms) = seek_ms {
+                c.media_seek(&name, ms)?;
+            }
+            let info = match what {
+                None => c.media_state(&name)?,
+                Some(w) => c.media(
+                    &name,
+                    match w {
+                        M::Play => S::Play,
+                        M::Pause => S::Pause,
+                        M::PlayPause => S::PlayPause,
+                        M::Restart => S::Restart,
+                        M::Stop => S::Stop,
+                        M::Next => S::Next,
+                        M::Previous => S::Previous,
+                    },
+                )?,
+            };
+            v(to_json!(info))
+        }
         A::ReplaceFile { source, parent, kind, key, path, to } => done(c.replace_file(
             &ferrocast_studio::MissingFile { source, parent, kind, key, label: String::new(), path },
             &to,
@@ -551,7 +574,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::Select { .. } | A::Undo | A::Redo | A::History => Ok(Value::Null),
         A::Web { name, what } => done(c.web(&name, web_act(what))),
         // Handled in `act`, which knows where recordings go.
-        A::Screenshot { .. } => Ok(Value::Null),
+        A::Screenshot { .. } | A::ScreenshotProgram => Ok(Value::Null),
         A::EditFilter { name, filter, edit } => done(match edit {
             FilterEdit::Enable => c.set_filter_enabled(&name, &filter, true),
             FilterEdit::Disable => c.set_filter_enabled(&name, &filter, false),
@@ -850,7 +873,7 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
-            if let StudioAct::Screenshot { name } = &act {
+            if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
                 // Next to the recordings, as OBS does.
                 let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
                 let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -863,7 +886,11 @@ impl StudioHost for DesktopStudio {
                     path = folder.join(format!("Screenshot {stamp} ({n}).png"));
                     n += 1;
                 }
-                c.screenshot(name, &path).map_err(|e| e.to_string())?;
+                match &act {
+                    StudioAct::Screenshot { name } => c.screenshot(name, &path),
+                    _ => c.screenshot_program(&path),
+                }
+                .map_err(|e| e.to_string())?;
                 return Ok(json!({ "file": path.display().to_string() }));
             }
             if let StudioAct::Select { scene, id } = &act {
