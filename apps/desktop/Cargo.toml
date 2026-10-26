@@ -13,6 +13,11 @@ default-run = "ferrocast"
 name = "ferrocast"
 path = "src/main.rs"
 
+# Stands in for OBS's mux helper next to Ferrocast (MKV, FLV, TS recordings); bundled beside it.
+[[bin]]
+name = "obs-ffmpeg-mux"
+path = "src/bin/obs-ffmpeg-mux.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
