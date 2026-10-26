@@ -91,10 +91,9 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
 
 ### Transitions
 - [x] P1 Cut, fade, swipe, slide, fade to color, luma wipe, stinger (video, transition point,
-  audio fade style, track matte), duration, per-scene override (26 Oct). Quick transitions
-  still to come.
-- [ ] P2 Studio mode: preview/program, transition button, T-bar, swap, duplicate scene,
-  "Transition on double click". *Better: our motion themes ship matching stingers.*
+  audio fade style, track matte), duration, per-scene override, quick transitions (26 Oct).
+- [x] P2 Studio mode: preview/program, transition button, quick transitions (26 Oct). T-bar,
+  swap, duplicate scene and "Transition on double click" still to come. *Better: our motion themes ship matching stingers.*
 
 ### Streaming
 - ✅ Multistream to Twitch, YouTube, Kick and custom servers, health, reconnects, upload check,
