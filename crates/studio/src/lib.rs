@@ -157,6 +157,12 @@ pub struct OptionInfo {
     pub values: Vec<serde_json::Value>,
     /// A group's own options.
     pub group: Vec<OptionInfo>,
+    /// A path's kind: "file", "save" or "folder"; an editable list's: "files" (files, or
+    /// files and addresses) or "" (plain text, as for anything else).
+    pub path: &'static str,
+    /// The file types of a path or a list of files, as OBS writes them
+    /// ("Image Files (*.png *.jpg);;All Files (*.*)").
+    pub filter: String,
 }
 
 fn kind_name(t: c_int) -> &'static str {
@@ -518,7 +524,23 @@ impl Studio {
             } else {
                 Vec::new()
             };
+            let (path, filter) = if kind == "path" {
+                let t = match a.obs_property_path_type(p) {
+                    1 => "save",
+                    2 => "folder",
+                    _ => "file",
+                };
+                (t, text(a.obs_property_path_filter(p)))
+            } else if kind == "editable_list" {
+                // OBS_EDITABLE_LIST_TYPE_STRINGS is 0; FILES and FILES_AND_URLS take files.
+                let t = if a.obs_property_editable_list_type(p) == 0 { "" } else { "files" };
+                (t, text(a.obs_property_editable_list_filter(p)))
+            } else {
+                ("", String::new())
+            };
             out.push(OptionInfo {
+                path,
+                filter,
                 key: text(a.obs_property_name(p)),
                 label: text(a.obs_property_description(p)),
                 kind,
@@ -747,8 +769,11 @@ impl Studio {
                 view.remove();
                 return Err(StudioError::Failed("the preview couldn't be made".into()));
             }
-            let state =
-                Box::new(ffi::DrawState { api: &self.inner.api, base: (self.canvas().width, self.canvas().height) });
+            let state = Box::new(ffi::DrawState {
+                api: &self.inner.api,
+                base: (self.canvas().width, self.canvas().height),
+                selected: std::sync::Mutex::new(None),
+            });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
             Ok(Preview { studio: self.clone(), display, state, view, scale })
@@ -786,6 +811,14 @@ impl Preview {
         self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
         let (cx, cy) = px(rect, scale);
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
+    }
+
+    /// Outlines item `id` of `scene` with handles (as OBS marks the picked source), or nothing.
+    pub fn select(&self, pick: Option<(&str, i64)>) {
+        let pick = pick.map(|(scene, id)| (cstr(scene), id));
+        if let Ok(mut sel) = self.state.selected.lock() {
+            *sel = pick;
+        }
     }
 }
 
@@ -828,6 +861,31 @@ pub struct SourceInfo {
 }
 
 /// A source name: 1 to 100 letters on one line (OBS's own names stay unique per scene).
+/// This app may record the screen (macOS's Screen Recording switch; always true elsewhere).
+/// macOS answers for the app as it started: a change shows only after a restart.
+pub fn screen_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::mac::screen_access()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Asks macOS for screen recording (its prompt, and Ferrocast listed in System Settings).
+pub fn request_screen_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::mac::request_screen_access()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 pub fn check_name(name: &str) -> Result<(), StudioError> {
     let n = name.chars().count();
     if n == 0 || n > 100 || name.trim() != name || name.chars().any(char::is_control) {

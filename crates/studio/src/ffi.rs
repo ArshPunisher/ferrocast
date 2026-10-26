@@ -126,6 +126,18 @@ pub const OBS_BOUNDS_SCALE_INNER: c_int = 2;
 pub const OBS_ALIGN_CENTER: u32 = 0;
 pub const OBS_ALIGN_LEFT: u32 = 1;
 pub const OBS_ALIGN_TOP: u32 = 1 << 2;
+pub const OBS_ALIGN_RIGHT: u32 = 1 << 1;
+pub const OBS_ALIGN_BOTTOM: u32 = 1 << 3;
+
+/// `struct obs_sceneitem_crop`, pixels off each side.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Crop {
+    pub left: c_int,
+    pub top: c_int,
+    pub right: c_int,
+    pub bottom: c_int,
+}
 /// `obs-source.h`: the kind makes sound.
 pub const OBS_SOURCE_AUDIO: u32 = 1 << 1;
 /// `enum obs_order_movement`.
@@ -293,6 +305,7 @@ api! {
     obs_sceneitem_get_scale: fn(a: *const ObsSceneItem, b: *mut Vec2);
     obs_sceneitem_set_scale: fn(a: *mut ObsSceneItem, b: *const Vec2);
     obs_sceneitem_get_rot: fn(a: *const ObsSceneItem) -> f32;
+    obs_sceneitem_get_crop: fn(a: *const ObsSceneItem, b: *mut Crop);
     obs_sceneitem_set_rot: fn(a: *mut ObsSceneItem, b: f32);
     obs_sceneitem_get_alignment: fn(a: *const ObsSceneItem) -> u32;
     obs_sceneitem_get_bounds_type: fn(a: *const ObsSceneItem) -> c_int;
@@ -450,6 +463,18 @@ api! {
     gs_effect_get_param_by_name: fn(a: *const GsEffect, b: *const c_char) -> *mut GsEparam;
     gs_effect_set_texture: fn(a: *mut GsEparam, b: *mut GsTexture);
     gs_draw_sprite: fn(a: *mut GsTexture, b: u32, c: u32, d: u32);
+    gs_matrix_push: fn();
+    gs_matrix_pop: fn();
+    gs_matrix_translate3f: fn(a: f32, b: f32, c: f32);
+    gs_matrix_rotaa4f: fn(a: f32, b: f32, c: f32, d: f32);
+    gs_matrix_scale3f: fn(a: f32, b: f32, c: f32);
+    gs_effect_loop: fn(a: *mut GsEffect, b: *const c_char) -> bool;
+    gs_effect_set_vec4: fn(a: *mut GsEparam, b: *const Vec4);
+    obs_get_base_effect: fn(a: c_int) -> *mut GsEffect;
+    obs_property_path_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_path_filter: fn(a: *mut ObsProperty) -> *const c_char;
+    obs_property_editable_list_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_editable_list_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_enter_graphics: fn();
     obs_leave_graphics: fn();
 }
@@ -659,6 +684,96 @@ pub(crate) unsafe extern "C" fn store_level(param: *mut c_void, mag: *const f32,
 pub(crate) struct DrawState {
     pub api: *const Api,
     pub base: (u32, u32),
+    /// The item picked in the preview (its scene's name and its id), outlined with handles.
+    pub selected: std::sync::Mutex<Option<(std::ffi::CString, i64)>>,
+}
+
+/// What `find_box` looks for and found.
+struct FindBox<'a> {
+    api: &'a Api,
+    id: i64,
+    found: Option<Matrix4>,
+}
+
+/// Finds a visible item's box while libobs holds the scene's lock (the main thread may be
+/// changing the scene; the items are only read here, inside the enum call).
+unsafe extern "C" fn find_box(_s: *mut ObsScene, item: *mut ObsSceneItem, param: *mut c_void) -> bool {
+    // SAFETY: `param` is the `&mut FindBox` item_box passes for this synchronous enum call.
+    let f = unsafe { &mut *(param as *mut FindBox) };
+    if f.api.obs_sceneitem_get_id(item) != f.id {
+        return true;
+    }
+    if f.api.obs_sceneitem_visible(item) {
+        let mut m = Matrix4::default();
+        f.api.obs_sceneitem_get_box_transform(item, &mut m);
+        f.found = Some(m);
+    }
+    false
+}
+
+/// The box of item `id` in scene `scene` (canvas pixels), if it's there and showing.
+fn item_box(api: &Api, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
+    let src = api.obs_get_source_by_name(scene.as_ptr());
+    if src.is_null() {
+        return None;
+    }
+    let sc = api.obs_scene_from_source(src);
+    let mut f = FindBox { api, id, found: None };
+    if !sc.is_null() {
+        api.obs_scene_enum_items(sc, find_box, &mut f as *mut FindBox as *mut c_void);
+    }
+    api.obs_source_release(src);
+    f.found
+}
+
+/// `enum obs_base_effect` OBS_EFFECT_SOLID.
+const OBS_EFFECT_SOLID: c_int = 3;
+
+/// Draws `m`'s box (a unit square mapped onto the canvas) as OBS's preview does: an outline
+/// and eight handles. `px` is one screen pixel in canvas units.
+fn draw_selection(api: &Api, m: &Matrix4, px: f32) {
+    let effect = api.obs_get_base_effect(OBS_EFFECT_SOLID);
+    if effect.is_null() {
+        return;
+    }
+    let color = api.gs_effect_get_param_by_name(effect, c"color".as_ptr());
+    let at = |u: f32, v: f32| (m.x.x * u + m.y.x * v + m.t.x, m.x.y * u + m.y.y * v + m.t.y);
+    // A filled quad from (x, y) along angle `a` (radians), `len` long and `thick` wide,
+    // centred on that line. The colour is set for each: ending the effect's technique
+    // puts its parameters back to their defaults (white).
+    let quad = |c: &Vec4, x: f32, y: f32, a: f32, len: f32, thick: f32| {
+        api.gs_effect_set_vec4(color, c);
+        api.gs_matrix_push();
+        api.gs_matrix_translate3f(x, y, 0.0);
+        api.gs_matrix_rotaa4f(0.0, 0.0, 1.0, a);
+        api.gs_matrix_translate3f(0.0, -thick / 2.0, 0.0);
+        api.gs_matrix_scale3f(len, thick, 1.0);
+        while api.gs_effect_loop(effect, c"Solid".as_ptr()) {
+            api.gs_draw_sprite(std::ptr::null_mut(), 0, 1, 1);
+        }
+        api.gs_matrix_pop();
+    };
+    let corners = [at(0.0, 0.0), at(1.0, 0.0), at(1.0, 1.0), at(0.0, 1.0)];
+    // Ferrocast's orange, #ff5a1f.
+    let orange = Vec4 { x: 1.0, y: 0.353, z: 0.122, w: 1.0 };
+    let white = Vec4 { x: 1.0, y: 1.0, z: 1.0, w: 1.0 };
+    for i in 0..4 {
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 0.0 {
+            quad(&orange, a.0, a.1, dy.atan2(dx), len, 2.0 * px);
+        }
+    }
+    // Handles: white squares with an orange rim, at the corners and the middle of each side.
+    let handles = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.0, 0.5)];
+    for (size, c) in [(10.0, &orange), (6.0, &white)] {
+        for (u, v) in handles {
+            let (x, y) = at(u, v);
+            let s = size * px;
+            quad(c, x - s / 2.0, y, 0.0, s, s);
+        }
+    }
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -678,6 +793,12 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     api.gs_ortho(0.0, bw, 0.0, bh, -100.0, 100.0);
     api.gs_set_viewport(x, y, w, h);
     api.obs_render_main_texture();
+    if let Ok(sel) = st.selected.lock()
+        && let Some((scene, id)) = sel.as_ref()
+        && let Some(m) = item_box(api, scene, *id)
+    {
+        draw_selection(api, &m, 1.0 / scale.max(1e-6));
+    }
     api.gs_projection_pop();
     api.gs_viewport_pop();
 }
@@ -688,9 +809,26 @@ pub(crate) mod mac {
     use std::ffi::c_void;
 
     use objc2::rc::Retained;
-    use objc2::{MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSResponder, NSView};
+    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
+
+    define_class!(
+        // SAFETY: NSView allows subclassing; PassView adds no ivars and doesn't implement Drop.
+        #[unsafe(super(NSView, NSResponder, NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastPreviewView"]
+        struct PassView;
+
+        impl PassView {
+            /// Clicks go through to the page under it, which handles picking, moving and
+            /// resizing sources (the picture is drawn here, the page only listens).
+            #[unsafe(method(hitTest:))]
+            fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+                std::ptr::null_mut()
+            }
+        }
+    );
 
     /// A child view of the window's content, in top-left coordinates like the web page.
     #[derive(Debug)]
@@ -739,7 +877,11 @@ pub(crate) mod mac {
         // SAFETY: `parent` is the live NSView from the window toolkit's raw handle (Tauri/tao),
         // used on the main thread while that window exists.
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
-        let view = NSView::initWithFrame(NSView::alloc(mtm), frame(parent, None, x, y, w, h, vh));
+        let pass = PassView::alloc(mtm).set_ivars(());
+        // SAFETY: NSView's designated initialiser on a freshly allocated PassView.
+        let view: Retained<PassView> =
+            unsafe { msg_send![super(pass), initWithFrame: frame(parent, None, x, y, w, h, vh)] };
+        let view: Retained<NSView> = Retained::into_super(view);
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
         // AppKit would keep it from the bottom and slide it over the page above (2.1 test).
@@ -748,6 +890,26 @@ pub(crate) mod mac {
         }
         parent.addSubview(&view);
         Some(ChildView { view })
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    /// macOS lets this app record the screen (as it was when the app started: macOS applies a
+    /// change only after a restart).
+    pub fn screen_access() -> bool {
+        // SAFETY: a plain CoreGraphics query with no arguments, callable from any thread.
+        unsafe { CGPreflightScreenCaptureAccess() }
+    }
+
+    /// Asks for screen recording: macOS shows its prompt (once) and lists the app in System
+    /// Settings. True if it's already allowed.
+    pub fn request_screen_access() -> bool {
+        // SAFETY: as above; it only shows the system's prompt.
+        unsafe { CGRequestScreenCaptureAccess() }
     }
 
     impl ChildView {

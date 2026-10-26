@@ -47,13 +47,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(tone_item.audio, "a media file makes sound");
     c.add_existing("Just chatting", "Background")?;
-    c.add_source(
+    let blue = c.add_source(
         "Just chatting",
         "color_source_v3",
         "Box",
         &json!({ "color": 0xFF_00_A0_FFu32, "width": 400, "height": 300 }),
         false,
     )?;
+    // Moved and sized from the preview: a plain item by its scale, keeping a flip and a turn;
+    // one with a bounding box (Stretch) by that box. Each frame matches what libobs draws.
+    let same = |a: [f32; 6], b: [f32; 6]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.05);
+    let drawn = |want: [f32; 6]| -> Result<(), Box<dyn std::error::Error>> {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let got = c.drawn_frame("Just chatting", blue.id)?;
+        assert!(same(got, want), "libobs drew {got:?}, Ferrocast said {want:?}");
+        Ok(())
+    };
+    assert_eq!(blue.frame, [400.0, 0.0, 0.0, 300.0, 0.0, 0.0], "a new item sits at the top left");
+    let f = c.set_item_box("Just chatting", blue.id, 100.0, 50.0, 800.0, 600.0)?.frame;
+    assert!(same(f, [800.0, 0.0, 0.0, 600.0, 100.0, 50.0]), "moved and twice the size: {f:?}");
+    drawn(f)?;
+    c.edit_item("Just chatting", blue.id, ItemEdit::FlipH)?;
+    c.edit_item("Just chatting", blue.id, ItemEdit::RotateCw)?;
+    let turned = c.items("Just chatting")?.into_iter().find(|i| i.id == blue.id).ok_or("box")?.frame;
+    drawn(turned)?;
+    let f = c.set_item_box("Just chatting", blue.id, 900.0, 50.0, 400.0, 300.0)?.frame;
+    assert!(same([f[4], f[5], f[0].hypot(f[1]), f[2].hypot(f[3]), 0.0, 0.0], [900.0, 50.0, 400.0, 300.0, 0.0, 0.0]));
+    drawn(f)?;
+    c.edit_item("Just chatting", blue.id, ItemEdit::Stretch)?;
+    let f = c.set_item_box("Just chatting", blue.id, 10.0, 20.0, 960.0, 540.0)?.frame;
+    assert!(same(f, [960.0, 0.0, 0.0, 540.0, 10.0, 20.0]), "the bounding box changed: {f:?}");
+    drawn(f)?;
+    assert!(c.set_item_box("Just chatting", blue.id, 0.0, 0.0, 0.0, 10.0).is_err(), "no zero sizes");
+    c.edit_item("Just chatting", blue.id, ItemEdit::Reset)?;
     c.edit_item("Gameplay", title.id, ItemEdit::Lock)?;
     c.edit_item("Gameplay", title.id, ItemEdit::Bottom)?;
     c.edit_item("Gameplay", title.id, ItemEdit::Top)?;
@@ -99,6 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(c);
 
     let back = Collection::load(&studio, &saved, "Scene")?;
+    // A text's size is known once it has drawn.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let after = (
         back.scenes(),
         back.items("Gameplay")?,

@@ -51,7 +51,7 @@ const TRANSITION_NAMES: [(&str, &str); 6] = [
 ];
 
 /// A source in a scene, top first. A group lists its own items.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ItemInfo {
     /// The item's id in its scene (stable while it's there).
     pub id: i64,
@@ -66,6 +66,10 @@ pub struct ItemInfo {
     pub blend: String,
     /// How it's scaled: one of [`SCALE_FILTERS`].
     pub scale_filter: String,
+    /// Where it is on the canvas, in pixels: its box's two sides and its first corner,
+    /// `[side_x.x, side_x.y, side_y.x, side_y.y, corner.x, corner.y]` (a point (u, v) of the
+    /// box, each 0 to 1, is at `corner + u * side_x + v * side_y`). In a group, inside it.
+    pub frame: [f32; 6],
     pub children: Vec<ItemInfo>,
 }
 
@@ -578,6 +582,7 @@ impl Collection {
                 .get(usize::try_from(a.obs_sceneitem_get_scale_filter(item)).unwrap_or(0))
                 .unwrap_or(&SCALE_FILTERS[0])
                 .to_string(),
+            frame: self.place(item).frame(),
             children: if group {
                 self.group_items(item).into_iter().rev().map(|i| self.info(i)).collect()
             } else {
@@ -810,6 +815,64 @@ impl Collection {
             ItemEdit::ScaleArea => a.obs_sceneitem_set_scale_filter(item, 5),
         }
         Ok(())
+    }
+
+    /// What decides where an item is (libobs works its box out only on the next frame).
+    fn place(&self, item: *mut ffi::ObsSceneItem) -> Place {
+        let a = self.api();
+        let src = a.obs_sceneitem_get_source(item);
+        let (mut pos, mut scale, mut bounds) =
+            (ffi::Vec2 { x: 0.0, y: 0.0 }, ffi::Vec2 { x: 1.0, y: 1.0 }, ffi::Vec2 { x: 0.0, y: 0.0 });
+        let mut crop = ffi::Crop::default();
+        a.obs_sceneitem_get_pos(item, &mut pos);
+        a.obs_sceneitem_get_scale(item, &mut scale);
+        a.obs_sceneitem_get_bounds(item, &mut bounds);
+        a.obs_sceneitem_get_crop(item, &mut crop);
+        let cut = |size: u32, x: c_int, y: c_int| {
+            let c = u32::try_from(x.max(0)).unwrap_or(0).saturating_add(u32::try_from(y.max(0)).unwrap_or(0));
+            if c > size { 2 } else { size - c }
+        };
+        Place {
+            pos: (pos.x, pos.y),
+            scale: (scale.x, scale.y),
+            rot: a.obs_sceneitem_get_rot(item),
+            align: a.obs_sceneitem_get_alignment(item),
+            bounds: (a.obs_sceneitem_get_bounds_type(item) != ffi::OBS_BOUNDS_NONE).then_some((bounds.x, bounds.y)),
+            size: (
+                cut(a.obs_source_get_width(src), crop.left, crop.right),
+                cut(a.obs_source_get_height(src), crop.top, crop.bottom),
+            ),
+        }
+    }
+
+    /// The item's box as libobs last worked it out (on a frame), to check [`ItemInfo::frame`].
+    #[doc(hidden)]
+    pub fn drawn_frame(&self, scene: &str, id: i64) -> Result<[f32; 6], StudioError> {
+        let item = self.item(scene, id)?;
+        let mut m = ffi::Matrix4::default();
+        self.api().obs_sceneitem_get_box_transform(item, &mut m);
+        Ok([m.x.x, m.x.y, m.y.x, m.y.y, m.t.x, m.t.y])
+    }
+
+    /// Moves and sizes an item from the preview: its box's first corner goes to (`x`, `y`)
+    /// and its sides become `w` and `h` long (canvas pixels), keeping its turn and flips. A
+    /// box set by OBS's "bounding box" changes that box, anything else its scale (as OBS's
+    /// own preview does). Returns it as it is now.
+    pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
+        const MAX: f32 = 100_000.0;
+        if ![x, y, w, h].iter().all(|v| v.is_finite() && v.abs() <= MAX) || w < 1.0 || h < 1.0 {
+            return Err(StudioError::Failed("That size or place is off the canvas.".into()));
+        }
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        let next = self.place(item).with_box(x, y, w, h);
+        if next.bounds.is_some() {
+            a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: next.box_size().0, y: next.box_size().1 });
+        } else {
+            a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: next.scale.0, y: next.scale.1 });
+        }
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: next.pos.0, y: next.pos.1 });
+        Ok(self.info(item))
     }
 
     /// Every source in a scene (groups included), with the scenes it's in, in scene order.
@@ -1382,5 +1445,126 @@ impl Drop for Collection {
         if !t.is_null() {
             a.obs_source_release(t);
         }
+    }
+}
+/// Where an item is, as libobs works out its box (`update_item_transform` in obs-scene.c):
+/// the box is `bounds` (or the cropped source size times `scale`), its `align` point is at
+/// `pos`, turned `rot` degrees about it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Place {
+    pub pos: (f32, f32),
+    pub scale: (f32, f32),
+    pub rot: f32,
+    pub align: u32,
+    pub bounds: Option<(f32, f32)>,
+    /// The source's size after cropping.
+    pub size: (u32, u32),
+}
+
+impl Place {
+    fn box_size(&self) -> (f32, f32) {
+        self.bounds.unwrap_or((self.size.0 as f32 * self.scale.0, self.size.1 as f32 * self.scale.1))
+    }
+
+    /// The box's align point from its first corner (libobs rounds toward zero, as here).
+    fn origin(&self) -> (f32, f32) {
+        let (w, h) = self.box_size();
+        let (w, h) = (w as i32, h as i32);
+        let x = if self.align & ffi::OBS_ALIGN_RIGHT != 0 {
+            w as f32
+        } else if self.align & ffi::OBS_ALIGN_LEFT == 0 {
+            (w / 2) as f32
+        } else {
+            0.0
+        };
+        let y = if self.align & ffi::OBS_ALIGN_BOTTOM != 0 {
+            h as f32
+        } else if self.align & ffi::OBS_ALIGN_TOP == 0 {
+            (h / 2) as f32
+        } else {
+            0.0
+        };
+        (x, y)
+    }
+
+    fn turn(&self, (x, y): (f32, f32)) -> (f32, f32) {
+        let (s, c) = self.rot.to_radians().sin_cos();
+        (x * c - y * s, x * s + y * c)
+    }
+
+    /// `[side_x, side_y, corner]` as in [`ItemInfo::frame`].
+    pub fn frame(&self) -> [f32; 6] {
+        let (w, h) = self.box_size();
+        let u = self.turn((w, 0.0));
+        let v = self.turn((0.0, h));
+        let o = self.turn(self.origin());
+        [u.0, u.1, v.0, v.1, self.pos.0 - o.0, self.pos.1 - o.1]
+    }
+
+    /// The same item with its box's first corner at (`x`, `y`) and sides `w` and `h` long.
+    /// The scale keeps its sign (a flip stays); a source with no size yet only moves.
+    pub fn with_box(&self, x: f32, y: f32, w: f32, h: f32) -> Place {
+        let mut p = *self;
+        if p.bounds.is_some() {
+            p.bounds = Some((w, h));
+        } else {
+            if p.size.0 > 0 {
+                p.scale.0 = w / p.size.0 as f32 * if p.scale.0 < 0.0 { -1.0 } else { 1.0 };
+            }
+            if p.size.1 > 0 {
+                p.scale.1 = h / p.size.1 as f32 * if p.scale.1 < 0.0 { -1.0 } else { 1.0 };
+            }
+        }
+        let o = p.turn(p.origin());
+        p.pos = (x + o.0, y + o.1);
+        p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain() -> Place {
+        Place { pos: (0.0, 0.0), scale: (1.0, 1.0), rot: 0.0, align: 5, bounds: None, size: (400, 300) }
+    }
+
+    fn close(a: [f32; 6], b: [f32; 6]) {
+        assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01), "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn boxes_come_out_as_libobs_works_them_out() {
+        close(plain().frame(), [400.0, 0.0, 0.0, 300.0, 0.0, 0.0]);
+        // Centred anchor (a flip or turn put it there), flipped across.
+        let flipped = Place { pos: (500.0, 200.0), scale: (-2.0, 1.0), align: 0, ..plain() };
+        close(flipped.frame(), [-800.0, 0.0, 0.0, 300.0, 900.0, 50.0]);
+        // A quarter turn about the centre.
+        let turned = Place { pos: (500.0, 200.0), rot: 90.0, align: 0, ..plain() };
+        close(turned.frame(), [0.0, 400.0, -300.0, 0.0, 650.0, 0.0]);
+        // A bounding box is the box, whatever the scale.
+        let bounded = Place { bounds: Some((1920.0, 1080.0)), scale: (3.0, 3.0), ..plain() };
+        close(bounded.frame(), [1920.0, 0.0, 0.0, 1080.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_new_box_lands_exactly_where_asked() {
+        for p in [
+            plain(),
+            Place { pos: (500.0, 200.0), scale: (-2.0, 1.0), align: 0, ..plain() },
+            Place { pos: (500.0, 200.0), rot: 30.0, align: 10, ..plain() },
+            Place { bounds: Some((1920.0, 1080.0)), ..plain() },
+        ] {
+            let f = p.with_box(100.0, 50.0, 640.0, 360.0).frame();
+            let (lu, lv) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            assert!((lu - 640.0).abs() < 0.01 && (lv - 360.0).abs() < 0.01, "{p:?}: {f:?}");
+            close([f[4], f[5], 0.0, 0.0, 0.0, 0.0], [100.0, 50.0, 0.0, 0.0, 0.0, 0.0]);
+        }
+        // A flip stays a flip.
+        let f = Place { scale: (-1.0, 1.0), ..plain() }.with_box(0.0, 0.0, 200.0, 150.0);
+        assert_eq!(f.scale, (-0.5, 0.5));
+        // A source with no size yet only moves.
+        let empty = Place { size: (0, 0), ..plain() }.with_box(10.0, 20.0, 50.0, 50.0);
+        assert_eq!((empty.scale, empty.pos), ((1.0, 1.0), (10.0, 20.0)));
     }
 }
