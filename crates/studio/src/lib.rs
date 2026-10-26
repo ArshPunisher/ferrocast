@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
-    AudioInfo, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo, SourceUse,
-    TransitionInfo, WebAct,
+    AudioInfo, BOUNDS, CHANNEL_KEYS, Collection, FilterInfo, ItemEdit, ItemInfo, LevelInfo, Monitor, SceneInfo,
+    SourceUse, Transform, TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{ProjectorOf, Screen};

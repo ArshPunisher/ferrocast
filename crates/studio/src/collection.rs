@@ -73,6 +73,39 @@ pub struct ItemInfo {
     pub children: Vec<ItemInfo>,
 }
 
+/// `enum obs_bounds_type`, in order: none, stretch, fit inside (scale inner), fill (scale
+/// outer), to width, to height, shrink only (max only).
+pub const BOUNDS: [&str; 7] = ["none", "stretch", "fit", "fill", "width", "height", "max"];
+
+/// Everything OBS's Edit Transform dialog shows for an item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    /// Where its alignment point is on the canvas.
+    pub x: f32,
+    pub y: f32,
+    /// Degrees, clockwise.
+    pub rotation: f32,
+    pub scale_x: f32,
+    pub scale_y: f32,
+    /// Which point of it sits at (x, y): OBS's bits (0 the middle; 1 left, 2 right, 4 top,
+    /// 8 bottom).
+    pub alignment: u32,
+    /// One of [`BOUNDS`].
+    pub bounds: String,
+    pub bounds_alignment: u32,
+    pub bounds_width: f32,
+    pub bounds_height: f32,
+    pub crop_left: i32,
+    pub crop_top: i32,
+    pub crop_right: i32,
+    pub crop_bottom: i32,
+    /// The source's own size before cropping (only read).
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
 /// `enum obs_blending_type`, in order.
 pub const BLENDS: [&str; 7] = ["normal", "additive", "subtract", "screen", "multiply", "lighten", "darken"];
 
@@ -843,6 +876,63 @@ impl Collection {
                 cut(a.obs_source_get_height(src), crop.top, crop.bottom),
             ),
         }
+    }
+
+    /// An item's place, size, turn, bounding box and crop, as Edit Transform shows them.
+    pub fn transform(&self, scene: &str, id: i64) -> Result<Transform, StudioError> {
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        let (mut pos, mut scale, mut bounds) =
+            (ffi::Vec2 { x: 0.0, y: 0.0 }, ffi::Vec2 { x: 1.0, y: 1.0 }, ffi::Vec2 { x: 0.0, y: 0.0 });
+        let mut crop = ffi::Crop::default();
+        a.obs_sceneitem_get_pos(item, &mut pos);
+        a.obs_sceneitem_get_scale(item, &mut scale);
+        a.obs_sceneitem_get_bounds(item, &mut bounds);
+        a.obs_sceneitem_get_crop(item, &mut crop);
+        let src = a.obs_sceneitem_get_source(item);
+        Ok(Transform {
+            x: pos.x,
+            y: pos.y,
+            rotation: a.obs_sceneitem_get_rot(item),
+            scale_x: scale.x,
+            scale_y: scale.y,
+            alignment: a.obs_sceneitem_get_alignment(item),
+            bounds: BOUNDS
+                .get(usize::try_from(a.obs_sceneitem_get_bounds_type(item)).unwrap_or(0))
+                .unwrap_or(&BOUNDS[0])
+                .to_string(),
+            bounds_alignment: a.obs_sceneitem_get_bounds_alignment(item),
+            bounds_width: bounds.x,
+            bounds_height: bounds.y,
+            crop_left: crop.left,
+            crop_top: crop.top,
+            crop_right: crop.right,
+            crop_bottom: crop.bottom,
+            width: a.obs_source_get_width(src),
+            height: a.obs_source_get_height(src),
+        })
+    }
+
+    /// Sets all of an item's transform at once (its width and height are ignored) → the item.
+    pub fn set_transform(&self, scene: &str, id: i64, t: &Transform) -> Result<ItemInfo, StudioError> {
+        let bounds = BOUNDS
+            .iter()
+            .position(|b| *b == t.bounds)
+            .ok_or_else(|| StudioError::Failed(format!("\"{}\" isn't a kind of bounding box", t.bounds)))?;
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        a.obs_sceneitem_set_bounds_type(item, c_int::try_from(bounds).unwrap_or(0));
+        a.obs_sceneitem_set_bounds_alignment(item, t.bounds_alignment);
+        a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: t.bounds_width, y: t.bounds_height });
+        a.obs_sceneitem_set_crop(
+            item,
+            &ffi::Crop { left: t.crop_left, top: t.crop_top, right: t.crop_right, bottom: t.crop_bottom },
+        );
+        a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: t.scale_x, y: t.scale_y });
+        a.obs_sceneitem_set_rot(item, t.rotation.rem_euclid(360.0));
+        a.obs_sceneitem_set_alignment(item, t.alignment);
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: t.x, y: t.y });
+        Ok(self.info(item))
     }
 
     /// The item's box as libobs last worked it out (on a frame), to check [`ItemInfo::frame`].
