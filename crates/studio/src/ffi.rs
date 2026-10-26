@@ -513,6 +513,8 @@ api! {
     obs_output_set_media: fn(a: *mut ObsOutput, b: *mut VideoT, c: *mut AudioT);
     obs_encoder_defaults: fn(a: *const c_char) -> *mut ObsData;
     obs_volmeter_create: fn(a: c_int) -> *mut ObsVolmeter;
+    obs_volmeter_set_peak_meter_type: fn(a: *mut ObsVolmeter, b: c_int);
+    obs_source_audio_active: fn(a: *const ObsSource) -> bool;
     obs_volmeter_destroy: fn(a: *mut ObsVolmeter);
     obs_volmeter_attach_source: fn(a: *mut ObsVolmeter, b: *mut ObsSource) -> bool;
     obs_volmeter_add_callback: fn(a: *mut ObsVolmeter, b: VolmeterCb, c: *mut c_void);

@@ -331,6 +331,8 @@ pub struct AudioInfo {
     pub mono: bool,
     /// The audio tracks (1 to 6) it's mixed into.
     pub tracks: Vec<u8>,
+    /// Making sound now (OBS's "active": a playing file, an open device).
+    pub active: bool,
 }
 
 /// A source and the scenes it's in.
@@ -448,6 +450,8 @@ pub struct Collection {
     /// Play or pause asked for lately, by source: libobs applies it on the next frame, so a
     /// second press before then must not read the old state.
     media_intent: RefCell<HashMap<String, (bool, std::time::Instant)>>,
+    /// Meters read true peak (between samples) instead of sample peak.
+    true_peak: RefCell<bool>,
     /// Studio Mode's preview scene (one of `scenes`), or null when Studio Mode is off.
     preview: RefCell<*mut ffi::ObsSource>,
     /// OBS's quick transitions: one-click ways to send the preview on air.
@@ -535,6 +539,7 @@ impl Collection {
             black: RefCell::new(None),
             by_hand: RefCell::new(false),
             media_intent: RefCell::new(HashMap::new()),
+            true_peak: RefCell::new(false),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -2215,6 +2220,7 @@ impl Collection {
             sync_ms: a.obs_source_get_sync_offset(src) / 1_000_000,
             mono: a.obs_source_get_flags(src) & ffi::OBS_SOURCE_FLAG_FORCE_MONO != 0,
             tracks: tracks_of(a.obs_source_get_audio_mixers(src)),
+            active: a.obs_source_audio_active(src),
         }
     }
 
@@ -2383,6 +2389,16 @@ impl Collection {
         Ok(())
     }
 
+    /// Meters read true peak (OBS's "True Peak", catching peaks between samples) or sample
+    /// peak (lighter).
+    pub fn set_true_peak(&self, on: bool) {
+        self.true_peak.replace(on);
+        let a = self.api();
+        for m in self.meters.borrow().values() {
+            a.obs_volmeter_set_peak_meter_type(m.vm, c_int::from(on));
+        }
+    }
+
     /// The levels of these sounds now. Meters are made for new names and dropped for names
     /// no longer asked about.
     pub fn levels(&self, names: &[String]) -> HashMap<String, LevelInfo> {
@@ -2398,6 +2414,8 @@ impl Collection {
                 if vm.is_null() {
                     continue;
                 }
+                // enum obs_peak_meter_type: 0 sample peak, 1 true peak.
+                a.obs_volmeter_set_peak_meter_type(vm, c_int::from(*self.true_peak.borrow()));
                 let m = Meter {
                     studio: self.studio.clone(),
                     vm,

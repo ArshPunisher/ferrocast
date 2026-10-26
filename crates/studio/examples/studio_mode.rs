@@ -138,6 +138,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(c.media_state("Tone")?.duration_ms > 9_000, "a 10 s file");
     assert!(c.media_state("Box").is_err(), "a colour has no media controls");
     assert!(c.items("Next")?.iter().any(|i| i.name == "Tone" && i.media));
+    // A playing file is "active"; true-peak meters still read levels.
+    assert!(c.audio_of("Tone")?.active, "the tone is making sound");
+    c.set_true_peak(true);
+    let _ = c.levels(&["Tone".to_string()]);
+    std::thread::sleep(Duration::from_millis(400));
+    let lv = c.levels(&["Tone".to_string()]);
+    assert!(lv.get("Tone").is_some_and(|l| l.peak[0] > -60.0), "true peak reads the tone: {lv:?}");
+    c.set_true_peak(false);
 
     // Show and hide transitions, and deinterlacing (video from a file only).
     c.set_item_transition("Next", box_id, true, Some(&TransitionInfo { kind: "fade_transition".into(), ms: 700 }))?;
