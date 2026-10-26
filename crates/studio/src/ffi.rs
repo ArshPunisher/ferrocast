@@ -8,11 +8,33 @@ use std::path::Path;
 
 use libloading::Library;
 
+/// libobs's `calldata_t`: arguments for a procedure (here always on our own stack, `fixed`).
+#[repr(C)]
+pub struct CallData {
+    pub stack: *mut u8,
+    pub size: usize,
+    pub capacity: usize,
+    pub fixed: bool,
+}
+
+impl CallData {
+    /// As `calldata_init_fixed`: on `stack`, empty (its first word, zeroed, ends the list).
+    pub fn fixed(stack: &mut [u8]) -> CallData {
+        stack.iter_mut().take(std::mem::size_of::<usize>()).for_each(|b| *b = 0);
+        CallData { stack: stack.as_mut_ptr(), size: std::mem::size_of::<usize>(), capacity: stack.len(), fixed: true }
+    }
+}
+
+/// `media_remux_progress_callback`: percent done → keep going.
+pub type RemuxCb = unsafe extern "C" fn(*mut c_void, f32) -> bool;
+
 /// Opaque libobs objects.
 macro_rules! opaque {
     ($($n:ident),*) => { $( #[repr(C)] pub struct $n { _p: [u8; 0] } )* };
 }
 opaque!(
+    ProcHandler,
+    RemuxJob,
     ObsSource,
     ObsScene,
     ObsSceneItem,
@@ -457,6 +479,18 @@ api! {
     obs_transition_set_manual_time: fn(a: *mut ObsSource, b: f32);
     obs_transition_set_manual_torque: fn(a: *mut ObsSource, b: f32, c: f32);
     obs_transition_get_time: fn(a: *mut ObsSource) -> f32;
+    os_generate_formatted_filename: fn(a: *const c_char, b: bool, c: *const c_char) -> *mut c_char;
+    bfree: fn(a: *mut c_void);
+    obs_output_get_proc_handler: fn(a: *const ObsOutput) -> *mut ProcHandler;
+    proc_handler_call: fn(a: *mut ProcHandler, b: *const c_char, c: *mut CallData) -> bool;
+    calldata_set_data: fn(a: *mut CallData, b: *const c_char, c: *const c_void, d: usize);
+    calldata_get_data: fn(a: *const CallData, b: *const c_char, c: *mut c_void, d: usize) -> bool;
+    media_remux_job_create: fn(a: *mut *mut RemuxJob, b: *const c_char, c: *const c_char) -> bool;
+    media_remux_job_process: fn(a: *mut RemuxJob, b: Option<RemuxCb>, c: *mut c_void) -> bool;
+    media_remux_job_destroy: fn(a: *mut RemuxJob);
+    obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
+    obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
+    obs_encoder_defaults: fn(a: *const c_char) -> *mut ObsData;
     obs_volmeter_create: fn(a: c_int) -> *mut ObsVolmeter;
     obs_volmeter_destroy: fn(a: *mut ObsVolmeter);
     obs_volmeter_attach_source: fn(a: *mut ObsVolmeter, b: *mut ObsSource) -> bool;
@@ -670,6 +704,57 @@ pub(crate) unsafe extern "C" fn keep_scenes(param: *mut c_void, source: *mut Obs
             ctx.scenes.push(r);
         }
     }
+}
+
+/// libobs's remux functions, copied out so a remux can run on another thread (they touch no
+/// libobs state; libobs stays loaded while Ferrocast runs).
+#[derive(Clone, Copy)]
+pub(crate) struct RemuxFns {
+    create: unsafe extern "C" fn(*mut *mut RemuxJob, *const c_char, *const c_char) -> bool,
+    process: unsafe extern "C" fn(*mut RemuxJob, Option<RemuxCb>, *mut c_void) -> bool,
+    destroy: unsafe extern "C" fn(*mut RemuxJob),
+}
+
+impl std::fmt::Debug for RemuxFns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RemuxFns")
+    }
+}
+
+impl Api {
+    pub(crate) fn remux_fns(&self) -> RemuxFns {
+        RemuxFns {
+            create: self.fns.media_remux_job_create,
+            process: self.fns.media_remux_job_process,
+            destroy: self.fns.media_remux_job_destroy,
+        }
+    }
+}
+
+impl RemuxFns {
+    /// Remuxes `from` into `to` → whether it got to the end.
+    pub(crate) fn run(&self, from: &CStr, to: &CStr, progress: &mut dyn FnMut(f32) -> bool) -> Result<bool, ()> {
+        let mut job: *mut RemuxJob = std::ptr::null_mut();
+        // SAFETY: the pointers are libobs's own exports, valid while libobs is loaded (for
+        // the process's life); the strings outlive the calls; `job` is destroyed once.
+        unsafe {
+            if !(self.create)(&mut job, from.as_ptr(), to.as_ptr()) || job.is_null() {
+                return Err(());
+            }
+            let mut f: &mut dyn FnMut(f32) -> bool = progress;
+            let ok = (self.process)(job, Some(remux_progress), &mut f as *mut _ as *mut c_void);
+            (self.destroy)(job);
+            Ok(ok)
+        }
+    }
+}
+
+/// `media_remux_job_process` callback: hands the percent done to the caller's closure.
+pub(crate) unsafe extern "C" fn remux_progress(data: *mut c_void, pct: f32) -> bool {
+    // SAFETY: `data` is the `&mut &mut dyn FnMut(f32) -> bool` lib.rs passes for the
+    // synchronous process call; it outlives the call.
+    let f = unsafe { &mut *(data as *mut &mut dyn FnMut(f32) -> bool) };
+    f(pct)
 }
 
 /// `obs_save_sources_filtered` callback: saves only the sources listed (those in use; a

@@ -461,6 +461,39 @@ impl Studio {
         Ok(out)
     }
 
+    /// An encoder's own options (OBS's Advanced output settings), as they look for
+    /// `settings` (some show or hide by what's chosen), and its defaults.
+    pub fn encoder_options(
+        &self,
+        id: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(Vec<OptionInfo>, serde_json::Value), StudioError> {
+        let a = &self.inner.api;
+        let k = cstr(id);
+        let defaults = a.obs_encoder_defaults(k.as_ptr());
+        if defaults.is_null() {
+            return Err(StudioError::Failed(format!("OBS has no encoder \"{id}\".")));
+        }
+        let json = cstr(&serde_json::Value::Object(settings.clone()).to_string());
+        let over = a.obs_data_create_from_json(json.as_ptr());
+        if !over.is_null() {
+            a.obs_data_apply(defaults, over);
+            a.obs_data_release(over);
+        }
+        let props = a.obs_get_encoder_properties(k.as_ptr());
+        let out = if props.is_null() {
+            Vec::new()
+        } else {
+            a.obs_properties_apply_settings(props, defaults);
+            let o = self.read_options(props);
+            a.obs_properties_destroy(props);
+            o
+        };
+        let values = serde_json::from_str(&text(a.obs_data_get_json_with_defaults(defaults))).unwrap_or_default();
+        a.obs_data_release(defaults);
+        Ok((out, values))
+    }
+
     /// A source's options; with `current`, as they look for its own settings (OBS shows or
     /// hides some options, and fills some lists, from what's chosen).
     fn source_options(&self, src: *mut ffi::ObsSource, current: bool) -> Vec<OptionInfo> {
@@ -597,35 +630,131 @@ impl Studio {
     }
 
     /// Starts recording what's on air to `path` (`.mp4` or `.mov`, OBS's own crash-safe hybrid
-    /// writers); video as `enc` says, AAC sound.
+    /// writers); video as `enc` says, AAC sound (track 1).
     pub fn record(&self, path: &Path, enc: &EncodeSettings) -> Result<Recording, StudioError> {
-        let a = &self.inner.api;
-        let (venc, aenc) = self.encoders(enc)?;
-        let settings = a.obs_data_create();
-        let (k, v) = (cstr("path"), cstr(&path.display().to_string()));
-        a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
-        // OBS's own hybrid writers: the file stays playable if the app or the Mac stops. (MKV
-        // needs OBS's separate mux program, which only runs next to OBS's own executable.)
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        let id = match ext.as_str() {
-            "mp4" => "mp4_output",
-            "mov" => "mov_output",
-            _ => {
-                a.obs_data_release(settings);
-                a.obs_encoder_release(venc);
-                a.obs_encoder_release(aenc);
-                return Err(StudioError::Failed("recordings are MP4 or MOV".into()));
-            }
+        if ext != "mp4" && ext != "mov" {
+            return Err(StudioError::Failed("recordings are MP4 or MOV".into()));
+        }
+        self.record_to(path, &RecordPlan { format: ext, encode: enc.clone(), ..RecordPlan::default() })
+    }
+
+    /// A recording's file name now, from OBS's name pattern (`%CCYY-%MM-%DD %hh-%mm-%ss`…), in
+    /// `plan.folder`; with " (2)", " (3)"… when a file of that name is there (unless it may be
+    /// overwritten).
+    pub fn record_path(&self, plan: &RecordPlan) -> PathBuf {
+        let a = &self.inner.api;
+        let (ext, fmt) = (cstr(plan.extension()), cstr(&plan.name));
+        let p = a.os_generate_formatted_filename(ext.as_ptr(), plan.spaces, fmt.as_ptr());
+        let name = if p.is_null() {
+            format!("Recording.{}", plan.extension())
+        } else {
+            let n = text(p);
+            a.bfree(p.cast());
+            n
         };
+        let first = plan.folder.join(&name);
+        if plan.overwrite || !first.exists() {
+            return first;
+        }
+        let stem = first.file_stem().and_then(|s| s.to_str()).unwrap_or("Recording").to_string();
+        let gap = if plan.spaces { " " } else { "_" };
+        (2..)
+            .map(|n| plan.folder.join(format!("{stem}{gap}({n}).{}", plan.extension())))
+            .find(|p| !p.exists())
+            .unwrap_or(first)
+    }
+
+    /// Whether OBS's mux helper sits next to this program (MKV, FLV, TS and fragmented
+    /// MP4/MOV recordings need it).
+    pub fn muxer_ready() -> bool {
+        let name = if cfg!(windows) { "obs-ffmpeg-mux.exe" } else { "obs-ffmpeg-mux" };
+        std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name))).is_some_and(|p| p.exists())
+    }
+
+    /// Starts recording what's on air to `path` as `plan` says: its format, the audio tracks,
+    /// splitting by time or size, and the names of the next parts.
+    pub fn record_to(&self, path: &Path, plan: &RecordPlan) -> Result<Recording, StudioError> {
+        let a = &self.inner.api;
+        let (id, muxer) = match plan.format.as_str() {
+            "mp4" => ("mp4_output", ""),
+            "mov" => ("mov_output", ""),
+            "fmp4" | "fmov" => ("ffmpeg_muxer", "movflags=frag_keyframe+empty_moov+delay_moov"),
+            "mkv" | "flv" | "ts" => ("ffmpeg_muxer", ""),
+            f => return Err(StudioError::Failed(format!("format: mp4, mov, fmp4, fmov, mkv, flv or ts, not \"{f}\""))),
+        };
+        if id == "ffmpeg_muxer" && !Studio::muxer_ready() {
+            return Err(StudioError::Failed(
+                "MKV, FLV, TS and fragmented recordings need OBS's mux helper beside Ferrocast; record as MP4 or MOV"
+                    .into(),
+            ));
+        }
+        let tracks: Vec<u8> = if plan.tracks.is_empty() { vec![1] } else { plan.tracks.clone() };
+        if tracks.iter().any(|t| !(1..=6).contains(t)) {
+            return Err(StudioError::Failed("tracks: numbers 1 to 6.".into()));
+        }
+        let (venc, aenc) = self.encoders(&plan.encode)?;
+        let mut audio = vec![aenc];
+        // Track 1's encoder is the first; the others mix their own track.
+        for t in tracks.iter().skip(1) {
+            match self.audio_encoder(plan.encode.audio_kbps, usize::from(t - 1)) {
+                Ok(e) => audio.push(e),
+                Err(err) => {
+                    a.obs_encoder_release(venc);
+                    audio.iter().for_each(|e| a.obs_encoder_release(*e));
+                    return Err(err);
+                }
+            }
+        }
+        if tracks[0] != 1 {
+            // The first encoder mixes track 1: make it mix the first track asked for.
+            a.obs_encoder_release(audio[0]);
+            match self.audio_encoder(plan.encode.audio_kbps, usize::from(tracks[0] - 1)) {
+                Ok(e) => audio[0] = e,
+                Err(err) => {
+                    a.obs_encoder_release(venc);
+                    audio.iter().skip(1).for_each(|e| a.obs_encoder_release(*e));
+                    return Err(err);
+                }
+            }
+        }
+        let settings = a.obs_data_create();
+        let set_str = |k: &str, v: &str| {
+            let (k, v) = (cstr(k), cstr(v));
+            a.obs_data_set_string(settings, k.as_ptr(), v.as_ptr());
+        };
+        let set_int = |k: &str, v: i64| {
+            let k = cstr(k);
+            a.obs_data_set_int(settings, k.as_ptr(), v);
+        };
+        let set_bool = |k: &str, v: bool| {
+            let k = cstr(k);
+            a.obs_data_set_bool(settings, k.as_ptr(), v);
+        };
+        set_str("path", &path.display().to_string());
+        if !muxer.is_empty() {
+            set_str("muxer_settings", muxer);
+        }
+        // Splitting: each part is named like the first, in the same folder.
+        set_bool("split_file", true);
+        set_int("max_time_sec", i64::from(plan.split_minutes) * 60);
+        set_int("max_size_mb", i64::from(plan.split_mb));
+        set_bool("allow_overwrite", plan.overwrite);
+        set_str("directory", &path.parent().unwrap_or(&plan.folder).display().to_string());
+        set_str("format", &plan.name);
+        set_str("extension", plan.extension());
+        set_bool("allow_spaces", plan.spaces);
         let (oid, oname) = (cstr(id), cstr("ferrocast-record"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
         a.obs_data_release(settings);
-        let rec = Recording { studio: self.clone(), out, venc, aenc };
+        let rec = Recording { studio: self.clone(), out, venc, audio, path: path.to_path_buf() };
         if out.is_null() {
             return Err(StudioError::Failed("the recorder couldn't be made".into()));
         }
         a.obs_output_set_video_encoder(out, venc);
-        a.obs_output_set_audio_encoder(out, aenc, 0);
+        for (i, e) in rec.audio.iter().enumerate() {
+            a.obs_output_set_audio_encoder(out, *e, i);
+        }
         if !a.obs_output_start(out) {
             return Err(StudioError::Failed(format!(
                 "recording didn't start: {}",
@@ -633,6 +762,39 @@ impl Studio {
             )));
         }
         Ok(rec)
+    }
+
+    /// An AAC encoder mixing audio track `mixer` (0 to 5).
+    fn audio_encoder(&self, kbps: u32, mixer: usize) -> Result<*mut ffi::ObsEncoder, StudioError> {
+        let a = &self.inner.api;
+        let s = a.obs_data_create();
+        let b = cstr("bitrate");
+        a.obs_data_set_int(s, b.as_ptr(), i64::from(kbps));
+        let name = cstr(&format!("ferrocast-audio-{}", mixer + 1));
+        let mut enc = ptr::null_mut();
+        for id in ["ffmpeg_aac", "CoreAudio_AAC"] {
+            let aid = cstr(id);
+            enc = a.obs_audio_encoder_create(aid.as_ptr(), name.as_ptr(), s, mixer, ptr::null_mut());
+            if !enc.is_null() {
+                break;
+            }
+        }
+        a.obs_data_release(s);
+        if enc.is_null() {
+            return Err(StudioError::Failed("no AAC encoder is available".into()));
+        }
+        a.obs_encoder_set_audio(enc, a.obs_get_audio());
+        Ok(enc)
+    }
+
+    /// Rewrites a recording (MKV, FLV, TS…) as `to`, as OBS's Remux does. See [`Remuxer`].
+    pub fn remux(&self, from: &Path, to: &Path, progress: impl FnMut(f32) -> bool) -> Result<(), StudioError> {
+        self.remuxer().remux(from, to, progress)
+    }
+
+    /// A handle that remuxes on any thread (a long file needn't hold up the main one).
+    pub fn remuxer(&self) -> Remuxer {
+        Remuxer { fns: self.inner.api.remux_fns() }
     }
 
     /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output), with
@@ -725,6 +887,14 @@ impl Studio {
         } else {
             let k = cstr("bframes");
             a.obs_data_set_bool(vs, k.as_ptr(), e.bframes);
+        }
+        if !e.extra.is_empty() {
+            let json = cstr(&serde_json::Value::Object(e.extra.clone()).to_string());
+            let over = a.obs_data_create_from_json(json.as_ptr());
+            if !over.is_null() {
+                a.obs_data_apply(vs, over);
+                a.obs_data_release(over);
+            }
         }
         let (vid, vname) = (cstr(&e.video_encoder), cstr("ferrocast-video"));
         let venc = a.obs_video_encoder_create(vid.as_ptr(), vname.as_ptr(), vs, ptr::null_mut());
@@ -1338,10 +1508,129 @@ pub struct Recording {
     studio: Studio,
     out: *mut ffi::ObsOutput,
     venc: *mut ffi::ObsEncoder,
-    aenc: *mut ffi::ObsEncoder,
+    /// One encoder per audio track recorded.
+    audio: Vec<*mut ffi::ObsEncoder>,
+    path: PathBuf,
+}
+
+/// Remuxes recordings, from any thread: OBS's media-remux (no encoding again).
+#[derive(Debug, Clone, Copy)]
+pub struct Remuxer {
+    fns: ffi::RemuxFns,
+}
+
+impl Remuxer {
+    /// Rewrites `from` as `to` (its extension picks the format). `progress` gets the percent
+    /// done; returning false stops it. Never writes over a file that's there.
+    pub fn remux(&self, from: &Path, to: &Path, mut progress: impl FnMut(f32) -> bool) -> Result<(), StudioError> {
+        if !from.is_file() {
+            return Err(StudioError::Failed(format!("{} isn't there", from.display())));
+        }
+        if to.exists() {
+            return Err(StudioError::Failed(format!("{} is there already", to.display())));
+        }
+        let (i, o) = (cstr(&from.display().to_string()), cstr(&to.display().to_string()));
+        match self.fns.run(&i, &o, &mut progress) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let _ = std::fs::remove_file(to);
+                Err(StudioError::Failed("the remux stopped before the end".into()))
+            }
+            Err(()) => Err(StudioError::Failed(format!("{} can't be remuxed", from.display()))),
+        }
+    }
+}
+
+/// How a recording is made: its format, file names, tracks, splitting and encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordPlan {
+    pub folder: PathBuf,
+    /// OBS's name pattern: `%CCYY` year, `%MM` month, `%DD` day, `%hh`, `%mm`, `%ss`…
+    pub name: String,
+    /// mp4, mov (crash-safe), fmp4, fmov (fragmented), mkv, flv or ts.
+    pub format: String,
+    /// Spaces allowed in the name (else they become underscores).
+    pub spaces: bool,
+    /// A file of the same name is replaced (else " (2)" is added).
+    pub overwrite: bool,
+    /// A new file every this many minutes or megabytes (0: never).
+    pub split_minutes: u32,
+    pub split_mb: u32,
+    /// Audio tracks (1 to 6) in the file; empty is track 1.
+    pub tracks: Vec<u8>,
+    pub encode: EncodeSettings,
+}
+
+impl Default for RecordPlan {
+    fn default() -> Self {
+        RecordPlan {
+            folder: PathBuf::new(),
+            name: "%CCYY-%MM-%DD %hh-%mm-%ss".into(),
+            format: "mp4".into(),
+            spaces: true,
+            overwrite: false,
+            split_minutes: 0,
+            split_mb: 0,
+            tracks: vec![1],
+            encode: EncodeSettings::with_encoder("obs_x264"),
+        }
+    }
+}
+
+impl RecordPlan {
+    /// The file extension the format writes.
+    pub fn extension(&self) -> &str {
+        match self.format.as_str() {
+            "fmp4" => "mp4",
+            "fmov" => "mov",
+            f => f,
+        }
+    }
 }
 
 impl Recording {
+    /// The file it started writing.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Starts a new file now (OBS's "Split recording"). Err when this format can't.
+    pub fn split(&self) -> Result<(), StudioError> {
+        let mut stack = [0u8; 128];
+        let mut cd = ffi::CallData::fixed(&mut stack);
+        if !self.call("split_file", &mut cd) {
+            return Err(StudioError::Failed("This recording can't be split.".into()));
+        }
+        let mut on = false;
+        let k = cstr("split_file_enabled");
+        self.studio.inner.api.calldata_get_data(&cd, k.as_ptr(), (&mut on as *mut bool).cast(), 1);
+        if on { Ok(()) } else { Err(StudioError::Failed("This recording can't be split.".into())) }
+    }
+
+    /// Marks a chapter here (MP4 and MOV): named, or numbered when the name is empty.
+    pub fn chapter(&self, name: &str) -> Result<(), StudioError> {
+        let mut stack = [0u8; 512];
+        let mut cd = ffi::CallData::fixed(&mut stack);
+        let name: String = name.chars().filter(|c| !c.is_control()).take(100).collect();
+        let (k, v) = (cstr("chapter_name"), cstr(&name));
+        self.studio.inner.api.calldata_set_data(&mut cd, k.as_ptr(), v.as_ptr().cast(), name.len() + 1);
+        if self.call("add_chapter", &mut cd) {
+            Ok(())
+        } else {
+            Err(StudioError::Failed("Chapters need an MP4 or MOV recording.".into()))
+        }
+    }
+
+    fn call(&self, proc_name: &str, cd: &mut ffi::CallData) -> bool {
+        let a = &self.studio.inner.api;
+        let ph = a.obs_output_get_proc_handler(self.out);
+        if ph.is_null() {
+            return false;
+        }
+        let n = cstr(proc_name);
+        a.proc_handler_call(ph, n.as_ptr(), cd)
+    }
+
     /// Stops and waits up to 10 s for the file to be written out.
     pub fn stop(self) {
         drop(self);
@@ -1392,7 +1681,9 @@ impl Drop for Recording {
             a.obs_output_release(self.out);
         }
         a.obs_encoder_release(self.venc);
-        a.obs_encoder_release(self.aenc);
+        for e in &self.audio {
+            a.obs_encoder_release(*e);
+        }
     }
 }
 
@@ -1414,6 +1705,9 @@ pub struct EncodeSettings {
     /// Sent at this size instead of the canvas's.
     pub scale: Option<(u32, u32)>,
     pub audio_kbps: u32,
+    /// The encoder's own options (OBS's keys), applied over the ones above.
+    #[serde(default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl EncodeSettings {
@@ -1429,6 +1723,7 @@ impl EncodeSettings {
             bframes: true,
             scale: None,
             audio_kbps: 160,
+            extra: Default::default(),
         }
     }
 }
