@@ -8,6 +8,8 @@ use std::process::ExitCode;
 
 /// OBS's helper, where OBS is installed.
 fn helper() -> Option<PathBuf> {
+    // Linux has no OBS helper to look for, so nothing is added there.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
     let mut places: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "macos")]
     {
