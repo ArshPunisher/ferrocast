@@ -169,6 +169,11 @@ pub struct OptionInfo {
     /// The file types of a path or a list of files, as OBS writes them
     /// ("Image Files (*.png *.jpg);;All Files (*.*)").
     pub filter: String,
+    /// A text's kind: "multiline" (a box), "password" (hidden), "info" (read only) or ""
+    /// (one line).
+    pub text_type: &'static str,
+    /// A text OBS shows in a fixed-width font (code, CSS).
+    pub monospace: bool,
 }
 
 fn kind_name(t: c_int) -> &'static str {
@@ -650,9 +655,23 @@ impl Studio {
             } else {
                 ("", String::new())
             };
+            // enum obs_text_type: DEFAULT 0, PASSWORD 1, MULTILINE 2, INFO 3.
+            let (text_type, monospace) = if kind == "text" {
+                let t = match a.obs_property_text_type(p) {
+                    1 => "password",
+                    2 => "multiline",
+                    3 => "info",
+                    _ => "",
+                };
+                (t, a.obs_property_text_monospace(p))
+            } else {
+                ("", false)
+            };
             // enum obs_group_type: OBS_GROUP_CHECKABLE is 2.
             let checkable = kind == "group" && a.obs_property_group_type(p) == 2;
             out.push(OptionInfo {
+                text_type,
+                monospace,
                 checkable,
                 path,
                 filter,

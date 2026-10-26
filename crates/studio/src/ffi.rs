@@ -578,6 +578,9 @@ api! {
     obs_property_path_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_path_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_property_editable_list_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_text_type: fn(a: *mut ObsProperty) -> c_int;
+    obs_property_text_monospace: fn(a: *mut ObsProperty) -> bool;
+    obs_property_text_set_monospace: fn(a: *mut ObsProperty, b: bool);
     obs_property_group_type: fn(a: *mut ObsProperty) -> c_int;
     obs_property_editable_list_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_enter_graphics: fn();
@@ -2112,7 +2115,11 @@ pub(crate) mod web {
         a.obs_properties_add_int(p, c"width".as_ptr(), c"Width".as_ptr(), 1, 8192, 1);
         a.obs_properties_add_int(p, c"height".as_ptr(), c"Height".as_ptr(), 1, 8192, 1);
         a.obs_properties_add_int(p, c"fps".as_ptr(), c"Frame rate".as_ptr(), 1, 60, 1);
-        a.obs_properties_add_text(p, c"css".as_ptr(), c"Custom CSS".as_ptr(), 2);
+        // A box of several lines (OBS_TEXT_MULTILINE), in a code font.
+        let css = a.obs_properties_add_text(p, c"css".as_ptr(), c"Custom CSS".as_ptr(), 2);
+        if !css.is_null() {
+            a.obs_property_text_set_monospace(css, true);
+        }
         p
     }
 
