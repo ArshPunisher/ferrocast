@@ -492,6 +492,9 @@ api! {
     obs_data_apply: fn(a: *mut ObsData, b: *mut ObsData);
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
     obs_view_create: fn() -> *mut ObsView;
+    os_get_free_disk_space: fn(a: *const c_char) -> u64;
+    video_output_get_skipped_frames: fn(a: *const VideoT) -> u32;
+    video_output_get_total_frames: fn(a: *const VideoT) -> u32;
     obs_view_set_source: fn(a: *mut ObsView, b: u32, c: *mut ObsSource);
     obs_view_add: fn(a: *mut ObsView) -> *mut VideoT;
     obs_view_remove: fn(a: *mut ObsView);

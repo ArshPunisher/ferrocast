@@ -25,8 +25,8 @@ pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
     AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Collection, DEINTERLACE, FilterInfo, FilterSnap, ItemEdit, ItemInfo,
-    ItemSnap, LevelInfo, Monitor, SceneInfo, SceneSnap, SourceUse, StudioOptions, TBarState, Transform, TransitionInfo,
-    WebAct,
+    ItemSnap, LevelInfo, MissingFile, Monitor, SceneInfo, SceneSnap, SourceUse, StudioOptions, TBarState, Transform,
+    TransitionInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{ProjectorOf, Screen};
@@ -194,11 +194,50 @@ fn kind_name(t: c_int) -> &'static str {
 pub struct AudioSetup {
     pub sample_rate: u32,
     pub stereo: bool,
+    /// A surround layout instead; None follows `stereo`.
+    pub layout: Option<Surround>,
+}
+
+/// Surround speaker layouts libobs mixes for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surround {
+    TwoOne,
+    Four,
+    FourOne,
+    FiveOne,
+    SevenOne,
+}
+
+impl Surround {
+    /// "2.1", "4.0", "4.1", "5.1" or "7.1".
+    pub fn from_name(n: &str) -> Option<Surround> {
+        Some(match n {
+            "2.1" => Surround::TwoOne,
+            "4.0" => Surround::Four,
+            "4.1" => Surround::FourOne,
+            "5.1" => Surround::FiveOne,
+            "7.1" => Surround::SevenOne,
+            _ => return None,
+        })
+    }
 }
 
 impl Default for AudioSetup {
     fn default() -> Self {
-        AudioSetup { sample_rate: 48_000, stereo: true }
+        AudioSetup { sample_rate: 48_000, stereo: true, layout: None }
+    }
+}
+
+/// libobs's `enum speaker_layout` for a layout name.
+fn speaker_layout(a: &AudioSetup) -> c_int {
+    match a.layout {
+        Some(Surround::TwoOne) => 3,
+        Some(Surround::Four) => 4,
+        Some(Surround::FourOne) => 5,
+        Some(Surround::FiveOne) => 6,
+        Some(Surround::SevenOne) => 8,
+        None if a.stereo => ffi::SPEAKERS_STEREO,
+        None => ffi::SPEAKERS_MONO,
     }
 }
 
@@ -266,10 +305,7 @@ impl Studio {
         let data = cstr(&paths.data);
         api.obs_add_data_path(data.as_ptr());
 
-        let audio = ffi::AudioInfo {
-            samples_per_sec: audio.sample_rate,
-            speakers: if audio.stereo { ffi::SPEAKERS_STEREO } else { ffi::SPEAKERS_MONO },
-        };
+        let audio = ffi::AudioInfo { samples_per_sec: audio.sample_rate, speakers: speaker_layout(&audio) };
         if !api.obs_reset_audio(&audio) {
             api.obs_shutdown();
             return Err(StudioError::Audio);
@@ -365,7 +401,21 @@ impl Studio {
             lagged: a.obs_get_lagged_frames(),
             frames: a.obs_get_total_frames(),
             memory_mb: a.os_get_proc_resident_size() / (1024 * 1024),
+            skipped: {
+                let v = a.obs_get_video();
+                if v.is_null() { 0 } else { a.video_output_get_skipped_frames(v) }
+            },
+            encoded: {
+                let v = a.obs_get_video();
+                if v.is_null() { 0 } else { a.video_output_get_total_frames(v) }
+            },
         }
+    }
+
+    /// Free space on the disk holding `dir`, in megabytes.
+    pub fn free_disk_mb(&self, dir: &Path) -> u64 {
+        let d = cstr(&dir.display().to_string());
+        self.inner.api.os_get_free_disk_space(d.as_ptr()) / (1024 * 1024)
     }
 
     /// Where "Hear it" plays: every output device (name, id); "default" is the system's.
@@ -1603,6 +1653,45 @@ pub struct Recording {
     path: PathBuf,
 }
 
+/// Looks for files named like `names` (by file name) under `folder`, a few levels deep, as
+/// OBS's Missing Files "Search directory" → each name's first match.
+pub fn find_files(folder: &Path, names: &[String]) -> std::collections::HashMap<String, PathBuf> {
+    let mut want: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for n in names {
+        if let Some(f) = Path::new(n).file_name().and_then(|f| f.to_str()) {
+            want.entry(f.to_lowercase()).or_default().push(n.clone());
+        }
+    }
+    let mut found = std::collections::HashMap::new();
+    let mut stack = vec![(folder.to_path_buf(), 0u8)];
+    let mut looked = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            looked += 1;
+            // A whole disk isn't searched: enough for a folder of media.
+            if looked > 200_000 || found.len() == names.len() {
+                return found;
+            }
+            let p = e.path();
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() {
+                let hidden = p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with('.'));
+                if depth < 8 && !hidden {
+                    stack.push((p, depth + 1));
+                }
+            } else if let Some(f) = p.file_name().and_then(|f| f.to_str())
+                && let Some(originals) = want.get(&f.to_lowercase())
+            {
+                for o in originals {
+                    found.entry(o.clone()).or_insert_with(|| p.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
 /// What a replay buffer keeps and where it saves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayPlan {
@@ -1991,6 +2080,10 @@ pub struct EngineStats {
     pub lagged: u32,
     pub frames: u32,
     pub memory_mb: u64,
+    /// Frames the encoders skipped because they fell behind (encoding lag), and all frames
+    /// given to them.
+    pub skipped: u32,
+    pub encoded: u32,
 }
 
 /// How a stream is going.

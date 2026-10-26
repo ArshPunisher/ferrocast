@@ -184,6 +184,21 @@ pub struct FilterSnap {
     filters: Vec<(String, String, Value, bool)>,
 }
 
+/// A file a source (or filter, or transition) uses that isn't there any more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingFile {
+    /// The source or filter's name; for a transition, "" (its kind is `kind`).
+    pub source: String,
+    /// For a filter: the source it's on.
+    pub parent: Option<String>,
+    /// The OBS kind (`image_source`, `obs_stinger_transition`…).
+    pub kind: String,
+    /// The setting holding it, and the option's label.
+    pub key: String,
+    pub label: String,
+    pub path: String,
+}
+
 /// A sound's mixer state as it was, to put back (undo).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioSnap {
@@ -1829,6 +1844,131 @@ impl Collection {
         a.obs_source_set_flags(src.ptr, snap.flags);
         a.obs_source_set_audio_mixers(src.ptr, snap.mixers);
         Ok(())
+    }
+
+    /// Every file a source, filter or transition kind uses that isn't on this computer (OBS's
+    /// Missing Files): file and folder options, and each file of a list (slideshows).
+    pub fn missing_files(&self) -> Vec<MissingFile> {
+        let a = self.api();
+        let mut out = Vec::new();
+        let mut seen: Vec<*mut ffi::ObsSource> = Vec::new();
+        for src in self.in_use() {
+            if seen.contains(&src) || a.obs_source_is_scene(src) {
+                continue;
+            }
+            seen.push(src);
+            let name = text(a.obs_source_get_name(src));
+            self.missing_in(src, &name, None, &mut out);
+            for f in self.raw_filters(src) {
+                self.missing_in(f, &text(a.obs_source_get_name(f)), Some(&name), &mut out);
+            }
+        }
+        // Scenes have filters too.
+        for scene in self.scenes.borrow().iter() {
+            let name = text(a.obs_source_get_name(*scene));
+            for f in self.raw_filters(*scene) {
+                self.missing_in(f, &text(a.obs_source_get_name(f)), Some(&name), &mut out);
+            }
+        }
+        for (kind, settings) in self.transition_settings.borrow().iter() {
+            for key in ["path", "luma_image", "track_matte_path"] {
+                // Only whole paths: a Luma Wipe names one of OBS's own images instead.
+                if let Some(p) = settings.get(key).and_then(Value::as_str)
+                    && std::path::Path::new(p).is_absolute()
+                    && !std::path::Path::new(p).exists()
+                {
+                    out.push(MissingFile {
+                        source: String::new(),
+                        parent: None,
+                        kind: kind.clone(),
+                        key: key.into(),
+                        label: key.into(),
+                        path: p.into(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn missing_in(&self, src: *mut ffi::ObsSource, name: &str, parent: Option<&str>, out: &mut Vec<MissingFile>) {
+        let a = self.api();
+        let settings = self.settings_of(src);
+        let kind = text(a.obs_source_get_id(src));
+        let mut opts = self.studio.source_options(src, true);
+        while let Some(o) = opts.pop() {
+            opts.extend(o.group.iter().cloned());
+            if !o.visible {
+                continue;
+            }
+            // Whole paths only (not addresses, not names a plugin resolves itself).
+            let missing = |p: &str| std::path::Path::new(p).is_absolute() && !std::path::Path::new(p).exists();
+            let mut push = |p: &str| {
+                out.push(MissingFile {
+                    source: name.into(),
+                    parent: parent.map(String::from),
+                    kind: kind.clone(),
+                    key: o.key.clone(),
+                    label: o.label.clone(),
+                    path: p.into(),
+                })
+            };
+            match (o.kind, o.path) {
+                ("path", "file" | "folder") => {
+                    if let Some(p) = settings.get(&o.key).and_then(Value::as_str).filter(|p| missing(p)) {
+                        push(p);
+                    }
+                }
+                ("editable_list", "files") => {
+                    for item in settings.get(&o.key).and_then(Value::as_array).into_iter().flatten() {
+                        if let Some(p) = item.get("value").and_then(Value::as_str).filter(|p| missing(p)) {
+                            push(p);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Points a missing file's setting at `to` (or, `to` empty, clears it; a list loses the
+    /// item): OBS's Missing Files "Select file" and "Clear".
+    pub fn replace_file(&self, m: &MissingFile, to: &str) -> Result<(), StudioError> {
+        if m.source.is_empty() {
+            let mut patch = serde_json::Map::new();
+            patch.insert(m.key.clone(), json!(to));
+            return self.set_transition_settings(&m.kind, &Value::Object(patch));
+        }
+        let owner = match &m.parent {
+            Some(p) => {
+                let parent = self.source(p)?;
+                self.filter(&parent, &m.source)?.ptr
+            }
+            None => self.source(&m.source)?.ptr,
+        };
+        let settings = self.settings_of(owner);
+        let next = match settings.get(&m.key) {
+            Some(Value::Array(list)) => {
+                let mut list = list.clone();
+                if to.is_empty() {
+                    list.retain(|i| i.get("value").and_then(Value::as_str) != Some(m.path.as_str()));
+                } else {
+                    for i in &mut list {
+                        if i.get("value").and_then(Value::as_str) == Some(m.path.as_str())
+                            && let Some(o) = i.as_object_mut()
+                        {
+                            o.insert("value".into(), json!(to));
+                        }
+                    }
+                }
+                Value::Array(list)
+            }
+            Some(Value::String(p)) if *p == m.path => json!(to),
+            _ => return Err(StudioError::Failed(format!("\"{}\" doesn't use {} any more", m.source, m.path))),
+        };
+        let mut patch = serde_json::Map::new();
+        patch.insert(m.key.clone(), next);
+        self.update_of(owner, &Value::Object(patch))
     }
 
     /// A scene's own transition now (to put back).
