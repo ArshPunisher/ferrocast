@@ -40,6 +40,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/current", post(engine_set_current))
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
+        .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route("/studio/engine/preview/selection", put(engine_select))
+        .route("/studio/engine/pick-file", post(engine_pick_file))
+        .route("/studio/engine/screen-access", get(engine_screen_access))
+        .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
+        .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
         .route("/studio/engine/scenes/{scene}/transition", put(engine_scene_transition))
@@ -474,6 +480,58 @@ async fn engine_edit_item(
     Body(b): Body<DoBody<ItemEdit>>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::EditItem { scene, id, edit: b.what }).await
+}
+
+#[derive(Deserialize)]
+struct BoxBody {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    #[serde(default)]
+    save: bool,
+}
+
+/// `PUT …/items/{id}/box` `{ x, y, w, h, save? }`: moved or resized in the preview → the item.
+async fn engine_item_box(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<BoxBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemBox { scene, id, x: b.x, y: b.y, w: b.w, h: b.h, save: b.save }).await
+}
+
+#[derive(Deserialize)]
+struct SelectBody {
+    scene: Option<String>,
+    id: Option<i64>,
+}
+
+/// `PUT /studio/engine/preview/selection` `{ scene, id }` (both null for none).
+async fn engine_select(State(app): State<AppState>, Body(b): Body<SelectBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id }).await
+}
+
+/// `POST /studio/engine/pick-file` `{ kind, filter? }` → `{ path }` (null when cancelled).
+async fn engine_pick_file(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::studio_host::FilePick>,
+) -> ApiResult<Json<Value>> {
+    let path = app.engine.studio_pick_file(b).await?;
+    Ok(Json(serde_json::json!({ "path": path })))
+}
+
+async fn engine_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_screen_access().await?))
+}
+
+async fn engine_fix_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_fix_screen_access().await?))
+}
+
+async fn engine_restart(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    app.engine.studio_restart().await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn engine_audio(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<Json<Value>> {

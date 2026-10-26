@@ -589,6 +589,13 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/scenes/Gameplay/transition", json!({ "transition": null })).await,
         r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "scale_lanczos" })).await,
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
+        r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
+        r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
+        r.put("/studio/engine/preview/selection", json!({ "scene": null, "id": null })).await,
+        r.post("/studio/engine/pick-file", json!({ "kind": "file", "filter": "Images (*.png)" })).await,
+        r.get("/studio/engine/screen-access").await,
+        r.post("/studio/engine/screen-access/fix", json!({})).await,
+        r.post("/studio/engine/restart", json!({})).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
@@ -615,6 +622,13 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Mic" })).await, "paste onto itself"),
         (r.post("/studio/engine/sources/Alerts/web", json!({ "do": "click" })).await, "unknown web act"),
         (r.post("/studio/engine/obs-collections/import", json!({ "id": "../x" })).await, "id with a path"),
+        (
+            r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0, "w": 0, "h": 360 })).await,
+            "no width",
+        ),
+        (r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0 })).await, "no size"),
+        (r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay" })).await, "scene without id"),
+        (r.post("/studio/engine/pick-file", json!({ "kind": "run" })).await, "unknown dialog"),
         (
             r.put(
                 "/studio/engine/scenes/Gameplay/transition",

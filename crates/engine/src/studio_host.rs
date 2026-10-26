@@ -91,6 +91,67 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
     /// the old scenes are kept in a file first) → what came in.
     async fn import_obs(&self, id: String) -> Result<Value, String>;
+    /// A file dialog on this computer → the path picked (a list for "files"), or null when
+    /// it's cancelled.
+    async fn pick_file(&self, _pick: FilePick) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
+    async fn screen_access(&self) -> Result<Value, String> {
+        Ok(serde_json::json!({ "granted": true }))
+    }
+    /// Asks macOS again, forgetting what it said to an older build of Ferrocast (each unsigned
+    /// update is a new app to macOS, while System Settings still shows the old one switched on).
+    async fn fix_screen_access(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Quits and opens Ferrocast again (macOS applies a new permission only then).
+    async fn restart(&self) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+}
+
+/// Hosts say this for what only the Ferrocast app on this computer can do.
+pub const NOT_HERE: &str = "That needs the Ferrocast app on this computer.";
+
+/// What a file dialog asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FilePick {
+    /// "file" (open one), "files" (open several), "save" (a new file's name) or "folder".
+    pub kind: String,
+    /// File types as OBS writes them: `Image Files (*.png *.jpg);;All Files (*.*)`.
+    #[serde(default)]
+    pub filter: String,
+}
+
+impl FilePick {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if !matches!(self.kind.as_str(), "file" | "files" | "save" | "folder") {
+            return Err(EngineError::Invalid("kind: file, files, save or folder.".into()));
+        }
+        if self.filter.len() > 2000 {
+            return Err(EngineError::Invalid("filter: at most 2000 characters.".into()));
+        }
+        Ok(())
+    }
+
+    /// The filter as (name, extensions) pairs; "*.*" (any file) and bad patterns are left out.
+    pub fn filters(&self) -> Vec<(String, Vec<String>)> {
+        self.filter
+            .split(";;")
+            .filter_map(|part| {
+                let (name, rest) = part.split_once('(')?;
+                let exts: Vec<String> = rest
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .filter_map(|p| p.strip_prefix("*."))
+                    .filter(|e| *e != "*" && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                (!exts.is_empty()).then(|| (name.trim().to_string(), exts))
+            })
+            .collect()
+    }
 }
 
 /// How the Studio streams, records and runs. Every field has a default, so an older or
@@ -463,6 +524,23 @@ pub enum StudioAct {
         name: String,
         from: String,
     },
+    /// Moves and sizes an item from the preview: its box's first corner to (`x`, `y`), its
+    /// sides `w` and `h` long, in canvas pixels → the item. `save` at the end of a drag.
+    SetItemBox {
+        scene: String,
+        id: i64,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        #[serde(default)]
+        save: bool,
+    },
+    /// Outlines an item in the preview, or nothing (`scene` and `id` null).
+    Select {
+        scene: Option<String>,
+        id: Option<i64>,
+    },
 }
 
 impl StudioAct {
@@ -585,12 +663,31 @@ impl StudioAct {
                 }
                 Ok(())
             }
+            A::SetItemBox { scene, x, y, w, h, .. } => {
+                check_source_name(scene)?;
+                const MAX: f32 = 100_000.0;
+                if ![*x, *y, *w, *h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
+                    return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+                }
+                if *w < 1.0 || *h < 1.0 {
+                    return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+                }
+                Ok(())
+            }
+            A::Select { scene, id } => match (scene, id) {
+                (Some(s), Some(_)) => check_source_name(s),
+                (None, None) => Ok(()),
+                _ => Err(EngineError::Invalid("scene, id: both, or neither to pick nothing.".into())),
+            },
         }
     }
 
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
+        if let A::SetItemBox { save, .. } = self {
+            return *save;
+        }
         !matches!(
             self,
             A::Scenes
@@ -604,6 +701,7 @@ impl StudioAct {
                 | A::Screenshot { .. }
                 | A::FilterSettings { .. }
                 | A::FilterOptions { .. }
+                | A::Select { .. }
         )
     }
 }
@@ -766,6 +864,25 @@ impl Engine {
         self.studio_host()?.stream_stats().await.map_err(failed)
     }
 
+    /// A file dialog on the computer Ferrocast runs on → the path picked, or null.
+    pub async fn studio_pick_file(&self, pick: FilePick) -> Result<Value, EngineError> {
+        pick.validate()?;
+        self.studio_host()?.pick_file(pick).await.map_err(failed)
+    }
+
+    pub async fn studio_screen_access(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.screen_access().await.map_err(failed)
+    }
+
+    pub async fn studio_fix_screen_access(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.fix_screen_access().await.map_err(failed)
+    }
+
+    /// Opens Ferrocast again; refused while the Studio streams or records.
+    pub async fn studio_restart(&self) -> Result<(), EngineError> {
+        self.studio_host()?.restart().await.map_err(failed)
+    }
+
     pub async fn studio_preview(&self, rect: Option<PreviewRect>) -> Result<(), EngineError> {
         if let Some(r) = &rect {
             r.validate().map_err(EngineError::Invalid)?;
@@ -810,6 +927,14 @@ fn failed(message: String) -> EngineError {
     }
     if message.contains("isn't here yet") {
         return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
+    }
+    if message == NOT_HERE {
+        return refused(
+            422,
+            "studio_not_here",
+            message,
+            "Do it in the Ferrocast app on the computer it runs on (or type the file's path).",
+        );
     }
     if message.contains("isn't a web page") {
         return refused(400, "studio_not_web_page", message, "Pick a Web page source.");
@@ -939,6 +1064,55 @@ mod tests {
             failed("Stop streaming and recording before bringing in scenes.".into()),
             EngineError::Refused { status: 409, code: "studio_busy", .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn preview_editing_file_dialogs_and_screen_access() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        // Moving and sizing: numbers on the canvas, sizes of at least a pixel.
+        let bx = |scene: &str, x: f32, y: f32, w: f32, save: bool| StudioAct::SetItemBox {
+            scene: scene.into(),
+            id: 3,
+            x,
+            y,
+            w,
+            h: 360.0,
+            save,
+        };
+        assert!(!bx("Main", -20.0, 40.5, 640.0, false).changes());
+        assert!(bx("Main", -20.0, 40.5, 640.0, true).changes());
+        e.studio_act(bx("Main", -20.0, 40.5, 640.0, false)).await.unwrap();
+        for bad in [
+            bx("Main", 0.0, 0.0, 0.5, false),
+            bx("Main", f32::NAN, 0.0, 10.0, false),
+            bx("Main", 0.0, 1e9, 10.0, false),
+            bx("", 0.0, 0.0, 10.0, false),
+            StudioAct::Select { scene: Some("Main".into()), id: None },
+        ] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
+        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3) };
+        assert!(!pick.changes());
+        e.studio_act(pick).await.unwrap();
+        e.studio_act(StudioAct::Select { scene: None, id: None }).await.unwrap();
+        assert_eq!(fake.acts.lock().unwrap().len(), 3);
+
+        // OBS's filter strings become dialog filters; "any file" is left to the dialog.
+        let f = FilePick {
+            kind: "file".into(),
+            filter: "Image Files (*.bmp *.PNG *.jpeg);;Bad (*.x/y);;All Files (*.*)".into(),
+        };
+        assert_eq!(f.filters(), vec![("Image Files".to_string(), vec!["bmp".into(), "png".into(), "jpeg".into()])]);
+        assert!(f.validate().is_ok());
+        let bad = FilePick { kind: "run".into(), filter: String::new() };
+        assert!(matches!(e.studio_pick_file(bad).await.unwrap_err(), EngineError::Invalid(_)));
+        // Hosts without dialogs (or a fix for macOS) say so plainly.
+        let not_here = e.studio_pick_file(f).await.unwrap_err();
+        assert!(matches!(not_here, EngineError::Refused { status: 422, code: "studio_not_here", .. }));
+        assert_eq!(e.studio_screen_access().await.unwrap()["granted"], true);
+        assert!(matches!(e.studio_restart().await.unwrap_err(), EngineError::Refused { code: "studio_not_here", .. }));
     }
 
     #[tokio::test]
