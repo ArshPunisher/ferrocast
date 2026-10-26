@@ -508,6 +508,23 @@ pub struct StudioSettings {
     pub multiview_layout: String,
     pub multiview_labels: bool,
     pub multiview_safe_areas: bool,
+    /// Moving sources in the preview snaps (OBS's Snapping): within `snap_px` screen pixels,
+    /// to the screen's edges, other sources, and the screen's middle.
+    pub snapping: bool,
+    pub snap_px: u32,
+    pub snap_screen: bool,
+    pub snap_sources: bool,
+    pub snap_center: bool,
+    /// Asked "are you sure?" before going live, ending the stream, stopping a recording.
+    pub confirm_go_live: bool,
+    pub confirm_end_stream: bool,
+    pub confirm_stop_record: bool,
+    /// OBS's General › Output: recording and the replay buffer start with the stream, and stop
+    /// with it unless kept.
+    pub record_when_streaming: bool,
+    pub keep_recording: bool,
+    pub replay_when_streaming: bool,
+    pub keep_replay: bool,
 }
 
 impl Default for StudioSettings {
@@ -555,6 +572,19 @@ impl Default for StudioSettings {
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
+            // OBS's defaults.
+            snapping: true,
+            snap_px: 10,
+            snap_screen: true,
+            snap_sources: false,
+            snap_center: false,
+            confirm_go_live: false,
+            confirm_end_stream: true,
+            confirm_stop_record: false,
+            record_when_streaming: false,
+            keep_recording: false,
+            replay_when_streaming: false,
+            keep_replay: false,
         }
     }
 }
@@ -636,6 +666,9 @@ impl StudioSettings {
             && !["2.1", "4.0", "4.1", "5.1", "7.1"].contains(&l.as_str())
         {
             return bad("speakers: 2.1, 4.0, 4.1, 5.1 or 7.1 (or null for stereo or mono).");
+        }
+        if !(1..=50).contains(&self.snap_px) {
+            return bad("snap_px: 1 to 50 screen pixels.");
         }
         if !["top", "bottom", "left", "right", "scenes_only"].contains(&self.multiview_layout.as_str()) {
             return bad("multiview_layout: top, bottom, left, right or scenes_only.");
@@ -1549,12 +1582,20 @@ impl Engine {
     /// to every destination switched on, as a stream from OBS would.
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
+        let s = host.settings().await;
         if !on {
             host.stream_stop().await.map_err(failed)?;
-            return Ok(Value::Null);
+            // The stream has ended either way; what didn't stop with it comes back in words.
+            return Ok(follow_stream(host.as_ref(), false, &s)
+                .await
+                .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
         let (server, key) = self.golive_ingest().await?;
-        host.stream_start(server, key).await.map_err(failed)
+        let mut v = host.stream_start(server, key).await.map_err(failed)?;
+        if let (Some(also), Some(o)) = (follow_stream(host.as_ref(), true, &s).await, v.as_object_mut()) {
+            o.insert("also".into(), Value::String(also));
+        }
+        Ok(v)
     }
 
     pub async fn studio_stream_stats(&self) -> Result<Value, EngineError> {
@@ -1689,6 +1730,38 @@ fn failed(message: String) -> EngineError {
     )
 }
 
+/// What starts and stops with the stream (OBS's "Automatically record when streaming" and its
+/// friends). The stream starts or ends either way, so what didn't follow comes back in words.
+async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> Option<String> {
+    let mut failed = Vec::new();
+    if on {
+        if s.record_when_streaming
+            && let Err(e) = host.record(true).await
+        {
+            failed.push(format!("The recording didn't start: {e}"));
+        }
+        if s.replay_when_streaming
+            && let Err(e) = host.replay(true).await
+        {
+            failed.push(format!("The replay buffer didn't start: {e}"));
+        }
+    } else {
+        if s.record_when_streaming
+            && !s.keep_recording
+            && let Err(e) = host.record(false).await
+        {
+            failed.push(format!("The recording didn't stop: {e}"));
+        }
+        if s.replay_when_streaming
+            && !s.keep_replay
+            && let Err(e) = host.replay(false).await
+        {
+            failed.push(format!("The replay buffer didn't stop: {e}"));
+        }
+    }
+    (!failed.is_empty()).then(|| failed.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +1770,7 @@ mod tests {
     struct Fake {
         rects: std::sync::Mutex<Vec<Option<PreviewRect>>>,
         acts: std::sync::Mutex<Vec<StudioAct>>,
+        outputs: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -1733,7 +1807,15 @@ mod tests {
             Ok(Value::Null)
         }
         async fn record(&self, on: bool) -> Result<Value, String> {
+            self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push(format!("record {on}"));
             Ok(serde_json::json!({ "on": on }))
+        }
+        async fn replay(&self, on: bool) -> Result<Value, String> {
+            if on {
+                return Err("No disk space.".into());
+            }
+            self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push(format!("replay {on}"));
+            Ok(serde_json::json!({ "active": on }))
         }
         async fn record_pause(&self, _on: bool) -> Result<(), String> {
             Ok(())
@@ -1760,6 +1842,29 @@ mod tests {
         async fn import_obs(&self, id: String) -> Result<Value, String> {
             Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
         }
+    }
+
+    #[tokio::test]
+    async fn recording_and_the_replay_buffer_follow_the_stream_when_asked() {
+        let fake = Fake::default();
+        let taken = |f: &Fake| std::mem::take(&mut *f.outputs.lock().unwrap_or_else(|p| p.into_inner()));
+        // Off by default: nothing else moves.
+        let mut s = StudioSettings::default();
+        assert_eq!(follow_stream(&fake, true, &s).await, None);
+        follow_stream(&fake, false, &s).await;
+        assert!(taken(&fake).is_empty());
+        // Both on: a replay buffer that fails says so; both stop with the stream.
+        s.record_when_streaming = true;
+        s.replay_when_streaming = true;
+        let also = follow_stream(&fake, true, &s).await.unwrap_or_default();
+        assert!(also.contains("replay buffer didn't start") && also.contains("No disk space"), "{also}");
+        follow_stream(&fake, false, &s).await;
+        assert_eq!(taken(&fake), ["record true", "record false", "replay false"]);
+        // Kept: they go on after the stream.
+        s.keep_recording = true;
+        s.keep_replay = true;
+        follow_stream(&fake, false, &s).await;
+        assert!(taken(&fake).is_empty());
     }
 
     async fn engine() -> (Engine, tempfile::TempDir) {
