@@ -5,8 +5,12 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.1.2
+## 2.1.3
 
+- Flipping a source keeps it in place. A source you sized by dragging used to jump half its
+  width out of its outline when flipped; if one of yours did, flip it once more.
+- The live preview keeps playing when a menu, side panel or window opens over part of it,
+  instead of going blank (and staying blank after a side panel closed).
 - Updates download in seconds. Ferrocast now fetches updates from a fast mirror, so a
   46 MB update no longer takes minutes in India.
 - The update window no longer scrolls the page behind it.
