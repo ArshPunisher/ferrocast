@@ -160,6 +160,11 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let WindowEvent::DragDrop(drop) = event
+                && window.label() == "main"
+            {
+                forward_drop(window, drop);
+            }
             if let WindowEvent::CloseRequested { api, .. } = event
                 && window.label() == "main"
             {
@@ -626,6 +631,39 @@ fn open_with_retry<E>(mut open: impl FnMut() -> Result<(), E>, attempts: u32, wa
             }
         }
     }
+}
+
+/// Files dragged onto the window, passed to the page as a `ferrocast:drop` event (the
+/// window takes drops itself, which is how their paths are known; the page then adds them as
+/// sources, as OBS does). `detail`: `{ kind: "enter" | "over" | "drop" | "leave", paths?,
+/// x?, y? }`, the position in the page's CSS pixels.
+fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
+    let Some(view) = window.app_handle().get_webview_window("main") else { return };
+    tracing::debug!(?drop, "files dragged onto the window");
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let at = |p: &tauri::PhysicalPosition<f64>| (p.x / scale, p.y / scale);
+    // Only paths that are text: one that isn't (invalid UTF-8) can't be a source's file, and
+    // serializing it would fail (CodeRabbit).
+    fn text(paths: &[PathBuf]) -> Vec<&str> {
+        paths.iter().filter_map(|p| p.to_str()).collect()
+    }
+    let detail = match drop {
+        tauri::DragDropEvent::Enter { paths, position } => {
+            let (x, y) = at(position);
+            serde_json::json!({ "kind": "enter", "paths": text(paths), "x": x, "y": y })
+        }
+        tauri::DragDropEvent::Over { position } => {
+            let (x, y) = at(position);
+            serde_json::json!({ "kind": "over", "x": x, "y": y })
+        }
+        tauri::DragDropEvent::Drop { paths, position } => {
+            let (x, y) = at(position);
+            serde_json::json!({ "kind": "drop", "paths": text(paths), "x": x, "y": y })
+        }
+        _ => serde_json::json!({ "kind": "leave" }),
+    };
+    // JSON is a JavaScript expression; paths are only ever data here.
+    let _ = view.eval(format!("window.dispatchEvent(new CustomEvent('ferrocast:drop', {{ detail: {detail} }}))"));
 }
 
 /// Shows the main window, creating it if it was never opened.
