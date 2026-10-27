@@ -5,7 +5,7 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.1.5
+## 2.1.6
 
 - A status bar along the bottom of the window, like OBS's: live and recording times, CPU,
   frame rate, dropped frames and upload. Click it for Stats.
