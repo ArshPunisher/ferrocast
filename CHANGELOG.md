@@ -7,7 +7,7 @@ words. The Release workflow reads the section whose heading is the version being
 
 ## 2.1.1
 
-**The Studio: stream without OBS.** Ferrocast now has OBS's own engine inside it. Studio,
+**The Studio: stream without OBS.** Ferrocast now has OBS's own engine inside it. In Studio ›
 Go live, Ferrocast shows your scenes, sources, sound and the live picture in one window, and
 goes live to Twitch, YouTube and Kick straight from there.
 
