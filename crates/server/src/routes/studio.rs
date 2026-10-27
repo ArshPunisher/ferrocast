@@ -43,6 +43,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route("/studio/engine/scenes/{scene}/items/{id}/crop", put(engine_item_crop))
         .route(
             "/studio/engine/scenes/{scene}/items/{id}/transform",
             get(engine_item_transform).put(engine_set_item_transform),
@@ -429,9 +430,12 @@ struct AddItemBody {
     /// With `existing`: a new copy of it instead of the same source (OBS's Paste (Duplicate)).
     #[serde(default)]
     copy: bool,
-    /// A new, empty group of this name.
+    /// A new group of this name: empty, or holding these sources of the scene (`items`, ids),
+    /// each where it is on screen.
     #[serde(default)]
     group: Option<String>,
+    #[serde(default)]
+    items: Option<Vec<i64>>,
     #[serde(flatten)]
     source: Option<NewSource>,
     #[serde(default)]
@@ -515,7 +519,10 @@ async fn engine_add_item(
     Body(b): Body<AddItemBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let a = match (b.existing, b.source) {
-        _ if b.group.is_some() => StudioAct::AddGroup { scene, name: b.group.unwrap_or_default() },
+        _ if b.group.is_some() => match b.items {
+            Some(ids) => StudioAct::GroupItems { scene, ids, name: b.group.unwrap_or_default() },
+            None => StudioAct::AddGroup { scene, name: b.group.unwrap_or_default() },
+        },
         (Some(name), _) if b.copy => StudioAct::PasteCopy { scene, name },
         (Some(name), _) => StudioAct::AddExisting { scene, name },
         (None, Some(source)) => StudioAct::AddSource { scene, source, fit: b.fit },
@@ -552,6 +559,25 @@ async fn engine_item_box(
     Body(b): Body<BoxBody>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetItemBox { scene, id, x: b.x, y: b.y, w: b.w, h: b.h, save: b.save }).await
+}
+
+#[derive(Deserialize)]
+struct CropBody {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    #[serde(default)]
+    save: bool,
+}
+
+/// `PUT …/items/{id}/crop` `{ left, top, right, bottom, save? }`: cropped in the preview → the item.
+async fn engine_item_crop(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<CropBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemCrop { scene, id, crop: [b.left, b.top, b.right, b.bottom], save: b.save }).await
 }
 
 async fn engine_item_transform(
@@ -730,11 +756,13 @@ struct SelectBody {
     id: Option<i64>,
     #[serde(default)]
     frames: bool,
+    #[serde(default)]
+    also: Vec<i64>,
 }
 
 /// `PUT /studio/engine/preview/selection` `{ scene, id }` (both null for none).
 async fn engine_select(State(app): State<AppState>, Body(b): Body<SelectBody>) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames }).await
+    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames, also: b.also }).await
 }
 
 /// `POST /studio/engine/pick-file` `{ kind, filter? }` → `{ path }` (null when cancelled).

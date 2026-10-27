@@ -20,6 +20,8 @@ const MERGE: Duration = Duration::from_secs(3);
 const NUDGES: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
+// The history keeps a few dozen steps, so an item snapshot inline costs nothing worth boxing.
+#[allow(clippy::large_enum_variant)]
 enum Change {
     /// Put this item back as it was.
     Item(ItemSnap),
@@ -45,6 +47,10 @@ enum Change {
     Deinterlace(String, String, bool),
     /// Put this item back at this place among its neighbours (from the top).
     Order { scene: String, id: i64, at: usize },
+    /// Take this group apart (its sources stay where they are).
+    Ungroup { scene: String, id: i64 },
+    /// Group these sources of the scene again under this name.
+    Regroup { scene: String, name: String, sources: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -68,6 +74,8 @@ pub struct Before {
     join: bool,
     /// The scene and its item ids before an act that adds items.
     added: Option<(String, Vec<i64>)>,
+    /// The scene an act grouped sources in (undone by taking the new group apart).
+    grouped: Option<String>,
     /// The drag ends with this act.
     closes: bool,
     open: bool,
@@ -121,6 +129,7 @@ impl History {
             key,
             join: false,
             added: None,
+            grouped: None,
             closes: false,
             open,
         };
@@ -156,6 +165,15 @@ impl History {
                 let snap = c.snap(scene, *id).ok()?;
                 Some(fresh(format!("Move {}", snap.name), vec![Change::Item(snap)], Some(key), !*save))
             }
+            StudioAct::SetItemCrop { scene, id, save, .. } => {
+                let key = ("crop", scene.clone(), *id);
+                // A drag's crops are one step.
+                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.open) {
+                    return Some(Before { join: true, closes: *save, ..fresh(String::new(), Vec::new(), None, false) });
+                }
+                let snap = c.snap(scene, *id).ok()?;
+                Some(fresh(format!("Crop {}", snap.name), vec![Change::Item(snap)], Some(key), !*save))
+            }
             StudioAct::SetTransform { scene, id, .. } => {
                 let key = ("transform", scene.clone(), *id);
                 if self.joins(&key) {
@@ -171,6 +189,10 @@ impl History {
             StudioAct::AddGroup { scene, name } => Some(Before {
                 added: Some((scene.clone(), c.item_ids(scene).ok()?)),
                 ..fresh(format!("Add group {name}"), Vec::new(), None, false)
+            }),
+            StudioAct::GroupItems { scene, name, .. } => Some(Before {
+                grouped: Some(scene.clone()),
+                ..fresh(format!("Group into {name}"), Vec::new(), None, false)
             }),
             StudioAct::PasteCopy { scene, name } => Some(Before {
                 added: Some((scene.clone(), c.item_ids(scene).ok()?)),
@@ -306,6 +328,7 @@ impl History {
             key,
             join: false,
             added: None,
+            grouped: None,
             closes: false,
             open: false,
         })
@@ -327,6 +350,11 @@ impl History {
             return;
         }
         let mut changes = b.changes;
+        if let (Some(scene), Ok(v)) = (b.grouped, out)
+            && let Some(id) = v.get("id").and_then(Value::as_i64)
+        {
+            changes.push(Change::Ungroup { scene, id });
+        }
         if let Some((scene, before)) = b.added {
             let now = c.item_ids(&scene).unwrap_or_default();
             changes.extend(
@@ -463,6 +491,16 @@ fn apply(c: &Collection, change: Change) -> Result<(Change, Option<Remap>), Stri
             let now = c.snap_filters(&snap.source).map_err(|e| e.to_string())?;
             c.restore_filters(&snap).map_err(|e| e.to_string())?;
             Ok((Change::Filters(now), None))
+        }
+        Change::Ungroup { scene, id } => {
+            let (name, sources) = c.group_parts(&scene, id).map_err(|e| e.to_string())?;
+            c.ungroup(&scene, id).map_err(|e| e.to_string())?;
+            Ok((Change::Regroup { scene, name, sources }, None))
+        }
+        Change::Regroup { scene, name, sources } => {
+            let ids = c.ids_named(&scene, &sources).map_err(|e| e.to_string())?;
+            let group = c.group_together(&scene, &ids, &name).map_err(|e| e.to_string())?;
+            Ok((Change::Ungroup { scene, id: group.id }, None))
         }
         Change::Settings(name, was) => {
             let now = c.snap_settings(&name).map_err(|e| e.to_string())?;

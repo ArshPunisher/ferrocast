@@ -44,7 +44,7 @@ struct Held {
     settings: Option<StudioSettings>,
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
-    selected: Option<(String, i64)>,
+    selected: Option<(String, Vec<i64>)>,
     /// The scene whose sources the preview outlines, each in its colour.
     frames: Option<String>,
     /// Where the canvas is inside the preview's box (points), when the page placed it.
@@ -473,6 +473,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::MissingFiles => v(to_json!(c.missing_files())),
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
+        A::GroupItems { scene, ids, name } => v(to_json!(c.group_together(&scene, &ids, &name)?)),
         A::ItemOrder { scene, id, to } => done(c.item_order(&scene, id, to)),
         A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
         A::PasteCopy { scene, name } => v(to_json!(c.paste_copy(&scene, &name)?)),
@@ -584,6 +585,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
         A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
+        A::SetItemCrop { scene, id, crop, .. } => v(to_json!(c.set_item_crop(&scene, id, crop)?)),
         A::Transform { scene, id } => v(to_json!(c.transform(&scene, id)?)),
         A::TransitionSettings { kind } => Ok(c.transition_settings(&kind)),
         A::SetTransitionSettings { kind, settings } => done(c.set_transition_settings(&kind, &settings)),
@@ -679,7 +681,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
     }
-    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
     p.frames(h.frames.as_deref());
     if let Some(c) = h.preview_bg {
         p.background(c);
@@ -974,11 +976,15 @@ impl StudioHost for DesktopStudio {
                 .map_err(|e| e.to_string())?;
                 return Ok(json!({ "file": path.display().to_string() }));
             }
-            if let StudioAct::Select { scene, id, frames } = &act {
-                h.selected = scene.clone().zip(*id);
+            if let StudioAct::Select { scene, id, frames, also } = &act {
+                h.selected = scene.clone().zip(*id).map(|(s, id)| {
+                    let mut ids = vec![id];
+                    ids.extend(also.iter().filter(|a| **a != id));
+                    (s, ids)
+                });
                 h.frames = if *frames { scene.clone() } else { None };
                 if let Some(p) = &h.preview {
-                    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), *i)));
+                    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
                     p.frames(h.frames.as_deref());
                 }
                 return Ok(Value::Null);

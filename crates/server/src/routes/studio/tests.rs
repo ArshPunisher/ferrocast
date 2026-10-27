@@ -591,6 +591,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
+        r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3, "also": [4, 5] })).await,
+        r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "Cam + frame", "items": [3, 4] })).await,
+        r.put("/studio/engine/scenes/Gameplay/items/3/crop", json!({ "left": 10, "top": 0, "right": 0, "bottom": 20 }))
+            .await,
         r.put("/studio/engine/preview/selection", json!({ "scene": null, "id": null })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": null, "frames": true })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/order", json!({ "to": 0 })).await,
@@ -656,6 +660,13 @@ async fn the_studio_engine_needs_the_desktop_app() {
             "no width",
         ),
         (r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0 })).await, "no size"),
+        (r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "G", "items": [] })).await, "group of nothing"),
+        (
+            r.put("/studio/engine/scenes/Gameplay/items/3/crop", json!({ "left": -1, "top": 0, "right": 0, "bottom": 0 }))
+                .await,
+            "negative crop",
+        ),
+        (r.put("/studio/engine/scenes/Gameplay/items/3/crop", json!({ "left": 5 })).await, "half a crop"),
         (r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay" })).await, "scene without id"),
         (r.post("/studio/engine/pick-file", json!({ "kind": "run" })).await, "unknown dialog"),
         (r.post("/studio/engine/projectors", json!({ "what": "source" })).await, "source without a name"),

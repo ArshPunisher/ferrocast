@@ -1084,6 +1084,16 @@ pub enum StudioAct {
         #[serde(default)]
         save: bool,
     },
+    /// Crops an item from the preview (Alt-drag on a handle): left, top, right, bottom in the
+    /// source's own pixels, keeping what's left where it is on screen → the item. `save` at the
+    /// end of a drag.
+    SetItemCrop {
+        scene: String,
+        id: i64,
+        crop: [i32; 4],
+        #[serde(default)]
+        save: bool,
+    },
     /// An item's transform, as OBS's Edit Transform shows it.
     Transform {
         scene: String,
@@ -1138,6 +1148,13 @@ pub enum StudioAct {
     /// A new, empty group on top of a scene → the item.
     AddGroup {
         scene: String,
+        name: String,
+    },
+    /// Puts these sources of a scene into a new group, each where it is on screen (OBS's
+    /// Group Selected Items) → the group.
+    GroupItems {
+        scene: String,
+        ids: Vec<i64>,
         name: String,
     },
     /// Moves an item to place `to` in its list (0 is the top: on top of everything).
@@ -1211,6 +1228,9 @@ pub enum StudioAct {
         id: Option<i64>,
         #[serde(default)]
         frames: bool,
+        /// More sources picked with it (⌘-click, Shift-click), each outlined with handles.
+        #[serde(default)]
+        also: Vec<i64>,
     },
 }
 
@@ -1341,6 +1361,13 @@ impl StudioAct {
                 }
                 Ok(())
             }
+            A::SetItemCrop { scene, crop, .. } => {
+                check_source_name(scene)?;
+                if crop.iter().any(|c| !(0..=100_000).contains(c)) {
+                    return Err(EngineError::Invalid("crop: left, top, right, bottom, 0 to 100000 pixels.".into()));
+                }
+                Ok(())
+            }
             A::SetItemBox { scene, x, y, w, h, .. } => {
                 check_source_name(scene)?;
                 const MAX: f32 = 100_000.0;
@@ -1360,6 +1387,14 @@ impl StudioAct {
                 check_source_name(name)
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
+            A::GroupItems { scene, ids, name } => {
+                check_source_name(scene)?;
+                check_source_name(name)?;
+                if ids.is_empty() || ids.len() > 500 {
+                    return Err(EngineError::Invalid("ids: the sources to group, 1 to 500.".into()));
+                }
+                Ok(())
+            }
             A::ItemOrder { scene, to, .. } => {
                 check_source_name(scene)?;
                 if *to > 10_000 {
@@ -1425,7 +1460,10 @@ impl StudioAct {
                 check_source_name(scene)?;
                 transform.validate()
             }
-            A::Select { scene, id, frames } => match (scene, id) {
+            A::Select { also, .. } if also.len() > 500 => {
+                Err(EngineError::Invalid("also: at most 500 more sources.".into()))
+            }
+            A::Select { scene, id, frames, .. } => match (scene, id) {
                 (Some(s), Some(_)) => check_source_name(s),
                 (Some(s), None) if *frames => check_source_name(s),
                 (None, None) => Ok(()),
@@ -1439,7 +1477,9 @@ impl StudioAct {
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
-        if let A::SetItemBox { save: last, .. } | A::TBar { release: last, .. } = self {
+        if let A::SetItemBox { save: last, .. } | A::SetItemCrop { save: last, .. } | A::TBar { release: last, .. } =
+            self
+        {
             return *last;
         }
         !matches!(
@@ -2200,15 +2240,17 @@ mod tests {
             bx("Main", f32::NAN, 0.0, 10.0, false),
             bx("Main", 0.0, 1e9, 10.0, false),
             bx("", 0.0, 0.0, 10.0, false),
-            StudioAct::Select { scene: Some("Main".into()), id: None, frames: false },
+            StudioAct::Select { scene: Some("Main".into()), id: None, frames: false, also: vec![] },
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
-        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false };
+        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4] };
         assert!(!pick.changes());
         e.studio_act(pick).await.unwrap();
-        e.studio_act(StudioAct::Select { scene: Some("Main".into()), id: None, frames: true }).await.unwrap();
-        e.studio_act(StudioAct::Select { scene: None, id: None, frames: false }).await.unwrap();
+        e.studio_act(StudioAct::Select { scene: Some("Main".into()), id: None, frames: true, also: vec![] })
+            .await
+            .unwrap();
+        e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![] }).await.unwrap();
         assert_eq!(fake.acts.lock().unwrap().len(), 4);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.

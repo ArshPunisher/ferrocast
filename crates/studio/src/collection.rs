@@ -132,8 +132,13 @@ pub struct ItemSnap {
     pub scene: String,
     pub id: i64,
     pub name: String,
-    /// From the bottom of the scene (0 is the lowest).
+    /// From the bottom of the scene, or of its group (0 is the lowest).
     order: usize,
+    /// The group it was in, if any (a source removed from a group goes back into it), and its
+    /// box on the canvas then: a group's own pixels shift as its sources move, so that's where
+    /// it goes back to.
+    group: Option<i64>,
+    canvas: Option<[f32; 6]>,
     transform: Transform,
     visible: bool,
     locked: bool,
@@ -1243,7 +1248,18 @@ impl Collection {
             srgb_off: a.obs_sceneitem_get_blending_method(item) == 1,
             frame: self.place(item).frame(),
             children: if group {
-                self.group_items(item).into_iter().rev().map(|i| self.info(i)).collect()
+                // A group's sources keep their place inside the group; the page works on the
+                // canvas, so their boxes go out in canvas pixels.
+                let m = self.group_matrix(item);
+                self.group_items(item)
+                    .into_iter()
+                    .rev()
+                    .map(|i| {
+                        let mut c = self.info(i);
+                        c.frame = on_canvas(c.frame, &m);
+                        c
+                    })
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -1426,6 +1442,38 @@ impl Collection {
         ffi::Vec2 { x: (m.x.x + m.y.x) * 0.5 + m.t.x, y: (m.x.y + m.y.y) * 0.5 + m.t.y }
     }
 
+    /// How a group's own pixels map onto the canvas (its sources are placed in them), as
+    /// libobs draws it now.
+    fn group_matrix(&self, group: *mut ffi::ObsSceneItem) -> ffi::Matrix4 {
+        let a = self.api();
+        let mut m = ffi::Matrix4::default();
+        a.obs_sceneitem_force_update_transform(group);
+        a.obs_sceneitem_get_draw_transform(group, &mut m);
+        m
+    }
+
+    /// Runs `f` with the groups of a scene held still: libobs re-fits a group around its
+    /// sources on its own thread, which shifts the group's pixels under a change made in
+    /// several steps (a source landed off where it was put, 2.1.3 test). They re-fit after.
+    fn holding_groups<T>(&self, scene: *mut ffi::ObsScene, f: impl FnOnce() -> T) -> T {
+        let a = self.api();
+        let groups: Vec<_> = self.raw_items(scene).into_iter().filter(|i| a.obs_sceneitem_is_group(*i)).collect();
+        for g in &groups {
+            a.obs_sceneitem_defer_group_resize_begin(*g);
+        }
+        let out = f();
+        for g in &groups {
+            a.obs_sceneitem_defer_group_resize_end(*g);
+        }
+        out
+    }
+
+    /// The group `item` is in, if it's in one.
+    fn group_of(&self, scene: *mut ffi::ObsScene, item: *mut ffi::ObsSceneItem) -> Option<*mut ffi::ObsSceneItem> {
+        let g = self.api().obs_sceneitem_get_group(scene, item);
+        (!g.is_null()).then_some(g)
+    }
+
     /// Makes a change (a flip or a turn) in place: the box keeps its middle where it was.
     /// An item without a bounding box is anchored at its top left first, as OBS's own flips
     /// leave it: libobs draws a flipped item anchored anywhere else off its box (by half its
@@ -1473,6 +1521,64 @@ impl Collection {
             return Err(StudioError::Failed(format!("the group \"{name}\" couldn't be made")));
         }
         Ok(self.info(item))
+    }
+
+    /// Puts sources of a scene into a new group, each staying where it is on screen and the
+    /// group where the topmost of them was (OBS's Group Selected Items). Groups and sources
+    /// already in a group can't go in. → the group.
+    pub fn group_together(&self, scene: &str, ids: &[i64], name: &str) -> Result<ItemInfo, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        self.name_free(name)?;
+        let a = self.api();
+        let top = self.raw_items(s);
+        // libobs wants them bottom first, as the scene holds them.
+        let mut items: Vec<*mut ffi::ObsSceneItem> = Vec::new();
+        for i in &top {
+            if ids.contains(&a.obs_sceneitem_get_id(*i)) {
+                if a.obs_sceneitem_is_group(*i) {
+                    return Err(StudioError::Failed("A group can't go inside another group.".into()));
+                }
+                items.push(*i);
+            }
+        }
+        if items.len() != ids.len() {
+            return Err(StudioError::Failed("Pick sources of this scene that aren't already in a group.".into()));
+        }
+        if items.is_empty() {
+            return Err(StudioError::Failed("Pick the sources to group.".into()));
+        }
+        for i in &items {
+            a.obs_sceneitem_force_update_transform(*i);
+        }
+        let n = cstr(name);
+        let group = a.obs_scene_insert_group2(s, n.as_ptr(), items.as_mut_ptr(), items.len(), true);
+        if group.is_null() {
+            return Err(StudioError::Failed(format!("the group \"{name}\" couldn't be made")));
+        }
+        Ok(self.info(group))
+    }
+
+    /// The sources in group `id` of a scene (names, top first) and the group's own name.
+    pub fn group_parts(&self, scene: &str, id: i64) -> Result<(String, Vec<String>), StudioError> {
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        if !a.obs_sceneitem_is_group(item) {
+            return Err(StudioError::Failed("That isn't a group.".into()));
+        }
+        let name = |i: *mut ffi::ObsSceneItem| text(a.obs_source_get_name(a.obs_sceneitem_get_source(i)));
+        Ok((name(item), self.group_items(item).into_iter().rev().map(name).collect()))
+    }
+
+    /// Ids of a scene's own sources (not in a group) with these names.
+    pub fn ids_named(&self, scene: &str, names: &[String]) -> Result<Vec<i64>, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        let a = self.api();
+        Ok(self
+            .raw_items(s)
+            .into_iter()
+            .filter(|i| names.contains(&text(a.obs_source_get_name(a.obs_sceneitem_get_source(*i)))))
+            .map(|i| a.obs_sceneitem_get_id(i))
+            .collect())
     }
 
     /// An item's place among its neighbours, counted from the top as the list shows them, and
@@ -1527,9 +1633,21 @@ impl Collection {
     /// keeping where it is on screen.
     pub fn set_group(&self, scene: &str, id: i64, group: Option<i64>) -> Result<(), StudioError> {
         let s = self.scene_ptr(scene)?;
+        self.holding_groups(s, || self.set_group_held(scene, id, group))
+    }
+
+    fn set_group_held(&self, scene: &str, id: i64, group: Option<i64>) -> Result<(), StudioError> {
+        let s = self.scene_ptr(scene)?;
         let item = self.item(scene, id)?;
         let a = self.api();
         let now = a.obs_sceneitem_get_group(s, item);
+        // libobs keeps an item where it is on screen using both transforms, which it otherwise
+        // works out only on the next frame (a group made a moment ago has none yet): the item
+        // jumped when it went in (2.1.3 test).
+        a.obs_sceneitem_force_update_transform(item);
+        if !now.is_null() {
+            a.obs_sceneitem_force_update_transform(now);
+        }
         match group {
             Some(g) => {
                 let target = self.item(scene, g)?;
@@ -1540,13 +1658,23 @@ impl Collection {
                     return Err(StudioError::Failed("A group can't go inside another group.".into()));
                 }
                 if now != target {
+                    // Where it is on the canvas, to put it back there inside the group: libobs's
+                    // own sum is off for a group that's been resized (2.1.3 test).
+                    let f = self.place(item).frame();
+                    let f = if now.is_null() { f } else { on_canvas(f, &self.group_matrix(now)) };
+                    a.obs_sceneitem_force_update_transform(target);
                     if !now.is_null() {
                         a.obs_sceneitem_group_remove_item(now, item);
                     }
                     // Its id may change on the way out: find it again by source.
                     let src = a.obs_sceneitem_get_source(item);
                     let moved = self.raw_items(s).into_iter().find(|i| a.obs_sceneitem_get_source(*i) == src);
-                    a.obs_sceneitem_group_add_item(target, moved.unwrap_or(item));
+                    let moved = moved.unwrap_or(item);
+                    a.obs_sceneitem_group_add_item(target, moved);
+                    let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+                    if w >= 1.0 && h >= 1.0 {
+                        self.set_item_box(scene, a.obs_sceneitem_get_id(moved), f[4], f[5], w, h)?;
+                    }
                 }
             }
             None => {
@@ -1686,14 +1814,16 @@ impl Collection {
             }
             ItemEdit::Center => {
                 // Moved, not re-anchored: libobs draws a flipped item anchored in its middle off
-                // its box (see `in_place`).
+                // its box (see `in_place`). Inside a group, the canvas's middle in its pixels.
                 let mid = self.box_middle(item);
+                let target = (c.width as f32 / 2.0, c.height as f32 / 2.0);
+                let target = match self.group_of(self.scene_ptr(scene)?, item) {
+                    Some(g) => off_canvas(&self.group_matrix(g), target),
+                    None => target,
+                };
                 let mut pos = ffi::Vec2 { x: 0.0, y: 0.0 };
                 a.obs_sceneitem_get_pos(item, &mut pos);
-                a.obs_sceneitem_set_pos(
-                    item,
-                    &ffi::Vec2 { x: pos.x + c.width as f32 / 2.0 - mid.x, y: pos.y + c.height as f32 / 2.0 - mid.y },
-                );
+                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: pos.x + target.0 - mid.x, y: pos.y + target.1 - mid.y });
             }
             ItemEdit::Reset => {
                 a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_NONE);
@@ -1815,13 +1945,26 @@ impl Collection {
     /// Remembers an item as it is now (a top-level item of `scene`), to put back later.
     pub fn snap(&self, scene: &str, id: i64) -> Result<ItemSnap, StudioError> {
         let s = self.scene_ptr(scene)?;
-        let items = self.raw_items(s);
-        let order = items
-            .iter()
-            .position(|i| self.api().obs_sceneitem_get_id(*i) == id)
-            .ok_or_else(|| StudioError::Failed(format!("there's no source with id {id} in \"{scene}\"")))?;
-        let item = items[order];
+        self.holding_groups(s, || self.snap_held(scene, id))
+    }
+
+    fn snap_held(&self, scene: &str, id: i64) -> Result<ItemSnap, StudioError> {
+        let s = self.scene_ptr(scene)?;
         let a = self.api();
+        let is = |i: &*mut ffi::ObsSceneItem| a.obs_sceneitem_get_id(*i) == id;
+        let top = self.raw_items(s);
+        // In the scene itself, or inside one of its groups.
+        let (item, order, group) = match top.iter().position(is) {
+            Some(o) => (top[o], o, None),
+            None => top
+                .iter()
+                .filter(|g| a.obs_sceneitem_is_group(**g))
+                .find_map(|g| {
+                    let kids = self.group_items(*g);
+                    kids.iter().position(is).map(|o| (kids[o], o, Some(a.obs_sceneitem_get_id(*g))))
+                })
+                .ok_or_else(|| StudioError::Failed(format!("there's no source with id {id} in \"{scene}\"")))?,
+        };
         let src = a.obs_source_get_ref(a.obs_sceneitem_get_source(item));
         if src.is_null() {
             return Err(StudioError::Failed("that source is being removed".into()));
@@ -1833,6 +1976,10 @@ impl Collection {
             id,
             name: text(a.obs_source_get_name(src)),
             order,
+            group,
+            canvas: group
+                .and_then(|g| self.item(scene, g).ok())
+                .map(|g| on_canvas(self.place(item).frame(), &self.group_matrix(g))),
             transform: self.transform(scene, id)?,
             visible: a.obs_sceneitem_visible(item),
             locked: a.obs_sceneitem_locked(item),
@@ -1849,14 +1996,23 @@ impl Collection {
     /// item was removed. Returns its id now (new if it was added again).
     pub fn restore(&self, snap: &ItemSnap) -> Result<i64, StudioError> {
         let s = self.scene_ptr(&snap.scene)?;
+        self.holding_groups(s, || self.restore_held(snap))
+    }
+
+    fn restore_held(&self, snap: &ItemSnap) -> Result<i64, StudioError> {
+        let s = self.scene_ptr(&snap.scene)?;
         let a = self.api();
-        let item = match self.raw_items(s).into_iter().find(|i| a.obs_sceneitem_get_id(*i) == snap.id) {
-            Some(i) => i,
-            None => {
+        let item = match self.item(&snap.scene, snap.id) {
+            Ok(i) => i,
+            Err(_) => {
                 self.reclaim_name(snap.src, &snap.name)?;
                 let i = a.obs_scene_add(s, snap.src);
                 if i.is_null() {
                     return Err(StudioError::Failed(format!("\"{}\" couldn't be put back", snap.name)));
+                }
+                // Back into its group, if that's still there (its place inside it is set below).
+                if let Some(g) = snap.group.and_then(|g| self.item(&snap.scene, g).ok()) {
+                    a.obs_sceneitem_group_add_item(g, i);
                 }
                 i
             }
@@ -1869,6 +2025,13 @@ impl Collection {
         a.obs_sceneitem_set_blending_method(item, snap.blend_method);
         a.obs_sceneitem_set_scale_filter(item, snap.scale_filter);
         a.obs_sceneitem_set_order_position(item, c_int::try_from(snap.order).unwrap_or(0));
+        // Inside a group: back where it was on the canvas.
+        if let Some(f) = snap.canvas.filter(|_| self.group_of(s, item).is_some()) {
+            let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            if w >= 1.0 && h >= 1.0 {
+                self.set_item_box(&snap.scene, id, f[4], f[5], w, h)?;
+            }
+        }
         for (show, t) in [(true, &snap.show), (false, &snap.hide)] {
             if self.item_transition(item, show) != *t {
                 self.set_item_transition(&snap.scene, id, show, t.as_ref())?;
@@ -2288,12 +2451,30 @@ impl Collection {
     /// box set by OBS's "bounding box" changes that box, anything else its scale (as OBS's
     /// own preview does). Returns it as it is now.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        self.holding_groups(s, || self.set_item_box_held(scene, id, x, y, w, h))
+    }
+
+    fn set_item_box_held(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
         const MAX: f32 = 100_000.0;
         if ![x, y, w, h].iter().all(|v| v.is_finite() && v.abs() <= MAX) || w < 1.0 || h < 1.0 {
             return Err(StudioError::Failed("That size or place is off the canvas.".into()));
         }
         let item = self.item(scene, id)?;
         let a = self.api();
+        // Inside a group the box is in the group's own pixels: bring the canvas box there.
+        let group = self.group_of(self.scene_ptr(scene)?, item).map(|g| self.group_matrix(g));
+        let (x, y, w, h) = match &group {
+            Some(m) => {
+                let (lx, ly) = off_canvas(m, (x, y));
+                let (sx, sy) = (m.x.x.hypot(m.x.y), m.y.x.hypot(m.y.y));
+                if !(sx > 0.0 && sy > 0.0) {
+                    return Err(StudioError::Failed("That group has no size to place a source in.".into()));
+                }
+                (lx, ly, w / sx, h / sy)
+            }
+            None => (x, y, w, h),
+        };
         let next = self.place(item).with_box(x, y, w, h);
         if next.bounds.is_some() {
             a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: next.box_size().0, y: next.box_size().1 });
@@ -2301,7 +2482,51 @@ impl Collection {
             a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: next.scale.0, y: next.scale.1 });
         }
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: next.pos.0, y: next.pos.1 });
-        Ok(self.info(item))
+        let mut info = self.info(item);
+        if let Some(m) = &group {
+            info.frame = on_canvas(info.frame, m);
+        }
+        Ok(info)
+    }
+
+    /// Crops an item from the preview (OBS's Alt-drag on a handle): `crop` is left, top, right,
+    /// bottom in the source's own pixels. What's left of the picture stays where it was on
+    /// screen. Returns it as it is now (its box on the canvas).
+    pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
+        let s = self.scene_ptr(scene)?;
+        self.holding_groups(s, || self.set_item_crop_held(scene, id, crop))
+    }
+
+    fn set_item_crop_held(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
+        let item = self.item(scene, id)?;
+        let a = self.api();
+        let src = a.obs_sceneitem_get_source(item);
+        let (w, h) = (a.obs_source_get_width(src) as i64, a.obs_source_get_height(src) as i64);
+        let [l, t, r, b] = crop.map(i64::from);
+        if [l, t, r, b].iter().any(|v| *v < 0) || l + r > w - 2 || t + b > h - 2 {
+            return Err(StudioError::Failed("That crops away the whole picture.".into()));
+        }
+        let mut was = ffi::Crop::default();
+        a.obs_sceneitem_get_crop(item, &mut was);
+        // The new top-left source pixel, where it is on screen now (in the item's own space:
+        // the canvas, or its group's pixels).
+        let mut before = ffi::Matrix4::default();
+        a.obs_sceneitem_force_update_transform(item);
+        a.obs_sceneitem_get_draw_transform(item, &mut before);
+        let (dx, dy) = ((crop[0] - was.left) as f32, (crop[1] - was.top) as f32);
+        let keep = (dx * before.x.x + dy * before.y.x + before.t.x, dx * before.x.y + dy * before.y.y + before.t.y);
+        a.obs_sceneitem_set_crop(item, &ffi::Crop { left: crop[0], top: crop[1], right: crop[2], bottom: crop[3] });
+        let mut after = ffi::Matrix4::default();
+        a.obs_sceneitem_force_update_transform(item);
+        a.obs_sceneitem_get_draw_transform(item, &mut after);
+        let mut pos = ffi::Vec2 { x: 0.0, y: 0.0 };
+        a.obs_sceneitem_get_pos(item, &mut pos);
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: pos.x + keep.0 - after.t.x, y: pos.y + keep.1 - after.t.y });
+        let mut info = self.info(item);
+        if let Some(g) = self.group_of(self.scene_ptr(scene)?, item) {
+            info.frame = on_canvas(info.frame, &self.group_matrix(g));
+        }
+        Ok(info)
     }
 
     /// Every source in a scene (groups included), with the scenes it's in, in scene order.
@@ -3107,6 +3332,27 @@ impl Place {
     }
 }
 
+/// A box ([`ItemInfo::frame`]) in a group's pixels, put on the canvas by the group's
+/// transform (libobs's row vectors: a point p goes to p.x·m.x + p.y·m.y + m.t).
+fn on_canvas(f: [f32; 6], m: &ffi::Matrix4) -> [f32; 6] {
+    let side = |x: f32, y: f32| (x * m.x.x + y * m.y.x, x * m.x.y + y * m.y.y);
+    let (ux, uy) = side(f[0], f[1]);
+    let (vx, vy) = side(f[2], f[3]);
+    let (cx, cy) = side(f[4], f[5]);
+    [ux, uy, vx, vy, cx + m.t.x, cy + m.t.y]
+}
+
+/// A canvas point in a group's pixels (the inverse of [`on_canvas`] for a point).
+fn off_canvas(m: &ffi::Matrix4, p: (f32, f32)) -> (f32, f32) {
+    let (a, b, c, d) = (m.x.x, m.x.y, m.y.x, m.y.y);
+    let det = a * d - b * c;
+    if det.abs() < f32::EPSILON {
+        return p;
+    }
+    let (px, py) = (p.0 - m.t.x, p.1 - m.t.y);
+    ((px * d - py * c) / det, (py * a - px * b) / det)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3117,6 +3363,28 @@ mod tests {
 
     fn close(a: [f32; 6], b: [f32; 6]) {
         assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01), "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn group_pixels_and_canvas_go_both_ways() {
+        let m4 = |ax: f32, ay: f32, bx: f32, by: f32, tx: f32, ty: f32| ffi::Matrix4 {
+            x: ffi::Vec4 { x: ax, y: ay, z: 0.0, w: 0.0 },
+            y: ffi::Vec4 { x: bx, y: by, z: 0.0, w: 0.0 },
+            z: ffi::Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },
+            t: ffi::Vec4 { x: tx, y: ty, z: 0.0, w: 1.0 },
+        };
+        // A group at (300, 200), half size.
+        let half = m4(0.5, 0.0, 0.0, 0.5, 300.0, 200.0);
+        assert_eq!(on_canvas([100.0, 0.0, 0.0, 50.0, 40.0, 20.0], &half), [50.0, 0.0, 0.0, 25.0, 320.0, 210.0]);
+        assert_eq!(off_canvas(&half, (320.0, 210.0)), (40.0, 20.0));
+        // Turned a quarter, doubled: a point there and back lands where it started.
+        let turned = m4(0.0, 2.0, -2.0, 0.0, 500.0, 100.0);
+        let p = (37.0, -12.5);
+        let f = on_canvas([0.0, 0.0, 0.0, 0.0, p.0, p.1], &turned);
+        let back = off_canvas(&turned, (f[4], f[5]));
+        assert!((back.0 - p.0).abs() < 1e-3 && (back.1 - p.1).abs() < 1e-3, "{back:?}");
+        // A group with no size leaves the point alone rather than dividing by zero.
+        assert_eq!(off_canvas(&m4(0.0, 0.0, 0.0, 0.0, 9.0, 9.0), (1.0, 2.0)), (1.0, 2.0));
     }
 
     #[test]

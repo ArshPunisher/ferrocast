@@ -1273,9 +1273,9 @@ impl Preview {
         (!p.is_null()).then(|| text(self.studio.inner.api.obs_source_get_name(p)))
     }
 
-    /// Outlines item `id` of `scene` with handles (as OBS marks the picked source), or nothing.
-    pub fn select(&self, pick: Option<(&str, i64)>) {
-        let pick = pick.map(|(scene, id)| (cstr(scene), id));
+    /// Outlines items `ids` of `scene` with handles (as OBS marks the picked sources), or nothing.
+    pub fn select(&self, pick: Option<(&str, &[i64])>) {
+        let pick = pick.map(|(scene, ids)| (cstr(scene), ids.to_vec()));
         if let Ok(mut sel) = self.state.selected.lock() {
             *sel = pick;
         }

@@ -436,6 +436,8 @@ api! {
     obs_sceneitem_get_bounds: fn(a: *const ObsSceneItem, b: *mut Vec2);
     obs_sceneitem_get_box_transform: fn(a: *const ObsSceneItem, b: *mut Matrix4);
     obs_sceneitem_force_update_transform: fn(a: *mut ObsSceneItem);
+    obs_sceneitem_defer_group_resize_begin: fn(a: *mut ObsSceneItem);
+    obs_sceneitem_defer_group_resize_end: fn(a: *mut ObsSceneItem);
     obs_sceneitem_set_blending_mode: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_get_blending_mode: fn(a: *const ObsSceneItem) -> c_int;
     obs_source_copy_filters: fn(a: *mut ObsSource, b: *mut ObsSource);
@@ -583,6 +585,8 @@ api! {
     obs_get_encoder_properties: fn(a: *const c_char) -> *mut ObsProperties;
     obs_view_create: fn() -> *mut ObsView;
     obs_scene_add_group2: fn(a: *mut ObsScene, b: *const c_char, c: bool) -> *mut ObsSceneItem;
+    obs_scene_insert_group2:
+        fn(a: *mut ObsScene, b: *const c_char, c: *mut *mut ObsSceneItem, d: usize, e: bool) -> *mut ObsSceneItem;
     obs_sceneitem_group_ungroup2: fn(a: *mut ObsSceneItem, b: bool);
     obs_sceneitem_group_add_item: fn(a: *mut ObsSceneItem, b: *mut ObsSceneItem);
     obs_sceneitem_group_remove_item: fn(a: *mut ObsSceneItem, b: *mut ObsSceneItem);
@@ -927,7 +931,8 @@ pub(crate) struct DrawState {
     pub api: *const Api,
     pub base: (u32, u32),
     /// The item picked in the preview (its scene's name and its id), outlined with handles.
-    pub selected: std::sync::Mutex<Option<(std::ffi::CString, i64)>>,
+    /// The scene and the ids picked in it (each outlined with handles, as OBS does).
+    pub selected: std::sync::Mutex<Option<(std::ffi::CString, Vec<i64>)>>,
     /// A scene to show instead of what's on air (Studio Mode's preview): our reference, and
     /// showing. Null for what's on air.
     pub scene: std::sync::Mutex<*mut ObsSource>,
@@ -1172,17 +1177,24 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
         && let Some(scene) = frames.as_ref()
     {
         for (id, m) in all_boxes(api, scene) {
-            if picked.as_ref().is_some_and(|(_, p)| *p == id) {
+            if picked.as_ref().is_some_and(|(_, p)| p.contains(&id)) {
                 continue;
             }
             draw_selection(api, &m, 1.0 / s, &frame_color(id), false, 1.5);
         }
     }
-    if let Some((scene, id)) = picked.as_ref()
-        && let Some(m) = item_box(api, scene, *id)
-            .or_else(|| all_boxes(api, scene).into_iter().find(|(i, _)| i == id).map(|(_, m)| m))
-    {
-        draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);
+    if let Some((scene, ids)) = picked.as_ref() {
+        // Sources inside groups have their boxes only in the group's own pixels: all_boxes
+        // puts them on the canvas.
+        let mut nested: Option<Vec<(i64, Matrix4)>> = None;
+        for id in ids {
+            let m = item_box(api, scene, *id).or_else(|| {
+                nested.get_or_insert_with(|| all_boxes(api, scene)).iter().find(|(i, _)| i == id).map(|(_, m)| *m)
+            });
+            if let Some(m) = m {
+                draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);
+            }
+        }
     }
     api.gs_projection_pop();
     api.gs_viewport_pop();
