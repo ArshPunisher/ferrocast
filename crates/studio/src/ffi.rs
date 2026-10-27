@@ -1554,6 +1554,24 @@ pub(crate) mod mac {
             /// Resized (by the page, or by AppKit as the window is resized): the picture is
             /// redrawn at the new size at once, as OBS's preview does, instead of a frame or
             /// two later stretched.
+            /// The window jumped in size (full screen, zoom): hidden at once, as the page can't
+            /// say where it goes until the change settles (the main thread is busy with the
+            /// animation), and a view left at the old size spills over the panels. The page
+            /// shows it again where things ended up. A drag's small steps leave it alone: the
+            /// page shows a still of it then.
+            #[unsafe(method(resizeWithOldSuperviewSize:))]
+            fn resize_with_old(&self, old: NSSize) {
+                // SAFETY: NSView's own resizeWithOldSuperviewSize: with AppKit's argument.
+                let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
+                // SAFETY: on the main thread (AppKit calls this there); only reads the tree.
+                if let Some(p) = unsafe { self.superview() } {
+                    let now = p.bounds().size;
+                    if (now.width - old.width).abs() > 60.0 || (now.height - old.height).abs() > 60.0 {
+                        self.setAlphaValue(0.0);
+                    }
+                }
+            }
+
             #[unsafe(method(setFrameSize:))]
             fn set_frame_size(&self, size: NSSize) {
                 // SAFETY: NSView's own setFrameSize: with the size AppKit passed.
