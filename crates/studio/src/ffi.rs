@@ -1443,10 +1443,35 @@ pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: 
 pub(crate) mod mac {
     use std::ffi::c_void;
 
+    use objc2::encode::{Encoding, RefEncode};
     use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::{NSAutoresizingMaskOptions, NSResponder, NSView};
-    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
+    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+
+    /// CoreGraphics' path (`CGPathRef`), only passed along.
+    #[repr(C)]
+    struct CGPath {
+        _opaque: [u8; 0],
+    }
+
+    // SAFETY: CGPathRef is `struct CGPath *`, which the Objective-C runtime encodes as below.
+    unsafe impl RefEncode for CGPath {
+        const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGPath", &[]));
+    }
+
+    #[link(name = "QuartzCore", kind = "framework")]
+    unsafe extern "C" {
+        static kCAFillRuleEvenOdd: &'static NSString;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPathCreateMutable() -> *mut CGPath;
+        fn CGPathAddRect(path: *mut CGPath, m: *const c_void, rect: NSRect);
+        fn CGPathRelease(path: *mut CGPath);
+    }
 
     define_class!(
         // SAFETY: NSView allows subclassing; PassView adds no ivars and doesn't implement Drop.
@@ -1566,6 +1591,60 @@ pub(crate) mod mac {
         pub fn remove(&self) {
             if MainThreadMarker::new().is_some() {
                 self.view.removeFromSuperview();
+            }
+        }
+
+        /// Leaves the picture out of `holes` (x, y, w, h in points from the view's top left)
+        /// so the page's menus and panels there show through it; none: all of it shows.
+        /// Main thread only; ignored elsewhere.
+        pub fn set_holes(&self, holes: &[(f64, f64, f64, f64)]) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            // SAFETY: `layer` on a layer-backed NSView (wantsLayer is set when it's made).
+            let layer: Option<Retained<AnyObject>> = unsafe { msg_send![&*self.view, layer] };
+            let Some(layer) = layer else { return };
+            let b = self.view.bounds();
+            let inside: Vec<NSRect> = holes
+                .iter()
+                .filter_map(|&(x, y, w, h)| {
+                    let (l, t) = (x.max(0.0), y.max(0.0));
+                    let (r, btm) = ((x + w).min(b.size.width), (y + h).min(b.size.height));
+                    (r > l && btm > t).then(|| {
+                        // The layer counts up from the bottom like its view (not flipped).
+                        let y0 = if self.view.isFlipped() { t } else { b.size.height - btm };
+                        NSRect::new(NSPoint::new(l, y0), NSSize::new(r - l, btm - t))
+                    })
+                })
+                .collect();
+            let none: Option<&AnyObject> = None;
+            if inside.is_empty() {
+                // SAFETY: CALayer's `mask` property takes nil.
+                let _: () = unsafe { msg_send![&*layer, setMask: none] };
+                return;
+            }
+            let Some(class) = AnyClass::get(c"CAShapeLayer") else { return };
+            // SAFETY: `+[CAShapeLayer layer]` makes a new layer (QuartzCore is linked above).
+            let mask: Option<Retained<AnyObject>> = unsafe { msg_send![class, layer] };
+            let Some(mask) = mask else { return };
+            // SAFETY: a fresh mutable path, filled then handed to the layer (which keeps its own
+            // reference) and released here.
+            unsafe {
+                let path = CGPathCreateMutable();
+                if path.is_null() {
+                    return;
+                }
+                CGPathAddRect(path, std::ptr::null(), NSRect::new(NSPoint::new(0.0, 0.0), b.size));
+                for r in &inside {
+                    CGPathAddRect(path, std::ptr::null(), *r);
+                }
+                // Even-odd: the whole view, minus each hole.
+                let _: () = msg_send![&*mask, setFillRule: kCAFillRuleEvenOdd];
+                let _: () = msg_send![&*mask, setPath: path];
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), b.size);
+                let _: () = msg_send![&*mask, setFrame: frame];
+                let _: () = msg_send![&*layer, setMask: &*mask];
+                CGPathRelease(path);
             }
         }
     }

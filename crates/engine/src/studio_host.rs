@@ -25,7 +25,7 @@ pub struct StudioStatus {
 }
 
 /// A box in the dashboard window, in CSS pixels from its top-left corner.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PreviewRect {
     pub x: f64,
     pub y: f64,
@@ -43,7 +43,14 @@ pub struct PreviewRect {
     /// missing: dark.
     #[serde(default)]
     pub bg: Option<u32>,
+    /// Where the page's menus and panels lie over the box (points from its top left): the
+    /// picture isn't drawn there, so they show through instead of the whole preview hiding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holes: Vec<CanvasBox>,
 }
+
+/// At most this many holes (menus, panels) at once.
+pub const PREVIEW_HOLES: usize = 16;
 
 impl PreviewRect {
     /// `bg` as libobs wants a display's colour (0xAABBGGRR).
@@ -84,6 +91,17 @@ impl PreviewRect {
         }
         if self.bg.is_some() && self.bg_abgr().is_none() {
             return Err("bg: a colour, 0 to 0xFFFFFF.".into());
+        }
+        if self.holes.len() > PREVIEW_HOLES {
+            return Err(format!("holes: at most {PREVIEW_HOLES}."));
+        }
+        if !self.holes.iter().all(|c| {
+            ok(c.x, -20_000.0, 20_000.0)
+                && ok(c.y, -20_000.0, 20_000.0)
+                && ok(c.w, 0.0, 20_000.0)
+                && ok(c.h, 0.0, 20_000.0)
+        }) {
+            return Err("holes: boxes of 0 to 20000 pixels near the box.".into());
         }
         Ok(())
     }
@@ -2326,28 +2344,33 @@ mod tests {
         for bad in ["", "a b", "../x", &"x".repeat(200)] {
             assert!(matches!(e.studio_options(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0, canvas: None, bg: None };
-        e.studio_preview(Some(r), Some(r)).await.unwrap();
+        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0, canvas: None, bg: None, holes: vec![] };
+        e.studio_preview(Some(r.clone()), Some(r.clone())).await.unwrap();
         e.studio_preview(None, None).await.unwrap();
         // The whole stage, with the canvas zoomed out inside it.
-        let staged = PreviewRect { canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }), ..r };
+        let staged = PreviewRect { canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }), ..r.clone() };
         assert!(staged.validate().is_ok());
-        let light = PreviewRect { bg: Some(0xe7e9ee), ..r };
+        // A menu over part of it: a hole there, the rest still shows.
+        let holed = PreviewRect { holes: vec![CanvasBox { x: 400.0, y: -10.0, w: 260.0, h: 500.0 }], ..r.clone() };
+        assert!(holed.validate().is_ok());
+        let light = PreviewRect { bg: Some(0xe7e9ee), ..r.clone() };
         assert_eq!(light.bg_abgr(), Some(0xffee_e9e7));
-        let canvas = |w: f64, h: f64| PreviewRect { canvas: Some(CanvasBox { x: 0.0, y: 0.0, w, h }), ..r };
+        let canvas = |w: f64, h: f64| PreviewRect { canvas: Some(CanvasBox { x: 0.0, y: 0.0, w, h }), ..r.clone() };
         for bad in [
-            PreviewRect { w: 0.0, ..r },
-            PreviewRect { h: f64::NAN, ..r },
-            PreviewRect { x: f64::INFINITY, ..r },
-            PreviewRect { w: 99_999.0, ..r },
-            PreviewRect { vh: -1.0, ..r },
+            PreviewRect { w: 0.0, ..r.clone() },
+            PreviewRect { h: f64::NAN, ..r.clone() },
+            PreviewRect { x: f64::INFINITY, ..r.clone() },
+            PreviewRect { w: 99_999.0, ..r.clone() },
+            PreviewRect { vh: -1.0, ..r.clone() },
             canvas(0.0, 270.0),
             canvas(480.0, f64::NAN),
-            PreviewRect { bg: Some(0x0100_0000), ..r },
+            PreviewRect { bg: Some(0x0100_0000), ..r.clone() },
+            PreviewRect { holes: vec![CanvasBox { x: 0.0, y: 0.0, w: f64::NAN, h: 1.0 }], ..r.clone() },
+            PreviewRect { holes: vec![CanvasBox { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }; PREVIEW_HOLES + 1], ..r.clone() },
         ] {
             assert!(matches!(e.studio_preview(None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
-        assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r), None], "only good boxes reach the app");
+        assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r.clone()), None], "only good boxes reach the app");
 
         let src =
             |kind: &str, name: &str, settings: Value| NewSource { kind: kind.into(), name: name.into(), settings };

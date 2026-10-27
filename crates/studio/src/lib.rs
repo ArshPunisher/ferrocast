@@ -1286,6 +1286,19 @@ impl Preview {
         self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr));
     }
 
+    /// Leaves the picture out where the page's menus and panels lie over it (x, y, w, h in
+    /// points from the top left of the box last given to `set_rect` or `set_area`), so they
+    /// show instead of the whole preview hiding. Main thread.
+    pub fn set_holes(&self, holes: &[(f64, f64, f64, f64)]) {
+        // `set_rect`'s view reaches PREVIEW_EDGE past the page's box; `set_area`'s is the box.
+        let edge = if self.state.canvas.lock().map(|g| g.is_none()).unwrap_or(true) { PREVIEW_EDGE } else { 0.0 };
+        let moved: Vec<_> = holes.iter().map(|&(x, y, w, h)| (x + edge, y + edge, w, h)).collect();
+        #[cfg(target_os = "macos")]
+        self.view.set_holes(&moved);
+        #[cfg(not(target_os = "macos"))]
+        let _ = moved;
+    }
+
     /// Outlines every source of `scene` in its own colour, or none.
     pub fn frames(&self, scene: Option<&str>) {
         if let Ok(mut f) = self.state.frames.lock() {

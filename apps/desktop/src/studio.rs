@@ -51,8 +51,12 @@ struct Held {
     preview_canvas: Option<(f64, f64, f64, f64)>,
     /// The page's colour round the canvas (0xAABBGGRR), when it said.
     preview_bg: Option<u32>,
+    /// Where the page's menus and panels lie over the preview (points from its box's top left).
+    preview_holes: Vec<(f64, f64, f64, f64)>,
     /// The same for Studio Mode's picture of what's on air.
     program_bg: Option<u32>,
+    /// Where the page's menus and panels lie over Studio Mode's picture of what's on air.
+    program_holes: Vec<(f64, f64, f64, f64)>,
     /// Undo and redo for sources.
     history: History,
     /// Studio Mode's picture of what's on air, beside the preview, and where it goes.
@@ -660,6 +664,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(c) = h.program_bg {
         p.background(c);
     }
+    p.set_holes(&h.program_holes);
     h.program_view = Some(p);
     Ok(())
 }
@@ -679,6 +684,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(c) = h.preview_bg {
         p.background(c);
     }
+    p.set_holes(&h.preview_holes);
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -891,6 +897,10 @@ impl StudioHost for DesktopStudio {
             } else {
                 make_program_view(&app, h)?;
             }
+            h.program_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h)).collect();
+            if let Some(p) = h.program_view.as_ref() {
+                p.set_holes(&h.program_holes);
+            }
             // The stage round it matches the page's theme.
             h.program_bg = r.bg_abgr();
             if let (Some(p), Some(c)) = (h.program_view.as_ref(), h.program_bg) {
@@ -915,6 +925,7 @@ impl StudioHost for DesktopStudio {
             h.preview_at = Some((rect, scale));
             h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
             h.preview_bg = r.bg_abgr();
+            h.preview_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h)).collect();
             if let Some(p) = h.preview.as_mut() {
                 if let Some(c) = h.preview_bg {
                     p.background(c);
@@ -923,6 +934,7 @@ impl StudioHost for DesktopStudio {
                     Some(c) => p.set_area(rect, c, scale),
                     None => p.set_rect(rect, scale),
                 }
+                p.set_holes(&h.preview_holes);
                 return Ok(());
             }
             make_preview(&app, h)
