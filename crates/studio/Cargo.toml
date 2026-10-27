@@ -16,6 +16,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 png = "0.17"
+# Scene pictures as data URLs (the Scenes grid), on every platform.
+base64 = "0.23"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -23,7 +25,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSImage", "NSGraphics", "NSScreen", "NSEvent", "objc2-core-foundation"] }
 # The Web page source: a WKWebView snapshotted into a texture (2.1, Browser source on WebKit).
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKSnapshotConfiguration", "WKNavigation", "WKUserScript", "WKUserContentController", "WKPreferences", "WKScriptMessage", "WKScriptMessageHandler"] }
-base64 = "0.23"
 block2 = "0.6"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
 
