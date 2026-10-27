@@ -44,6 +44,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
         .route("/studio/engine/scenes/{scene}/items/{id}/crop", put(engine_item_crop))
+        .route("/studio/engine/scenes/{scene}/thumbnail", get(engine_scene_thumbnail))
         .route(
             "/studio/engine/scenes/{scene}/items/{id}/transform",
             get(engine_item_transform).put(engine_set_item_transform),
@@ -559,6 +560,26 @@ async fn engine_item_box(
     Body(b): Body<BoxBody>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetItemBox { scene, id, x: b.x, y: b.y, w: b.w, h: b.h, save: b.save }).await
+}
+
+#[derive(Deserialize)]
+struct ThumbQuery {
+    #[serde(default = "thumb_width")]
+    w: u32,
+}
+
+fn thumb_width() -> u32 {
+    256
+}
+
+/// `GET …/scenes/{scene}/thumbnail?w=256` → `{ image }`: a small PNG of the scene now (the
+/// Scenes grid's tiles).
+async fn engine_scene_thumbnail(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Query(q): Query<ThumbQuery>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Thumbnail { scene, width: q.w }).await
 }
 
 #[derive(Deserialize)]

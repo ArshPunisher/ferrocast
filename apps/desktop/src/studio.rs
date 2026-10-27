@@ -483,6 +483,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::MissingFiles => v(to_json!(c.missing_files())),
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
+        A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
         A::GroupItems { scene, ids, name } => v(to_json!(c.group_together(&scene, &ids, &name)?)),
         A::ItemOrder { scene, id, to } => done(c.item_order(&scene, id, to)),
         A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
@@ -1112,6 +1113,11 @@ impl StudioHost for DesktopStudio {
     async fn stats(&self) -> Result<Value, String> {
         self.on_main(|h| {
             let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            // The page asks for stats every second, so scenes held for the grid's pictures
+            // are let go soon after it closes.
+            if let Some(c) = &h.collection {
+                c.let_thumbs_go(false);
+            }
             let disk_free = {
                 let folder = record_folder(&h.settings.clone().unwrap_or_default());
                 let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);

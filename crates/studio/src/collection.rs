@@ -477,6 +477,10 @@ pub struct Collection {
     /// The last transition was driven by the T-bar (libobs then reports the bar's place, not
     /// a time).
     by_hand: RefCell<bool>,
+    /// Scenes whose pictures are asked for (the scene grid), kept showing between pictures as
+    /// OBS's multiview does: a scene that only shows for one draw hasn't loaded its media or
+    /// captures. Our reference each, with the last time asked; let go by `let_thumbs_go`.
+    thumb_showing: RefCell<HashMap<String, (*mut ffi::ObsSource, std::time::Instant)>>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -551,6 +555,7 @@ impl Collection {
             black: RefCell::new(None),
             by_hand: RefCell::new(false),
             media_intent: RefCell::new(HashMap::new()),
+            thumb_showing: RefCell::new(HashMap::new()),
             true_peak: RefCell::new(false),
         };
         c.make_transition("fade_transition")?;
@@ -2938,6 +2943,65 @@ impl Collection {
         Ok(())
     }
 
+    /// A small picture of a scene as it looks now (`width` pixels wide, the canvas's shape), as a
+    /// PNG data URL: the Scenes grid's tiles, as OBS's multiview.
+    pub fn thumbnail(&self, scene: &str, width: u32) -> Result<String, StudioError> {
+        use base64::Engine as _;
+        let s = self.scene_src(scene)?;
+        let a = self.api();
+        let c = self.studio.canvas();
+        if c.width == 0 || c.height == 0 {
+            return Err(StudioError::Failed("The canvas has no size yet.".into()));
+        }
+        let w = width.clamp(64, 640);
+        let h = ((w as u64 * c.height as u64) / c.width as u64).max(1) as u32;
+        {
+            let mut held = self.thumb_showing.borrow_mut();
+            match held.get_mut(scene) {
+                Some((src, at)) if *src == s => *at = std::time::Instant::now(),
+                _ => {
+                    // New, or the name is another scene now (undone removal, renames).
+                    if let Some((old, _)) = held.remove(scene) {
+                        a.obs_source_dec_showing(old);
+                        a.obs_source_release(old);
+                    }
+                    let r = a.obs_source_get_ref(s);
+                    if !r.is_null() {
+                        a.obs_source_inc_showing(r);
+                        held.insert(scene.to_string(), (r, std::time::Instant::now()));
+                    }
+                }
+            }
+        }
+        let src = Ref { api: a, ptr: a.obs_source_get_ref(s) };
+        let px = ffi::snapshot_scaled(a, src.ptr, (c.width, c.height), w, h)
+            .ok_or_else(|| StudioError::Failed(format!("\"{scene}\" couldn't be drawn")))?;
+        let mut out = Vec::with_capacity(px.len() / 4);
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        enc.write_header()
+            .and_then(|mut wr| wr.write_image_data(&px))
+            .map_err(|e| StudioError::Failed(format!("\"{scene}\"'s picture couldn't be made ({e})")))?;
+        Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&out)))
+    }
+
+    /// Lets go of scenes kept showing for pictures that haven't been asked for in a while (the
+    /// grid closed, or the scene went), or of all of them with `all`.
+    pub fn let_thumbs_go(&self, all: bool) {
+        const KEEP: std::time::Duration = std::time::Duration::from_secs(10);
+        let a = self.api();
+        self.thumb_showing.borrow_mut().retain(|_, (src, at)| {
+            if !all && at.elapsed() < KEEP {
+                return true;
+            }
+            a.obs_source_dec_showing(*src);
+            a.obs_source_release(*src);
+            false
+        });
+    }
+
     /// Clicks, stops clicking or reloads a Web page source.
     pub fn web(&self, name: &str, what: WebAct) -> Result<(), StudioError> {
         let src = self.source(name)?;
@@ -3219,6 +3283,7 @@ impl Collection {
 impl Drop for Collection {
     fn drop(&mut self) {
         self.meters.borrow_mut().clear();
+        self.let_thumbs_go(true);
         let a = &self.studio.inner.api;
         a.obs_set_output_source(0, ptr::null_mut());
         // As OBS clears a collection: every source in a scene, each scene, the devices.

@@ -1199,6 +1199,11 @@ pub enum StudioAct {
         scene: String,
         name: String,
     },
+    /// A small picture of a scene now, `width` pixels wide → `{ image }` (a PNG data URL).
+    Thumbnail {
+        scene: String,
+        width: u32,
+    },
     /// Puts these sources of a scene into a new group, each where it is on screen (OBS's
     /// Group Selected Items) → the group.
     GroupItems {
@@ -1436,6 +1441,13 @@ impl StudioAct {
                 check_source_name(name)
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
+            A::Thumbnail { scene, width } => {
+                check_source_name(scene)?;
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
+                }
+                Ok(())
+            }
             A::GroupItems { scene, ids, name } => {
                 check_source_name(scene)?;
                 check_source_name(name)?;
@@ -1534,6 +1546,7 @@ impl StudioAct {
         !matches!(
             self,
             A::Scenes
+                | A::Thumbnail { .. }
                 | A::Items { .. }
                 | A::Sources
                 | A::Settings { .. }

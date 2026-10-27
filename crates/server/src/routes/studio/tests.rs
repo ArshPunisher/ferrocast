@@ -593,6 +593,7 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3, "also": [4, 5] })).await,
         r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "Cam + frame", "items": [3, 4] })).await,
+        r.get("/studio/engine/scenes/Gameplay/thumbnail?w=256").await,
         r.put("/studio/engine/scenes/Gameplay/items/3/crop", json!({ "left": 10, "top": 0, "right": 0, "bottom": 20 }))
             .await,
         r.put("/studio/engine/preview/selection", json!({ "scene": null, "id": null })).await,
@@ -661,6 +662,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         ),
         (r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0 })).await, "no size"),
         (r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "G", "items": [] })).await, "group of nothing"),
+        (r.get("/studio/engine/scenes/Gameplay/thumbnail?w=10").await, "thumbnail too small"),
+        (r.get("/studio/engine/scenes/Gameplay/thumbnail?w=5000").await, "thumbnail too big"),
         (
             r.put("/studio/engine/scenes/Gameplay/items/3/crop", json!({ "left": -1, "top": 0, "right": 0, "bottom": 0 }))
                 .await,
