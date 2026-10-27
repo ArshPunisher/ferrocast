@@ -5,8 +5,15 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.1.3
+## 2.1.4
 
+- Group the OBS way: ⌘-click or Shift-click to pick several sources, then right-click › Group
+  selected items. Everything stays exactly where it was.
+- Inside a group, pick one source and move, resize or nudge it on its own; pick the group to
+  move it all. Sources no longer jump when they go into a group.
+- Drag several picked sources together in the preview, and hide, lock or transform them all
+  at once.
+- Hold Alt (Option) while dragging a handle to crop, as in OBS.
 - Flipping a source keeps it in place. A source you sized by dragging used to jump half its
   width out of its outline when flipped; if one of yours did, flip it once more.
 - The live preview keeps playing when a menu, side panel or window opens over part of it,
