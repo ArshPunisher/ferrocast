@@ -942,10 +942,6 @@ pub(crate) struct DrawState {
     /// Where the canvas is inside the view (device pixels: x, y, w, h), when the page says;
     /// else it's fitted inside the margin. Around it, outlines of what's off the canvas show.
     pub canvas: std::sync::Mutex<Option<(f32, f32, f32, f32)>>,
-    /// How the page fits the canvas in the view (padding in device pixels, zoom, width over
-    /// height): then the canvas is placed by that rule from the view's size at each draw, so
-    /// it stays right while the window is being resized, before the page catches up.
-    pub fit: std::sync::Mutex<Option<(f32, f32, f32)>>,
     /// A scene whose sources all get an outline, each in its own colour.
     pub frames: std::sync::Mutex<Option<std::ffi::CString>>,
     /// A dark layer over everything, as a dialog's backdrop dims the page round the view
@@ -1149,18 +1145,7 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     // SAFETY: as above, the Api outlives every registered draw callback.
     let api = unsafe { &*st.api };
     let (bw, bh) = (st.base.0.max(1) as f32, st.base.1.max(1) as f32);
-    let fit = st.fit.lock().ok().and_then(|g| *g);
-    let placed = match fit {
-        // The page's rule (CSS: the largest box of this shape inside the padding, times the
-        // zoom, in the middle) applied to the view's size now.
-        Some((pad, zoom, aspect)) if aspect > 0.0 => {
-            let (aw, ah) = ((cx as f32 - 2.0 * pad).max(1.0), (cy as f32 - 2.0 * pad).max(1.0));
-            let w = aw.min(ah * aspect) * zoom;
-            let h = w / aspect;
-            Some(((cx as f32 - w) / 2.0, (cy as f32 - h) / 2.0, w, h))
-        }
-        _ => st.canvas.lock().ok().and_then(|g| *g),
-    };
+    let placed = st.canvas.lock().ok().and_then(|g| *g);
     let (x, y, w, h, scale) = match placed {
         // Where the page put it (zoomed out, it leaves room to see what's off the canvas).
         Some((px_, py, pw, ph)) if pw >= 1.0 && ph >= 1.0 => {
@@ -1631,7 +1616,12 @@ pub(crate) mod mac {
         let vh = if vh > 0.0 && vh <= p.size.height { vh } else { p.size.height };
         // AppKit counts from the bottom unless the view is flipped; the page counts from the top.
         let top = if parent.isFlipped() { p.origin.y + (p.size.height - vh) + y } else { p.origin.y + vh - y - h };
-        NSRect::new(NSPoint::new(p.origin.x + x, top), NSSize::new(w.max(1.0), h.max(1.0)))
+        // On whole device pixels, covering the box: a frame on a half pixel (the page's boxes
+        // often are) left a row of the GL surface undrawn, a black line along the stage.
+        let s = parent.window().map(|w| w.backingScaleFactor()).filter(|s| *s > 0.0).unwrap_or(1.0);
+        let (x0, y0) = (((p.origin.x + x) * s).floor() / s, (top * s).floor() / s);
+        let (x1, y1) = (((p.origin.x + x + w.max(1.0)) * s).ceil() / s, ((top + h.max(1.0)) * s).ceil() / s);
+        NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0))
     }
 
     /// Adds a view over `parent` (an `NSView *` the window toolkit handed out) at the rectangle.
@@ -1685,6 +1675,15 @@ pub(crate) mod mac {
             Retained::as_ptr(&self.view) as *mut c_void
         }
 
+        /// Its size in device pixels (what libobs draws into). None off the main thread.
+        pub fn pixels(&self) -> Option<(u32, u32)> {
+            MainThreadMarker::new()?;
+            let f = self.view.frame();
+            let s = self.view.window().map(|w| w.backingScaleFactor()).unwrap_or(1.0);
+            let px = |v: f64| (v * s).round().clamp(1.0, 16_384.0) as u32;
+            Some((px(f.size.width), px(f.size.height)))
+        }
+
         /// Moves and resizes it (the page's box moved). Main thread only; ignored elsewhere.
         pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64, vh: f64) {
             if MainThreadMarker::new().is_none() {
@@ -1709,25 +1708,6 @@ pub(crate) mod mac {
             if MainThreadMarker::new().is_some() {
                 self.pass.ivars().resize.set(Some((api, display)));
             }
-        }
-
-        /// `follow`: kept at the same distance from every edge of the window as it's resized
-        /// (the Studio's stage grows and shrinks with the window), so it moves with AppKit's
-        /// resize itself instead of a frame behind; else it keeps its size, the same
-        /// distance from the top. Main thread only.
-        pub fn follow(&self, follow: bool) {
-            if MainThreadMarker::new().is_none() {
-                return;
-            }
-            // SAFETY: on the main thread (checked above); only reads the view tree.
-            let flipped = unsafe { self.view.superview() }.is_some_and(|p| p.isFlipped());
-            self.view.setAutoresizingMask(if follow {
-                NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
-            } else if flipped {
-                NSAutoresizingMaskOptions::ViewMaxYMargin
-            } else {
-                NSAutoresizingMaskOptions::ViewMinYMargin
-            });
         }
 
         /// The view's own colour under the picture (0xAABBGGRR, as libobs takes it), shown

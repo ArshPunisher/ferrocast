@@ -49,8 +49,6 @@ struct Held {
     frames: Option<String>,
     /// Where the canvas is inside the preview's box (points), when the page placed it.
     preview_canvas: Option<(f64, f64, f64, f64)>,
-    /// How the page fits the canvas in the stage (padding, zoom), for resizing natively.
-    preview_fit: Option<(f64, f64)>,
     /// The page's colour round the canvas (0xAABBGGRR), when it said.
     preview_bg: Option<u32>,
     /// Where the page's menus and panels lie over the preview (points from its box's top left).
@@ -109,25 +107,23 @@ thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
 }
 
-/// Where OBS is installed (macOS), if it is, with the renderer to load (`metal`, else OpenGL).
-fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
+/// Where OBS is installed (macOS), if it is.
+fn obs_paths() -> Option<(Paths, &'static str)> {
     #[cfg(target_os = "macos")]
     {
         let mut places = vec![PathBuf::from("/Applications/OBS.app/Contents")];
         if let Some(home) = dirs::home_dir() {
             places.push(home.join("Applications/OBS.app/Contents"));
         }
-        // OpenGL is OBS's own default on a Mac. Metal drew without late frames in the app too
-        // (27 Oct) and resizes smoothly (OpenGL's surface shows a black strip for a frame as
-        // the window grows), so it's offered in Settings › Advanced.
+        // OpenGL drew without late frames in the 25 Oct runs; Metal is tried again once the
+        // preview lives in the app (STUDIO-PARITY, spikes/libobs-mac).
         places
             .into_iter()
             .find(|p| p.join("Frameworks/libobs.framework").exists())
-            .map(|c| (Paths::from_obs_app(&c, metal), if metal { "metal" } else { "opengl" }))
+            .map(|c| (Paths::from_obs_app(&c, false), "opengl"))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = metal;
         None
     }
 }
@@ -692,7 +688,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     let mut p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     if let Some(c) = h.preview_canvas {
-        p.set_area(rect, c, scale, h.preview_fit);
+        p.set_area(rect, c, scale);
     }
     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
     p.frames(h.frames.as_deref());
@@ -784,7 +780,7 @@ impl DesktopStudio {
     }
 
     fn status_of(h: &Held) -> StudioStatus {
-        let found = obs_paths(false).is_some();
+        let found = obs_paths().is_some();
         StudioStatus {
             available: found,
             running: h.collection.is_some(),
@@ -811,8 +807,8 @@ impl StudioHost for DesktopStudio {
                 return Ok(Self::status_of(h));
             }
             if h.studio.is_none() {
+                let (paths, renderer) = obs_paths().ok_or(NO_OBS)?;
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
-                let (paths, renderer) = obs_paths(s.renderer == "metal").ok_or(NO_OBS)?;
                 let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                 let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
                 let audio = AudioSetup {
@@ -945,7 +941,6 @@ impl StudioHost for DesktopStudio {
             let scale = window.scale_factor().unwrap_or(1.0);
             h.preview_at = Some((rect, scale));
             h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
-            h.preview_fit = r.fit.map(|f| (f.pad, f.zoom));
             h.preview_bg = r.bg_abgr();
             h.preview_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
             h.preview_opacity = r.opacity;
@@ -955,7 +950,7 @@ impl StudioHost for DesktopStudio {
                     p.background(c);
                 }
                 match h.preview_canvas {
-                    Some(c) => p.set_area(rect, c, scale, h.preview_fit),
+                    Some(c) => p.set_area(rect, c, scale),
                     None => p.set_rect(rect, scale),
                 }
                 p.set_holes(&h.preview_holes);
@@ -1087,9 +1082,6 @@ impl StudioHost for DesktopStudio {
                             || a.low_latency != s.low_latency_audio
                     }) {
                         notes.push("Sound changes apply after Ferrocast restarts.".into());
-                    }
-                    if h.studio.is_some() && h.renderer != s.renderer {
-                        notes.push("The new way of drawing applies after Ferrocast restarts.".into());
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));

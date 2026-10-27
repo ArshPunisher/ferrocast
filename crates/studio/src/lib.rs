@@ -1143,7 +1143,8 @@ impl Studio {
             };
             let view = ffi::mac::child_view(h.ns_view.as_ptr(), rect.x, rect.y, rect.w, rect.h, rect.vh)
                 .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?;
-            let (cx, cy) = px(rect, scale);
+            // The view's own pixels (its frame is snapped to whole pixels round the box).
+            let (cx, cy) = view.pixels().unwrap_or_else(|| px(rect, scale));
             let init = ffi::GsInitData {
                 window: view.ptr(),
                 cx,
@@ -1167,7 +1168,6 @@ impl Studio {
                 scene: std::sync::Mutex::new(ptr::null_mut()),
                 edge: std::sync::atomic::AtomicU32::new(edge_px(scale)),
                 canvas: std::sync::Mutex::new(None),
-                fit: std::sync::Mutex::new(None),
                 frames: std::sync::Mutex::new(None),
                 shade: std::sync::atomic::AtomicU32::new(0),
             });
@@ -1234,6 +1234,15 @@ pub struct Preview {
 }
 
 impl Preview {
+    /// The size it draws at: its view's own pixels (snapped round the box) where there's one.
+    fn pixels(&self, rect: Rect, scale: f64) -> (u32, u32) {
+        #[cfg(target_os = "macos")]
+        if let Some(p) = self.view.pixels() {
+            return p;
+        }
+        px(rect, scale)
+    }
+
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: Rect, scale: f64) {
         let rect = with_edge(rect);
@@ -1241,16 +1250,10 @@ impl Preview {
         if let Ok(mut g) = self.state.canvas.lock() {
             *g = None;
         }
-        if let Ok(mut g) = self.state.fit.lock() {
-            *g = None;
-        }
         self.state.edge.store(edge_px(scale), std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
-        {
-            self.view.follow(false);
-            self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
-        }
-        let (cx, cy) = px(rect, scale);
+        self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
+        let (cx, cy) = self.pixels(rect, scale);
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
 
@@ -1337,26 +1340,14 @@ impl Preview {
     /// Covers `area` (the page's whole stage) and draws the canvas at `canvas` inside it
     /// (points, from the area's top left): zoomed out, the outlines of what's off the canvas
     /// show round it. Main thread.
-    ///
-    /// `fit` (padding in points, zoom): how the page fits the canvas in the area; then the
-    /// area grows and shrinks with the window and the canvas is fitted by the same rule as it
-    /// does, so resizing the window is smooth before the page sends where it ends up.
-    pub fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64, fit: Option<(f64, f64)>) {
+    pub fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64) {
         self.scale = scale;
         #[cfg(target_os = "macos")]
-        {
-            self.view.follow(fit.is_some());
-            self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
-        }
-        let (cx, cy) = px(area, scale);
+        self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        let (cx, cy) = self.pixels(area, scale);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         if let Ok(mut g) = self.state.canvas.lock() {
             *g = Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
-        }
-        if let Ok(mut g) = self.state.fit.lock() {
-            *g = fit
-                .filter(|_| canvas.3 > 0.0)
-                .map(|(pad, zoom)| ((pad * s) as f32, zoom as f32, (canvas.2 / canvas.3) as f32));
         }
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
