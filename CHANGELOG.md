@@ -5,7 +5,22 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 2.1.4
+## 2.1.5
+
+- A status bar along the bottom of the window, like OBS's: live and recording times, CPU,
+  frame rate, dropped frames and upload. Click it for Stats.
+- Stats has graphs of the last minute and a table of your outputs.
+- Drop pictures, videos and sounds onto the Studio to add them as sources.
+- Resizing the window or the panels is smooth: no black edges, nothing spilling over the
+  panels. The dividers follow your mouse exactly, and the preview can be made as small as
+  you like.
+- Right-click a source in the preview for its menu; outlines show when you point at a source.
+- Scenes as a grid of live pictures.
+- Studio settings open in a wide window with the pages down the side.
+- Clearer colours: what's picked is solid dark grey, menus highlight the row you point at.
+- Menus and dialogs over the preview show cleanly, with rounded corners, and the preview
+  dims under a dialog like the rest of the window.
+- An open filter folds away when you click elsewhere.
 
 - Group the OBS way: ⌘-click or Shift-click to pick several sources, then right-click › Group
   selected items. Everything stays exactly where it was.
