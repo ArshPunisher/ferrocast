@@ -5,6 +5,15 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.1.2
+
+- Updates download in seconds. Ferrocast now fetches updates from a fast mirror, so a
+  46 MB update no longer takes minutes in India.
+- The update window no longer scrolls the page behind it.
+- "What's new" reads properly: sentences no longer break into separate lines, and bold
+  text shows as bold.
+- The website's Download buttons use the same fast mirror.
+
 ## 2.1.1
 
 **The Studio: stream without OBS.** Ferrocast now has OBS's own engine inside it. In Studio ›
