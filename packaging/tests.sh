@@ -62,8 +62,8 @@ done
 if command -v jq >/dev/null; then
   json="$("$m" 0.1.0-beta.1 "$tmp/dist")"
   is "version" "$(jq -r .version <<<"$json")" 0.1.0-beta.1
-  is "urls point at the tag's own release" "$(jq -r '.platforms["windows-x86_64"].url' <<<"$json")" \
-    https://github.com/ArshPunisher/ferrocast/releases/download/v0.1.0-beta.1/Ferrocast_0.1.0-beta.1_x64-setup.exe
+  is "urls point at the tag's files on the mirror" "$(jq -r '.platforms["windows-x86_64"].url' <<<"$json")" \
+    https://ferrocast.clearcraftlabs.com/dl/v0.1.0-beta.1/Ferrocast_0.1.0-beta.1_x64-setup.exe
   is "every platform" "$(jq -r '.platforms | keys | join(",")' <<<"$json")" \
     darwin-aarch64,darwin-x86_64,linux-x86_64,linux-x86_64-deb,linux-x86_64-rpm,windows-x86_64
   is "signature" "$(jq -r '.platforms["darwin-aarch64"].signature' <<<"$json")" sig-of-Ferrocast.app.tar.gz

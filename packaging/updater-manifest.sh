@@ -22,7 +22,10 @@ fi
   echo "'$version' isn't a version (MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-beta.N)" >&2
   exit 1
 }
-base="https://github.com/ArshPunisher/ferrocast/releases/download/v${version}"
+# Served through the website's Cloudflare mirror (ferrocast-web functions/dl): GitHub's own
+# downloads can crawl in some regions. It only passes a tagged release's files through, and
+# the app checks each bundle's signature either way.
+base="https://ferrocast.clearcraftlabs.com/dl/v${version}"
 
 entry() { # <platform key> <file>
   local file=$2
