@@ -435,6 +435,7 @@ api! {
     obs_sceneitem_get_bounds_alignment: fn(a: *const ObsSceneItem) -> u32;
     obs_sceneitem_get_bounds: fn(a: *const ObsSceneItem, b: *mut Vec2);
     obs_sceneitem_get_box_transform: fn(a: *const ObsSceneItem, b: *mut Matrix4);
+    obs_sceneitem_force_update_transform: fn(a: *mut ObsSceneItem);
     obs_sceneitem_set_blending_mode: fn(a: *mut ObsSceneItem, b: c_int);
     obs_sceneitem_get_blending_mode: fn(a: *const ObsSceneItem) -> c_int;
     obs_source_copy_filters: fn(a: *mut ObsSource, b: *mut ObsSource);

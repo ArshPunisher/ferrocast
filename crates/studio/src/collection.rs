@@ -1417,29 +1417,50 @@ impl Collection {
         a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
     }
 
-    /// Puts the item's anchor at its middle without moving it on screen, so flips and turns
-    /// happen in place (as OBS does).
-    fn anchor_middle(&self, item: *mut ffi::ObsSceneItem) {
-        let a = self.api();
+    /// The middle of the item's box on the canvas, as it is now (libobs works the box out
+    /// only on its next frame otherwise: a new item's is still empty).
+    fn box_middle(&self, item: *mut ffi::ObsSceneItem) -> ffi::Vec2 {
         let mut m = ffi::Matrix4::default();
-        a.obs_sceneitem_get_box_transform(item, &mut m);
-        let mid = ffi::Vec2 { x: (m.x.x + m.y.x) * 0.5 + m.t.x, y: (m.x.y + m.y.y) * 0.5 + m.t.y };
-        a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_CENTER);
-        a.obs_sceneitem_set_pos(item, &mid);
+        self.api().obs_sceneitem_force_update_transform(item);
+        self.api().obs_sceneitem_get_box_transform(item, &mut m);
+        ffi::Vec2 { x: (m.x.x + m.y.x) * 0.5 + m.t.x, y: (m.x.y + m.y.y) * 0.5 + m.t.y }
+    }
+
+    /// Makes a change (a flip or a turn) in place: the box keeps its middle where it was.
+    /// An item without a bounding box is anchored at its top left first, as OBS's own flips
+    /// leave it: libobs draws a flipped item anchored anywhere else off its box (by half its
+    /// width when anchored in the middle, 2.1.1).
+    fn in_place(&self, item: *mut ffi::ObsSceneItem, change: impl FnOnce()) {
+        let a = self.api();
+        let before = self.box_middle(item);
+        if a.obs_sceneitem_get_bounds_type(item) == ffi::OBS_BOUNDS_NONE {
+            let mut m = ffi::Matrix4::default();
+            a.obs_sceneitem_get_box_transform(item, &mut m);
+            // Anchored at its top left, the box's first corner is where the item sits.
+            a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+            a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: m.t.x, y: m.t.y });
+        }
+        change();
+        let after = self.box_middle(item);
+        let mut pos = ffi::Vec2 { x: 0.0, y: 0.0 };
+        a.obs_sceneitem_get_pos(item, &mut pos);
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: pos.x + before.x - after.x, y: pos.y + before.y - after.y });
     }
 
     fn scale_by(&self, item: *mut ffi::ObsSceneItem, x: f32, y: f32) {
         let a = self.api();
-        self.anchor_middle(item);
-        let mut s = ffi::Vec2 { x: 1.0, y: 1.0 };
-        a.obs_sceneitem_get_scale(item, &mut s);
-        a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: s.x * x, y: s.y * y });
+        self.in_place(item, || {
+            let mut s = ffi::Vec2 { x: 1.0, y: 1.0 };
+            a.obs_sceneitem_get_scale(item, &mut s);
+            a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: s.x * x, y: s.y * y });
+        });
     }
 
     fn turn(&self, item: *mut ffi::ObsSceneItem, deg: f32) {
         let a = self.api();
-        self.anchor_middle(item);
-        a.obs_sceneitem_set_rot(item, (a.obs_sceneitem_get_rot(item) + deg).rem_euclid(360.0));
+        self.in_place(item, || {
+            a.obs_sceneitem_set_rot(item, (a.obs_sceneitem_get_rot(item) + deg).rem_euclid(360.0));
+        });
     }
 
     /// A new, empty group on top of a scene (OBS's Add Group).
@@ -1664,8 +1685,15 @@ impl Collection {
                 a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
             }
             ItemEdit::Center => {
-                a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_CENTER);
-                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: c.width as f32 / 2.0, y: c.height as f32 / 2.0 });
+                // Moved, not re-anchored: libobs draws a flipped item anchored in its middle off
+                // its box (see `in_place`).
+                let mid = self.box_middle(item);
+                let mut pos = ffi::Vec2 { x: 0.0, y: 0.0 };
+                a.obs_sceneitem_get_pos(item, &mut pos);
+                a.obs_sceneitem_set_pos(
+                    item,
+                    &ffi::Vec2 { x: pos.x + c.width as f32 / 2.0 - mid.x, y: pos.y + c.height as f32 / 2.0 - mid.y },
+                );
             }
             ItemEdit::Reset => {
                 a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_NONE);
