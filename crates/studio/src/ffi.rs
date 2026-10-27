@@ -942,8 +942,15 @@ pub(crate) struct DrawState {
     /// Where the canvas is inside the view (device pixels: x, y, w, h), when the page says;
     /// else it's fitted inside the margin. Around it, outlines of what's off the canvas show.
     pub canvas: std::sync::Mutex<Option<(f32, f32, f32, f32)>>,
+    /// How the page fits the canvas in the view (padding in device pixels, zoom, width over
+    /// height): then the canvas is placed by that rule from the view's size at each draw, so
+    /// it stays right while the window is being resized, before the page catches up.
+    pub fit: std::sync::Mutex<Option<(f32, f32, f32)>>,
     /// A scene whose sources all get an outline, each in its own colour.
     pub frames: std::sync::Mutex<Option<std::ffi::CString>>,
+    /// A dark layer over everything, as a dialog's backdrop dims the page round the view
+    /// (thousandths of full strength; 0 for none).
+    pub shade: std::sync::atomic::AtomicU32,
 }
 
 /// The colours of sources' outlines, picked by item id (`id % 8`); the page's list shows the
@@ -1114,12 +1121,17 @@ fn draw_selection(api: &Api, m: &Matrix4, px: f32, rim: &Vec4, handles: bool, th
 /// A black canvas under the picture, as OBS's DrawBackdrop: the canvas's own transparent parts
 /// show black, and its edge stands out from the stage round it.
 fn draw_backdrop(api: &Api, w: f32, h: f32) {
+    draw_solid(api, w, h, &Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 });
+}
+
+/// A `w`×`h` rectangle of one colour at the origin (alpha blends over what's drawn).
+fn draw_solid(api: &Api, w: f32, h: f32, rgba: &Vec4) {
     let effect = api.obs_get_base_effect(OBS_EFFECT_SOLID);
     if effect.is_null() {
         return;
     }
     let color = api.gs_effect_get_param_by_name(effect, c"color".as_ptr());
-    api.gs_effect_set_vec4(color, &Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 });
+    api.gs_effect_set_vec4(color, rgba);
     api.gs_matrix_push();
     api.gs_matrix_scale3f(w, h, 1.0);
     while api.gs_effect_loop(effect, c"Solid".as_ptr()) {
@@ -1137,7 +1149,18 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     // SAFETY: as above, the Api outlives every registered draw callback.
     let api = unsafe { &*st.api };
     let (bw, bh) = (st.base.0.max(1) as f32, st.base.1.max(1) as f32);
-    let placed = st.canvas.lock().ok().and_then(|g| *g);
+    let fit = st.fit.lock().ok().and_then(|g| *g);
+    let placed = match fit {
+        // The page's rule (CSS: the largest box of this shape inside the padding, times the
+        // zoom, in the middle) applied to the view's size now.
+        Some((pad, zoom, aspect)) if aspect > 0.0 => {
+            let (aw, ah) = ((cx as f32 - 2.0 * pad).max(1.0), (cy as f32 - 2.0 * pad).max(1.0));
+            let w = aw.min(ah * aspect) * zoom;
+            let h = w / aspect;
+            Some(((cx as f32 - w) / 2.0, (cy as f32 - h) / 2.0, w, h))
+        }
+        _ => st.canvas.lock().ok().and_then(|g| *g),
+    };
     let (x, y, w, h, scale) = match placed {
         // Where the page put it (zoomed out, it leaves room to see what's off the canvas).
         Some((px_, py, pw, ph)) if pw >= 1.0 && ph >= 1.0 => {
@@ -1195,6 +1218,18 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
                 draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);
             }
         }
+    }
+    // Under a dialog: the page's backdrop colour over the whole view, so the picture dims with
+    // the page instead of shining through it.
+    let shade = st.shade.load(std::sync::atomic::Ordering::Relaxed);
+    if shade > 0 {
+        api.gs_ortho(0.0, cx as f32, 0.0, cy as f32, -100.0, 100.0);
+        draw_solid(
+            api,
+            cx as f32,
+            cy as f32,
+            &Vec4 { x: 4.0 / 255.0, y: 5.0 / 255.0, z: 8.0 / 255.0, w: shade as f32 / 1000.0 },
+        );
     }
     api.gs_projection_pop();
     api.gs_viewport_pop();
@@ -1458,9 +1493,9 @@ pub(crate) mod mac {
     use objc2::encode::{Encoding, RefEncode};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::{NSAutoresizingMaskOptions, NSResponder, NSView};
-    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
+    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 
     /// CoreGraphics' path (`CGPathRef`), only passed along.
     #[repr(C)]
@@ -1473,26 +1508,80 @@ pub(crate) mod mac {
         const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGPath", &[]));
     }
 
-    #[link(name = "QuartzCore", kind = "framework")]
-    unsafe extern "C" {
-        static kCAFillRuleEvenOdd: &'static NSString;
+    /// CoreGraphics' colour (`CGColorRef`), only passed along.
+    #[repr(C)]
+    struct CGColor {
+        _opaque: [u8; 0],
     }
+
+    // SAFETY: CGColorRef is `struct CGColor *`, encoded by the runtime as below.
+    unsafe impl RefEncode for CGColor {
+        const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGColor", &[]));
+    }
+
+    // Linked for CALayer (the mask layer is made by name).
+    #[link(name = "QuartzCore", kind = "framework")]
+    unsafe extern "C" {}
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
-        fn CGPathCreateMutable() -> *mut CGPath;
-        fn CGPathAddRect(path: *mut CGPath, m: *const c_void, rect: NSRect);
+        fn CGPathCreateWithRoundedRect(rect: NSRect, rx: f64, ry: f64, m: *const c_void) -> *mut CGPath;
         fn CGPathRelease(path: *mut CGPath);
+        fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+        fn CGColorSpaceRelease(space: *mut c_void);
+        fn CGBitmapContextCreate(
+            data: *mut c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut c_void,
+            info: u32,
+        ) -> *mut c_void;
+        fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *mut c_void;
+        fn CGContextRelease(ctx: *mut c_void);
+        fn CGContextScaleCTM(ctx: *mut c_void, sx: f64, sy: f64);
+        fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
+        fn CGContextFillRect(ctx: *mut c_void, rect: NSRect);
+        fn CGContextSetBlendMode(ctx: *mut c_void, mode: i32);
+        fn CGContextAddPath(ctx: *mut c_void, path: *const CGPath);
+        fn CGContextFillPath(ctx: *mut c_void);
+        fn CGImageRelease(image: *mut c_void);
+        fn CGColorCreateSRGB(r: f64, g: f64, b: f64, a: f64) -> *mut CGColor;
+        fn CGColorRelease(color: *mut CGColor);
+    }
+
+    /// The display drawn into the view, resized with it.
+    #[derive(Debug, Default)]
+    pub struct PassIvars {
+        resize: std::cell::Cell<Option<(*const super::Api, *mut super::ObsDisplay)>>,
     }
 
     define_class!(
-        // SAFETY: NSView allows subclassing; PassView adds no ivars and doesn't implement Drop.
+        // SAFETY: NSView allows subclassing; PassView's ivars are plain Cells (no Drop needed).
         #[unsafe(super(NSView, NSResponder, NSObject))]
         #[thread_kind = MainThreadOnly]
         #[name = "FerrocastPreviewView"]
+        #[ivars = PassIvars]
         struct PassView;
 
         impl PassView {
+            /// Resized (by the page, or by AppKit as the window is resized): the picture is
+            /// redrawn at the new size at once, as OBS's preview does, instead of a frame or
+            /// two later stretched.
+            #[unsafe(method(setFrameSize:))]
+            fn set_frame_size(&self, size: NSSize) {
+                // SAFETY: NSView's own setFrameSize: with the size AppKit passed.
+                let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+                if let Some((api, display)) = self.ivars().resize.get() {
+                    let scale = self.window().map(|w| w.backingScaleFactor()).unwrap_or(1.0);
+                    let px = |v: f64| (v * scale).round().clamp(1.0, 16_384.0) as u32;
+                    // SAFETY: set by `ChildView::follow` from a live Preview, which clears it
+                    // (`remove`) before the display and the Api go.
+                    unsafe { &*api }.obs_display_resize(display, px(size.width), px(size.height));
+                }
+            }
+
             /// Clicks go through to the page under it, which handles picking, moving and
             /// resizing sources (the picture is drawn here, the page only listens).
             #[unsafe(method(hitTest:))]
@@ -1503,9 +1592,15 @@ pub(crate) mod mac {
     );
 
     /// A child view of the window's content, in top-left coordinates like the web page.
-    #[derive(Debug)]
     pub struct ChildView {
         view: Retained<NSView>,
+        pass: Retained<PassView>,
+    }
+
+    impl std::fmt::Debug for ChildView {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ChildView").field("view", &self.view).finish_non_exhaustive()
+        }
     }
 
     /// Where the web page sits inside `parent`: the largest view in it (the webview; a preview
@@ -1549,10 +1644,11 @@ pub(crate) mod mac {
         // SAFETY: `parent` is the live NSView from the window toolkit's raw handle (Tauri/tao),
         // used on the main thread while that window exists.
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
-        let pass = PassView::alloc(mtm).set_ivars(());
+        let pass = PassView::alloc(mtm).set_ivars(PassIvars::default());
         // SAFETY: NSView's designated initialiser on a freshly allocated PassView.
         let view: Retained<PassView> =
             unsafe { msg_send![super(pass), initWithFrame: frame(parent, None, x, y, w, h, vh)] };
+        let pass = view.clone();
         let view: Retained<NSView> = Retained::into_super(view);
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
@@ -1561,7 +1657,7 @@ pub(crate) mod mac {
             view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
         }
         parent.addSubview(&view);
-        Some(ChildView { view })
+        Some(ChildView { view, pass })
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -1602,14 +1698,75 @@ pub(crate) mod mac {
 
         pub fn remove(&self) {
             if MainThreadMarker::new().is_some() {
+                self.pass.ivars().resize.set(None);
                 self.view.removeFromSuperview();
             }
         }
 
-        /// Leaves the picture out of `holes` (x, y, w, h in points from the view's top left)
-        /// so the page's menus and panels there show through it; none: all of it shows.
-        /// Main thread only; ignored elsewhere.
-        pub fn set_holes(&self, holes: &[(f64, f64, f64, f64)]) {
+        /// Resizes `display` whenever the view changes size. `api` and `display` must outlive
+        /// the view's use of them: `remove` lets go. Main thread only.
+        pub fn resize_with(&self, api: *const super::Api, display: *mut super::ObsDisplay) {
+            if MainThreadMarker::new().is_some() {
+                self.pass.ivars().resize.set(Some((api, display)));
+            }
+        }
+
+        /// `follow`: kept at the same distance from every edge of the window as it's resized
+        /// (the Studio's stage grows and shrinks with the window), so it moves with AppKit's
+        /// resize itself instead of a frame behind; else it keeps its size, the same
+        /// distance from the top. Main thread only.
+        pub fn follow(&self, follow: bool) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            // SAFETY: on the main thread (checked above); only reads the view tree.
+            let flipped = unsafe { self.view.superview() }.is_some_and(|p| p.isFlipped());
+            self.view.setAutoresizingMask(if follow {
+                NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
+            } else if flipped {
+                NSAutoresizingMaskOptions::ViewMaxYMargin
+            } else {
+                NSAutoresizingMaskOptions::ViewMinYMargin
+            });
+        }
+
+        /// The view's own colour under the picture (0xAABBGGRR, as libobs takes it), shown
+        /// where the picture isn't drawn yet. Main thread only; ignored elsewhere.
+        pub fn set_backdrop(&self, abgr: u32) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            // SAFETY: `layer` on a layer-backed NSView (wantsLayer is set when it's made).
+            let layer: Option<Retained<AnyObject>> = unsafe { msg_send![&*self.view, layer] };
+            let Some(layer) = layer else { return };
+            let c = |shift: u32| f64::from((abgr >> shift) & 0xff) / 255.0;
+            // SAFETY: a new colour handed to the layer (which keeps its own reference), then
+            // released here.
+            unsafe {
+                let color = CGColorCreateSRGB(c(0), c(8), c(16), 1.0);
+                if color.is_null() {
+                    return;
+                }
+                let _: () = msg_send![&*layer, setBackgroundColor: color];
+                CGColorRelease(color);
+            }
+        }
+
+        /// How much of the view shows, 0 to 1. Main thread only; ignored elsewhere.
+        pub fn set_opacity(&self, opacity: f64) {
+            if MainThreadMarker::new().is_some() {
+                self.view.setAlphaValue(opacity.clamp(0.0, 1.0));
+            }
+        }
+
+        /// Leaves the picture out of `holes` (x, y, w, h and corner radius in points from the
+        /// view's top left) so the page's menus and panels there show through it; none: all
+        /// of it shows. Main thread only; ignored elsewhere.
+        ///
+        /// The mask is drawn as a picture rather than an even-odd path: holes that overlap (a
+        /// sub-menu over its menu, a list over a dialog) stay holes, and rounded corners show
+        /// the page's rounded panel, not a square cut of what's under it.
+        pub fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
             if MainThreadMarker::new().is_none() {
                 return;
             }
@@ -1617,46 +1774,68 @@ pub(crate) mod mac {
             let layer: Option<Retained<AnyObject>> = unsafe { msg_send![&*self.view, layer] };
             let Some(layer) = layer else { return };
             let b = self.view.bounds();
-            let inside: Vec<NSRect> = holes
+            let inside: Vec<(NSRect, f64)> = holes
                 .iter()
-                .filter_map(|&(x, y, w, h)| {
+                .filter_map(|&(x, y, w, h, rad)| {
+                    // Only the part inside the view; corners cut off by its edge stay square.
                     let (l, t) = (x.max(0.0), y.max(0.0));
                     let (r, btm) = ((x + w).min(b.size.width), (y + h).min(b.size.height));
                     (r > l && btm > t).then(|| {
                         // The layer counts up from the bottom like its view (not flipped).
                         let y0 = if self.view.isFlipped() { t } else { b.size.height - btm };
-                        NSRect::new(NSPoint::new(l, y0), NSSize::new(r - l, btm - t))
+                        let rad = rad.max(0.0).min((r - l) / 2.0).min((btm - t) / 2.0);
+                        (NSRect::new(NSPoint::new(l, y0), NSSize::new(r - l, btm - t)), rad)
                     })
                 })
                 .collect();
             let none: Option<&AnyObject> = None;
-            if inside.is_empty() {
+            if inside.is_empty() || b.size.width < 1.0 || b.size.height < 1.0 {
                 // SAFETY: CALayer's `mask` property takes nil.
                 let _: () = unsafe { msg_send![&*layer, setMask: none] };
                 return;
             }
-            let Some(class) = AnyClass::get(c"CAShapeLayer") else { return };
-            // SAFETY: `+[CAShapeLayer layer]` makes a new layer (QuartzCore is linked above).
+            let scale: f64 = self.view.window().map(|w| w.backingScaleFactor()).unwrap_or(2.0);
+            let (pw, ph) = ((b.size.width * scale).ceil() as usize, (b.size.height * scale).ceil() as usize);
+            let Some(class) = AnyClass::get(c"CALayer") else { return };
+            // SAFETY: `+[CALayer layer]` makes a new layer (QuartzCore is linked above).
             let mask: Option<Retained<AnyObject>> = unsafe { msg_send![class, layer] };
             let Some(mask) = mask else { return };
-            // SAFETY: a fresh mutable path, filled then handed to the layer (which keeps its own
-            // reference) and released here.
+            // SAFETY: a fresh RGBA bitmap context of the view's size in pixels, filled opaque,
+            // then each hole cleared; its image is handed to the layer (which keeps its own
+            // reference) and everything made here is released here.
             unsafe {
-                let path = CGPathCreateMutable();
-                if path.is_null() {
+                let space = CGColorSpaceCreateDeviceRGB();
+                // kCGImageAlphaPremultipliedLast
+                let ctx = CGBitmapContextCreate(std::ptr::null_mut(), pw, ph, 8, 0, space, 1);
+                CGColorSpaceRelease(space);
+                if ctx.is_null() {
                     return;
                 }
-                CGPathAddRect(path, std::ptr::null(), NSRect::new(NSPoint::new(0.0, 0.0), b.size));
-                for r in &inside {
-                    CGPathAddRect(path, std::ptr::null(), *r);
+                CGContextScaleCTM(ctx, scale, scale);
+                CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
+                CGContextFillRect(ctx, NSRect::new(NSPoint::new(0.0, 0.0), b.size));
+                // kCGBlendModeClear: what's drawn now becomes see-through.
+                CGContextSetBlendMode(ctx, 16);
+                for (r, rad) in &inside {
+                    let path = CGPathCreateWithRoundedRect(*r, *rad, *rad, std::ptr::null());
+                    if path.is_null() {
+                        continue;
+                    }
+                    CGContextAddPath(ctx, path);
+                    CGContextFillPath(ctx);
+                    CGPathRelease(path);
                 }
-                // Even-odd: the whole view, minus each hole.
-                let _: () = msg_send![&*mask, setFillRule: kCAFillRuleEvenOdd];
-                let _: () = msg_send![&*mask, setPath: path];
+                let image = CGBitmapContextCreateImage(ctx);
+                CGContextRelease(ctx);
+                if image.is_null() {
+                    return;
+                }
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), b.size);
                 let _: () = msg_send![&*mask, setFrame: frame];
+                let _: () = msg_send![&*mask, setContentsScale: scale];
+                let _: () = msg_send![&*mask, setContents: image as *mut AnyObject];
                 let _: () = msg_send![&*layer, setMask: &*mask];
-                CGPathRelease(path);
+                CGImageRelease(image);
             }
         }
     }
@@ -1671,7 +1850,13 @@ const GS_BLEND_ONE: c_int = 1;
 /// Draws a source (a scene or anything else) once at `w`×`h` and reads it back as RGBA rows,
 /// as OBS's own screenshot does. Waits for the graphics thread (main thread is fine).
 pub(crate) fn snapshot(api: &Api, src: *mut ObsSource, w: u32, h: u32) -> Option<Vec<u8>> {
-    if src.is_null() || w == 0 || h == 0 || w > 16_384 || h > 16_384 {
+    snapshot_scaled(api, src, (w, h), w, h)
+}
+
+/// The same, drawing `src` as if it were `base` big (a scene: the canvas) into `w`×`h`, so a
+/// whole scene comes out small (a thumbnail).
+pub(crate) fn snapshot_scaled(api: &Api, src: *mut ObsSource, base: (u32, u32), w: u32, h: u32) -> Option<Vec<u8>> {
+    if src.is_null() || w == 0 || h == 0 || w > 16_384 || h > 16_384 || base.0 == 0 || base.1 == 0 {
         return None;
     }
     api.obs_enter_graphics();
@@ -1680,7 +1865,7 @@ pub(crate) fn snapshot(api: &Api, src: *mut ObsSource, w: u32, h: u32) -> Option
     if !tr.is_null() && api.gs_texrender_begin(tr, w, h) {
         let zero = Vec4::default();
         api.gs_clear(GS_CLEAR_COLOR, &zero, 0.0, 0);
-        api.gs_ortho(0.0, w as f32, 0.0, h as f32, -100.0, 100.0);
+        api.gs_ortho(0.0, base.0 as f32, 0.0, base.1 as f32, -100.0, 100.0);
         api.gs_blend_state_push();
         api.gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
         api.obs_source_inc_showing(src);

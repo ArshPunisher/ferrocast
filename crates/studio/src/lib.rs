@@ -1167,10 +1167,13 @@ impl Studio {
                 scene: std::sync::Mutex::new(ptr::null_mut()),
                 edge: std::sync::atomic::AtomicU32::new(edge_px(scale)),
                 canvas: std::sync::Mutex::new(None),
+                fit: std::sync::Mutex::new(None),
                 frames: std::sync::Mutex::new(None),
+                shade: std::sync::atomic::AtomicU32::new(0),
             });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
+            view.resize_with(&self.inner.api, display);
             Ok(Preview { studio: self.clone(), display, state, view, scale })
         }
         #[cfg(not(target_os = "macos"))]
@@ -1238,9 +1241,15 @@ impl Preview {
         if let Ok(mut g) = self.state.canvas.lock() {
             *g = None;
         }
+        if let Ok(mut g) = self.state.fit.lock() {
+            *g = None;
+        }
         self.state.edge.store(edge_px(scale), std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
-        self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
+        {
+            self.view.follow(false);
+            self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
+        }
         let (cx, cy) = px(rect, scale);
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
@@ -1284,19 +1293,38 @@ impl Preview {
     /// The colour round the canvas (0xAABBGGRR), to match the page's theme.
     pub fn background(&self, abgr: u32) {
         self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr));
+        // The view itself too: while the window grows, the strip not drawn yet shows the
+        // stage's colour, not black.
+        #[cfg(target_os = "macos")]
+        self.view.set_backdrop(abgr);
     }
 
-    /// Leaves the picture out where the page's menus and panels lie over it (x, y, w, h in
-    /// points from the top left of the box last given to `set_rect` or `set_area`), so they
+    /// Leaves the picture out where the page's menus and panels lie over it (x, y, w, h and
+    /// corner radius in points from the top left of the box last given to `set_rect` or `set_area`), so they
     /// show instead of the whole preview hiding. Main thread.
-    pub fn set_holes(&self, holes: &[(f64, f64, f64, f64)]) {
+    pub fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
         // `set_rect`'s view reaches PREVIEW_EDGE past the page's box; `set_area`'s is the box.
         let edge = if self.state.canvas.lock().map(|g| g.is_none()).unwrap_or(true) { PREVIEW_EDGE } else { 0.0 };
-        let moved: Vec<_> = holes.iter().map(|&(x, y, w, h)| (x + edge, y + edge, w, h)).collect();
+        let moved: Vec<_> = holes.iter().map(|&(x, y, w, h, r)| (x + edge, y + edge, w, h, r)).collect();
         #[cfg(target_os = "macos")]
         self.view.set_holes(&moved);
         #[cfg(not(target_os = "macos"))]
         let _ = moved;
+    }
+
+    /// A dark layer over the whole view, 0 to 1 (a dialog's backdrop over it). Any thread.
+    pub fn set_shade(&self, shade: f64) {
+        let v = (shade.clamp(0.0, 1.0) * 1000.0).round() as u32;
+        self.state.shade.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How much of the picture shows, 0 to 1 (dimmed under a dialog, hidden while the window
+    /// is resized). Main thread.
+    pub fn set_opacity(&self, opacity: f64) {
+        #[cfg(target_os = "macos")]
+        self.view.set_opacity(opacity);
+        #[cfg(not(target_os = "macos"))]
+        let _ = opacity;
     }
 
     /// Outlines every source of `scene` in its own colour, or none.
@@ -1309,14 +1337,26 @@ impl Preview {
     /// Covers `area` (the page's whole stage) and draws the canvas at `canvas` inside it
     /// (points, from the area's top left): zoomed out, the outlines of what's off the canvas
     /// show round it. Main thread.
-    pub fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+    ///
+    /// `fit` (padding in points, zoom): how the page fits the canvas in the area; then the
+    /// area grows and shrinks with the window and the canvas is fitted by the same rule as it
+    /// does, so resizing the window is smooth before the page sends where it ends up.
+    pub fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64, fit: Option<(f64, f64)>) {
         self.scale = scale;
         #[cfg(target_os = "macos")]
-        self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        {
+            self.view.follow(fit.is_some());
+            self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        }
         let (cx, cy) = px(area, scale);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         if let Ok(mut g) = self.state.canvas.lock() {
             *g = Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
+        }
+        if let Ok(mut g) = self.state.fit.lock() {
+            *g = fit
+                .filter(|_| canvas.3 > 0.0)
+                .map(|(pad, zoom)| ((pad * s) as f32, zoom as f32, (canvas.2 / canvas.3) as f32));
         }
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }

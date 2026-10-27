@@ -46,7 +46,27 @@ pub struct PreviewRect {
     /// Where the page's menus and panels lie over the box (points from its top left): the
     /// picture isn't drawn there, so they show through instead of the whole preview hiding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub holes: Vec<CanvasBox>,
+    pub holes: Vec<PreviewHole>,
+    /// How much of the picture shows, 0 to 1 (missing: all of it): dimmed under a dialog's
+    /// backdrop like the page round it, hidden while the window is being resized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+    /// A dark layer over the picture, 0 to 1, drawn by the app: a dialog's backdrop over the
+    /// page dims the preview the same (missing: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shade: Option<f64>,
+    /// How the page fits `canvas` in the box (the largest box of its shape inside `pad`
+    /// points, times `zoom`, centred): the app then follows the window's resizing itself,
+    /// fitting the canvas by the same rule, until the page sends where it ends up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<PreviewFit>,
+}
+
+/// See `PreviewRect::fit`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PreviewFit {
+    pub pad: f64,
+    pub zoom: f64,
 }
 
 /// At most this many holes (menus, panels) at once.
@@ -67,6 +87,18 @@ pub struct CanvasBox {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+}
+
+/// A menu or panel over the preview: its box and corner radius (points), so the picture is left
+/// out exactly where it lies, rounded corners and all.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PreviewHole {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default)]
+    pub r: f64,
 }
 
 impl PreviewRect {
@@ -92,6 +124,15 @@ impl PreviewRect {
         if self.bg.is_some() && self.bg_abgr().is_none() {
             return Err("bg: a colour, 0 to 0xFFFFFF.".into());
         }
+        if self.opacity.is_some_and(|o| !(0.0..=1.0).contains(&o)) {
+            return Err("opacity: 0 to 1.".into());
+        }
+        if self.shade.is_some_and(|o| !(0.0..=1.0).contains(&o)) {
+            return Err("shade: 0 to 1.".into());
+        }
+        if self.fit.is_some_and(|f| !(ok(f.pad, 0.0, 200.0) && ok(f.zoom, 0.05, 1.0))) {
+            return Err("fit: padding 0 to 200, zoom 0.05 to 1.".into());
+        }
         if self.holes.len() > PREVIEW_HOLES {
             return Err(format!("holes: at most {PREVIEW_HOLES}."));
         }
@@ -100,8 +141,9 @@ impl PreviewRect {
                 && ok(c.y, -20_000.0, 20_000.0)
                 && ok(c.w, 0.0, 20_000.0)
                 && ok(c.h, 0.0, 20_000.0)
+                && ok(c.r, 0.0, 200.0)
         }) {
-            return Err("holes: boxes of 0 to 20000 pixels near the box.".into());
+            return Err("holes: boxes of 0 to 20000 pixels near the box, corners 0 to 200.".into());
         }
         Ok(())
     }
@@ -583,6 +625,9 @@ pub struct StudioSettings {
     pub true_peak: bool,
     /// OBS's Low Latency Audio Buffering (after a restart).
     pub low_latency_audio: bool,
+    /// How the picture is drawn on a Mac: "opengl" (OBS's default) or "metal" (newer;
+    /// resizing the window is smooth). After a restart.
+    pub renderer: String,
     /// Multiviews: what's on air "top", "bottom", "left" or "right" of the scenes, or
     /// "scenes_only"; names under each box; EBU R95 safe areas.
     pub multiview_layout: String,
@@ -650,6 +695,7 @@ impl Default for StudioSettings {
             speakers: None,
             true_peak: false,
             low_latency_audio: false,
+            renderer: "opengl".into(),
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
@@ -771,6 +817,9 @@ impl StudioSettings {
         }
         if ![44_100, 48_000].contains(&self.sample_rate) {
             return bad("sample_rate: 44100 or 48000.");
+        }
+        if !["opengl", "metal"].contains(&self.renderer.as_str()) {
+            return bad("renderer: opengl or metal.");
         }
         if let Some((n, i)) = &self.monitoring
             && (n.len() > 256 || i.len() > 512)
@@ -2386,14 +2435,31 @@ mod tests {
         for bad in ["", "a b", "../x", &"x".repeat(200)] {
             assert!(matches!(e.studio_options(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let r = PreviewRect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0, canvas: None, bg: None, holes: vec![] };
+        let r = PreviewRect {
+            x: 10.0,
+            y: 20.0,
+            w: 640.0,
+            h: 360.0,
+            vh: 800.0,
+            canvas: None,
+            bg: None,
+            holes: vec![],
+            opacity: None,
+            shade: None,
+            fit: None,
+        };
         e.studio_preview(Some(r.clone()), Some(r.clone())).await.unwrap();
         e.studio_preview(None, None).await.unwrap();
         // The whole stage, with the canvas zoomed out inside it.
-        let staged = PreviewRect { canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }), ..r.clone() };
+        let staged = PreviewRect {
+            canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }),
+            fit: Some(PreviewFit { pad: 12.0, zoom: 0.75 }),
+            ..r.clone()
+        };
         assert!(staged.validate().is_ok());
         // A menu over part of it: a hole there, the rest still shows.
-        let holed = PreviewRect { holes: vec![CanvasBox { x: 400.0, y: -10.0, w: 260.0, h: 500.0 }], ..r.clone() };
+        let holed =
+            PreviewRect { holes: vec![PreviewHole { x: 400.0, y: -10.0, w: 260.0, h: 500.0, r: 10.0 }], ..r.clone() };
         assert!(holed.validate().is_ok());
         let light = PreviewRect { bg: Some(0xe7e9ee), ..r.clone() };
         assert_eq!(light.bg_abgr(), Some(0xffee_e9e7));
@@ -2407,8 +2473,16 @@ mod tests {
             canvas(0.0, 270.0),
             canvas(480.0, f64::NAN),
             PreviewRect { bg: Some(0x0100_0000), ..r.clone() },
-            PreviewRect { holes: vec![CanvasBox { x: 0.0, y: 0.0, w: f64::NAN, h: 1.0 }], ..r.clone() },
-            PreviewRect { holes: vec![CanvasBox { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }; PREVIEW_HOLES + 1], ..r.clone() },
+            PreviewRect { holes: vec![PreviewHole { x: 0.0, y: 0.0, w: f64::NAN, h: 1.0, r: 0.0 }], ..r.clone() },
+            PreviewRect { holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 500.0 }], ..r.clone() },
+            PreviewRect {
+                holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 0.0 }; PREVIEW_HOLES + 1],
+                ..r.clone()
+            },
+            PreviewRect { opacity: Some(1.5), ..r.clone() },
+            PreviewRect { shade: Some(-0.1), ..r.clone() },
+            PreviewRect { fit: Some(PreviewFit { pad: 12.0, zoom: 0.0 }), ..r.clone() },
+            PreviewRect { fit: Some(PreviewFit { pad: -1.0, zoom: 1.0 }), ..r.clone() },
         ] {
             assert!(matches!(e.studio_preview(None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
@@ -2505,6 +2579,7 @@ mod tests {
             ("reconnect", StudioSettings { reconnect_every_s: 0, ..d.clone() }),
             ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
             ("sample_rate", StudioSettings { sample_rate: 96_000, ..d.clone() }),
+            ("renderer", StudioSettings { renderer: "vulkan".into(), ..d.clone() }),
         ] {
             let err = e.studio_set_settings(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{field}: {err:?}");
