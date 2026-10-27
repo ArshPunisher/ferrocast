@@ -1757,14 +1757,15 @@ pub(crate) mod mac {
             let inside: Vec<(NSRect, f64)> = holes
                 .iter()
                 .filter_map(|&(x, y, w, h, rad)| {
-                    // Only the part inside the view; corners cut off by its edge stay square.
-                    let (l, t) = (x.max(0.0), y.max(0.0));
-                    let (r, btm) = ((x + w).min(b.size.width), (y + h).min(b.size.height));
-                    (r > l && btm > t).then(|| {
+                    // The whole box, drawn past the view's edge where it reaches over it: only
+                    // its own corners are round (rounding the part inside cut round notches
+                    // where a dialog crosses the stage's edge).
+                    let inside = x < b.size.width && y < b.size.height && x + w > 0.0 && y + h > 0.0;
+                    (inside && w > 0.0 && h > 0.0).then(|| {
                         // The layer counts up from the bottom like its view (not flipped).
-                        let y0 = if self.view.isFlipped() { t } else { b.size.height - btm };
-                        let rad = rad.max(0.0).min((r - l) / 2.0).min((btm - t) / 2.0);
-                        (NSRect::new(NSPoint::new(l, y0), NSSize::new(r - l, btm - t)), rad)
+                        let y0 = if self.view.isFlipped() { y } else { b.size.height - y - h };
+                        let rad = rad.max(0.0).min(w / 2.0).min(h / 2.0);
+                        (NSRect::new(NSPoint::new(x, y0), NSSize::new(w, h)), rad)
                     })
                 })
                 .collect();
