@@ -267,7 +267,8 @@ impl Engine {
         self.push_music(false);
     }
 
-    /// Reads the beat while Settings › Music names an OBS source; starts over when it changes.
+    /// Reads the beat while Settings › Music names a sound (the Studio's while it runs, else
+    /// OBS's); starts over when it changes.
     async fn beat_loop(&self) {
         loop {
             let Some(input) = self.music_config().beat_input else {
@@ -275,6 +276,10 @@ impl Engine {
                 self.music().wake_beat.notified().await;
                 continue;
             };
+            if self.studio_status().await.running {
+                self.studio_beat(&input).await;
+                continue;
+            }
             let target = match self.obs_target().await {
                 Ok(t) => t,
                 Err(e) => {
@@ -304,6 +309,36 @@ impl Engine {
                     () = self.music().wake_beat.notified() => break,
                 }
             }
+        }
+    }
+
+    /// The Studio's meter for `input`, read 20 times a second (as often as OBS sends its
+    /// meters) until the setting changes or the Studio stops.
+    async fn studio_beat(&self, input: &str) {
+        // An earlier "OBS isn't running" no longer applies.
+        self.set_problem(true, None);
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = self.music().wake_beat.notified() => return,
+            }
+            let act = crate::studio_host::StudioAct::Levels { names: vec![input.to_string()] };
+            let Ok(v) = self.studio_act(act).await else {
+                // Stopped (or the sound is gone): quiet, then see what runs now.
+                self.set_level(0.0);
+                self.wait_or_wake(true).await;
+                return;
+            };
+            let db = v
+                .pointer(&format!("/{}/peak", input.replace('~', "~0").replace('/', "~1")))
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_f64).fold(-100.0_f64, f64::max))
+                .unwrap_or(-100.0);
+            #[allow(clippy::cast_possible_truncation)]
+            let peak = 10f64.powf(db / 20.0) as f32;
+            self.set_level(ferrocast_obs::meters::loudness(peak));
         }
     }
 
