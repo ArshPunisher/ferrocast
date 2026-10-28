@@ -175,7 +175,7 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
         && k > max_keyint_ms + 250
     {
         out.push(format!(
-            "{name} needs a keyframe at least every {} s; yours come every {:.1} s. Set Keyframe Interval to 2 in OBS (Settings, Output).",
+            "{name} needs a keyframe at least every {} s; yours come every {:.1} s. Set the keyframe interval to 2 s.",
             max_keyint_ms / 1000,
             f64::from(k) / 1000.0
         ));
@@ -190,7 +190,7 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
             "viewers may see it stutter"
         };
         out.push(format!(
-            "{name} takes up to {} of video; you're sending {}. Set Bitrate to {} or less in OBS (Settings, Output), or {then}.",
+            "{name} takes up to {} of video; you're sending {}. Lower the video bitrate to {} or less, or {then}.",
             kbps_text(max_kbps),
             kbps_text(stats.kbps),
             kbps_text(max_kbps.saturating_sub(500)),
@@ -294,7 +294,10 @@ mod tests {
         let fast = StreamStats { kbps: 12_001, ..good };
         let k = rules(&fast, Service::Kick);
         assert_eq!(k.len(), 1);
-        assert!(k[0].contains("Set Bitrate to 7,500 kbps or less") && k[0].contains("keeps dropping"), "{k:?}");
+        assert!(
+            k[0].contains("Lower the video bitrate to 7,500 kbps or less") && k[0].contains("keeps dropping"),
+            "{k:?}"
+        );
         assert!(rules(&fast, Service::Twitch)[0].contains("stutter"));
     }
 
