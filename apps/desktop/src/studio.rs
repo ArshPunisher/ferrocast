@@ -71,6 +71,48 @@ struct Held {
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
     projectors: Vec<(u64, Projector)>,
     last_projector: u64,
+    /// The vertical picture's preview, beside the main one.
+    vertical: VerticalView,
+}
+
+/// The vertical picture's preview and what the page last said about its box.
+#[derive(Default)]
+struct VerticalView {
+    view: Option<Preview>,
+    at: Option<(Rect, f64)>,
+    canvas: Option<(f64, f64, f64, f64)>,
+    bg: Option<u32>,
+    holes: Vec<(f64, f64, f64, f64, f64)>,
+    opacity: Option<f64>,
+    shade: f64,
+}
+
+/// Makes the vertical picture's preview at its last place, when the picture is on and the page
+/// has a box for it (main thread).
+fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
+    let Some((rect, scale)) = h.vertical.at else { return Ok(()) };
+    let Some(c) = h.collection.as_ref() else { return Ok(()) };
+    if c.vertical().is_none() {
+        h.vertical.view = None;
+        return Ok(());
+    }
+    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+    let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
+    let mut p = c.vertical_preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    let v = &h.vertical;
+    if let Some(area) = v.canvas {
+        p.set_area(rect, area, scale);
+    }
+    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
+    p.frames(h.frames.as_deref());
+    if let Some(bg) = v.bg {
+        p.background(bg);
+    }
+    p.set_holes(&v.holes);
+    p.set_opacity(v.opacity.unwrap_or(1.0));
+    p.set_shade(v.shade);
+    h.vertical.view = Some(p);
+    Ok(())
 }
 
 /// A multiview follows the scenes after anything that changes them.
@@ -225,6 +267,8 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     };
     // libobs keeps one collection's sources at a time: the old ones go first, with the undo
     // steps that hold them and the projectors that show them.
+    // The vertical preview draws the old collection's canvas: it goes before the canvas does.
+    h.vertical.view = None;
     let old = h.collection.take().map(|c| {
         save(&c, from);
         c.save(COLLECTION)
@@ -468,7 +512,13 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             "studio_options": c.studio_options(),
             "tbar": c.tbar_state(),
             "black": c.is_black(),
+            "vertical": c.vertical(),
         }))),
+        A::StartVertical { scene } => done(c.start_vertical(&scene)),
+        A::StopVertical => {
+            c.stop_vertical();
+            Ok(Value::Null)
+        }
         A::SetStudioOptions { options: o } => done(c.set_studio_options(StudioOptions {
             swap: o.swap,
             duplicate_scene: o.duplicate_scene,
@@ -531,7 +581,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::SetQuickTransitions { list } => done(c.set_quick_transitions(
             &list.into_iter().map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).collect::<Vec<_>>(),
         )),
-        A::AddScene { name } => done(c.add_scene(&name)),
+        A::AddScene { name, vertical: false } => done(c.add_scene(&name)),
+        A::AddScene { name, vertical: true } => done(c.add_vertical_scene(&name)),
         A::DuplicateScene { scene, name } => done(c.duplicate_scene(&scene, &name)),
         A::RemoveScene { scene } => done(c.remove_scene(&scene)),
         A::MoveScene { scene, to } => done(c.move_scene(&scene, to)),
@@ -866,6 +917,7 @@ impl StudioHost for DesktopStudio {
             h.preview_at = None;
             h.program_view = None;
             h.program_at = None;
+            h.vertical = VerticalView::default();
             h.projectors.clear();
             h.history.clear();
             if let Some(c) = h.collection.take() {
@@ -928,6 +980,40 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn vertical_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
+        let app = self.app.clone();
+        self.on_main(move |h| {
+            let Some(r) = rect else {
+                h.vertical.view = None;
+                h.vertical.at = None;
+                return Ok(());
+            };
+            let rect = Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh };
+            let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let v = &mut h.vertical;
+            v.at = Some((rect, scale));
+            v.canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
+            v.bg = r.bg_abgr();
+            v.holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
+            v.opacity = r.opacity;
+            v.shade = r.shade.unwrap_or(0.0);
+            let Some(p) = v.view.as_mut() else { return make_vertical_view(&app, h) };
+            if let Some(bg) = v.bg {
+                p.background(bg);
+            }
+            match v.canvas {
+                Some(c) => p.set_area(rect, c, scale),
+                None => p.set_rect(rect, scale),
+            }
+            p.set_holes(&v.holes);
+            p.set_opacity(v.opacity.unwrap_or(1.0));
+            p.set_shade(v.shade);
+            Ok(())
+        })
+        .await?
+    }
+
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
@@ -973,6 +1059,7 @@ impl StudioHost for DesktopStudio {
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
         let data = self.data.clone();
+        let app = self.app.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
             if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
@@ -1002,7 +1089,8 @@ impl StudioHost for DesktopStudio {
                     (s, ids)
                 });
                 h.frames = if *frames { scene.clone() } else { None };
-                if let Some(p) = &h.preview {
+                // Each picture outlines only its own scenes' sources (the other finds no such scene).
+                for p in h.preview.iter().chain(h.vertical.view.iter()) {
                     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
                     p.frames(h.frames.as_deref());
                 }
@@ -1025,7 +1113,17 @@ impl StudioHost for DesktopStudio {
                 return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
             }
             let before = h.history.before(c, &act);
+            let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
+            if turns_vertical {
+                // The preview goes before its canvas does.
+                h.vertical.view = None;
+            }
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
             let out = run(c, act).map_err(|e| e.to_string());
+            if turns_vertical {
+                let _ = make_vertical_view(&app, h);
+            }
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(b) = before {
                 h.history.after(c, b, &out);
             }
@@ -1063,6 +1161,10 @@ impl StudioHost for DesktopStudio {
                         }
                         if h.program_view.take().is_some() {
                             let _ = make_program_view(&app, h);
+                        }
+                        // Its frame rate follows the main picture's.
+                        if h.vertical.view.take().is_some() {
+                            let _ = make_vertical_view(&app, h);
                         }
                         h.projectors.clear();
                     }

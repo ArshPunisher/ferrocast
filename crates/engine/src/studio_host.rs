@@ -150,6 +150,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn program_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
         Ok(())
     }
+    /// The vertical picture over its own box (or none).
+    async fn vertical_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
     /// The settings a new source of `kind` starts with.
     async fn defaults(&self, kind: String) -> Result<Value, String>;
     /// Does one thing to the scene collection (checked before it gets here) and answers what
@@ -973,11 +977,20 @@ pub struct NewSource {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "act")]
 pub enum StudioAct {
-    /// `{ scenes, current, transition }`.
+    /// `{ scenes, current, transition, vertical }` (`vertical` null while it's off).
     Scenes,
     AddScene {
         name: String,
+        /// In the vertical picture.
+        #[serde(default)]
+        vertical: bool,
     },
+    /// Turns the vertical picture on, with a first scene (nothing happens when it's on).
+    StartVertical {
+        scene: String,
+    },
+    /// Turns the vertical picture off: its scenes go; sources stay where else they're used.
+    StopVertical,
     DuplicateScene {
         scene: String,
         name: String,
@@ -1286,8 +1299,8 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources => Ok(()),
-            A::AddScene { name } => check_source_name(name),
+            A::Scenes | A::Sources | A::StopVertical => Ok(()),
+            A::AddScene { name, .. } | A::StartVertical { scene: name } => check_source_name(name),
             A::RemoveScene { scene }
             | A::MoveScene { scene, .. }
             | A::SetCurrent { scene }
@@ -1868,18 +1881,21 @@ impl Engine {
         self.studio_host()?.restart().await.map_err(failed)
     }
 
-    /// The preview over the page's box, and in Studio Mode what's on air over a second one.
+    /// The preview over the page's box, in Studio Mode what's on air over a second one, and
+    /// the vertical picture over a third.
     pub async fn studio_preview(
         &self,
         rect: Option<PreviewRect>,
         program: Option<PreviewRect>,
+        vertical: Option<PreviewRect>,
     ) -> Result<(), EngineError> {
-        for r in rect.iter().chain(program.iter()) {
+        for r in rect.iter().chain(program.iter()).chain(vertical.iter()) {
             r.validate().map_err(EngineError::Invalid)?;
         }
         let host = self.studio_host()?;
         host.preview(rect).await.map_err(failed)?;
-        host.program_view(program).await.map_err(failed)
+        host.program_view(program).await.map_err(failed)?;
+        host.vertical_view(vertical).await.map_err(failed)
     }
 }
 
@@ -2165,6 +2181,21 @@ mod tests {
     }
 
     #[test]
+    fn vertical_acts_read_and_check() {
+        let add: StudioAct = serde_json::from_value(serde_json::json!({ "act": "add_scene", "name": "Tall" })).unwrap();
+        assert_eq!(add, StudioAct::AddScene { name: "Tall".into(), vertical: false });
+        let add: StudioAct =
+            serde_json::from_value(serde_json::json!({ "act": "add_scene", "name": "Tall", "vertical": true })).unwrap();
+        assert_eq!(add, StudioAct::AddScene { name: "Tall".into(), vertical: true });
+        assert!(StudioAct::StartVertical { scene: "Gameplay".into() }.check().is_ok());
+        assert!(matches!(StudioAct::StartVertical { scene: "  ".into() }.check(), Err(EngineError::Invalid(_))));
+        assert!(StudioAct::StopVertical.check().is_ok());
+        // Turning it on or off is saved with the scenes.
+        assert!(StudioAct::StartVertical { scene: "Gameplay".into() }.changes());
+        assert!(StudioAct::StopVertical.changes());
+    }
+
+    #[test]
     fn logs_lose_their_secrets() {
         let cases = [
             (
@@ -2446,8 +2477,8 @@ mod tests {
             opacity: None,
             shade: None,
         };
-        e.studio_preview(Some(r.clone()), Some(r.clone())).await.unwrap();
-        e.studio_preview(None, None).await.unwrap();
+        e.studio_preview(Some(r.clone()), Some(r.clone()), Some(r.clone())).await.unwrap();
+        e.studio_preview(None, None, None).await.unwrap();
         // The whole stage, with the canvas zoomed out inside it.
         let staged = PreviewRect { canvas: Some(CanvasBox { x: 80.0, y: 45.0, w: 480.0, h: 270.0 }), ..r.clone() };
         assert!(staged.validate().is_ok());
@@ -2476,7 +2507,7 @@ mod tests {
             PreviewRect { opacity: Some(1.5), ..r.clone() },
             PreviewRect { shade: Some(-0.1), ..r.clone() },
         ] {
-            assert!(matches!(e.studio_preview(None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
+            assert!(matches!(e.studio_preview(None, None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
         assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r.clone()), None], "only good boxes reach the app");
 

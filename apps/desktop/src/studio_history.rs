@@ -229,7 +229,7 @@ impl History {
                     ))
                 }
             },
-            StudioAct::AddScene { name } => {
+            StudioAct::AddScene { name, .. } => {
                 Some(fresh(format!("Add scene {name}"), vec![Change::SceneGone(name.clone())], None, false))
             }
             StudioAct::DuplicateScene { scene, name } => {

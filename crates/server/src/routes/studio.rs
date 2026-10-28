@@ -36,6 +36,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/kinds/{id}/defaults", get(engine_defaults))
         .route("/studio/engine/stream", get(engine_stream_stats).post(engine_stream))
         .route("/studio/engine/scenes", get(engine_scenes).post(engine_add_scene))
+        .route("/studio/engine/vertical", post(engine_start_vertical).delete(engine_stop_vertical))
         .route("/studio/engine/scenes/{scene}", delete(engine_remove_scene))
         .route("/studio/engine/scenes/{scene}/duplicate", post(engine_duplicate_scene))
         .route("/studio/engine/scenes/{scene}/move", post(engine_move_scene))
@@ -369,11 +370,14 @@ struct PreviewBody {
     /// Studio Mode's second box, for what's on air.
     #[serde(default)]
     program: Option<ferrocast_engine::studio_host::PreviewRect>,
+    /// The vertical picture's box.
+    #[serde(default)]
+    vertical: Option<ferrocast_engine::studio_host::PreviewRect>,
 }
 
 /// `PUT /studio/engine/preview` `{ rect: {x, y, w, h} | null }`: the preview over the page's box.
 async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
-    app.engine.studio_preview(b.rect, b.program).await?;
+    app.engine.studio_preview(b.rect, b.program, b.vertical).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -406,6 +410,9 @@ async fn act_done(app: &AppState, a: StudioAct) -> ApiResult<StatusCode> {
 #[derive(Deserialize)]
 struct NameBody {
     name: String,
+    /// A scene for the vertical picture (adding scenes only).
+    #[serde(default)]
+    vertical: bool,
 }
 
 #[derive(Deserialize)]
@@ -457,8 +464,24 @@ async fn engine_add_scene(
     State(app): State<AppState>,
     Body(b): Body<NameBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let Json(v) = act(&app, StudioAct::AddScene { name: b.name }).await?;
+    let Json(v) = act(&app, StudioAct::AddScene { name: b.name, vertical: b.vertical }).await?;
     Ok((StatusCode::CREATED, Json(v)))
+}
+
+#[derive(Deserialize)]
+struct VerticalBody {
+    /// The first vertical scene's name.
+    scene: String,
+}
+
+/// `POST /studio/engine/vertical` `{ scene }`: turns the vertical picture on.
+async fn engine_start_vertical(State(app): State<AppState>, Body(b): Body<VerticalBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::StartVertical { scene: b.scene }).await
+}
+
+/// `DELETE /studio/engine/vertical`: turns it off (its scenes go).
+async fn engine_stop_vertical(State(app): State<AppState>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::StopVertical).await
 }
 
 async fn engine_remove_scene(State(app): State<AppState>, Path(scene): Path<String>) -> ApiResult<StatusCode> {
