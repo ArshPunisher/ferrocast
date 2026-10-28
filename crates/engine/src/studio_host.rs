@@ -1929,6 +1929,14 @@ fn failed(message: String) -> EngineError {
     if message.contains("isn't here yet") {
         return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
     }
+    if message.starts_with("The replay buffer is off") {
+        return refused(
+            422,
+            "studio_replay_off",
+            message,
+            "Turn on Replay buffer in Studio, Go live (the menu beside Record).",
+        );
+    }
     if message.contains("display isn't there") {
         return refused(404, "studio_no_screen", message, "Pick a display from the list again.");
     }
