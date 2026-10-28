@@ -199,8 +199,8 @@ impl Engine {
             let engine = self.clone();
             let id = marker.id;
             tokio::spawn(async move {
-                let Ok(c) = engine.obs_client().await else { return };
-                if ferrocast_obs::control::save_replay(&c).await.is_ok()
+                let Ok(rig) = engine.rig().await else { return };
+                if engine.rig_save_replay(&rig).await.is_ok()
                     && let Err(err) = engine.db(move |s| repo::studio::mark_clipped(s, id)).await
                 {
                     tracing::warn!(%err, "couldn't mark a marker clipped");

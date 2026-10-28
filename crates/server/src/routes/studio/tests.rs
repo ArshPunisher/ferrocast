@@ -325,14 +325,15 @@ async fn show_routes_with_obs_closed_then_open() {
     let (_, pf) = body(r.get("/show/preflight").await).await;
     assert_eq!(pf["ready"], false);
     assert_eq!(pf["checks"][0]["id"], "obs");
-    assert_eq!(pf["checks"][0]["fix"]["href"], "#/settings/obs");
+    // Neither the Studio nor OBS: the Studio is what to start.
+    assert_eq!(pf["checks"][0]["fix"]["href"], "#/studio/golive");
     assert_eq!(
         code(r.post("/show/start", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "preflight_failed".into())
     );
     assert_eq!(
         code(r.post("/show/preflight/fix", json!({ "action": "unmute:Mic" })).await).await,
-        (StatusCode::UNPROCESSABLE_ENTITY, "obs_unreachable".into())
+        (StatusCode::CONFLICT, "studio_stopped".into())
     );
     assert_eq!(code(r.put("/show/config", json!({ "countdown_s": 3 })).await).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(code(r.put("/show/config", json!({ "countdown_s": "soon" })).await).await.0, StatusCode::BAD_REQUEST);
@@ -374,7 +375,11 @@ async fn show_routes_with_obs_closed_then_open() {
 async fn obs_helper_routes_and_their_errors() {
     let r = start().await;
     assert_eq!(code(r.get("/obs/scenes").await).await, (StatusCode::UNPROCESSABLE_ENTITY, "obs_unreachable".into()));
-    assert_eq!(code(r.post("/obs/replay/save", json!({})).await).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    // Clips use the Studio's replay buffer, else OBS's: with neither, start the Studio.
+    assert_eq!(
+        code(r.post("/obs/replay/save", json!({})).await).await,
+        (StatusCode::CONFLICT, "studio_stopped".into())
+    );
     let (_, h) = body(r.get("/obs/health").await).await;
     assert!(h["health"].is_null());
     let obs = fake_obs(&r).await;

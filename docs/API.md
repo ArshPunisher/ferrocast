@@ -751,12 +751,14 @@ type ShowRun = { id; phase: "starting" | "countdown" | "live" | "ended"; started
 | Method | Path | Body → Response |
 |---|---|---|
 | GET / PUT | `/api/v1/show/config` | `ShowConfig` (400 `countdown_s: …`, `preset_id: …`, `at_zero.chat: …`). A countdown needs `live_scene` only while `at_zero.switch` is on; at zero, each `at_zero` action that's on runs and adds a `zero_*` step (`live_scene` for the switch) |
-| GET | `/api/v1/show/preflight` | → `{ checks: Check[], ready }`: OBS, scenes exist, mics not muted, cameras shown, disk space (OBS's recording drive), platforms connected, stream-info permission, Discord webhook |
+| GET | `/api/v1/show/preflight` | → `{ checks: Check[], ready }`: the Studio running (check `obs`, labelled "Studio"; OBS, connected, when the Studio isn't running), scenes exist, mics not muted, cameras shown, disk space (the recordings drive), platforms connected, stream-info permission, Discord webhook |
 | POST | `/api/v1/show/preflight/fix` | `{ action: "unmute:<input>" \| "show:<scene>/<source>" \| "start_replay_buffer" }` → the new pre-flight |
 | GET | `/api/v1/show` | → `{ show: ShowRun \| null }` |
-| POST | `/api/v1/show/start` | `{ force?: boolean }` → 201 `{ show }`. Runs: preset → replay buffer → starting scene → OBS Start Streaming (`start_stream`, step `stream`) → alerts on → bot on → Discord post → countdown (switches to the live scene at zero). 409 while a show runs, 422 `preflight_failed` (unless `force`) |
+| POST | `/api/v1/show/start` | `{ force?: boolean }` → 201 `{ show }`. Runs: preset → replay buffer → starting scene → Start Streaming (`start_stream`, step `stream`) → alerts on → bot on → Discord post → countdown (switches to the live scene at zero). 409 while a show runs, 422 `preflight_failed` (unless `force`) |
 | POST | `/api/v1/show/countdown/skip` · `/countdown/cancel` · `/live-scene` | → `{ show }`. 404 `no_countdown` |
-| POST | `/api/v1/show/end` | → `{ show }`: ending scene, thank-you in chat, an "Show ended" marker, then with `stop_stream` OBS Stop Streaming (step `stop_stream`: `done` at once with `stop_delay_s: 0`, else `waiting` and updated by a `show` frame when OBS stops; a show started meanwhile keeps streaming) |
+| POST | `/api/v1/show/end` | → `{ show }`: ending scene, thank-you in chat, an "Show ended" marker, then with `stop_stream` Stop Streaming (step `stop_stream`: `done` at once with `stop_delay_s: 0`, else `waiting` and updated by a `show` frame when it stops; a show started meanwhile keeps streaming) |
+
+The show, its pre-flight and fixes, BRB, `!scene`, `!clip`, `/obs/replay/save` and big-moment clips act in Ferrocast's Studio while it's running (its scenes, mixer, replay buffer and stream to Go live), and in OBS otherwise. With neither: 409 `studio_stopped` "The Studio isn't started" (a wrong OBS password still answers `obs_password`). The other `/obs/*` routes are OBS's own.
 
 **OBS helpers.** `ScenesConfig = { chat_enabled; chat_allowed: string[] /* !scene allow-list */; hotkeys: string[] /* Alt+1…9 in the dashboard */; brb_scene; brb_on_ads; brb_mute: string[]; clip_command; clip_on_big_moments }`.
 

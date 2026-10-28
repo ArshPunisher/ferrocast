@@ -1,7 +1,7 @@
 //! "Start show" and "End show" (API.md §4 "Studio: show"): the go-live checklist the
 //! streamer sets up once, pre-flight checks with one-click fixes, and the countdown that
-//! switches OBS to the live scene at zero. Every step reports what it did; one step failing
-//! never stops the others (OBS closed shouldn't stop the stream info going out).
+//! switches to the live scene at zero, in the Studio (or OBS, see `rig`). Every step reports
+//! what it did; one step failing never stops the others (the Studio stopped shouldn't stop the stream info going out).
 
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use ferrocast_core::show::{self, Check, CheckStatus, ShowConfig, fix};
 use ferrocast_core::template::Template;
 use serde::Serialize;
 
+use super::rig::Rig;
 use super::{SHOW_KEY, save_setting};
 use crate::{Engine, EngineError, now, platform_key};
 
@@ -110,19 +111,22 @@ impl Engine {
     pub async fn preflight(&self) -> Preflight {
         let cfg = self.show_config();
         let mut checks = Vec::new();
-        let client = self.obs_client().await;
-        match &client {
-            Ok(_) => checks.push(Check::new("obs", "OBS", CheckStatus::Ok, "Connected.", None)),
-            Err(e) => checks.push(Check::new(
+        let rig = self.rig().await;
+        match &rig {
+            Ok(Rig::Studio) => checks.push(Check::new("obs", "Studio", CheckStatus::Ok, "Running.", None)),
+            Ok(Rig::Obs(_)) => checks.push(Check::new("obs", "OBS", CheckStatus::Ok, "Connected.", None)),
+            // OBS is the fallback: the Studio is what to start.
+            Err(_) => checks.push(Check::new(
                 "obs",
-                "OBS",
+                "Studio",
                 CheckStatus::Fail,
-                e.to_string(),
-                fix("OBS settings", "#/settings/obs"),
+                "The Studio isn't started (and OBS isn't open).",
+                fix("Open the Studio", "#/studio/golive"),
             )),
         }
-        if let Ok(c) = &client {
-            match ferrocast_obs::control::scene_names(c).await {
+        if let Ok(r) = &rig {
+            let app = r.name();
+            match self.rig_scenes(r).await {
                 Ok((_, names)) => {
                     for (id, label, scene) in [
                         ("starting_scene", "Starting scene", &cfg.starting_scene),
@@ -131,13 +135,13 @@ impl Engine {
                     ] {
                         let Some(s) = scene else { continue };
                         checks.push(if names.iter().any(|n| n == s) {
-                            Check::new(id, label, CheckStatus::Ok, format!("\"{s}\" is in OBS."), None)
+                            Check::new(id, label, CheckStatus::Ok, format!("\"{s}\" is in {app}."), None)
                         } else {
                             Check::new(
                                 id,
                                 label,
                                 CheckStatus::Fail,
-                                format!("OBS has no scene called \"{s}\" (renamed or deleted?)."),
+                                format!("{} has no scene called \"{s}\" (renamed or deleted?).", r.title()),
                                 fix("Pick the scene again", "#/studio/show"),
                             )
                         });
@@ -146,13 +150,13 @@ impl Engine {
                 Err(e) => checks.push(Check::new("scenes", "Scenes", CheckStatus::Warn, e.to_string(), None)),
             }
             for m in &cfg.mic_sources {
-                checks.push(match ferrocast_obs::control::muted(c, m).await {
+                checks.push(match self.rig_muted(r, m).await {
                     Ok(false) => Check::new(&format!("mic:{m}"), m, CheckStatus::Ok, "Not muted.", None),
                     Ok(true) => Check::new(
                         &format!("mic:{m}"),
                         m,
                         CheckStatus::Fail,
-                        "Muted in OBS: nobody will hear you.",
+                        format!("Muted in {app}: nobody will hear you."),
                         fix("Unmute", format!("action:unmute:{m}")),
                     ),
                     Err(e) => Check::new(
@@ -167,7 +171,7 @@ impl Engine {
             let scene = cfg.live_scene.clone().or(cfg.starting_scene.clone());
             for cam in &cfg.cam_sources {
                 let Some(scene) = &scene else { break };
-                checks.push(match ferrocast_obs::control::source_visible(c, scene, cam).await {
+                checks.push(match self.rig_visible(r, scene, cam).await {
                     Ok(Some(true)) => {
                         Check::new(&format!("cam:{cam}"), cam, CheckStatus::Ok, format!("Shown in \"{scene}\"."), None)
                     }
@@ -189,15 +193,15 @@ impl Engine {
                 });
             }
             if cfg.replay_buffer {
-                checks.push(match ferrocast_obs::control::replay_buffer_active(c).await {
+                checks.push(match self.rig_replay_active(r).await {
                     Ok(true) => Check::new("replay", "Replay buffer", CheckStatus::Ok, "Running.", None),
                     Ok(false) => Check::new("replay", "Replay buffer", CheckStatus::Ok, "Starts with the show.", None),
                     Err(e) => Check::new("replay", "Replay buffer", CheckStatus::Warn, e.to_string(), None),
                 });
             }
         }
-        let disk = match &client {
-            Ok(c) => ferrocast_obs::control::health_sample(c, now().0).await.ok().map(|s| s.disk_mb),
+        let disk = match &rig {
+            Ok(r) => self.rig_disk_mb(r).await,
             Err(_) => None,
         };
         checks.push(show::disk_check(disk, cfg.min_disk_gb));
@@ -263,20 +267,19 @@ impl Engine {
 
     /// Runs a pre-flight fix: `unmute:<input>`, `show:<scene>/<source>`, `start_replay_buffer`.
     pub async fn preflight_fix(&self, action: &str) -> Result<Preflight, EngineError> {
-        let c = self.obs_client().await?;
+        let rig = self.rig().await?;
         if let Some(input) = action.strip_prefix("unmute:") {
-            ferrocast_obs::control::set_muted(&c, input, false).await.map_err(super::obs_error)?;
+            self.rig_set_muted(&rig, input, false).await?;
         } else if let Some(rest) = action.strip_prefix("show:") {
             let (scene, source) = rest
                 .split_once('/')
                 .ok_or_else(|| EngineError::Invalid("action: use show:<scene>/<source>.".into()))?;
-            let id = ferrocast_obs::control::item_id(&c, scene, source)
-                .await
-                .map_err(super::obs_error)?
-                .ok_or_else(|| EngineError::Invalid(format!("action: \"{source}\" isn't in \"{scene}\".")))?;
-            ferrocast_obs::control::set_visible(&c, scene, id, true).await.map_err(super::obs_error)?;
+            self.rig_set_visible(&rig, scene, source, true).await.map_err(|e| match e {
+                EngineError::Invalid(m) => EngineError::Invalid(format!("action: {m}")),
+                e => e,
+            })?;
         } else if action == "start_replay_buffer" {
-            ferrocast_obs::control::start_replay_buffer(&c).await.map_err(super::obs_error)?;
+            self.rig_start_replay(&rig).await?;
         } else {
             return Err(EngineError::Invalid(
                 "action: unmute:<input>, show:<scene>/<source> or start_replay_buffer.".into(),
@@ -356,13 +359,13 @@ impl Engine {
         }
         let client =
             if cfg.starting_scene.is_some() || cfg.live_scene.is_some() || cfg.replay_buffer || cfg.start_stream {
-                Some(self.obs_client().await)
+                Some(self.rig().await)
             } else {
                 None
             };
         if cfg.replay_buffer {
             steps.push(match &client {
-                Some(Ok(c)) => match ferrocast_obs::control::start_replay_buffer(c).await {
+                Some(Ok(r)) => match self.rig_start_replay(r).await {
                     Ok(()) => Step::new("replay", "Replay buffer", "done", "Running, so \"clip that\" works."),
                     Err(e) => Step::new("replay", "Replay buffer", "failed", e.to_string()),
                 },
@@ -375,12 +378,12 @@ impl Engine {
         }
         if cfg.start_stream {
             steps.push(match &client {
-                Some(Ok(c)) => match ferrocast_obs::control::start_stream(c).await {
-                    Ok(()) => Step::new("stream", "Go live in OBS", "done", "OBS is streaming."),
-                    Err(e) => Step::new("stream", "Go live in OBS", "failed", e.to_string()),
+                Some(Ok(r)) => match self.rig_set_streaming(r, true).await {
+                    Ok(()) => Step::new("stream", "Go live", "done", format!("{} is streaming.", r.title())),
+                    Err(e) => Step::new("stream", "Go live", "failed", e.to_string()),
                 },
-                Some(Err(e)) => Step::new("stream", "Go live in OBS", "failed", e.to_string()),
-                None => Step::new("stream", "Go live in OBS", "skipped", ""),
+                Some(Err(e)) => Step::new("stream", "Go live", "failed", e.to_string()),
+                None => Step::new("stream", "Go live", "skipped", ""),
             });
         }
         if cfg.alerts_on {
@@ -450,26 +453,22 @@ impl Engine {
         Ok(run)
     }
 
-    async fn switch_step(
-        &self,
-        client: &Option<Result<ferrocast_obs::Client, EngineError>>,
-        id: &str,
-        label: &str,
-        scene: &str,
-    ) -> Step {
-        match client {
-            Some(Ok(c)) => match ferrocast_obs::control::switch_scene(c, scene).await {
-                Ok(()) => Step::new(id, label, "done", format!("OBS is on \"{scene}\".")),
-                Err(e) => Step::new(id, label, "failed", e.to_string()),
+    async fn switch_step(&self, rig: &Option<Result<Rig, EngineError>>, id: &str, label: &str, scene: &str) -> Step {
+        let own;
+        let r = match rig {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => return Step::new(id, label, "failed", e.to_string()),
+            None => match self.rig().await {
+                Ok(r) => {
+                    own = r;
+                    &own
+                }
+                Err(e) => return Step::new(id, label, "failed", e.to_string()),
             },
-            Some(Err(e)) => Step::new(id, label, "failed", e.to_string()),
-            None => match self.obs_client().await {
-                Ok(c) => match ferrocast_obs::control::switch_scene(&c, scene).await {
-                    Ok(()) => Step::new(id, label, "done", format!("OBS is on \"{scene}\".")),
-                    Err(e) => Step::new(id, label, "failed", e.to_string()),
-                },
-                Err(e) => Step::new(id, label, "failed", e.to_string()),
-            },
+        };
+        match self.rig_switch(r, scene).await {
+            Ok(()) => Step::new(id, label, "done", format!("{} is on \"{scene}\".", r.title())),
+            Err(e) => Step::new(id, label, "failed", e.to_string()),
         }
     }
 
@@ -509,13 +508,13 @@ impl Engine {
                 None => Step::new("live_scene", "Live scene", "skipped", "No live scene picked."),
             });
         }
-        let client = if z.unmute || z.start_stream || z.record { Some(self.obs_client().await) } else { None };
+        let client = if z.unmute || z.start_stream || z.record { Some(self.rig().await) } else { None };
         if z.unmute {
             run.steps.push(match &client {
-                Some(Ok(c)) => {
+                Some(Ok(r)) => {
                     let mut bad = Vec::new();
                     for m in &cfg.mic_sources {
-                        if ferrocast_obs::control::set_muted(c, m, false).await.is_err() {
+                        if self.rig_set_muted(r, m, false).await.is_err() {
                             bad.push(m.clone());
                         }
                     }
@@ -524,7 +523,7 @@ impl Engine {
                     } else if bad.is_empty() {
                         Step::new("zero_unmute", "Mic", "done", "On.")
                     } else {
-                        Step::new("zero_unmute", "Mic", "failed", format!("OBS has no {}.", bad.join(", ")))
+                        Step::new("zero_unmute", "Mic", "failed", format!("{} has no {}.", r.title(), bad.join(", ")))
                     }
                 }
                 Some(Err(e)) => Step::new("zero_unmute", "Mic", "failed", e.to_string()),
@@ -533,21 +532,23 @@ impl Engine {
         }
         if z.start_stream {
             run.steps.push(match &client {
-                Some(Ok(c)) => match ferrocast_obs::control::streaming(c).await {
-                    Ok(true) => Step::new("zero_stream", "Go live in OBS", "skipped", "OBS is streaming already."),
-                    _ => match ferrocast_obs::control::start_stream(c).await {
-                        Ok(()) => Step::new("zero_stream", "Go live in OBS", "done", "OBS is streaming."),
-                        Err(e) => Step::new("zero_stream", "Go live in OBS", "failed", e.to_string()),
+                Some(Ok(r)) => match self.rig_streaming(r).await {
+                    Ok(true) => {
+                        Step::new("zero_stream", "Go live", "skipped", format!("{} is streaming already.", r.title()))
+                    }
+                    _ => match self.rig_set_streaming(r, true).await {
+                        Ok(()) => Step::new("zero_stream", "Go live", "done", format!("{} is streaming.", r.title())),
+                        Err(e) => Step::new("zero_stream", "Go live", "failed", e.to_string()),
                     },
                 },
-                Some(Err(e)) => Step::new("zero_stream", "Go live in OBS", "failed", e.to_string()),
-                None => Step::new("zero_stream", "Go live in OBS", "skipped", ""),
+                Some(Err(e)) => Step::new("zero_stream", "Go live", "failed", e.to_string()),
+                None => Step::new("zero_stream", "Go live", "skipped", ""),
             });
         }
         if z.record {
             run.steps.push(match &client {
-                Some(Ok(c)) => match ferrocast_obs::control::start_record(c).await {
-                    Ok(()) => Step::new("zero_record", "Recording", "done", "OBS is recording."),
+                Some(Ok(r)) => match self.rig_start_record(r).await {
+                    Ok(()) => Step::new("zero_record", "Recording", "done", format!("{} is recording.", r.title())),
                     Err(e) => Step::new("zero_record", "Recording", "failed", e.to_string()),
                 },
                 Some(Err(e)) => Step::new("zero_record", "Recording", "failed", e.to_string()),
@@ -653,12 +654,7 @@ impl Engine {
                     tokio::time::sleep(std::time::Duration::from_secs(u64::from(delay))).await;
                     engine.stop_stream_later(&id).await;
                 });
-                Step::new(
-                    "stop_stream",
-                    "Stop streaming",
-                    "waiting",
-                    format!("OBS stops streaming in {delay} seconds."),
-                )
+                Step::new("stop_stream", "Stop streaming", "waiting", format!("Streaming stops in {delay} seconds."))
             });
         }
         run.phase = Phase::Ended;
@@ -671,13 +667,13 @@ impl Engine {
 
 impl Engine {
     async fn stop_stream_step(&self) -> Step {
-        let r = match self.obs_client().await {
-            Ok(c) => ferrocast_obs::control::stop_stream(&c).await.map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
+        let rig = match self.rig().await {
+            Ok(r) => r,
+            Err(e) => return Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
         };
-        match r {
-            Ok(()) => Step::new("stop_stream", "Stop streaming", "done", "OBS stopped streaming."),
-            Err(e) => Step::new("stop_stream", "Stop streaming", "failed", e),
+        match self.rig_set_streaming(&rig, false).await {
+            Ok(()) => Step::new("stop_stream", "Stop streaming", "done", format!("{} stopped streaming.", rig.title())),
+            Err(e) => Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
         }
     }
 

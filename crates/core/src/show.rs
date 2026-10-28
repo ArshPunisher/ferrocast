@@ -43,7 +43,7 @@ pub struct ShowConfig {
     pub mic_sources: Vec<String>,
     /// Pre-flight: these OBS sources must be visible in the live scene.
     pub cam_sources: Vec<String>,
-    /// Pre-flight: warn below this much free space where OBS records (GB).
+    /// Pre-flight: warn below this much free space where recordings go (GB).
     pub min_disk_gb: u32,
     /// Pre-flight: these platforms should be connected.
     pub platforms: Vec<crate::event::Platform>,
@@ -192,22 +192,26 @@ pub fn ready(checks: &[Check]) -> bool {
     !checks.iter().any(|c| c.status == CheckStatus::Fail)
 }
 
-/// The disk check, from OBS's free space in MB.
+/// The disk check, from the free space where recordings go (MB).
 pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
     match free_mb {
-        None => {
-            Check::new("disk", "Disk space", CheckStatus::Skip, "OBS isn't connected, so free space is unknown.", None)
-        }
+        None => Check::new(
+            "disk",
+            "Disk space",
+            CheckStatus::Skip,
+            "The Studio isn't started, so free space is unknown.",
+            None,
+        ),
         Some(mb) => {
             let gb = mb / 1024.0;
-            let label = format!("{gb:.0} GB free where OBS records.");
+            let label = format!("{gb:.0} GB free where recordings go.");
             if gb < 1.0 {
                 Check::new(
                     "disk",
                     "Disk space",
                     CheckStatus::Fail,
                     format!("{label} Recordings and replays will fail."),
-                    fix("Free up space", "#/studio/obs"),
+                    fix("Free up space", "#/studio/golive"),
                 )
             } else if gb < f64::from(min_gb) {
                 Check::new(
@@ -443,7 +447,7 @@ pub fn health(prev: Option<&HealthSample>, cur: &HealthSample) -> Health {
         warn(
             "disk",
             if cur.disk_mb < 1024.0 { "error" } else { "warn" },
-            format!("Only {:.1} GB free where OBS records.", cur.disk_mb / 1024.0),
+            format!("Only {:.1} GB free where recordings go.", cur.disk_mb / 1024.0),
             "Free up space before recordings or replay saves fail.",
         );
     }

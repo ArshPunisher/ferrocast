@@ -1,4 +1,4 @@
-//! OBS helpers (API.md §4 "Studio: OBS"): scenes and sources from the dashboard, `!scene`
+//! Scene tools (API.md §4 "Studio: OBS"): OBS's scenes and sources from the dashboard, `!scene`
 //! for mods (only scenes on the allow-list), BRB by button, `!brb` or during Twitch ads,
 //! "clip that" (the replay buffer, from the dashboard, `!clip` or big moments) and the
 //! health watch (dropped frames, encoder and render lag, bitrate, CPU, disk) for Home.
@@ -66,6 +66,15 @@ impl Engine {
         ferrocast_obs::control::switch_scene(&c, scene).await.map_err(obs_error)
     }
 
+    /// A scene switch from chat or a rule: in the Studio while it runs, else in OBS.
+    pub(crate) async fn switch_scene_anywhere(&self, scene: &str) -> Result<(), EngineError> {
+        if !ferrocast_core::show::valid_scene_name(scene) {
+            return Err(EngineError::Invalid("scene: a scene name of 1 to 100 characters.".into()));
+        }
+        let rig = self.rig().await?;
+        self.rig_switch(&rig, scene).await
+    }
+
     pub async fn set_source_visible(&self, scene: &str, item_id: i64, visible: bool) -> Result<(), EngineError> {
         let c = self.obs_client().await?;
         ferrocast_obs::control::set_visible(&c, scene, item_id, visible).await.map_err(obs_error)
@@ -76,10 +85,11 @@ impl Engine {
         ferrocast_obs::control::set_muted(&c, input, muted).await.map_err(obs_error)
     }
 
-    /// "Clip that": saves the replay buffer and puts a marker on the timeline.
+    /// "Clip that": saves the replay buffer (the Studio's, or OBS's) and puts a marker on the
+    /// timeline.
     pub async fn clip_that(&self, label: Option<&str>) -> Result<ClipResult, EngineError> {
-        let c = self.obs_client().await?;
-        let path = ferrocast_obs::control::save_replay(&c).await.map_err(obs_error)?;
+        let rig = self.rig().await?;
+        let path = self.rig_save_replay(&rig).await?;
         let label = label.map(str::trim).filter(|l| !l.is_empty()).unwrap_or("Clip saved").to_string();
         let marker = self.add_marker_now(MomentKind::Clip, &label, None, true).await?;
         Ok(ClipResult { saved: true, path, marker })
@@ -93,18 +103,18 @@ impl Engine {
             status: 422,
             code: "no_brb_scene",
             message: "No BRB scene is picked.".into(),
-            hint: "Pick one in Studio, OBS.".into(),
+            hint: "Pick one in Studio, Show.".into(),
             retry_after: None,
         })?;
-        let c = self.obs_client().await?;
+        let rig = self.rig().await?;
         if on {
-            let (current, _) = ferrocast_obs::control::scene_names(&c).await.map_err(obs_error)?;
-            ferrocast_obs::control::switch_scene(&c, &brb).await.map_err(obs_error)?;
+            let (current, _) = self.rig_scenes(&rig).await?;
+            self.rig_switch(&rig, &brb).await?;
             if current.as_deref() != Some(brb.as_str()) {
                 *self.studio().brb_from.lock().unwrap_or_else(|p| p.into_inner()) = current;
             }
             for m in &cfg.brb_mute {
-                if let Err(e) = ferrocast_obs::control::set_muted(&c, m, true).await {
+                if let Err(e) = self.rig_set_muted(&rig, m, true).await {
                     tracing::warn!(error = %e, input = %m, "couldn't mute for BRB");
                 }
             }
@@ -125,9 +135,9 @@ impl Engine {
                     hint: "Switch the scene yourself, or pick a live scene in Studio, Show.".into(),
                     retry_after: None,
                 })?;
-            ferrocast_obs::control::switch_scene(&c, &back).await.map_err(obs_error)?;
+            self.rig_switch(&rig, &back).await?;
             for m in &cfg.brb_mute {
-                if let Err(e) = ferrocast_obs::control::set_muted(&c, m, false).await {
+                if let Err(e) = self.rig_set_muted(&rig, m, false).await {
                     tracing::warn!(error = %e, input = %m, "couldn't unmute after BRB");
                 }
             }
@@ -158,7 +168,7 @@ impl Engine {
                 tokio::spawn(async move {
                     let reply = match cfg.chat_scene(&asked) {
                         Err(why) => why,
-                        Ok(scene) => match engine.switch_scene(scene).await {
+                        Ok(scene) => match engine.switch_scene_anywhere(scene).await {
                             Ok(()) => format!("Switched to {scene}."),
                             Err(err) => format!("Couldn't switch: {err}"),
                         },
@@ -185,7 +195,7 @@ impl Engine {
                 let label = format!("Clip by {}", actor.display_name);
                 tokio::spawn(async move {
                     let reply = match engine.clip_that(Some(&label)).await {
-                        Ok(_) => "Clipped! It's saved in OBS's recordings folder.".to_string(),
+                        Ok(_) => "Clipped! It's saved in the recordings folder.".to_string(),
                         Err(err) => format!("Couldn't clip: {err}"),
                     };
                     engine.studio_reply(&ev, &reply);

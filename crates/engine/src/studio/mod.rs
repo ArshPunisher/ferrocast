@@ -20,6 +20,7 @@ pub mod autoreplies;
 pub mod chatbot;
 pub mod moments;
 pub mod obs_tools;
+pub(crate) mod rig;
 pub mod show;
 pub mod stream_info;
 

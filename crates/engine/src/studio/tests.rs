@@ -685,13 +685,14 @@ async fn with_obs_closed_the_preflight_says_so_and_steps_fail_cleanly() {
     let pf = e.preflight().await;
     let obs = pf.checks.iter().find(|c| c.id == "obs").unwrap();
     assert_eq!(obs.status, ferrocast_core::show::CheckStatus::Fail);
-    assert_eq!(obs.fix.as_ref().unwrap().href, "#/settings/obs");
+    // The Studio is what to start (OBS is the fallback).
+    assert_eq!(obs.fix.as_ref().unwrap().href, "#/studio/golive");
     assert!(pf.checks.iter().any(|c| c.id == "discord"), "no webhook is a warning");
     assert!(pf.checks.iter().any(|c| c.id == "platforms"));
     let run = e.start_show(true).await.unwrap();
     let scene = run.steps.iter().find(|s| s.id == "starting_scene").unwrap();
     assert_eq!(scene.status, "failed");
-    assert!(scene.detail.contains("OBS isn't running"), "{}", scene.detail);
+    assert!(scene.detail.contains("The Studio isn't started"), "{}", scene.detail);
     assert_eq!(run.steps.iter().find(|s| s.id == "discord").unwrap().status, "skipped");
     assert!(e.patch_show_config(json!({ "countdown_s": 5 }).as_object().unwrap()).await.is_err());
     assert!(e.patch_show_config(json!({ "preset_id": "ghost" }).as_object().unwrap()).await.is_err());
@@ -1071,5 +1072,161 @@ async fn at_zero_runs_only_the_actions_that_are_on() {
     let bad = json!({ "at_zero": { "chat": "" } });
     assert!(
         matches!(e.patch_show_config(bad.as_object().unwrap()).await, Err(crate::EngineError::Invalid(m)) if m.starts_with("at_zero.chat"))
+    );
+}
+
+// ---------------------------------------------------------------- the Studio drives the show
+
+/// A running Studio with three scenes, a muted mic and a hidden camera in "Live".
+#[derive(Debug, Default)]
+struct FakeStudio {
+    acts: Mutex<Vec<String>>,
+    current: Mutex<String>,
+    muted: Mutex<bool>,
+    streaming: Mutex<bool>,
+}
+
+#[async_trait]
+impl crate::studio_host::StudioHost for FakeStudio {
+    async fn status(&self) -> crate::studio_host::StudioStatus {
+        crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Err("no".into())
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({ "inputs": [] }))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
+        use crate::studio_host::StudioAct as A;
+        let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
+        Ok(match act {
+            A::Scenes => json!({
+                "current": lock(&self.current),
+                "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
+            }),
+            A::SetCurrent { scene } => {
+                self.acts.lock().unwrap().push(format!("scene {scene}"));
+                *self.current.lock().unwrap() = scene;
+                Value::Null
+            }
+            A::Audio { .. } => json!([{ "name": "Mic", "muted": *self.muted.lock().unwrap() }]),
+            A::SetAudio { name, change } => {
+                if let Some(m) = change.muted {
+                    self.acts.lock().unwrap().push(format!("mute {name} {m}"));
+                    *self.muted.lock().unwrap() = m;
+                }
+                Value::Null
+            }
+            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": false }]),
+            A::EditItem { scene, id, edit } => {
+                self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
+                Value::Null
+            }
+            other => return Err(format!("not faked: {other:?}")),
+        })
+    }
+    async fn settings(&self) -> crate::studio_host::StudioSettings {
+        Default::default()
+    }
+    async fn set_settings(&self, _s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(json!({ "disk_free_mb": 500_000.0, "replay": null }))
+    }
+    async fn record(&self, on: bool) -> Result<Value, String> {
+        self.acts.lock().unwrap().push(format!("record {on}"));
+        Ok(json!({}))
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(&self, _server: String, _key: String) -> Result<Value, String> {
+        self.acts.lock().unwrap().push("stream true".into());
+        *self.streaming.lock().unwrap() = true;
+        Ok(json!({ "active": true }))
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        self.acts.lock().unwrap().push("stream false".into());
+        *self.streaming.lock().unwrap() = false;
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(if *self.streaming.lock().unwrap() { json!({ "active": true }) } else { Value::Null })
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+}
+
+#[tokio::test]
+async fn the_show_and_brb_run_in_the_studio_while_it_runs() {
+    let (e, _d) = engine().await;
+    let studio =
+        Arc::new(FakeStudio { muted: Mutex::new(true), current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": "Live", "mic_sources": ["Mic"], "cam_sources": ["Camera"],
+            "countdown_s": 0, "discord": false, "alerts_on": false, "bot_on": false,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    // No OBS anywhere: the pre-flight reads the Studio.
+    let pf = e.preflight().await;
+    let check = |id: &str| pf.checks.iter().find(|c| c.id == id).cloned().unwrap_or_else(|| panic!("{id}"));
+    assert_eq!(check("obs").label, "Studio");
+    assert!(check("live_scene").detail.contains("is in the Studio"), "{:?}", check("live_scene"));
+    assert!(check("mic:Mic").detail.contains("Muted in the Studio"), "{:?}", check("mic:Mic"));
+    assert!(check("cam:Camera").detail.contains("Hidden"), "{:?}", check("cam:Camera"));
+    // Its fixes act in the Studio.
+    e.preflight_fix("unmute:Mic").await.unwrap();
+    e.preflight_fix("show:Live/Camera").await.unwrap();
+    assert!(!*studio.muted.lock().unwrap());
+    // Start: the starting scene, then the live one (no countdown).
+    let run = e.start_show(true).await.unwrap();
+    let step = |id: &str| run.steps.iter().find(|s| s.id == id).map(|s| (s.status.clone(), s.detail.clone()));
+    assert_eq!(step("starting_scene").map(|s| s.0), Some("done".into()));
+    assert_eq!(step("live_scene"), Some(("done".into(), "The Studio is on \"Live\".".into())));
+    // BRB: there and back, the mic muted meanwhile.
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_mute": ["Mic"] }).as_object().unwrap()).await.unwrap();
+    e.set_brb(true).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    e.set_brb(false).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "Live", "back where we were");
+    assert_eq!(
+        studio.acts.lock().unwrap().clone(),
+        [
+            "mute Mic false",
+            "edit Live 7 Show",
+            "scene Starting",
+            "scene Live",
+            "scene BRB",
+            "mute Mic true",
+            "scene Live",
+            "mute Mic false",
+        ]
     );
 }
