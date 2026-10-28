@@ -1853,7 +1853,10 @@ impl StudioHost for DesktopStudio {
             h.vstream = None;
             let s = h.settings.clone().unwrap_or_default();
             let settings = stream_settings(studio, &s);
-            tracing::info!(kbps = settings.encode.video_kbps, "the Studio's vertical picture starts streaming into Go live");
+            tracing::info!(
+                kbps = settings.encode.video_kbps,
+                "the Studio's vertical picture starts streaming into Go live"
+            );
             h.vstream = Some(c.vertical_stream(&server, &key, &settings).map_err(|e| e.to_string())?);
             Ok(true)
         })

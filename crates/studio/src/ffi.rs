@@ -1333,7 +1333,11 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
         let mut nested: Option<Vec<(i64, Matrix4)>> = None;
         for id in ids {
             let m = item_box(api, st.on, scene, *id).or_else(|| {
-                nested.get_or_insert_with(|| all_boxes(api, st.on, scene)).iter().find(|(i, _)| i == id).map(|(_, m)| *m)
+                nested
+                    .get_or_insert_with(|| all_boxes(api, st.on, scene))
+                    .iter()
+                    .find(|(i, _)| i == id)
+                    .map(|(_, m)| *m)
             });
             if let Some(m) = m {
                 draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);

@@ -167,14 +167,21 @@ impl Collection {
         rect: crate::Rect,
         scale: f64,
     ) -> Result<crate::Preview, StudioError> {
-        let canvas = self.vertical_canvas().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?;
+        let canvas =
+            self.vertical_canvas().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?;
         self.studio.preview_on(window, rect, scale, canvas, VERTICAL_SIZE)
     }
 
     /// Streams the vertical picture over RTMP to `server` with `key`, encoded as `s` says but at
     /// its own size (the main picture's scaling doesn't apply). Stops when the handle is dropped.
-    pub fn vertical_stream(&self, server: &str, key: &str, s: &crate::StreamSettings) -> Result<crate::Streaming, StudioError> {
-        let video = self.vertical_video_out().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?;
+    pub fn vertical_stream(
+        &self,
+        server: &str,
+        key: &str,
+        s: &crate::StreamSettings,
+    ) -> Result<crate::Streaming, StudioError> {
+        let video =
+            self.vertical_video_out().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?;
         let mut s = s.clone();
         s.encode.scale = None;
         self.studio.stream_of(server, key, &s, video)
@@ -204,7 +211,8 @@ impl Collection {
 
     pub fn add_vertical_scene(&self, name: &str) -> Result<(), StudioError> {
         self.need_canvases()?;
-        let canvas = self.vertical_canvas().ok_or_else(|| StudioError::Failed("Turn the vertical picture on first.".into()))?;
+        let canvas =
+            self.vertical_canvas().ok_or_else(|| StudioError::Failed("Turn the vertical picture on first.".into()))?;
         self.name_free(name)?;
         let a = self.api();
         let n = cstr(name);

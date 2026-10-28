@@ -1852,7 +1852,9 @@ impl Engine {
         };
         match started {
             Ok(true) => None,
-            Ok(false) => Some("A vertical platform is on, but there's no vertical picture: add one in Studio, Go live.".into()),
+            Ok(false) => {
+                Some("A vertical platform is on, but there's no vertical picture: add one in Studio, Go live.".into())
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "the Studio's vertical picture didn't start streaming");
                 Some("The vertical stream didn't start; the wide one did.".into())
@@ -2261,7 +2263,8 @@ mod tests {
         let add: StudioAct = serde_json::from_value(serde_json::json!({ "act": "add_scene", "name": "Tall" })).unwrap();
         assert_eq!(add, StudioAct::AddScene { name: "Tall".into(), vertical: false });
         let add: StudioAct =
-            serde_json::from_value(serde_json::json!({ "act": "add_scene", "name": "Tall", "vertical": true })).unwrap();
+            serde_json::from_value(serde_json::json!({ "act": "add_scene", "name": "Tall", "vertical": true }))
+                .unwrap();
         assert_eq!(add, StudioAct::AddScene { name: "Tall".into(), vertical: true });
         assert!(StudioAct::StartVertical { scene: "Gameplay".into() }.check().is_ok());
         assert!(matches!(StudioAct::StartVertical { scene: "  ".into() }.check(), Err(EngineError::Invalid(_))));

@@ -818,7 +818,12 @@ impl Collection {
     /// Where a scene is in its picture's list.
     fn index_of(&self, name: &str) -> Result<usize, StudioError> {
         if let Some(src) = self.vertical_scene(name) {
-            return Ok(self.vertical.borrow().as_ref().and_then(|v| v.scenes.iter().position(|s| *s == src)).unwrap_or(0));
+            return Ok(self
+                .vertical
+                .borrow()
+                .as_ref()
+                .and_then(|v| v.scenes.iter().position(|s| *s == src))
+                .unwrap_or(0));
         }
         let src = self.scene_src(name)?;
         Ok(self.scenes.borrow().iter().position(|s| *s == src).unwrap_or(0))
@@ -1507,7 +1512,10 @@ impl Collection {
             a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: k, y: k });
             a.obs_sceneitem_set_pos(
                 item,
-                &ffi::Vec2 { x: ((c.width as f32 - w * k) / 2.0).round(), y: ((c.height as f32 - h * k) / 2.0).round() },
+                &ffi::Vec2 {
+                    x: ((c.width as f32 - w * k) / 2.0).round(),
+                    y: ((c.height as f32 - h * k) / 2.0).round(),
+                },
             );
             return;
         }
