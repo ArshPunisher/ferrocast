@@ -171,6 +171,15 @@ impl Collection {
         self.studio.preview_on(window, rect, scale, canvas, VERTICAL_SIZE)
     }
 
+    /// Streams the vertical picture over RTMP to `server` with `key`, encoded as `s` says but at
+    /// its own size (the main picture's scaling doesn't apply). Stops when the handle is dropped.
+    pub fn vertical_stream(&self, server: &str, key: &str, s: &crate::StreamSettings) -> Result<crate::Streaming, StudioError> {
+        let video = self.vertical_video_out().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?;
+        let mut s = s.clone();
+        s.encode.scale = None;
+        self.studio.stream_of(server, key, &s, video)
+    }
+
     /// The vertical scene called `name`.
     pub(super) fn vertical_scene(&self, name: &str) -> Option<*mut ffi::ObsSource> {
         let a = self.api();
@@ -303,7 +312,9 @@ impl Collection {
         }
         // Made the size and rate ours whatever was saved (and given a mix if it had none).
         let mut video = self.vertical_video();
-        a.canvas_reset_video(canvas, &mut video);
+        if !a.canvas_reset_video(canvas, &mut video) {
+            tracing::warn!("the vertical picture's video couldn't be set up");
+        }
         Some(canvas)
     }
 

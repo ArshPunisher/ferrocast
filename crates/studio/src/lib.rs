@@ -998,8 +998,19 @@ impl Studio {
     /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output), with
     /// its reconnects and delay as `s` says. Stops when the handle is dropped.
     pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<Streaming, StudioError> {
+        self.stream_of(server, key, s, ptr::null_mut())
+    }
+
+    /// As [`Studio::stream`], of the canvas whose video is `video` (null: the main picture).
+    pub(crate) fn stream_of(
+        &self,
+        server: &str,
+        key: &str,
+        s: &StreamSettings,
+        video: *mut ffi::VideoT,
+    ) -> Result<Streaming, StudioError> {
         let a = &self.inner.api;
-        let (venc, aenc) = self.encoders(&s.encode)?;
+        let (venc, aenc) = self.encoders_for(&s.encode, false, video)?;
         let settings = a.obs_data_create();
         for (k, v) in [("server", server), ("key", key)] {
             let (k, v) = (cstr(k), cstr(v));
@@ -1038,7 +1049,7 @@ impl Studio {
 
     /// The video encoder `e` describes and an AAC audio encoder, tied to the canvas.
     fn encoders(&self, e: &EncodeSettings) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
-        self.encoders_for(e, false)
+        self.encoders_for(e, false, ptr::null_mut())
     }
 
     /// As [`Studio::encoders`]; `opus` makes the sound Opus (WebRTC takes only that).
@@ -1046,6 +1057,7 @@ impl Studio {
         &self,
         e: &EncodeSettings,
         opus: bool,
+        video: *mut ffi::VideoT,
     ) -> Result<(*mut ffi::ObsEncoder, *mut ffi::ObsEncoder), StudioError> {
         let a = &self.inner.api;
         let vs = a.obs_data_create();
@@ -1124,7 +1136,7 @@ impl Studio {
                 if opus { "no Opus encoder is available" } else { "no AAC encoder is available" }.into(),
             ));
         }
-        a.obs_encoder_set_video(venc, a.obs_get_video());
+        a.obs_encoder_set_video(venc, if video.is_null() { a.obs_get_video() } else { video });
         a.obs_encoder_set_audio(aenc, a.obs_get_audio());
         Ok((venc, aenc))
     }
@@ -2451,7 +2463,7 @@ impl Streaming {
         let (venc, aenc) = if proto == Protocol::Whip {
             let mut e = self.settings.encode.clone();
             e.bframes = false;
-            match self.studio.encoders_for(&e, true) {
+            match self.studio.encoders_for(&e, true, ptr::null_mut()) {
                 Ok(pair) => {
                     d.own = Some(pair);
                     pair
