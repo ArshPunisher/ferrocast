@@ -633,7 +633,7 @@ async fn a_description_replaces_the_old_one_and_a_thumbnail_is_uploaded() {
     assert!(e.contains("JPEG or PNG"), "{e}");
     let e =
         api.set_thumbnail(&vec![0; crate::api::MAX_THUMBNAIL_BYTES + 1], "image/jpeg").await.unwrap_err().to_string();
-    assert!(e.contains("2 MB"), "{e}");
+    assert!(e.contains("50 MB"), "{e}");
     // No broadcast: the usual refusal.
     let (ep, _) = fake_videos(false).await;
     let e = video_api(ep).set_thumbnail(b"x", "image/png").await.unwrap_err().to_string();
@@ -771,4 +771,14 @@ fn utc_timestamps() {
     assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
     assert_eq!(rfc3339_utc(1_793_097_000_000), "2026-10-27T10:30:00Z");
     assert_eq!(rfc3339_utc(951_782_400_000), "2000-02-29T00:00:00Z");
+}
+
+#[test]
+fn a_big_thumbnail_gets_time_to_upload() {
+    use crate::api::{MAX_THUMBNAIL_BYTES, thumbnail_deadline};
+    assert_eq!(thumbnail_deadline(200 * 1024).as_secs(), 15);
+    // 50 MB at about 2 Mbps, within the 5-minute cap.
+    let big = thumbnail_deadline(MAX_THUMBNAIL_BYTES).as_secs();
+    assert!((200..=300).contains(&big), "{big}");
+    assert_eq!(thumbnail_deadline(usize::MAX / 2).as_secs(), 300);
 }

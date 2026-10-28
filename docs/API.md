@@ -711,7 +711,7 @@ Chat: `!deaths` shows the count (everyone); mods `!deaths +`, `+5`, `-`, `set 10
 type StreamInfo = { title?: string /* 1–140 (YouTube: 100) */; category?: { name: string; ids?: { twitch?, youtube?, kick? } };
                     tags?: string[] /* ≤10, letters and digits, ≤25 each; [] clears */; language?: string /* "en" */;
                     description?: string /* YouTube only; ≤5000, line breaks kept, no < or >; "" clears */;
-                    thumbnail?: string /* a media library id; YouTube only; JPEG or PNG ≤2 MB */;
+                    thumbnail?: string /* a media library id; YouTube only; JPEG or PNG ≤50 MB */;
                     per?: { twitch?: StreamInfo; youtube?: StreamInfo; kick?: StreamInfo } /* a platform's own fields (no nested per) */ }
 type PlatformResult = { platform; ok: boolean; applied: string[]; skipped: string[] /* "language: Kick has no stream language setting" */;
                         error: { code: "not_connected" | "reconnect_needed" | "rate_limited" | "refused" | "unreachable" | "no_broadcast"

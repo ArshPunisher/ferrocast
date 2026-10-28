@@ -262,13 +262,13 @@ impl Api {
         Ok(applied)
     }
 
-    /// Sets the broadcast's thumbnail (`thumbnails.set`, 50 units): a JPEG or PNG of up to 2 MB.
+    /// Sets the broadcast's thumbnail (`thumbnails.set`, 50 units): a JPEG or PNG of up to 50 MB.
     pub async fn set_thumbnail(&self, image: &[u8], mime: &str) -> Result<(), YoutubeError> {
         if !matches!(mime, "image/jpeg" | "image/png") {
             return Err(YoutubeError::Refused("YouTube thumbnails must be a JPEG or PNG picture".into()));
         }
         if image.len() > MAX_THUMBNAIL_BYTES {
-            return Err(YoutubeError::Refused("YouTube thumbnails can be 2 MB at most".into()));
+            return Err(YoutubeError::Refused("YouTube thumbnails can be 50 MB at most".into()));
         }
         let id = self.broadcast_id().await?;
         let url = upload_base(&self.ep.api) + "/thumbnails/set";
@@ -281,6 +281,8 @@ impl Api {
                 .bearer_auth(&token)
                 .header(reqwest::header::CONTENT_TYPE, mime)
                 .body(image.to_vec())
+                // The client's 20 s is for small calls; a big picture takes longer on a slow line.
+                .timeout(thumbnail_deadline(image.len()))
                 .send()
                 .await
                 .map_err(YoutubeError::network)?;
@@ -305,7 +307,15 @@ impl Api {
 }
 
 /// YouTube's own limit for a thumbnail.
-pub const MAX_THUMBNAIL_BYTES: usize = 2 * 1024 * 1024;
+/// `thumbnails.set` takes up to 50 MB (YouTube's API reference, checked 28 Oct 2026; it was 2 MB).
+pub const MAX_THUMBNAIL_BYTES: usize = 50 * 1024 * 1024;
+
+/// How long a thumbnail of `bytes` may take to send: 15 s, plus time for it at a slow upload
+/// (256 KB/s, about 2 Mbps), at most 5 minutes. A big picture mustn't fail as "too slow".
+pub fn thumbnail_deadline(bytes: usize) -> std::time::Duration {
+    let send = bytes as u64 / (256 * 1024);
+    std::time::Duration::from_secs((15 + send).min(300))
+}
 
 /// Uploads go to `/upload/youtube/v3` next to the API (`{api}/upload` for a test server).
 fn upload_base(api: &str) -> String {

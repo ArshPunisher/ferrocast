@@ -354,7 +354,9 @@ async fn push_one(
                 let r = match t {
                     Err(why) => Err(why),
                     Ok((bytes, mime)) => {
-                        match tokio::time::timeout(PLATFORM_DEADLINE, c.set_thumbnail(&bytes, &mime)).await {
+                        // Twice the upload's own time: the broadcast lookup and a token refresh too.
+                        let deadline = ferrocast_youtube::api::thumbnail_deadline(bytes.len()) * 2;
+                        match tokio::time::timeout(deadline, c.set_thumbnail(&bytes, &mime)).await {
                             Ok(Ok(())) => Ok(()),
                             Ok(Err(e)) => Err(match e {
                                 ConnectorError::Refused { message, .. } => message,
@@ -370,7 +372,7 @@ async fn push_one(
                         return fail(
                             "refused",
                             sentence(&format!("Thumbnail: {why}")),
-                            Some("Pick a JPEG or PNG of up to 2 MB, then try again."),
+                            Some("Pick a JPEG or PNG of up to 50 MB, then try again."),
                             skipped,
                         );
                     }
