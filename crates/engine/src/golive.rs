@@ -1401,11 +1401,25 @@ impl Engine {
         *lock(&g.cut) = Some(CutRun { config: cfg.cut, stop, state });
     }
 
-    /// What's on air in OBS, to mark the camera and game on (the cut editor).
+    /// What's on air, to mark the camera and game on (the cut editor): the Studio's own picture
+    /// when it runs (it streams through here like OBS does), else OBS's.
     pub async fn golive_picture(&self) -> Result<serde_json::Value, EngineError> {
+        if let Some(v) = self.studio_picture().await {
+            return Ok(v);
+        }
         let c = self.obs_client().await?;
         let (image, width, height) = obs::program_picture(&c, 960).await?;
         Ok(serde_json::json!({ "image": image, "width": width, "height": height }))
+    }
+
+    /// The Studio's scene on air as a picture (640 wide), or None while the Studio isn't running.
+    async fn studio_picture(&self) -> Option<serde_json::Value> {
+        let scenes = self.studio_act(crate::studio_host::StudioAct::Scenes).await.ok()?;
+        let scene = scenes.get("current")?.as_str()?.to_string();
+        let shot = self.studio_act(crate::studio_host::StudioAct::Thumbnail { scene, width: 640 }).await.ok()?;
+        let image = shot.get("image")?.as_str()?.to_string();
+        let (width, height) = png_size(&image)?;
+        Some(serde_json::json!({ "image": image, "width": width, "height": height }))
     }
 
     /// Saves Go live's Advanced settings; the protection rule applies at once, the port at
@@ -1728,5 +1742,30 @@ pub(crate) async fn run(engine: Engine) {
         }
         engine.protect_tick().await;
         engine.send_golive();
+    }
+}
+
+/// A PNG data URL's size, from its header (IHDR: width and height after the 16th byte).
+fn png_size(data_url: &str) -> Option<(u32, u32)> {
+    use base64::Engine as _;
+    let b64 = data_url.strip_prefix("data:image/png;base64,")?;
+    // The first 32 base64 characters hold the first 24 bytes.
+    let head = base64::engine::general_purpose::STANDARD.decode(b64.get(..32)?).ok()?;
+    let be = |i: usize| head.get(i..i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    Some((be(16)?, be(20)?))
+}
+
+#[cfg(test)]
+mod picture_tests {
+    #[test]
+    fn png_size_reads_the_header() {
+        // A 256 × 144 PNG's first bytes (signature, IHDR length and type, width, height).
+        use base64::Engine as _;
+        let mut b = vec![0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        b.extend(256u32.to_be_bytes());
+        b.extend(144u32.to_be_bytes());
+        let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&b));
+        assert_eq!(super::png_size(&url), Some((256, 144)));
+        assert_eq!(super::png_size("data:image/jpeg;base64,AAAA"), None);
     }
 }
