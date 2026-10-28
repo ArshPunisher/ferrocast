@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 use crate::ffi::{self, Api, Level, cstr, text};
 use crate::{OptionInfo, Studio, StudioError, check_name};
 
+mod vertical;
+pub use vertical::{VERTICAL_SIZE, VerticalInfo};
+
 /// OBS's keys for the six global sound channels (1 and 2: desktop audio, 3 to 6: mics).
 pub const CHANNEL_KEYS: [(u32, &str); 6] = [
     (1, "DesktopAudioDevice1"),
@@ -481,6 +484,8 @@ pub struct Collection {
     /// OBS's multiview does: a scene that only shows for one draw hasn't loaded its media or
     /// captures. Our reference each, with the last time asked; let go by `let_thumbs_go`.
     thumb_showing: RefCell<HashMap<String, (*mut ffi::ObsSource, std::time::Instant)>>,
+    /// The vertical picture, when it's on.
+    vertical: RefCell<Option<vertical::Vertical>>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -557,6 +562,7 @@ impl Collection {
             media_intent: RefCell::new(HashMap::new()),
             thumb_showing: RefCell::new(HashMap::new()),
             true_peak: RefCell::new(false),
+            vertical: RefCell::new(None),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -609,6 +615,11 @@ impl Collection {
 
     fn name_free(&self, name: &str) -> Result<(), StudioError> {
         check_name(name)?;
+        // Vertical scenes have their own names in libobs (their canvas's), but names are one
+        // list for people.
+        if self.vertical_scene(name).is_some() {
+            return Err(StudioError::Failed(format!("name: there's already a source or scene called \"{name}\".")));
+        }
         if let Some(src) = self.find(name) {
             if self.in_use().contains(&src.ptr) {
                 return Err(StudioError::Failed(format!("name: there's already a source or scene called \"{name}\".")));
@@ -631,8 +642,8 @@ impl Collection {
     /// Every source in use: the scenes, what's in them (groups included) and the global devices.
     fn in_use(&self) -> Vec<*mut ffi::ObsSource> {
         let a = self.api();
-        let mut out: Vec<*mut ffi::ObsSource> = self.scenes.borrow().clone();
-        for s in self.scenes.borrow().iter() {
+        let mut out: Vec<*mut ffi::ObsSource> = self.every_scene();
+        for s in self.every_scene().iter() {
             for i in self.raw_items(a.obs_scene_from_source(*s)) {
                 out.push(a.obs_sceneitem_get_source(i));
                 if a.obs_sceneitem_is_group(i) {
@@ -661,6 +672,16 @@ impl Collection {
         Ok(())
     }
 
+    /// The main picture's scenes, then the vertical one's.
+    fn every_scene(&self) -> Vec<*mut ffi::ObsSource> {
+        let mut all = self.scenes.borrow().clone();
+        if let Some(v) = self.vertical.borrow().as_ref() {
+            all.extend(v.scenes.iter().copied());
+        }
+        all
+    }
+
+    /// A main-picture scene by name (what's on air, Studio Mode and transitions are its own).
     fn scene_src(&self, name: &str) -> Result<*mut ffi::ObsSource, StudioError> {
         let a = self.api();
         self.scenes
@@ -671,8 +692,13 @@ impl Collection {
             .ok_or_else(|| no_scene(name))
     }
 
+    /// A scene by name in either picture (its sources, pictures and undo work the same).
+    fn any_scene(&self, name: &str) -> Result<*mut ffi::ObsSource, StudioError> {
+        self.scene_src(name).or_else(|e| self.vertical_scene(name).ok_or(e))
+    }
+
     fn scene_ptr(&self, name: &str) -> Result<*mut ffi::ObsScene, StudioError> {
-        Ok(self.api().obs_scene_from_source(self.scene_src(name)?))
+        Ok(self.api().obs_scene_from_source(self.any_scene(name)?))
     }
 
     /// Puts a scene on air, through the transition (`ms` 0 cuts).
@@ -772,18 +798,33 @@ impl Collection {
         }
         let src = a.obs_source_get_ref(a.obs_scene_get_source(copy));
         a.obs_scene_release(copy);
+        // The copy is on the same picture as the scene.
+        if let Some(orig) = self.vertical_scene(name) {
+            if let Some(v) = self.vertical.borrow_mut().as_mut() {
+                let at = v.scenes.iter().position(|s| *s == orig).map_or(v.scenes.len(), |i| i + 1);
+                v.scenes.insert(at, src);
+            }
+            return Ok(());
+        }
         let at = self.index_of(name)? + 1;
         self.scenes.borrow_mut().insert(at, src);
         Ok(())
     }
 
+    /// Where a scene is in its picture's list.
     fn index_of(&self, name: &str) -> Result<usize, StudioError> {
+        if let Some(src) = self.vertical_scene(name) {
+            return Ok(self.vertical.borrow().as_ref().and_then(|v| v.scenes.iter().position(|s| *s == src)).unwrap_or(0));
+        }
         let src = self.scene_src(name)?;
         Ok(self.scenes.borrow().iter().position(|s| *s == src).unwrap_or(0))
     }
 
     /// Removes a scene (never the last one). If it was on air, the one before it goes on.
     pub fn remove_scene(&self, name: &str) -> Result<(), StudioError> {
+        if let Some(v) = self.vertical_scene(name) {
+            return self.remove_vertical_scene(v);
+        }
         let src = self.scene_src(name)?;
         if self.scenes.borrow().len() == 1 {
             return Err(StudioError::Failed("A collection keeps at least one scene. Add another first.".into()));
@@ -815,6 +856,10 @@ impl Collection {
 
     /// Moves a scene to `to` in the list (0 is the top).
     pub fn move_scene(&self, name: &str, to: usize) -> Result<(), StudioError> {
+        if let Some(v) = self.vertical_scene(name) {
+            self.move_vertical_scene(v, to);
+            return Ok(());
+        }
         let at = self.index_of(name)?;
         let mut v = self.scenes.borrow_mut();
         let s = v.remove(at);
@@ -825,6 +870,9 @@ impl Collection {
 
     /// Puts a scene on air through the transition.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
+        if self.vertical_scene(name).is_some() {
+            return self.set_vertical_current(name);
+        }
         let src = self.scene_src(name)?;
         // The scene's own transition if it has one, else the Studio's.
         let studio = self.transition_info.borrow().clone();
@@ -1202,7 +1250,11 @@ impl Collection {
         if name == new_name {
             return Ok(());
         }
-        let src = self.source(name)?;
+        // A vertical scene isn't among libobs's named sources.
+        let src = match self.vertical_scene(name) {
+            Some(v) => Ref { api: self.api(), ptr: self.api().obs_source_get_ref(v) },
+            None => self.source(name)?,
+        };
         self.name_free(new_name)?;
         let n = cstr(new_name);
         self.api().obs_source_set_name(src.ptr, n.as_ptr());
@@ -1418,7 +1470,7 @@ impl Collection {
     pub fn add_existing(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
         let s = self.scene_ptr(scene)?;
         let src = self.source(name)?;
-        if src.ptr == self.scene_src(scene).unwrap_or(ptr::null_mut()) {
+        if src.ptr == self.any_scene(scene).unwrap_or(ptr::null_mut()) {
             return Err(StudioError::Failed("A scene can't be put inside itself.".into()));
         }
         let item = self.api().obs_scene_add(s, src.ptr);
@@ -1428,9 +1480,14 @@ impl Collection {
         Ok(self.info(item))
     }
 
+    /// The size of the picture an item is in.
+    fn size_of_item(&self, item: *mut ffi::ObsSceneItem) -> (u32, u32) {
+        self.size_of(self.api().obs_sceneitem_get_scene(item))
+    }
+
     fn fit(&self, item: *mut ffi::ObsSceneItem) {
         let a = self.api();
-        let c = self.studio.canvas();
+        let c = Size::of(self.size_of_item(item));
         a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
         a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_SCALE_INNER);
@@ -1795,7 +1852,7 @@ impl Collection {
     pub fn edit_item(&self, scene: &str, id: i64, edit: ItemEdit) -> Result<(), StudioError> {
         let item = self.item(scene, id)?;
         let a = self.api();
-        let c = self.studio.canvas();
+        let c = Size::of(self.size_of(self.scene_ptr(scene)?));
         let blend = |m: c_int| a.obs_sceneitem_set_blending_mode(item, m);
         match edit {
             ItemEdit::Show | ItemEdit::Hide => {
@@ -2051,7 +2108,7 @@ impl Collection {
 
     /// Remembers a scene as it is now, to bring it back after it's removed.
     pub fn snap_scene(&self, name: &str) -> Result<SceneSnap, StudioError> {
-        let src = self.scene_src(name)?;
+        let src = self.any_scene(name)?;
         let a = self.api();
         let d = a.obs_save_source(src);
         let mut data = self.data_json(d);
@@ -2104,6 +2161,14 @@ impl Collection {
         };
         for extra in loaded {
             a.obs_source_release(extra);
+        }
+        // Back on the picture it was on (it keeps its canvas when saved).
+        if self.is_vertical(a.obs_scene_from_source(src))
+            && let Some(v) = self.vertical.borrow_mut().as_mut()
+        {
+            let at = snap.index.min(v.scenes.len());
+            v.scenes.insert(at, src);
+            return Ok(());
         }
         let mut v = self.scenes.borrow_mut();
         let at = snap.index.min(v.len());
@@ -2306,7 +2371,7 @@ impl Collection {
             }
         }
         // Scenes have filters too.
-        for scene in self.scenes.borrow().iter() {
+        for scene in self.every_scene().iter() {
             let name = text(a.obs_source_get_name(*scene));
             for f in self.raw_filters(*scene) {
                 self.missing_in(f, &text(a.obs_source_get_name(f)), Some(&name), &mut out);
@@ -2538,7 +2603,7 @@ impl Collection {
     pub fn sources(&self) -> Vec<SourceUse> {
         let a = self.api();
         let mut out: Vec<SourceUse> = Vec::new();
-        for s in self.scenes.borrow().iter() {
+        for s in self.every_scene().iter() {
             let scene = text(a.obs_source_get_name(*s));
             let mut items = Vec::new();
             for i in self.raw_items(a.obs_scene_from_source(*s)) {
@@ -2904,6 +2969,10 @@ impl Collection {
     /// A picture of a scene (at the canvas size) or a source (at its own size), saved as a
     /// PNG at `path`.
     pub fn screenshot(&self, name: &str, path: &std::path::Path) -> Result<(), StudioError> {
+        // A vertical scene isn't among libobs's named sources.
+        if let Some(v) = self.vertical_scene(name) {
+            return self.screenshot_of(v, name, path);
+        }
         let src = self.source(name)?;
         self.screenshot_of(src.ptr, name, path)
     }
@@ -2921,7 +2990,9 @@ impl Collection {
             return Err(StudioError::Failed(format!("\"{name}\" has nothing to show yet.")));
         }
         let a = self.api();
-        let (w, h) = if a.obs_source_is_scene(src.ptr) || src.ptr == *self.transition.borrow() {
+        let (w, h) = if a.obs_source_is_scene(src.ptr) {
+            self.size_of(a.obs_scene_from_source(src.ptr))
+        } else if src.ptr == *self.transition.borrow() {
             let c = self.studio.canvas();
             (c.width, c.height)
         } else {
@@ -2947,9 +3018,9 @@ impl Collection {
     /// PNG data URL: the Scenes grid's tiles, as OBS's multiview.
     pub fn thumbnail(&self, scene: &str, width: u32) -> Result<String, StudioError> {
         use base64::Engine as _;
-        let s = self.scene_src(scene)?;
+        let s = self.any_scene(scene)?;
         let a = self.api();
-        let c = self.studio.canvas();
+        let c = Size::of(self.size_of(a.obs_scene_from_source(s)));
         if c.width == 0 || c.height == 0 {
             return Err(StudioError::Failed("The canvas has no size yet.".into()));
         }
@@ -3158,6 +3229,7 @@ impl Collection {
                 "quick_transitions": self.quick_transitions(),
                 "studio_mode": self.preview_scene(),
                 "studio_options": self.studio_options(),
+                "vertical": self.save_vertical(),
             }),
         );
         // OBS keeps Studio Mode's preview as the "current scene".
@@ -3186,6 +3258,9 @@ impl Collection {
                 a.obs_source_release(src);
             }
         }
+        // The vertical canvas first, so its scenes find it as they load.
+        let saved_vertical = doc.pointer("/ferrocast/vertical").filter(|v| v.is_object());
+        let mut vertical_canvas = saved_vertical.and_then(|v| c.load_vertical_canvas(v));
         let sources = doc.get("sources").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([]));
         let s = cstr(&json!({ "sources": sources }).to_string());
         let holder = a.obs_data_create_from_json(s.as_ptr());
@@ -3209,7 +3284,14 @@ impl Collection {
                 let n = text(a.obs_source_get_name(*s));
                 order.iter().position(|o| *o == n).unwrap_or(usize::MAX)
             });
+            if let (Some(canvas), Some(saved)) = (vertical_canvas.take(), saved_vertical) {
+                c.adopt_vertical(canvas, saved, &mut scenes);
+            }
             c.scenes.replace(scenes);
+        }
+        if let Some(canvas) = vertical_canvas {
+            // Loaded, but there were no sources to put on it.
+            a.canvas_remove_release(canvas);
         }
         if c.scenes.borrow().is_empty() {
             c.add_scene(first_scene)?;
@@ -3288,7 +3370,7 @@ impl Drop for Collection {
         a.obs_set_output_source(0, ptr::null_mut());
         // As OBS clears a collection: every source in a scene, each scene, the devices.
         let mut sources: Vec<*mut ffi::ObsSource> = Vec::new();
-        for s in self.scenes.borrow().iter() {
+        for s in self.every_scene().iter() {
             for i in self.raw_items(a.obs_scene_from_source(*s)) {
                 let mut all = vec![i];
                 if a.obs_sceneitem_is_group(i) {
@@ -3321,6 +3403,20 @@ impl Drop for Collection {
         if !t.is_null() {
             a.obs_source_release(t);
         }
+        self.drop_vertical();
+    }
+}
+
+/// A picture's width and height, read as the canvas's are.
+#[derive(Clone, Copy)]
+struct Size {
+    width: u32,
+    height: u32,
+}
+
+impl Size {
+    fn of((width, height): (u32, u32)) -> Size {
+        Size { width, height }
     }
 }
 /// Where an item is, as libobs works out its box (`update_item_transform` in obs-scene.c):

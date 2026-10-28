@@ -34,6 +34,7 @@ macro_rules! opaque {
 }
 opaque!(
     ObsView,
+    ObsCanvas,
     ProcHandler,
     RemuxJob,
     ObsSource,
@@ -297,6 +298,28 @@ pub(crate) struct Newer {
     /// OBS's), so OBS's plugins are loaded through this instead.
     pub load_plugins: Option<unsafe extern "C" fn(*mut RuntimeModuleInfo, *mut ModuleFailureInfo)>,
     pub failure_free: Option<unsafe extern "C" fn(*mut ModuleFailureInfo)>,
+    /// libobs 31+: more than one canvas (the vertical picture).
+    pub canvas: Option<CanvasFns>,
+}
+
+/// `enum obs_canvas_flags` ACTIVATE: sources in the canvas's scenes play when they show.
+pub(crate) const CANVAS_ACTIVATE: u32 = 1 << 1;
+
+/// libobs 31+'s canvas functions (all there or none).
+#[derive(Clone, Copy)]
+pub(crate) struct CanvasFns {
+    pub create: unsafe extern "C" fn(*const c_char, *mut VideoInfo, u32) -> *mut ObsCanvas,
+    pub remove: unsafe extern "C" fn(*mut ObsCanvas),
+    pub release: unsafe extern "C" fn(*mut ObsCanvas),
+    pub scene_create: unsafe extern "C" fn(*mut ObsCanvas, *const c_char) -> *mut ObsScene,
+    pub set_channel: unsafe extern "C" fn(*mut ObsCanvas, u32, *mut ObsSource),
+    pub get_video: unsafe extern "C" fn(*const ObsCanvas) -> *mut VideoT,
+    pub reset_video: unsafe extern "C" fn(*mut ObsCanvas, *mut VideoInfo) -> bool,
+    pub save: unsafe extern "C" fn(*mut ObsCanvas) -> *mut ObsData,
+    pub load: unsafe extern "C" fn(*mut ObsData) -> *mut ObsCanvas,
+    pub source_canvas: unsafe extern "C" fn(*const ObsSource) -> *mut ObsCanvas,
+    pub render_texture: unsafe extern "C" fn(*mut ObsCanvas),
+    pub source_by_name: unsafe extern "C" fn(*mut ObsCanvas, *const c_char) -> *mut ObsSource,
 }
 
 impl Newer {
@@ -313,7 +336,116 @@ impl Newer {
                     .get::<unsafe extern "C" fn(*mut ModuleFailureInfo)>(b"obs_module_failure_info_free\0")
                     .ok()
                     .map(|f| *f),
+                canvas: (|| {
+                    Some(CanvasFns {
+                        create: *lib.get(b"obs_canvas_create\0").ok()?,
+                        remove: *lib.get(b"obs_canvas_remove\0").ok()?,
+                        release: *lib.get(b"obs_canvas_release\0").ok()?,
+                        scene_create: *lib.get(b"obs_canvas_scene_create\0").ok()?,
+                        set_channel: *lib.get(b"obs_canvas_set_channel\0").ok()?,
+                        get_video: *lib.get(b"obs_canvas_get_video\0").ok()?,
+                        reset_video: *lib.get(b"obs_canvas_reset_video\0").ok()?,
+                        save: *lib.get(b"obs_save_canvas\0").ok()?,
+                        load: *lib.get(b"obs_load_canvas\0").ok()?,
+                        source_canvas: *lib.get(b"obs_source_get_canvas\0").ok()?,
+                        render_texture: *lib.get(b"obs_render_canvas_texture\0").ok()?,
+                        source_by_name: *lib.get(b"obs_canvas_get_source_by_name\0").ok()?,
+                    })
+                })(),
             }
+        }
+    }
+}
+
+/// The canvas functions, safe to call: each does nothing (or gives null) without libobs 31+.
+/// Callers pass canvases these gave out, live sources and data, as for the `Api` methods.
+impl Api {
+    pub(crate) fn has_canvases(&self) -> bool {
+        self.newer.canvas.is_some()
+    }
+
+    pub(crate) fn canvas_create(&self, name: &CStr, video: &mut VideoInfo, flags: u32) -> *mut ObsCanvas {
+        // SAFETY: obs_canvas_create copies the name and the video setup, which outlive the call.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.create)(name.as_ptr(), video, flags) })
+    }
+
+    /// Removes a canvas and lets go of our reference.
+    pub(crate) fn canvas_remove_release(&self, canvas: *mut ObsCanvas) {
+        if let Some(f) = self.newer.canvas
+            && !canvas.is_null()
+        {
+            // SAFETY: a canvas libobs gave us, with our one reference, let go once.
+            unsafe {
+                (f.remove)(canvas);
+                (f.release)(canvas);
+            }
+        }
+    }
+
+    pub(crate) fn canvas_scene_create(&self, canvas: *mut ObsCanvas, name: &CStr) -> *mut ObsScene {
+        // SAFETY: a live canvas; libobs copies the name.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.scene_create)(canvas, name.as_ptr()) })
+    }
+
+    pub(crate) fn canvas_set_channel(&self, canvas: *mut ObsCanvas, channel: u32, source: *mut ObsSource) {
+        if let Some(f) = self.newer.canvas {
+            // SAFETY: a live canvas and a live source or null (libobs takes its own reference).
+            unsafe { (f.set_channel)(canvas, channel, source) }
+        }
+    }
+
+    pub(crate) fn canvas_get_video(&self, canvas: *mut ObsCanvas) -> *mut VideoT {
+        // SAFETY: a live canvas.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.get_video)(canvas) })
+    }
+
+    pub(crate) fn canvas_reset_video(&self, canvas: *mut ObsCanvas, video: &mut VideoInfo) -> bool {
+        // SAFETY: a live canvas; libobs copies the video setup.
+        self.newer.canvas.is_some_and(|f| unsafe { (f.reset_video)(canvas, video) })
+    }
+
+    /// A canvas's saved data (our reference: release it).
+    pub(crate) fn canvas_save(&self, canvas: *mut ObsCanvas) -> *mut ObsData {
+        // SAFETY: a live canvas.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.save)(canvas) })
+    }
+
+    /// A canvas made from saved data, with no picture yet (our reference).
+    pub(crate) fn canvas_load(&self, data: *mut ObsData) -> *mut ObsCanvas {
+        // SAFETY: live obs_data.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.load)(data) })
+    }
+
+    /// The canvas a scene or group belongs to (compared only, so no reference is kept).
+    pub(crate) fn canvas_of(&self, source: *mut ObsSource) -> *mut ObsCanvas {
+        let Some(f) = self.newer.canvas else { return std::ptr::null_mut() };
+        if source.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a live source; the reference it gives is let go at once (the canvas stays
+        // alive while the source is on it).
+        unsafe {
+            let c = (f.source_canvas)(source);
+            if !c.is_null() {
+                (f.release)(c);
+            }
+            c
+        }
+    }
+
+    /// A scene by name: the main picture's (null `canvas`) or another canvas's. Our reference.
+    pub(crate) fn scene_named(&self, canvas: *mut ObsCanvas, name: &CStr) -> *mut ObsSource {
+        if canvas.is_null() {
+            return self.obs_get_source_by_name(name.as_ptr());
+        }
+        // SAFETY: a live canvas; libobs reads the name during the call.
+        self.newer.canvas.map_or(std::ptr::null_mut(), |f| unsafe { (f.source_by_name)(canvas, name.as_ptr()) })
+    }
+
+    pub(crate) fn render_canvas(&self, canvas: *mut ObsCanvas) {
+        if let Some(f) = self.newer.canvas {
+            // SAFETY: called while drawing (inside a display's draw callback), a live canvas.
+            unsafe { (f.render_texture)(canvas) }
         }
     }
 }
@@ -417,6 +549,7 @@ api! {
     obs_scene_release: fn(a: *mut ObsScene);
     obs_scene_add: fn(a: *mut ObsScene, b: *mut ObsSource) -> *mut ObsSceneItem;
     obs_scene_get_source: fn(a: *const ObsScene) -> *mut ObsSource;
+    obs_sceneitem_get_scene: fn(a: *const ObsSceneItem) -> *mut ObsScene;
     obs_sceneitem_set_pos: fn(a: *mut ObsSceneItem, b: *const Vec2);
     obs_sceneitem_set_alignment: fn(a: *mut ObsSceneItem, b: u32);
     obs_sceneitem_set_bounds_type: fn(a: *mut ObsSceneItem, b: c_int);
@@ -947,6 +1080,8 @@ pub(crate) struct DrawState {
     /// A dark layer over everything, as a dialog's backdrop dims the page round the view
     /// (thousandths of full strength; 0 for none).
     pub shade: std::sync::atomic::AtomicU32,
+    /// The canvas it shows (the vertical picture), or null for the main one.
+    pub on: *mut ObsCanvas,
 }
 
 /// The colours of sources' outlines, picked by item id (`id % 8`); the page's list shows the
@@ -1009,8 +1144,8 @@ unsafe extern "C" fn all_boxes_cb(_s: *mut ObsScene, item: *mut ObsSceneItem, pa
     true
 }
 
-fn all_boxes(api: &Api, scene: &std::ffi::CStr) -> Vec<(i64, Matrix4)> {
-    let src = api.obs_get_source_by_name(scene.as_ptr());
+fn all_boxes(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr) -> Vec<(i64, Matrix4)> {
+    let src = api.scene_named(on, scene);
     if src.is_null() {
         return Vec::new();
     }
@@ -1047,8 +1182,8 @@ unsafe extern "C" fn find_box(_s: *mut ObsScene, item: *mut ObsSceneItem, param:
 }
 
 /// The box of item `id` in scene `scene` (canvas pixels), if it's there and showing.
-fn item_box(api: &Api, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
-    let src = api.obs_get_source_by_name(scene.as_ptr());
+fn item_box(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
+    let src = api.scene_named(on, scene);
     if src.is_null() {
         return None;
     }
@@ -1171,6 +1306,7 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
         // Held while drawing: Preview::show_scene can't release the source mid-render.
         let shown = st.scene.lock();
         match shown.as_ref().map(|g| **g) {
+            _ if !st.on.is_null() => api.render_canvas(st.on),
             Ok(scene) if !scene.is_null() => api.obs_source_video_render(scene),
             _ => api.obs_render_main_texture(),
         }
@@ -1184,7 +1320,7 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
     if let Ok(frames) = st.frames.lock()
         && let Some(scene) = frames.as_ref()
     {
-        for (id, m) in all_boxes(api, scene) {
+        for (id, m) in all_boxes(api, st.on, scene) {
             if picked.as_ref().is_some_and(|(_, p)| p.contains(&id)) {
                 continue;
             }
@@ -1196,8 +1332,8 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
         // puts them on the canvas.
         let mut nested: Option<Vec<(i64, Matrix4)>> = None;
         for id in ids {
-            let m = item_box(api, scene, *id).or_else(|| {
-                nested.get_or_insert_with(|| all_boxes(api, scene)).iter().find(|(i, _)| i == id).map(|(_, m)| *m)
+            let m = item_box(api, st.on, scene, *id).or_else(|| {
+                nested.get_or_insert_with(|| all_boxes(api, st.on, scene)).iter().find(|(i, _)| i == id).map(|(_, m)| *m)
             });
             if let Some(m) = m {
                 draw_selection(api, &m, 1.0 / s, &frame_color(*id), true, 2.0);

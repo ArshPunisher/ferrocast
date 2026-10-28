@@ -27,7 +27,7 @@ pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 pub use collection::{
     AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Collection, DEINTERLACE, FilterInfo, FilterSnap, ItemEdit, ItemInfo,
     ItemSnap, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SceneSnap, SourceUse, StudioOptions,
-    TBarState, Transform, TransitionInfo, WebAct,
+    TBarState, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
@@ -1135,6 +1135,19 @@ impl Studio {
     /// e.g. Tauri's), drawn by libobs straight into a native view: no copies through the page.
     /// `scale` is the screen's pixels per point (2 on a Retina display). macOS, main thread.
     pub fn preview(&self, window: RawWindowHandle, rect: Rect, scale: f64) -> Result<Preview, StudioError> {
+        let c = self.canvas();
+        self.preview_on(window, rect, scale, ptr::null_mut(), (c.width, c.height))
+    }
+
+    /// A preview of canvas `on` (null: the main one) of size `base`.
+    pub(crate) fn preview_on(
+        &self,
+        window: RawWindowHandle,
+        rect: Rect,
+        scale: f64,
+        on: *mut ffi::ObsCanvas,
+        base: (u32, u32),
+    ) -> Result<Preview, StudioError> {
         #[cfg(target_os = "macos")]
         {
             let rect = with_edge(rect);
@@ -1163,13 +1176,14 @@ impl Studio {
             }
             let state = Box::new(ffi::DrawState {
                 api: &self.inner.api,
-                base: (self.canvas().width, self.canvas().height),
+                base,
                 selected: std::sync::Mutex::new(None),
                 scene: std::sync::Mutex::new(ptr::null_mut()),
                 edge: std::sync::atomic::AtomicU32::new(edge_px(scale)),
                 canvas: std::sync::Mutex::new(None),
                 frames: std::sync::Mutex::new(None),
                 shade: std::sync::atomic::AtomicU32::new(0),
+                on,
             });
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
@@ -1178,7 +1192,7 @@ impl Studio {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (window, rect, scale);
+            let _ = (window, rect, scale, on, base);
             Err(StudioError::Failed("the preview isn't on this system yet".into()))
         }
     }
