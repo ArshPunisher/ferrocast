@@ -1219,6 +1219,8 @@ impl StudioHost for DesktopStudio {
             // are let go soon after it closes.
             if let Some(c) = &h.collection {
                 c.let_thumbs_go(false);
+                // Sources added before their first frame get their snug fit now.
+                c.settle_fits();
             }
             let disk_free = {
                 let folder = record_folder(&h.settings.clone().unwrap_or_default());

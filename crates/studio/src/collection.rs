@@ -486,6 +486,9 @@ pub struct Collection {
     thumb_showing: RefCell<HashMap<String, (*mut ffi::ObsSource, std::time::Instant)>>,
     /// The vertical picture, when it's on.
     vertical: RefCell<Option<vertical::Vertical>>,
+    /// Items fitted before their source had a size (scene, item id, when): fitted again once
+    /// it has one, so their frame hugs the picture (`settle_fits`).
+    waiting_fit: RefCell<Vec<(String, i64, std::time::Instant)>>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -563,6 +566,7 @@ impl Collection {
             thumb_showing: RefCell::new(HashMap::new()),
             true_peak: RefCell::new(false),
             vertical: RefCell::new(None),
+            waiting_fit: RefCell::new(Vec::new()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -1485,9 +1489,36 @@ impl Collection {
         self.size_of(self.api().obs_sceneitem_get_scene(item))
     }
 
+    /// Fits an item inside its picture, centred, keeping its shape. The source itself is sized
+    /// (no bounding box), so its frame is exactly the picture it shows: in a tall picture a wide
+    /// source would otherwise get a frame the whole picture's size round a strip of picture.
+    /// A source with no size yet (a capture that hasn't sent a frame), or one turned or
+    /// flipped, gets OBS's bounding box instead, which fits whatever it later shows.
     fn fit(&self, item: *mut ffi::ObsSceneItem) {
         let a = self.api();
         let c = Size::of(self.size_of_item(item));
+        let p = self.place(item);
+        let upright = p.rot.rem_euclid(360.0) < 0.01 && p.scale.0 > 0.0 && p.scale.1 > 0.0;
+        if upright && p.size.0 > 0 && p.size.1 > 0 && c.width > 0 && c.height > 0 {
+            let (w, h) = (p.size.0 as f32, p.size.1 as f32);
+            let k = (c.width as f32 / w).min(c.height as f32 / h);
+            a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_NONE);
+            a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+            a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: k, y: k });
+            a.obs_sceneitem_set_pos(
+                item,
+                &ffi::Vec2 { x: ((c.width as f32 - w * k) / 2.0).round(), y: ((c.height as f32 - h * k) / 2.0).round() },
+            );
+            return;
+        }
+        if upright && p.size == (0, 0) {
+            // No frame yet: fitted again when it has one.
+            let scene = text(a.obs_source_get_name(a.obs_scene_get_source(a.obs_sceneitem_get_scene(item))));
+            let id = a.obs_sceneitem_get_id(item);
+            let mut w = self.waiting_fit.borrow_mut();
+            w.retain(|(s, i, _)| !(s == &scene && *i == id));
+            w.push((scene, id, std::time::Instant::now()));
+        }
         a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: 0.0, y: 0.0 });
         a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_SCALE_INNER);
@@ -3060,6 +3091,36 @@ impl Collection {
 
     /// Lets go of scenes kept showing for pictures that haven't been asked for in a while (the
     /// grid closed, or the scene went), or of all of them with `all`.
+    /// Fits again the items fitted before their source had a size, once it has one and they
+    /// still have the bounding box `fit` gave them (nothing moved them since). Called often
+    /// (the stats read); gives up on one after 30 s.
+    pub fn settle_fits(&self) {
+        if self.waiting_fit.borrow().is_empty() {
+            return;
+        }
+        let waiting = std::mem::take(&mut *self.waiting_fit.borrow_mut());
+        let mut keep = Vec::new();
+        for (scene, id, since) in waiting {
+            let Ok(item) = self.item(&scene, id) else { continue };
+            let a = self.api();
+            let c = self.size_of_item(item);
+            let mut b = ffi::Vec2 { x: 0.0, y: 0.0 };
+            a.obs_sceneitem_get_bounds(item, &mut b);
+            let untouched = a.obs_sceneitem_get_bounds_type(item) == ffi::OBS_BOUNDS_SCALE_INNER
+                && (b.x - c.0 as f32).abs() < 0.5
+                && (b.y - c.1 as f32).abs() < 0.5;
+            if !untouched {
+                continue;
+            }
+            if self.place(item).size.0 > 0 {
+                self.fit(item);
+            } else if since.elapsed() < std::time::Duration::from_secs(30) {
+                keep.push((scene, id, since));
+            }
+        }
+        self.waiting_fit.borrow_mut().extend(keep);
+    }
+
     pub fn let_thumbs_go(&self, all: bool) {
         const KEEP: std::time::Duration = std::time::Duration::from_secs(10);
         let a = self.api();
