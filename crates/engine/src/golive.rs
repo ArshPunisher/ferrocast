@@ -542,6 +542,11 @@ impl Engine {
         &self.inner.golive
     }
 
+    /// Whether a stream is coming in to Go live now, and its changes.
+    pub(crate) fn golive_live(&self) -> tokio::sync::watch::Receiver<ferrocast_golive::hub::Live> {
+        self.golive().hub.live()
+    }
+
     /// Loads the destinations and starts the local ingest on `port` (another free one if it's
     /// taken; 0 picks any, for tests) and the task that runs the forwarders.
     pub async fn start_golive(&self, port: u16) {

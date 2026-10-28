@@ -714,7 +714,9 @@ type StreamInfo = { title?: string /* 1–140 (YouTube: 100) */; category?: { na
                     per?: { twitch?: StreamInfo; youtube?: StreamInfo; kick?: StreamInfo } /* a platform's own fields (no nested per) */ }
 type PlatformResult = { platform; ok: boolean; applied: string[]; skipped: string[] /* "language: Kick has no stream language setting" */;
                         error: { code: "not_connected" | "reconnect_needed" | "rate_limited" | "refused" | "unreachable" | "no_broadcast"
-                                       | "unknown_category" | "not_supported"; message; hint } | null }
+                                       | "unknown_category" | "not_supported"; message; hint } | null;
+                        waiting?: true /* YouTube before the stream starts: ok, `applied` is what it will get; Ferrocast puts it on
+                                          the live broadcast YouTube makes when the stream goes live (no scheduling needed) */ }
 type StreamInfoView = { last: HistoryEntry | null; presets: Preset[]; history: HistoryEntry[] /* newest first, 20 */;
                         platforms: { platform; connected; can_edit; needs: string | null; supports: { title, category, tags, language, description, thumbnail } }[] }
 type Preset = { id; name /* 1–60, unique */; info: StreamInfo; updated_at }   // up to 50

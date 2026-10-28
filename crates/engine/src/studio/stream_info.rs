@@ -145,8 +145,26 @@ impl Engine {
             let c = self.connector(p);
             jobs.push(async move { (p, push_one(p, c, &info, thumb).await) });
         }
-        let results: Vec<PlatformResult> =
+        let mut results: Vec<PlatformResult> =
             futures_util::future::join_all(jobs).await.into_iter().map(|(_, r)| r).collect();
+        // YouTube makes the live broadcast when the stream starts: before that there's nothing
+        // to change. Kept and put on it once live, instead of asking for a scheduled stream.
+        let mut pending: Option<Option<StreamInfo>> = None;
+        for r in &mut results {
+            if r.platform != Platform::Youtube {
+                continue;
+            }
+            if r.error.as_ref().is_some_and(|e| e.code == "no_broadcast") {
+                let yt = info.for_platform(Platform::Youtube);
+                r.ok = true;
+                r.error = None;
+                r.waiting = true;
+                r.applied = waiting_fields(&yt);
+                pending = Some(Some(yt));
+            } else if r.ok {
+                pending = Some(None);
+            }
+        }
         let ok = results.iter().filter(|r| r.ok).count();
         let failed = results.len() - ok;
         let entry = HistoryEntry { info: info.clone(), at: now().0, results: results.clone() };
@@ -154,6 +172,9 @@ impl Engine {
             let _one_at_a_time = self.config_lock().await;
             let mut saved = self.stream_info_saved().await?;
             saved.remember(entry);
+            if let Some(p) = pending {
+                saved.youtube_pending = p;
+            }
             save_setting(self, STREAM_INFO_KEY, &saved).await?;
         }
         if let Some(by) = by {
@@ -223,6 +244,46 @@ impl Engine {
         Ok((bytes, media.mime))
     }
 
+    /// Puts the waiting YouTube info on the live broadcast. `false` while YouTube has none yet
+    /// (try again shortly); `true` once done, refused for another reason, or nothing waits.
+    pub(crate) async fn apply_youtube_pending(&self) -> bool {
+        let Ok(saved) = self.stream_info_saved().await else { return true };
+        let Some(info) = saved.youtube_pending else { return true };
+        let Some(c) = self.connector(Platform::Youtube) else { return true };
+        let thumb = match &info.thumbnail {
+            Some(id) => Some(self.thumbnail_image(id).await),
+            None => None,
+        };
+        let r = push_one(Platform::Youtube, Some(c), &info, thumb).await;
+        // No broadcast yet, or a blip (network, rate limit): keep it and try again shortly.
+        if r.error.as_ref().is_some_and(|e| matches!(e.code.as_str(), "no_broadcast" | "unreachable" | "rate_limited"))
+        {
+            return false;
+        }
+        match &r.error {
+            None => tracing::info!(applied = ?r.applied, "stream info put on YouTube's live broadcast"),
+            Some(e) => tracing::warn!(code = %e.code, "YouTube refused the stream info saved for going live"),
+        }
+        let _one_at_a_time = self.config_lock().await;
+        // Newer info saved meanwhile stays waiting for the next try.
+        if let Ok(mut saved) = self.stream_info_saved().await
+            && saved.youtube_pending.as_ref() == Some(&info)
+        {
+            saved.youtube_pending = None;
+            // The newest waiting YouTube line says what happened now.
+            if let Some(line) = saved
+                .history
+                .iter_mut()
+                .flat_map(|h| h.results.iter_mut())
+                .find(|x| x.platform == Platform::Youtube && x.waiting)
+            {
+                *line = r;
+            }
+            let _ = save_setting(self, STREAM_INFO_KEY, &saved).await;
+        }
+        true
+    }
+
     pub async fn preset(&self, id: &str) -> Result<Preset, EngineError> {
         self.stream_info_saved().await?.presets.into_iter().find(|p| p.id == id).ok_or(PRESET_NOT_FOUND)
     }
@@ -260,6 +321,7 @@ async fn push_one(
         applied: vec![],
         skipped,
         error: Some(PlatformError { code: code.into(), message, hint: hint.map(String::from) }),
+        waiting: false,
     };
     let Some(c) = c else {
         return fail(
@@ -316,7 +378,7 @@ async fn push_one(
                 }
             }
             // With nothing this platform takes, `applied` is empty and `skipped` says why.
-            PlatformResult { platform: p, ok: true, applied, skipped, error: None }
+            PlatformResult { platform: p, ok: true, applied, skipped, error: None, waiting: false }
         }
         Ok(Err(e)) => {
             let (code, hint) = match &e {
@@ -331,7 +393,7 @@ async fn push_one(
                     ("unknown_category", "Pick the category from the search list.")
                 }
                 ConnectorError::Refused { message, .. } if message.contains("live or scheduled") => {
-                    ("no_broadcast", "Start or schedule the stream in YouTube Studio, then try again.")
+                    ("no_broadcast", "Ferrocast puts it on YouTube as soon as you go live.")
                 }
                 ConnectorError::Refused { .. } => ("refused", "Check the text, then try again."),
             };
@@ -342,6 +404,44 @@ async fn push_one(
                 other => sentence(&other.to_string()),
             };
             fail(code, message, Some(hint), skipped)
+        }
+    }
+}
+
+/// The fields YouTube will get once live, for the result line.
+fn waiting_fields(i: &StreamInfo) -> Vec<String> {
+    let mut f = Vec::new();
+    for (on, name) in [
+        (i.title.is_some(), "title"),
+        (i.category.is_some(), "category"),
+        (i.tags.is_some(), "tags"),
+        (i.language.is_some(), "language"),
+        (i.description.is_some(), "description"),
+        (i.thumbnail.is_some(), "thumbnail"),
+    ] {
+        if on {
+            f.push(name.to_string());
+        }
+    }
+    f
+}
+
+/// Waits for the stream to go live, then puts the stream info saved for YouTube on the
+/// broadcast YouTube makes for it (it can take a minute to appear): every 15 s for 5 minutes.
+pub(crate) async fn youtube_when_live(engine: Engine) {
+    let mut live = engine.golive_live();
+    loop {
+        if live.changed().await.is_err() {
+            return;
+        }
+        if !live.borrow().on {
+            continue;
+        }
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if !live.borrow().on || engine.apply_youtube_pending().await {
+                break;
+            }
         }
     }
 }

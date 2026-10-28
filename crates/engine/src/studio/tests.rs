@@ -24,6 +24,8 @@ struct Fake {
     said: Mutex<Vec<String>>,
     infos: Mutex<Vec<StreamInfo>>,
     refuse_scope: bool,
+    /// YouTube with no broadcast yet (before the stream starts).
+    no_broadcast: std::sync::atomic::AtomicBool,
     markers: Mutex<Vec<String>>,
     /// Thumbnails taken: (bytes, mime). Only a YouTube fake takes them.
     thumbs: Mutex<Vec<(usize, String)>>,
@@ -68,6 +70,12 @@ impl Connector for Fake {
     async fn update_stream_info(&self, info: &StreamInfo) -> ferrocast_connector::Result<Vec<String>> {
         if self.refuse_scope {
             return Err(ConnectorError::MissingScope { platform: self.platform(), scope: "channel:write".into() });
+        }
+        if self.no_broadcast.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ConnectorError::Refused {
+                platform: self.platform(),
+                message: "you don't have a live or scheduled stream on YouTube".into(),
+            });
         }
         self.infos.lock().unwrap().push(info.clone());
         Ok(info.fields().into_iter().map(String::from).collect())
@@ -463,6 +471,32 @@ async fn stream_info_reports_each_platform_and_keeps_history() {
         e.apply_stream_info(StreamInfo { title: Some("x".into()), ..Default::default() }, None, None).await,
         Err(crate::EngineError::Refused { status: 422, code: "no_platforms", .. })
     ));
+}
+
+#[tokio::test]
+async fn youtube_info_set_before_going_live_waits_for_the_broadcast() {
+    let (e, _d) = engine().await;
+    let yt = Fake::new(Platform::Youtube);
+    yt.no_broadcast.store(true, std::sync::atomic::Ordering::Relaxed);
+    e.register_connector(yt.clone());
+    let info = StreamInfo { title: Some("Finals night".into()), ..Default::default() };
+    let r = e.apply_stream_info(info, None, None).await.unwrap();
+    let line = &r.results[0];
+    assert!(line.ok && line.waiting && line.error.is_none(), "{line:?}");
+    assert_eq!(line.applied, vec!["title".to_string()]);
+    assert!(e.stream_info_saved().await.unwrap().youtube_pending.is_some());
+    // Still no broadcast: it keeps waiting.
+    assert!(!e.apply_youtube_pending().await);
+    // The stream started and YouTube made its broadcast: put on it, and done.
+    yt.no_broadcast.store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(e.apply_youtube_pending().await);
+    assert_eq!(yt.infos.lock().unwrap().last().unwrap().title.as_deref(), Some("Finals night"));
+    let saved = e.stream_info_saved().await.unwrap();
+    assert!(saved.youtube_pending.is_none());
+    let last = &saved.history[0].results[0];
+    assert!(last.ok && !last.waiting, "the history line says it was done: {last:?}");
+    // Nothing waits now.
+    assert!(e.apply_youtube_pending().await);
 }
 
 #[tokio::test]

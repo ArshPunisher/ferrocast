@@ -337,6 +337,10 @@ pub struct PlatformResult {
     /// Fields it can't take, with why ("Kick has no stream language").
     pub skipped: Vec<String>,
     pub error: Option<PlatformError>,
+    /// Saved for later: YouTube has no broadcast until the stream starts, so Ferrocast puts
+    /// `applied` on it as soon as you're live (no scheduling in YouTube Studio).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +366,8 @@ pub struct HistoryEntry {
 pub struct Saved {
     pub presets: Vec<Preset>,
     pub history: Vec<HistoryEntry>,
+    /// YouTube's part of the last push, waiting for the broadcast that starts with the stream.
+    pub youtube_pending: Option<StreamInfo>,
 }
 
 impl Saved {
