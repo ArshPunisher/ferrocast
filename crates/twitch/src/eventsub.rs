@@ -29,6 +29,10 @@ const WELCOME_WAIT: Duration = Duration::from_secs(10);
 /// Extra slack on top of Twitch's keepalive before we call a socket dead.
 const KEEPALIVE_SLACK: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// The keepalive asked of Twitch (10 to 600 s; its default is 10). While streaming, a full
+/// upload delays everything else on the line: with 10 s, a busy minute dropped the socket
+/// again and again (27 Oct: 40 reconnects in a stream, every alert in them missed).
+const KEEPALIVE_ASKED_S: u32 = 30;
 /// A session that lasted this long resets the backoff.
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 
@@ -47,6 +51,7 @@ enum End {
 
 /// Runs until the sink closes or sign-in is needed. Emits connector status events.
 pub async fn run(helix: Helix, broadcaster: String, url: String, sink: EventSink) {
+    let url = with_keepalive(&url);
     let mut attempt: u32 = 0;
     loop {
         let started = tokio::time::Instant::now();
@@ -83,6 +88,15 @@ pub async fn run(helix: Helix, broadcaster: String, url: String, sink: EventSink
             }
         }
     }
+}
+
+/// The EventSub address asking for a longer keepalive, unless it names one already.
+fn with_keepalive(url: &str) -> String {
+    if url.contains("keepalive_timeout_seconds=") {
+        return url.to_string();
+    }
+    let join = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{join}keepalive_timeout_seconds={KEEPALIVE_ASKED_S}")
 }
 
 /// 1 s, 2 s, 4 s … up to a minute, plus up to half a second of jitter so many apps
@@ -235,4 +249,20 @@ async fn deliver(v: &Value, sink: &EventSink) -> bool {
         return true;
     };
     sink.send(map::map(kind, id, event, Millis(now_ms()))).await.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_address_asks_for_a_longer_keepalive_once() {
+        assert_eq!(
+            with_keepalive("wss://eventsub.wss.twitch.tv/ws"),
+            "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=30"
+        );
+        assert_eq!(with_keepalive("ws://127.0.0.1:9/ws?x=1"), "ws://127.0.0.1:9/ws?x=1&keepalive_timeout_seconds=30");
+        let own = "wss://e.example/ws?keepalive_timeout_seconds=60";
+        assert_eq!(with_keepalive(own), own);
+    }
 }
