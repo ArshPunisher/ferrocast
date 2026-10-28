@@ -5,6 +5,32 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.1.7
+
+- A vertical picture of its own: press Vertical under the picture and a tall 1080×1920 picture
+  sits beside the wide one, with its own scenes. Your game and camera are shared, placed for
+  phones. Click a picture to edit it; the other one dims.
+- Go live sends the vertical picture to YouTube Shorts and your own vertical servers at the same
+  time. Vertical platforms are in Go live, under Vertical.
+- Fit makes a source's frame match its picture, also in the tall picture.
+- The Studio is the main way now: Start show, BRB, `!scene`, `!clip`, Alt+1…9, overlays, themes,
+  onboarding and the music beat all use it. OBS shows only if you stream with OBS.
+- Show reads as a run of show: a big countdown, then each step and what it will do.
+- Stream info shows what each platform will get, with presets one click away. Leave a box empty
+  and the platform keeps what it has.
+- Moments shows tonight's stream as a timeline, a dot for each big moment.
+- YouTube: set the title, description and thumbnail before going live; Ferrocast puts them on
+  your live video when it starts. Thumbnails can be up to 50 MB, and a bigger picture can be made
+  smaller in one click.
+- Optimize in Go live tests your upload and sets each platform's bitrate. The status bar warns
+  while frames are lost and says why.
+- Add a source: name it first, see at once if the name is taken, and add a capture card with its
+  sound. Any sound can play in every scene or only some.
+- Overlay cards show the real overlay. Add to Studio puts one in your scene in one click, sounds
+  included.
+- Twitch alerts stay connected on a busy upload. Notifications show above dialogs, and drawers
+  sit above the status bar.
+
 ## 2.1.6
 
 - A status bar along the bottom of the window, like OBS's: live and recording times, CPU,
