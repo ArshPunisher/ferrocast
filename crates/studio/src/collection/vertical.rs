@@ -81,10 +81,21 @@ impl Collection {
         t
     }
 
-    /// Turns the vertical picture on, with one empty scene called `first_scene` (nothing
-    /// happens when it's on already).
+    /// Turns the vertical picture on: as it was when turned off, else new with one empty scene
+    /// called `first_scene` (nothing happens when it's on already).
     pub fn start_vertical(&self, first_scene: &str) -> Result<(), StudioError> {
         if self.vertical.borrow().is_some() {
+            return Ok(());
+        }
+        let parked = self.parked.borrow_mut().take();
+        if let Some(v) = parked {
+            let a = self.api();
+            a.canvas_set_channel(v.canvas, 0, v.transition);
+            let show = if v.current.is_null() { v.scenes.first().copied() } else { Some(v.current) };
+            self.vertical.replace(Some(v));
+            if let Some(s) = show {
+                self.vertical_go(s, 0);
+            }
             return Ok(());
         }
         self.need_canvases()?;
@@ -106,15 +117,34 @@ impl Collection {
         Ok(())
     }
 
-    /// Turns the vertical picture off: its canvas and scenes go (the sources stay where else
-    /// they're used).
+    /// Turns the vertical picture off: it draws nothing and isn't shown or streamed, but its
+    /// scenes and sources are kept (and saved), for when it's turned on again. Its scenes'
+    /// sources aren't on any picture then, so cameras and captures rest.
     pub fn stop_vertical(&self) {
-        self.drop_vertical();
+        let Some(v) = self.vertical.replace(None) else { return };
+        self.api().canvas_set_channel(v.canvas, 0, ptr::null_mut());
+        if let Some(old) = self.parked.replace(Some(v)) {
+            self.release_vertical(old);
+        }
     }
 
-    /// Lets go of the vertical canvas and its scenes.
+    /// The vertical scene called `name` while the picture is off.
+    pub(super) fn parked_scene(&self, name: &str) -> Option<*mut ffi::ObsSource> {
+        let a = self.api();
+        self.parked.borrow().as_ref()?.scenes.iter().copied().find(|s| text(a.obs_source_get_name(*s)) == name)
+    }
+
+    /// Lets go of the vertical canvas and its scenes, on or off (a collection switch).
     pub(super) fn drop_vertical(&self) {
-        let Some(v) = self.vertical.replace(None) else { return };
+        if let Some(v) = self.vertical.replace(None) {
+            self.release_vertical(v);
+        }
+        if let Some(v) = self.parked.replace(None) {
+            self.release_vertical(v);
+        }
+    }
+
+    fn release_vertical(&self, v: Vertical) {
         let a = self.api();
         a.canvas_set_channel(v.canvas, 0, ptr::null_mut());
         if !v.transition.is_null() {
@@ -283,10 +313,11 @@ impl Collection {
         Ok(())
     }
 
-    /// The vertical picture as saved in the collection.
+    /// The vertical picture as saved in the collection, on or off.
     pub(super) fn save_vertical(&self) -> Option<Value> {
-        let v = self.vertical.borrow();
-        let v = v.as_ref()?;
+        let on = self.vertical.borrow();
+        let off = self.parked.borrow();
+        let v = on.as_ref().or(off.as_ref())?;
         let a = self.api();
         let data = a.canvas_save(v.canvas);
         let canvas = self.data_json(data);
@@ -297,6 +328,7 @@ impl Collection {
             "canvas": canvas,
             "scene_order": v.scenes.iter().map(|s| json!({ "name": text(a.obs_source_get_name(*s)) })).collect::<Vec<_>>(),
             "current_scene": if v.current.is_null() { String::new() } else { text(a.obs_source_get_name(v.current)) },
+            "on": on.is_some(),
         }))
     }
 
@@ -363,5 +395,9 @@ impl Collection {
         let want = saved.get("current_scene").and_then(Value::as_str).and_then(|n| self.vertical_scene(n));
         let first = self.vertical.borrow().as_ref().map(|v| v.scenes[0]).unwrap_or(ptr::null_mut());
         self.vertical_go(want.unwrap_or(first), 0);
+        // Saved while off (older saves were only ever on): kept, off.
+        if saved.get("on").and_then(Value::as_bool) == Some(false) {
+            self.stop_vertical();
+        }
     }
 }

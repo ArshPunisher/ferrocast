@@ -486,6 +486,9 @@ pub struct Collection {
     thumb_showing: RefCell<HashMap<String, (*mut ffi::ObsSource, std::time::Instant)>>,
     /// The vertical picture, when it's on.
     vertical: RefCell<Option<vertical::Vertical>>,
+    /// The vertical picture while it's off: kept whole (its scenes and sources), drawing
+    /// nothing, so turning it on again brings it back as it was (owner, 28 Oct).
+    parked: RefCell<Option<vertical::Vertical>>,
     /// Items fitted before their source had a size (scene, item id, when): fitted again once
     /// it has one, so their frame hugs the picture (`settle_fits`).
     waiting_fit: RefCell<Vec<(String, i64, std::time::Instant)>>,
@@ -566,6 +569,7 @@ impl Collection {
             thumb_showing: RefCell::new(HashMap::new()),
             true_peak: RefCell::new(false),
             vertical: RefCell::new(None),
+            parked: RefCell::new(None),
             waiting_fit: RefCell::new(Vec::new()),
         };
         c.make_transition("fade_transition")?;
@@ -621,7 +625,7 @@ impl Collection {
         check_name(name)?;
         // Vertical scenes have their own names in libobs (their canvas's), but names are one
         // list for people.
-        if self.vertical_scene(name).is_some() {
+        if self.vertical_scene(name).is_some() || self.parked_scene(name).is_some() {
             return Err(StudioError::Failed(format!("name: there's already a source or scene called \"{name}\".")));
         }
         if let Some(src) = self.find(name) {
@@ -646,8 +650,8 @@ impl Collection {
     /// Every source in use: the scenes, what's in them (groups included) and the global devices.
     fn in_use(&self) -> Vec<*mut ffi::ObsSource> {
         let a = self.api();
-        let mut out: Vec<*mut ffi::ObsSource> = self.every_scene();
-        for s in self.every_scene().iter() {
+        let mut out: Vec<*mut ffi::ObsSource> = self.held_scenes();
+        for s in self.held_scenes().iter() {
             for i in self.raw_items(a.obs_scene_from_source(*s)) {
                 out.push(a.obs_sceneitem_get_source(i));
                 if a.obs_sceneitem_is_group(i) {
@@ -680,6 +684,16 @@ impl Collection {
     fn every_scene(&self) -> Vec<*mut ffi::ObsSource> {
         let mut all = self.scenes.borrow().clone();
         if let Some(v) = self.vertical.borrow().as_ref() {
+            all.extend(v.scenes.iter().copied());
+        }
+        all
+    }
+
+    /// Every scene held, the vertical picture's included while it's off: what's saved and
+    /// what a collection switch clears.
+    fn held_scenes(&self) -> Vec<*mut ffi::ObsSource> {
+        let mut all = self.every_scene();
+        if let Some(v) = self.parked.borrow().as_ref() {
             all.extend(v.scenes.iter().copied());
         }
         all
@@ -2209,6 +2223,15 @@ impl Collection {
             v.scenes.insert(at, src);
             return Ok(());
         }
+        // The vertical picture is off: back among its kept scenes, not the main picture's
+        // (CodeRabbit).
+        if let Some(v) = self.parked.borrow_mut().as_mut()
+            && a.canvas_of(src) == v.canvas
+        {
+            let at = snap.index.min(v.scenes.len());
+            v.scenes.insert(at, src);
+            return Ok(());
+        }
         let mut v = self.scenes.borrow_mut();
         let at = snap.index.min(v.len());
         v.insert(at, src);
@@ -3437,9 +3460,10 @@ impl Drop for Collection {
         self.let_thumbs_go(true);
         let a = &self.studio.inner.api;
         a.obs_set_output_source(0, ptr::null_mut());
-        // As OBS clears a collection: every source in a scene, each scene, the devices.
+        // As OBS clears a collection: every source in a scene (the vertical picture's while
+        // it's off too), each scene, the devices.
         let mut sources: Vec<*mut ffi::ObsSource> = Vec::new();
-        for s in self.every_scene().iter() {
+        for s in self.held_scenes().iter() {
             for i in self.raw_items(a.obs_scene_from_source(*s)) {
                 let mut all = vec![i];
                 if a.obs_sceneitem_is_group(i) {
