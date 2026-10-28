@@ -38,6 +38,8 @@ struct Held {
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
     stream: Option<Streaming>,
+    /// The vertical picture's stream, beside the main one.
+    vstream: Option<Streaming>,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     replay: Option<ferrocast_studio::ReplayBuffer>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
@@ -267,8 +269,9 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     };
     // libobs keeps one collection's sources at a time: the old ones go first, with the undo
     // steps that hold them and the projectors that show them.
-    // The vertical preview draws the old collection's canvas: it goes before the canvas does.
+    // The vertical preview and stream use the old collection's canvas: they go before it does.
     h.vertical.view = None;
+    h.vstream = None;
     let old = h.collection.take().map(|c| {
         save(&c, from);
         c.save(COLLECTION)
@@ -909,6 +912,7 @@ impl StudioHost for DesktopStudio {
             let file = scenes_file(&data);
             // The stream, the recording, the preview and the scenes go (saved first); the engine
             // stays loaded for the next Start.
+            h.vstream = None;
             h.stream = None;
             h.record = None;
             h.replay = None;
@@ -1115,8 +1119,12 @@ impl StudioHost for DesktopStudio {
             let before = h.history.before(c, &act);
             let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
             if turns_vertical {
-                // The preview goes before its canvas does.
+                // The preview goes before its canvas does; the vertical stream too when the
+                // picture goes (turning it on when it's on changes nothing).
                 h.vertical.view = None;
+                if act == StudioAct::StopVertical {
+                    h.vstream = None;
+                }
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let out = run(c, act).map_err(|e| e.to_string());
@@ -1817,9 +1825,37 @@ impl StudioHost for DesktopStudio {
 
     async fn stream_stop(&self) -> Result<(), String> {
         self.on_main(|h| {
+            h.vstream = None;
             h.stream = None;
         })
         .await
+    }
+
+    async fn vertical_stream_stop(&self) -> Result<(), String> {
+        self.on_main(|h| {
+            h.vstream = None;
+        })
+        .await
+    }
+
+    async fn vertical_stream_start(&self, server: String, key: String) -> Result<bool, String> {
+        self.on_main(move |h| {
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let studio = h.studio.as_ref().ok_or(STOPPED)?;
+            if c.vertical().is_none() {
+                return Ok(false);
+            }
+            if h.vstream.as_ref().is_some_and(|s| s.stats().active) {
+                return Ok(true);
+            }
+            h.vstream = None;
+            let s = h.settings.clone().unwrap_or_default();
+            let settings = stream_settings(studio, &s);
+            tracing::info!(kbps = settings.encode.video_kbps, "the Studio's vertical picture starts streaming into Go live");
+            h.vstream = Some(c.vertical_stream(&server, &key, &settings).map_err(|e| e.to_string())?);
+            Ok(true)
+        })
+        .await?
     }
 
     async fn stream_stats(&self) -> Result<Value, String> {

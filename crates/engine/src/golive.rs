@@ -1356,6 +1356,8 @@ impl Engine {
             self.start_destination(&d).await;
         }
         self.reconcile_cut().await;
+        // The Studio's vertical stream follows the ticked platforms and the source.
+        self.studio_sync_vertical().await;
         self.send_golive();
     }
 
@@ -1727,10 +1729,10 @@ pub(crate) async fn run(engine: Engine) {
         if changed {
             let now = (main.borrow_and_update().on, vertical.borrow_and_update().on);
             if now.0 != was.0 {
-                tracing::info!(live = now.0, "Go live: OBS's stream changed");
+                tracing::info!(live = now.0, "Go live: the stream changed");
             }
             if now.1 != was.1 {
-                tracing::info!(live = now.1, "Go live: OBS's vertical stream changed");
+                tracing::info!(live = now.1, "Go live: the vertical stream changed");
             }
             was = now;
             engine.reconcile().await;

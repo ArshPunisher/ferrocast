@@ -207,7 +207,17 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn monitoring(&self) -> Result<Value, String>;
     /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String>;
+    /// Stops the stream (and the vertical picture's with it).
     async fn stream_stop(&self) -> Result<(), String>;
+    /// Also streams the vertical picture, while it's on, over RTMP to `key` → whether it
+    /// started (false: there's no vertical picture).
+    async fn vertical_stream_start(&self, _server: String, _key: String) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Stops the vertical picture's stream (the wide one goes on).
+    async fn vertical_stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
     /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
@@ -1788,7 +1798,13 @@ impl Engine {
     /// Does one thing to the scene collection, after checking it.
     pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
         act.check()?;
-        self.studio_host()?.act(act).await.map_err(failed)
+        let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
+        let out = self.studio_host()?.act(act).await.map_err(failed)?;
+        if turns_vertical {
+            // Turned on or off while live: the vertical stream follows.
+            self.studio_sync_vertical().await;
+        }
+        Ok(out)
     }
 
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
@@ -1805,10 +1821,52 @@ impl Engine {
         }
         let (server, key) = self.golive_ingest().await?;
         let mut v = host.stream_start(server, key).await.map_err(failed)?;
-        if let (Some(also), Some(o)) = (follow_stream(host.as_ref(), true, &s).await, v.as_object_mut()) {
+        let mut also = follow_stream(host.as_ref(), true, &s).await;
+        if let Some(note) = self.studio_sync_vertical().await {
+            also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+        }
+        if let (Some(also), Some(o)) = (also, v.as_object_mut()) {
             o.insert("also".into(), Value::String(also));
         }
         Ok(v)
+    }
+
+    /// Starts or stops the Studio's vertical stream to match: while the Studio streams, its
+    /// vertical picture goes to Go live's vertical key (as OBS's vertical canvas does) when a
+    /// vertical platform is ticked and the picture comes from a canvas. Called when the stream
+    /// starts and whenever Go live's platforms, the source or the vertical picture change →
+    /// a note when it should send but can't.
+    pub(crate) async fn studio_sync_vertical(&self) -> Option<String> {
+        let host = self.studio_host().ok()?;
+        // The wide stream is on (connecting or live) unless it isn't there or failed.
+        let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
+        if !streaming || !self.studio_vertical_wanted() {
+            if let Err(e) = host.vertical_stream_stop().await {
+                tracing::warn!(error = %e, "the Studio's vertical stream didn't stop");
+            }
+            return None;
+        }
+        let started = match self.golive_vertical_ingest().await {
+            Ok((server, key)) => host.vertical_stream_start(server, key).await,
+            Err(e) => Err(e.to_string()),
+        };
+        match started {
+            Ok(true) => None,
+            Ok(false) => Some("A vertical platform is on, but there's no vertical picture: add one in Studio, Go live.".into()),
+            Err(e) => {
+                tracing::warn!(error = %e, "the Studio's vertical picture didn't start streaming");
+                Some("The vertical stream didn't start; the wide one did.".into())
+            }
+        }
+    }
+
+    /// A vertical platform is ticked and the vertical picture comes from a canvas (the Studio's
+    /// or OBS's), not cut from the stream.
+    fn studio_vertical_wanted(&self) -> bool {
+        use crate::golive::{Canvas, VerticalSource};
+        let cfg = self.golive_config();
+        cfg.vertical_source == VerticalSource::Canvas
+            && cfg.destinations.iter().any(|d| d.enabled && d.canvas == Canvas::Vertical)
     }
 
     pub async fn studio_stream_stats(&self) -> Result<Value, EngineError> {
@@ -1869,7 +1927,10 @@ impl Engine {
     /// Scene collections or profiles: one act on that list.
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
-        self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)
+        let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
+        // Another collection may have its own vertical picture (or none): the stream follows.
+        self.studio_sync_vertical().await;
+        Ok(out)
     }
 
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {
@@ -2107,6 +2168,7 @@ mod tests {
         rects: std::sync::Mutex<Vec<Option<PreviewRect>>>,
         acts: std::sync::Mutex<Vec<StudioAct>>,
         outputs: std::sync::Mutex<Vec<String>>,
+        streaming: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2164,13 +2226,27 @@ mod tests {
             Ok(serde_json::to_value(act).unwrap_or_default())
         }
         async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
+            self.streaming.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::json!({ "server": server, "key_len": key.len() }))
         }
         async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        async fn vertical_stream_start(&self, _server: String, key: String) -> Result<bool, String> {
+            self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push(format!("vstream on {}", key.len()));
+            Ok(true)
+        }
+        async fn vertical_stream_stop(&self) -> Result<(), String> {
+            self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push("vstream off".into());
             Ok(())
         }
         async fn stream_stats(&self) -> Result<Value, String> {
-            Ok(Value::Null)
+            Ok(if self.streaming.load(std::sync::atomic::Ordering::Relaxed) {
+                serde_json::json!({ "active": true, "error": null })
+            } else {
+                Value::Null
+            })
         }
         async fn obs_collections(&self) -> Result<Value, String> {
             Ok(serde_json::json!([{ "id": "Untitled", "name": "Untitled", "scenes": 2, "sources": 3 }]))
@@ -2262,6 +2338,35 @@ mod tests {
             .await
             .unwrap();
         (e, dir)
+    }
+
+    #[tokio::test]
+    async fn the_vertical_picture_streams_with_the_wide_one_when_a_vertical_platform_is_ticked() {
+        let (e, _d) = engine().await;
+        // Go live's local server, on a free port.
+        e.start_golive(0).await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let taken = || std::mem::take(&mut *fake.outputs.lock().unwrap_or_else(|p| p.into_inner()));
+        let sent = |o: &Vec<String>| o.iter().any(|o| o.starts_with("vstream on"));
+        // No vertical platform ticked: only the wide stream.
+        e.studio_stream(true).await.unwrap();
+        assert!(!sent(&taken()));
+        // Ticked while live: the vertical stream starts then (Go live's platforms changed).
+        e.add_golive_destination("Phone test", "rtmp://127.0.0.1:1/live", "k", crate::golive::Canvas::Vertical)
+            .await
+            .unwrap();
+        assert!(sent(&taken()));
+        // Cut from the stream instead, while live: Ferrocast makes it, the Studio's stops.
+        e.set_vertical_source(crate::golive::VerticalSource::Cut).await.unwrap();
+        let out = taken();
+        assert!(!sent(&out) && out.iter().any(|o| o == "vstream off"), "{out:?}");
+        // Not streaming: nothing is sent, whatever is ticked.
+        e.set_vertical_source(crate::golive::VerticalSource::Canvas).await.unwrap();
+        e.studio_stream(false).await.unwrap();
+        taken();
+        e.studio_sync_vertical().await;
+        assert!(!sent(&taken()));
     }
 
     #[tokio::test]
