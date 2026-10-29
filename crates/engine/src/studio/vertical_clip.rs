@@ -234,12 +234,14 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>) {
     // A folder per copy: clips saved close together never share (or remove) each other's.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let work = std::env::temp_dir().join(format!("ferrocast-vertical-{}-{n}", std::process::id()));
+    // Made new (never one already there: on a shared computer another user could have put a
+    // link in its place), with a name no one can guess ahead.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let work = std::env::temp_dir().join(format!("ferrocast-vertical-{}-{n}-{nanos:x}", std::process::id()));
+    let made = subs.is_some() && tokio::fs::create_dir(&work).await.is_ok();
     let burn = match subs {
-        Some(s) => {
-            tokio::fs::create_dir_all(&work).await.is_ok() && tokio::fs::copy(s, work.join("subs.srt")).await.is_ok()
-        }
-        None => false,
+        Some(s) if made => tokio::fs::copy(s, work.join("subs.srt")).await.is_ok(),
+        _ => false,
     };
     let args = vertical_args(clip, &part, burn.then_some("subs.srt"));
     let mut cmd = Command::new(ffmpeg);
@@ -263,7 +265,7 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>) {
             false
         }
     };
-    if subs.is_some() {
+    if made {
         let _ = tokio::fs::remove_dir_all(&work).await;
     }
     if ok && tokio::fs::rename(&part, &out).await.is_ok() {

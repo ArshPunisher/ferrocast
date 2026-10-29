@@ -155,6 +155,10 @@ async fn voice_commands(engine: &Engine, acted: &mut Acted, id: u64, said: &str,
         if !acted.first(n, &c) {
             continue;
         }
+        if super::voice_commands::from_a_viewer(&c, &scenes, crate::now().0) {
+            tracing::info!(command = ?c, "voice command ignored: a viewer's message read aloud said it");
+            continue;
+        }
         if !engine.studio_cooldown(&format!("voice:{c:?}"), 5) {
             continue;
         }

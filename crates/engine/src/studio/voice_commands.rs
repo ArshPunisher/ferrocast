@@ -2,6 +2,34 @@
 //! what they say. Read from what's being said now, once per sentence; a scene's name only once
 //! the words have stopped changing, so "switch to just" never picks "Just chatting" early.
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+/// Viewers' messages read aloud lately (when, Unix ms; what): a speaker the mic hears must
+/// never let a viewer give a voice command ("stop recording" in a tip message).
+static READ_ALOUD: Mutex<VecDeque<(i64, String)>> = Mutex::new(VecDeque::new());
+/// How long a message read aloud keeps its commands from working.
+const READ_ALOUD_MS: i64 = 3 * 60_000;
+
+/// A viewer's message is about to be read aloud (an alert's text to speech).
+pub(crate) fn reading_aloud(text: &str, now: i64) {
+    if let Ok(mut r) = READ_ALOUD.lock() {
+        r.push_back((now, text.to_string()));
+        while r.len() > 50 || r.front().is_some_and(|(t, _)| now - t > READ_ALOUD_MS) {
+            r.pop_front();
+        }
+    }
+}
+
+/// Whether a viewer's message read aloud lately would itself give `c`: then it isn't the
+/// streamer's voice asking (or can't be told apart), and it's ignored.
+pub(crate) fn from_a_viewer(c: &Command, scenes: &[String], now: i64) -> bool {
+    let Ok(r) = READ_ALOUD.lock() else { return true };
+    r.iter()
+        .filter(|(t, _)| now - t <= READ_ALOUD_MS)
+        .any(|(_, text)| commands(text).contains(c) || scene_command(text, scenes).as_ref() == Some(c))
+}
+
 /// What a sentence asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -109,6 +137,18 @@ mod tests {
         assert_eq!(s("switch to"), None);
         assert_eq!(s("switch to minecraft"), None);
         assert_eq!(s("just chatting"), None);
+    }
+
+    #[test]
+    fn a_viewers_message_read_aloud_gives_no_commands() {
+        let scenes: Vec<String> = ["Main", "Ending"].map(String::from).to_vec();
+        let now = 1_000_000_000;
+        reading_aloud("$5 from troll: switch to ending and stop recording lol", now);
+        assert!(from_a_viewer(&Command::Scene("Ending".into()), &scenes, now + 10_000));
+        assert!(from_a_viewer(&Command::RecordOff, &scenes, now + 10_000));
+        // What the message didn't ask for still works, and the message stops counting after a while.
+        assert!(!from_a_viewer(&Command::Brb, &scenes, now + 10_000));
+        assert!(!from_a_viewer(&Command::RecordOff, &scenes, now + READ_ALOUD_MS + 1));
     }
 
     #[test]

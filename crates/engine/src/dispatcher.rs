@@ -125,6 +125,8 @@ impl Engine {
         self.queue_op(move |q, t| q.enqueue(alert, priority, t)).await;
         self.inner.queue_changed.notify_one();
         if let Some((alert_id, text)) = speak {
+            // Read aloud: what it says can't be taken for the streamer's voice command.
+            crate::studio::voice_commands::reading_aloud(&text, crate::now().0);
             let engine = self.clone();
             tokio::spawn(async move {
                 if let Some(media) = engine.speak_to_media(&text).await {
