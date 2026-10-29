@@ -17,7 +17,7 @@ use crate::{Engine, EngineError, now};
 /// How often OBS is asked for its numbers while connected.
 const HEALTH_EVERY: Duration = Duration::from_secs(5);
 /// `!clip` at most this often (a chat full of mods can't fill the disk).
-const CLIP_COOLDOWN_S: i64 = 20;
+pub(crate) const CLIP_COOLDOWN_S: i64 = 20;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipResult {

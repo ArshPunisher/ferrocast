@@ -25,6 +25,7 @@ pub(crate) mod rig;
 pub mod show;
 pub mod stream_info;
 pub mod vertical_clip;
+pub(crate) mod voice_clip;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Mutex, RwLock};

@@ -252,6 +252,8 @@ pub struct ScenesConfig {
     /// Away: while live, the BRB scene after this many minutes with the Show's mics silent,
     /// and back when you talk again (0: off; the Studio only).
     pub away_minutes: u32,
+    /// Saying "clip that" while live captions listen saves a clip (the Studio only).
+    pub clip_by_voice: bool,
 }
 
 impl Default for ScenesConfig {
@@ -267,6 +269,7 @@ impl Default for ScenesConfig {
             clip_on_big_moments: false,
             vertical_clips: false,
             away_minutes: 0,
+            clip_by_voice: false,
         }
     }
 }

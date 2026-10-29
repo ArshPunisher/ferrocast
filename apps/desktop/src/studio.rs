@@ -362,6 +362,19 @@ static REMUX: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 /// What live captions last heard, as the "Captions" text source shows it.
 static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// Times "clip that" was said while captions listened (the engine clips when it goes up).
+static CLIPS_SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times `said` asks for a clip ("clip that", "clip it"), any case or punctuation.
+fn clip_calls(said: &str) -> usize {
+    let words: Vec<String> = said
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.windows(2).filter(|w| w[0] == "clip" && (w[1] == "that" || w[1] == "it")).count()
+}
+
 /// The text source live captions write into, when the scenes have one.
 const CAPTIONS_SOURCE: &str = "Captions";
 
@@ -961,7 +974,10 @@ impl StudioHost for DesktopStudio {
             if h.studio.is_none() {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
                 // FERROCAST_RENDERER (opengl or metal) overrides it for a test run.
-                let want = std::env::var("FERROCAST_RENDERER").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| s.renderer.clone());
+                let want = std::env::var("FERROCAST_RENDERER")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| s.renderer.clone());
                 let (paths, renderer) = obs_paths(want != "opengl").ok_or(NO_OBS)?;
                 let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                 let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
@@ -1523,8 +1539,19 @@ impl StudioHost for DesktopStudio {
                     // The old listener goes first: one at a time.
                     h.captions = None;
                     let done = RefCell::new(String::new());
+                    // "clip that"s already counted in this sentence (partial results repeat it).
+                    let counted = std::cell::Cell::new(0usize);
                     let listener = c
                         .start_captions(&source, move |said, last| {
+                            let calls = clip_calls(&said);
+                            if calls > counted.get() {
+                                CLIPS_SAID
+                                    .fetch_add((calls - counted.get()) as u64, std::sync::atomic::Ordering::Relaxed);
+                                counted.set(calls);
+                            }
+                            if last {
+                                counted.set(0);
+                            }
                             let shown = caption_tail(&format!("{} {said}", done.borrow()), CAPTION_CHARS);
                             if last {
                                 *done.borrow_mut() = shown.clone();
@@ -1555,6 +1582,7 @@ impl StudioHost for DesktopStudio {
                 "on": h.captions.is_some(),
                 "source": h.captions.as_ref().map(|(_, s)| s.clone()),
                 "text": HEARD.lock().map(|t| t.clone()).unwrap_or_default(),
+                "clips_said": CLIPS_SAID.load(std::sync::atomic::Ordering::Relaxed),
                 // Shown only when a scene has it (a removed one lingers for undo).
                 "box": h.collection.as_ref().is_some_and(|c| {
                     c.sources().iter().any(|s| s.name == CAPTIONS_SOURCE && !s.scenes.is_empty())
@@ -2194,6 +2222,19 @@ mod log_tests {
 #[cfg(test)]
 mod caption_tests {
     use super::caption_tail;
+
+    #[test]
+    fn clip_that_is_heard_in_any_case_and_punctuation() {
+        use super::clip_calls;
+        assert_eq!(clip_calls("Oh wow, clip that!"), 1);
+        assert_eq!(clip_calls("CLIP IT. clip that"), 2);
+        assert_eq!(clip_calls("Clip... that"), 1);
+        // Near misses aren't clips.
+        assert_eq!(clip_calls("clipping that was fun"), 0);
+        assert_eq!(clip_calls("that clip"), 0);
+        assert_eq!(clip_calls("eclipse that"), 0);
+        assert_eq!(clip_calls(""), 0);
+    }
 
     #[test]
     fn short_captions_show_whole() {
