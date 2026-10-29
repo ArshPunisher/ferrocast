@@ -1548,6 +1548,30 @@ impl Collection {
         a.obs_sceneitem_set_bounds(item, &ffi::Vec2 { x: c.width as f32, y: c.height as f32 });
     }
 
+    /// Takes a fitted item out of its bounding box, its picture staying where it shows in it
+    /// (scaled, no box): its frame is then the picture itself. Only for an upright item whose
+    /// box centres it (as `fit` makes it); others are left as they are.
+    fn unbox(&self, item: *mut ffi::ObsSceneItem) {
+        let a = self.api();
+        let p = self.place(item);
+        let Some((bw, bh)) = p.bounds else { return };
+        let (w, h) = (p.size.0 as f32, p.size.1 as f32);
+        if w <= 0.0 || h <= 0.0 || p.rot.rem_euclid(360.0) > 0.01 || p.scale.0 <= 0.0 || p.scale.1 <= 0.0 {
+            return;
+        }
+        if a.obs_sceneitem_get_bounds_alignment(item) != ffi::OBS_ALIGN_CENTER {
+            return;
+        }
+        let k = (bw / w).min(bh / h);
+        let f = p.frame();
+        let x = f[4] + (bw - w * k) / 2.0;
+        let y = f[5] + (bh - h * k) / 2.0;
+        a.obs_sceneitem_set_bounds_type(item, ffi::OBS_BOUNDS_NONE);
+        a.obs_sceneitem_set_alignment(item, ffi::OBS_ALIGN_LEFT | ffi::OBS_ALIGN_TOP);
+        a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: k, y: k });
+        a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: x.round(), y: y.round() });
+    }
+
     /// The middle of the item's box on the canvas, as it is now (libobs works the box out
     /// only on its next frame otherwise: a new item's is still empty).
     fn box_middle(&self, item: *mut ffi::ObsSceneItem) -> ffi::Vec2 {
@@ -3122,9 +3146,11 @@ impl Collection {
 
     /// Lets go of scenes kept showing for pictures that haven't been asked for in a while (the
     /// grid closed, or the scene went), or of all of them with `all`.
-    /// Fits again the items fitted before their source had a size, once it has one and they
-    /// still have the bounding box `fit` gave them (nothing moved them since). Called often
-    /// (the stats read); gives up on one after 30 s.
+    /// Fits again the items fitted before their source had a size, once it has one. One still
+    /// with the bounding box `fit` gave it is fitted afresh; one moved or sized meanwhile keeps
+    /// where its picture shows, without the box: a window capture whose window was picked later
+    /// otherwise kept a canvas-sized frame round a smaller picture, and lining the frame up
+    /// left black edges (owner, 29 Oct). Called often (the stats read); waits up to 30 min.
     pub fn settle_fits(&self) {
         if self.waiting_fit.borrow().is_empty() {
             return;
@@ -3134,18 +3160,21 @@ impl Collection {
         for (scene, id, since) in waiting {
             let Ok(item) = self.item(&scene, id) else { continue };
             let a = self.api();
-            let c = self.size_of_item(item);
-            let mut b = ffi::Vec2 { x: 0.0, y: 0.0 };
-            a.obs_sceneitem_get_bounds(item, &mut b);
-            let untouched = a.obs_sceneitem_get_bounds_type(item) == ffi::OBS_BOUNDS_SCALE_INNER
-                && (b.x - c.0 as f32).abs() < 0.5
-                && (b.y - c.1 as f32).abs() < 0.5;
-            if !untouched {
+            // Given another kind of box (Stretch, Edit Transform) or none: it's the user's now.
+            if a.obs_sceneitem_get_bounds_type(item) != ffi::OBS_BOUNDS_SCALE_INNER {
                 continue;
             }
-            if self.place(item).size.0 > 0 {
-                self.fit(item);
-            } else if since.elapsed() < std::time::Duration::from_secs(30) {
+            let c = self.size_of_item(item);
+            let p = self.place(item);
+            let untouched = p.pos == (0.0, 0.0)
+                && p.bounds.is_some_and(|(w, h)| (w - c.0 as f32).abs() < 0.5 && (h - c.1 as f32).abs() < 0.5);
+            if p.size.0 > 0 && p.size.1 > 0 {
+                if untouched {
+                    self.fit(item);
+                } else {
+                    self.unbox(item);
+                }
+            } else if since.elapsed() < std::time::Duration::from_secs(30 * 60) {
                 keep.push((scene, id, since));
             }
         }
