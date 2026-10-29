@@ -687,6 +687,10 @@ pub struct StudioSettings {
     pub true_peak: bool,
     /// OBS's Low Latency Audio Buffering (after a restart).
     pub low_latency_audio: bool,
+    /// How a Mac draws the picture: "metal" (Apple's own, the default from 29 Oct) or
+    /// "opengl" (the older way, for a filter or plugin that draws wrong with Metal). After a
+    /// restart; other systems ignore it.
+    pub renderer: String,
     /// Multiviews: what's on air "top", "bottom", "left" or "right" of the scenes, or
     /// "scenes_only"; names under each box; EBU R95 safe areas.
     pub multiview_layout: String,
@@ -754,6 +758,7 @@ impl Default for StudioSettings {
             speakers: None,
             true_peak: false,
             low_latency_audio: false,
+            renderer: "metal".into(),
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
@@ -846,6 +851,9 @@ impl StudioSettings {
         }
         if !(5..=21_600).contains(&self.replay_seconds) || self.replay_mb > 1_000_000 {
             return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000).");
+        }
+        if !["metal", "opengl"].contains(&self.renderer.as_str()) {
+            return bad("renderer: metal or opengl.");
         }
         if let Some(l) = &self.speakers
             && !["2.1", "4.0", "4.1", "5.1", "7.1"].contains(&l.as_str())
@@ -2486,6 +2494,15 @@ mod tests {
     }
 
     #[test]
+    fn settings_saved_before_the_renderer_choice_draw_with_metal() {
+        let old: StudioSettings = serde_json::from_str(r#"{"video_kbps": 6000}"#).unwrap();
+        assert_eq!(old.renderer, "metal");
+        assert!(old.check().is_ok());
+        let gl = StudioSettings { renderer: "opengl".into(), ..StudioSettings::default() };
+        assert!(gl.check().is_ok());
+    }
+
+    #[test]
     fn following_needs_both_scene_and_item_or_neither() {
         let set = |scene: Option<&str>, item| FollowSet { scene: scene.map(String::from), item };
         assert!(set(None, None).check().is_ok());
@@ -2843,6 +2860,7 @@ mod tests {
             assert!(bad.check().is_err(), "{action} is refused");
         }
         for (field, bad) in [
+            ("renderer", StudioSettings { renderer: "vulkan".into(), ..d.clone() }),
             ("encoder", StudioSettings { encoder: "gpu".into(), ..d.clone() }),
             ("video_kbps", StudioSettings { video_kbps: 90_000, ..d.clone() }),
             ("keyframe_s", StudioSettings { keyframe_s: 30, ..d.clone() }),

@@ -157,22 +157,23 @@ thread_local! {
 }
 
 /// Where OBS is installed (macOS), if it is.
-fn obs_paths() -> Option<(Paths, &'static str)> {
+fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
     #[cfg(target_os = "macos")]
     {
         let mut places = vec![PathBuf::from("/Applications/OBS.app/Contents")];
         if let Some(home) = dirs::home_dir() {
             places.push(home.join("Applications/OBS.app/Contents"));
         }
-        // OpenGL drew without late frames in the 25 Oct runs; Metal is tried again once the
-        // preview lives in the app (STUDIO-PARITY, spikes/libobs-mac).
-        places
-            .into_iter()
-            .find(|p| p.join("Frameworks/libobs.framework").exists())
-            .map(|c| (Paths::from_obs_app(&c, false), "opengl"))
+        // Metal is the default from 29 Oct (OpenGL crashed in gl_update once while previews
+        // came and went); OpenGL stays in Settings. An OBS without Metal's renderer gets OpenGL.
+        places.into_iter().find(|p| p.join("Frameworks/libobs.framework").exists()).map(|c| {
+            let metal = metal && c.join("Frameworks/libobs-metal.dylib").exists();
+            (Paths::from_obs_app(&c, metal), if metal { "metal" } else { "opengl" })
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = metal;
         None
     }
 }
@@ -868,7 +869,7 @@ impl DesktopStudio {
     }
 
     fn status_of(h: &Held) -> StudioStatus {
-        let found = obs_paths().is_some();
+        let found = obs_paths(true).is_some();
         StudioStatus {
             available: found,
             running: h.collection.is_some(),
@@ -958,8 +959,10 @@ impl StudioHost for DesktopStudio {
                 return Ok(Self::status_of(h));
             }
             if h.studio.is_none() {
-                let (paths, renderer) = obs_paths().ok_or(NO_OBS)?;
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+                // FERROCAST_RENDERER (opengl or metal) overrides it for a test run.
+                let want = std::env::var("FERROCAST_RENDERER").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| s.renderer.clone());
+                let (paths, renderer) = obs_paths(want != "opengl").ok_or(NO_OBS)?;
                 let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                 let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
                 let audio = AudioSetup {
@@ -1298,6 +1301,9 @@ impl StudioHost for DesktopStudio {
                             || a.low_latency != s.low_latency_audio
                     }) {
                         notes.push("Sound changes apply after Ferrocast restarts.".into());
+                    }
+                    if h.studio.is_some() && cfg!(target_os = "macos") && h.renderer != s.renderer {
+                        notes.push("The new way of drawing applies after Ferrocast restarts.".into());
                     }
                 }
                 // A new bitrate reaches the stream on air at once; the encoder, its size and the
