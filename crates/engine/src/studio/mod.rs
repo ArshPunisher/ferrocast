@@ -17,6 +17,7 @@
 //! counter values, quotes, markers and watch time have tables.
 
 pub mod autoreplies;
+pub mod away;
 pub mod chatbot;
 pub mod moments;
 pub mod obs_tools;

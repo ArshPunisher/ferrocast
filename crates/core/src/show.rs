@@ -249,6 +249,9 @@ pub struct ScenesConfig {
     pub clip_on_big_moments: bool,
     /// Each saved clip also as a 1080×1920 copy for Shorts, TikTok and Reels (ffmpeg).
     pub vertical_clips: bool,
+    /// Away: while live, the BRB scene after this many minutes with the Show's mics silent,
+    /// and back when you talk again (0: off; the Studio only).
+    pub away_minutes: u32,
 }
 
 impl Default for ScenesConfig {
@@ -263,6 +266,7 @@ impl Default for ScenesConfig {
             clip_command: true,
             clip_on_big_moments: false,
             vertical_clips: false,
+            away_minutes: 0,
         }
     }
 }
@@ -271,6 +275,9 @@ impl ScenesConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.chat_allowed.len() > 50 {
             return Err("chat_allowed: 50 scenes at most.".into());
+        }
+        if self.away_minutes > 60 {
+            return Err("away_minutes: 0 (off) to 60 minutes.".into());
         }
         if self.hotkeys.len() > 9 {
             return Err("hotkeys: 9 at most (Alt+1 to Alt+9).".into());

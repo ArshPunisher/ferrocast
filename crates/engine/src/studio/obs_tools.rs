@@ -108,6 +108,17 @@ impl Engine {
     /// BRB on: remember the scene, switch to the BRB scene and mute the listed inputs.
     /// BRB off: back to the remembered scene (or the show's live scene) and unmute.
     pub async fn set_brb(&self, on: bool) -> Result<serde_json::Value, EngineError> {
+        self.set_brb_keeping(on, &[]).await
+    }
+
+    /// BRB by Away: as BRB, but the mics it listens to stay on (muted, it could never hear
+    /// you come back).
+    pub(crate) async fn set_brb_away(&self, on: bool) -> Result<serde_json::Value, EngineError> {
+        let mics = self.show_config().mic_sources;
+        self.set_brb_keeping(on, &mics).await
+    }
+
+    async fn set_brb_keeping(&self, on: bool, keep: &[String]) -> Result<serde_json::Value, EngineError> {
         let cfg = self.scenes_config();
         let brb = cfg.brb_scene.clone().ok_or_else(|| EngineError::Refused {
             status: 422,
@@ -123,7 +134,7 @@ impl Engine {
             if current.as_deref() != Some(brb.as_str()) {
                 *self.studio().brb_from.lock().unwrap_or_else(|p| p.into_inner()) = current;
             }
-            for m in &cfg.brb_mute {
+            for m in cfg.brb_mute.iter().filter(|m| !keep.contains(m)) {
                 if let Err(e) = self.rig_set_muted(&rig, m, true).await {
                     tracing::warn!(error = %e, input = %m, "couldn't mute for BRB");
                 }
@@ -146,7 +157,7 @@ impl Engine {
                     retry_after: None,
                 })?;
             self.rig_switch(&rig, &back).await?;
-            for m in &cfg.brb_mute {
+            for m in cfg.brb_mute.iter().filter(|m| !keep.contains(m)) {
                 if let Err(e) = self.rig_set_muted(&rig, m, false).await {
                     tracing::warn!(error = %e, input = %m, "couldn't unmute after BRB");
                 }
