@@ -247,6 +247,8 @@ pub struct ScenesConfig {
     pub clip_command: bool,
     /// Save the replay buffer by itself on big moments (see `moments`).
     pub clip_on_big_moments: bool,
+    /// Each saved clip also as a 1080×1920 copy for Shorts, TikTok and Reels (ffmpeg).
+    pub vertical_clips: bool,
 }
 
 impl Default for ScenesConfig {
@@ -260,6 +262,7 @@ impl Default for ScenesConfig {
             brb_mute: Vec::new(),
             clip_command: true,
             clip_on_big_moments: false,
+            vertical_clips: false,
         }
     }
 }

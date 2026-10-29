@@ -204,8 +204,33 @@ impl Engine {
     pub(crate) async fn rig_save_replay(&self, rig: &Rig) -> Result<Option<String>, EngineError> {
         match rig {
             Rig::Obs(c) => ferrocast_obs::control::save_replay(c).await.map_err(obs_error),
-            Rig::Studio => self.studio_replay_save().await.map(|_| None),
+            Rig::Studio => {
+                // The Studio writes the file in the background: its name shows in the stats
+                // once it's done, and a vertical copy (when asked for) is made from it then.
+                let before = self.studio_last_replay().await;
+                self.studio_replay_save().await?;
+                if self.scenes_config().vertical_clips {
+                    let engine = self.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..40 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let now = engine.studio_last_replay().await;
+                            if now.is_some() && now != before {
+                                engine.vertical_copy(now.as_deref());
+                                return;
+                            }
+                        }
+                        tracing::info!("no vertical clip: the replay's file didn't show up");
+                    });
+                }
+                Ok(None)
+            }
         }
+    }
+
+    /// The Studio's last saved replay file, from its stats.
+    async fn studio_last_replay(&self) -> Option<String> {
+        self.studio_stats().await.ok()?.get("replay")?.get("last")?.as_str().map(str::to_string)
     }
 
     /// Free space where recordings go, in MB (None when it can't be read).

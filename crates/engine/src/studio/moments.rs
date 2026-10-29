@@ -200,10 +200,11 @@ impl Engine {
             let id = marker.id;
             tokio::spawn(async move {
                 let Ok(rig) = engine.rig().await else { return };
-                if engine.rig_save_replay(&rig).await.is_ok()
-                    && let Err(err) = engine.db(move |s| repo::studio::mark_clipped(s, id)).await
-                {
-                    tracing::warn!(%err, "couldn't mark a marker clipped");
+                if let Ok(path) = engine.rig_save_replay(&rig).await {
+                    engine.vertical_copy(path.as_deref());
+                    if let Err(err) = engine.db(move |s| repo::studio::mark_clipped(s, id)).await {
+                        tracing::warn!(%err, "couldn't mark a marker clipped");
+                    }
                 }
             });
         }

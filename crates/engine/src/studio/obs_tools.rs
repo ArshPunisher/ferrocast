@@ -41,6 +41,15 @@ impl Engine {
             cfg.brb_scene = None;
         }
         cfg.validate().map_err(EngineError::Invalid)?;
+        // Vertical clips need ffmpeg: fetched now, in the background, when they're switched on.
+        if cfg.vertical_clips && !self.scenes_config().vertical_clips && self.ffmpeg_path().is_none() {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = engine.get_ffmpeg().await {
+                    tracing::warn!(%err, "ffmpeg couldn't be fetched for vertical clips");
+                }
+            });
+        }
         save_setting(self, SCENES_KEY, &cfg).await?;
         *self.studio().scenes.write().unwrap_or_else(|p| p.into_inner()) = cfg.clone();
         Ok(cfg)
@@ -92,6 +101,7 @@ impl Engine {
         let path = self.rig_save_replay(&rig).await?;
         let label = label.map(str::trim).filter(|l| !l.is_empty()).unwrap_or("Clip saved").to_string();
         let marker = self.add_marker_now(MomentKind::Clip, &label, None, true).await?;
+        self.vertical_copy(path.as_deref());
         Ok(ClipResult { saved: true, path, marker })
     }
 
