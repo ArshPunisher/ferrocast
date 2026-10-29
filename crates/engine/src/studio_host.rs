@@ -279,6 +279,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn captions(&self, _set: Option<CaptionsSet>) -> Result<Value, String> {
         Ok(serde_json::json!({ "access": "unsupported", "on": false, "source": null, "text": "", "box": false }))
     }
+    /// Smart vertical (plan item 8): `None` reads; `Some` makes an item of a vertical scene
+    /// follow the face in it, or stops → `{ on, scene, item, face }`.
+    async fn follow_face(&self, _set: Option<FollowSet>) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Quits and opens Ferrocast again (macOS applies a new permission only then).
     async fn restart(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -506,6 +511,35 @@ impl CaptionsSet {
             }
         }
         Ok(())
+    }
+}
+
+/// Which item follows faces: a vertical scene and an item in it, or neither to stop.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FollowSet {
+    #[serde(default)]
+    pub scene: Option<String>,
+    #[serde(default)]
+    pub item: Option<i64>,
+}
+
+impl FollowSet {
+    pub fn check(&self) -> Result<(), String> {
+        match (&self.scene, self.item) {
+            (None, None) => Ok(()),
+            (Some(s), Some(i)) => {
+                let s = s.trim();
+                if s.is_empty() || s.chars().count() > 100 || s.contains('\n') {
+                    Err("scene: a vertical scene's name, 1 to 100 characters on one line.".into())
+                } else if i < 0 {
+                    Err("item: an item id in that scene.".into())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err("scene and item: both to follow a face, neither to stop.".into()),
+        }
     }
 }
 
@@ -1953,6 +1987,14 @@ impl Engine {
         self.studio_host()?.captions(set).await.map_err(captions_failed)
     }
 
+    /// Smart vertical → `{ on, scene, item, face }`.
+    pub async fn studio_follow_face(&self, set: Option<FollowSet>) -> Result<Value, EngineError> {
+        if let Some(s) = &set {
+            s.check().map_err(EngineError::Invalid)?;
+        }
+        self.studio_host()?.follow_face(set).await.map_err(failed)
+    }
+
     /// Opens a projector (a window, or full screen on a display) → `{ id }`.
     pub async fn studio_projector(&self, p: ProjectorReq) -> Result<Value, EngineError> {
         p.validate()?;
@@ -2441,6 +2483,21 @@ mod tests {
         }
         assert!(set(false, true, Some(&"m".repeat(101))).check().is_err());
         assert!(set(false, true, Some(&"m".repeat(100))).check().is_ok());
+    }
+
+    #[test]
+    fn following_needs_both_scene_and_item_or_neither() {
+        let set = |scene: Option<&str>, item| FollowSet { scene: scene.map(String::from), item };
+        assert!(set(None, None).check().is_ok());
+        assert!(set(Some("Vertical"), Some(3)).check().is_ok());
+        for bad in
+            [set(Some("Vertical"), None), set(None, Some(3)), set(Some(" "), Some(3)), set(Some("a\nb"), Some(1))]
+        {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        assert!(set(Some("V"), Some(-1)).check().is_err());
+        assert!(set(Some(&"v".repeat(101)), Some(1)).check().is_err());
+        assert!(serde_json::from_str::<FollowSet>(r#"{"scene":"V","item":1,"x":2}"#).is_err());
     }
 
     #[tokio::test]

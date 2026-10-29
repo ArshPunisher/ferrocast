@@ -617,6 +617,8 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.delete("/studio/engine/projectors").await,
         r.get("/studio/engine/screens").await,
         r.get("/studio/engine/captions").await,
+        r.get("/studio/engine/vertical/follow").await,
+        r.put("/studio/engine/vertical/follow", json!({ "scene": "Vertical", "item": 1 })).await,
         r.put("/studio/engine/captions", json!({ "on": true, "source": "Mic" })).await,
         r.put("/studio/engine/captions", json!({ "ask": true })).await,
         r.get("/studio/engine/scenes/Gameplay/items/3/transform").await,
@@ -639,6 +641,16 @@ async fn the_studio_engine_needs_the_desktop_app() {
         assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{body}");
     }
     assert_eq!(code(r.put("/studio/engine/captions", json!({ "on": "yes" })).await).await.0, StatusCode::BAD_REQUEST);
+    for body in [
+        json!({ "scene": "Vertical" }),
+        json!({ "item": 1 }),
+        json!({ "scene": "", "item": 1 }),
+        json!({ "scene": "V", "item": -2 }),
+        json!({ "scene": "V", "item": 1, "speed": 9 }),
+    ] {
+        let res = r.put("/studio/engine/vertical/follow", body.clone()).await;
+        assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{body}");
+    }
     assert_eq!(code(r.get("/studio/engine/kinds/..%2Fx/options").await).await.0, StatusCode::BAD_REQUEST);
     let bad = r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 0, "h": 360 } })).await;
     assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);

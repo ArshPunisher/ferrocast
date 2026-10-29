@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    CaptionsSet, FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, ShelfAct,
-    StudioAct, StudioHost, StudioSettings, StudioStatus,
+    CaptionsSet, FilePick, FilterEdit, FollowSet, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq,
+    STOPPED, ShelfAct, StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
 use ferrocast_studio::{
     AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
@@ -77,6 +77,9 @@ struct Held {
     vertical: VerticalView,
     /// Live captions, and the sound they listen to.
     captions: Option<(ferrocast_studio::Captions, String)>,
+    /// The vertical item following a face, and which run of the loop moves it.
+    follow: Option<ferrocast_studio::FaceFollow>,
+    follow_run: u64,
 }
 
 /// The vertical picture's preview and what the page last said about its box.
@@ -275,6 +278,10 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     h.vertical.view = None;
     h.vstream = None;
     h.captions = None;
+    // Put the following item back first, so neither collection is saved slid sideways.
+    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+        c.stop_follow(&f);
+    }
     let old = h.collection.take().map(|c| {
         save(&c, from);
         c.save(COLLECTION)
@@ -872,6 +879,69 @@ impl DesktopStudio {
     }
 }
 
+/// Where following stands → `{ on, scene, item, face }` (`face`: one was seen just now).
+fn follow_status(h: &Held) -> Value {
+    match &h.follow {
+        Some(f) => json!({ "on": true, "scene": f.scene, "item": f.id, "face": f.misses == 0 }),
+        None => json!({ "on": false, "scene": null, "item": null, "face": false }),
+    }
+}
+
+impl DesktopStudio {
+    /// Four times a second while `run` is the one following: a small picture on the main
+    /// thread, faces found on another, then a step on the main thread. Ends when following
+    /// stops or the item goes.
+    async fn follow_loop(&self, run: u64) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let look = self
+                .on_main(move |h| {
+                    if h.follow_run != run {
+                        return None;
+                    }
+                    let (Some(c), Some(f)) = (&h.collection, &h.follow) else { return None };
+                    match c.follow_look(f) {
+                        Ok(look) => Some(look),
+                        Err(_) => {
+                            // The item or its scene went: stop (there's nothing to put back).
+                            h.follow = None;
+                            None
+                        }
+                    }
+                })
+                .await;
+            let look = match look {
+                Ok(Some(Some(look))) => look,
+                Ok(Some(None)) => continue,
+                _ => return,
+            };
+            let face = tokio::task::spawn_blocking(move || {
+                ferrocast_studio::find_faces(&look.rgba, look.width, look.height).first().copied()
+            })
+            .await
+            .ok()
+            .flatten();
+            let go_on = self
+                .on_main(move |h| {
+                    if h.follow_run != run {
+                        return false;
+                    }
+                    let Some(c) = h.collection.as_ref() else { return false };
+                    let Some(f) = h.follow.as_mut() else { return false };
+                    if c.follow_step(f, face).is_err() {
+                        h.follow = None;
+                        return false;
+                    }
+                    true
+                })
+                .await;
+            if !matches!(go_on, Ok(true)) {
+                return;
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl StudioHost for DesktopStudio {
     async fn status(&self) -> StudioStatus {
@@ -952,6 +1022,9 @@ impl StudioHost for DesktopStudio {
             h.projectors.clear();
             h.history.clear();
             h.captions = None;
+            if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+                c.stop_follow(&f);
+            }
             if let Some(c) = h.collection.take() {
                 save(&c, &file);
             }
@@ -1152,6 +1225,11 @@ impl StudioHost for DesktopStudio {
                 h.vertical.view = None;
                 if act == StudioAct::StopVertical {
                     h.vstream = None;
+                    // A vertical item following a face goes back first (it's saved with the
+                    // picture).
+                    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+                        c.stop_follow(&f);
+                    }
                 }
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -1478,6 +1556,41 @@ impl StudioHost for DesktopStudio {
             }))
         })
         .await?
+    }
+
+    async fn follow_face(&self, set: Option<FollowSet>) -> Result<Value, String> {
+        if let Some(set) = &set {
+            set.check()?;
+        }
+        let started = self
+            .on_main(move |h| {
+                let mut run = None;
+                if let Some(set) = set {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    if let Some(f) = h.follow.take() {
+                        c.stop_follow(&f);
+                    }
+                    h.follow_run += 1;
+                    if let (Some(scene), Some(item)) = (set.scene, set.item) {
+                        if !cfg!(target_os = "macos") {
+                            return Err("Following your face works on a Mac for now.".to_string());
+                        }
+                        if !c.vertical().is_some_and(|v| v.scenes.iter().any(|s| s.name == scene)) {
+                            return Err(format!("There's no scene called \"{scene}\" in the vertical picture."));
+                        }
+                        h.follow = Some(c.start_follow(scene.trim(), item).map_err(|e| e.to_string())?);
+                        run = Some(h.follow_run);
+                    }
+                }
+                Ok((run, follow_status(h)))
+            })
+            .await??;
+        if let (Some(run), status) = started {
+            let me = DesktopStudio { app: self.app.clone(), data: self.data.clone() };
+            tauri::async_runtime::spawn(async move { me.follow_loop(run).await });
+            return Ok(status);
+        }
+        Ok(started.1)
     }
 
     async fn record_split(&self) -> Result<(), String> {
