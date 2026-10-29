@@ -2412,6 +2412,23 @@ struct Direct {
 }
 
 impl Streaming {
+    /// Changes the bitrate of the stream on air, at once (OBS's encoders take a new bitrate
+    /// while running, as its dynamic bitrate does): the stream doctor's lighter bitrate helps
+    /// the stream that's struggling, not only the next one.
+    pub fn set_video_kbps(&mut self, kbps: u32) {
+        let a = &self.studio.inner.api;
+        let d = a.obs_data_create();
+        let k = cstr("bitrate");
+        a.obs_data_set_int(d, k.as_ptr(), i64::from(kbps));
+        a.obs_encoder_update(self.venc, d);
+        // WebRTC's own encoders too, and the outputs added later (CodeRabbit).
+        for (v, _) in self.directs.iter().filter_map(|x| x.own) {
+            a.obs_encoder_update(v, d);
+        }
+        a.obs_data_release(d);
+        self.settings.encode.video_kbps = kbps;
+    }
+
     pub fn stats(&self) -> StreamStats {
         output_stats(&self.studio.inner.api, self.out)
     }

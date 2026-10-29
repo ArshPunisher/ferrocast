@@ -1194,6 +1194,15 @@ impl StudioHost for DesktopStudio {
                         notes.push("Sound changes apply after Ferrocast restarts.".into());
                     }
                 }
+                // A new bitrate reaches the stream on air at once; the encoder, its size and the
+                // rest wait for the next start.
+                let was_kbps = h.settings.as_ref().map(|o| o.video_kbps);
+                if was_kbps.is_some_and(|k| k != s.video_kbps) {
+                    // The vertical picture's stream uses the same bitrate (CodeRabbit).
+                    for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
+                        st.set_video_kbps(s.video_kbps);
+                    }
+                }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
                 h.settings = Some(s);
                 // Open multiviews take a new layout at once.

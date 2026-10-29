@@ -618,6 +618,7 @@ api! {
     obs_encoder_set_video: fn(a: *mut ObsEncoder, b: *mut VideoT);
     obs_encoder_set_audio: fn(a: *mut ObsEncoder, b: *mut AudioT);
     obs_encoder_release: fn(a: *mut ObsEncoder);
+    obs_encoder_update: fn(a: *mut ObsEncoder, b: *mut ObsData);
     obs_output_create: fn(a: *const c_char, b: *const c_char, c: *mut ObsData, d: *mut ObsData) -> *mut ObsOutput;
     obs_output_set_video_encoder: fn(a: *mut ObsOutput, b: *mut ObsEncoder);
     obs_output_set_audio_encoder: fn(a: *mut ObsOutput, b: *mut ObsEncoder, c: usize);
