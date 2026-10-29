@@ -303,6 +303,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn follow_face(&self, _set: Option<FollowSet>) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Whisper over a whole recording's sound (16 kHz mono) → what was said and when, for a
+    /// clip's subtitles.
+    async fn transcribe(&self, _sound: Vec<f32>, _how: Transcribe) -> Result<Vec<Said>, String> {
+        Err(NOT_HERE.into())
+    }
     /// The app in front, and (with `running`) every app open now → `{ front, running }`, for a
     /// scene per game. None and [] where it can't be told.
     async fn apps(&self, _running: bool) -> Result<Value, String> {
@@ -571,6 +576,22 @@ impl CaptionsSet {
         }
         Ok(())
     }
+}
+
+/// How to transcribe: the model's file, the language ("auto", "en"…), English or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transcribe {
+    pub model: std::path::PathBuf,
+    pub language: String,
+    pub translate: bool,
+}
+
+/// A stretch of speech: when (ms from the start) and what.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Said {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
 }
 
 /// Which item follows faces: a vertical scene and an item in it, or neither to stop.

@@ -42,7 +42,9 @@ impl Engine {
         }
         cfg.validate().map_err(EngineError::Invalid)?;
         // Vertical clips need ffmpeg: fetched now, in the background, when they're switched on.
-        if cfg.vertical_clips && !self.scenes_config().vertical_clips && self.ffmpeg_path().is_none() {
+        let was = self.scenes_config();
+        let wants = (cfg.vertical_clips && !was.vertical_clips) || (cfg.clip_captions && !was.clip_captions);
+        if wants && self.ffmpeg_path().is_none() {
             let engine = self.clone();
             tokio::spawn(async move {
                 if let Err(err) = engine.get_ffmpeg().await {

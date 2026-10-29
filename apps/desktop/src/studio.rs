@@ -1796,6 +1796,16 @@ impl StudioHost for DesktopStudio {
         Ok(started.1)
     }
 
+    async fn transcribe(
+        &self,
+        sound: Vec<f32>,
+        how: ferrocast_engine::studio_host::Transcribe,
+    ) -> Result<Vec<ferrocast_engine::studio_host::Said>, String> {
+        tokio::task::spawn_blocking(move || crate::whisper::transcribe(&sound, &how))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
     async fn apps(&self, running: bool) -> Result<Value, String> {
         // AppKit answers on the main thread.
         self.on_main(move |_| {

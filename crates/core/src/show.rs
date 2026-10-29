@@ -254,6 +254,9 @@ pub struct ScenesConfig {
     pub away_minutes: u32,
     /// Saying "clip that" while live captions listen saves a clip (the Studio only).
     pub clip_by_voice: bool,
+    /// Each saved clip gets a subtitle file (.srt) beside it, and its vertical copy the words
+    /// burned in: Whisper on this computer (a downloaded model) and ffmpeg.
+    pub clip_captions: bool,
     /// A scene per game: when that app comes to the front, its scene goes on air (the Studio
     /// on a Mac). Empty: off.
     pub game_scenes: Vec<GameScene>,
@@ -280,6 +283,7 @@ impl Default for ScenesConfig {
             vertical_clips: false,
             away_minutes: 0,
             clip_by_voice: false,
+            clip_captions: false,
             game_scenes: Vec::new(),
         }
     }

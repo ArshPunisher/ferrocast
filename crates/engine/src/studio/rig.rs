@@ -209,7 +209,8 @@ impl Engine {
                 // once it's done, and a vertical copy (when asked for) is made from it then.
                 let before = self.studio_last_replay().await;
                 self.studio_replay_save().await?;
-                if self.scenes_config().vertical_clips {
+                let cfg = self.scenes_config();
+                if cfg.vertical_clips || cfg.clip_captions {
                     let engine = self.clone();
                     tokio::spawn(async move {
                         for _ in 0..40 {

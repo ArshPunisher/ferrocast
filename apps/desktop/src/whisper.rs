@@ -145,6 +145,45 @@ fn run(
     Ok(())
 }
 
+/// What was said in a whole recording's sound (16 kHz mono) and when, for subtitles.
+pub fn transcribe(
+    sound: &[f32],
+    how: &ferrocast_engine::studio_host::Transcribe,
+) -> Result<Vec<ferrocast_engine::studio_host::Said>, String> {
+    whisper_rs::install_logging_hooks();
+    if rms(sound) < SILENCE {
+        return Ok(Vec::new());
+    }
+    let ctx = WhisperContext::new_with_params(&how.model, WhisperContextParameters::default())
+        .map_err(|e| format!("The speech model didn't load ({e})."))?;
+    let mut state = ctx.create_state().map_err(|e| format!("The speech model didn't start ({e})."))?;
+    let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    // Made in the background, maybe while live: two threads leave the stream the rest.
+    p.set_n_threads(2);
+    p.set_language(Some(how.language.as_str()));
+    p.set_translate(how.translate);
+    p.set_suppress_blank(true);
+    p.set_no_speech_thold(NO_SPEECH);
+    p.set_print_progress(false);
+    p.set_print_realtime(false);
+    p.set_print_special(false);
+    p.set_print_timestamps(false);
+    state.full(p, sound).map_err(|e| format!("The clip couldn't be transcribed ({e})."))?;
+    Ok(state
+        .as_iter()
+        .filter(|s| s.no_speech_probability() < NO_SPEECH)
+        .filter_map(|s| {
+            let text = clean(&s.to_str_lossy().ok()?);
+            // Whisper's timestamps are hundredths of a second.
+            (!text.is_empty()).then(|| ferrocast_engine::studio_host::Said {
+                start_ms: (s.start_timestamp().max(0) as u64) * 10,
+                end_ms: (s.end_timestamp().max(0) as u64) * 10,
+                text,
+            })
+        })
+        .collect())
+}
+
 /// `input` at `from` Hz as `to` Hz (linear; speech needs no better).
 pub(crate) fn resample(input: &[f32], from: usize, to: usize) -> Vec<f32> {
     if input.is_empty() || from == 0 || to == 0 {
