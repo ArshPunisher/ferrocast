@@ -73,6 +73,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/log/show", post(engine_show_log))
         .route("/studio/engine/screen-access", get(engine_screen_access))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
+        .route("/studio/engine/captions", get(engine_captions).put(engine_set_captions))
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
         .route("/studio/engine/screens", get(engine_screens))
@@ -850,6 +851,17 @@ async fn engine_web_window(State(app): State<AppState>, Body(b): Body<WebWindowB
 
 async fn engine_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_screen_access().await?))
+}
+
+async fn engine_captions(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_captions(None).await?))
+}
+
+async fn engine_set_captions(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::studio_host::CaptionsSet>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_captions(Some(b)).await?))
 }
 
 async fn engine_fix_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {

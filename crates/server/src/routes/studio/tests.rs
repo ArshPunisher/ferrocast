@@ -616,6 +616,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/projectors", json!({ "what": "multiview" })).await,
         r.delete("/studio/engine/projectors").await,
         r.get("/studio/engine/screens").await,
+        r.get("/studio/engine/captions").await,
+        r.put("/studio/engine/captions", json!({ "on": true, "source": "Mic" })).await,
+        r.put("/studio/engine/captions", json!({ "ask": true })).await,
         r.get("/studio/engine/scenes/Gameplay/items/3/transform").await,
         r.post("/studio/engine/undo", json!({})).await,
         r.put("/studio/engine/studio-mode", json!({ "on": true })).await,
@@ -631,6 +634,11 @@ async fn the_studio_engine_needs_the_desktop_app() {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
     // Bad input is refused before anything else.
+    for body in [json!({ "on": true }), json!({ "on": true, "source": " " }), json!({ "on": true, "source": "a\nb" })] {
+        let res = r.put("/studio/engine/captions", body.clone()).await;
+        assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert_eq!(code(r.put("/studio/engine/captions", json!({ "on": "yes" })).await).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(code(r.get("/studio/engine/kinds/..%2Fx/options").await).await.0, StatusCode::BAD_REQUEST);
     let bad = r.put("/studio/engine/preview", json!({ "rect": { "x": 0, "y": 0, "w": 0, "h": 360 } })).await;
     assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST);

@@ -274,6 +274,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn fix_screen_access(&self) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Live captions (plan item 7): `None` reads where they stand; `Some` asks macOS for
+    /// speech recognition, or turns them on (from a sound) or off → `{ access, on, source, text, box }`.
+    async fn captions(&self, _set: Option<CaptionsSet>) -> Result<Value, String> {
+        Ok(serde_json::json!({ "access": "unsupported", "on": false, "source": null, "text": "", "box": false }))
+    }
     /// Quits and opens Ferrocast again (macOS applies a new permission only then).
     async fn restart(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -480,6 +485,30 @@ impl ItemTransform {
 }
 
 /// Hosts say this for what only the Ferrocast app on this computer can do.
+/// A change to live captions: ask for macOS's permission, or turn them on from `source` (a
+/// Studio sound) or off.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct CaptionsSet {
+    #[serde(default)]
+    pub ask: bool,
+    #[serde(default)]
+    pub on: bool,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl CaptionsSet {
+    pub fn check(&self) -> Result<(), String> {
+        if self.on && !self.ask {
+            let s = self.source.as_deref().unwrap_or("").trim();
+            if s.is_empty() || s.chars().count() > 100 || s.contains('\n') {
+                return Err("source: the sound to listen to, 1 to 100 characters on one line.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub const NOT_HERE: &str = "That needs the Ferrocast app on this computer.";
 
 /// What a file dialog asks for.
@@ -1916,6 +1945,14 @@ impl Engine {
         self.studio_host()?.fix_screen_access().await.map_err(failed)
     }
 
+    /// Live captions → `{ access, on, source, text, box }`.
+    pub async fn studio_captions(&self, set: Option<CaptionsSet>) -> Result<Value, EngineError> {
+        if let Some(s) = &set {
+            s.check().map_err(EngineError::Invalid)?;
+        }
+        self.studio_host()?.captions(set).await.map_err(captions_failed)
+    }
+
     /// Opens a projector (a window, or full screen on a display) → `{ id }`.
     pub async fn studio_projector(&self, p: ProjectorReq) -> Result<Value, EngineError> {
         p.validate()?;
@@ -1964,6 +2001,25 @@ impl Engine {
 
 /// Hosts say "Start the Studio first." when it's stopped; anything else is a failure.
 pub const STOPPED: &str = "Start the Studio first.";
+
+/// Speech recognition's own refusals say what to do; the rest are the Studio's.
+fn captions_failed(message: String) -> EngineError {
+    // The Studio's own (stopped, an unknown sound) keep their mapping, whatever the name says.
+    if message == STOPPED || message.starts_with("There's no") {
+        return failed(message);
+    }
+    let lower = message.to_lowercase();
+    let hint = if message.starts_with("Allow speech recognition") {
+        "Press Allow speech recognition in Live captions."
+    } else if message.contains("on a Mac for now") {
+        "Windows captions come in a later update."
+    } else if lower.contains("speech") || lower.contains("dictation") {
+        "Then try again."
+    } else {
+        return failed(message);
+    };
+    EngineError::Refused { status: 422, code: "captions_unavailable", message, hint: hint.into(), retry_after: None }
+}
 
 fn failed(message: String) -> EngineError {
     let refused = |status, code, message: String, hint: &str| EngineError::Refused {
@@ -2370,6 +2426,45 @@ mod tests {
         taken();
         e.studio_sync_vertical().await;
         assert!(!sent(&taken()));
+    }
+
+    #[test]
+    fn captions_need_a_sound_only_to_switch_on() {
+        let set = |ask, on, source: Option<&str>| CaptionsSet { ask, on, source: source.map(String::from) };
+        assert!(set(false, false, None).check().is_ok());
+        assert!(set(true, false, None).check().is_ok());
+        // Asking for permission needs no sound, even with on set.
+        assert!(set(true, true, None).check().is_ok());
+        assert!(set(false, true, Some("Mic")).check().is_ok());
+        for bad in [None, Some(""), Some("   "), Some("a\nb")] {
+            assert!(set(false, true, bad).check().is_err(), "{bad:?}");
+        }
+        assert!(set(false, true, Some(&"m".repeat(101))).check().is_err());
+        assert!(set(false, true, Some(&"m".repeat(100))).check().is_ok());
+    }
+
+    #[tokio::test]
+    async fn captions_are_checked_before_the_host_and_default_to_unsupported() {
+        let (e, _d) = engine().await;
+        // No desktop app: refused like the rest of the Studio.
+        assert!(e.studio_captions(None).await.is_err());
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake);
+        let bad = CaptionsSet { ask: false, on: true, source: None };
+        assert!(matches!(e.studio_captions(Some(bad)).await, Err(EngineError::Invalid(_))));
+        let e1 = captions_failed("Allow speech recognition first.".into());
+        assert!(matches!(e1, EngineError::Refused { status: 422, code: "captions_unavailable", .. }), "{e1:?}");
+        let e2 = captions_failed("There's no source called \"X\"".into());
+        assert!(matches!(e2, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e2:?}");
+        assert!(matches!(captions_failed(STOPPED.into()), EngineError::Refused { status: 409, .. }));
+        let e3 = captions_failed("Speech recognition isn't available on this Mac.".into());
+        assert!(matches!(e3, EngineError::Refused { code: "captions_unavailable", .. }), "{e3:?}");
+        let e4 = captions_failed("There's no source called \"speech\"".into());
+        assert!(matches!(e4, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e4:?}");
+        // A host that has no captions says so, rather than failing.
+        let v = e.studio_captions(None).await.unwrap();
+        assert_eq!(v["access"], "unsupported");
+        assert_eq!(v["on"], false);
     }
 
     #[tokio::test]

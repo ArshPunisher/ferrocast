@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, ShelfAct, StudioAct,
-    StudioHost, StudioSettings, StudioStatus,
+    CaptionsSet, FilePick, FilterEdit, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, ShelfAct,
+    StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
 use ferrocast_studio::{
     AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
@@ -75,6 +75,8 @@ struct Held {
     last_projector: u64,
     /// The vertical picture's preview, beside the main one.
     vertical: VerticalView,
+    /// Live captions, and the sound they listen to.
+    captions: Option<(ferrocast_studio::Captions, String)>,
 }
 
 /// The vertical picture's preview and what the page last said about its box.
@@ -272,6 +274,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     // The vertical preview and stream use the old collection's canvas: they go before it does.
     h.vertical.view = None;
     h.vstream = None;
+    h.captions = None;
     let old = h.collection.take().map(|c| {
         save(&c, from);
         c.save(COLLECTION)
@@ -347,6 +350,30 @@ fn record_folder(s: &StudioSettings) -> PathBuf {
 
 /// How the last remux went: `{ from, to, percent, done, error }`, or null.
 static REMUX: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+/// What live captions last heard, as the "Captions" text source shows it.
+static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The text source live captions write into, when the scenes have one.
+const CAPTIONS_SOURCE: &str = "Captions";
+
+/// About two short lines of captions.
+const CAPTION_CHARS: usize = 90;
+
+/// The end of `said` that fits a captions box: at most `max` characters, starting at a word.
+fn caption_tail(said: &str, max: usize) -> String {
+    let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = said.chars().count();
+    if n <= max {
+        return said;
+    }
+    let cut: String = said.chars().skip(n - max).collect();
+    // Start at the next whole word, unless the last word alone is longer than the box.
+    match cut.find(' ') {
+        Some(i) if i + 1 < cut.len() => cut[i + 1..].to_string(),
+        _ => cut,
+    }
+}
 
 fn set_remux(v: Value) {
     *REMUX.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
@@ -924,6 +951,7 @@ impl StudioHost for DesktopStudio {
             h.vertical = VerticalView::default();
             h.projectors.clear();
             h.history.clear();
+            h.captions = None;
             if let Some(c) = h.collection.take() {
                 save(&c, &file);
             }
@@ -1384,6 +1412,70 @@ impl StudioHost for DesktopStudio {
             })?;
             h.virtualcam = Some(cam);
             Ok(json!({ "active": true }))
+        })
+        .await?
+    }
+
+    async fn captions(&self, set: Option<CaptionsSet>) -> Result<Value, String> {
+        if let Some(set) = &set {
+            set.check()?;
+        }
+        self.on_main(move |h| {
+            // Captions that stopped by themselves (recognition kept failing) read as off.
+            if h.captions.as_ref().is_some_and(|(c, _)| !c.working()) {
+                h.captions = None;
+            }
+            match set {
+                Some(CaptionsSet { ask: true, .. }) => ferrocast_studio::ask_captions_access(),
+                Some(CaptionsSet { on: false, .. }) => {
+                    h.captions = None;
+                    if let Ok(mut heard) = HEARD.lock() {
+                        heard.clear();
+                    }
+                }
+                Some(CaptionsSet { on: true, source, .. }) => {
+                    let source = source.unwrap_or_default().trim().to_string();
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    // The old listener goes first: one at a time.
+                    h.captions = None;
+                    let done = RefCell::new(String::new());
+                    let listener = c
+                        .start_captions(&source, move |said, last| {
+                            let shown = caption_tail(&format!("{} {said}", done.borrow()), CAPTION_CHARS);
+                            if last {
+                                *done.borrow_mut() = shown.clone();
+                            }
+                            // Called by macOS on the main thread, never inside a Studio call.
+                            HELD.with(|h| {
+                                if let Ok(h) = h.try_borrow()
+                                    && let Some(c) = &h.collection
+                                {
+                                    // Without a "Captions" text source there's nothing to write.
+                                    let _ = c.update(CAPTIONS_SOURCE, &json!({ "text": shown }));
+                                }
+                            });
+                            if let Ok(mut heard) = HEARD.lock() {
+                                *heard = shown;
+                            }
+                        })
+                        .map_err(|e| e.to_string())?;
+                    if let Ok(mut heard) = HEARD.lock() {
+                        heard.clear();
+                    }
+                    h.captions = Some((listener, source));
+                }
+                None => {}
+            }
+            Ok(json!({
+                "access": ferrocast_studio::captions_access(),
+                "on": h.captions.is_some(),
+                "source": h.captions.as_ref().map(|(_, s)| s.clone()),
+                "text": HEARD.lock().map(|t| t.clone()).unwrap_or_default(),
+                // Shown only when a scene has it (a removed one lingers for undo).
+                "box": h.collection.as_ref().is_some_and(|c| {
+                    c.sources().iter().any(|s| s.name == CAPTIONS_SOURCE && !s.scenes.is_empty())
+                }),
+            }))
         })
         .await?
     }
@@ -1977,5 +2069,38 @@ mod log_tests {
         std::fs::write(&even, format!("{}\n{}\n", "a".repeat(399), "b".repeat(399))).unwrap();
         assert_eq!(log_tail(&even, 1).unwrap(), ["b".repeat(399)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::caption_tail;
+
+    #[test]
+    fn short_captions_show_whole() {
+        assert_eq!(caption_tail("  hello   there \n", 90), "hello there");
+        assert_eq!(caption_tail("", 90), "");
+    }
+
+    #[test]
+    fn long_captions_keep_the_end_from_a_whole_word() {
+        let said = "one two three four five six seven eight nine ten";
+        let t = caption_tail(said, 20);
+        assert!(t.chars().count() <= 20, "{t}");
+        assert!(said.ends_with(&t));
+        assert!(said.contains(&format!(" {t}")), "starts at a word: {t}");
+    }
+
+    #[test]
+    fn one_huge_word_is_cut_not_dropped() {
+        let t = caption_tail(&"a".repeat(200), 90);
+        assert_eq!(t.chars().count(), 90);
+    }
+
+    #[test]
+    fn non_latin_text_is_cut_on_characters() {
+        let said = "नमस्ते दोस्तों आज हम खेलेंगे ".repeat(10);
+        let t = caption_tail(&said, 30);
+        assert!(t.chars().count() <= 30);
     }
 }
