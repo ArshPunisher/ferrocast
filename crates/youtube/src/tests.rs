@@ -312,6 +312,8 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
     let puts = Arc::new(Mutex::new(Vec::new()));
     let p2 = puts.clone();
     let p3 = puts.clone();
+    let p4 = puts.clone();
+    let p5 = puts.clone();
     let app = axum::Router::new()
         // thumbnails.set: a body of "403" is refused like an unverified channel; anything
         // else is recorded as {"thumbnail": video id, "type", "bytes"}.
@@ -343,6 +345,24 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
                 let upcoming = q.get("broadcastStatus").map(String::as_str) == Some("upcoming");
                 let items = if upcoming && scheduled { json!([{ "id": "vid-1" }]) } else { json!([]) };
                 axum::Json(json!({ "items": items }))
+            })
+            // With no broadcast, one is made (recorded like a PUT, as {"made": body}).
+            .post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+                let p = p4.clone();
+                async move {
+                    p.lock().unwrap().push(json!({ "made": b }));
+                    axum::Json(json!({ "id": "made-1" }))
+                }
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts/bind",
+            axum::routing::post(move |Query(q): Query<HashMap<String, String>>| {
+                let p = p5.clone();
+                async move {
+                    p.lock().unwrap().push(json!({ "bind": q.get("id"), "stream": q.get("streamId") }));
+                    axum::Json(json!({ "id": q.get("id") }))
+                }
             }),
         )
         .route(
@@ -414,12 +434,31 @@ async fn stream_info_updates_the_broadcast_video_and_keeps_its_description() {
 }
 
 #[tokio::test]
-async fn no_live_or_scheduled_broadcast_is_a_clear_refusal() {
+async fn with_no_broadcast_one_is_made_for_the_stream_info() {
     use ferrocast_core::stream_info::StreamInfo;
     let (ep, puts) = fake_videos(false).await;
-    let err = video_api(ep).update_broadcast_info(&StreamInfo { title: Some("x".into()), ..Default::default() }).await;
-    assert!(err.unwrap_err().to_string().contains("live or scheduled stream"));
-    assert!(puts.lock().unwrap().is_empty());
+    let got =
+        video_api(ep).update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await;
+    assert_eq!(got.unwrap(), vec!["title"]);
+    let p = puts.lock().unwrap().clone();
+    // Made public, starting and ending with the stream, bound to the channel's stream, then titled.
+    assert_eq!(p[0]["made"]["status"]["privacyStatus"], "public");
+    assert_eq!(p[0]["made"]["contentDetails"]["enableAutoStart"], true);
+    assert_eq!(p[1], json!({ "bind": "made-1", "stream": "s1" }));
+    assert_eq!((p[2]["id"].as_str(), p[2]["snippet"]["title"].as_str()), (Some("made-1"), Some("Ranked")));
+}
+
+#[tokio::test]
+async fn one_broadcast_is_made_even_when_youtube_is_slow_to_list_it() {
+    use ferrocast_core::stream_info::StreamInfo;
+    // This fake never lists what it made (as YouTube right after an insert).
+    let (ep, puts) = fake_videos(false).await;
+    let api = video_api(ep);
+    let info = StreamInfo { title: Some("A".into()), ..Default::default() };
+    let (a, b, c) = tokio::join!(api.update_broadcast_info(&info), api.set_thumbnail(b"x", "image/png"), api.ingest());
+    assert!(a.is_ok() && b.is_ok() && c.is_ok());
+    let made = puts.lock().unwrap().iter().filter(|p| p.get("made").is_some()).count();
+    assert_eq!(made, 1, "{:?}", puts.lock().unwrap());
 }
 
 /// A chat server that sends one page, then keeps the stream open without a word.
@@ -634,10 +673,11 @@ async fn a_description_replaces_the_old_one_and_a_thumbnail_is_uploaded() {
     let e =
         api.set_thumbnail(&vec![0; crate::api::MAX_THUMBNAIL_BYTES + 1], "image/jpeg").await.unwrap_err().to_string();
     assert!(e.contains("50 MB"), "{e}");
-    // No broadcast: the usual refusal.
-    let (ep, _) = fake_videos(false).await;
-    let e = video_api(ep).set_thumbnail(b"x", "image/png").await.unwrap_err().to_string();
-    assert!(e.contains("live or scheduled"), "{e}");
+    // No broadcast: one is made, and the thumbnail goes on it.
+    let (ep, puts) = fake_videos(false).await;
+    video_api(ep).set_thumbnail(b"x", "image/png").await.unwrap();
+    let last = puts.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last["thumbnail"], "made-1");
 }
 
 // ---------------------------------------------------------------- ingest (Go live everywhere)
@@ -684,10 +724,17 @@ async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
         calls: Arc<Mutex<Vec<String>>>,
     }
     let st = Live::default();
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
     st.streams.lock().unwrap().push(json!({ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
         "cdn": { "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
-    st.broadcasts.lock().unwrap().push(json!({ "id": "b1", "snippet": { "title": "Day 41 ranked" },
-        "status": { "privacyStatus": "unlisted", "lifeCycleStatus": "ready" }, "contentDetails": { "boundStreamId": "s1" } }));
+    // Waiting for "Go live" in YouTube Studio (auto-start off), with a custom thumbnail.
+    st.broadcasts.lock().unwrap().push(json!({ "id": "b1",
+        "snippet": { "title": "Day 41 ranked", "description": "Ranked all night",
+            "thumbnails": { "high": { "url": format!("{base}/img/b1.jpg") } } },
+        "status": { "privacyStatus": "unlisted", "lifeCycleStatus": "ready" },
+        "contentDetails": { "boundStreamId": "s1", "enableAutoStart": false,
+            "monitorStream": { "enableMonitorStream": true, "broadcastStreamDelayMs": 0 } } }));
     let calls = st.calls.clone();
     let app = axum::Router::new()
         .route(
@@ -712,8 +759,19 @@ async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
                 let items = if upcoming { st.broadcasts.lock().unwrap().clone() } else { vec![] };
                 axum::Json(json!({ "items": items }))
             })
+            .put(|State(st): State<Live>, axum::Json(b): axum::Json<serde_json::Value>| async move {
+                // Recorded with the monitor setting, so a change to it fails the test.
+                st.calls.lock().unwrap().push(format!(
+                    "broadcasts.update {} autostart={} bound={} monitor={}",
+                    b["id"].as_str().unwrap_or(""),
+                    b["contentDetails"]["enableAutoStart"],
+                    b["contentDetails"].get("boundStreamId").is_some(),
+                    b["contentDetails"]["monitorStream"]["enableMonitorStream"]
+                ));
+                axum::Json(b)
+            })
             .post(|State(st): State<Live>, axum::Json(mut b): axum::Json<serde_json::Value>| async move {
-                st.calls.lock().unwrap().push(format!("broadcasts.insert {}", b["status"]["privacyStatus"]));
+                st.calls.lock().unwrap().push(format!("broadcasts.insert {} {}", b["status"]["privacyStatus"], b["snippet"]["description"]));
                 assert_eq!(b["contentDetails"]["enableAutoStart"], true);
                 assert!(b["snippet"]["scheduledStartTime"].as_str().unwrap().ends_with('Z'));
                 b["id"] = json!("bv");
@@ -733,9 +791,15 @@ async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
                 axum::Json(json!({ "id": q["id"] }))
             }),
         )
+        .route("/img/b1.jpg", axum::routing::get(|| async { ([("content-type", "image/jpeg")], vec![0xFFu8, 0xD8, 0xFF, 0xE0]) }))
+        .route(
+            "/api/upload/thumbnails/set",
+            axum::routing::post(|State(st): State<Live>, Query(q): Query<HashMap<String, String>>, body: axum::body::Bytes| async move {
+                st.calls.lock().unwrap().push(format!("thumbnail {} {}", q["videoId"], body.len()));
+                axum::Json(json!({ "items": [] }))
+            }),
+        )
         .with_state(st);
-    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", rest.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(rest, app).await });
     let ep = Endpoints {
         authorize: format!("{base}/auth"),
@@ -754,15 +818,27 @@ async fn the_vertical_stream_is_made_once_and_never_taken_for_the_normal_one() {
     assert_eq!(v.key, "vertical-key");
     assert_eq!(
         calls.lock().unwrap().iter().filter(|c| !c.ends_with(".list")).cloned().collect::<Vec<_>>(),
-        vec!["streams.insert", "broadcasts.insert \"unlisted\"", "bind bv sv"],
-        "made once, with the normal live's privacy"
+        vec!["streams.insert", "broadcasts.insert \"unlisted\" \"Ranked all night\"", "bind bv sv", "thumbnail bv 4"],
+        "made once, with the normal live's privacy, description and thumbnail"
     );
     // Again: found, nothing new made.
     calls.lock().unwrap().clear();
     assert_eq!(api.vertical_ingest().await.unwrap().key, "vertical-key");
     assert!(calls.lock().unwrap().iter().all(|c| c.ends_with(".list")), "{:?}", calls.lock().unwrap());
-    // The normal YouTube destination keeps its own key, even with the vertical broadcast upcoming.
+    // The normal YouTube destination keeps its own key, even with the vertical broadcast upcoming,
+    // and its broadcast, waiting for "Go live" in YouTube Studio, now starts with the stream.
+    calls.lock().unwrap().clear();
     assert_eq!(api.ingest().await.unwrap().key, "main-key");
+    assert!(
+        calls.lock().unwrap().contains(&"broadcasts.update b1 autostart=true bound=false monitor=true".to_string()),
+        "{:?}",
+        calls.lock().unwrap()
+    );
+    // Stream info goes to both broadcasts: the normal one and the vertical one.
+    calls.lock().unwrap().clear();
+    api.set_thumbnail(b"\x89PNG", "image/png").await.unwrap();
+    let thumbs: Vec<String> = calls.lock().unwrap().iter().filter(|c| c.starts_with("thumbnail")).cloned().collect();
+    assert_eq!(thumbs, ["thumbnail b1 4", "thumbnail bv 4"]);
 }
 
 #[test]
