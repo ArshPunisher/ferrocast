@@ -414,6 +414,9 @@ impl Api {
 
     /// Copies a thumbnail (from YouTube's own image host) onto another video.
     async fn copy_thumbnail(&self, url: &str, video: &str) -> Result<(), YoutubeError> {
+        if !thumbnail_host_ok(url, &self.ep.api) {
+            return Err(YoutubeError::Protocol("the thumbnail isn't on YouTube's image host".into()));
+        }
         let res = self.http.get(url).send().await.map_err(YoutubeError::network)?;
         if !res.status().is_success() {
             return Err(YoutubeError::Protocol(format!("the thumbnail answered {}", res.status().as_u16())));
@@ -672,6 +675,17 @@ fn just_made(made: &Option<(String, i64)>) -> Option<String> {
     made.as_ref().filter(|(_, at)| now_ms() - at < MADE_FRESH_MS).map(|(id, _)| id.clone())
 }
 
+/// Only YouTube's own image host is fetched from (https, `*.ytimg.com`), or the API's own
+/// host (a test server): an address in an answer never sends the app anywhere else.
+fn thumbnail_host_ok(url: &str, api: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    let youtube = u.scheme() == "https" && u.host_str().is_some_and(|h| h == "ytimg.com" || h.ends_with(".ytimg.com"));
+    let same = reqwest::Url::parse(api)
+        .ok()
+        .is_some_and(|a| a.scheme() == u.scheme() && a.host_str() == u.host_str() && a.port() == u.port());
+    youtube || same
+}
+
 /// A broadcast's biggest thumbnail's address (a custom one when it was set).
 fn best_thumbnail(b: &Value) -> Option<String> {
     ["maxres", "standard", "high", "medium"]
@@ -709,4 +723,28 @@ fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
         .filter(|u| u.starts_with("rtmps://"))
         .or_else(|| info.get("ingestionAddress").and_then(Value::as_str))?;
     Some(ferrocast_connector::Ingest { url: url.trim().trim_end_matches('/').to_string(), key: key.to_string() })
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::thumbnail_host_ok;
+
+    #[test]
+    fn only_youtubes_image_host_is_fetched() {
+        let api = "https://www.googleapis.com/youtube/v3";
+        assert!(thumbnail_host_ok("https://i.ytimg.com/vi/x/maxresdefault.jpg", api));
+        assert!(thumbnail_host_ok("https://i9.ytimg.com/vi/x/hq.jpg?sqp=1", api));
+        for bad in [
+            "http://i.ytimg.com/vi/x.jpg",
+            "https://ytimg.com.evil.example/x.jpg",
+            "https://evil.example/i.ytimg.com/x.jpg",
+            "file:///etc/passwd",
+            "http://127.0.0.1:8080/x",
+            "not a url",
+        ] {
+            assert!(!thumbnail_host_ok(bad, api), "{bad}");
+        }
+        // A test server's own address.
+        assert!(thumbnail_host_ok("http://127.0.0.1:5555/img/b1.jpg", "http://127.0.0.1:5555/api"));
+    }
 }
