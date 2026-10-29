@@ -637,6 +637,18 @@ async fn the_studio_engine_needs_the_desktop_app() {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
     // Bad input is refused before anything else.
+    // Speech models: listed without the desktop app; an unknown one is a 404 (no download
+    // is started in tests).
+    let list: Value = r.get("/speech/models").await.json().await.unwrap();
+    assert_eq!(list.as_array().map(Vec::len), Some(2), "{list}");
+    assert_eq!(list[0]["state"], "missing");
+    for bad in ["huge", "..%2Fetc"] {
+        assert_eq!(
+            code(r.post(&format!("/speech/models/{bad}"), json!({})).await).await.0,
+            StatusCode::NOT_FOUND,
+            "{bad}"
+        );
+    }
     for body in [json!({ "on": true }), json!({ "on": true, "source": " " }), json!({ "on": true, "source": "a\nb" })] {
         let res = r.put("/studio/engine/captions", body.clone()).await;
         assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{body}");

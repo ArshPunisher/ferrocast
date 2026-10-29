@@ -75,6 +75,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
         .route("/studio/engine/captions", get(engine_captions).put(engine_set_captions))
         .route("/studio/engine/apps", get(engine_apps))
+        .route("/speech/models", get(speech_models))
+        .route("/speech/models/{id}", post(speech_model_fetch).delete(speech_model_remove))
         .route("/studio/engine/vertical/follow", get(engine_follow).put(engine_set_follow))
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
@@ -875,6 +877,18 @@ async fn engine_set_follow(
     Body(b): Body<ferrocast_engine::studio_host::FollowSet>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_follow_face(Some(b)).await?))
+}
+
+async fn speech_models(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(app.engine.speech_models()).unwrap_or(Value::Null)))
+}
+
+async fn speech_model_fetch(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(app.engine.fetch_speech_model(&id)?).unwrap_or(Value::Null)))
+}
+
+async fn speech_model_remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(app.engine.remove_speech_model(&id)?).unwrap_or(Value::Null)))
 }
 
 async fn engine_apps(State(app): State<AppState>) -> ApiResult<Json<Value>> {

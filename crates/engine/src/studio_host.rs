@@ -516,7 +516,7 @@ impl ItemTransform {
 /// Hosts say this for what only the Ferrocast app on this computer can do.
 /// A change to live captions: ask for macOS's permission, or turn them on from `source` (a
 /// Studio sound) or off.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct CaptionsSet {
     #[serde(default)]
     pub ask: bool,
@@ -524,10 +524,45 @@ pub struct CaptionsSet {
     pub on: bool,
     #[serde(default)]
     pub source: Option<String>,
+    /// "apple" (macOS's own, the default on a Mac) or "whisper" (every system; a downloaded
+    /// model).
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Whisper's model: "base" (the default) or "small".
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whisper: the language spoken ("auto", "en", "hi"…; the default is auto).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Whisper: captions in English whatever is spoken.
+    #[serde(default)]
+    pub translate: bool,
+    /// The model's file, found by the engine (never from the request).
+    #[serde(skip_deserializing)]
+    pub model_path: Option<std::path::PathBuf>,
 }
+
+/// Languages Whisper is offered in (it knows more; these are the ones the dashboard lists).
+pub const WHISPER_LANGUAGES: [&str; 13] =
+    ["auto", "en", "hi", "es", "pt", "fr", "de", "ja", "ko", "ru", "ar", "id", "tr"];
 
 impl CaptionsSet {
     pub fn check(&self) -> Result<(), String> {
+        if let Some(e) = &self.engine
+            && !["apple", "whisper"].contains(&e.as_str())
+        {
+            return Err("engine: apple or whisper.".into());
+        }
+        if let Some(m) = &self.model
+            && crate::speech_model::model(m).is_none()
+        {
+            return Err("model: base or small.".into());
+        }
+        if let Some(l) = &self.language
+            && !WHISPER_LANGUAGES.contains(&l.as_str())
+        {
+            return Err(format!("language: one of {}.", WHISPER_LANGUAGES.join(", ")));
+        }
         if self.on && !self.ask {
             let s = self.source.as_deref().unwrap_or("").trim();
             if s.is_empty() || s.chars().count() > 100 || s.contains('\n') {
@@ -2037,9 +2072,20 @@ impl Engine {
     }
 
     /// Live captions → `{ access, on, source, text, box }`.
-    pub async fn studio_captions(&self, set: Option<CaptionsSet>) -> Result<Value, EngineError> {
-        if let Some(s) = &set {
+    pub async fn studio_captions(&self, mut set: Option<CaptionsSet>) -> Result<Value, EngineError> {
+        if let Some(s) = &mut set {
             s.check().map_err(EngineError::Invalid)?;
+            // Whisper needs its model here first.
+            if s.on && !s.ask && s.engine.as_deref() == Some("whisper") {
+                let id = s.model.clone().unwrap_or_else(|| "base".into());
+                s.model_path = Some(self.speech_model_path(&id).ok_or_else(|| EngineError::Refused {
+                    status: 409,
+                    code: "captions_model_missing",
+                    message: "The speech model isn't downloaded yet.".into(),
+                    hint: "Download it in Live captions first (it stays on this computer).".into(),
+                    retry_after: None,
+                })?);
+            }
         }
         self.studio_host()?.captions(set).await.map_err(captions_failed)
     }
@@ -2534,7 +2580,12 @@ mod tests {
 
     #[test]
     fn captions_need_a_sound_only_to_switch_on() {
-        let set = |ask, on, source: Option<&str>| CaptionsSet { ask, on, source: source.map(String::from) };
+        let set = |ask, on, source: Option<&str>| CaptionsSet {
+            ask,
+            on,
+            source: source.map(String::from),
+            ..Default::default()
+        };
         assert!(set(false, false, None).check().is_ok());
         assert!(set(true, false, None).check().is_ok());
         // Asking for permission needs no sound, even with on set.
@@ -2545,6 +2596,22 @@ mod tests {
         }
         assert!(set(false, true, Some(&"m".repeat(101))).check().is_err());
         assert!(set(false, true, Some(&"m".repeat(100))).check().is_ok());
+        let w = |engine: &str, model: Option<&str>, language: Option<&str>| CaptionsSet {
+            engine: Some(engine.into()),
+            model: model.map(String::from),
+            language: language.map(String::from),
+            ..set(false, true, Some("Mic"))
+        };
+        assert!(w("whisper", Some("small"), Some("hi")).check().is_ok());
+        assert!(w("apple", None, None).check().is_ok());
+        assert!(w("siri", None, None).check().is_err());
+        assert!(w("whisper", Some("huge"), None).check().is_err());
+        assert!(w("whisper", Some("../x"), None).check().is_err());
+        assert!(w("whisper", None, Some("klingon")).check().is_err());
+        // The model's path never comes from the request.
+        let sneaky: CaptionsSet =
+            serde_json::from_str(r#"{"on":true,"source":"Mic","model_path":"/etc/passwd"}"#).unwrap();
+        assert!(sneaky.model_path.is_none());
     }
 
     #[test]
@@ -2581,7 +2648,7 @@ mod tests {
         assert!(e.studio_captions(None).await.is_err());
         let fake = Arc::new(Fake::default());
         e.set_studio_host(fake);
-        let bad = CaptionsSet { ask: false, on: true, source: None };
+        let bad = CaptionsSet { ask: false, on: true, source: None, ..Default::default() };
         assert!(matches!(e.studio_captions(Some(bad)).await, Err(EngineError::Invalid(_))));
         let e1 = captions_failed("Allow speech recognition first.".into());
         assert!(matches!(e1, EngineError::Refused { status: 422, code: "captions_unavailable", .. }), "{e1:?}");
@@ -2593,6 +2660,15 @@ mod tests {
         let e4 = captions_failed("There's no source called \"speech\"".into());
         assert!(matches!(e4, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e4:?}");
         // A host that has no captions says so, rather than failing.
+        // Whisper without its model downloaded: a 409 saying so.
+        let no_model = CaptionsSet {
+            engine: Some("whisper".into()),
+            ..CaptionsSet { ask: false, on: true, source: Some("Mic".into()), ..Default::default() }
+        };
+        assert!(matches!(
+            e.studio_captions(Some(no_model)).await,
+            Err(EngineError::Refused { status: 409, code: "captions_model_missing", .. })
+        ));
         let v = e.studio_captions(None).await.unwrap();
         assert_eq!(v["access"], "unsupported");
         assert_eq!(v["on"], false);

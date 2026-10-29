@@ -36,6 +36,7 @@ mod patch;
 mod pipeline;
 mod polls;
 mod pro;
+pub mod speech_model;
 pub use pro::{ProStatus, ProView};
 mod recap;
 mod relay;

@@ -47,6 +47,12 @@ allow = [
   "GPL-3.0-or-later",
 ]
 confidence-threshold = 0.9
+# whisper-rs (live captions, 30 Oct) is public domain (the Unlicense, GPL-compatible): allowed
+# for these two crates only.
+exceptions = [
+  { allow = ["Unlicense"], crate = "whisper-rs" },
+  { allow = ["Unlicense"], crate = "whisper-rs-sys" },
+]
 unused-allowed-license = "allow"
 
 [bans]
