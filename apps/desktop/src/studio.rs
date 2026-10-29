@@ -1213,7 +1213,8 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stats(&self) -> Result<Value, String> {
-        self.on_main(|h| {
+        let data = self.data.clone();
+        self.on_main(move |h| {
             let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
             // The page asks for stats every second, so scenes held for the grid's pictures
             // are let go soon after it closes.
@@ -1221,6 +1222,11 @@ impl StudioHost for DesktopStudio {
                 c.let_thumbs_go(false);
                 // Sources added before their first frame get their snug fit now.
                 c.settle_fits();
+                // A captured window resized keeps its shape on the canvas (and stays so after
+                // a restart).
+                if c.follow_sizes() {
+                    save(c, &scenes_file(&data));
+                }
             }
             let disk_free = {
                 let folder = record_folder(&h.settings.clone().unwrap_or_default());

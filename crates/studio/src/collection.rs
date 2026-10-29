@@ -492,6 +492,9 @@ pub struct Collection {
     /// Items fitted before their source had a size (scene, item id, when): fitted again once
     /// it has one, so their frame hugs the picture (`settle_fits`).
     waiting_fit: RefCell<Vec<(String, i64, std::time::Instant)>>,
+    /// Each capture's last size, by its item: a window resized keeps its shape on the canvas
+    /// (`follow_sizes`).
+    sizes_seen: RefCell<std::collections::HashMap<(usize, i64, i64), Seen>>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -571,6 +574,7 @@ impl Collection {
             vertical: RefCell::new(None),
             parked: RefCell::new(None),
             waiting_fit: RefCell::new(Vec::new()),
+            sizes_seen: RefCell::new(std::collections::HashMap::new()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -3181,6 +3185,86 @@ impl Collection {
         self.waiting_fit.borrow_mut().extend(keep);
     }
 
+    /// A captured window or display that changes size is shown at its new shape, never
+    /// stretched: its picture is fitted in the box it was given (one scale for both sides, the
+    /// same top left). OBS keeps each side's scale, so a window made narrower or taller was
+    /// squashed (owner, 29 Oct). The box is the one last set by hand, so a window that goes
+    /// square and back comes back to its size; a crop isn't taken for a resize. Upright items
+    /// without a bounding box, in groups too; called often (the stats read). True when one was
+    /// fitted again (the scenes then want saving).
+    pub fn follow_sizes(&self) -> bool {
+        const CAPTURES: [&str; 5] =
+            ["screen_capture", "window_capture", "display_capture", "game_capture", "xcomposite_input"];
+        let a = self.api();
+        let mut seen = self.sizes_seen.borrow_mut();
+        let mut now = std::collections::HashMap::new();
+        let mut moved = false;
+        for scene in self.every_scene() {
+            let top = self.raw_items(a.obs_scene_from_source(scene));
+            // A group's sources count their ids in the group: keyed by the group's id too.
+            let mut all = Vec::new();
+            for i in top {
+                if a.obs_sceneitem_is_group(i) {
+                    let g = a.obs_sceneitem_get_id(i);
+                    all.extend(self.group_items(i).into_iter().map(|c| (g, c)));
+                }
+                all.push((0, i));
+            }
+            for (group, item) in all {
+                let src = a.obs_sceneitem_get_source(item);
+                if !CAPTURES.contains(&text(a.obs_source_get_id(src)).as_str()) {
+                    continue;
+                }
+                let raw = (a.obs_source_get_width(src), a.obs_source_get_height(src));
+                let p = self.place(item);
+                if raw.0 == 0 || raw.1 == 0 || p.size.0 == 0 || p.size.1 == 0 {
+                    continue;
+                }
+                let key = (scene as usize, group, a.obs_sceneitem_get_id(item));
+                let shown = (p.size.0 as f32 * p.scale.0.abs(), p.size.1 as f32 * p.scale.1.abs());
+                let fresh = Seen { raw, target: shown, scale: p.scale };
+                let Some(was) = seen.get(&key).copied() else {
+                    now.insert(key, fresh);
+                    continue;
+                };
+                let same_scale = (was.scale.0 - p.scale.0).abs() < 1e-4 && (was.scale.1 - p.scale.1).abs() < 1e-4;
+                if was.raw == raw {
+                    // Resized by hand (or not at all): that's the box from now on.
+                    now.insert(key, if same_scale { was } else { fresh });
+                    continue;
+                }
+                if p.bounds.is_some() || p.rot.rem_euclid(360.0) > 0.01 {
+                    now.insert(key, fresh);
+                    continue;
+                }
+                // The crop is the same: the picture before was the old size less it.
+                let cut = (raw.0.saturating_sub(p.size.0), raw.1.saturating_sub(p.size.1));
+                let before = Place {
+                    size: (was.raw.0.saturating_sub(cut.0).max(1), was.raw.1.saturating_sub(cut.1).max(1)),
+                    ..p
+                };
+                let k = (was.target.0 / p.size.0 as f32).min(was.target.1 / p.size.1 as f32);
+                if !k.is_finite() || k <= 0.0 {
+                    now.insert(key, fresh);
+                    continue;
+                }
+                let f = before.frame();
+                let fitted = Place { scale: (k * p.scale.0.signum(), k * p.scale.1.signum()), ..p }.with_box(
+                    f[4],
+                    f[5],
+                    p.size.0 as f32 * k,
+                    p.size.1 as f32 * k,
+                );
+                a.obs_sceneitem_set_scale(item, &ffi::Vec2 { x: fitted.scale.0, y: fitted.scale.1 });
+                a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: fitted.pos.0, y: fitted.pos.1 });
+                now.insert(key, Seen { raw, target: was.target, scale: fitted.scale });
+                moved = true;
+            }
+        }
+        *seen = now;
+        moved
+    }
+
     pub fn let_thumbs_go(&self, all: bool) {
         const KEEP: std::time::Duration = std::time::Duration::from_secs(10);
         let a = self.api();
@@ -3553,6 +3637,15 @@ pub(crate) struct Place {
     pub bounds: Option<(f32, f32)>,
     /// The source's size after cropping.
     pub size: (u32, u32),
+}
+
+/// A capture as `follow_sizes` last saw it: its uncropped size, the box it's fitted in, and
+/// its scale then (another one means it was resized by hand).
+#[derive(Clone, Copy)]
+struct Seen {
+    raw: (u32, u32),
+    target: (f32, f32),
+    scale: (f32, f32),
 }
 
 impl Place {
