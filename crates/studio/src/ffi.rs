@@ -1629,6 +1629,10 @@ pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: 
 #[cfg(target_os = "macos")]
 pub(crate) mod speech;
 
+/// Faces in a picture with Apple's Vision (plan item 8, smart vertical).
+#[cfg(target_os = "macos")]
+pub(crate) mod vision;
+
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {
     use std::ffi::c_void;

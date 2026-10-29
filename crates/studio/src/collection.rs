@@ -18,7 +18,9 @@ use serde_json::{Value, json};
 use crate::ffi::{self, Api, Level, cstr, text};
 use crate::{OptionInfo, Studio, StudioError, check_name};
 
+mod follow;
 mod vertical;
+pub use follow::{Face, FaceFollow, FollowLook, find_faces};
 pub use vertical::{VERTICAL_SIZE, VerticalInfo};
 
 /// OBS's keys for the six global sound channels (1 and 2: desktop audio, 3 to 6: mics).

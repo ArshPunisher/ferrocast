@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
-    AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Captions, Collection, DEINTERLACE, FilterInfo, FilterSnap, ItemEdit,
-    ItemInfo, ItemSnap, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SceneSnap, SourceUse,
-    StudioOptions, TBarState, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access,
-    captions_access,
+    AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Captions, Collection, DEINTERLACE, Face, FaceFollow, FilterInfo,
+    FilterSnap, FollowLook, ItemEdit, ItemInfo, ItemSnap, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor,
+    SceneInfo, SceneSnap, SourceUse, StudioOptions, TBarState, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo,
+    WebAct, ask_captions_access, captions_access, find_faces,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
