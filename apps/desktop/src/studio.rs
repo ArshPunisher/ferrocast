@@ -1260,6 +1260,8 @@ impl StudioHost for DesktopStudio {
                     "error": r.last_error(),
                 })),
                 "virtualcam": h.virtualcam.as_ref().map(|c| json!({ "active": c.active() })),
+                // Captures on air that show nothing (the black screen fixer).
+                "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             }))

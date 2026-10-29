@@ -495,6 +495,8 @@ pub struct Collection {
     /// Each capture's last size, by its item: a window resized keeps its shape on the canvas
     /// (`follow_sizes`).
     sizes_seen: RefCell<std::collections::HashMap<(usize, i64, i64), Seen>>,
+    /// The last capture check and when it ran (`capture_problems`).
+    captures_seen: RefCell<(Option<std::time::Instant>, Vec<CaptureProblem>)>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -575,6 +577,7 @@ impl Collection {
             parked: RefCell::new(None),
             waiting_fit: RefCell::new(Vec::new()),
             sizes_seen: RefCell::new(std::collections::HashMap::new()),
+            captures_seen: RefCell::new((None, Vec::new())),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -3265,6 +3268,89 @@ impl Collection {
         moved
     }
 
+    /// Captures on air that show nothing, for the black screen fixer (29 Oct): a screen
+    /// capture without macOS's Screen Recording permission, a capture with no picture at all
+    /// (a closed window, a camera that didn't start), or one whose picture is all black. Looked
+    /// at every 3 s at most (a 32×18 still of each); the page says so after it lasts.
+    pub fn capture_problems(&self) -> Vec<CaptureProblem> {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+        if let (Some(at), last) = &*self.captures_seen.borrow()
+            && at.elapsed() < EVERY
+        {
+            return last.clone();
+        }
+        let a = self.api();
+        // What the main picture really shows: its transition's scene, which in Studio Mode can
+        // be a private copy of the scene (CodeRabbit). The vertical picture shows its own.
+        let shown = a.obs_transition_get_active_source(*self.transition.borrow());
+        let mut on_air = vec![if shown.is_null() { *self.current.borrow() } else { shown }];
+        if let Some(v) = self.vertical.borrow().as_ref() {
+            on_air.push(v.current);
+        }
+        let mut out: Vec<CaptureProblem> = Vec::new();
+        // Visible sources, through groups and scenes shown inside scenes (each scene once).
+        let mut items = Vec::new();
+        let mut visited: Vec<*mut ffi::ObsSource> = Vec::new();
+        let mut todo: Vec<*mut ffi::ObsSource> = on_air.iter().copied().filter(|s| !s.is_null()).collect();
+        while let Some(scene) = todo.pop() {
+            if visited.contains(&scene) {
+                continue;
+            }
+            visited.push(scene);
+            let mut here = Vec::new();
+            for i in self.raw_items(a.obs_scene_from_source(scene)) {
+                if !a.obs_sceneitem_visible(i) {
+                    continue;
+                }
+                if a.obs_sceneitem_is_group(i) {
+                    here.extend(self.group_items(i).into_iter().filter(|c| a.obs_sceneitem_visible(*c)));
+                } else {
+                    here.push(i);
+                }
+            }
+            for i in here {
+                let src = a.obs_sceneitem_get_source(i);
+                if !a.obs_scene_from_source(src).is_null() {
+                    todo.push(src);
+                } else {
+                    items.push(i);
+                }
+            }
+        }
+        if !shown.is_null() {
+            a.obs_source_release(shown);
+        }
+        {
+            for item in items {
+                let src = a.obs_sceneitem_get_source(item);
+                let kind = text(a.obs_source_get_id(src));
+                let screen = SCREEN_KINDS.contains(&kind.as_str());
+                if !screen && !CAMERA_KINDS.contains(&kind.as_str()) {
+                    continue;
+                }
+                let name = text(a.obs_source_get_name(src));
+                if out.iter().any(|p| p.source == name) {
+                    continue;
+                }
+                let problem = if screen && !crate::screen_access() {
+                    "permission"
+                } else {
+                    let (w, h) = (a.obs_source_get_width(src), a.obs_source_get_height(src));
+                    if w == 0 || h == 0 {
+                        "no_picture"
+                    } else if ffi::snapshot_scaled(a, src, (w, h), 32, 18).is_some_and(|px| all_black(&px)) {
+                        "black"
+                    } else {
+                        continue;
+                    }
+                };
+                out.push(CaptureProblem { source: name, kind, problem });
+            }
+        }
+        *self.captures_seen.borrow_mut() = (Some(std::time::Instant::now()), out.clone());
+        out
+    }
+
     pub fn let_thumbs_go(&self, all: bool) {
         const KEEP: std::time::Duration = std::time::Duration::from_secs(10);
         let a = self.api();
@@ -3639,6 +3725,27 @@ pub(crate) struct Place {
     pub size: (u32, u32),
 }
 
+/// A capture on air that shows nothing (`capture_problems`): `problem` is `permission`
+/// (macOS's Screen Recording is off for this app), `no_picture` or `black`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CaptureProblem {
+    pub source: String,
+    pub kind: String,
+    pub problem: &'static str,
+}
+
+/// Screen and window captures (each system's), and cameras: the kinds the black screen fixer
+/// looks at.
+const SCREEN_KINDS: [&str; 6] =
+    ["screen_capture", "display_capture", "window_capture", "game_capture", "monitor_capture", "xcomposite_input"];
+const CAMERA_KINDS: [&str; 5] =
+    ["macos-avcapture", "macos-avcapture-fast", "av_capture_input", "dshow_input", "v4l2_input"];
+
+/// A still (RGBA rows) with nothing to see: every pixel near black, or see-through.
+fn all_black(px: &[u8]) -> bool {
+    px.as_chunks::<4>().0.iter().all(|p| p[3] < 16 || p[0].max(p[1]).max(p[2]) < 12)
+}
+
 /// A capture as `follow_sizes` last saw it: its uncropped size, the box it's fitted in, and
 /// its scale then (another one means it was resized by hand).
 #[derive(Clone, Copy)]
@@ -3732,6 +3839,17 @@ fn off_canvas(m: &ffi::Matrix4, p: (f32, f32)) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_still_is_black_only_when_nothing_shows() {
+        // Pure black, see-through and very dark count as nothing; one lit pixel doesn't.
+        assert!(all_black(&[0, 0, 0, 255, 5, 8, 11, 255]));
+        assert!(all_black(&[200, 200, 200, 0, 0, 0, 0, 255]));
+        assert!(!all_black(&[0, 0, 0, 255, 12, 0, 0, 255]));
+        assert!(!all_black(&[0, 0, 0, 255, 255, 255, 255, 255]));
+        // An empty still (nothing drawn) has nothing to see.
+        assert!(all_black(&[]));
+    }
 
     fn plain() -> Place {
         Place { pos: (0.0, 0.0), scale: (1.0, 1.0), rot: 0.0, align: 5, bounds: None, size: (400, 300) }
