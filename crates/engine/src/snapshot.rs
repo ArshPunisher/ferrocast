@@ -143,12 +143,14 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let cutoff = self.chat_cutoff();
         let chat: Vec<_> = if o.wants_chat() {
             let mut c: Vec<_> = self
                 .db(|s| repo::events::recent_visible(s, None, 50, &["chat_message".to_string()]))
                 .await?
                 .into_iter()
                 .map(|(_, e)| e)
+                .filter(|e| e.occurred_at.0 >= cutoff)
                 .collect();
             c.retain(|e| !e.source_id.as_deref().is_some_and(|id| self.is_hidden(e.platform, id)));
             c.reverse();

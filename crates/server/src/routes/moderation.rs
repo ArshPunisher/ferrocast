@@ -21,6 +21,9 @@ pub struct ChatQuery {
 
 pub async fn chat(State(app): State<AppState>, Query(q): Query<ChatQuery>) -> ApiResult<Json<Value>> {
     let mut list = app.engine.events(None, q.limit.unwrap_or(200).clamp(1, 500), vec!["chat_message".into()]).await?;
+    // This stream's chat only (a new stream doesn't open with the last one's).
+    let cutoff = app.engine.chat_cutoff();
+    list.retain(|e| e.occurred_at.0 >= cutoff);
     list.reverse();
     Ok(Json(json!(list)))
 }

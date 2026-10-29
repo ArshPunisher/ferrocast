@@ -1711,3 +1711,25 @@ async fn theme_in_obs_routes_answer_in_our_shape() {
     assert_eq!(error_code(unknown).await.0, StatusCode::BAD_REQUEST, "unknown fields are refused");
     assert_eq!(r.get("/api/v1/designs/whatever/obs").await.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn chat_shows_this_stream_not_the_last_one() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Platform};
+    let r = start().await;
+    let now = ferrocast_engine::now().0;
+    let say = |id: &str, at: i64| {
+        let mut a = Actor::named(Platform::Twitch, "viewer");
+        a.id = Some("viewer-id".into());
+        Event::live(
+            Platform::Twitch,
+            Some(id.into()),
+            ferrocast_core::event::Millis(at),
+            EventKind::ChatMessage { actor: a, content: Content::plain(id), reply_to: None, is_action: false },
+        )
+    };
+    r.engine.ingest(say("two days ago", now - 2 * 86_400_000)).await;
+    r.engine.ingest(say("just now", now - 60_000)).await;
+    let chat: Value = r.get("/api/v1/chat").await.json().await.unwrap();
+    let ids: Vec<&str> = chat.as_array().unwrap().iter().filter_map(|e| e["source_id"].as_str()).collect();
+    assert_eq!(ids, ["just now"]);
+}

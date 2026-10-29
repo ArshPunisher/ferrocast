@@ -1752,3 +1752,35 @@ async fn a_browser_that_didnt_open_reaches_the_dashboard() {
     let message = notices[0]["message"].as_str().unwrap();
     assert!(message.contains("couldn't open your browser") && message.contains("Try again"), "{message}");
 }
+
+#[tokio::test]
+async fn a_new_stream_starts_with_empty_chat() {
+    let (e, _d) = engine().await;
+    let now = crate::now().0;
+    // Offline: the last six hours of chat.
+    assert!((e.chat_cutoff() - (now - 6 * 3_600_000)).abs() < 5_000);
+    let mut overlays = e.subscribe_overlays();
+    let mut live = e.subscribe_live();
+    e.ingest(Event::live(Platform::Twitch, Some("on-a".into()), Millis(now), EventKind::StreamOnline { title: None }))
+        .await;
+    // Chat overlays empty out, and the dashboard loads chat again.
+    let cleared = next_overlay_frame(&mut overlays, "clear_chat").await;
+    assert_eq!(cleared["data"]["platform"], Value::Null);
+    let mut kinds = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        kinds.push(serde_json::from_str::<Value>(&f.text).unwrap()["type"].as_str().unwrap_or("").to_string());
+    }
+    assert!(kinds.iter().any(|k| k == "resync"), "{kinds:?}");
+    // Live: this stream's chat, and the five minutes before it.
+    let start = e.stream_started_at().unwrap();
+    assert_eq!(e.chat_cutoff(), start - 5 * 60_000);
+    // A second platform going live is the same stream: no second clear.
+    e.ingest(Event::live(Platform::Kick, Some("on-b".into()), Millis(now), EventKind::StreamOnline { title: None }))
+        .await;
+    let mut again = false;
+    while let Ok(f) = overlays.try_recv() {
+        again |= serde_json::from_str::<Value>(&f.text).unwrap()["type"] == "clear_chat";
+    }
+    assert!(!again, "one stream, one clear");
+    assert_eq!(e.stream_started_at(), Some(start));
+}

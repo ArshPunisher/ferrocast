@@ -220,6 +220,16 @@ impl Engine {
                 st.live.insert(e.platform, true);
                 if !anyone_live {
                     st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
+                    drop(st);
+                    // A new stream: chat overlays empty out and the dashboard loads this
+                    // stream's chat again, so the last stream's messages don't show.
+                    self.send_overlay(crate::frames::OverlayFrame::new(
+                        crate::frames::Audience::Chat,
+                        e.seq,
+                        "clear_chat",
+                        &json!({ "platform": null }),
+                    ));
+                    self.send_live(crate::frames::LiveFrame::new("resync", &json!({ "missed": 0 })));
                 }
             }
             EventKind::StreamOffline => {

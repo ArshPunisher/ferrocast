@@ -182,6 +182,16 @@ impl Engine {
         ferrocast_obs::connect(&target.cfg, target.password.as_deref()).await.map_err(obs_error)
     }
 
+    /// The oldest chat to show (the chat panel, chat overlays): this stream's (and the five
+    /// minutes before it, the waiting room), or the last six hours while offline. A new stream
+    /// never opens with the last one's messages (owner, 30 Oct).
+    pub fn chat_cutoff(&self) -> i64 {
+        match self.stream_started_at() {
+            Some(start) => start - 5 * 60_000,
+            None => crate::now().0 - 6 * 3_600_000,
+        }
+    }
+
     /// When the current stream started (any platform live), for markers and recaps.
     pub(crate) fn stream_started_at(&self) -> Option<i64> {
         let st = self.state();

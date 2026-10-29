@@ -290,7 +290,7 @@ Tips goals are in **major units** of their currency everywhere (API, `goals` fra
 ### Chat and moderation
 | Method | Path | Body → Response |
 |---|---|---|
-| GET | `/api/v1/chat?limit=200` | → `Event[]` (recent chat_message events) |
+| GET | `/api/v1/chat?limit=200` | → `Event[]` (recent chat_message events): this stream's (and the 5 minutes before it), or the last 6 hours while offline; chat overlays' snapshots likewise. When a new stream starts, chat overlays get `clear_chat` (`platform: null`) and dashboards a `resync`, so a stream never opens with the last one's messages |
 | POST | `/api/v1/chat/send` | `{ text, platforms: Platform[] \| "all", reply_to?: { platform, message_id } }` → `{ sent: Platform[], failed: { platform, reason }[] }` |
 | POST | `/api/v1/mod/delete` | `{ platform, message_id }` → 204 |
 | POST | `/api/v1/mod/timeout` | `{ platform, user_id, seconds, reason? }` → 204 |
