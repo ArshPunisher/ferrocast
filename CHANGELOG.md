@@ -5,6 +5,39 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.2.0
+
+The Studio gets smarter: live captions in any language, Shorts with captions, a face that stays in
+the middle of the vertical picture, and a stream doctor that says what's wrong and fixes it.
+Everything runs on your computer; nothing you say or show is sent anywhere.
+
+- Live captions: what you say appears on stream in a Captions box (one click adds it). On a Mac
+  use the Mac's own recognition, or Whisper on any computer: Hindi and many more languages, and
+  captions in English whatever you speak. Whisper downloads once (60 MB, or 191 MB for better
+  Hindi).
+- Your voice can do things while captions listen: say "clip that" to save a clip, "be right
+  back", "I'm back", "switch to" a scene, "start recording" or "stop recording". A viewer's
+  message read aloud can't trigger them.
+- Clips get subtitles: a subtitle file beside each one, and the words burned into its vertical
+  copy for Shorts, TikTok and Reels. Each clip can also get a vertical copy by itself.
+- Keep a transcript of what you said and search it in Moments.
+- Follow my face: a camera or your whole picture in the vertical scene slides to keep your face
+  in the middle. Or follow the action, for games.
+- Stream doctor: when the stream struggles, the status bar says why and offers one click: a
+  lighter encoder, 720p, or a lower bitrate that applies while you're live.
+- A capture showing black or nothing is spotted and explained, with an Allow button when screen
+  recording permission is the cause.
+- Clean up my mic: noise removal, an even level and a limiter in one click, and a meter that says
+  if you're too quiet or too loud.
+- Away: BRB comes on after a few quiet minutes while live, and goes off when you talk.
+- A scene per game: when a game comes to the front, its scene goes on air.
+- After you press Start, a ready check looks at your mic, cameras, captures and disk and shows
+  only what needs fixing. If Ferrocast closed unexpectedly, Start brings back the replay buffer
+  and recording (never the stream on its own).
+- On a Mac the picture is drawn with Metal by default: smoother and steadier. OpenGL is still
+  in Settings, Picture, Drawing.
+- The preview stops drawing while the window is hidden, to save your computer's power.
+
 ## 2.1.8
 
 This update also brings 2.1.7, which wasn't released on its own: a vertical picture of its own
