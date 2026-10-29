@@ -5,6 +5,21 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.2.1
+
+This update also brings 2.2.0, which wasn't released on its own: live captions in any language,
+voice commands, Shorts with captions, follow my face, the stream doctor and more (below).
+
+- YouTube: your main live starts by itself. If YouTube Studio had a broadcast waiting for its Go
+  live button, Ferrocast now sets it to start with your stream, and with no broadcast at all it
+  makes one. Updating Stream info never asks you to create a broadcast first.
+- YouTube Shorts live gets your title, description and thumbnail too, instead of YouTube's own
+  picture.
+- A new stream starts with an empty chat: the chat panel and chat overlays no longer show the last
+  stream's messages (they stay in History).
+- The Send to buttons beside the chat box are bigger and as tall as the box, with the platforms'
+  own colours.
+
 ## 2.2.0
 
 The Studio gets smarter: live captions in any language, Shorts with captions, a face that stays in
