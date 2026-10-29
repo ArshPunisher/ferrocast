@@ -18,6 +18,7 @@ mod studio;
 mod studio_history;
 mod studio_keys;
 mod studio_library;
+mod whisper;
 
 use ferrocast_engine::Engine;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};

@@ -76,7 +76,9 @@ struct Held {
     /// The vertical picture's preview, beside the main one.
     vertical: VerticalView,
     /// Live captions, and the sound they listen to.
-    captions: Option<(ferrocast_studio::Captions, String)>,
+    captions: Option<(Listening, String)>,
+    /// Which run of captions the Whisper worker's words belong to.
+    captions_run: u64,
     /// The vertical item following a face, and which run of the loop moves it.
     follow: Option<ferrocast_studio::FaceFollow>,
     follow_run: u64,
@@ -403,6 +405,76 @@ pub fn end_session() {
 
 /// What live captions last heard, as the "Captions" text source shows it.
 static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Why captions last stopped by themselves, until they're turned on again.
+static CAPTIONS_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Where words heard go, for one run of captions.
+type Sink = (u64, Box<dyn Fn(String, bool)>);
+
+thread_local! {
+    /// Where Whisper's words go on the main thread, for the run listening now.
+    static CAPTION_SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+}
+
+/// Captions from macOS's recognizer or from Whisper.
+enum Listening {
+    Apple(ferrocast_studio::Captions),
+    Whisper { _tap: ferrocast_studio::SoundTap, listener: crate::whisper::WhisperListener },
+}
+
+impl Listening {
+    fn engine(&self) -> &'static str {
+        match self {
+            Listening::Apple(_) => "apple",
+            Listening::Whisper { .. } => "whisper",
+        }
+    }
+
+    /// Why it stopped by itself, if it did.
+    fn stopped(&self) -> Option<String> {
+        match self {
+            Listening::Apple(c) => {
+                (!c.working()).then(|| "Speech recognition kept failing, so captions stopped.".to_string())
+            }
+            Listening::Whisper { listener, .. } => listener.failed(),
+        }
+    }
+}
+
+/// What to do with words heard (on the main thread): count "clip that", keep the end of what
+/// was said, and write it into the "Captions" text source.
+fn caption_sink() -> impl Fn(String, bool) + 'static {
+    let done = RefCell::new(String::new());
+    // "clip that"s already counted in this sentence (partial results repeat it).
+    let counted = std::cell::Cell::new(0usize);
+    move |said, last| {
+        let calls = clip_calls(&said);
+        if calls > counted.get() {
+            CLIPS_SAID.fetch_add((calls - counted.get()) as u64, std::sync::atomic::Ordering::Relaxed);
+            counted.set(calls);
+        }
+        if last {
+            counted.set(0);
+        }
+        let shown = caption_tail(&format!("{} {said}", done.borrow()), CAPTION_CHARS);
+        if last {
+            *done.borrow_mut() = shown.clone();
+        }
+        // Never inside a Studio call: macOS's handlers and run_on_main_thread come between them.
+        HELD.with(|h| {
+            if let Ok(h) = h.try_borrow()
+                && let Some(c) = &h.collection
+            {
+                // Without a "Captions" text source there's nothing to write.
+                let _ = c.update(CAPTIONS_SOURCE, &json!({ "text": shown }));
+            }
+        });
+        if let Ok(mut heard) = HEARD.lock() {
+            *heard = shown;
+        }
+    }
+}
 
 /// Times "clip that" was said while captions listened (the engine clips when it goes up).
 static CLIPS_SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1603,68 +1675,81 @@ impl StudioHost for DesktopStudio {
         if let Some(set) = &set {
             set.check()?;
         }
+        let app = self.app.clone();
         self.on_main(move |h| {
-            // Captions that stopped by themselves (recognition kept failing) read as off.
-            if h.captions.as_ref().is_some_and(|(c, _)| !c.working()) {
+            // Captions that stopped by themselves (recognition kept failing, the model didn't
+            // load) read as off, with why.
+            if let Some((l, _)) = &h.captions
+                && let Some(why) = l.stopped()
+            {
+                if let Ok(mut e) = CAPTIONS_ERROR.lock() {
+                    *e = Some(why);
+                }
                 h.captions = None;
             }
             match set {
                 Some(CaptionsSet { ask: true, .. }) => ferrocast_studio::ask_captions_access(),
                 Some(CaptionsSet { on: false, .. }) => {
                     h.captions = None;
+                    CAPTION_SINK.with(|s| s.borrow_mut().take());
                     if let Ok(mut heard) = HEARD.lock() {
                         heard.clear();
                     }
                 }
-                Some(CaptionsSet { on: true, source, .. }) => {
-                    let source = source.unwrap_or_default().trim().to_string();
+                Some(set @ CaptionsSet { on: true, .. }) => {
+                    let source = set.source.clone().unwrap_or_default().trim().to_string();
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     // The old listener goes first: one at a time.
                     h.captions = None;
-                    let done = RefCell::new(String::new());
-                    // "clip that"s already counted in this sentence (partial results repeat it).
-                    let counted = std::cell::Cell::new(0usize);
-                    let listener = c
-                        .start_captions(&source, move |said, last| {
-                            let calls = clip_calls(&said);
-                            if calls > counted.get() {
-                                CLIPS_SAID
-                                    .fetch_add((calls - counted.get()) as u64, std::sync::atomic::Ordering::Relaxed);
-                                counted.set(calls);
-                            }
-                            if last {
-                                counted.set(0);
-                            }
-                            let shown = caption_tail(&format!("{} {said}", done.borrow()), CAPTION_CHARS);
-                            if last {
-                                *done.borrow_mut() = shown.clone();
-                            }
-                            // Called by macOS on the main thread, never inside a Studio call.
-                            HELD.with(|h| {
-                                if let Ok(h) = h.try_borrow()
-                                    && let Some(c) = &h.collection
-                                {
-                                    // Without a "Captions" text source there's nothing to write.
-                                    let _ = c.update(CAPTIONS_SOURCE, &json!({ "text": shown }));
-                                }
-                            });
-                            if let Ok(mut heard) = HEARD.lock() {
-                                *heard = shown;
-                            }
-                        })
-                        .map_err(|e| e.to_string())?;
+                    h.captions_run += 1;
+                    let run = h.captions_run;
+                    if let Ok(mut e) = CAPTIONS_ERROR.lock() {
+                        *e = None;
+                    }
+                    let listening = if set.engine.as_deref() == Some("whisper") {
+                        let model = set.model_path.clone().ok_or("The speech model isn't downloaded yet.")?;
+                        let tap = c.tap_sound(&source).map_err(|e| e.to_string())?;
+                        CAPTION_SINK.with(|s| *s.borrow_mut() = Some((run, Box::new(caption_sink()))));
+                        // Words come from the worker: they're shown on the main thread, and only
+                        // while this run is the one listening.
+                        let listener = crate::whisper::start(
+                            tap.reader(),
+                            tap.rate(),
+                            crate::whisper::Options {
+                                model,
+                                language: set.language.clone().unwrap_or_else(|| "auto".into()),
+                                translate: set.translate,
+                            },
+                            move |said, last| {
+                                let _ = app.run_on_main_thread(move || {
+                                    CAPTION_SINK.with(|s| {
+                                        if let Some((r, f)) = s.borrow().as_ref()
+                                            && *r == run
+                                        {
+                                            f(said, last);
+                                        }
+                                    });
+                                });
+                            },
+                        );
+                        Listening::Whisper { _tap: tap, listener }
+                    } else {
+                        Listening::Apple(c.start_captions(&source, caption_sink()).map_err(|e| e.to_string())?)
+                    };
                     if let Ok(mut heard) = HEARD.lock() {
                         heard.clear();
                     }
-                    h.captions = Some((listener, source));
+                    h.captions = Some((listening, source));
                 }
                 None => {}
             }
             Ok(json!({
                 "access": ferrocast_studio::captions_access(),
                 "on": h.captions.is_some(),
+                "engine": h.captions.as_ref().map(|(l, _)| l.engine()),
                 "source": h.captions.as_ref().map(|(_, s)| s.clone()),
                 "text": HEARD.lock().map(|t| t.clone()).unwrap_or_default(),
+                "error": CAPTIONS_ERROR.lock().ok().and_then(|e| e.clone()),
                 "clips_said": CLIPS_SAID.load(std::sync::atomic::Ordering::Relaxed),
                 // Shown only when a scene has it (a removed one lingers for undo).
                 "box": h.collection.as_ref().is_some_and(|c| {

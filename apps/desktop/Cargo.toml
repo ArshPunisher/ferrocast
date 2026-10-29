@@ -46,6 +46,13 @@ dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tauri-plugin-dialog = "2"
 
+# Live captions on every system (plan item 7b): whisper.cpp, on this computer; Metal on a Mac.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal", "tracing_backend"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+
 [dev-dependencies]
 # A mock app runs the real updater plugin against local feeds (main.rs tests).
 tauri = { version = "2", features = ["tray-icon", "test"] }
