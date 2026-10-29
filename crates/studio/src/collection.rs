@@ -3794,6 +3794,42 @@ impl Captions {
     }
 }
 
+impl Collection {
+    /// Listens to a sound (its audio after its filters, mono, at the Studio's rate) for
+    /// anything that wants it: Whisper captions.
+    pub fn tap_sound(&self, source: &str) -> Result<SoundTap, StudioError> {
+        let src = self.find(source).ok_or_else(|| no_source(source))?;
+        let mut info = ffi::AudioInfo2 { samples_per_sec: 0, speakers: 0, max_buffering_ms: 0, fixed_buffering: false };
+        let rate = if self.api().obs_get_audio_info2(&mut info) && info.samples_per_sec > 0 {
+            info.samples_per_sec
+        } else {
+            48_000
+        };
+        Ok(SoundTap { tap: ffi::tap::SoundTap::start(self.api(), src.ptr, rate), _studio: self.studio.clone() })
+    }
+}
+
+/// Listening to one sound; dropping it stops. Can move to another thread.
+#[derive(Debug)]
+pub struct SoundTap {
+    // Dropped first: it uses the Studio's libobs, kept alive by the field after it.
+    tap: ffi::tap::SoundTap,
+    _studio: Studio,
+}
+
+impl SoundTap {
+    pub fn rate(&self) -> u32 {
+        self.tap.rate()
+    }
+
+    /// What it hears, for another thread: `take()` drains it.
+    pub fn reader(&self) -> TapReader {
+        self.tap.reader()
+    }
+}
+
+pub use ffi::tap::TapReader;
+
 /// Speech recognition for this app: "allowed", "not_asked", "denied", "restricted", or
 /// "unsupported" where there's none.
 pub fn captions_access() -> &'static str {
