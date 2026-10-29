@@ -5,6 +5,38 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.1.8
+
+This update also brings 2.1.7, which wasn't released on its own: a vertical picture of its own
+streamed to YouTube Shorts, the Studio as the main way to stream, redesigned Show, Stream info and
+Moments, YouTube title and thumbnail before going live, and Optimize for your upload.
+
+- Record and Go live answer the moment you press them, show Starting while the stream or
+  recording gets going, then turn red with the time. Pause and Resume switch at once, and a
+  paused recording stands still.
+- Going live with no title or category asks first: set up Stream info, or go live anyway.
+  Stream info is the Studio's second tab, and the Go live panel is just your platforms.
+- A source's drawer has two tabs: Sound & filters, and Settings. Mute and Hear it sit beside the
+  volume, and Add a filter opens a picker with search; screen and window captures get picture
+  filters too (Crop, Green screen, Colour).
+- Settings shows one area at a time, picked from a list grouped into Streaming, Extras and App.
+  Studio settings close when you save.
+- Studio panels can share a spot as tabs: drag one onto the middle of another. While dragging,
+  arrows show where it will land, and the picture stays visible.
+- Narrow panels keep their names readable: the extras step back first. The mixing desk has slim
+  strips with one scale beside them.
+- The bar under the picture, the scene collection and profile buttons and their menus are
+  cleaner, and buttons have colour instead of looking like grey boxes. Empty fields show no
+  example text, so they don't look filled in.
+- A captured window keeps its shape when you resize it: no more stretched pictures. A capture
+  added before its window was picked fits snugly, without black edges.
+- Turning the vertical picture off keeps its scenes for when you turn it on again.
+- Frames can be locked to their shape, and they snap to the edges as you resize them.
+- Fixed: the picture could be drawn over the panels, a sideways scrollbar in the source drawer,
+  frame handles that wouldn't drag after a window changed size, and the Kick multistreaming link
+  doing nothing. Hide Ferrocast from capture (in Display Capture) keeps Ferrocast's own window out
+  of a screen capture.
+
 ## 2.1.7
 
 - A vertical picture of its own: press Vertical under the picture and a tall 1080×1920 picture
