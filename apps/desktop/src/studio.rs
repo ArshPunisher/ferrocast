@@ -406,6 +406,14 @@ pub fn end_session() {
 /// What live captions last heard, as the "Captions" text source shows it.
 static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// What's being said now (this sentence, as heard so far) and its number, for voice commands.
+static SENTENCE: std::sync::Mutex<(u64, String)> = std::sync::Mutex::new((0, String::new()));
+/// Sentences finished lately (number, when in Unix ms, words), for the transcript.
+static DONE: std::sync::Mutex<std::collections::VecDeque<(u64, i64, String)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+/// Finished sentences kept for the engine to pick up (it looks every 0.7 s).
+const DONE_KEPT: usize = 50;
+
 /// Why captions last stopped by themselves, until they're turned on again.
 static CAPTIONS_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -456,6 +464,23 @@ fn caption_sink() -> impl Fn(String, bool) + 'static {
         }
         if last {
             counted.set(0);
+        }
+        if let Ok(mut s) = SENTENCE.lock() {
+            if last {
+                // Finished: kept for the transcript, and the next sentence gets the next number.
+                let text = said.trim().to_string();
+                if !text.is_empty()
+                    && let Ok(mut d) = DONE.lock()
+                {
+                    d.push_back((s.0, chrono::Utc::now().timestamp_millis(), text));
+                    while d.len() > DONE_KEPT {
+                        d.pop_front();
+                    }
+                }
+                *s = (s.0 + 1, String::new());
+            } else {
+                s.1 = said.clone();
+            }
         }
         let shown = caption_tail(&format!("{} {said}", done.borrow()), CAPTION_CHARS);
         if last {
@@ -1751,6 +1776,9 @@ impl StudioHost for DesktopStudio {
                 "text": HEARD.lock().map(|t| t.clone()).unwrap_or_default(),
                 "error": CAPTIONS_ERROR.lock().ok().and_then(|e| e.clone()),
                 "clips_said": CLIPS_SAID.load(std::sync::atomic::Ordering::Relaxed),
+                // For voice commands and the transcript (the engine reads these).
+                "sentence": SENTENCE.lock().map(|s| json!({ "id": s.0, "said": s.1 })).unwrap_or(Value::Null),
+                "done": DONE.lock().map(|d| d.iter().map(|(id, at, text)| json!({ "id": id, "at": at, "text": text })).collect::<Vec<_>>()).unwrap_or_default(),
                 // Shown only when a scene has it (a removed one lingers for undo).
                 "box": h.collection.as_ref().is_some_and(|c| {
                     c.sources().iter().any(|s| s.name == CAPTIONS_SOURCE && !s.scenes.is_empty())

@@ -25,8 +25,10 @@ pub mod obs_tools;
 pub(crate) mod rig;
 pub mod show;
 pub mod stream_info;
+pub mod transcript;
 pub mod vertical_clip;
 pub(crate) mod voice_clip;
+pub(crate) mod voice_commands;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Mutex, RwLock};

@@ -76,6 +76,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/captions", get(engine_captions).put(engine_set_captions))
         .route("/studio/engine/apps", get(engine_apps))
         .route("/speech/models", get(speech_models))
+        .route("/transcript", get(transcript_search))
         .route("/speech/models/{id}", post(speech_model_fetch).delete(speech_model_remove))
         .route("/studio/engine/vertical/follow", get(engine_follow).put(engine_set_follow))
         .route("/studio/engine/restart", post(engine_restart))
@@ -877,6 +878,17 @@ async fn engine_set_follow(
     Body(b): Body<ferrocast_engine::studio_host::FollowSet>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_follow_face(Some(b)).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct TranscriptQuery {
+    #[serde(default)]
+    q: String,
+    since: Option<i64>,
+}
+
+async fn transcript_search(State(app): State<AppState>, Query(t): Query<TranscriptQuery>) -> ApiResult<Json<Value>> {
+    Ok(Json(serde_json::to_value(app.engine.transcript_search(&t.q, t.since)?).unwrap_or(Value::Null)))
 }
 
 async fn speech_models(State(app): State<AppState>) -> ApiResult<Json<Value>> {

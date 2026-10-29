@@ -257,6 +257,12 @@ pub struct ScenesConfig {
     /// Each saved clip gets a subtitle file (.srt) beside it, and its vertical copy the words
     /// burned in: Whisper on this computer (a downloaded model) and ffmpeg.
     pub clip_captions: bool,
+    /// While live captions listen: "be right back", "I'm back", "switch to <scene>", "start
+    /// recording" and "stop recording" do that (the Studio only).
+    pub voice_commands: bool,
+    /// While live captions listen: each finished sentence is kept with its time, on this
+    /// computer, to search later.
+    pub keep_transcript: bool,
     /// A scene per game: when that app comes to the front, its scene goes on air (the Studio
     /// on a Mac). Empty: off.
     pub game_scenes: Vec<GameScene>,
@@ -284,6 +290,8 @@ impl Default for ScenesConfig {
             away_minutes: 0,
             clip_by_voice: false,
             clip_captions: false,
+            voice_commands: false,
+            keep_transcript: false,
             game_scenes: Vec::new(),
         }
     }

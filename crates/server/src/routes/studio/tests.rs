@@ -642,6 +642,12 @@ async fn the_studio_engine_needs_the_desktop_app() {
     let list: Value = r.get("/speech/models").await.json().await.unwrap();
     assert_eq!(list.as_array().map(Vec::len), Some(2), "{list}");
     assert_eq!(list[0]["state"], "missing");
+    // The transcript: an empty list at first; a long query or a future start is a 400.
+    let found: Value = r.get("/transcript?q=giveaway").await.json().await.unwrap();
+    assert_eq!(found, json!([]));
+    assert_eq!(code(r.get(&format!("/transcript?q={}", "x".repeat(201))).await).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(code(r.get("/transcript?since=99999999999999").await).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(code(r.get("/transcript?since=soon").await).await.0, StatusCode::BAD_REQUEST);
     for bad in ["huge", "..%2Fetc"] {
         assert_eq!(
             code(r.post(&format!("/speech/models/{bad}"), json!({})).await).await.0,
