@@ -617,6 +617,7 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.delete("/studio/engine/projectors").await,
         r.get("/studio/engine/screens").await,
         r.get("/studio/engine/captions").await,
+        r.get("/studio/engine/apps").await,
         r.get("/studio/engine/vertical/follow").await,
         r.put("/studio/engine/vertical/follow", json!({ "scene": "Vertical", "item": 1 })).await,
         r.put("/studio/engine/captions", json!({ "on": true, "source": "Mic" })).await,

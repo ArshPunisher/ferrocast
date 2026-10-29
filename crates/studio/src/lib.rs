@@ -2590,6 +2590,45 @@ impl Drop for Streaming {
     }
 }
 
+/// The app in front (its name as the Dock shows it), for a scene per game. None where it
+/// can't be told (not a Mac yet) or nothing is.
+pub fn front_app() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        ws.frontmostApplication().and_then(|a| a.localizedName()).map(|n| n.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Apps open now with a window in the Dock (not this one), by name, sorted: what a scene per
+/// game can be set for.
+pub fn running_apps() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSApplicationActivationPolicy;
+        let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        let me = objc2_app_kit::NSRunningApplication::currentApplication().localizedName().map(|n| n.to_string());
+        let mut names: Vec<String> = ws
+            .runningApplications()
+            .iter()
+            .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+            .filter_map(|a| a.localizedName().map(|n| n.to_string()))
+            .filter(|n| Some(n) != me.as_ref())
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        names
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

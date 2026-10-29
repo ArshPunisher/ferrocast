@@ -254,6 +254,16 @@ pub struct ScenesConfig {
     pub away_minutes: u32,
     /// Saying "clip that" while live captions listen saves a clip (the Studio only).
     pub clip_by_voice: bool,
+    /// A scene per game: when that app comes to the front, its scene goes on air (the Studio
+    /// on a Mac). Empty: off.
+    pub game_scenes: Vec<GameScene>,
+}
+
+/// An app (by the name the Dock shows) and the scene for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameScene {
+    pub app: String,
+    pub scene: String,
 }
 
 impl Default for ScenesConfig {
@@ -270,6 +280,7 @@ impl Default for ScenesConfig {
             vertical_clips: false,
             away_minutes: 0,
             clip_by_voice: false,
+            game_scenes: Vec::new(),
         }
     }
 }
@@ -278,6 +289,17 @@ impl ScenesConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.chat_allowed.len() > 50 {
             return Err("chat_allowed: 50 scenes at most.".into());
+        }
+        if self.game_scenes.len() > 20 {
+            return Err("game_scenes: 20 at most.".into());
+        }
+        for (i, g) in self.game_scenes.iter().enumerate() {
+            for (field, v) in [("app", &g.app), ("scene", &g.scene)] {
+                let t = v.trim();
+                if t.is_empty() || t.chars().count() > 100 || t.contains('\n') {
+                    return Err(format!("game_scenes.{i}.{field}: 1 to 100 characters on one line."));
+                }
+            }
         }
         if self.away_minutes > 60 {
             return Err("away_minutes: 0 (off) to 60 minutes.".into());
@@ -500,6 +522,22 @@ pub fn recap_vars(thanks: &[String], follows: u64, subs: u64, duration_ms: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_scenes_are_checked() {
+        let g = |app: &str, scene: &str| GameScene { app: app.into(), scene: scene.into() };
+        let ok = ScenesConfig { game_scenes: vec![g("Minecraft", "In game")], ..ScenesConfig::default() };
+        assert!(ok.validate().is_ok());
+        for bad in [g("", "In game"), g("Minecraft", " "), g("a\nb", "In game"), g(&"x".repeat(101), "In game")] {
+            let c = ScenesConfig { game_scenes: vec![bad.clone()], ..ScenesConfig::default() };
+            assert!(c.validate().is_err(), "{bad:?}");
+        }
+        let many = ScenesConfig { game_scenes: vec![g("A", "B"); 21], ..ScenesConfig::default() };
+        assert!(many.validate().is_err());
+        // Saved before game scenes: none, still valid.
+        let old: ScenesConfig = serde_json::from_str(r#"{"clip_command": true}"#).unwrap();
+        assert!(old.game_scenes.is_empty());
+    }
 
     #[test]
     fn show_config() {

@@ -1635,6 +1635,15 @@ impl StudioHost for DesktopStudio {
         Ok(started.1)
     }
 
+    async fn apps(&self, running: bool) -> Result<Value, String> {
+        // AppKit answers on the main thread.
+        self.on_main(move |_| {
+            let list = if running { ferrocast_studio::running_apps() } else { Vec::new() };
+            json!({ "front": ferrocast_studio::front_app(), "running": list })
+        })
+        .await
+    }
+
     async fn record_split(&self) -> Result<(), String> {
         self.on_main(|h| {
             let r = h.record.as_ref().ok_or("Nothing is recording.")?;

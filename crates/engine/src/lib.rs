@@ -337,6 +337,7 @@ impl Engine {
         tokio::spawn(studio::run(engine.clone()));
         tokio::spawn(studio::away::run(engine.clone()));
         tokio::spawn(studio::voice_clip::run(engine.clone()));
+        tokio::spawn(studio::game_scenes::run(engine.clone()));
         tokio::spawn(studio::stream_info::youtube_when_live(engine.clone()));
         engine.load_music().await;
         tokio::spawn(music::run(engine.clone()));

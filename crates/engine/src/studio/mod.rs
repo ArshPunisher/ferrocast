@@ -19,6 +19,7 @@
 pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
+pub(crate) mod game_scenes;
 pub mod moments;
 pub mod obs_tools;
 pub(crate) mod rig;

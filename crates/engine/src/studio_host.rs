@@ -284,6 +284,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn follow_face(&self, _set: Option<FollowSet>) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// The app in front, and (with `running`) every app open now → `{ front, running }`, for a
+    /// scene per game. None and [] where it can't be told.
+    async fn apps(&self, _running: bool) -> Result<Value, String> {
+        Ok(serde_json::json!({ "front": null, "running": [] }))
+    }
     /// Quits and opens Ferrocast again (macOS applies a new permission only then).
     async fn restart(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -2000,6 +2005,11 @@ impl Engine {
             s.check().map_err(EngineError::Invalid)?;
         }
         self.studio_host()?.captions(set).await.map_err(captions_failed)
+    }
+
+    /// The app in front and the apps open → `{ front, running }`.
+    pub async fn studio_apps(&self, running: bool) -> Result<Value, EngineError> {
+        self.studio_host()?.apps(running).await.map_err(failed)
     }
 
     /// Smart vertical → `{ on, scene, item, face }`.
