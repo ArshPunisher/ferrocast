@@ -893,11 +893,16 @@ impl DesktopStudio {
     }
 }
 
-/// Where following stands → `{ on, scene, item, face }` (`face`: one was seen just now).
+/// Where following stands → `{ on, scene, item, found, face, what }`.
 fn follow_status(h: &Held) -> Value {
     match &h.follow {
-        Some(f) => json!({ "on": true, "scene": f.scene, "item": f.id, "face": f.misses == 0 }),
-        None => json!({ "on": false, "scene": null, "item": null, "face": false }),
+        Some(f) => json!({
+            "on": true, "scene": f.scene, "item": f.id,
+            // `found`: what it follows was seen in the last look; `face`: a face was.
+            "found": f.misses == 0, "face": f.misses == 0 && !f.action,
+            "what": if f.action { "action" } else { "face" },
+        }),
+        None => json!({ "on": false, "scene": null, "item": null, "found": false, "face": false, "what": null }),
     }
 }
 
@@ -915,7 +920,7 @@ impl DesktopStudio {
                     }
                     let (Some(c), Some(f)) = (&h.collection, &h.follow) else { return None };
                     match c.follow_look(f) {
-                        Ok(look) => Some(look),
+                        Ok(look) => Some(look.map(|l| (l, f.action))),
                         Err(_) => {
                             // The item or its scene went: stop (there's nothing to put back).
                             h.follow = None;
@@ -929,8 +934,10 @@ impl DesktopStudio {
                 Ok(Some(None)) => continue,
                 _ => return,
             };
+            let (look, action) = look;
             let face = tokio::task::spawn_blocking(move || {
-                ferrocast_studio::find_faces(&look.rgba, look.width, look.height).first().copied()
+                let find = if action { ferrocast_studio::find_busy } else { ferrocast_studio::find_faces };
+                find(&look.rgba, look.width, look.height).first().copied()
             })
             .await
             .ok()
@@ -1605,6 +1612,7 @@ impl StudioHost for DesktopStudio {
                         c.stop_follow(&f);
                     }
                     h.follow_run += 1;
+                    let action = set.what.as_deref() == Some("action");
                     if let (Some(scene), Some(item)) = (set.scene, set.item) {
                         if !cfg!(target_os = "macos") {
                             return Err("Following your face works on a Mac for now.".to_string());
@@ -1612,7 +1620,7 @@ impl StudioHost for DesktopStudio {
                         if !c.vertical().is_some_and(|v| v.scenes.iter().any(|s| s.name == scene)) {
                             return Err(format!("There's no scene called \"{scene}\" in the vertical picture."));
                         }
-                        h.follow = Some(c.start_follow(scene.trim(), item).map_err(|e| e.to_string())?);
+                        h.follow = Some(c.start_follow(scene.trim(), item, action).map_err(|e| e.to_string())?);
                         run = Some(h.follow_run);
                     }
                 }

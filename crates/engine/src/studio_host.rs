@@ -522,12 +522,15 @@ pub struct FollowSet {
     pub scene: Option<String>,
     #[serde(default)]
     pub item: Option<i64>,
+    /// "face" (the default) or "action": what stands out, as in a game.
+    #[serde(default)]
+    pub what: Option<String>,
 }
 
 impl FollowSet {
     pub fn check(&self) -> Result<(), String> {
         match (&self.scene, self.item) {
-            (None, None) => Ok(()),
+            (None, None) => Ok::<(), String>(()),
             (Some(s), Some(i)) => {
                 let s = s.trim();
                 if s.is_empty() || s.chars().count() > 100 || s.contains('\n') {
@@ -539,6 +542,10 @@ impl FollowSet {
                 }
             }
             _ => Err("scene and item: both to follow a face, neither to stop.".into()),
+        }?;
+        match self.what.as_deref() {
+            None | Some("face") | Some("action") => Ok(()),
+            Some(_) => Err("what: face or action.".into()),
         }
     }
 }
@@ -2504,7 +2511,7 @@ mod tests {
 
     #[test]
     fn following_needs_both_scene_and_item_or_neither() {
-        let set = |scene: Option<&str>, item| FollowSet { scene: scene.map(String::from), item };
+        let set = |scene: Option<&str>, item| FollowSet { scene: scene.map(String::from), item, what: None };
         assert!(set(None, None).check().is_ok());
         assert!(set(Some("Vertical"), Some(3)).check().is_ok());
         for bad in
@@ -2515,6 +2522,9 @@ mod tests {
         assert!(set(Some("V"), Some(-1)).check().is_err());
         assert!(set(Some(&"v".repeat(101)), Some(1)).check().is_err());
         assert!(serde_json::from_str::<FollowSet>(r#"{"scene":"V","item":1,"x":2}"#).is_err());
+        let action = FollowSet { what: Some("action".into()), ..set(Some("V"), Some(1)) };
+        assert!(action.check().is_ok());
+        assert!(FollowSet { what: Some("cat".into()), ..set(Some("V"), Some(1)) }.check().is_err());
     }
 
     #[tokio::test]

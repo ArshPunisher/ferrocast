@@ -40,6 +40,20 @@ pub fn find_faces(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
     }
 }
 
+/// Where the eye goes in an RGBA picture (what stands out: the action in a game), biggest
+/// first; none where Vision isn't.
+pub fn find_busy(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::vision::busy(rgba, w, h).into_iter().map(|f| Face { x: f.x, y: f.y, w: f.w, h: f.h }).collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (rgba, w, h);
+        Vec::new()
+    }
+}
+
 /// A small picture of what an item shows, to look for faces in.
 #[derive(Debug, Clone)]
 pub struct FollowLook {
@@ -53,6 +67,8 @@ pub struct FollowLook {
 pub struct FaceFollow {
     pub scene: String,
     pub id: i64,
+    /// Follows what stands out (the action) instead of a face.
+    pub action: bool,
     before: Transform,
     /// Looks in a row without a face.
     pub misses: u32,
@@ -84,7 +100,7 @@ pub(crate) fn shown_mid(face: &Face, src_w: f32, crop_left: f32, crop_right: f32
 impl Collection {
     /// Starts an item following faces: it fills the picture's height, centred, from its top
     /// left (how it was comes back with [`Collection::stop_follow`]).
-    pub fn start_follow(&self, scene: &str, id: i64) -> Result<FaceFollow, StudioError> {
+    pub fn start_follow(&self, scene: &str, id: i64, action: bool) -> Result<FaceFollow, StudioError> {
         let before = self.transform(scene, id)?;
         let (cw, ch) = self.size_of(self.scene_ptr(scene)?);
         let shown_w = (before.width as i32 - before.crop_left - before.crop_right).max(1) as f32;
@@ -107,7 +123,7 @@ impl Collection {
             ..before.clone()
         };
         self.set_transform(scene, id, &t)?;
-        Ok(FaceFollow { scene: scene.into(), id, before, misses: 0 })
+        Ok(FaceFollow { scene: scene.into(), id, action, before, misses: 0 })
     }
 
     /// A small picture of what the item's source shows now.

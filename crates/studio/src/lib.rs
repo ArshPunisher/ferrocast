@@ -28,7 +28,7 @@ pub use collection::{
     AudioInfo, AudioSnap, BOUNDS, CHANNEL_KEYS, Captions, Collection, DEINTERLACE, Face, FaceFollow, FilterInfo,
     FilterSnap, FollowLook, ItemEdit, ItemInfo, ItemSnap, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor,
     SceneInfo, SceneSnap, SourceUse, StudioOptions, TBarState, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo,
-    WebAct, ask_captions_access, captions_access, find_faces,
+    WebAct, ask_captions_access, captions_access, find_busy, find_faces,
 };
 use ffi::{Api, cstr, text};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
