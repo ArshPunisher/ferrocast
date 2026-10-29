@@ -361,6 +361,13 @@ impl Studio {
             let name = cstr(m);
             api.obs_add_disabled_module(name.as_ptr());
         }
+        // On a Mac, OBS's browser plugin can't start outside OBS.app (it fails each time,
+        // ~0.15 s): web pages are Ferrocast's own WebKit source there. Windows keeps it.
+        #[cfg(target_os = "macos")]
+        {
+            let name = cstr("obs-browser");
+            api.obs_add_disabled_module(name.as_ptr());
+        }
         let core = paths.core.as_ref().map(|(b, d)| (cstr(b), cstr(d)));
         let mut places = vec![(bin.as_c_str(), pdata.as_c_str())];
         places.extend(core.as_ref().map(|(b, d)| (b.as_c_str(), d.as_c_str())));
