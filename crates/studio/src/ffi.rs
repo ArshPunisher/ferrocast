@@ -210,6 +210,17 @@ pub type LoadSourceCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource);
 pub type SaveFilterCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource) -> bool;
 pub type VolmeterCb = unsafe extern "C" fn(*mut c_void, *const f32, *const f32, *const f32);
 pub type AudioDeviceCb = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool;
+/// libobs's `obs_source_audio_capture_t`: a source's audio, after its filters.
+pub type AudioCaptureCb = unsafe extern "C" fn(*mut c_void, *mut ObsSource, *const AudioData, bool);
+
+/// libobs's `struct audio_data`: up to 8 planes of `frames` samples each.
+#[repr(C)]
+#[derive(Debug)]
+pub struct AudioData {
+    pub data: [*mut u8; 8],
+    pub frames: u32,
+    pub timestamp: u64,
+}
 
 macro_rules! api {
     ($( $name:ident : fn($($arg:ident : $a:ty),*) $(-> $r:ty)?; )*) => {
@@ -619,6 +630,8 @@ api! {
     obs_encoder_set_audio: fn(a: *mut ObsEncoder, b: *mut AudioT);
     obs_encoder_release: fn(a: *mut ObsEncoder);
     obs_encoder_update: fn(a: *mut ObsEncoder, b: *mut ObsData);
+    obs_source_add_audio_capture_callback: fn(a: *mut ObsSource, b: AudioCaptureCb, c: *mut c_void);
+    obs_source_remove_audio_capture_callback: fn(a: *mut ObsSource, b: AudioCaptureCb, c: *mut c_void);
     obs_output_create: fn(a: *const c_char, b: *const c_char, c: *mut ObsData, d: *mut ObsData) -> *mut ObsOutput;
     obs_output_set_video_encoder: fn(a: *mut ObsOutput, b: *mut ObsEncoder);
     obs_output_set_audio_encoder: fn(a: *mut ObsOutput, b: *mut ObsEncoder, c: usize);
@@ -1611,6 +1624,10 @@ pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: 
         }
     }
 }
+
+/// Live captions with Apple's Speech recognizer (plan item 7).
+#[cfg(target_os = "macos")]
+pub(crate) mod speech;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {

@@ -21,11 +21,14 @@ base64 = "0.23"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSThread", "NSArray", "NSEnumerator", "NSString", "NSURL", "NSURLRequest", "NSError"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSThread", "NSArray", "NSEnumerator", "NSString", "NSURL", "NSURLRequest", "NSError", "NSLocale"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSImage", "NSGraphics", "NSScreen", "NSEvent", "objc2-core-foundation"] }
 # The Web page source: a WKWebView snapshotted into a texture (2.1, Browser source on WebKit).
 objc2-web-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKSnapshotConfiguration", "WKNavigation", "WKUserScript", "WKUserContentController", "WKPreferences", "WKScriptMessage", "WKScriptMessageHandler"] }
 block2 = "0.6"
+# Live captions: Apple's Speech recognizer on the device, fed the Studio's audio (plan item 7).
+objc2-speech = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-avf-audio", "SFErrors", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFSpeechRecognitionTaskHint", "SFSpeechRecognizer", "SFTranscription"] }
+objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioBuffer", "AVAudioFormat", "AVAudioTypes"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

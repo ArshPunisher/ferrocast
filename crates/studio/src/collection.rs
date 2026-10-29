@@ -3351,6 +3351,50 @@ impl Collection {
         out
     }
 
+    /// Live captions from a sound (plan item 7): its audio, after its filters, to the Mac's
+    /// own speech recognizer; `on_text` gets the sentence heard so far, and true once it's
+    /// finished, on the main thread. macOS only; elsewhere it says so.
+    pub fn start_captions(
+        &self,
+        source: &str,
+        on_text: impl Fn(String, bool) + 'static,
+    ) -> Result<Captions, StudioError> {
+        #[cfg(target_os = "macos")]
+        {
+            use ffi::speech::{Access, Listener, Unavailable};
+            let src = self.find(source).ok_or_else(|| no_source(source))?.ptr;
+            let mut info =
+                ffi::AudioInfo2 { samples_per_sec: 0, speakers: 0, max_buffering_ms: 0, fixed_buffering: false };
+            let rate = if self.api().obs_get_audio_info2(&mut info) && info.samples_per_sec > 0 {
+                info.samples_per_sec
+            } else {
+                48_000
+            };
+            match Listener::start(self.api(), src, rate, on_text) {
+                Ok(listener) => Ok(Captions { listener, _studio: self.studio.clone() }),
+                Err(Unavailable::NoAccess(Access::NotAsked)) => {
+                    Err(StudioError::Failed("Allow speech recognition first.".into()))
+                }
+                Err(Unavailable::NoAccess(_)) => Err(StudioError::Failed(
+                    "Ferrocast isn't allowed to recognise speech: turn it on in System Settings, Privacy & Security, Speech Recognition."
+                        .into(),
+                )),
+                Err(Unavailable::NotOnDevice) => Err(StudioError::Failed(
+                    "This Mac can't recognise your language on the device yet: in System Settings, Keyboard, turn on Dictation to download it."
+                        .into(),
+                )),
+                Err(Unavailable::NoRecognizer) => {
+                    Err(StudioError::Failed("Speech recognition isn't available on this Mac.".into()))
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (source, on_text);
+            Err(StudioError::Failed("Live captions work on a Mac for now.".into()))
+        }
+    }
+
     pub fn let_thumbs_go(&self, all: bool) {
         const KEEP: std::time::Duration = std::time::Duration::from_secs(10);
         let a = self.api();
@@ -3723,6 +3767,53 @@ pub(crate) struct Place {
     pub bounds: Option<(f32, f32)>,
     /// The source's size after cropping.
     pub size: (u32, u32),
+}
+
+/// Live captions running on one sound; dropping it stops them.
+#[derive(Debug)]
+pub struct Captions {
+    // Dropped first: the listener uses the Studio's libobs, kept alive by the field after it.
+    #[cfg(target_os = "macos")]
+    listener: ffi::speech::Listener,
+    _studio: Studio,
+}
+
+impl Captions {
+    /// False once recognition kept failing and stopped (turn them on again to retry).
+    pub fn working(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.listener.working()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+}
+
+/// Speech recognition for this app: "allowed", "not_asked", "denied", "restricted", or
+/// "unsupported" where there's none.
+pub fn captions_access() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        match ffi::speech::access() {
+            ffi::speech::Access::Allowed => "allowed",
+            ffi::speech::Access::NotAsked => "not_asked",
+            ffi::speech::Access::Denied => "denied",
+            ffi::speech::Access::Restricted => "restricted",
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unsupported"
+    }
+}
+
+/// Shows macOS's prompt for speech recognition (once).
+pub fn ask_captions_access() {
+    #[cfg(target_os = "macos")]
+    ffi::speech::ask();
 }
 
 /// A capture on air that shows nothing (`capture_problems`): `problem` is `permission`
