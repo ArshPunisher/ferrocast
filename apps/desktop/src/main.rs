@@ -198,7 +198,10 @@ fn main() {
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
-        RunEvent::Exit => tracing::info!("Ferrocast quitting"),
+        RunEvent::Exit => {
+            studio::end_session();
+            tracing::info!("Ferrocast quitting");
+        }
         _ => {}
     });
 }

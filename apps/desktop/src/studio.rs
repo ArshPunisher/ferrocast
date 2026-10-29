@@ -359,6 +359,48 @@ fn record_folder(s: &StudioSettings) -> PathBuf {
 /// How the last remux went: `{ from, to, percent, done, error }`, or null.
 static REMUX: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 
+/// Where the Studio's note of what it's doing is kept while it runs (`session.json`): still
+/// there when Ferrocast opens means it didn't close normally, and the next Start puts things
+/// back as they were.
+static SESSION: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// What the note said at launch, for the next Start.
+static CRASHED: std::sync::Mutex<Option<ferrocast_engine::studio_host::Recovered>> = std::sync::Mutex::new(None);
+/// Set when Ferrocast quits normally, so the note isn't written again on the way out.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the note holds: what's on now (`None`: the Studio isn't running).
+fn session_now(h: &Held) -> Option<ferrocast_engine::studio_host::Recovered> {
+    h.collection.as_ref()?;
+    Some(ferrocast_engine::studio_host::Recovered {
+        record: h.record.is_some(),
+        replay: h.replay.is_some(),
+        live: h.stream.is_some(),
+        ..Default::default()
+    })
+}
+
+/// Writes the note (or removes it when the Studio isn't running).
+fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
+    let Some(file) = SESSION.get() else { return };
+    if QUITTING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    match now {
+        Some(s) => save_json(file, &serde_json::to_value(s).unwrap_or(Value::Null)),
+        None => {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// Ferrocast is quitting normally: the note goes, so the next launch isn't taken for a crash.
+pub fn end_session() {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(file) = SESSION.get() {
+        let _ = std::fs::remove_file(file);
+    }
+}
+
 /// What live captions last heard, as the "Captions" text source shows it.
 static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -815,7 +857,36 @@ pub struct DesktopStudio {
 
 impl DesktopStudio {
     pub fn new(app: AppHandle, data: PathBuf) -> DesktopStudio {
-        DesktopStudio { app, data }
+        let file = data.join("studio").join("session.json");
+        // A note left from last time: Ferrocast didn't close normally while the Studio ran.
+        if let Some(r) = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<ferrocast_engine::studio_host::Recovered>(&b).ok())
+        {
+            tracing::warn!(?r, "Ferrocast didn't close normally last time; the next Start puts the Studio back");
+            if let Ok(mut c) = CRASHED.lock() {
+                *c = Some(r);
+            }
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = SESSION.set(file);
+        let me = DesktopStudio { app, data };
+        let watcher = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
+        tauri::async_runtime::spawn(async move { watcher.session_loop().await });
+        me
+    }
+
+    /// Every 2 s, the note of what the Studio is doing, written when it changes.
+    async fn session_loop(&self) {
+        let mut last: Option<Option<ferrocast_engine::studio_host::Recovered>> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let Ok(now) = self.on_main(|h| session_now(h)).await else { continue };
+            if last.as_ref() != Some(&now) {
+                write_session(now.as_ref());
+                last = Some(now);
+            }
+        }
     }
 
     /// Runs `f` on the main thread with the libobs state and waits for its answer.
@@ -889,6 +960,7 @@ impl DesktopStudio {
             version: h.collection.as_ref().and(h.studio.as_ref()).map(Studio::version),
             renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
             detail: (!found).then(|| NO_OBS.into()),
+            recovered: None,
         }
     }
 }
@@ -1024,7 +1096,10 @@ impl StudioHost for DesktopStudio {
             save(&collection, &file);
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             h.collection = Some(collection);
-            Ok(Self::status_of(h))
+            write_session(session_now(h).as_ref());
+            // The first Start after a crash says what was on, for the engine to put back.
+            let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
+            Ok(StudioStatus { recovered, ..Self::status_of(h) })
         })
         .await?
     }
@@ -1054,6 +1129,7 @@ impl StudioHost for DesktopStudio {
             if let Some(c) = h.collection.take() {
                 save(&c, &file);
             }
+            write_session(None);
             Self::status_of(h)
         })
         .await

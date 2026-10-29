@@ -22,6 +22,25 @@ pub struct StudioStatus {
     pub renderer: Option<String>,
     /// Why it isn't available, in plain words with what to do.
     pub detail: Option<String>,
+    /// Only on the Start after Ferrocast didn't close normally (a crash): what was on then, and
+    /// what came back on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered: Option<Recovered>,
+}
+
+/// What the Studio was doing when Ferrocast last closed without quitting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovered {
+    pub record: bool,
+    pub replay: bool,
+    /// It was live: the stream isn't started again by itself (the dashboard offers it).
+    pub live: bool,
+    /// What came back on ("recording", "replay buffer").
+    #[serde(default)]
+    pub again: Vec<String>,
+    /// What didn't, in words.
+    #[serde(default)]
+    pub failed: Vec<String>,
 }
 
 /// A box in the dashboard window, in CSS pixels from its top-left corner.
@@ -1721,7 +1740,25 @@ impl Engine {
     }
 
     pub async fn studio_start(&self) -> Result<StudioStatus, EngineError> {
-        self.studio_host()?.start().await.map_err(failed)
+        let mut status = self.studio_host()?.start().await.map_err(failed)?;
+        // After a crash: the replay buffer and the recording come back on as they were (a new
+        // file); the stream waits for the streamer.
+        if let Some(r) = status.recovered.as_mut() {
+            if r.replay {
+                match self.studio_replay(true).await {
+                    Ok(_) => r.again.push("replay buffer".into()),
+                    Err(e) => r.failed.push(format!("The replay buffer didn't start: {e}")),
+                }
+            }
+            if r.record {
+                match self.studio_record(true).await {
+                    Ok(_) => r.again.push("recording".into()),
+                    Err(e) => r.failed.push(format!("Recording didn't start: {e}")),
+                }
+            }
+            tracing::info!(?r, "the Studio came back after Ferrocast closed unexpectedly");
+        }
+        Ok(status)
     }
 
     pub async fn studio_stop(&self) -> Result<StudioStatus, EngineError> {
