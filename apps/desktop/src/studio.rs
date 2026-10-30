@@ -251,6 +251,28 @@ fn record_encode(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
 }
 
 /// The scene collection in use now. Switches happen on the main thread, so read it there.
+/// The scene list from a saved collection (OBS's format: `scene_order`, `current_scene`), as
+/// the Studio lists them when running, marked `saved` (nothing is on air).
+fn saved_scenes(doc: Option<&Value>) -> Value {
+    let names: Vec<&str> = doc
+        .and_then(|d| d.get("scene_order"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("name").and_then(Value::as_str))
+        .collect();
+    let scenes: Vec<Value> =
+        names.iter().map(|n| json!({ "name": n, "items": 0, "current": false, "preview": false })).collect();
+    json!({
+        "scenes": scenes,
+        "current": doc.and_then(|d| d.get("current_scene")).and_then(Value::as_str).unwrap_or(""),
+        "transition": null,
+        "preview": null,
+        "vertical": null,
+        "saved": true,
+    })
+}
+
 fn scenes_file(data: &std::path::Path) -> PathBuf {
     library::load(data).current_file(data, Kind::Collections)
 }
@@ -1366,6 +1388,12 @@ impl StudioHost for DesktopStudio {
         let app = self.app.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
+            // The Studio off: its scenes from the saved file, so the show, BRB and the scene
+            // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
+            if act == StudioAct::Scenes && h.collection.is_none() {
+                let saved = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                return Ok(saved_scenes(saved.as_ref()));
+            }
             if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
                 // Next to the recordings, as OBS does.
                 let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
@@ -2432,6 +2460,25 @@ mod log_tests {
         std::fs::write(&even, format!("{}\n{}\n", "a".repeat(399), "b".repeat(399))).unwrap();
         assert_eq!(log_tail(&even, 1).unwrap(), ["b".repeat(399)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod saved_scene_tests {
+    use super::saved_scenes;
+    use serde_json::json;
+
+    #[test]
+    fn a_saved_collection_lists_its_scenes_in_order() {
+        let doc = json!({ "current_scene": "Main", "scene_order": [{ "name": "Starting" }, { "name": "Main" }, { "name": "Ending" }] });
+        let v = saved_scenes(Some(&doc));
+        let names: Vec<&str> = v["scenes"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Starting", "Main", "Ending"]);
+        assert_eq!(v["current"], "Main");
+        assert_eq!(v["saved"], true);
+        // No file, or one without scenes: an empty list, never an error.
+        assert_eq!(saved_scenes(None)["scenes"], json!([]));
+        assert_eq!(saved_scenes(Some(&json!({ "scene_order": "nope" })))["scenes"], json!([]));
     }
 }
 
