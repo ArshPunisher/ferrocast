@@ -5,6 +5,17 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.2.2
+
+- The Show tab asks how your stream should start: Just go live, Countdown first (a Starting screen
+  and a countdown, then your stream) or Full show (adds alerts, the bot, a Discord post and a
+  thank-you at the end). Pick one and it's saved; Customise has the details.
+- Go live runs the style you picked, and ending your stream runs its ending. There's no separate
+  Start show or Start streaming button any more. While a show runs, its countdown can still be
+  skipped or cancelled.
+- The BRB scene and the show's scene lists show your Studio scenes even before you start the
+  Studio, and never say OBS isn't connected when you use the Studio.
+
 ## 2.2.1
 
 This update also brings 2.2.0, which wasn't released on its own: live captions in any language,
