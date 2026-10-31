@@ -45,6 +45,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+# The vod_track example's little RTMP server (as Go live's tests use).
+rml_rtmp = "0.8"
 # The examples print libobs's own log (FERROCAST_LOG=info).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

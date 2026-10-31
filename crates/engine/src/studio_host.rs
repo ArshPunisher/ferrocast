@@ -740,6 +740,9 @@ pub struct StudioSettings {
     pub reconnect_tries: u32,
     /// Viewers see everything this many seconds later (0: off).
     pub delay_s: u32,
+    /// Twitch's VOD track: this audio track (2 to 6) also goes to Twitch for the VOD (leave
+    /// music off it); 0: off.
+    pub twitch_vod_track: u8,
     /// 44100 or 48000 (applies after a restart).
     pub sample_rate: u32,
     pub stereo: bool,
@@ -833,6 +836,7 @@ impl Default for StudioSettings {
             reconnect_every_s: 2,
             reconnect_tries: 25,
             delay_s: 0,
+            twitch_vod_track: 0,
             sample_rate: 48000,
             stereo: true,
             monitoring: None,
@@ -882,6 +886,9 @@ impl StudioSettings {
         let bad = |m: &str| Err(EngineError::Invalid(m.into()));
         if !["hardware", "software"].contains(&self.encoder.as_str()) {
             return bad("encoder: hardware or software.");
+        }
+        if self.twitch_vod_track == 1 || self.twitch_vod_track > 6 {
+            return bad("twitch_vod_track: 0 (off) or an audio track from 2 to 6.");
         }
         if !(500..=60_000).contains(&self.video_kbps) {
             return bad("video_kbps: 500 to 60000.");

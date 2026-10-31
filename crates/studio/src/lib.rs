@@ -1164,13 +1164,29 @@ impl Studio {
         a.obs_data_release(settings);
         let (oid, oname) = (cstr("rtmp_output"), cstr("ferrocast-stream"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), ptr::null_mut(), ptr::null_mut());
-        let stream =
-            Streaming { studio: self.clone(), out, service, venc, aenc, settings: s.clone(), directs: Vec::new() };
+        let mut stream = Streaming {
+            studio: self.clone(),
+            out,
+            service,
+            venc,
+            aenc,
+            vod: ptr::null_mut(),
+            settings: s.clone(),
+            directs: Vec::new(),
+        };
         if service.is_null() || out.is_null() {
             return Err(StudioError::Failed("the stream output couldn't be made".into()));
         }
         a.obs_output_set_video_encoder(out, venc);
         a.obs_output_set_audio_encoder(out, aenc, 0);
+        // The VOD track: the main picture's stream only (a vertical one has no Twitch VOD).
+        if let Some(t) = s.vod_track.filter(|_| video.is_null()) {
+            if !(2..=6).contains(&t) {
+                return Err(StudioError::Failed("vod_track: an audio track from 2 to 6.".into()));
+            }
+            stream.vod = self.audio_encoder(s.encode.audio_kbps, usize::from(t - 1))?;
+            a.obs_output_set_audio_encoder(out, stream.vod, 1);
+        }
         a.obs_output_set_service(out, service);
         match s.reconnect {
             Some((retries, every_s)) => a.obs_output_set_reconnect_settings(out, retries as c_int, every_s as c_int),
@@ -2532,6 +2548,11 @@ pub struct StreamSettings {
     pub reconnect: Option<(u32, u32)>,
     /// Viewers see it this many seconds later (0: no delay).
     pub delay_s: u32,
+    /// Twitch's VOD track: this audio track (2 to 6) sent too, as a second track (OBS's own
+    /// way, Enhanced RTMP multitrack audio). Twitch keeps it for the VOD (music left out there)
+    /// while viewers hear track 1. None: one track.
+    #[serde(default)]
+    pub vod_track: Option<u8>,
 }
 
 /// The engine's own load.
@@ -2570,6 +2591,8 @@ pub struct Streaming {
     service: *mut ffi::ObsService,
     venc: *mut ffi::ObsEncoder,
     aenc: *mut ffi::ObsEncoder,
+    /// The VOD track's encoder (null without one).
+    vod: *mut ffi::ObsEncoder,
     settings: StreamSettings,
     /// Destinations sent straight from here (SRT, RIST, WebRTC), by id.
     directs: Vec<Direct>,
@@ -2792,6 +2815,9 @@ impl Drop for Streaming {
         }
         a.obs_encoder_release(self.venc);
         a.obs_encoder_release(self.aenc);
+        if !self.vod.is_null() {
+            a.obs_encoder_release(self.vod);
+        }
     }
 }
 

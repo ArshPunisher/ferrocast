@@ -259,6 +259,7 @@ fn stream_settings(studio: &Studio, s: &StudioSettings) -> StreamSettings {
         encode: encode_of(studio, s),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
         delay_s: s.delay_s,
+        vod_track: (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track),
     }
 }
 
