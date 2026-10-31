@@ -152,6 +152,11 @@ jobs:
           # Signed as the app is: signing the app checks every binary inside it is signed.
           codesign --force --options runtime --sign "${APPLE_SIGNING_IDENTITY:--}" \
             target/universal-apple-darwin/release/obs-ffmpeg-mux
+      # The Studio runs OBS's engine; the app carries it, so users don't install OBS.
+      - name: OBS's engine inside the app (macOS)
+        if: matrix.name == 'macOS'
+        shell: bash
+        run: deploy/obs-runtime-macos.sh
       - name: Build the app
         shell: bash
         env:
@@ -176,8 +181,11 @@ jobs:
         run: |
           bundles=""
           if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
-          # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
-          cargo tauri build ${{ matrix.args }} $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          # On macOS, deploy/obs-runtime-macos.sh wrote the list of OBS's engine files to copy in.
+          obs=""
+          if [[ "$OS_NAME" == macOS ]]; then obs="--config obs-runtime/tauri.obs.json"; fi
+          # shellcheck disable=SC2086 # matrix.args, $bundles and $obs hold separate words.
+          cargo tauri build ${{ matrix.args }} $bundles $obs --config '{"bundle":{"createUpdaterArtifacts":true}}'
       - name: Remove the signing keychain
         if: always() && matrix.name == 'macOS'
         shell: bash

@@ -10,3 +10,4 @@
 *.db-shm
 /apps/desktop/gen
 node_modules
+/apps/desktop/obs-runtime
