@@ -633,11 +633,17 @@ async fn the_studio_engine_needs_the_desktop_app() {
             .await,
         r.post("/studio/engine/redo", json!({})).await,
         r.put("/studio/engine/preview/cursor", json!({ "cursor": "nwse-resize" })).await,
+        r.post("/studio/engine/sources/Camera/record", json!({ "on": true })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0, "y": 0, "rotation": 0, "scale_x": 1, "scale_y": 1, "alignment": 5, "bounds": "none", "bounds_alignment": 0, "bounds_width": 0, "bounds_height": 0, "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0 })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
     // Bad input is refused before anything else.
+    let long = "a".repeat(101);
+    for bad in ["%0A", long.as_str()] {
+        let res = r.post(&format!("/studio/engine/sources/{bad}/record"), json!({ "on": true })).await;
+        assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
     for bad in ["", "url(x.png), auto", "MOVE", &"a".repeat(33)] {
         let res = r.put("/studio/engine/preview/cursor", json!({ "cursor": bad })).await;
         assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{bad}");

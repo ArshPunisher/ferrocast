@@ -102,6 +102,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/options", get(engine_source_options))
         .route("/studio/engine/sources/{name}/audio", put(engine_set_audio))
         .route("/studio/engine/sources/{name}/filters", get(engine_filters).post(engine_add_filter))
+        .route("/studio/engine/sources/{name}/record", post(engine_record_source))
         .route("/studio/engine/sources/{name}/filters/{filter}", delete(engine_remove_filter))
         .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
         .route("/studio/engine/sources/{name}/web", post(engine_web))
@@ -1190,6 +1191,15 @@ struct OnBody {
 
 async fn engine_record(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record(b.on).await?))
+}
+
+/// `POST /studio/engine/sources/{name}/record` `{ on }`: that source recorded on its own.
+async fn engine_record_source(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<OnBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_record_source(&name, b.on).await?))
 }
 
 /// `GET /studio/engine/sources/{name}/media` → `{ state, time_ms, duration_ms }`.

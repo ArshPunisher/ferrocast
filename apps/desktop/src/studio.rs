@@ -41,6 +41,8 @@ struct Held {
     /// The vertical picture's stream, beside the main one.
     vstream: Option<Streaming>,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
+    /// Sources recorded on their own (Source Record): name, recording, file.
+    source_records: Vec<(String, Recording, PathBuf)>,
     replay: Option<ferrocast_studio::ReplayBuffer>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
     settings: Option<StudioSettings>,
@@ -1276,6 +1278,7 @@ impl StudioHost for DesktopStudio {
             h.vstream = None;
             h.stream = None;
             h.record = None;
+            h.source_records.clear();
             h.replay = None;
             h.virtualcam = None;
             h.preview = None;
@@ -1642,6 +1645,11 @@ impl StudioHost for DesktopStudio {
                 "canvas": studio.canvas(),
                 "stream": h.stream.as_ref().map(stats_of),
                 "record": h.record.as_ref().map(record_stats),
+                // Sources recorded on their own.
+                "source_records": h.source_records.iter().map(|(n, _, f)| json!({
+                    "name": n,
+                    "file": f.display().to_string(),
+                })).collect::<Vec<_>>(),
                 // Free space where recordings go (OBS's Stats shows it).
                 "disk_free_mb": disk_free,
                 "replay": h.replay.as_ref().map(|r| json!({
@@ -1705,6 +1713,56 @@ impl StudioHost for DesktopStudio {
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
             h.record = Some(r);
+            Ok(v)
+        })
+        .await?
+    }
+
+    async fn record_source(&self, name: String, on: bool) -> Result<Value, String> {
+        self.on_main(move |h| {
+            let at = h.source_records.iter().position(|(n, _, _)| *n == name);
+            if !on {
+                // Dropping it waits for the file to be finished.
+                if let Some(i) = at {
+                    h.source_records.remove(i);
+                }
+                return Ok(json!({ "file": null }));
+            }
+            if let Some(i) = at {
+                if h.source_records[i].1.stats().active {
+                    return Ok(json!({ "file": h.source_records[i].2.display().to_string() }));
+                }
+                // It stopped by itself (a full disk…): started again below.
+                h.source_records.remove(i);
+            }
+            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let s = h.settings.clone().unwrap_or_default();
+            let folder = record_folder(&s);
+            std::fs::create_dir_all(&folder)
+                .map_err(|e| format!("The recordings folder {} can't be made: {e}", folder.display()))?;
+            // The usual name pattern, after the source's name ("Camera 2026-10-31 17-20-05").
+            let plan = ferrocast_studio::RecordPlan {
+                folder,
+                // Characters no file name may hold (on any system) become dashes.
+                name: format!(
+                    "{} {}",
+                    name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "-"),
+                    s.record_name
+                ),
+                format: s.record_format.clone(),
+                spaces: s.record_spaces,
+                overwrite: s.record_overwrite,
+                split_minutes: s.record_split_minutes,
+                split_mb: s.record_split_mb,
+                tracks: s.record_tracks.clone(),
+                encode: record_encode(studio, &s),
+                muxer: s.record_muxer.clone(),
+            };
+            let file = studio.record_path(&plan);
+            let rec = studio.record_source_to(&name, &file, &plan).map_err(|e| e.to_string())?;
+            tracing::info!(source = %name, file = %file.display(), "the Studio is recording a source on its own");
+            let v = json!({ "file": file.display().to_string() });
+            h.source_records.push((name, rec, file));
             Ok(v)
         })
         .await?

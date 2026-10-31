@@ -201,6 +201,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn replay_save(&self) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Records one scene or source on its own (OBS's Source Record), or stops it → `{ file }`
+    /// (null when stopped).
+    async fn record_source(&self, _name: String, _on: bool) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Starts the virtual camera showing what's on air (`source` None) or one scene or
     /// source, or stops it → `{ active }`.
     async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {
@@ -1858,6 +1863,13 @@ impl Engine {
 
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
         self.studio_host()?.record(on).await.map_err(failed)
+    }
+
+    pub async fn studio_record_source(&self, name: &str, on: bool) -> Result<Value, EngineError> {
+        if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(EngineError::Invalid("name: a scene or source's name.".into()));
+        }
+        self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)
     }
 
     pub async fn studio_record_pause(&self, on: bool) -> Result<(), EngineError> {
