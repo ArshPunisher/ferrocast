@@ -632,11 +632,16 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.put("/studio/engine/transitions/obs_stinger_transition/settings", json!({ "settings": { "path": "/a.webm" } }))
             .await,
         r.post("/studio/engine/redo", json!({})).await,
+        r.put("/studio/engine/preview/cursor", json!({ "cursor": "nwse-resize" })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/transform", json!({ "x": 0, "y": 0, "rotation": 0, "scale_x": 1, "scale_y": 1, "alignment": 5, "bounds": "none", "bounds_alignment": 0, "bounds_width": 0, "bounds_height": 0, "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0 })).await,
     ] {
         assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
     }
     // Bad input is refused before anything else.
+    for bad in ["", "url(x.png), auto", "MOVE", &"a".repeat(33)] {
+        let res = r.put("/studio/engine/preview/cursor", json!({ "cursor": bad })).await;
+        assert_eq!(code(res).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
     // Speech models: listed without the desktop app; an unknown one is a 404 (no download
     // is started in tests).
     let list: Value = r.get("/speech/models").await.json().await.unwrap();

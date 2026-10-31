@@ -173,6 +173,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn vertical_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
         Ok(())
     }
+    /// The cursor over the pictures, by its CSS name: on Windows they take the mouse
+    /// themselves and pass it on to the page, which says what it shows there.
+    async fn preview_cursor(&self, _cursor: String) -> Result<(), String> {
+        Ok(())
+    }
     /// The settings a new source of `kind` starts with.
     async fn defaults(&self, kind: String) -> Result<Value, String>;
     /// Does one thing to the scene collection (checked before it gets here) and answers what
@@ -2167,6 +2172,14 @@ impl Engine {
         host.preview(rect).await.map_err(failed)?;
         host.program_view(program).await.map_err(failed)?;
         host.vertical_view(vertical).await.map_err(failed)
+    }
+
+    /// The cursor over the pictures (a CSS cursor name, as the page's stage shows it there).
+    pub async fn studio_preview_cursor(&self, cursor: String) -> Result<(), EngineError> {
+        if cursor.is_empty() || cursor.len() > 32 || !cursor.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+            return Err(EngineError::Invalid("cursor: a CSS cursor name, like move or nwse-resize.".into()));
+        }
+        self.studio_host()?.preview_cursor(cursor).await.map_err(failed)
     }
 }
 

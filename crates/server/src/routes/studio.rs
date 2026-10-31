@@ -51,6 +51,7 @@ pub(crate) fn routes() -> Router<AppState> {
             get(engine_item_transform).put(engine_set_item_transform),
         )
         .route("/studio/engine/preview/selection", put(engine_select))
+        .route("/studio/engine/preview/cursor", put(engine_cursor))
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
@@ -384,6 +385,17 @@ struct PreviewBody {
 /// `PUT /studio/engine/preview` `{ rect: {x, y, w, h} | null }`: the preview over the page's box.
 async fn engine_preview(State(app): State<AppState>, Body(b): Body<PreviewBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview(b.rect, b.program, b.vertical).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CursorBody {
+    cursor: String,
+}
+
+/// `PUT /studio/engine/preview/cursor` `{ cursor }`: the cursor over the pictures (Windows).
+async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -> ApiResult<StatusCode> {
+    app.engine.studio_preview_cursor(b.cursor).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
