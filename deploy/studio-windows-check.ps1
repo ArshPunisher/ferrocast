@@ -94,6 +94,8 @@ try {
   Write-Host "Inputs: $(($kinds.inputs | ForEach-Object id) -join ', ')"
   $scene = (Api GET '/studio/engine/scenes').current
   Api POST "/studio/engine/scenes/$([uri]::EscapeDataString($scene))/items" @{ kind = 'color_source'; name = 'Box' } | Out-Null
+  # Bigger than the canvas, so the middle of the picture is on it.
+  Api PUT '/studio/engine/sources/Box/settings' @{ settings = @{ width = 3840; height = 2160; color = 4278222847 } } | Out-Null
 
   # The picture: the page puts it over its stage once the Studio runs.
   $view = Wait 'the picture' 60 { $v = [Win]::Child($app.Id, 'FerrocastPreview'); if ($v -ne [IntPtr]::Zero) { $v } }
