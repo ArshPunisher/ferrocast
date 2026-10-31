@@ -178,6 +178,42 @@ At every step the Studio looks and works the same, and every step ships on its o
 | **E6. Beyond OBS** | Keyframes, crash-proof helper processes, guests, WebAssembly plugins, HDR | Each feature on its own |
 | **E7. libobs optional** | Engine default; the libobs bridge becomes an optional download for old OBS plugins | Installer without libobs; parity list fully ticked |
 
+### Status
+
+**1 Nov 2026 (one night's run): E0 done; E1 built; E2's compositor matches libobs; E3 and E4
+started; the engine core runs with no libobs at all.** All in `crates/av` (`ferrocast-av`), not
+used by the app yet.
+
+Checked against libobs by `cargo run -p ferrocast-studio --example engine_match -- <dir>
+[opengl]` (pixels more than 2 of 255 apart, out of 921,600):
+
+| What libobs does | Our engine | Metal | OpenGL |
+|---|---|---|---|
+| Placement: move, scale, turn, alignment, crop, every bounds kind | `transform.rs` (libobs's own sums) | 0 | 0 |
+| Mixing: sRGB-aware in linear light, older sources (Text) in gamma, premultiplied images | `compose.rs` | 0 | 0 |
+| Scale filters: point, bilinear, bicubic, lanczos, area (down and up), low-res | `draw.wgsl` (libobs's effects ported) | 0 | 0 |
+| Blend modes (7), sRGB-off blending; Metal's alpha rule differs from D3D/GL's, both matched | `compose.rs` | 0 | 0 |
+| Groups, nested scenes (cropped, blended) | `compose.rs` | 0 | 0 |
+| Ferrocast's filters: rounded, border, shadow, shape, blur/pixelate, looks (chained) | `effects.wgsl` | 0 | — |
+| Transitions: fade, fade to colour, slide, swipe, luma wipe (held at 40% by the T-bar) | `transition.wgsl` | 0 | — |
+| NV12 for encoders (BT.709 limited, chroma sited left) | `render_nv12` | 0 | — |
+
+| Step | Built | Checked |
+|---|---|---|
+| E1 outputs | VideoToolbox H.264/HEVC (CBR, average, quality), AudioToolbox AAC (priming compensated), FLV (classic and Enhanced RTMP HEVC), crash-safe fragmented MP4, `Pipeline` into Go live's hub (`Hub::start/video/audio/end` now public), `Studio::program_feed` (libobs's frames handed over) | `own_stream`: 25 min over real RTMP and to MP4, all 45,002 frames, sync within 2 ms of libobs's own recording throughout |
+| E3 audio | `mix.rs`: timestamps (70 ms jitter smoothing, as libobs), any rate to 48 kHz (rubato), volume, mute, balance (sine law), mono, sync offset, 6 tracks, levels; `afx.rs`: gain, invert, noise gate, compressor, limiter, expander/gate, upward compressor, 3-band EQ, ported from obs-filters line for line | unit tests (placement to the sample, pitch kept, an hour of blocks without drift); not yet compared against libobs's output |
+| E4 sources | image (PNG, JPEG, animated GIF with its timing, WebP, BMP), text (cosmic-text: any font, emoji in colour, RTL and Indic scripts, outline, shadow, gradient, wrap, align, chat-log mode), screen and window capture (ScreenCaptureKit), cameras and microphones (AVFoundation), media files (AVAssetReader, looping) | screen capture run (stats only); media: every beep within 6 ms of its flash over 25 s and two loops (libobs's media source drifted −20 to +63 ms on the same kind of clip); cameras and microphones built, not run yet |
+| E7 core | `engine.rs`: sources, scenes, cut and transitions, outputs with a canvas each (size, scene, rate divisor, track), its own frame loop on the host clock | `own_engine`: screen + text + test pattern, no libobs, over RTMP and to MP4: sync within 1 ms |
+
+Speed: a 1080p frame (background, game, camera uploaded each frame with rounded corners and
+border, a turned bicubic logo, a lower third) drawn and read back as NV12 in **2.7 ms** on this
+Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps frame.
+Still to do: Windows (D3D11 checks; Media Foundation, NVENC, AMF, QSV encoders; WGC, WASAPI and
+Media Foundation capture); camera, microphone and app-sound runs on real devices; the engine
+wired into the app (behind a switch, libobs kept); zero-copy (IOSurface and shared D3D textures
+from capture to encoder); stingers and "Move"; libobs's own filters (chroma key, LUT, sharpen…);
+monitoring (hearing a sound locally); web pages; game capture (E5); helper processes (E6).
+
 ### Honest sizes and risks
 
 - **OBS is about 12 years and ~600,000 lines of C/C++.** We don't need all of it: the parity list
