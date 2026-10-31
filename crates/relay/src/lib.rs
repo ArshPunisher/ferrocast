@@ -21,6 +21,7 @@ pub mod bot;
 pub mod cloud;
 pub mod db;
 pub mod discord;
+pub mod guests;
 mod history;
 pub mod kick;
 pub mod mail;
@@ -130,6 +131,8 @@ pub struct AppState {
     pub(crate) accounts: Arc<accounts::Runtime>,
     /// Cloud mode (docs/CLOUD.md): off without the web host and the vault key.
     pub(crate) cloud: Arc<cloud::Runtime>,
+    /// Guest cameras: the PCs' link sockets and the guests waiting for an answer.
+    pub(crate) guests: Arc<guests::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -159,6 +162,7 @@ impl AppState {
             admin: Arc::default(),
             accounts: Arc::default(),
             cloud: Arc::default(),
+            guests: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -379,6 +383,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin_pro::routes())
         .merge(accounts::routes())
         .merge(cloud::routes())
+        .merge(guests::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
@@ -499,6 +504,8 @@ async fn link(State(st): State<AppState>, headers: HeaderMap, ws: WebSocketUpgra
 async fn link_loop(st: AppState, install: String, socket: WebSocket) {
     let (mut tx, mut rx) = socket.split();
     let wake = st.waker(&install);
+    // Guests' offers for this PC come down this socket while it's open (guests.rs).
+    let (_attached, mut guest_frames) = guests::Runtime::attach(&st, &install);
     let mut sent_up_to = 0i64;
     let mut ping = tokio::time::interval(Duration::from_secs(30));
     loop {
@@ -517,6 +524,11 @@ async fn link_loop(st: AppState, install: String, socket: WebSocket) {
         }
         tokio::select! {
             _ = wake.notified() => {}
+            Some(frame) = guest_frames.recv() => {
+                if tx.send(Message::Text(Utf8Bytes::from(frame))).await.is_err() {
+                    return;
+                }
+            }
             _ = ping.tick() => {
                 if tx.send(Message::Ping(Default::default())).await.is_err() {
                     return;
@@ -529,6 +541,8 @@ async fn link_loop(st: AppState, install: String, socket: WebSocket) {
                             && let Some(id) = v["id"].as_i64()
                         {
                             let _ = st.db.ack(&install, id);
+                        } else if v["type"] == "guest_answer" {
+                            st.guests.answered(&install, &v);
                         } else if v["type"] == "bot_seen" {
                             // The PC's bot is on: the cloud bot stands by (bot::lease).
                             bot::seen_frame(&st, &install, &v);

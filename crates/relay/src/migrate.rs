@@ -69,6 +69,7 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "Cloud mode: documents, overlay URLs, channels, media",
         sql: &[crate::cloud::SCHEMA],
     },
+    Migration { version: 17, name: "Guest cameras: invites", sql: &[crate::guests::SCHEMA] },
 ];
 
 pub(crate) fn latest() -> i64 {

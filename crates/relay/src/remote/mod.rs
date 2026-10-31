@@ -21,7 +21,7 @@ pub(crate) mod limits;
 mod offline;
 #[cfg(test)]
 mod offline_tests;
-mod proxy;
+pub(crate) mod proxy;
 pub mod scope;
 mod store;
 #[cfg(test)]
