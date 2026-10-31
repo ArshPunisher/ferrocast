@@ -61,7 +61,7 @@ fn no_pad(_: &[[f32; 4]]) -> f32 {
 
 /// Every filter's shader starts with this: the uniforms libobs and the filter set, the vertex
 /// shader, and helpers in source pixels.
-const HEADER: &str = "
+pub(crate) const HEADER: &str = "
 uniform float4x4 ViewProj;
 uniform texture2d image;
 uniform float2 size;
@@ -106,7 +106,7 @@ float rbox(float2 px, float2 half_size, float r)
 }
 ";
 
-const FOOTER: &str = "
+pub(crate) const FOOTER: &str = "
 technique Draw
 {
 	pass
@@ -607,35 +607,35 @@ unsafe extern "C" fn video_render(data: *mut c_void, _effect: *mut GsEffect) {
 }
 
 /// `enum obs_allow_direct_render`: the source may draw straight into the filter.
-const OBS_ALLOW_DIRECT_RENDERING: c_int = 1;
+pub(crate) const OBS_ALLOW_DIRECT_RENDERING: c_int = 1;
 /// `enum obs_combo_type` OBS_COMBO_TYPE_LIST, `enum obs_combo_format` OBS_COMBO_FORMAT_INT.
-const COMBO_LIST: c_int = 2;
-const COMBO_FORMAT_INT: c_int = 1;
+pub(crate) const COMBO_LIST: c_int = 2;
+pub(crate) const COMBO_FORMAT_INT: c_int = 1;
 /// `enum obs_source_type` OBS_SOURCE_TYPE_FILTER; `OBS_SOURCE_VIDEO`.
-const OBS_SOURCE_TYPE_FILTER: c_int = 1;
-const OBS_SOURCE_VIDEO: u32 = 1 << 0;
+pub(crate) const OBS_SOURCE_TYPE_FILTER: c_int = 1;
+pub(crate) const OBS_SOURCE_VIDEO: u32 = 1 << 0;
 
 /// `struct obs_source_info` up to `video_render` (libobs 32.2's order); libobs takes the size
 /// given and zero-fills the rest.
 #[repr(C)]
-struct SourceInfo {
-    id: *const c_char,
-    kind: c_int,
-    output_flags: u32,
-    get_name: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
-    create: Option<unsafe extern "C" fn(*mut ObsData, *mut ObsSource) -> *mut c_void>,
-    destroy: Option<unsafe extern "C" fn(*mut c_void)>,
-    get_width: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
-    get_height: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
-    get_defaults: Option<unsafe extern "C" fn(*mut ObsData)>,
-    get_properties: Option<unsafe extern "C" fn(*mut c_void) -> *mut ObsProperties>,
-    update: Option<unsafe extern "C" fn(*mut c_void, *mut ObsData)>,
-    activate: Option<unsafe extern "C" fn(*mut c_void)>,
-    deactivate: Option<unsafe extern "C" fn(*mut c_void)>,
-    show: Option<unsafe extern "C" fn(*mut c_void)>,
-    hide: Option<unsafe extern "C" fn(*mut c_void)>,
-    video_tick: Option<unsafe extern "C" fn(*mut c_void, f32)>,
-    video_render: Option<unsafe extern "C" fn(*mut c_void, *mut GsEffect)>,
+pub(crate) struct SourceInfo {
+    pub(crate) id: *const c_char,
+    pub(crate) kind: c_int,
+    pub(crate) output_flags: u32,
+    pub(crate) get_name: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
+    pub(crate) create: Option<unsafe extern "C" fn(*mut ObsData, *mut ObsSource) -> *mut c_void>,
+    pub(crate) destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub(crate) get_width: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub(crate) get_height: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    pub(crate) get_defaults: Option<unsafe extern "C" fn(*mut ObsData)>,
+    pub(crate) get_properties: Option<unsafe extern "C" fn(*mut c_void) -> *mut ObsProperties>,
+    pub(crate) update: Option<unsafe extern "C" fn(*mut c_void, *mut ObsData)>,
+    pub(crate) activate: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub(crate) deactivate: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub(crate) show: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub(crate) hide: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub(crate) video_tick: Option<unsafe extern "C" fn(*mut c_void, f32)>,
+    pub(crate) video_render: Option<unsafe extern "C" fn(*mut c_void, *mut GsEffect)>,
 }
 
 fn register_one<const I: usize>(api: &Api) {

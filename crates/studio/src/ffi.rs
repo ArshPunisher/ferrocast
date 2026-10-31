@@ -1654,6 +1654,10 @@ pub(crate) mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
 
+/// Remove background (macOS): Vision's person mask, applied by a shader.
+#[cfg(target_os = "macos")]
+pub(crate) mod cutout;
+
 /// Ferrocast's own picture filters (every platform): Rounded corners, Border, Shadow and glow,
 /// Shape, Blur or pixelate an area, Colour looks.
 pub(crate) mod shaders;

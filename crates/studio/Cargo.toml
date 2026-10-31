@@ -31,7 +31,9 @@ objc2-speech = { version = "0.3", default-features = false, features = ["std", "
 objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioBuffer", "AVAudioFormat", "AVAudioTypes"] }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
 # Smart vertical: Apple's Vision finds faces in a small snapshot of the item (plan item 8).
-objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-image-io", "VNTypes", "VNRequest", "VNRequestHandler", "VNObservation", "VNDetectFaceRectanglesRequest", "VNGenerateAttentionBasedSaliencyImageRequest"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "objc2-image-io", "VNTypes", "VNRequest", "VNRequestHandler", "VNObservation", "VNDetectFaceRectanglesRequest", "VNGenerateAttentionBasedSaliencyImageRequest", "VNGeneratePersonSegmentationRequest", "VNStatefulRequest", "objc2-core-video"] }
+# Remove background reads Vision's person mask (a CVPixelBuffer).
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 
 # The Studio's picture in the app's window (a child window libobs draws into with D3D11).
 [target.'cfg(windows)'.dependencies]
