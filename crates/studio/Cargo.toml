@@ -81,6 +81,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # The workspace forbids unsafe code. Calling libobs needs it, so here it is denied instead and
 # allowed in src/ffi.rs only, each block with its SAFETY reason (LESSONS R-73).
+[[example]]
+name = "denoise"
+required-features = ["deepfilter"]
+
 [lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
