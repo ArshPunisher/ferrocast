@@ -247,6 +247,15 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn vertical_stream_stop(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Streams a lighter copy of what's on air (720p, 3,000 kbps at most) to `server`/`key`
+    /// beside the full one, for platforms that take it. Running already: nothing changes.
+    async fn light_stream_start(&self, _server: String, _key: String) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Stops the lighter stream (the full one goes on).
+    async fn light_stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
     /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
@@ -2025,6 +2034,9 @@ impl Engine {
         if let Some(note) = self.studio_sync_vertical().await {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
+        if let Some(note) = self.studio_sync_light().await {
+            also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+        }
         if let (Some(also), Some(o)) = (also, v.as_object_mut()) {
             o.insert("also".into(), Value::String(also));
         }
@@ -2060,6 +2072,28 @@ impl Engine {
                 Some("The vertical stream didn't start; the wide one did.".into())
             }
         }
+    }
+
+    /// Starts or stops the Studio's lighter stream to match: while the Studio streams, it goes
+    /// to Go live's light key when a ticked platform takes it → a note when it can't.
+    pub(crate) async fn studio_sync_light(&self) -> Option<String> {
+        let host = self.studio_host().ok()?;
+        let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
+        let wanted = self.golive_config().destinations.iter().any(|d| d.enabled && d.wants_light());
+        if !streaming || !wanted {
+            if let Err(e) = host.light_stream_stop().await {
+                tracing::warn!(error = %e, "the Studio's lighter stream didn't stop");
+            }
+            return None;
+        }
+        let started = match self.golive_light_ingest().await {
+            Ok((server, key)) => host.light_stream_start(server, key).await,
+            Err(e) => Err(e.to_string()),
+        };
+        started.err().map(|e| {
+            tracing::warn!(error = %e, "the Studio's lighter stream didn't start");
+            "The lighter stream didn't start; the full one did.".to_string()
+        })
     }
 
     /// A vertical platform is ticked and the vertical picture comes from a canvas (the Studio's

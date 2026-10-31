@@ -1547,6 +1547,16 @@ async fn go_live_routes_refuse_what_is_wrong() {
     assert_eq!(v["vertical_live"], false);
     assert_eq!(v["destinations"][0]["enabled"], false);
     assert_eq!(v["live"], false);
+    // The lighter stream: on a main platform, never the vertical one or an unknown one.
+    let v: Value = r.put("/api/v1/golive/destinations/kick/light", json!({ "on": true })).await.json().await.unwrap();
+    let kick = v["destinations"].as_array().unwrap().iter().find(|d| d["id"] == "kick").cloned().unwrap();
+    assert_eq!(kick["light"], true);
+    let vertical = r.put("/api/v1/golive/destinations/youtube_vertical/light", json!({ "on": true })).await;
+    assert_eq!(error_code(vertical).await.0, StatusCode::BAD_REQUEST);
+    let nobody = r.put("/api/v1/golive/destinations/nope/light", json!({ "on": true })).await;
+    assert_eq!(error_code(nobody).await.0, StatusCode::NOT_FOUND);
+    let v: Value = r.put("/api/v1/golive/destinations/kick/light", json!({ "on": false })).await.json().await.unwrap();
+    assert!(v["destinations"].as_array().unwrap().iter().all(|d| d.get("light").is_none()), "off isn't saved");
     // The order must list every destination once.
     let short =
         r.put("/api/v1/golive/destinations", json!({ "destinations": [{ "id": "twitch", "enabled": true }] })).await;

@@ -75,6 +75,17 @@ pub struct DestinationConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_main")]
     pub canvas: Canvas,
+    /// Gets the lighter stream (720p, 3,000 kbps) the Ferrocast Studio sends beside the full
+    /// one: for a platform whose route is slow, or that takes less. The main picture only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub light: bool,
+}
+
+impl DestinationConfig {
+    /// Takes the lighter stream (the main picture, an RTMP platform).
+    pub fn wants_light(&self) -> bool {
+        self.light && self.canvas == Canvas::Main && self.url.as_deref().and_then(direct_kind).is_none()
+    }
 }
 
 /// A server address the Studio sends to itself (SRT, RIST, WebRTC/WHIP), not an RTMP
@@ -254,6 +265,7 @@ impl Default for GoLiveConfig {
             url: None,
             enabled: false,
             canvas: Canvas::Main,
+            light: false,
         };
         Self {
             destinations: vec![
@@ -406,6 +418,9 @@ pub struct DestinationView {
     /// absent for RTMP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct: Option<&'static str>,
+    /// Takes the Studio's lighter stream (left out when not).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub light: bool,
 }
 
 /// Go live's runtime state, one per engine.
@@ -414,6 +429,8 @@ pub(crate) struct GoLive {
     pub hub: Arc<Hub>,
     /// OBS's vertical canvas (A2.3).
     pub vhub: Arc<Hub>,
+    /// The Studio's lighter stream, for platforms that take it (`DestinationConfig::light`).
+    pub lhub: Arc<Hub>,
     pub cfg: RwLock<GoLiveConfig>,
     ingest: Mutex<Option<String>>,
     running: Mutex<HashMap<String, Running>>,
@@ -451,6 +468,7 @@ impl Default for GoLive {
         Self {
             hub: Hub::new(),
             vhub: Hub::new(),
+            lhub: Hub::new(),
             cfg: RwLock::new(GoLiveConfig::default()),
             ingest: Mutex::new(None),
             running: Mutex::new(HashMap::new()),
@@ -473,6 +491,8 @@ impl Default for GoLive {
 struct Running {
     stop: watch::Sender<bool>,
     health: watch::Receiver<Health>,
+    /// Sending the lighter stream (it moves when that starts or stops).
+    light: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -529,6 +549,11 @@ fn vertical_key(main: &str) -> String {
     format!("{main}v")
 }
 
+/// The lighter stream's local key, likewise.
+fn light_key(main: &str) -> String {
+    format!("{main}l")
+}
+
 pub(crate) fn refused_pub(code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> EngineError {
     refused(code, message, hint)
 }
@@ -573,14 +598,14 @@ impl Engine {
         };
         // The streamer's port from Advanced mode (0 is for tests: any free port).
         let port = if port == 0 { 0 } else { self.golive_config().advanced.port };
-        let (hub, vhub) = (self.golive().hub.clone(), self.golive().vhub.clone());
-        let vkey = vertical_key(&key);
+        let (hub, vhub, lhub) = (self.golive().hub.clone(), self.golive().vhub.clone(), self.golive().lhub.clone());
+        let (vkey, lkey) = (vertical_key(&key), light_key(&key));
         let bound = match Ingest::bind(port, key.clone(), hub.clone()).await {
             Ok(i) => Ok(i),
             Err(_) if port != 0 => Ingest::bind(0, key, hub).await,
             Err(e) => Err(e),
         };
-        let ingest = match bound.map(|i| i.with_route(vkey, vhub)) {
+        let ingest = match bound.map(|i| i.with_route(vkey, vhub).with_route(lkey, lhub)) {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!(error = %e, "Go live: the local server couldn't start");
@@ -602,7 +627,7 @@ impl Engine {
     /// Never while either stream is live.
     pub async fn golive_new_key(&self) -> Result<(), EngineError> {
         let g = self.golive();
-        if g.hub.live().borrow().on || g.vhub.live().borrow().on {
+        if g.hub.live().borrow().on || g.vhub.live().borrow().on || g.lhub.live().borrow().on {
             return Err(refused(
                 "golive_streaming",
                 "A stream is coming in right now.",
@@ -634,7 +659,8 @@ impl Engine {
             };
             let ingest = bound
                 .map_err(|e| EngineError::Unavailable(format!("the local server couldn't restart: {e}")))?
-                .with_route(vertical_key(&key), g.vhub.clone());
+                .with_route(vertical_key(&key), g.vhub.clone())
+                .with_route(light_key(&key), g.lhub.clone());
             *lock(&g.ingest) = Some(ingest.server_url());
             let (stop, stop_rx) = watch::channel(false);
             let task = tokio::spawn(ingest.run(stop_rx));
@@ -704,6 +730,23 @@ impl Engine {
         Ok((server, vertical_key(&key)))
     }
 
+    /// Where the Studio sends its lighter stream: the local server and the light key.
+    pub async fn golive_light_ingest(&self) -> Result<(String, String), EngineError> {
+        let (server, key) = self.golive_ingest().await?;
+        Ok((server, light_key(&key)))
+    }
+
+    /// Whether a destination takes the lighter stream now: it wants it and the Studio sends it.
+    /// Until then (or streaming from OBS, which has no lighter copy) it takes the full one.
+    fn on_light(&self, d: &DestinationConfig) -> bool {
+        d.wants_light() && self.golive().lhub.live().borrow().on
+    }
+
+    /// The stream a destination takes: the lighter one, the vertical one or the main one.
+    fn hub_of(&self, d: &DestinationConfig) -> &Arc<Hub> {
+        if self.on_light(d) { &self.golive().lhub } else { self.hub_for(d.canvas) }
+    }
+
     fn hub_for(&self, c: Canvas) -> &Arc<Hub> {
         match c {
             Canvas::Main => &self.golive().hub,
@@ -769,6 +812,7 @@ impl Engine {
                         (true, Canvas::Vertical) => probe::rules(&vertical_stats, d.kind),
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
+                    light: d.wants_light(),
                 }
             })
             .collect();
@@ -1012,6 +1056,33 @@ impl Engine {
         Ok(next)
     }
 
+    /// Gives destination `id` the Studio's lighter stream (720p, 3,000 kbps) or the full one.
+    /// Running, it starts again on the stream it now takes; the Studio's lighter stream follows.
+    pub async fn set_golive_light(&self, id: &str, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
+        if on && d.canvas != Canvas::Main {
+            return Err(EngineError::Invalid("light: the vertical stream has no lighter copy.".into()));
+        }
+        if on && d.url.as_deref().and_then(direct_kind).is_some() {
+            return Err(EngineError::Invalid(
+                "light: SRT, RIST and WebRTC servers get the full stream from the Studio.".into(),
+            ));
+        }
+        if d.light == on {
+            return Ok(cfg);
+        }
+        d.light = on;
+        self.save_golive(cfg.clone()).await?;
+        drop(one_at_a_time);
+        if let Some(r) = lock(&self.golive().running).remove(id) {
+            r.stop.send_replace(true);
+        }
+        self.reconcile().await;
+        Ok(cfg)
+    }
+
     /// Adds a custom destination: a name, an `rtmp://` or `rtmps://` server, and its key
     /// (kept in the secret store). It starts ticked.
     pub async fn add_golive_destination(
@@ -1074,6 +1145,7 @@ impl Engine {
             url: Some(url),
             enabled: true,
             canvas,
+            light: false,
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
@@ -1338,13 +1410,21 @@ impl Engine {
     pub(crate) async fn reconcile(&self) {
         let g = self.golive();
         let _one = g.reconciling.lock().await;
-        let (main_on, vertical_on) = (g.hub.live().borrow().on, g.vhub.live().borrow().on);
-        let on = |c: Canvas| match c {
-            Canvas::Main => main_on,
+        let (main_on, vertical_on, light_on) =
+            (g.hub.live().borrow().on, g.vhub.live().borrow().on, g.lhub.live().borrow().on);
+        let on = |d: &DestinationConfig| match d.canvas {
+            Canvas::Main => main_on || (d.wants_light() && light_on),
             Canvas::Vertical => vertical_on,
         };
         let want: Vec<DestinationConfig> =
-            self.golive_config().destinations.into_iter().filter(|d| d.enabled && on(d.canvas)).collect();
+            self.golive_config().destinations.into_iter().filter(|d| d.enabled && on(d)).collect();
+        // One whose stream changed (the lighter one started or stopped) starts again on the other.
+        for d in &want {
+            let moved = lock(&g.running).get(&d.id).is_some_and(|r| r.light != self.on_light(d));
+            if moved && let Some(r) = lock(&g.running).remove(&d.id) {
+                r.stop.send_replace(true);
+            }
+        }
         let wanted = |id: &String| want.iter().any(|d| &d.id == id);
         let stale: Vec<String> = lock(&g.running).keys().filter(|id| !wanted(id)).cloned().collect();
         for id in stale {
@@ -1364,8 +1444,9 @@ impl Engine {
             self.start_destination(&d).await;
         }
         self.reconcile_cut().await;
-        // The Studio's vertical stream follows the ticked platforms and the source.
+        // The Studio's vertical and lighter streams follow the ticked platforms and the source.
         self.studio_sync_vertical().await;
+        self.studio_sync_light().await;
         self.send_golive();
     }
 
@@ -1490,8 +1571,8 @@ impl Engine {
                 let (health_tx, health) =
                     watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
                 let (stop, stop_rx) = watch::channel(false);
-                tokio::spawn(ferrocast_golive::push::run(dest, self.hub_for(d.canvas).clone(), health_tx, stop_rx));
-                lock(&g.running).insert(d.id.clone(), Running { stop, health });
+                tokio::spawn(ferrocast_golive::push::run(dest, self.hub_of(d).clone(), health_tx, stop_rx));
+                lock(&g.running).insert(d.id.clone(), Running { stop, health, light: self.on_light(d) });
             }
             Err(reason) => {
                 tracing::info!(dest = %d.id, %reason, "Go live: a destination can't start");
@@ -1570,7 +1651,7 @@ impl Engine {
             }
             let _ = host.direct_stop(id).await;
         });
-        lock(&g.running).insert(d.id.clone(), Running { stop, health });
+        lock(&g.running).insert(d.id.clone(), Running { stop, health, light: false });
     }
 
     /// Turns upload protection on or off. Off brings every paused destination back.
@@ -1724,7 +1805,7 @@ fn describe_service(s: &StreamService) -> String {
 /// while either is live, sends the health lines and runs upload protection every second.
 pub(crate) async fn run(engine: Engine) {
     let g = engine.golive();
-    let (mut main, mut vertical) = (g.hub.live(), g.vhub.live());
+    let (mut main, mut vertical, mut light) = (g.hub.live(), g.vhub.live(), g.lhub.live());
     let mut was = (false, false);
     loop {
         let any = was.0 || was.1;
@@ -1732,6 +1813,7 @@ pub(crate) async fn run(engine: Engine) {
         let changed = tokio::select! {
             r = main.changed() => { if r.is_err() { return; } true }
             r = vertical.changed() => { if r.is_err() { return; } true }
+            r = light.changed() => { if r.is_err() { return; } true }
             _ = tokio::time::sleep(HEALTH_EVERY), if any => false,
         };
         if changed {

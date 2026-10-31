@@ -21,6 +21,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/ingest", get(ingest))
         .route("/golive/destinations", put(order).post(add))
         .route("/golive/destinations/{id}", delete(remove))
+        .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
@@ -81,6 +82,17 @@ struct AddBody {
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {
     let d = app.engine.add_golive_destination(&b.name, &b.url, &b.key, b.canvas).await?;
     Ok((StatusCode::CREATED, Json(json!(d))).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnBody {
+    on: bool,
+}
+
+/// `PUT /golive/destinations/{id}/light` `{ on }`: the Studio's lighter stream for it, or the full one.
+async fn light(State(app): State<AppState>, Path(id): Path<String>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_light(&id, b.on).await?)))
 }
 
 async fn remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
