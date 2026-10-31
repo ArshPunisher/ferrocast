@@ -420,6 +420,8 @@ impl Studio {
         // Ferrocast's own Web page source (WebKit), in place of OBS's Chromium one (R-78).
         #[cfg(target_os = "macos")]
         ffi::web::register(&inner.api);
+        // Ferrocast's own Rounded corners filter.
+        ffi::rounded::register(&inner.api);
         Ok(Studio { inner })
     }
 

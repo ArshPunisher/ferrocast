@@ -819,6 +819,18 @@ api! {
     obs_property_editable_list_filter: fn(a: *mut ObsProperty) -> *const c_char;
     obs_enter_graphics: fn();
     obs_leave_graphics: fn();
+    gs_effect_create: fn(a: *const c_char, b: *const c_char, c: *mut *mut c_char) -> *mut GsEffect;
+    gs_effect_destroy: fn(a: *mut GsEffect);
+    gs_effect_set_float: fn(a: *mut GsEparam, b: f32);
+    gs_effect_set_vec2: fn(a: *mut GsEparam, b: *const Vec2);
+    obs_filter_get_target: fn(a: *mut ObsSource) -> *mut ObsSource;
+    obs_source_get_base_width: fn(a: *mut ObsSource) -> u32;
+    obs_source_get_base_height: fn(a: *mut ObsSource) -> u32;
+    obs_source_process_filter_begin: fn(a: *mut ObsSource, b: c_int, c: c_int) -> bool;
+    obs_source_process_filter_end: fn(a: *mut ObsSource, b: *mut GsEffect, c: u32, d: u32);
+    obs_source_skip_video_filter: fn(a: *mut ObsSource);
+    obs_properties_add_int_slider: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char, d: c_int, e: c_int, f: c_int) -> *mut ObsProperty;
+    obs_property_int_set_suffix: fn(a: *mut ObsProperty, b: *const c_char);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
@@ -1635,6 +1647,9 @@ pub(crate) mod tap;
 /// Faces in a picture with Apple's Vision (plan item 8, smart vertical).
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
+
+/// Ferrocast's Rounded corners filter (every platform).
+pub(crate) mod rounded;
 
 /// The Studio's picture in the app's window on Windows (the macOS one is `mac::ChildView`).
 #[cfg(windows)]
