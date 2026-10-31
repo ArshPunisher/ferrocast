@@ -75,8 +75,9 @@ foreach ($f in $Checks) { Take (Join-Path $src "bin\64bit\$f") $root }
 # Visual Studio on this machine (CI's runner has it).
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vs = & $vswhere -latest -products * -property installationPath
+# Version folders (14.44.35112) newest first, then the others beside them (v145).
 $crt = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Directory |
-  Sort-Object { [version]($_.Name -replace '[^0-9.]', '') } -Descending |
+  Sort-Object { if ($_.Name -match '^\d+(\.\d+){1,3}$') { [version]$_.Name } else { [version]'0.0' } } -Descending |
   ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'x64') -Directory -Filter 'Microsoft.VC*.CRT' -ErrorAction SilentlyContinue } |
   Select-Object -First 1
 if (-not $crt) { throw "no Visual C++ runtime found under $vs" }
