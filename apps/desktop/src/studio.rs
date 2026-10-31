@@ -40,6 +40,8 @@ struct Held {
     stream: Option<Streaming>,
     /// The vertical picture's stream, beside the main one.
     vstream: Option<Streaming>,
+    /// The lighter copy of what's on air, for platforms that take it (720p).
+    lstream: Option<Streaming>,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     /// Sources recorded on their own (Source Record): name, recording, file.
     source_records: Vec<(String, Recording, PathBuf)>,
@@ -1327,6 +1329,7 @@ impl StudioHost for DesktopStudio {
             // The stream, the recording, the preview and the scenes go (saved first); the engine
             // stays loaded for the next Start.
             h.vstream = None;
+            h.lstream = None;
             h.stream = None;
             h.record = None;
             h.source_records.clear();
@@ -2498,7 +2501,39 @@ impl StudioHost for DesktopStudio {
     async fn stream_stop(&self) -> Result<(), String> {
         self.on_main(|h| {
             h.vstream = None;
+            h.lstream = None;
             h.stream = None;
+        })
+        .await
+    }
+
+    async fn light_stream_start(&self, server: String, key: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            if h.lstream.as_ref().is_some_and(|s| s.stats().active) {
+                return Ok(());
+            }
+            h.lstream = None;
+            let s = h.settings.clone().unwrap_or_default();
+            let mut settings = stream_settings(studio, &s);
+            // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
+            let canvas = studio.canvas();
+            settings.encode.scale = (canvas.height > 720).then(|| {
+                let w = (u64::from(canvas.width) * 720 / u64::from(canvas.height.max(1))) as u32;
+                (w & !1, 720)
+            });
+            settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
+            settings.vod_track = None;
+            tracing::info!(kbps = settings.encode.video_kbps, "the Studio's lighter stream starts into Go live");
+            h.lstream = Some(studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?);
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn light_stream_stop(&self) -> Result<(), String> {
+        self.on_main(|h| {
+            h.lstream = None;
         })
         .await
     }
