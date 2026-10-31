@@ -436,6 +436,49 @@ static CRASHED: std::sync::Mutex<Option<ferrocast_engine::studio_host::Recovered
 /// Set when Ferrocast quits normally, so the note isn't written again on the way out.
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The app, for the Move transition's steps (`glide`).
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+/// A Move transition is being stepped.
+static GLIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Steps a Move transition about 60 times a second on the main thread until it ends (after
+/// any scene switch: a click, a rule, a game, a multiview). Main thread or not.
+fn glide() {
+    use std::sync::atomic::Ordering;
+    let Some(app) = APP.get().cloned() else { return };
+    if GLIDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sent = app.run_on_main_thread(move || {
+                // None: the Studio's state is busy this moment (tried again next frame).
+                let more =
+                    HELD.with(|h| h.try_borrow().ok().map(|h| h.collection.as_ref().is_some_and(|c| c.tick_moves())));
+                let _ = tx.send(more);
+            });
+            if sent.is_err() {
+                break;
+            }
+            match rx.await {
+                Ok(Some(false)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        GLIDING.store(false, Ordering::Release);
+        // A Move started while this one was ending found it still running: stepped now.
+        let _ = app.run_on_main_thread(|| {
+            let again =
+                HELD.with(|h| h.try_borrow().ok().is_some_and(|h| h.collection.as_ref().is_some_and(|c| c.moving())));
+            if again {
+                glide();
+            }
+        });
+    });
+}
+
 /// What the note holds: what's on now (`None`: the Studio isn't running).
 fn session_now(h: &Held) -> Option<ferrocast_engine::studio_host::Recovered> {
     h.collection.as_ref()?;
@@ -842,7 +885,13 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::DuplicateScene { scene, name } => done(c.duplicate_scene(&scene, &name)),
         A::RemoveScene { scene } => done(c.remove_scene(&scene)),
         A::MoveScene { scene, to } => done(c.move_scene(&scene, to)),
-        A::SetCurrent { scene } => done(c.set_current(&scene)),
+        A::SetCurrent { scene } => {
+            let r = done(c.set_current(&scene));
+            if c.moving() {
+                glide();
+            }
+            r
+        }
         A::SetTransition { kind, ms } => done(c.set_transition(&TransitionInfo { kind, ms })),
         A::SetSceneTransition { scene, transition } => {
             done(c.set_scene_transition(&scene, transition.map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).as_ref()))
@@ -1022,6 +1071,7 @@ pub struct DesktopStudio {
 
 impl DesktopStudio {
     pub fn new(app: AppHandle, data: PathBuf) -> DesktopStudio {
+        let _ = APP.set(app.clone());
         let file = data.join("studio").join("session.json");
         // A note left from last time: Ferrocast didn't close normally while the Studio ran.
         if let Some(r) = std::fs::read(&file)
@@ -1487,6 +1537,10 @@ impl StudioHost for DesktopStudio {
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let changes = act.changes();
+            // An edit lands on items in their own place, never half way through a Move.
+            if changes {
+                c.finish_moves();
+            }
             if act == StudioAct::History {
                 let (undo, redo) = h.history.list();
                 return Ok(json!({ "undo": undo, "redo": redo }));
@@ -2367,6 +2421,9 @@ impl StudioHost for DesktopStudio {
                     if let Some(c) = &h.collection {
                         let done =
                             if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
+                        if c.moving() {
+                            glide();
+                        }
                         if let Err(e) = done {
                             tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
                         }
