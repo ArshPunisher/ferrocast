@@ -23,6 +23,7 @@ pub(crate) mod game_scenes;
 pub mod moments;
 pub mod obs_tools;
 pub(crate) mod rig;
+pub(crate) mod rules;
 pub mod show;
 pub mod stream_info;
 pub mod transcript;
@@ -81,6 +82,8 @@ pub(crate) struct Studio {
     pub health_watching: std::sync::atomic::AtomicBool,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
     pub autoreplies: autoreplies::AutoReplies,
+    /// Event rules running now (by their place in the list).
+    pub rules_busy: Mutex<HashSet<usize>>,
 }
 
 impl Engine {
@@ -138,6 +141,7 @@ impl Engine {
     pub(crate) async fn studio_saw(&self, e: &Event, first_message: bool) {
         self.moments_saw(e, first_message).await;
         self.ads_saw(e).await;
+        self.rules_saw(e).await;
         if let ferrocast_core::event::EventKind::ChatMessage { actor, .. } = &e.kind
             && e.origin == ferrocast_core::event::Origin::Live
             && e.channel.is_none()

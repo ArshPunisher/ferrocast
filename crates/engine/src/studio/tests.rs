@@ -1230,3 +1230,63 @@ async fn the_show_and_brb_run_in_the_studio_while_it_runs() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_raid_puts_its_rules_scene_on_for_a_while_and_a_follow_shows_a_source() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let rules = json!([
+        { "when": "raid", "min": 5, "scene": "BRB", "seconds": 1 },
+        { "when": "follow", "source": "Webcam", "seconds": 1 },
+    ]);
+    let mut patch = serde_json::Map::new();
+    patch.insert("event_rules".into(), rules);
+    e.patch_scenes_config(&patch).await.unwrap();
+    let raid = |viewers: u32| {
+        Event::live(
+            Platform::Twitch,
+            Some(format!("raid-{viewers}")),
+            Millis(0),
+            EventKind::Raid { from: Actor::named(Platform::Twitch, "pal"), viewers },
+        )
+    };
+    let current = || obs.lock().unwrap().current.clone();
+    // Under the rule's minimum: nothing.
+    e.rules_saw(&raid(3)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(current(), "Starting Soon");
+    // At it: the rule's scene, then back after its second.
+    e.rules_saw(&raid(8)).await;
+    eventually(|| current() == "BRB").await;
+    eventually(|| current() == "Starting Soon").await;
+
+    // A follow shows the hidden Webcam in the scene on air for its second.
+    {
+        let mut o = obs.lock().unwrap();
+        o.current = "Gameplay".into();
+        let cam =
+            o.scenes.iter_mut().find(|s| s.name == "Gameplay").unwrap().items.iter_mut().find(|i| i.source == "Webcam");
+        cam.unwrap().enabled = false;
+    }
+    let shown = || {
+        let o = obs.lock().unwrap();
+        o.scenes
+            .iter()
+            .find(|s| s.name == "Gameplay")
+            .unwrap()
+            .items
+            .iter()
+            .find(|i| i.source == "Webcam")
+            .unwrap()
+            .enabled
+    };
+    let follow = Event::live(
+        Platform::Twitch,
+        Some("follow-1".into()),
+        Millis(0),
+        EventKind::Follow { actor: Actor::named(Platform::Twitch, "newfan") },
+    );
+    e.rules_saw(&follow).await;
+    eventually(shown).await;
+    eventually(|| !shown()).await;
+}
