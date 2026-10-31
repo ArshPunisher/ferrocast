@@ -64,17 +64,28 @@ $env:FERROCAST_HOME = $home_
 $env:FERROCAST_DEBUG_TOKEN_FILE = $tokenFile
 $env:FERROCAST_DEBUG_ROUTE = '#/studio'
 $env:RUST_LOG = 'info,ferrocast::studio=debug,tao=warn,wry=warn'
-$app = Start-Process -FilePath $Exe -PassThru -RedirectStandardOutput (Join-Path $Out 'app.out.log') -RedirectStandardError (Join-Path $Out 'app.log')
+function Launch($log) {
+  Remove-Item -Force $tokenFile -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardOutput (Join-Path $Out "$log.out.log") -RedirectStandardError (Join-Path $Out "$log.log")
+  $tok = Wait 'the app' 90 { if (Test-Path $tokenFile) { (Get-Content $tokenFile -Raw).Trim() } }
+  $script:base, $token = $tok -split ' ', 2
+  $script:h = @{ Authorization = "Bearer $token" }
+  $p
+}
+function Api($method, $path, $body) {
+  $args_ = @{ Method = $method; Uri = "$base/api/v1$path"; Headers = $h; ContentType = 'application/json'; TimeoutSec = 120 }
+  if ($null -ne $body) { $args_.Body = ($body | ConvertTo-Json -Depth 8 -Compress) }
+  Invoke-RestMethod @args_
+}
+
+# A new install opens first-time setup: finished here, then the app opens on the Studio.
+$app = Launch 'setup'
+Api POST '/setup/complete' $null | Out-Null
+Stop-Process -Id $app.Id -Force
+Start-Sleep -Seconds 2
+$app = Launch 'app'
 $failed = $null
 try {
-  $tok = Wait 'the app' 90 { if (Test-Path $tokenFile) { (Get-Content $tokenFile -Raw).Trim() } }
-  $base, $token = $tok -split ' ', 2
-  $h = @{ Authorization = "Bearer $token" }
-  function Api($method, $path, $body) {
-    $args_ = @{ Method = $method; Uri = "$base/api/v1$path"; Headers = $h; ContentType = 'application/json'; TimeoutSec = 120 }
-    if ($null -ne $body) { $args_.Body = ($body | ConvertTo-Json -Depth 8 -Compress) }
-    Invoke-RestMethod @args_
-  }
   $status = Api POST '/studio/engine/start' @{}
   Write-Host "Studio: $($status | ConvertTo-Json -Compress)"
   if (-not $status.running) { throw "the Studio didn't start: $($status.detail)" }
@@ -98,7 +109,7 @@ try {
   [Win]::mouse_event(0x4, 0, 0, 0, [UIntPtr]::Zero)                                 # left up
   Start-Sleep -Seconds 2
   Shot 'studio-picked'
-  $log = Get-Content (Join-Path $Out 'app.log') -Raw
+  $log = Get-Content (Join-Path $Out 'app.out.log') -Raw
   if ($log -notmatch 'picked in the preview selected=Some') { throw "a click on the picture didn't reach the page" }
   Write-Host 'A click on the picture picked the source under it.'
 
