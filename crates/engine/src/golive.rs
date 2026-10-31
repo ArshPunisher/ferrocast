@@ -1222,6 +1222,7 @@ impl Engine {
                             target,
                             key: String::new(),
                             retry: Default::default(),
+                            extra_audio: false,
                         })
                         .map_err(|e| e.to_string()),
                     None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
@@ -1322,7 +1323,14 @@ impl Engine {
             }
         };
         let target = Target::parse(&url).map_err(|e| e.to_string())?;
-        Ok(Destination { id: d.id.clone(), target, key, retry: self.golive_config().advanced.retry(&d.id) })
+        Ok(Destination {
+            id: d.id.clone(),
+            target,
+            key,
+            retry: self.golive_config().advanced.retry(&d.id),
+            // Twitch's VOD track: only Twitch knows what to do with an extra audio track.
+            extra_audio: d.kind == Service::Twitch,
+        })
     }
 
     /// Starts forwarders for ticked destinations whose stream (normal or vertical) is live and

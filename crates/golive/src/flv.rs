@@ -73,9 +73,42 @@ pub fn audio_is_header(data: &[u8]) -> bool {
     }
 }
 
+/// Enhanced RTMP's multitrack audio packet type, and its "one track" kind.
+const AUDIO_MULTITRACK: u8 = 5;
+const ONE_TRACK: u8 = 0x00;
+
+/// An extra audio track (OBS sends Twitch's VOD track so: Enhanced RTMP multitrack audio, one
+/// track a packet, `trackId` after the FourCC): its track number and whether this is that track's
+/// codec header. None for the main track (0) and everything else.
+pub fn audio_extra_track(data: &[u8]) -> Option<(u8, bool)> {
+    let &b = data.first()?;
+    if b >> 4 != AUDIO_EX_HEADER || b & 0x0F != AUDIO_MULTITRACK {
+        return None;
+    }
+    let &kind = data.get(1)?;
+    if kind & 0xF0 != ONE_TRACK {
+        return None;
+    }
+    let &track = data.get(6)?;
+    (track != 0).then_some((track, kind & 0x0F == 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_audio_tracks_as_obs_sends_them() {
+        // 0x95 = ex header + multitrack; one track, SequenceStart (0) or CodedFrames (1); mp4a; track 1.
+        assert_eq!(audio_extra_track(b"\x95\x00mp4a\x01\x12\x10"), Some((1, true)));
+        assert_eq!(audio_extra_track(b"\x95\x01mp4a\x01\x21"), Some((1, false)));
+        // Track 0, ordinary AAC and short packets aren't extra tracks.
+        assert_eq!(audio_extra_track(b"\x95\x01mp4a\x00\x21"), None);
+        assert_eq!(audio_extra_track(&[0xAF, 0x01, 0x21]), None);
+        assert_eq!(audio_extra_track(&[0x95, 0x01]), None);
+        // An extra track's header isn't the main audio header.
+        assert!(!audio_is_header(b"\x95\x00mp4a\x01\x12\x10"));
+    }
 
     #[test]
     fn avc_keyframes_and_headers() {

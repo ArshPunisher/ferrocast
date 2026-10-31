@@ -52,6 +52,8 @@ pub struct Destination {
     pub target: Target,
     pub key: String,
     pub retry: Retry,
+    /// Gets the stream's extra audio tracks (Twitch's VOD track); others get only the main one.
+    pub extra_audio: bool,
 }
 
 impl std::fmt::Debug for Destination {
@@ -270,6 +272,12 @@ async fn session(
         let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
         p.send(r).await?;
     }
+    if dest.extra_audio {
+        for (_, a) in headers.extra_audio {
+            let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
+            p.send(r).await?;
+        }
+    }
     set_state(health, PushState::Live);
     let mut base: Option<u32> = None;
     let mut waiting_for_key = true;
@@ -300,7 +308,12 @@ async fn session(
                         p.client.publish_video_data(data, stamp(&mut base, ts), false)
                     }
                     Frame::Audio { ts, data } => {
-                        if waiting_for_key && !flv::audio_is_header(&data) {
+                        let extra = flv::audio_extra_track(&data);
+                        if extra.is_some() && !dest.extra_audio {
+                            continue;
+                        }
+                        let header = flv::audio_is_header(&data) || extra.is_some_and(|(_, h)| h);
+                        if waiting_for_key && !header {
                             continue;
                         }
                         p.client.publish_audio_data(data, stamp(&mut base, ts), false)

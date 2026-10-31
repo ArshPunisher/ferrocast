@@ -213,6 +213,7 @@ fn destination(port: u16, key: &str) -> Destination {
         target: Target::parse(&format!("rtmp://127.0.0.1:{port}/app")).unwrap(),
         key: key.into(),
         retry: Default::default(),
+        extra_audio: false,
     }
 }
 
@@ -584,4 +585,49 @@ async fn the_cutter_makes_an_upright_stream_from_the_normal_one() {
     timeout(Duration::from_secs(15), vlive.wait_for(|l| !l.on)).await.expect("vertical ended").unwrap();
     timeout(Duration::from_secs(10), state.wait_for(|s| *s == CutState::Waiting)).await.unwrap().unwrap();
     stop.send_replace(true);
+}
+
+/// Twitch's VOD track as OBS sends it: Enhanced RTMP multitrack audio, track 1 (header, frame).
+const VOD_HEADER: &[u8] = b"\x95\x00mp4a\x01\x12\x10";
+const VOD_FRAME: &[u8] = b"\x95\x01mp4a\x01\x21\x22";
+const AAC_FRAME: &[u8] = &[0xAF, 0x01, 0x21, 0x22];
+
+#[tokio::test]
+async fn only_twitch_gets_the_vod_track_and_late_it_gets_its_header() {
+    let w = world().await;
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    obs.meta().await;
+    obs.video(0, AVC_HEADER).await;
+    obs.audio(0, AAC_HEADER).await;
+    obs.audio(0, VOD_HEADER).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Joining now: "Twitch" (extra tracks) and another platform.
+    let (lt, lo) = (free_listener().await, free_listener().await);
+    let (pt, po) = (lt.local_addr().unwrap().port(), lo.local_addr().unwrap().port());
+    let (mut twitch, mut other) = (platform(lt, "t").await, platform(lo, "o").await);
+    let mut ht = start(&w, Destination { extra_audio: true, ..destination(pt, "t") });
+    let mut ho = start(&w, destination(po, "o"));
+    state_is(&mut ht, |s| *s == PushState::Live).await;
+    state_is(&mut ho, |s| *s == PushState::Live).await;
+    for rx in [&mut twitch, &mut other] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Meta);
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+    // The late header of the VOD track: Twitch only.
+    assert_eq!(next(&mut twitch).await, Got::Audio(0, Bytes::from_static(VOD_HEADER)));
+
+    obs.video(1000, KEY).await;
+    obs.audio(1010, AAC_FRAME).await;
+    obs.audio(1010, VOD_FRAME).await;
+    obs.video(1040, INTER).await;
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(10, Bytes::from_static(AAC_FRAME)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(10, Bytes::from_static(VOD_FRAME)));
+    assert_eq!(next(&mut other).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut other).await, Got::Audio(10, Bytes::from_static(AAC_FRAME)));
+    // The other platform never sees the VOD track: next is the picture.
+    assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }

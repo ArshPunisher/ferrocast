@@ -39,6 +39,8 @@ pub struct Headers {
     pub metadata: Option<Arc<StreamMetadata>>,
     pub video: Option<Bytes>,
     pub audio: Option<Bytes>,
+    /// Extra audio tracks' codec headers, by track (Twitch's VOD track).
+    pub extra_audio: Vec<(u8, Bytes)>,
 }
 
 /// Which stream is on. Every new publish gets the next number, so a destination can tell a
@@ -160,6 +162,9 @@ impl Hub {
         let mut st = self.lock();
         if flv::audio_is_header(&data) {
             st.headers.audio = Some(data.clone());
+        } else if let Some((track, true)) = flv::audio_extra_track(&data) {
+            st.headers.extra_audio.retain(|(t, _)| *t != track);
+            st.headers.extra_audio.push((track, data.clone()));
         }
         st.count(ts, data.len());
         let _ = self.tx.send(Frame::Audio { ts, data });
