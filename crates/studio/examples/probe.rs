@@ -1,6 +1,7 @@
 //! Runs OBS's engine from an installed OBS (OBS.app on macOS; on Windows the folder in
 //! `FERROCAST_OBS_DIR`, an install or OBS's portable zip) and checks the Studio crate end to
-//! end: every kind with its options, a scene, and a 5 s recording.
+//! end: every kind with its options, a scene, and a 5 s recording. On macOS
+//! `FERROCAST_OBS_DIR` may name another `Contents`, such as the engine Ferrocast.app carries.
 //!
 //!   cargo run -p ferrocast-studio --example probe -- <out dir> [metal|opengl] [noopts]
 
@@ -23,7 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| r"C:\Program Files\obs-studio".into());
         Paths::from_obs_windows(std::path::Path::new(&dir))
     } else {
-        Paths::from_obs_app(std::path::Path::new("/Applications/OBS.app/Contents"), metal)
+        // An OBS.app's Contents, or the engine Ferrocast.app carries (apps/desktop/obs-runtime/Contents).
+        let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| "/Applications/OBS.app/Contents".into());
+        Paths::from_obs_app(std::path::Path::new(&dir), metal)
     };
     let canvas = Canvas { width: 1280, height: 720, fps: 30 };
     let studio = Studio::start(&paths, canvas, &out.join("plugin-config"))?;
