@@ -139,6 +139,13 @@ impl Compositor {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .map_err(|e| AvError::NoGpu(e.to_string()))?;
+        // Every texture is seen two ways (linear and as stored), which basic OpenGL can't do.
+        if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::VIEW_FORMATS) {
+            return Err(AvError::NoGpu(format!(
+                "{} can't show a picture both linear and as stored; a Metal, D3D12 or Vulkan graphics card is needed",
+                adapter.get_info().name
+            )));
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor { label: Some("ferrocast-av"), ..Default::default() })
             .await
