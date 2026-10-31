@@ -1,0 +1,216 @@
+// Ferrocast's own picture filters (ferrocast-studio's ffi/shaders.rs, which libobs runs), on
+// our engine. Each samples the picture before it (raw values: libobs runs these filters in
+// gamma space) and returns a straight colour, multiplied by its alpha on the way out as
+// libobs's filter blending (source alpha) does. A filter may be bigger than its picture by
+// `pad` on every side (a shadow).
+
+struct F {
+    size: vec2<f32>,
+    out_size: vec2<f32>,
+    pad: f32,
+    p0: f32,
+    p1: f32,
+    p2: f32,
+    p3: f32,
+    p4: f32,
+    p5: f32,
+    _pad: f32,
+    color: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> f: F;
+@group(0) @binding(1) var image: texture_2d<f32>;
+@group(0) @binding(2) var pick: sampler;
+
+struct Out {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> Out {
+    let uv = vec2<f32>(f32(i & 1u), f32(i >> 1u));
+    var o: Out;
+    o.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+fn premultiplied(c: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+fn src_px(uv: vec2<f32>) -> vec2<f32> {
+    return uv * f.out_size - vec2<f32>(f.pad, f.pad);
+}
+
+fn src_at(px: vec2<f32>) -> vec4<f32> {
+    let uv = px / f.size;
+    let inside = step(0.0, uv.x) * step(0.0, uv.y) * step(uv.x, 1.0) * step(uv.y, 1.0);
+    return textureSampleLevel(image, pick, uv, 0.0) * inside;
+}
+
+fn rbox(px: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
+    let q = abs(px - half_size) - (half_size - vec2<f32>(r, r));
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// Rounded corners: p0 radius.
+@fragment
+fn fs_rounded(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let h = f.size * 0.5;
+    let d = rbox(p, h, min(f.p0, min(h.x, h.y)));
+    return premultiplied(vec4<f32>(c.rgb, c.a * saturate(0.5 - d)));
+}
+
+// Border: p0 width, color, p1 radius.
+@fragment
+fn fs_border(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let h = f.size * 0.5;
+    let d = rbox(p, h, min(f.p1, min(h.x, h.y)));
+    let shape = saturate(0.5 - d);
+    let band = shape * saturate(d + f.p0 + 0.5);
+    let k = band * f.color.a;
+    return premultiplied(vec4<f32>(mix(c.rgb, f.color.rgb, k), mix(c.a, 1.0, k) * shape));
+}
+
+// Shadow and glow: color, p0 blur, p1 x, p2 y.
+@fragment
+fn fs_shadow(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let q = p - vec2<f32>(f.p1, f.p2);
+    var acc = 0.0;
+    var total = 0.0;
+    for (var n = 0; n < 48; n++) {
+        let t = (f32(n) + 0.5) / 48.0;
+        let ang = f32(n) * 2.39996323;
+        let o = vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p0);
+        let w = 1.0 - t * 0.5;
+        acc += src_at(q + o).a * w;
+        total += w;
+    }
+    let sa = acc / total * f.color.a;
+    let a = c.a + sa * (1.0 - c.a);
+    let rgb = (c.rgb * c.a + f.color.rgb * sa * (1.0 - c.a)) / max(a, 0.0001);
+    return premultiplied(vec4<f32>(rgb, a));
+}
+
+fn sd_hexagon(p_in: vec2<f32>) -> f32 {
+    var p = abs(p_in);
+    let k = vec2<f32>(-0.866025404, 0.5);
+    p -= 2.0 * min(dot(k, p), 0.0) * k;
+    p -= vec2<f32>(clamp(p.x, -0.577350269, 0.577350269), 1.0);
+    return length(p) * sign(p.y);
+}
+
+fn sd_star(p_in: vec2<f32>) -> f32 {
+    let k1 = vec2<f32>(0.809016994375, -0.587785252292);
+    let k2 = vec2<f32>(-k1.x, k1.y);
+    var p = p_in;
+    p.x = abs(p.x);
+    p -= 2.0 * max(dot(k1, p), 0.0) * k1;
+    p -= 2.0 * max(dot(k2, p), 0.0) * k2;
+    p.x = abs(p.x);
+    p.y -= 1.0;
+    let ba = 0.45 * vec2<f32>(-k1.y, k1.x) - vec2<f32>(0.0, 1.0);
+    let h = clamp(dot(p, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
+}
+
+fn sd_heart(p_in: vec2<f32>) -> f32 {
+    var p = p_in;
+    p.x = abs(p.x);
+    if p.y + p.x > 1.0 {
+        let a = p - vec2<f32>(0.25, 0.75);
+        return sqrt(dot(a, a)) - 0.353553391;
+    }
+    let b = p - vec2<f32>(0.0, 1.0);
+    let m = p - 0.5 * max(p.x + p.y, 0.0);
+    return sqrt(min(dot(b, b), dot(m, m))) * sign(p.x - p.y);
+}
+
+// Shape: p0 shape, p1 feather, p2 stretch.
+@fragment
+fn fs_shape(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let h = f.size * 0.5;
+    var r = vec2<f32>(min(h.x, h.y), min(h.x, h.y));
+    if f.p2 > 0.5 {
+        r = h;
+    }
+    let n = (p - h) / r;
+    let s = min(r.x, r.y);
+    var d: f32;
+    if f.p0 < 0.5 {
+        d = length(n) - 1.0;
+    } else if f.p0 < 1.5 {
+        d = sd_hexagon(n * 1.1547) / 1.1547;
+    } else if f.p0 < 2.5 {
+        d = (abs(n.x) + abs(n.y) - 1.0) * 0.707106781;
+    } else if f.p0 < 3.5 {
+        d = sd_star(vec2<f32>(n.x, -n.y) * 1.1);
+    } else {
+        d = sd_heart(vec2<f32>(n.x * 0.6, (1.0 - n.y) * 0.55)) / 0.58;
+    }
+    let edge = max(f.p1, 1.0);
+    return premultiplied(vec4<f32>(c.rgb, c.a * saturate(0.5 - d * s / edge)));
+}
+
+// Blur or pixelate an area: p0 mode, p1 strength, p2..p5 area x, y, w, h (percent).
+@fragment
+fn fs_blur_area(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let lo = vec2<f32>(f.p2, f.p3) * 0.01 * f.size;
+    let hi = lo + vec2<f32>(f.p4, f.p5) * 0.01 * f.size;
+    let inside = step(lo.x, p.x) * step(lo.y, p.y) * step(p.x, hi.x) * step(p.y, hi.y);
+    if inside < 0.5 {
+        return premultiplied(c);
+    }
+    if f.p0 > 0.5 {
+        let block = max(f.p1, 1.0);
+        return premultiplied(src_at((floor(p / block) + 0.5) * block));
+    }
+    var acc = vec4<f32>(0.0);
+    for (var n = 0; n < 64; n++) {
+        let t = (f32(n) + 0.5) / 64.0;
+        let ang = f32(n) * 2.39996323;
+        acc += src_at(clamp(p + vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p1), vec2<f32>(0.0, 0.0), f.size - 1.0));
+    }
+    return premultiplied(acc / 64.0);
+}
+
+// Colour look: p0 look, p1 strength (percent).
+@fragment
+fn fs_look(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let x = c.rgb;
+    let l = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let ll = vec3<f32>(l, l, l);
+    var g = x;
+    if f.p0 < 0.5 {
+        g = x * vec3<f32>(1.08, 1.0, 0.86);
+    } else if f.p0 < 1.5 {
+        g = x * vec3<f32>(0.88, 1.0, 1.1);
+    } else if f.p0 < 2.5 {
+        g = mix(ll, x, 1.15) + (l - 0.5) * vec3<f32>(0.16, 0.02, -0.16);
+    } else if f.p0 < 3.5 {
+        g = ll;
+    } else if f.p0 < 4.5 {
+        g = vec3<f32>(dot(x, vec3<f32>(0.393, 0.769, 0.189)), dot(x, vec3<f32>(0.349, 0.686, 0.168)), dot(x, vec3<f32>(0.272, 0.534, 0.131)));
+        g = g * 0.82 + 0.08;
+    } else if f.p0 < 5.5 {
+        g = (x - 0.5) * 1.2 + 0.5;
+        g = mix(ll, g, 1.3);
+    } else {
+        g = mix(ll, x, 0.8) * 0.85 + 0.1;
+    }
+    return premultiplied(vec4<f32>(mix(x, saturate(g), f.p1 * 0.01), c.a));
+}

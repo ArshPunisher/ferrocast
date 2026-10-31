@@ -1,0 +1,1146 @@
+//! The compositor: libobs's scene drawing (obs-scene.c `render_item`), step for step, on wgpu.
+//!
+//! An item is drawn straight onto its scene, unless libobs would first draw it into a texture of
+//! its cropped size (a "texrender"): when it's cropped, has a scale filter, isn't blended
+//! normally, has sRGB blending off, or is a nested scene. That texture is then drawn with the
+//! scale filter's shader and the blend mode. Following the same path keeps every rounding the
+//! same, so both engines' pictures match pixel for pixel.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, mpsc};
+
+use crate::transform::{Affine, cropped, draw_transform, output_scale};
+use crate::{
+    AvError, Blend, Content, Effect, Filter, Item, Nv12, Picture, Scene, Transition, TransitionKind, cubic_ease_in_out,
+    smoothstep,
+};
+
+/// Pictures and canvases are 8-bit RGBA holding sRGB values. Seen through `LINEAR` views the GPU
+/// decodes and encodes them, so items mix in linear light (libobs's way since OBS 28); seen
+/// through `GAMMA` views, as stored (libobs's way for sources that aren't sRGB-aware).
+const GAMMA: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const MAX: u32 = 16_384;
+/// libobs's `EPSILON` for "scaled at all".
+const EPSILON: f32 = 0.0001;
+
+/// The fragment shaders: libobs's effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Shader {
+    Default,
+    Bicubic,
+    Lanczos,
+    Area,
+    AreaUpscale,
+    Lowres,
+}
+
+impl Shader {
+    fn entry(self) -> &'static str {
+        match self {
+            Self::Default => "fs_default",
+            Self::Bicubic => "fs_bicubic",
+            Self::Lanczos => "fs_lanczos",
+            Self::Area => "fs_area",
+            Self::AreaUpscale => "fs_area_upscale",
+            Self::Lowres => "fs_lowres",
+        }
+    }
+}
+
+/// libobs's `obs_blend_mode_params`. libobs's Metal renderer applies the operation to colour
+/// only (alpha always adds); its D3D11 and OpenGL renderers to both. `metal` picks which to match.
+fn blend_state(b: Blend, metal: bool) -> wgpu::BlendState {
+    use wgpu::{BlendComponent as C, BlendFactor as F, BlendOperation as O};
+    let c = |src, dst, op| C { src_factor: src, dst_factor: dst, operation: op };
+    let same = |x: C| wgpu::BlendState { color: x, alpha: if metal { C { operation: O::Add, ..x } } else { x } };
+    match b {
+        Blend::Normal => same(c(F::One, F::OneMinusSrcAlpha, O::Add)),
+        Blend::Additive => same(c(F::One, F::One, O::Add)),
+        Blend::Subtract => same(c(F::One, F::One, O::ReverseSubtract)),
+        Blend::Screen => {
+            wgpu::BlendState { color: c(F::One, F::OneMinusSrc, O::Add), alpha: c(F::One, F::OneMinusSrcAlpha, O::Add) }
+        }
+        Blend::Multiply => wgpu::BlendState {
+            color: c(F::Dst, F::OneMinusSrcAlpha, O::Add),
+            alpha: c(F::DstAlpha, F::OneMinusSrcAlpha, O::Add),
+        },
+        Blend::Lighten => same(c(F::One, F::One, O::Max)),
+        Blend::Darken => same(c(F::One, F::One, O::Min)),
+    }
+}
+
+/// The compositor: a graphics card and what drawing needs on it.
+#[derive(Debug)]
+pub struct Compositor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    module: wgpu::ShaderModule,
+    layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    pipelines: Mutex<HashMap<(Shader, Blend, bool), wgpu::RenderPipeline>>,
+    /// Alpha blends as libobs's Metal renderer does (see `blend_state`).
+    metal_alpha: bool,
+    bilinear: wgpu::Sampler,
+    point: wgpu::Sampler,
+    /// Transitions: their shaders, layout and pipelines (by entry point and target view).
+    transition_module: wgpu::ShaderModule,
+    transition_layout: wgpu::BindGroupLayout,
+    transition_pipeline_layout: wgpu::PipelineLayout,
+    transition_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
+    /// Ferrocast's filters: their shaders and pipelines (by entry point).
+    effect_module: wgpu::ShaderModule,
+    effect_pipelines: Mutex<HashMap<&'static str, wgpu::RenderPipeline>>,
+    /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
+    uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
+    /// NV12 out: the Y and UV pipelines.
+    nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
+}
+
+/// What an item draws: a picture, a texture made on the GPU (filtered), or other items.
+enum Src<'a> {
+    Pic(&'a Picture),
+    /// An uploaded picture: its id, and whether it's premultiplied.
+    Up(u64, bool),
+    Tex(Box<Target>),
+    Items(&'a [Item]),
+}
+
+/// A texture drawn into: its two views and size.
+struct Target {
+    texture: wgpu::Texture,
+    linear: wgpu::TextureView,
+    gamma: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+/// One quad to draw: where it goes and how.
+struct Quad<'a> {
+    corners: [(f32, f32); 4],
+    view: &'a wgpu::TextureView,
+    size: (u32, u32),
+    shader: Shader,
+    blend: Blend,
+    linear: bool,
+    straight: bool,
+    point: bool,
+}
+
+impl Compositor {
+    /// Opens the system's graphics card, headless (no window needed).
+    pub fn new() -> Result<Self, AvError> {
+        pollster::block_on(Self::open())
+    }
+
+    async fn open() -> Result<Self, AvError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .map_err(|e| AvError::NoGpu(e.to_string()))?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor { label: Some("ferrocast-av"), ..Default::default() })
+            .await
+            .map_err(|e| AvError::NoGpu(e.to_string()))?;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("draw"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("draw.wgsl").into()),
+        });
+        let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry { binding, visibility, ty, count: None };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("item"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(
+                    1,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(2, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("item"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let sampler = |filter| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("pick"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: filter,
+                min_filter: filter,
+                ..Default::default()
+            })
+        };
+        let bilinear = sampler(wgpu::FilterMode::Linear);
+        let point = sampler(wgpu::FilterMode::Nearest);
+        let transition_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("transition"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("transition.wgsl").into()),
+        });
+        let tex = |binding| {
+            entry(
+                binding,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+            )
+        };
+        let transition_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("transition"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                tex(1),
+                tex(2),
+                tex(3),
+                entry(4, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let transition_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transition"),
+            bind_group_layouts: &[Some(&transition_layout)],
+            ..Default::default()
+        });
+        let effect_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("effects"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("effects.wgsl").into()),
+        });
+        let conv = |entry: &str, format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_full"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let nv12 = (conv("fs_y", wgpu::TextureFormat::R8Unorm), conv("fs_uv", wgpu::TextureFormat::Rg8Unorm));
+        Ok(Self {
+            uploads: Mutex::new(HashMap::new()),
+            nv12,
+            effect_module,
+            effect_pipelines: Mutex::new(HashMap::new()),
+            transition_module,
+            transition_layout,
+            transition_pipeline_layout,
+            transition_pipelines: Mutex::new(HashMap::new()),
+            device,
+            queue,
+            module,
+            layout,
+            pipeline_layout,
+            pipelines: Mutex::new(HashMap::new()),
+            metal_alpha: cfg!(target_os = "macos"),
+            bilinear,
+            point,
+        })
+    }
+
+    /// Which libobs renderer's alpha blending to match: Metal's (the Mac's default here) or
+    /// D3D11's and OpenGL's. They differ only in a picture's alpha under Subtract, Lighten and
+    /// Darken, which shows when the scene is drawn inside another.
+    pub fn match_libobs_metal(&mut self, metal: bool) {
+        if self.metal_alpha != metal {
+            self.metal_alpha = metal;
+            self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    fn pipeline(&self, shader: Shader, blend: Blend, linear: bool) -> wgpu::RenderPipeline {
+        let key = (shader, blend, linear);
+        let mut cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(shader.entry()),
+                    layout: Some(&self.pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.module,
+                        entry_point: Some("vs"),
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: 16,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                        })],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.module,
+                        entry_point: Some(shader.entry()),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: if linear { LINEAR } else { GAMMA },
+                            blend: Some(blend_state(blend, self.metal_alpha)),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone()
+    }
+
+    /// Draws a scene on a clear canvas → its RGBA rows (premultiplied, sRGB), as libobs's
+    /// screenshot of a scene gives them.
+    pub fn render(&self, scene: &Scene) -> Result<Vec<u8>, AvError> {
+        check_size(scene.width, scene.height)?;
+        self.validate(&scene.items)?;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let target = self.target(scene.width, scene.height, wgpu::TextureUsages::COPY_SRC);
+        self.clear(&mut enc, &target);
+        self.draw_items(&mut enc, &target, &scene.items, &Affine::IDENTITY)?;
+        self.read_back(enc, &target.texture, scene.width, scene.height)
+    }
+
+    /// Draws two scenes mid-transition, as libobs's transition plugins do → RGBA rows.
+    pub fn render_transition(&self, tr: &Transition) -> Result<Vec<u8>, AvError> {
+        let (w, h) = (tr.from.width, tr.from.height);
+        check_size(w, h)?;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let canvas = self.target(w, h, wgpu::TextureUsages::COPY_SRC);
+        self.transition_into(&mut enc, &canvas, tr)?;
+        self.read_back(enc, &canvas.texture, w, h)
+    }
+
+    /// The same → NV12, for the encoders.
+    pub fn render_transition_nv12(&self, tr: &Transition) -> Result<Nv12, AvError> {
+        let (w, h) = (tr.from.width, tr.from.height);
+        check_size(w, h)?;
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return Err(AvError::BadSize(w, h));
+        }
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let canvas = self.target(w, h, wgpu::TextureUsages::empty());
+        self.transition_into(&mut enc, &canvas, tr)?;
+        self.nv12_out(enc, &canvas)
+    }
+
+    fn transition_into(&self, enc: &mut wgpu::CommandEncoder, canvas: &Target, tr: &Transition) -> Result<(), AvError> {
+        let (w, h) = (tr.from.width, tr.from.height);
+        check_size(w, h)?;
+        self.validate(&tr.from.items)?;
+        self.validate(&tr.to.items)?;
+        if let TransitionKind::LumaWipe { luma, .. } = &tr.kind {
+            self.validate(&[Item::picture(luma.clone(), Default::default())])?;
+        }
+        self.clear(enc, canvas);
+        let t = tr.t.clamp(0.0, 1.0);
+        // Each scene drawn on its own at the canvas's size (libobs's render_child; a scene of
+        // another size is placed top left, as its default "shrink only" scaling leaves it).
+        let draw = |enc: &mut wgpu::CommandEncoder, s: &Scene| -> Result<Target, AvError> {
+            let target = self.target(w, h, wgpu::TextureUsages::empty());
+            self.clear(enc, &target);
+            self.draw_items(enc, &target, &s.items, &Affine::IDENTITY)?;
+            Ok(target)
+        };
+        if tr.kind == TransitionKind::Cut || t <= 0.0 || t >= 1.0 {
+            let s = if t >= 1.0 || (tr.kind == TransitionKind::Cut && t > 0.0) { &tr.to } else { &tr.from };
+            self.draw_items(enc, canvas, &s.items, &Affine::IDENTITY)?;
+            return Ok(());
+        }
+        let a = draw(enc, &tr.from)?;
+        let b = draw(enc, &tr.to)?;
+        let luma_tex;
+        // (entry point, textures and target seen linearly, t, softness, invert, a_dir, b_dir,
+        // colour, which textures as a and b, the luma picture)
+        let mut u = [0f32; 12];
+        let (entry, linear, first, second, luma): (&'static str, bool, &Target, &Target, Option<&wgpu::Texture>) =
+            match &tr.kind {
+                TransitionKind::Fade => {
+                    u[0] = t;
+                    ("fs_fade", false, &a, &b, None)
+                }
+                TransitionKind::FadeToColor { rgb, switch_point } => {
+                    let sp = switch_point.clamp(0.0, 1.0);
+                    let swp = if t < sp { smoothstep(0.0, sp, t) } else { 1.0 - smoothstep(sp, 1.0, t) };
+                    u[0] = swp;
+                    u[8..12].copy_from_slice(&[
+                        f32::from(rgb[0]) / 255.0,
+                        f32::from(rgb[1]) / 255.0,
+                        f32::from(rgb[2]) / 255.0,
+                        1.0,
+                    ]);
+                    ("fs_fade_to_color", false, if t < sp { &a } else { &b }, &b, None)
+                }
+                TransitionKind::Slide(dir) => {
+                    let e = cubic_ease_in_out(t);
+                    let (dx, dy) = dir.vector();
+                    u[4..8].copy_from_slice(&[dx * e, dy * e, dx * (1.0 - e), dy * (1.0 - e)]);
+                    ("fs_slide", true, &a, &b, None)
+                }
+                TransitionKind::Swipe { direction, swipe_in } => {
+                    let e = cubic_ease_in_out(t);
+                    let (mut dx, mut dy) = direction.vector();
+                    if *swipe_in {
+                        (dx, dy) = (-dx, -dy);
+                    }
+                    let k = if *swipe_in { 1.0 - e } else { e };
+                    u[4..6].copy_from_slice(&[dx * k, dy * k]);
+                    if *swipe_in { ("fs_swipe", true, &b, &a, None) } else { ("fs_swipe", true, &a, &b, None) }
+                }
+                TransitionKind::LumaWipe { luma, invert, softness } => {
+                    u[0] = t;
+                    u[1] = *softness;
+                    u[2] = if *invert { 1.0 } else { 0.0 };
+                    luma_tex = self.new_picture(luma);
+                    ("fs_luma", true, &a, &b, Some(&luma_tex))
+                }
+                // Drawn above as one scene; here only for completeness.
+                TransitionKind::Cut => {
+                    u[0] = 1.0;
+                    ("fs_fade", false, &a, &b, None)
+                }
+            };
+        let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
+        fn pick(t: &Target, linear: bool) -> &wgpu::TextureView {
+            if linear { &t.linear } else { &t.gamma }
+        }
+        let luma_view = luma.map(|l| view(l, GAMMA));
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transition"),
+            layout: &self.transition_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(pick(first, linear)) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pick(second, linear)) },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(luma_view.as_ref().unwrap_or(pick(first, linear))),
+                },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
+            ],
+        });
+        let pipeline = self.transition_pipeline(entry, linear);
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transition"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: pick(canvas, linear),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        Ok(())
+    }
+
+    fn transition_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
+        let mut cache = self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry((entry, linear))
+            .or_insert_with(|| {
+                self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&self.transition_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.transition_module,
+                        entry_point: Some("vs"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.transition_module,
+                        entry_point: Some(entry),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: if linear { LINEAR } else { GAMMA },
+                            // libobs draws transitions with blending one, inverse source alpha.
+                            blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone()
+    }
+
+    fn target(&self, width: u32, height: u32, extra: wgpu::TextureUsages) -> Target {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("canvas"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GAMMA,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | extra,
+            view_formats: &[LINEAR],
+        });
+        Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height }
+    }
+
+    fn clear(&self, enc: &mut wgpu::CommandEncoder, t: &Target) {
+        enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &t.gamma,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+    }
+
+    fn draw_items(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &Target,
+        items: &[Item],
+        parent: &Affine,
+    ) -> Result<(), AvError> {
+        for item in items {
+            self.draw_item(enc, target, item, parent)?;
+        }
+        Ok(())
+    }
+
+    /// libobs's `render_item`.
+    fn draw_item(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &Target,
+        item: &Item,
+        parent: &Affine,
+    ) -> Result<(), AvError> {
+        let (src, w, h, linear) = if item.effects.is_empty() {
+            match &item.content {
+                Content::Picture(p) => (Src::Pic(p), p.width, p.height, item.linear),
+                Content::Uploaded { id, width, height, premultiplied } => {
+                    (Src::Up(*id, *premultiplied), *width, *height, item.linear)
+                }
+                Content::Scene(s) => (Src::Items(&s.items), s.width, s.height, true),
+                Content::Group { width, height, items } => (Src::Items(items), *width, *height, true),
+            }
+        } else {
+            // Filters run in gamma space (they aren't sRGB-aware), so the result mixes that way.
+            let t = self.apply_effects(enc, item)?;
+            let (w, h) = (t.width, t.height);
+            (Src::Tex(Box::new(t)), w, h, false)
+        };
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        let p = &item.placement;
+        let (cw, ch) = cropped(w, h, p.crop);
+        if cw == 0 || ch == 0 {
+            return Ok(());
+        }
+        let m = draw_transform(p, w, h).then(parent);
+        let texrender = p.crop.iter().any(|c| *c > 0)
+            || item.filter != Filter::Disable
+            || item.srgb_off
+            || item.blend != Blend::Normal
+            || matches!(item.content, Content::Scene(_));
+
+        if !texrender {
+            return self.draw_src(enc, target, &src, &m, w, h, linear);
+        }
+
+        // Drawn into a texture of its cropped size first, moved up and left by the crop.
+        let tr = self.target(cw, ch, wgpu::TextureUsages::empty());
+        self.clear(enc, &tr);
+        let shift = Affine::translate(-(p.crop[0] as f32), -(p.crop[1] as f32));
+        self.draw_src(enc, &tr, &src, &shift, w, h, linear)?;
+
+        // Then drawn with the scale filter and the blend mode (render_item_texture).
+        let (sx, sy) = output_scale(p, w, h);
+        let scaled = (sx - 1.0).abs() > EPSILON || (sy - 1.0).abs() > EPSILON;
+        let shader = match item.filter {
+            Filter::Bicubic | Filter::Lanczos | Filter::Area if scaled && (sx < 0.5 || sy < 0.5) => Shader::Lowres,
+            Filter::Bicubic if scaled => Shader::Bicubic,
+            Filter::Lanczos if scaled => Shader::Lanczos,
+            Filter::Area if scaled && sx >= 1.0 && sy >= 1.0 => Shader::AreaUpscale,
+            Filter::Area if scaled => Shader::Area,
+            _ => Shader::Default,
+        };
+        let linear = !item.srgb_off;
+        self.quad(
+            enc,
+            target,
+            &Quad {
+                corners: corners(&m, cw as f32, ch as f32),
+                view: if linear { &tr.linear } else { &tr.gamma },
+                size: (cw, ch),
+                shader,
+                blend: item.blend,
+                linear,
+                straight: false,
+                point: item.filter == Filter::Point,
+            },
+        );
+        Ok(())
+    }
+
+    /// Draws what an item shows through `m`: a w×h picture or texture, or its items.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_src(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        target: &Target,
+        src: &Src<'_>,
+        m: &Affine,
+        w: u32,
+        h: u32,
+        linear: bool,
+    ) -> Result<(), AvError> {
+        let quad = |enc: &mut wgpu::CommandEncoder, v: &wgpu::TextureView, straight: bool| {
+            self.quad(
+                enc,
+                target,
+                &Quad {
+                    corners: corners(m, w as f32, h as f32),
+                    view: v,
+                    size: (w, h),
+                    shader: Shader::Default,
+                    blend: Blend::Normal,
+                    linear,
+                    straight,
+                    point: false,
+                },
+            );
+        };
+        match src {
+            Src::Pic(pic) => {
+                let tex = self.new_picture(pic);
+                quad(enc, &view(&tex, if linear { LINEAR } else { GAMMA }), !pic.premultiplied);
+            }
+            Src::Up(id, premultiplied) => {
+                let tex = self.uploaded(*id)?;
+                quad(enc, &view(&tex, if linear { LINEAR } else { GAMMA }), !premultiplied);
+            }
+            Src::Tex(t) => quad(enc, if linear { &t.linear } else { &t.gamma }, false),
+            Src::Items(items) => self.draw_items(enc, target, items, m)?,
+        }
+        Ok(())
+    }
+
+    /// Runs an item's filters (libobs's filter chain): its picture drawn raw into a texture, then
+    /// each filter into the next, as big as it draws.
+    fn apply_effects(&self, enc: &mut wgpu::CommandEncoder, item: &Item) -> Result<Target, AvError> {
+        let (w, h) = item.content.size();
+        let mut cur = self.target(w.max(1), h.max(1), wgpu::TextureUsages::empty());
+        self.clear(enc, &cur);
+        match &item.content {
+            Content::Picture(p) => {
+                let tex = self.new_picture(p);
+                self.quad(
+                    enc,
+                    &cur,
+                    &Quad {
+                        corners: corners(&Affine::IDENTITY, w as f32, h as f32),
+                        view: &view(&tex, GAMMA),
+                        size: (w, h),
+                        shader: Shader::Default,
+                        blend: Blend::Normal,
+                        linear: false,
+                        straight: !p.premultiplied,
+                        point: false,
+                    },
+                );
+            }
+            Content::Uploaded { id, premultiplied, .. } => {
+                let tex = self.uploaded(*id)?;
+                self.quad(
+                    enc,
+                    &cur,
+                    &Quad {
+                        corners: corners(&Affine::IDENTITY, w as f32, h as f32),
+                        view: &view(&tex, GAMMA),
+                        size: (w, h),
+                        shader: Shader::Default,
+                        blend: Blend::Normal,
+                        linear: false,
+                        straight: !premultiplied,
+                        point: false,
+                    },
+                );
+            }
+            Content::Scene(s) => self.draw_items(enc, &cur, &s.items, &Affine::IDENTITY)?,
+            Content::Group { items, .. } => self.draw_items(enc, &cur, items, &Affine::IDENTITY)?,
+        }
+        for e in &item.effects {
+            let pad = e.pad();
+            let (ow, oh) = (cur.width + 2 * pad, cur.height + 2 * pad);
+            check_size(ow, oh)?;
+            let next = self.target(ow, oh, wgpu::TextureUsages::empty());
+            self.clear(enc, &next);
+            let (entry, p, color) = match e {
+                Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
+                Effect::Shadow { rgba, blur, x, y } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], *rgba),
+                Effect::Shape { shape, feather, stretch } => {
+                    ("fs_shape", [*shape as f32, *feather, if *stretch { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], [0.0; 4])
+                }
+                Effect::BlurArea { pixelate, strength, area } => (
+                    "fs_blur_area",
+                    [if *pixelate { 1.0 } else { 0.0 }, *strength, area[0], area[1], area[2], area[3]],
+                    [0.0; 4],
+                ),
+                Effect::Look { look, strength } => ("fs_look", [*look as f32, *strength, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+            };
+            let u = [
+                cur.width as f32,
+                cur.height as f32,
+                ow as f32,
+                oh as f32,
+                pad as f32,
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                0.0,
+                color[0],
+                color[1],
+                color[2],
+                color[3],
+            ];
+            let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("effect"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&cur.gamma) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
+                ],
+            });
+            let pipeline = self.effect_pipeline(entry);
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("effect"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &next.gamma,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            cur = next;
+        }
+        Ok(cur)
+    }
+
+    fn effect_pipeline(&self, entry: &'static str) -> wgpu::RenderPipeline {
+        let mut cache = self.effect_pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(entry)
+            .or_insert_with(|| {
+                self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(entry),
+                    layout: Some(&self.pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &self.effect_module,
+                        entry_point: Some("vs"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &self.effect_module,
+                        entry_point: Some(entry),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: GAMMA,
+                            blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            })
+            .clone()
+    }
+
+    /// Keeps a picture on the graphics card under `id`, to draw as `Content::Uploaded` in later
+    /// frames without sending it again. The same id again replaces it (in place when the size is
+    /// the same: a camera's next frame).
+    pub fn upload(&self, id: u64, p: &Picture) -> Result<(), AvError> {
+        check_size(p.width, p.height)?;
+        if p.rgba.len() != p.width as usize * p.height as usize * 4 {
+            return Err(AvError::BadPixels(p.width, p.height));
+        }
+        let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        match ups.get(&id) {
+            Some((tex, w, h)) if *w == p.width && *h == p.height => self.write(tex, p),
+            _ => {
+                let tex = self.new_picture(p);
+                ups.insert(id, (tex, p.width, p.height));
+            }
+        }
+        Ok(())
+    }
+
+    /// Lets an uploaded picture go.
+    pub fn forget(&self, id: u64) {
+        self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    }
+
+    fn uploaded(&self, id: u64) -> Result<wgpu::Texture, AvError> {
+        let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        ups.get(&id).map(|(t, _, _)| t.clone()).ok_or(AvError::NotUploaded(id))
+    }
+
+    /// Draws a scene → NV12 (BT.709, limited range, as libobs gives its encoders).
+    pub fn render_nv12(&self, scene: &Scene) -> Result<Nv12, AvError> {
+        let (w, h) = (scene.width, scene.height);
+        check_size(w, h)?;
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return Err(AvError::BadSize(w, h));
+        }
+        self.validate(&scene.items)?;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let canvas = self.target(w, h, wgpu::TextureUsages::empty());
+        self.clear(&mut enc, &canvas);
+        self.draw_items(&mut enc, &canvas, &scene.items, &Affine::IDENTITY)?;
+        self.nv12_out(enc, &canvas)
+    }
+
+    /// Converts a drawn canvas to NV12 and reads it back.
+    fn nv12_out(&self, mut enc: wgpu::CommandEncoder, canvas: &Target) -> Result<Nv12, AvError> {
+        let (w, h) = (canvas.width, canvas.height);
+        let plane = |format, pw, ph| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nv12"),
+                size: wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let y = plane(wgpu::TextureFormat::R8Unorm, w, h);
+        let uv = plane(wgpu::TextureFormat::Rg8Unorm, w / 2, h / 2);
+        let mut u = Vec::with_capacity(16);
+        for row in bt709_limited() {
+            u.extend_from_slice(&row);
+        }
+        u.extend_from_slice(&[1.0 / w as f32, 0.0, (w / 2) as f32, (h / 2) as f32]);
+        let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nv12"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&canvas.gamma) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
+            ],
+        });
+        for (tex, pipeline) in [(&y, &self.nv12.0), (&uv, &self.nv12.1)] {
+            let v = tex.create_view(&Default::default());
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nv12"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &v,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let mut planes = self.read_planes(enc, &[(&y, w, h, 1), (&uv, w / 2, h / 2, 2)])?;
+        let uv = planes.pop().unwrap_or_default();
+        let y = planes.pop().unwrap_or_default();
+        Ok(Nv12 { width: w, height: h, y, uv })
+    }
+
+    fn write(&self, texture: &wgpu::Texture, p: &Picture) {
+        let size = wgpu::Extent3d { width: p.width, height: p.height, depth_or_array_layers: 1 };
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &p.rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(p.width * 4), rows_per_image: Some(p.height) },
+            size,
+        );
+    }
+
+    fn new_picture(&self, p: &Picture) -> wgpu::Texture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("picture"),
+            size: wgpu::Extent3d { width: p.width, height: p.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GAMMA,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[LINEAR],
+        });
+        self.write(&texture, p);
+        texture
+    }
+
+    /// Draws one quad in its own pass (the textures it reads are finished by then).
+    fn quad(&self, enc: &mut wgpu::CommandEncoder, target: &Target, q: &Quad<'_>) {
+        let (bw, bh) = (q.size.0 as f32, q.size.1 as f32);
+        let uniforms = floats(&[
+            target.width as f32,
+            target.height as f32,
+            if q.straight { 1.0 } else { 0.0 },
+            0.0,
+            bw,
+            bh,
+            1.0 / bw,
+            1.0 / bh,
+        ]);
+        let ubuf = self.buffer(&uniforms, wgpu::BufferUsages::UNIFORM);
+        let mut verts = Vec::with_capacity(16);
+        for ((x, y), (u, v)) in q.corners.iter().zip([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]) {
+            verts.extend_from_slice(&[*x, *y, u, v]);
+        }
+        let vbuf = self.buffer(&floats(&verts), wgpu::BufferUsages::VERTEX);
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("item"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(q.view) },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(if q.point { &self.point } else { &self.bilinear }),
+                },
+            ],
+        });
+        let pipeline = self.pipeline(q.shader, q.blend, q.linear);
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("item"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: if q.linear { &target.linear } else { &target.gamma },
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.set_vertex_buffer(0, vbuf.slice(..));
+        pass.draw(0..4, 0..1);
+    }
+
+    fn buffer(&self, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes.len() as u64,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytes);
+        buf
+    }
+
+    /// Copies the canvas into memory, row by row.
+    fn read_back(&self, enc: wgpu::CommandEncoder, target: &wgpu::Texture, w: u32, h: u32) -> Result<Vec<u8>, AvError> {
+        Ok(self.read_planes(enc, &[(target, w, h, 4)])?.pop().unwrap_or_default())
+    }
+
+    /// Copies textures (each with its size and bytes per pixel) into memory, rows packed (the
+    /// GPU pads them to 256 bytes on the way).
+    fn read_planes(
+        &self,
+        mut enc: wgpu::CommandEncoder,
+        planes: &[(&wgpu::Texture, u32, u32, u32)],
+    ) -> Result<Vec<Vec<u8>>, AvError> {
+        let mut bufs = Vec::new();
+        for (target, w, h, bpp) in planes {
+            let (w, h) = (*w, *h);
+            let row = w * bpp;
+            let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let out = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: u64::from(padded) * u64::from(h),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &out,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            bufs.push((out, row, padded, h));
+        }
+        self.queue.submit([enc.finish()]);
+        let (tx, rx) = mpsc::channel();
+        for (out, ..) in &bufs {
+            let tx = tx.clone();
+            out.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+        }
+        drop(tx);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| AvError::Readback(e.to_string()))?;
+        for r in rx {
+            r.map_err(|e| AvError::Readback(e.to_string()))?;
+        }
+        let mut result = Vec::new();
+        for (out, row, padded, h) in bufs {
+            let data = out.slice(..).get_mapped_range().map_err(|e| AvError::Readback(e.to_string()))?;
+            let mut px = Vec::with_capacity((row * h) as usize);
+            for y in 0..h as usize {
+                let start = y * padded as usize;
+                px.extend_from_slice(&data[start..start + row as usize]);
+            }
+            drop(data);
+            out.unmap();
+            result.push(px);
+        }
+        Ok(result)
+    }
+
+    /// Every picture's size and pixel count, and that uploaded ones are there, before anything
+    /// goes to the GPU.
+    fn validate(&self, items: &[Item]) -> Result<(), AvError> {
+        for item in items {
+            match &item.content {
+                Content::Picture(p) => {
+                    check_size(p.width, p.height)?;
+                    if p.rgba.len() != p.width as usize * p.height as usize * 4 {
+                        return Err(AvError::BadPixels(p.width, p.height));
+                    }
+                }
+                Content::Uploaded { id, width, height, .. } => {
+                    let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+                    match ups.get(id) {
+                        Some((_, w, h)) if w == width && h == height => {}
+                        _ => return Err(AvError::NotUploaded(*id)),
+                    }
+                }
+                Content::Scene(s) => {
+                    check_size(s.width, s.height)?;
+                    self.validate(&s.items)?;
+                }
+                Content::Group { width, height, items } => {
+                    check_size(*width, *height)?;
+                    self.validate(items)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// BT.709 limited range, RGB → Y, Cb, Cr: each row's weights and offset, as libobs converts.
+pub fn bt709_limited() -> [[f32; 4]; 3] {
+    let (kr, kb) = (0.2126f32, 0.0722f32);
+    let kg = 1.0 - kr - kb;
+    let ys = 219.0 / 255.0;
+    let cs = 224.0 / 255.0;
+    let (cb, cr) = (cs / (2.0 * (1.0 - kb)), cs / (2.0 * (1.0 - kr)));
+    [
+        [ys * kr, ys * kg, ys * kb, 16.0 / 255.0],
+        [-cb * kr, -cb * kg, cb * (1.0 - kb), 128.0 / 255.0],
+        [cr * (1.0 - kr), -cr * kg, -cr * kb, 128.0 / 255.0],
+    ]
+}
+
+fn check_size(w: u32, h: u32) -> Result<(), AvError> {
+    if w == 0 || h == 0 || w > MAX || h > MAX { Err(AvError::BadSize(w, h)) } else { Ok(()) }
+}
+
+/// A w×h rectangle's corners through `m`: top left, top right, bottom left, bottom right.
+fn corners(m: &Affine, w: f32, h: f32) -> [(f32, f32); 4] {
+    [m.apply(0.0, 0.0), m.apply(w, 0.0), m.apply(0.0, h), m.apply(w, h)]
+}
+
+fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() })
+}
+
+fn floats(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
