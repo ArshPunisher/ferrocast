@@ -1597,3 +1597,26 @@ The token is made on the server by `deploy/control-center-key.sh` (deploy/README
 | POST | `/v1/pro/smart/recap` | `{ minutes, title?, game?, peak_viewers, follows, subs, messages, chatters?, bits, tips: ["INR 500.00"], raids: [], thanks: [] /* first 15 used */, previous? }` → `{ summary }` (3 to 5 sentences, who to thank, two ideas for next time; ≤ 1,200 characters). 422 when there's no stream in it |
 
 The Control Center's stats show `usage.smart` (§9.9).
+
+### 9.11 Guest cameras (free)
+
+A guest opens a link in their browser (phone or computer) and their camera and mic come into the Studio over WebRTC (VP8 and Opus), straight to the streamer's PC: the relay only passes the offer and the answer, and never sees the media. The PC answers with str0m (`crates/guest`) and plays the stream in libobs's FFmpeg source from an SDP file on `127.0.0.1`. Connectivity: the PC's own address and its public one (STUN, `stun.cloudflare.com`, then Google's); the guest's browser uses the same STUN. There's no TURN relay yet, so two strict networks (some mobile carriers, offices) may not connect.
+
+**Relay**
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/guests/invites` | Install `Authorization` → 201 `{ token, url, expires_at }`. `url` is the remote host's `/app/guest.html#<token>` (the token after `#`, never in a log). Kept as SHA-256 for 30 days; at most 20 per install (409 `too_many_invites`). 503 `guests_unavailable` without `RELAY_REMOTE_URL` |
+| DELETE | `/v1/guests/invites/{token}` | Install `Authorization` → 204; the link stops working |
+| POST | `/g/v1/offer` | Remote host only (404 elsewhere). `{ token, name /* 1–40, control characters dropped */, offer: { type: "offer", sdp /* ≤ 32 KB */ } }` → `{ answer: { type: "answer", sdp } }`. Sent down the install's link socket as `{ type: "guest_offer", req, token, name, offer }`; the PC replies on the same socket `{ type: "guest_answer", req, answer }` or `{ type: "guest_answer", req, error }` (409 `guest_refused` with its words). Nothing is queued: 503 `streamer_offline` when the PC's link isn't open, 504 `no_answer` after 20 s, 404 `invite_ended` for an unknown or expired token, 400 for a bad body, 429 past 10 tries a minute per address or 20 per 10 minutes per link. Only the install that made the link may answer |
+
+**Engine** (`/api/v1`, dashboard auth)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/studio/guests` | `{ invites: [{ id, label, url, created_ms, expires_ms }], guests: [{ name, source, connected, video, audio }] }`. `guests` is empty while the Studio is off |
+| POST | `/studio/guests/invites` | `{ label? }` → 201 the new link (made at the relay; the relay link stays open while any exist, so guests can reach this PC). 400 past 20 links |
+| DELETE | `/studio/guests/invites/{id}` | 204; refused here at once, and at the relay when it's reachable. 404 `guest_link_missing` |
+| DELETE | `/studio/guests/{name}` | 204: hangs up on a guest, by their name or their source's; the source stays in the scenes, empty |
+
+A joining guest becomes an FFmpeg source `Guest: <name>` added **hidden** to the scene on air, so they're never on stream until the streamer shows them. A name a connected guest has gets its own source (`Guest: Asha 2`): a newcomer never takes over a guest's source. One whose guest has gone is theirs again on rejoining (same settings, new connection). At most 8 guests at once. The guest's page is `apps/dashboard/guest.html` in ferrocast-web.
