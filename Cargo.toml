@@ -53,6 +53,9 @@ debug = false
 opt-level = 3
 [profile.dev.package.tract-core]
 opt-level = 3
+# Its debug-only graph check rejects DeepFilterNet's model (a "duplicate name" its releases never
+# see): off, so debug builds start it as releases do.
+debug-assertions = false
 [profile.dev.package.tract-data]
 opt-level = 3
 [profile.dev.package.ndarray]

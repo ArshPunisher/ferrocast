@@ -51,7 +51,7 @@ impl Denoiser {
     pub(crate) fn new(channels: usize, strength: u32) -> Result<Denoiser, String> {
         let channels = channels.clamp(1, 8);
         let rp = RuntimeParams::default_with_ch(channels).with_atten_lim(atten_db(strength));
-        let df = DfTract::new(DfParams::default(), &rp).map_err(|e| e.to_string())?;
+        let df = DfTract::new(DfParams::default(), &rp).map_err(|e| format!("{e:#}"))?;
         let hop = df.hop_size;
         // One block of silence first: what's handed back is always there.
         let out = (0..channels).map(|_| std::iter::repeat_n(0.0, hop).collect()).collect();
