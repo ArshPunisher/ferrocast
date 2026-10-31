@@ -30,6 +30,7 @@ ferrocast-core.workspace = true
 ferrocast-engine.workspace = true
 ferrocast-server.workspace = true
 ferrocast-studio.workspace = true
+ferrocast-guest.workspace = true
 raw-window-handle = "0.6"
 async-trait = "0.1"
 tokio.workspace = true

@@ -45,6 +45,8 @@ struct Held {
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     /// Sources recorded on their own (Source Record): name, recording, file.
     source_records: Vec<(String, Recording, PathBuf)>,
+    /// Guests here now (crates/guest): their name, their source, their connection.
+    guests: Vec<(String, String, ferrocast_guest::Guest)>,
     replay: Option<ferrocast_studio::ReplayBuffer>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
     settings: Option<StudioSettings>,
@@ -1772,6 +1774,87 @@ impl StudioHost for DesktopStudio {
             let v = record_stats(&r);
             h.record = Some(r);
             Ok(v)
+        })
+        .await?
+    }
+
+    async fn guest_join(&self, name: String, offer: String) -> Result<String, String> {
+        /// Guests at once, at most.
+        const MAX_GUESTS: usize = 8;
+        static JOINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = JOINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Each join its own file, so a guest coming back reopens their source on the new one.
+        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        let sdp = self.data.join("studio").join("guests").join(format!("{slug}-{n}.sdp"));
+        let (answer, guest) = tokio::task::spawn_blocking(move || ferrocast_guest::Guest::accept(&offer, &sdp, None))
+            .await
+            .map_err(|_| "The Studio couldn't take the guest.".to_string())?
+            .map_err(|e| e.to_string())?;
+        let data = self.data.clone();
+        self.on_main(move |h| -> Result<String, String> {
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            h.guests.retain(|(_, _, g)| !g.status().ended);
+            if h.guests.len() >= MAX_GUESTS {
+                return Err(format!(
+                    "The Studio has {MAX_GUESTS} guests already. Ask the streamer to hang up on one first."
+                ));
+            }
+            // A name someone here now has gets a source of its own: a newcomer never takes over a
+            // guest's source (which may be on air). One whose guest has gone (no media coming
+            // in: they left, even if the connection hasn't noticed yet) is theirs again.
+            let taken = |src: &str| h.guests.iter().any(|(_, s, g)| s == src && g.status().receiving);
+            let mut source = format!("Guest: {name}");
+            let mut n = 2;
+            while taken(&source) {
+                source = format!("Guest: {name} {n}");
+                n += 1;
+            }
+            let settings = ferrocast_guest::source_settings(guest.sdp());
+            if c.sources().iter().any(|s| s.name == source) {
+                c.update(&source, &settings).map_err(|e| e.to_string())?;
+            } else {
+                // Hidden at first: a guest never appears on air until the streamer shows them.
+                let scene = c.current();
+                let item =
+                    c.add_source(&scene, "ffmpeg_source", &source, &settings, false).map_err(|e| e.to_string())?;
+                c.edit_item(&scene, item.id, ItemEdit::Hide).map_err(|e| e.to_string())?;
+            }
+            save(c, &scenes_file(&data));
+            // The connection whose source this was, if any, is over.
+            h.guests.retain(|(_, s, _)| *s != source);
+            h.guests.push((name, source, guest));
+            Ok(answer)
+        })
+        .await?
+    }
+
+    async fn guests(&self) -> Result<Value, String> {
+        self.on_main(|h| {
+            // The ones that ended go (their source stays).
+            h.guests.retain(|(_, _, g)| !g.status().ended);
+            let list: Vec<Value> = h
+                .guests
+                .iter()
+                .map(|(name, source, g)| {
+                    let s = g.status();
+                    json!({ "name": name, "source": source, "connected": s.connected, "video": s.video, "audio": s.audio })
+                })
+                .collect();
+            Value::Array(list)
+        })
+        .await
+    }
+
+    async fn guest_leave(&self, name: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            let before = h.guests.len();
+            // By their source (one guest), else by name (two guests may share one).
+            if h.guests.iter().any(|(_, s, _)| *s == name) {
+                h.guests.retain(|(_, s, _)| *s != name);
+            } else {
+                h.guests.retain(|(n, _, _)| *n != name);
+            }
+            if h.guests.len() == before { Err(format!("{name} isn't here.")) } else { Ok(()) }
         })
         .await?
     }
