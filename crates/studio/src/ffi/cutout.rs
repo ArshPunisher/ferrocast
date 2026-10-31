@@ -1,5 +1,6 @@
-//! Remove background (macOS): a filter that finds the person in a picture with Apple's Vision
-//! (person segmentation, on this Mac) and takes the background out, or blurs it. No green screen.
+//! Remove background: a filter that finds the person in a picture and takes the background out,
+//! or blurs it. No green screen. On macOS Apple's Vision finds them (person segmentation); on
+//! Windows Robust Video Matting does, on the CPU (`matte`).
 //!
 //! About 15 times a second the graphics thread renders a small copy of the source and hands it
 //! to a worker thread (only when the worker is free, so nothing waits); the worker asks Vision
@@ -20,8 +21,20 @@ use super::{Api, GsEffect, GsTexture, ObsData, ObsProperties, ObsSource, Vec2};
 
 pub(crate) const KIND: &CStr = c"ferrocast_remove_background";
 
-/// The mask Vision is asked for is about this wide (height follows the picture's shape).
-const MASK_W: u32 = 320;
+/// The small copy Vision is asked for a mask of: about 320 wide, the height following the
+/// picture's shape.
+#[cfg(all(target_os = "macos", not(feature = "onnx-matte")))]
+fn ask_size(w: u32, h: u32) -> (u32, u32) {
+    let sw = 320.min(w);
+    (sw, ((u64::from(h) * u64::from(sw)) / u64::from(w)).max(1) as u32)
+}
+
+/// The small copy RVM is given (the `onnx-matte` feature tries RVM on macOS too).
+#[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
+fn ask_size(w: u32, h: u32) -> (u32, u32) {
+    (super::matte::WIDTH, super::matte::height_for(w, h))
+}
+
 /// How often a new mask is asked for.
 const EVERY: Duration = Duration::from_millis(66);
 
@@ -67,7 +80,7 @@ fn api() -> Option<&'static Api> {
     unsafe { API.load(Ordering::Acquire).as_ref() }
 }
 
-/// A mask from Vision: one byte a pixel, 255 where the person is.
+/// A person mask: one byte a pixel, 255 where the person is.
 struct Mask {
     w: u32,
     h: u32,
@@ -91,6 +104,7 @@ struct Filter {
 }
 
 /// Vision's person mask of an RGBA picture, at its own size; None when it finds nothing.
+#[cfg(all(target_os = "macos", not(feature = "onnx-matte")))]
 fn person_mask(rgba: &[u8], w: u32, h: u32) -> Option<Mask> {
     use objc2::AnyThread;
     use objc2_core_video::{
@@ -149,10 +163,36 @@ fn person_mask(rgba: &[u8], w: u32, h: u32) -> Option<Mask> {
     }
 }
 
+#[cfg(all(target_os = "macos", not(feature = "onnx-matte")))]
 fn worker(rx: Receiver<(Vec<u8>, u32, u32)>, busy: Arc<AtomicBool>, out: Arc<Mutex<Option<Mask>>>) {
     while let Ok((rgba, w, h)) = rx.recv() {
         // Vision makes Objective-C objects: each round in its own pool.
         let m = objc2::rc::autoreleasepool(|_| person_mask(&rgba, w, h));
+        if let Some(m) = m
+            && let Ok(mut slot) = out.lock()
+        {
+            *slot = Some(m);
+        }
+        busy.store(false, Ordering::Release);
+    }
+}
+
+/// RVM's masks, one picture after another (it remembers the last ones: the mask stays steady).
+#[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
+fn worker(rx: Receiver<(Vec<u8>, u32, u32)>, busy: Arc<AtomicBool>, out: Arc<Mutex<Option<Mask>>>) {
+    let mut matte = super::matte::Matte::new();
+    let mut warned = false;
+    while let Ok((rgba, w, h)) = rx.recv() {
+        let m = match matte.mask(&rgba, w, h) {
+            Ok(px) => Some(Mask { w, h, px }),
+            Err(e) => {
+                if !warned {
+                    tracing::warn!(error = %e, "remove background couldn't find the person");
+                    warned = true;
+                }
+                None
+            }
+        };
         if let Some(m) = m
             && let Ok(mut slot) = out.lock()
         {
@@ -270,8 +310,7 @@ unsafe extern "C" fn update(data: *mut c_void, s: *mut ObsData) {
 fn feed(a: &Api, f: &mut Filter, target: *mut ObsSource, w: u32, h: u32) {
     let due = f.last_ask.is_none_or(|t| t.elapsed() >= EVERY);
     if due && !f.busy.load(Ordering::Acquire) {
-        let sw = MASK_W.min(w);
-        let sh = ((u64::from(h) * u64::from(sw)) / u64::from(w)).max(1) as u32;
+        let (sw, sh) = ask_size(w, h);
         if let Some(rgba) = super::snapshot_scaled(a, target, (w, h), sw, sh)
             && let Some(ask) = &f.ask
         {
@@ -351,11 +390,18 @@ unsafe extern "C" fn video_render(data: *mut c_void, _: *mut GsEffect) {
 const GS_R8: std::ffi::c_int = 2;
 const GS_DYNAMIC: u32 = 1 << 1;
 
-/// Registers the kind (once per process, after the plugins load).
-pub(crate) fn register(api: &Api) {
+/// Registers the kind (once per process, after the plugins load). Where RVM finds the person,
+/// only when its model is there (`obs_data`: libobs's data folder, as [`crate::Paths::data`]).
+pub(crate) fn register(api: &Api, obs_data: &str) {
     if !API.load(Ordering::Acquire).is_null() {
         return;
     }
+    #[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
+    if !super::matte::find(obs_data) {
+        tracing::info!("remove background isn't offered: its model isn't installed");
+        return;
+    }
+    let _ = obs_data;
     API.store(api as *const Api as *mut Api, Ordering::Release);
     let info = SourceInfo {
         id: KIND.as_ptr(),

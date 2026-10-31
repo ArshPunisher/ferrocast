@@ -48,6 +48,16 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Remove background's model runs in tract: unoptimised it takes seconds a frame, too slow to try.
+[profile.dev.package.tract-linalg]
+opt-level = 3
+[profile.dev.package.tract-core]
+opt-level = 3
+[profile.dev.package.tract-data]
+opt-level = 3
+[profile.dev.package.ndarray]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

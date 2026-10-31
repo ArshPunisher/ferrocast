@@ -417,9 +417,8 @@ impl Studio {
         ffi::web::register(&inner.api);
         // Ferrocast's own picture filters (Rounded corners, Border, Shadow and glow…).
         ffi::shaders::register(&inner.api);
-        // Remove background, with Apple's Vision (macOS).
-        #[cfg(target_os = "macos")]
-        ffi::cutout::register(&inner.api);
+        // Remove background: Apple's Vision on macOS, RVM elsewhere (when its model is installed).
+        ffi::cutout::register(&inner.api, &paths.data);
         Ok(Studio { inner })
     }
 

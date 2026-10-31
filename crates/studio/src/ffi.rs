@@ -1658,9 +1658,12 @@ pub(crate) mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
 
-/// Remove background (macOS): Vision's person mask, applied by a shader.
-#[cfg(target_os = "macos")]
+/// Remove background: a person mask (Vision on macOS, RVM elsewhere), applied by a shader.
 pub(crate) mod cutout;
+
+/// Robust Video Matting through tract: the person mask where Vision isn't.
+#[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
+pub(crate) mod matte;
 
 /// Ferrocast's own picture filters (every platform): Rounded corners, Border, Shadow and glow,
 /// Shape, Blur or pixelate an area, Colour looks.

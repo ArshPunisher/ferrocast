@@ -18,6 +18,12 @@ tracing.workspace = true
 png = "0.17"
 # Scene pictures as data URLs (the Scenes grid), on every platform.
 base64 = "0.23"
+# Remove background where Apple's Vision isn't: Robust Video Matting run by tract (pure Rust).
+tract-onnx = { version = "0.23", optional = true }
+
+[features]
+# Remove background with RVM on macOS too (to try it; Vision is the default there).
+onnx-matte = ["dep:tract-onnx"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -38,6 +44,9 @@ objc2-core-video = { version = "0.3", default-features = false, features = ["std
 # The Studio's picture in the app's window (a child window libobs draws into with D3D11).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tract-onnx = "0.23"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow", "NSApplication", "NSRunningApplication", "NSGraphics"] }
