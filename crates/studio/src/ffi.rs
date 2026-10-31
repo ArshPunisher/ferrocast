@@ -837,6 +837,8 @@ api! {
     obs_properties_add_color_alpha: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char) -> *mut ObsProperty;
     obs_data_get_bool: fn(a: *mut ObsData, b: *const c_char) -> bool;
     obs_data_set_default_bool: fn(a: *mut ObsData, b: *const c_char, c: bool);
+    obs_get_video_info: fn(a: *mut VideoInfo) -> bool;
+    obs_view_add2: fn(a: *mut ObsView, b: *mut VideoInfo) -> *mut VideoT;
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`

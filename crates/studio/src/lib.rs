@@ -822,19 +822,93 @@ impl Studio {
     /// Starts recording what's on air to `path` as `plan` says: its format, the audio tracks,
     /// splitting by time or size, and the names of the next parts.
     pub fn record_to(&self, path: &Path, plan: &RecordPlan) -> Result<Recording, StudioError> {
+        self.record_with(path, plan, None)
+    }
+
+    /// Starts recording one scene or source on its own (OBS's "Source Record"): its picture at
+    /// its own size, with the sound of `plan`'s tracks, as `record_to` otherwise does. The
+    /// camera and the game as separate files, for editing later.
+    pub fn record_source_to(&self, name: &str, path: &Path, plan: &RecordPlan) -> Result<Recording, StudioError> {
         let a = &self.inner.api;
+        let n = cstr(name);
+        let src = a.obs_get_source_by_name(n.as_ptr());
+        if src.is_null() {
+            return Err(StudioError::Failed(format!("there's no scene or source called \"{name}\"")));
+        }
+        let (sw, sh) = (a.obs_source_get_width(src), a.obs_source_get_height(src));
+        if sw == 0 || sh == 0 {
+            a.obs_source_release(src);
+            return Err(StudioError::Failed(format!(
+                "\"{name}\" has no picture yet (a camera still starting?); try again in a moment"
+            )));
+        }
+        // Encoders take even sizes.
+        let even = |v: u32| (v + 1) & !1;
+        let (w, h) = (even(sw), even(sh));
+        let view = a.obs_view_create();
+        a.obs_view_set_source(view, 0, src);
+        a.obs_source_release(src);
+        // Empty, for libobs to fill in with what's set now.
+        let mut ovi = ffi::VideoInfo {
+            graphics_module: ptr::null(),
+            fps_num: 0,
+            fps_den: 0,
+            base_width: 0,
+            base_height: 0,
+            output_width: 0,
+            output_height: 0,
+            output_format: 0,
+            adapter: 0,
+            gpu_conversion: false,
+            colorspace: 0,
+            range: 0,
+            scale_type: 0,
+        };
+        let video = if a.obs_get_video_info(&mut ovi) {
+            ovi.base_width = w;
+            ovi.base_height = h;
+            ovi.output_width = w;
+            ovi.output_height = h;
+            a.obs_view_add2(view, &mut ovi)
+        } else {
+            ptr::null_mut()
+        };
+        if video.is_null() {
+            a.obs_view_destroy(view);
+            return Err(StudioError::Failed(format!("\"{name}\" couldn't be recorded on its own")));
+        }
+        self.record_with(path, plan, Some((view, video)))
+    }
+
+    /// `record_to`, from what's on air or (with `view`) from a view's own picture.
+    fn record_with(
+        &self,
+        path: &Path,
+        plan: &RecordPlan,
+        view: Option<(*mut ffi::ObsView, *mut ffi::VideoT)>,
+    ) -> Result<Recording, StudioError> {
+        let a = &self.inner.api;
+        // The view goes with the recording, or here when it can't start.
+        let drop_view = || {
+            if let Some((v, _)) = view {
+                a.obs_view_remove(v);
+                a.obs_view_destroy(v);
+            }
+        };
         let (id, muxer) = match plan.format.as_str() {
             "mp4" => ("mp4_output", ""),
             "mov" => ("mov_output", ""),
             "fmp4" | "fmov" => ("ffmpeg_muxer", "movflags=frag_keyframe+empty_moov+delay_moov"),
             "mkv" | "flv" | "ts" | "hls" => ("ffmpeg_muxer", ""),
             f => {
+                drop_view();
                 return Err(StudioError::Failed(format!(
                     "format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls, not \"{f}\""
                 )));
             }
         };
         if id == "ffmpeg_muxer" && !Studio::muxer_ready() {
+            drop_view();
             return Err(StudioError::Failed(
                 "MKV, FLV, TS and fragmented recordings need OBS's mux helper beside Ferrocast; record as MP4 or MOV"
                     .into(),
@@ -842,9 +916,20 @@ impl Studio {
         }
         let tracks: Vec<u8> = if plan.tracks.is_empty() { vec![1] } else { plan.tracks.clone() };
         if tracks.iter().any(|t| !(1..=6).contains(t)) {
+            drop_view();
             return Err(StudioError::Failed("tracks: numbers 1 to 6.".into()));
         }
-        let (venc, audio) = self.encoders_for_tracks(&plan.encode, &tracks)?;
+        let (venc, audio) = match self.encoders_for_tracks(&plan.encode, &tracks) {
+            Ok(e) => e,
+            Err(e) => {
+                drop_view();
+                return Err(e);
+            }
+        };
+        if let Some((_, video)) = view {
+            // The view's picture, not what's on air.
+            a.obs_encoder_set_video(venc, video);
+        }
         let settings = a.obs_data_create();
         let set_str = |k: &str, v: &str| {
             let (k, v) = (cstr(k), cstr(v));
@@ -873,10 +958,18 @@ impl Studio {
         set_str("format", &plan.name);
         set_str("extension", plan.extension());
         set_bool("allow_spaces", plan.spaces);
-        let (oid, oname) = (cstr(id), cstr("ferrocast-record"));
+        let (oid, oname) =
+            (cstr(id), cstr(if view.is_some() { "ferrocast-record-source" } else { "ferrocast-record" }));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
         a.obs_data_release(settings);
-        let rec = Recording { studio: self.clone(), out, venc, audio, path: path.to_path_buf() };
+        let rec = Recording {
+            studio: self.clone(),
+            out,
+            venc,
+            audio,
+            path: path.to_path_buf(),
+            view: view.map_or(ptr::null_mut(), |(v, _)| v),
+        };
         if out.is_null() {
             return Err(StudioError::Failed("the recorder couldn't be made".into()));
         }
@@ -2007,6 +2100,8 @@ pub struct Recording {
     /// One encoder per audio track recorded.
     audio: Vec<*mut ffi::ObsEncoder>,
     path: PathBuf,
+    /// A source recorded on its own: its view (null for what's on air).
+    view: *mut ffi::ObsView,
 }
 
 /// Looks for files named like `names` (by file name) under `folder`, a few levels deep, as
@@ -2375,6 +2470,10 @@ impl Drop for Recording {
         a.obs_encoder_release(self.venc);
         for e in &self.audio {
             a.obs_encoder_release(*e);
+        }
+        if !self.view.is_null() {
+            a.obs_view_remove(self.view);
+            a.obs_view_destroy(self.view);
         }
     }
 }
