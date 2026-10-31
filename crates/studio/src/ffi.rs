@@ -1636,6 +1636,10 @@ pub(crate) mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
 
+/// The Studio's picture in the app's window on Windows (the macOS one is `mac::ChildView`).
+#[cfg(windows)]
+pub(crate) mod win;
+
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {
     use std::ffi::c_void;

@@ -1187,14 +1187,25 @@ impl Studio {
         on: *mut ffi::ObsCanvas,
         base: (u32, u32),
     ) -> Result<Preview, StudioError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let rect = with_edge(rect);
-            let RawWindowHandle::AppKit(h) = window else {
-                return Err(StudioError::Failed("that isn't a macOS window".into()));
+            #[cfg(target_os = "macos")]
+            let view = {
+                let RawWindowHandle::AppKit(h) = window else {
+                    return Err(StudioError::Failed("that isn't a macOS window".into()));
+                };
+                ffi::mac::child_view(h.ns_view.as_ptr(), rect.x, rect.y, rect.w, rect.h, rect.vh)
+                    .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?
             };
-            let view = ffi::mac::child_view(h.ns_view.as_ptr(), rect.x, rect.y, rect.w, rect.h, rect.vh)
-                .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?;
+            #[cfg(windows)]
+            let view = {
+                let RawWindowHandle::Win32(h) = window else {
+                    return Err(StudioError::Failed("that isn't a Windows window".into()));
+                };
+                ffi::win::child_view(h.hwnd.get() as *mut std::ffi::c_void, rect.x, rect.y, rect.w, rect.h)
+                    .ok_or_else(|| StudioError::Failed("the preview's window couldn't be made".into()))?
+            };
             // The view's own pixels (its frame is snapped to whole pixels round the box).
             let (cx, cy) = view.pixels().unwrap_or_else(|| px(rect, scale));
             let init = ffi::GsInitData {
@@ -1229,7 +1240,7 @@ impl Studio {
             view.resize_with(&self.inner.api, display);
             Ok(Preview { studio: self.clone(), display, state, view, scale })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = (window, rect, scale, on, base);
             Err(StudioError::Failed("the preview isn't on this system yet".into()))
@@ -1283,13 +1294,36 @@ pub struct Preview {
     state: Box<ffi::DrawState>,
     #[cfg(target_os = "macos")]
     view: ffi::mac::ChildView,
+    #[cfg(windows)]
+    view: ffi::win::ChildView,
     scale: f64,
+}
+
+/// A mouse action over the preview on Windows, in the page's CSS pixels from the window's top
+/// left: the picture's child window takes clicks there, and the app passes each on to the page
+/// (on a Mac they go through to the page by themselves).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PreviewInput {
+    /// "down", "up", "move", "dblclick", "wheel" or "leave".
+    pub kind: &'static str,
+    /// The button pressed or let go: 0 left, 1 middle, 2 right (as DOM events number them).
+    pub button: i16,
+    /// The buttons held now, as DOM `buttons` (1 left, 2 right, 4 middle).
+    pub buttons: u16,
+    pub x: f64,
+    pub y: f64,
+    /// A wheel's turn in CSS pixels (DOM `deltaX`/`deltaY`).
+    pub dx: f64,
+    pub dy: f64,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
 }
 
 impl Preview {
     /// The size it draws at: its view's own pixels (snapped round the box) where there's one.
     fn pixels(&self, rect: Rect, scale: f64) -> (u32, u32) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(p) = self.view.pixels() {
             return p;
         }
@@ -1306,6 +1340,8 @@ impl Preview {
         self.state.edge.store(edge_px(scale), std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         self.view.set_frame(rect.x, rect.y, rect.w, rect.h, rect.vh);
+        #[cfg(windows)]
+        self.view.set_frame(rect.x, rect.y, rect.w, rect.h);
         let (cx, cy) = self.pixels(rect, scale);
         self.studio.inner.api.obs_display_resize(self.display, cx, cy);
     }
@@ -1351,7 +1387,7 @@ impl Preview {
         self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr));
         // The view itself too: while the window grows, the strip not drawn yet shows the
         // stage's colour, not black.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.view.set_backdrop(abgr);
     }
 
@@ -1362,9 +1398,9 @@ impl Preview {
         // `set_rect`'s view reaches PREVIEW_EDGE past the page's box; `set_area`'s is the box.
         let edge = if self.state.canvas.lock().map(|g| g.is_none()).unwrap_or(true) { PREVIEW_EDGE } else { 0.0 };
         let moved: Vec<_> = holes.iter().map(|&(x, y, w, h, r)| (x + edge, y + edge, w, h, r)).collect();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.view.set_holes(&moved);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = moved;
     }
 
@@ -1377,10 +1413,28 @@ impl Preview {
     /// How much of the picture shows, 0 to 1 (dimmed under a dialog, hidden while the window
     /// is resized). Main thread.
     pub fn set_opacity(&self, opacity: f64) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.view.set_opacity(opacity);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = opacity;
+    }
+
+    /// Mouse actions over the preview go to `cb` (Windows; on a Mac the page gets them
+    /// itself). Main thread.
+    pub fn set_input(&self, cb: Box<dyn Fn(PreviewInput)>) {
+        #[cfg(windows)]
+        self.view.set_input(cb);
+        #[cfg(not(windows))]
+        let _ = cb;
+    }
+
+    /// The cursor over the preview, by its CSS name (Windows: the page says what it shows over
+    /// its stage there). Main thread.
+    pub fn set_cursor(&self, css: &str) {
+        #[cfg(windows)]
+        self.view.set_cursor(css);
+        #[cfg(not(windows))]
+        let _ = css;
     }
 
     /// Outlines every source of `scene` in its own colour, or none.
@@ -1397,6 +1451,8 @@ impl Preview {
         self.scale = scale;
         #[cfg(target_os = "macos")]
         self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        #[cfg(windows)]
+        self.view.set_frame(area.x, area.y, area.w, area.h);
         let (cx, cy) = self.pixels(area, scale);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         if let Ok(mut g) = self.state.canvas.lock() {
@@ -1417,7 +1473,7 @@ impl Drop for Preview {
             a.obs_source_dec_showing(shown);
             a.obs_source_release(shown);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.view.remove();
     }
 }
