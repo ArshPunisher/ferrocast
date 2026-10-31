@@ -111,8 +111,9 @@ try {
   [Win]::mouse_event(0x4, 0, 0, 0, [UIntPtr]::Zero)                                 # left up
   Start-Sleep -Seconds 2
   Shot 'studio-picked'
-  $log = Get-Content (Join-Path $Out 'app.out.log') -Raw
-  if ($log -notmatch 'picked in the preview selected=Some') { throw "a click on the picture didn't reach the page" }
+  # The debug app on a runner without a GPU can take a few seconds to log it.
+  $picked = { (Get-Content (Join-Path $Out 'app.out.log') -Raw) -match 'picked in the preview selected=Some' }
+  try { Wait 'the pick' 10 $picked | Out-Null } catch { throw "a click on the picture didn't reach the page" }
   Write-Host 'A click on the picture picked the source under it.'
 
   # MKV goes through obs-ffmpeg-mux (Ferrocast's stand-in, then OBS's beside the engine).
