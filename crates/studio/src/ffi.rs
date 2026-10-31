@@ -831,6 +831,12 @@ api! {
     obs_source_skip_video_filter: fn(a: *mut ObsSource);
     obs_properties_add_int_slider: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char, d: c_int, e: c_int, f: c_int) -> *mut ObsProperty;
     obs_property_int_set_suffix: fn(a: *mut ObsProperty, b: *const c_char);
+    obs_properties_add_bool: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char) -> *mut ObsProperty;
+    obs_properties_add_list: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char, d: c_int, e: c_int) -> *mut ObsProperty;
+    obs_property_list_add_int: fn(a: *mut ObsProperty, b: *const c_char, c: i64) -> usize;
+    obs_properties_add_color_alpha: fn(a: *mut ObsProperties, b: *const c_char, c: *const c_char) -> *mut ObsProperty;
+    obs_data_get_bool: fn(a: *mut ObsData, b: *const c_char) -> bool;
+    obs_data_set_default_bool: fn(a: *mut ObsData, b: *const c_char, c: bool);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
@@ -1648,8 +1654,9 @@ pub(crate) mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
 
-/// Ferrocast's Rounded corners filter (every platform).
-pub(crate) mod rounded;
+/// Ferrocast's own picture filters (every platform): Rounded corners, Border, Shadow and glow,
+/// Shape, Blur or pixelate an area, Colour looks.
+pub(crate) mod shaders;
 
 /// The Studio's picture in the app's window on Windows (the macOS one is `mac::ChildView`).
 #[cfg(windows)]
