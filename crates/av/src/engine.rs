@@ -74,6 +74,8 @@ pub struct SceneItem {
     pub opacity: f32,
     /// Keyframed properties, timed from when the scene went on air.
     pub animation: Vec<Track>,
+    /// Another scene shown here (then `source` is unused), drawn at the canvas's size.
+    pub scene: Option<String>,
 }
 
 impl SceneItem {
@@ -87,6 +89,7 @@ impl SceneItem {
             effects: Vec::new(),
             opacity: 1.0,
             animation: Vec::new(),
+            scene: None,
         }
     }
 }
@@ -504,6 +507,50 @@ impl Engine {
         self.lock().scenes.insert(name.to_string(), items);
     }
 
+    /// Opens an OBS scene collection (the JSON OBS and Ferrocast's Studio save): its sources,
+    /// scenes and the scene on air replace what the engine had. Returns what couldn't come over
+    /// (sources or filters it doesn't run yet, files that are gone).
+    pub fn load_obs(&self, doc: &serde_json::Value) -> Vec<String> {
+        let imported = crate::obs::import(doc, (self.config.width, self.config.height));
+        let mut skipped = imported.skipped;
+        let old: Vec<u64> = self.lock().sources.keys().copied().collect();
+        for id in old {
+            self.remove_source(id);
+        }
+        {
+            // A fresh start: nothing on air, every scene's clock unset.
+            let mut st = self.lock();
+            st.scenes.clear();
+            st.started.clear();
+            st.on_air = None;
+            st.moving = None;
+        }
+        for s in imported.sources {
+            match self.set_source(s.id, s.kind) {
+                Ok(()) => {
+                    if let Some(sound) = s.sound {
+                        self.set_sound(s.id, sound);
+                        self.set_sound_effects(s.id, &s.sound_effects);
+                    }
+                }
+                Err(e) => skipped.push(format!("{}: {e}", s.name)),
+            }
+        }
+        for (name, items) in imported.scenes {
+            self.set_scene(&name, items);
+        }
+        let first = self.lock().scenes.keys().next().cloned();
+        if let Some(cur) = imported.current.or(first) {
+            let _ = self.go(&cur);
+        }
+        skipped
+    }
+
+    /// The scenes there are.
+    pub fn scene_names(&self) -> Vec<String> {
+        self.lock().scenes.keys().cloned().collect()
+    }
+
     /// Puts a scene on air (a cut).
     pub fn go(&self, name: &str) -> Result<(), AvError> {
         self.go_with(name, TransitionKind::Cut, 0)
@@ -697,7 +744,7 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
                 ..Default::default()
             },
         );
-        s.items.extend(item_of(st, &over, 0));
+        s.items.extend(item_of(st, &over, 0, (width, height)));
         return Draw::Scene(s);
     }
     match &st.moving {
@@ -720,12 +767,32 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
 }
 
 /// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
-fn item_of(st: &State, it: &SceneItem, ms: u64) -> Option<Item> {
-    let src = st.sources.get(&it.source)?;
-    let (width, height, premultiplied) = src.size?;
+fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32)) -> Option<Item> {
+    item_at(st, it, ms, 0, canvas)
+}
+
+/// Scenes inside scenes go at most this deep (a scene showing itself stops there).
+const MAX_NESTING: u32 = 8;
+
+fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) -> Option<Item> {
     let (placement, opacity) = animated(it, ms);
+    let content = match &it.scene {
+        Some(name) if depth < MAX_NESTING => {
+            let scene = st.scenes.get(name)?;
+            // Its items keep the time of the scene showing it (as OBS: a nested scene plays along).
+            let items =
+                scene.iter().filter(|i| i.visible).filter_map(|i| item_at(st, i, ms, depth + 1, canvas)).collect();
+            Content::Scene(Scene { width: canvas.0, height: canvas.1, items })
+        }
+        Some(_) => return None,
+        None => {
+            let src = st.sources.get(&it.source)?;
+            let (width, height, premultiplied) = src.size?;
+            Content::Uploaded { id: it.source, width, height, premultiplied }
+        }
+    };
     Some(Item {
-        content: Content::Uploaded { id: it.source, width, height, premultiplied },
+        content,
         effects: it.effects.clone(),
         placement,
         filter: it.filter,
@@ -747,7 +814,7 @@ fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Sc
         && let Some(scene) = st.scenes.get(name)
     {
         let ms = scene_ms(st, name, ts);
-        items.extend(scene.iter().filter(|i| i.visible).filter_map(|it| item_of(st, it, ms)));
+        items.extend(scene.iter().filter(|i| i.visible).filter_map(|it| item_of(st, it, ms, (width, height))));
     }
     Scene { width, height, items }
 }
@@ -761,16 +828,19 @@ fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: 
     let b = st.scenes.get(to).unwrap_or(&empty2);
     let (ma, mb) = (scene_ms(st, from, ts), scene_ms(st, to, ts));
     let lerp = |x: f32, y: f32| x + (y - x) * t;
+    let canvas = (width, height);
+    // The same thing in both scenes: one source, or one nested scene.
+    let same = |x: &SceneItem, y: &SceneItem| x.source == y.source && x.scene == y.scene;
     let mut items = Vec::new();
-    for old in a.iter().filter(|i| i.visible && !b.iter().any(|n| n.visible && n.source == i.source)) {
-        if let Some(mut it) = item_of(st, old, ma) {
+    for old in a.iter().filter(|i| i.visible && !b.iter().any(|n| n.visible && same(n, i))) {
+        if let Some(mut it) = item_of(st, old, ma, canvas) {
             it.opacity *= 1.0 - t;
             items.push(it);
         }
     }
     for new in b.iter().filter(|i| i.visible) {
-        let Some(mut it) = item_of(st, new, mb) else { continue };
-        match a.iter().find(|o| o.visible && o.source == new.source).and_then(|o| item_of(st, o, ma)) {
+        let Some(mut it) = item_of(st, new, mb, canvas) else { continue };
+        match a.iter().find(|o| o.visible && same(o, new)).and_then(|o| item_of(st, o, ma, canvas)) {
             Some(o) => {
                 let (p, q) = (o.placement, it.placement);
                 it.placement.x = lerp(p.x, q.x);
