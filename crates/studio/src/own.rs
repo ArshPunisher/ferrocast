@@ -1,7 +1,8 @@
-//! Streaming with Ferrocast's own encoders (ENGINE.md E1, behind the "own encoder" switch):
-//! libobs still draws and mixes, but its finished frames and sound go through ferrocast-av's
-//! encoders and out over RTMP by Go live's own sender, to the same server libobs would send to
-//! (Go live's ingest on this computer). Everything after looks the same to the rest of the app.
+//! Streaming and recording with Ferrocast's own encoders (ENGINE.md E1, behind the "own
+//! encoder" switch): libobs still draws and mixes, but its finished frames and sound go through
+//! ferrocast-av's encoders, out over RTMP by Go live's own sender to the same server libobs
+//! would send to (Go live's ingest on this computer), or into a crash-safe MP4. Everything after
+//! looks the same to the rest of the app.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,7 @@ use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConf
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
 use ferrocast_golive::{Hub, Target};
 
-use crate::{ProgramFeed, StreamSettings, StreamStats, Studio, StudioError};
+use crate::{EncodeSettings, ProgramFeed, RecordPlan, RecordStats, StreamSettings, StreamStats, Studio, StudioError};
 
 /// Why this stream can't use our encoders (it then uses libobs's), or None when it can.
 pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'static str> {
@@ -39,6 +40,32 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
     }
 }
 
+/// Why this recording can't use our encoders, or None when it can.
+pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
+    let tracks_one = plan.tracks.is_empty() || plan.tracks == [1];
+    if !matches!(plan.format.as_str(), "mp4" | "fmp4") {
+        Some("this format (ours writes MP4)")
+    } else if plan.split_minutes > 0 || plan.split_mb > 0 {
+        Some("splitting a recording")
+    } else if !tracks_one {
+        Some("more than one sound track")
+    } else if !plan.muxer.trim().is_empty() {
+        Some("custom muxer settings")
+    } else if plan.encode.quality.is_some() {
+        Some("constant quality")
+    } else if !plan.encode.extra.is_empty() {
+        Some("an encoder's own options")
+    } else if plan.encode.scale.is_some() {
+        Some("a scaled recording")
+    } else if !own_codec_ok(&plan.encode.video_encoder) {
+        Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
+    } else if !cfg!(target_os = "macos") {
+        Some("this system (our encoders are Mac-only so far)")
+    } else {
+        None
+    }
+}
+
 /// Whether the picked encoder is one ours stands in for: the Mac's hardware H.264 or HEVC.
 fn own_codec_ok(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
@@ -53,14 +80,23 @@ struct Counts {
     error: Mutex<Option<String>>,
 }
 
-/// A stream through our encoders; dropping it ends it (the encoders flushed, the server told).
+/// Where a stream goes: the server, the key, and how it reconnects.
+pub(crate) struct Send<'a> {
+    pub server: &'a str,
+    pub key: &'a str,
+    pub reconnect: Option<(u32, u32)>,
+}
+
+/// A stream or recording through our encoders; dropping it ends it (the encoders flushed, the
+/// server told, the file closed).
 #[derive(Debug)]
 pub(crate) struct OwnStream {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     counts: Arc<Counts>,
-    health: tokio::sync::watch::Receiver<Health>,
-    stop_push: tokio::sync::watch::Sender<bool>,
+    /// The sender's health and its stop, when streaming.
+    health: Option<tokio::sync::watch::Receiver<Health>>,
+    stop_push: Option<tokio::sync::watch::Sender<bool>>,
     runtime: Option<tokio::runtime::Runtime>,
     /// libobs's side of the hand-over (kept on this thread: it holds the Studio); its
     /// channels are with the encoder thread.
@@ -68,14 +104,27 @@ pub(crate) struct OwnStream {
 }
 
 impl OwnStream {
-    pub(crate) fn start(studio: &Studio, server: &str, key: &str, s: &StreamSettings) -> Result<Self, StudioError> {
+    /// A stream as `s` says.
+    pub(crate) fn stream(studio: &Studio, server: &str, key: &str, s: &StreamSettings) -> Result<Self, StudioError> {
+        Self::start(studio, Some(Send { server, key, reconnect: s.reconnect }), None, &s.encode)
+    }
+
+    /// A recording to `path` (a fragmented MP4: it plays even after a crash).
+    pub(crate) fn record(studio: &Studio, path: &std::path::Path, plan: &RecordPlan) -> Result<Self, StudioError> {
+        Self::start(studio, None, Some(path), &plan.encode)
+    }
+
+    fn start(studio: &Studio, send_to: Option<Send<'_>>, record: Option<&std::path::Path>, e: &EncodeSettings) -> Result<Self, StudioError> {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own encoder couldn't start: {e}"));
-        let target = Target::parse(server).map_err(|e| fail(e.to_string()))?;
+        let target = match &send_to {
+            Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
+            None => None,
+        };
         let mut feed = studio.program_feed()?;
         // The channels go to the encoder thread; the feed itself stays here.
         let frames = std::mem::replace(&mut feed.video, std::sync::mpsc::sync_channel(0).1);
         let sound = std::mem::replace(&mut feed.sound, std::sync::mpsc::sync_channel(0).1);
-        let codec = if s.encode.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
+        let codec = if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
         let video = VideoConfig {
             codec,
             input: PixelFormat::Nv12,
@@ -83,28 +132,32 @@ impl OwnStream {
             height: feed.height,
             fps_num: feed.fps_num,
             fps_den: feed.fps_den.max(1),
-            bitrate_kbps: s.encode.video_kbps.max(100),
-            rate: if s.encode.vbr { RateControl::Average } else { RateControl::Cbr },
-            keyframe_secs: if s.encode.keyframe_s == 0 { 2 } else { s.encode.keyframe_s },
+            bitrate_kbps: e.video_kbps.max(100),
+            rate: if e.vbr { RateControl::Average } else { RateControl::Cbr },
+            keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
         };
-        let audio = AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: s.encode.audio_kbps.clamp(64, 320) };
-        let mut pipe = Pipeline::new(video, audio, None).map_err(|e| fail(e.to_string()))?;
+        let audio = AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let mut pipe = Pipeline::new(video, audio, record).map_err(|e| fail(e.to_string()))?;
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .thread_name("ferrocast-own-stream")
-            .build()
-            .map_err(|e| fail(e.to_string()))?;
         let hub = Hub::new();
-        let retry = match s.reconnect {
-            Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
-            None => Retry::default(),
-        };
-        let dest = Destination { id: "studio".into(), target, key: key.to_string(), retry, extra_audio: false };
-        let (health_tx, health) = tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
-        let (stop_push, stop_rx) = tokio::sync::watch::channel(false);
-        runtime.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
+        let (mut runtime, mut health, mut stop_push) = (None, None, None);
+        if let (Some(d), Some(target)) = (send_to, target) {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .thread_name("ferrocast-own-stream")
+                .build()
+                .map_err(|e| fail(e.to_string()))?;
+            let retry = match d.reconnect {
+                Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
+                None => Retry::default(),
+            };
+            let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: false };
+            let (health_tx, h) = tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+            let (sp, stop_rx) = tokio::sync::watch::channel(false);
+            rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
+            (runtime, health, stop_push) = (Some(rt), Some(h), Some(sp));
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
@@ -164,6 +217,10 @@ impl OwnStream {
                         if sound_failed {
                             break;
                         }
+                        if pipe.recording_failed() {
+                            fail_now("the recording couldn't be written (is the disk full?)".into());
+                            break;
+                        }
                     }
                     if let Ok(t) = pipe.finish() {
                         send(t, &counts);
@@ -173,27 +230,32 @@ impl OwnStream {
                 })
                 .map_err(|e| fail(e.to_string()))?
         };
-        tracing::info!(?codec, kbps = video.bitrate_kbps, "the Studio streams through Ferrocast's own encoder");
-        Ok(Self { stop, thread: Some(thread), counts, health, stop_push, runtime: Some(runtime), feed: Some(feed) })
+        tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "the Studio uses Ferrocast's own encoder");
+        Ok(Self { stop, thread: Some(thread), counts, health, stop_push, runtime, feed: Some(feed) })
     }
 
     pub(crate) fn stats(&self) -> StreamStats {
-        let state = self.health.borrow().state.clone();
+        let state = self.health.as_ref().map(|h| h.borrow().state.clone());
         StreamStats {
             active: self.counts.running.load(Ordering::Acquire),
-            reconnecting: matches!(state, PushState::Reconnecting { .. } | PushState::Connecting),
+            reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
             bytes: self.counts.bytes.load(Ordering::Relaxed),
             frames: self.counts.frames.load(Ordering::Relaxed),
             dropped: self.feed.as_ref().map_or(0, |f| f.dropped()).min(u64::from(u32::MAX)) as u32,
         }
     }
 
+    pub(crate) fn record_stats(&self) -> RecordStats {
+        let s = self.stats();
+        RecordStats { active: s.active, paused: false, bytes: s.bytes, frames: s.frames }
+    }
+
     pub(crate) fn last_error(&self) -> Option<String> {
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {
             return Some(e);
         }
-        match &self.health.borrow().state {
-            PushState::Reconnecting { reason, .. } => Some(reason.clone()),
+        match self.health.as_ref().map(|h| h.borrow().state.clone()) {
+            Some(PushState::Reconnecting { reason, .. }) => Some(reason),
             _ => None,
         }
     }
@@ -208,8 +270,10 @@ impl Drop for OwnStream {
         // libobs stops handing frames over.
         self.feed = None;
         // A moment for the last packets to leave, then the sender stops.
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = self.stop_push.send(true);
+        if let Some(sp) = self.stop_push.take() {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = sp.send(true);
+        }
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(5));
         }
@@ -240,5 +304,16 @@ mod tests {
         assert!(unsupported(&extra, true).is_some());
         assert!(unsupported(&StreamSettings { delay_s: 5, ..settings(hw) }, true).is_some());
         assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_some());
+    }
+
+    #[test]
+    fn recordings_ours_can_write() {
+        let plan = RecordPlan { encode: EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc"), ..RecordPlan::default() };
+        if cfg!(target_os = "macos") {
+            assert_eq!(unsupported_recording(&plan), None);
+        }
+        assert!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }).is_some());
+        assert!(unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_some());
+        assert!(unsupported_recording(&RecordPlan { tracks: vec![1, 2], ..plan.clone() }).is_some());
     }
 }

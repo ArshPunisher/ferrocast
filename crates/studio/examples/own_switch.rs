@@ -1,4 +1,4 @@
-//! The "own encoder" switch through `Studio::stream`, as the app calls it: a scene on a real
+//! The "own encoder" switch through `Studio::stream` and `Studio::record_to`, as the app calls them: a scene on a real
 //! engine streams to an FFmpeg RTMP server here for a few seconds; the stats the app shows and
 //! what arrived are checked. macOS (FERROCAST_OBS_DIR, else an installed OBS.app).
 //!
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use ferrocast_studio::{Canvas, Collection, EncodeSettings, Paths, StreamSettings, Studio};
+use ferrocast_studio::{Canvas, Collection, EncodeSettings, Paths, RecordPlan, StreamSettings, Studio};
 use serde_json::json;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -39,12 +39,21 @@ fn main() -> Result<()> {
         vod_track: None,
         own_encoder: true,
     };
+    // A recording through our encoder at the same time.
+    let file = out.join("own-switch.mp4");
+    let _ = std::fs::remove_file(&file);
+    let plan = RecordPlan { own_encoder: true, encode: settings.encode.clone(), ..RecordPlan::default() };
+    let rec = studio.record_to(&file, &plan)?;
+    assert!(rec.pause(true).is_err(), "pause says it needs OBS's encoder");
     let stream = studio.stream(&format!("rtmp://127.0.0.1:{port}/live"), "k", &settings)?;
     assert!(stream.own_encoder(), "the switch took our encoder");
     std::thread::sleep(Duration::from_secs(secs));
     let st = stream.stats();
     println!("stats: {st:?}, error: {:?}", stream.last_error());
+    let rs = rec.stats();
+    println!("recording: {rs:?}");
     drop(stream);
+    drop(rec);
     for _ in 0..50 {
         if server.try_wait()?.is_some() {
             break;
@@ -60,6 +69,15 @@ fn main() -> Result<()> {
     let text = String::from_utf8_lossy(&probe.stdout).trim().replace('\n', " | ");
     println!("arrived: {text}");
     let frames: u64 = text.split(" | ").filter_map(|l| l.split(',').nth(3)).filter_map(|n| n.parse().ok()).next().unwrap_or(0);
+    let played = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-show_entries", "stream=codec_name,nb_read_frames", "-of", "csv=p=0"])
+        .arg(&file)
+        .output()?;
+    let rec_text = String::from_utf8_lossy(&played.stdout).trim().replace('\n', " | ");
+    println!("recorded: {rec_text}");
+    if !rs.active || !rec_text.contains("h264") || !rec_text.contains("aac") {
+        return Err("the recording through our encoder didn't come out".into());
+    }
     if !st.active || st.frames < (secs as u32 - 1) * 30 || frames < (secs - 1) * 30 || !text.contains("aac") {
         return Err("the stream through our encoder came up short".into());
     }

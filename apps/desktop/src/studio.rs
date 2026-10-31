@@ -1767,6 +1767,7 @@ impl StudioHost for DesktopStudio {
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(studio, &s),
                 muxer: s.record_muxer.clone(),
+                own_encoder: s.own_encoder,
             };
             let file = studio.record_path(&plan);
             let rec = studio.record_to(&file, &plan).map_err(|e| e.to_string())?;
@@ -1899,6 +1900,8 @@ impl StudioHost for DesktopStudio {
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(studio, &s),
                 muxer: s.record_muxer.clone(),
+                // A source recorded on its own uses OBS's encoder (ours records what's on air).
+                own_encoder: false,
             };
             let file = studio.record_path(&plan);
             let rec = studio.record_source_to(&name, &file, &plan).map_err(|e| e.to_string())?;

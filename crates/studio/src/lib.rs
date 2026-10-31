@@ -875,6 +875,23 @@ impl Studio {
     /// Starts recording what's on air to `path` as `plan` says: its format, the audio tracks,
     /// splitting by time or size, and the names of the next parts.
     pub fn record_to(&self, path: &Path, plan: &RecordPlan) -> Result<Recording, StudioError> {
+        if plan.own_encoder {
+            match own::unsupported_recording(plan) {
+                None => {
+                    let own = own::OwnStream::record(self, path, plan)?;
+                    return Ok(Recording {
+                        studio: self.clone(),
+                        out: ptr::null_mut(),
+                        venc: ptr::null_mut(),
+                        audio: Vec::new(),
+                        path: path.to_path_buf(),
+                        view: ptr::null_mut(),
+                        own: Some(own),
+                    });
+                }
+                Some(why) => tracing::info!("Ferrocast's own encoder doesn't do {why} yet: libobs's records this"),
+            }
+        }
         self.record_with(path, plan, None)
     }
 
@@ -1022,6 +1039,7 @@ impl Studio {
             audio,
             path: path.to_path_buf(),
             view: view.map_or(ptr::null_mut(), |(v, _)| v),
+            own: None,
         };
         if out.is_null() {
             return Err(StudioError::Failed("the recorder couldn't be made".into()));
@@ -1192,7 +1210,7 @@ impl Studio {
         if s.own_encoder {
             match own::unsupported(s, true) {
                 None => {
-                    let own = own::OwnStream::start(self, server, key, s)?;
+                    let own = own::OwnStream::stream(self, server, key, s)?;
                     return Ok(Streaming {
                         studio: self.clone(),
                         out: ptr::null_mut(),
@@ -2191,6 +2209,8 @@ pub struct Recording {
     path: PathBuf,
     /// A source recorded on its own: its view (null for what's on air).
     view: *mut ffi::ObsView,
+    /// Written by Ferrocast's own encoders instead (`out` and the encoders are null then).
+    own: Option<own::OwnStream>,
 }
 
 /// Looks for files named like `names` (by file name) under `folder`, a few levels deep, as
@@ -2433,6 +2453,10 @@ pub struct RecordPlan {
     /// "Custom Muxer Settings".
     #[serde(default)]
     pub muxer: String,
+    /// Written by Ferrocast's own encoders (a crash-safe MP4) when they can (see `own_encoder`
+    /// on [`StreamSettings`]).
+    #[serde(default)]
+    pub own_encoder: bool,
 }
 
 impl Default for RecordPlan {
@@ -2448,6 +2472,7 @@ impl Default for RecordPlan {
             tracks: vec![1],
             encode: EncodeSettings::with_encoder("obs_x264"),
             muxer: String::new(),
+            own_encoder: false,
         }
     }
 }
@@ -2472,6 +2497,9 @@ impl Recording {
 
     /// Starts a new file now (OBS's "Split recording"). Err when this format can't.
     pub fn split(&self) -> Result<(), StudioError> {
+        if self.own.is_some() {
+            return Err(StudioError::Failed(OWN_CANT.into()));
+        }
         let mut stack = [0u8; 128];
         let mut cd = ffi::CallData::fixed(&mut stack);
         if !self.call("split_file", &mut cd) {
@@ -2485,6 +2513,9 @@ impl Recording {
 
     /// Marks a chapter here (MP4 and MOV): named, or numbered when the name is empty.
     pub fn chapter(&self, name: &str) -> Result<(), StudioError> {
+        if self.own.is_some() {
+            return Err(StudioError::Failed(OWN_CANT.into()));
+        }
         let mut stack = [0u8; 512];
         let mut cd = ffi::CallData::fixed(&mut stack);
         let name: String = name.chars().filter(|c| !c.is_control()).take(100).collect();
@@ -2513,6 +2544,9 @@ impl Recording {
     }
 
     pub fn pause(&self, on: bool) -> Result<(), StudioError> {
+        if self.own.is_some() {
+            return Err(StudioError::Failed(OWN_CANT.into()));
+        }
         if self.studio.inner.api.obs_output_pause(self.out, on) {
             Ok(())
         } else {
@@ -2521,6 +2555,9 @@ impl Recording {
     }
 
     pub fn stats(&self) -> RecordStats {
+        if let Some(o) = &self.own {
+            return o.record_stats();
+        }
         let a = &self.studio.inner.api;
         RecordStats {
             active: a.obs_output_active(self.out),
@@ -2531,10 +2568,17 @@ impl Recording {
     }
 
     pub fn last_error(&self) -> Option<String> {
+        if let Some(o) = &self.own {
+            return o.last_error();
+        }
         let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
         (!e.is_empty()).then_some(e)
     }
 }
+
+/// What a recording by Ferrocast's own encoder says when asked to pause, split or mark a chapter.
+const OWN_CANT: &str =
+    "Pause, split and chapters need OBS's encoder for now: turn off Ferrocast's own encoder in Settings for the next recording.";
 
 /// How a recording is going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2547,6 +2591,8 @@ pub struct RecordStats {
 
 impl Drop for Recording {
     fn drop(&mut self) {
+        // Ours closes its file on its own.
+        self.own = None;
         let a = &self.studio.inner.api;
         if !self.out.is_null() {
             a.obs_output_stop(self.out);
