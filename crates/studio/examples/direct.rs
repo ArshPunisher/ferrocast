@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encoder = "obs_x264";
     let mut enc = EncodeSettings::with_encoder(encoder);
     enc.video_kbps = 2500;
-    let settings = StreamSettings { encode: enc, reconnect: Some((3, 2)), delay_s: 0 };
+    let settings = StreamSettings { encode: enc, reconnect: Some((3, 2)), delay_s: 0, vod_track: None };
     let mut s = studio.stream("rtmp://127.0.0.1:1936/main", "", &settings)?;
     s.add_direct("srt", "srt://127.0.0.1:8890?streamid=publish:srt1", "")?;
     s.add_direct("whip", "http://127.0.0.1:8889/whip1/whip", "")?;
