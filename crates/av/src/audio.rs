@@ -41,6 +41,7 @@ pub struct AudioEncoder {
     config: AudioConfig,
     pending: Vec<f32>,
     /// AAC frames made so far: the next one's time.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     frames: i64,
 }
 
@@ -75,6 +76,7 @@ impl AudioEncoder {
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<AudioPacket>, AvError> {
         self.pending.extend_from_slice(pcm);
         let n = AAC_FRAME * self.config.channels as usize;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut out = Vec::new();
         while self.pending.len() >= n {
             #[cfg(target_os = "macos")]
