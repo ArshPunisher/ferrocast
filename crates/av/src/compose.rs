@@ -747,7 +747,7 @@ impl Compositor {
         }
         for e in &item.effects {
             let pad = e.pad();
-            let (ow, oh) = (cur.width + 2 * pad, cur.height + 2 * pad);
+            let (ow, oh) = e.out_size(cur.width, cur.height);
             check_size(ow, oh)?;
             let next = self.target(ow, oh, wgpu::TextureUsages::empty());
             self.clear(enc, &next);
@@ -792,6 +792,9 @@ impl Compositor {
                     ("fs_luma_key", [0.0; 6], [0.0; 4])
                 }
                 Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                Effect::Crop { left, top, .. } => {
+                    ("fs_crop", [*left as f32, *top as f32, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
                 Effect::ColorCorrection {
                     gamma,
                     contrast,

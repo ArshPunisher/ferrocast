@@ -220,6 +220,15 @@ pub enum Effect {
         max_smooth: f32,
         min_smooth: f32,
     },
+    /// OBS's Crop/Pad: pixels off each side (negative pads with transparency), or with `size`
+    /// that size from the left and top offsets (OBS's absolute mode).
+    Crop {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        size: Option<(u32, u32)>,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
@@ -236,6 +245,7 @@ impl Effect {
                 | Self::ColorKey { .. }
                 | Self::LumaKey { .. }
                 | Self::Sharpen { .. }
+                | Self::Crop { .. }
         )
     }
 
@@ -244,6 +254,19 @@ impl Effect {
         match self {
             Self::Shadow { blur, x, y, .. } => (blur + x.abs().max(y.abs())).ceil().clamp(0.0, 1000.0) as u32,
             _ => 0,
+        }
+    }
+
+    /// The picture's size after this filter, from its size before (at least 1×1 for a crop, as
+    /// OBS's).
+    pub fn out_size(&self, w: u32, h: u32) -> (u32, u32) {
+        match self {
+            Self::Crop { size: Some((cw, ch)), .. } => ((*cw).clamp(1, 16_384), (*ch).clamp(1, 16_384)),
+            Self::Crop { left, top, right, bottom, size: None } => (
+                (i64::from(w) - i64::from(*left) - i64::from(*right)).clamp(1, 16_384) as u32,
+                (i64::from(h) - i64::from(*top) - i64::from(*bottom)).clamp(1, 16_384) as u32,
+            ),
+            _ => (w + 2 * self.pad(), h + 2 * self.pad()),
         }
     }
 

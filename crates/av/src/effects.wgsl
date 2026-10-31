@@ -342,3 +342,10 @@ fn fs_sharpen(i: Out) -> @location(0) vec4<f32> {
     }
     return e;
 }
+
+// crop_filter.effect: the output's pixels from the picture's, moved by the left and top crop
+// (p0, p1); outside the picture is transparent (its sampler's border).
+@fragment
+fn fs_crop(i: Out) -> @location(0) vec4<f32> {
+    return src_at(i.uv * f.out_size + vec2<f32>(f.p0, f.p1));
+}

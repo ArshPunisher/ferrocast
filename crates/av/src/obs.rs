@@ -115,6 +115,17 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             min_smooth: n("luma_min_smooth", 0.0),
         },
         "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        "crop_filter" => {
+            let i = |k: &str| s.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(-16_384, 16_384) as i32;
+            let relative = s.get("relative").and_then(Value::as_bool).unwrap_or(true);
+            Effect::Crop {
+                left: i("left"),
+                top: i("top"),
+                right: i("right"),
+                bottom: i("bottom"),
+                size: (!relative).then(|| (i("cx").max(0) as u32, i("cy").max(0) as u32)),
+            }
+        }
         _ => return None,
     })
 }
