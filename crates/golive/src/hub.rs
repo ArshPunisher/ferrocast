@@ -118,21 +118,26 @@ impl Hub {
         Subscription { live: st.live, headers: st.headers.clone(), rx: self.tx.subscribe() }
     }
 
-    pub(crate) fn start(&self) {
+    // A publisher's side: the local RTMP ingest (OBS), or Ferrocast's own encoders sending
+    // straight in (ENGINE.md E1). One publisher at a time: start, packets, end.
+
+    /// A new stream begins: headers from before are forgotten.
+    pub fn start(&self) {
         let mut st = self.lock();
         let stream = st.live.stream + 1;
         *st = State { live: Live { stream, on: true }, ..State::default() };
         self.live.send_replace(st.live);
     }
 
-    pub(crate) fn end(&self) {
+    /// The stream ended: destinations finish theirs.
+    pub fn end(&self) {
         let mut st = self.lock();
         st.live.on = false;
         let _ = self.tx.send(Frame::End);
         self.live.send_replace(st.live);
     }
 
-    pub(crate) fn metadata(&self, m: StreamMetadata) {
+    pub fn metadata(&self, m: StreamMetadata) {
         let m = Arc::new(m);
         let mut st = self.lock();
         st.stats.width = m.video_width;
@@ -142,7 +147,8 @@ impl Hub {
         let _ = self.tx.send(Frame::Metadata(m));
     }
 
-    pub(crate) fn video(&self, ts: u32, data: Bytes) {
+    /// An FLV video tag body (a codec header, or a frame) at `ts` milliseconds.
+    pub fn video(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
         let key = flv::video_is_keyframe(&data);
         if flv::video_is_header(&data) {
@@ -158,7 +164,8 @@ impl Hub {
         let _ = self.tx.send(Frame::Video { ts, data, key });
     }
 
-    pub(crate) fn audio(&self, ts: u32, data: Bytes) {
+    /// An FLV audio tag body at `ts` milliseconds.
+    pub fn audio(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
         if flv::audio_is_header(&data) {
             st.headers.audio = Some(data.clone());
