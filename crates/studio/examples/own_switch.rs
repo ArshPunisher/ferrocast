@@ -19,9 +19,19 @@ fn main() -> Result<()> {
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
     std::fs::create_dir_all(&out)?;
     let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| "/Applications/OBS.app/Contents".into());
-    let studio = Studio::start(&Paths::from_obs_app(Path::new(&dir), true), Canvas { width: 1280, height: 720, fps: 30 }, &out.join("plugin-config"))?;
+    let studio = Studio::start(
+        &Paths::from_obs_app(Path::new(&dir), true),
+        Canvas { width: 1280, height: 720, fps: 30 },
+        &out.join("plugin-config"),
+    )?;
     let c = Collection::new(&studio, "Main")?;
-    c.add_source("Main", "color_source_v3", "Back", &json!({ "color": 0xFF_80_40_20u32, "width": 1280, "height": 720 }), false)?;
+    c.add_source(
+        "Main",
+        "color_source_v3",
+        "Back",
+        &json!({ "color": 0xFF_80_40_20u32, "width": 1280, "height": 720 }),
+        false,
+    )?;
 
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let got = out.join("own-switch.flv");
@@ -63,12 +73,21 @@ fn main() -> Result<()> {
     let _ = server.kill();
     drop(c);
     let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-count_frames", "-show_entries", "stream=codec_name,width,height,nb_read_frames", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-show_entries",
+            "stream=codec_name,width,height,nb_read_frames",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(&got)
         .output()?;
     let text = String::from_utf8_lossy(&probe.stdout).trim().replace('\n', " | ");
     println!("arrived: {text}");
-    let frames: u64 = text.split(" | ").filter_map(|l| l.split(',').nth(3)).filter_map(|n| n.parse().ok()).next().unwrap_or(0);
+    let frames: u64 =
+        text.split(" | ").filter_map(|l| l.split(',').nth(3)).filter_map(|n| n.parse().ok()).next().unwrap_or(0);
     let played = Command::new("ffprobe")
         .args(["-v", "error", "-count_frames", "-show_entries", "stream=codec_name,nb_read_frames", "-of", "csv=p=0"])
         .arg(&file)

@@ -1223,7 +1223,9 @@ impl Studio {
                         own: Some(own),
                     });
                 }
-                Some(why) => tracing::info!("Ferrocast's own encoder doesn't do {why} yet: libobs's encodes this stream"),
+                Some(why) => {
+                    tracing::info!("Ferrocast's own encoder doesn't do {why} yet: libobs's encodes this stream")
+                }
             }
         }
         self.stream_of(server, key, s, ptr::null_mut())
@@ -2577,8 +2579,7 @@ impl Recording {
 }
 
 /// What a recording by Ferrocast's own encoder says when asked to pause, split or mark a chapter.
-const OWN_CANT: &str =
-    "Pause, split and chapters need OBS's encoder for now: turn off Ferrocast's own encoder in Settings for the next recording.";
+const OWN_CANT: &str = "Pause, split and chapters need OBS's encoder for now: turn off Ferrocast's own encoder in Settings for the next recording.";
 
 /// How a recording is going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

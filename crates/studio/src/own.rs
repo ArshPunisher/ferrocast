@@ -114,7 +114,12 @@ impl OwnStream {
         Self::start(studio, None, Some(path), &plan.encode)
     }
 
-    fn start(studio: &Studio, send_to: Option<Send<'_>>, record: Option<&std::path::Path>, e: &EncodeSettings) -> Result<Self, StudioError> {
+    fn start(
+        studio: &Studio,
+        send_to: Option<Send<'_>>,
+        record: Option<&std::path::Path>,
+        e: &EncodeSettings,
+    ) -> Result<Self, StudioError> {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own encoder couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -124,7 +129,8 @@ impl OwnStream {
         // The channels go to the encoder thread; the feed itself stays here.
         let frames = std::mem::replace(&mut feed.video, std::sync::mpsc::sync_channel(0).1);
         let sound = std::mem::replace(&mut feed.sound, std::sync::mpsc::sync_channel(0).1);
-        let codec = if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
+        let codec =
+            if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
         let video = VideoConfig {
             codec,
             input: PixelFormat::Nv12,
@@ -136,7 +142,8 @@ impl OwnStream {
             rate: if e.vbr { RateControl::Average } else { RateControl::Cbr },
             keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
         };
-        let audio = AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let audio =
+            AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let mut pipe = Pipeline::new(video, audio, record).map_err(|e| fail(e.to_string()))?;
 
         let hub = Hub::new();
@@ -153,7 +160,8 @@ impl OwnStream {
                 None => Retry::default(),
             };
             let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: false };
-            let (health_tx, h) = tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+            let (health_tx, h) =
+                tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
             let (sp, stop_rx) = tokio::sync::watch::channel(false);
             rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
             (runtime, health, stop_push) = (Some(rt), Some(h), Some(sp));
@@ -191,7 +199,8 @@ impl OwnStream {
                     };
                     while !stop.load(Ordering::Acquire) {
                         if let Ok(f) = frames.recv_timeout(Duration::from_millis(100)) {
-                            let frame = Frame::Nv12 { y: &f.y, y_stride: f.y_stride, uv: &f.uv, uv_stride: f.uv_stride };
+                            let frame =
+                                Frame::Nv12 { y: &f.y, y_stride: f.y_stride, uv: &f.uv, uv_stride: f.uv_stride };
                             match pipe.video(frame, f.timestamp_ns) {
                                 Ok(t) => {
                                     send(t, &counts);
@@ -230,7 +239,12 @@ impl OwnStream {
                 })
                 .map_err(|e| fail(e.to_string()))?
         };
-        tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "the Studio uses Ferrocast's own encoder");
+        tracing::info!(
+            ?codec,
+            kbps = video.bitrate_kbps,
+            recording = record.is_some(),
+            "the Studio uses Ferrocast's own encoder"
+        );
         Ok(Self { stop, thread: Some(thread), counts, health, stop_push, runtime, feed: Some(feed) })
     }
 
@@ -286,7 +300,13 @@ mod tests {
     use crate::EncodeSettings;
 
     fn settings(id: &str) -> StreamSettings {
-        StreamSettings { encode: EncodeSettings::with_encoder(id), reconnect: None, delay_s: 0, vod_track: None, own_encoder: true }
+        StreamSettings {
+            encode: EncodeSettings::with_encoder(id),
+            reconnect: None,
+            delay_s: 0,
+            vod_track: None,
+            own_encoder: true,
+        }
     }
 
     #[test]
@@ -308,7 +328,10 @@ mod tests {
 
     #[test]
     fn recordings_ours_can_write() {
-        let plan = RecordPlan { encode: EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc"), ..RecordPlan::default() };
+        let plan = RecordPlan {
+            encode: EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc"),
+            ..RecordPlan::default()
+        };
         if cfg!(target_os = "macos") {
             assert_eq!(unsupported_recording(&plan), None);
         }
