@@ -5,6 +5,23 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 2.3.0
+
+- The Studio works without OBS installed, on Mac and now on Windows too: Ferrocast brings OBS's
+  engine with it.
+- Guest cameras: send a guest a link, they open it on their phone or computer, and their camera
+  and mic come straight into your Studio, hidden until you show them. Add a source › Guest.
+- Remove background: takes out or blurs what's behind you, no green screen. Now on Windows too.
+- Strong noise removal for your mic: loud keyboards and busy rooms go, your voice stays natural.
+- New filters: rounded corners, border, shadow and glow, shapes, blur or pixelate an area, and
+  colour looks.
+- Move transition: a source both scenes share glides to its new place instead of cutting.
+- Record one source on its own beside your main recording.
+- Twitch VOD track: music you play only on stream stays out of your Twitch VODs.
+- Lighter stream: send a 720p copy to a platform that wants less, the others keep full quality.
+- Event rules in the Studio: when something happens (a raid, a big tip), switch scenes or show a
+  source on its own.
+
 ## 2.2.2
 
 - The Show tab asks how your stream should start: Just go live, Countdown first (a Starting screen
