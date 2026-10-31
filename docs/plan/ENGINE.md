@@ -221,14 +221,15 @@ Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps
 | OBS's own filters: Chroma Key, Color Correction, Color Key, Luma Key, Sharpen | `effects.wgsl` | engine_match: 0 pixels apart |
 | Item opacity (a group fades as one); keyframes (position, size, rotation, opacity; eased, held, looping); the Move transition built in; stingers | `compose.rs`, `engine.rs` | unit tests in the engine |
 | Cameras and microphones run on real devices | `apple/camera.rs` | USB camera 1920×1080; iPhone mic 48 kHz |
+| OBS scene collections open in the engine: colour, image, text, media, screen, camera and microphone sources; every item setting (place, turn, scale, crop, bounds, blend, scale filter, shown); scenes inside scenes; picture and sound filters; volume, balance, mono, sync, tracks, monitoring. Whatever it can't run yet (a browser source, an unported filter) is listed by name | `obs.rs`, `Engine::load_obs` | `obs_import`: three scenes made in libobs, saved, opened by the engine: 0 pixels apart |
 
 CI: Linux's software OpenGL can't give a texture two views, so the compositor refuses it with
 a reason (tests skip there); macOS and Windows run every engine test.
 Still to do: Windows capture (WGC, WASAPI, Media Foundation cameras) and native encoders (FFmpeg
-covers encoding there for now); the engine drawing for the app (E7; today it encodes for it);
-zero-copy (IOSurface and shared D3D textures
-from capture to encoder); stingers and "Move"; libobs's own filters (chroma key, LUT, sharpen…);
-monitoring (hearing a sound locally); web pages; game capture (E5); helper processes (E6).
+covers encoding there for now); the engine drawing for the app (E7: it opens the app's
+collections now; next it takes over the preview and output); zero-copy (IOSurface and shared
+D3D textures from capture to encoder); more of libobs's filters (LUT, crop/pad, scroll, mask);
+groups in imported collections; web pages; game capture (E5); helper processes (E6).
 
 ### Honest sizes and risks
 
