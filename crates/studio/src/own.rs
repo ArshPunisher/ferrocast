@@ -33,10 +33,8 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("an encoder's own options")
     } else if !own_codec_ok(&s.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
-    } else if !cfg!(target_os = "macos") {
-        Some("this system (our encoders are Mac-only so far)")
     } else {
-        None
+        system_unsupported(&s.encode.video_encoder)
     }
 }
 
@@ -59,8 +57,19 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("a scaled recording")
     } else if !own_codec_ok(&plan.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
-    } else if !cfg!(target_os = "macos") {
-        Some("this system (our encoders are Mac-only so far)")
+    } else {
+        system_unsupported(&plan.encode.video_encoder)
+    }
+}
+
+/// Off a Mac our encoders go through FFmpeg: H.264 only, and only with an encoder that works.
+fn system_unsupported(encoder_id: &str) -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        None
+    } else if encoder_id.to_ascii_lowercase().contains("hevc") {
+        Some("HEVC on this system (ours does H.264 here so far)")
+    } else if ferrocast_av::ffenc::h264_encoder().is_none() {
+        Some("this system without a working FFmpeg H.264 encoder")
     } else {
         None
     }

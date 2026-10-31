@@ -2197,6 +2197,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "fastrand",
+ "ferrocast-av",
  "ferrocast-connector",
  "ferrocast-core",
  "ferrocast-golive",

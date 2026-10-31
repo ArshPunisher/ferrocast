@@ -222,6 +222,7 @@ impl Engine {
         engine.watch_obs();
         engine.watch_obs_health();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
+        engine.share_ffmpeg();
         Ok(engine)
     }
 

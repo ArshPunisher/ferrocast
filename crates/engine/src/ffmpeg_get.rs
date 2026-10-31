@@ -127,6 +127,13 @@ impl Engine {
         data.map(|d| tools_path(&d)).filter(|p| p.is_file()).or_else(crate::golive::find_ffmpeg)
     }
 
+    /// Tells Ferrocast's own encoders where FFmpeg is (they go through it off a Mac).
+    pub(crate) fn share_ffmpeg(&self) {
+        if let Some(p) = self.ffmpeg_path() {
+            ferrocast_av::ffenc::set_ffmpeg(&p);
+        }
+    }
+
     pub(crate) fn ffmpeg_state(&self) -> FfmpegState {
         if self.ffmpeg_path().is_some() {
             return FfmpegState::Ready;
@@ -167,6 +174,7 @@ impl Engine {
             match download_verified(&url, sha, &tools_path(&data), progress).await {
                 Ok(()) => {
                     tracing::info!("ffmpeg fetched for cutting the vertical picture");
+                    engine.share_ffmpeg();
                     engine.set_golive_ffmpeg_fetch(None);
                     engine.reconcile().await;
                 }
