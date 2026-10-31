@@ -209,9 +209,24 @@ Checked against libobs by `cargo run -p ferrocast-studio --example engine_match 
 Speed: a 1080p frame (background, game, camera uploaded each frame with rounded corners and
 border, a turned bicubic logo, a lower third) drawn and read back as NV12 in **2.7 ms** on this
 Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps frame.
-Still to do: Windows (D3D11 checks; Media Foundation, NVENC, AMF, QSV encoders; WGC, WASAPI and
-Media Foundation capture); camera, microphone and app-sound runs on real devices; the engine
-wired into the app (behind a switch, libobs kept); zero-copy (IOSurface and shared D3D textures
+
+**1 Nov 2026 (day): in the app, and further.**
+
+| What | Where | Checked |
+|---|---|---|
+| The "Ferrocast's own encoder" switch (beta, off by default): streams and recordings encoded by our engine while libobs draws; anything ours doesn't do yet falls back to OBS's encoder and logs why; an own recording refuses pause, split and chapters with a message | `crates/studio/src/own.rs`, Studio settings → More options (dashboard) | `own_switch`: stream and recording at once through `Studio::stream` / `record_to` |
+| Encoding through FFmpeg where there's no native encoder (Windows, Linux; forced with `FERROCAST_AV_ENCODER=ffmpeg`): NVENC, Quick Sync, AMF, Media Foundation or x264, whichever works; the app's own FFmpeg is passed in | `ffenc.rs` | encoder tests through FFmpeg on the Mac (VideoToolbox and x264), and a Windows CI job; media sync within a frame (x264 14 ms) |
+| What the Mac plays, captured with the screen (no driver) | `apple/screen.rs` | 2 s of a quiet tone: 96,000 frames at -22.7 dB |
+| Monitoring: sources heard here only, or here and sent, on the system's or a named device | `monitor.rs`, `mix.rs` | a quiet beep on this Mac's speakers |
+| OBS's own filters: Chroma Key, Color Correction, Color Key, Luma Key, Sharpen | `effects.wgsl` | engine_match: 0 pixels apart |
+| Item opacity (a group fades as one); keyframes (position, size, rotation, opacity; eased, held, looping); the Move transition built in; stingers | `compose.rs`, `engine.rs` | unit tests in the engine |
+| Cameras and microphones run on real devices | `apple/camera.rs` | USB camera 1920×1080; iPhone mic 48 kHz |
+
+CI: Linux's software OpenGL can't give a texture two views, so the compositor refuses it with
+a reason (tests skip there); macOS and Windows run every engine test.
+Still to do: Windows capture (WGC, WASAPI, Media Foundation cameras) and native encoders (FFmpeg
+covers encoding there for now); the engine drawing for the app (E7; today it encodes for it);
+zero-copy (IOSurface and shared D3D textures
 from capture to encoder); stingers and "Move"; libobs's own filters (chroma key, LUT, sharpen…);
 monitoring (hearing a sound locally); web pages; game capture (E5); helper processes (E6).
 
