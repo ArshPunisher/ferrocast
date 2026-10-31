@@ -288,6 +288,10 @@ struct State {
     on_air: Option<String>,
     /// A transition under way: from which scene, how, when it began and how long it lasts (ns).
     moving: Option<(String, TransitionKind, u64, u64)>,
+    /// A stinger under way: the scene it came from, when it started, when the scene changes
+    /// underneath, and when it ends (ns).
+    #[cfg(target_os = "macos")]
+    stinger: Option<(String, u64, u64, u64)>,
     /// When each scene last went on air (its keyframes' time 0).
     started: std::collections::HashMap<String, u64>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
@@ -348,6 +352,8 @@ impl Engine {
             scenes: BTreeMap::new(),
             on_air: None,
             moving: None,
+            #[cfg(target_os = "macos")]
+            stinger: None,
             started: std::collections::HashMap::new(),
             outputs: Vec::new(),
             next_output: 1,
@@ -521,9 +527,41 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether a transition is under way.
+    /// Puts a scene on air behind a stinger: `video` plays over everything, and the scene
+    /// changes underneath `cut_ms` in. Its sound plays too.
+    #[cfg(target_os = "macos")]
+    pub fn go_stinger(&self, name: &str, video: &std::path::Path, cut_ms: u64) -> Result<(), AvError> {
+        if !self.lock().scenes.contains_key(name) {
+            return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+        }
+        let m = crate::media::Media::open(video, false)?;
+        if !m.has_video {
+            return Err(AvError::Source("a stinger needs a video with a picture".into()));
+        }
+        let dur = m.duration_ns.max(1);
+        if m.has_audio {
+            self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(STINGER, SourceSettings::default());
+        }
+        let now = now_ns();
+        let mut st = self.lock();
+        st.sources.insert(STINGER, Src { live: Live::Media(m), size: None });
+        let from = st.on_air.replace(name.to_string()).unwrap_or_default();
+        st.started.insert(name.to_string(), now + cut_ms * 1_000_000);
+        st.moving = None;
+        // The media's first frame shows about 100 ms after it opens.
+        let start = now + 100_000_000;
+        st.stinger = Some((from, start, start + cut_ms * 1_000_000, start + dur));
+        Ok(())
+    }
+
+    /// Whether a transition (or stinger) is under way.
     pub fn transitioning(&self) -> bool {
-        self.lock().moving.is_some()
+        let st = self.lock();
+        #[cfg(target_os = "macos")]
+        if st.stinger.is_some() {
+            return true;
+        }
+        st.moving.is_some()
     }
 
     /// Starts an output (stream or recording) on the engine's own canvas → its id.
@@ -636,10 +674,31 @@ enum Draw {
     Moving(Box<Transition>),
 }
 
+/// The stinger's own source id (it plays as a source while it runs).
+#[cfg(target_os = "macos")]
+const STINGER: u64 = u64::MAX - 1;
+
 /// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps).
 fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64) -> Draw {
     if let Some(name) = scene {
         return Draw::Scene(build(st, width, height, Some(name), ts));
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((from, _, cut, _)) = &st.stinger {
+        let under = if ts < *cut { Some(from.as_str()) } else { st.on_air.as_deref() };
+        let mut s = build(st, width, height, under, ts);
+        // Over everything, stretched to the canvas.
+        let over = SceneItem::new(
+            STINGER,
+            Placement {
+                bounds: crate::Bounds::Stretch,
+                bounds_width: width as f32,
+                bounds_height: height as f32,
+                ..Default::default()
+            },
+        );
+        s.items.extend(item_of(st, &over, 0));
+        return Draw::Scene(s);
     }
     match &st.moving {
         Some((from, TransitionKind::Move, start, dur)) if ts < start + dur => {
@@ -826,6 +885,13 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
             }
         }
 
+        #[cfg(target_os = "macos")]
+        if st.stinger.as_ref().is_some_and(|(.., end)| ts >= *end) {
+            st.stinger = None;
+            st.sources.remove(&STINGER);
+            gpu.forget(STINGER);
+            mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(STINGER);
+        }
         if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
             st.moving = None;
         }
@@ -981,6 +1047,48 @@ mod tests {
         // Half way the square is in the middle, not at either end.
         let white_at = (0..640).find(|x| px[(180 * 640 + x) * 4] > 200).unwrap_or(0);
         assert!((200..440).contains(&white_at), "the square is part way: x {white_at}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stingers_cover_the_cut_then_go() {
+        let Some(e) = engine() else { return };
+        let clip = std::env::temp_dir().join("ferrocast-av-stinger.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x180:r=30:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no FFmpeg here
+        }
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Black", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("White", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Black").unwrap_or_else(|x| panic!("{x}"));
+        e.go_stinger("White", &clip, 500).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(e.transitioning());
+        let mid = e.snapshot().unwrap_or_default();
+        assert!(mid[0] > 200 && mid[1] < 60, "the stinger covers the cut: {:?}", &mid[..4]);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert!(!e.transitioning(), "it ends with its video");
+        assert_eq!(&e.snapshot().unwrap_or_default()[..3], &[255, 255, 255], "the new scene shows");
     }
 
     #[test]
