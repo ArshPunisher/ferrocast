@@ -112,6 +112,20 @@ impl Paths {
     }
 }
 
+/// Whether `plugin_bin` is the running app's own PlugIns (macOS), which libobs searches
+/// by itself.
+fn own_plugins(plugin_bin: &str) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    // …/Contents/MacOS/<program> → …/Contents
+    let Some(contents) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf())) else {
+        return false;
+    };
+    let own = Paths::from_obs_app(&contents, false).plugin_bin;
+    Path::new(&own) == Path::new(plugin_bin)
+}
+
 /// The canvas: what's composed and sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Canvas {
@@ -356,7 +370,12 @@ impl Studio {
             return Err(StudioError::Video(code));
         }
         let (bin, pdata) = (cstr(&paths.plugin_bin), cstr(&paths.plugin_data));
-        api.obs_add_module_path(bin.as_ptr(), pdata.as_ptr());
+        // On a Mac libobs already looks in the running app's own PlugIns (its mainBundle):
+        // when that's where the plugins are (Ferrocast.app carries them), adding the folder
+        // again would load every plugin twice.
+        if !own_plugins(&paths.plugin_bin) {
+            api.obs_add_module_path(bin.as_ptr(), pdata.as_ptr());
+        }
         for m in UI_ONLY {
             let name = cstr(m);
             api.obs_add_disabled_module(name.as_ptr());
