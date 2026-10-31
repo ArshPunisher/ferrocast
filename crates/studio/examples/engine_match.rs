@@ -537,6 +537,7 @@ fn item_of(c: &Collection, scene: &str, info: &ItemInfo, out: &Path) -> Result<O
         blend: Blend::from_name(&info.blend),
         srgb_off: info.srgb_off,
         linear,
+        opacity: 1.0,
     }))
 }
 

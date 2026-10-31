@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         blend: Blend::Normal,
         srgb_off: false,
         linear: true,
+        opacity: 1.0,
     };
     let camera_frames: Vec<Picture> = (0..2).map(|k| gradient(1280, 720, k + 4)).collect();
     let mut total = 0.0f64;

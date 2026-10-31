@@ -125,6 +125,8 @@ struct Quad<'a> {
     linear: bool,
     straight: bool,
     point: bool,
+    /// The item's opacity (1 for every draw but an item's last).
+    opacity: f32,
 }
 
 impl Compositor {
@@ -405,7 +407,7 @@ impl Compositor {
         let mut u = [0f32; 12];
         let (entry, linear, first, second, luma): (&'static str, bool, &Target, &Target, Option<&wgpu::Texture>) =
             match &tr.kind {
-                TransitionKind::Fade => {
+                TransitionKind::Fade | TransitionKind::Move => {
                     u[0] = t;
                     ("fs_fade", false, &a, &b, None)
                 }
@@ -607,6 +609,7 @@ impl Compositor {
             || item.filter != Filter::Disable
             || item.srgb_off
             || item.blend != Blend::Normal
+            || item.opacity < 1.0
             || matches!(item.content, Content::Scene(_));
 
         if !texrender {
@@ -643,6 +646,7 @@ impl Compositor {
                 linear,
                 straight: false,
                 point: item.filter == Filter::Point,
+                opacity: item.opacity.clamp(0.0, 1.0),
             },
         );
         Ok(())
@@ -673,6 +677,7 @@ impl Compositor {
                     linear,
                     straight,
                     point: false,
+                    opacity: 1.0,
                 },
             );
         };
@@ -715,6 +720,7 @@ impl Compositor {
                         linear: first_linear,
                         straight: !p.premultiplied,
                         point: false,
+                        opacity: 1.0,
                     },
                 );
             }
@@ -732,6 +738,7 @@ impl Compositor {
                         linear: first_linear,
                         straight: !premultiplied,
                         point: false,
+                        opacity: 1.0,
                     },
                 );
             }
@@ -1034,7 +1041,7 @@ impl Compositor {
             target.width as f32,
             target.height as f32,
             if q.straight { 1.0 } else { 0.0 },
-            0.0,
+            q.opacity,
             bw,
             bh,
             1.0 / bw,

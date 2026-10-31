@@ -182,3 +182,20 @@ fn transitions_refuse_bad_sizes_instead_of_crashing() {
     assert!(c.render_transition(&tr).is_err());
     assert!(c.render_transition_nv12(&tr).is_err());
 }
+
+#[test]
+fn opacity_fades_an_item_and_a_group_as_one() {
+    use ferrocast_av::Content;
+    let Some(c) = gpu() else { return };
+    let black = item(Picture::solid(10, 10, [0, 0, 0, 255]), Placement::default());
+    let white = Item { opacity: 0.5, ..item(Picture::solid(10, 10, [255, 255, 255, 255]), Placement::default()) };
+    let px = c.render(&Scene { width: 10, height: 10, items: vec![black.clone(), white.clone()] }).unwrap_or_default();
+    // Half of white's light: sRGB about 188.
+    assert!((185..=190).contains(&at(&px, 10, 5, 5)[0]), "{}", at(&px, 10, 5, 5)[0]);
+    // Two white squares overlapping in a half-faded group: the overlap is no brighter.
+    let a = item(Picture::solid(6, 6, [255, 255, 255, 255]), Placement::default());
+    let b = item(Picture::solid(6, 6, [255, 255, 255, 255]), Placement { x: 4.0, ..Default::default() });
+    let group = Item { content: Content::Group { width: 10, height: 6, items: vec![a, b] }, opacity: 0.5, ..white };
+    let px = c.render(&Scene { width: 10, height: 10, items: vec![black, group] }).unwrap_or_default();
+    assert_eq!(at(&px, 10, 5, 2)[0], at(&px, 10, 1, 2)[0], "the overlap fades with the rest");
+}

@@ -300,6 +300,8 @@ pub struct Item {
     /// Mixed in linear light (OBS's sRGB-aware sources: colours, images, cameras); else in
     /// gamma space, as libobs mixes older sources (Text on macOS and Linux, for one).
     pub linear: bool,
+    /// 0 (gone) to 1 (as is). Below 1 the item is drawn on its own first, so a group fades as one.
+    pub opacity: f32,
 }
 
 impl Item {
@@ -313,6 +315,7 @@ impl Item {
             blend: Blend::Normal,
             srgb_off: false,
             linear: true,
+            opacity: 1.0,
         }
     }
 }
@@ -364,6 +367,9 @@ pub enum TransitionKind {
         direction: Direction,
         swipe_in: bool,
     },
+    /// Sources in both scenes glide to their new places; the rest fade (OBS's Move plugin,
+    /// built in). Needs both scenes' items, so the engine draws it; the compositor alone fades.
+    Move,
     /// The new scene comes in where `luma` (a greyscale picture, stretched over the canvas) is
     /// darkest first.
     LumaWipe {

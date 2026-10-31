@@ -8,7 +8,8 @@ struct Item {
     canvas: vec2<f32>,
     // 1 when the picture's alpha is straight (the default draw multiplies it in).
     straight: f32,
-    _pad: f32,
+    // The item's opacity (1 as is), applied to the premultiplied result.
+    opacity: f32,
     // The picture's size in pixels, and one over it.
     base_dimension: vec2<f32>,
     base_dimension_i: vec2<f32>,
@@ -35,9 +36,9 @@ fn vs(@location(0) at: vec2<f32>, @location(1) uv: vec2<f32>) -> Out {
 fn fs_default(i: Out) -> @location(0) vec4<f32> {
     let c = textureSample(image, pick, i.uv);
     if item.straight > 0.5 {
-        return vec4<f32>(c.rgb * c.a, c.a);
+        return (vec4<f32>(c.rgb * c.a, c.a)) * item.opacity;
     }
-    return c;
+    return (c) * item.opacity;
 }
 
 fn load(p: vec2<i32>) -> vec4<f32> {
@@ -96,7 +97,7 @@ fn fs_bicubic(i: Out) -> @location(0) vec4<f32> {
     bottom += s_bot * u_weight_sum;
     bottom += load(br) * rowtaps.w;
     total += bottom * coltaps.w;
-    return total;
+    return (total) * item.opacity;
 }
 
 // ---- lanczos_scale.effect (a = 3) ----
@@ -199,7 +200,7 @@ fn fs_lanczos(i: Out) -> @location(0) vec4<f32> {
     row5 += load(vec2<i32>(c4.x, c5.y)) * row.t345.y;
     row5 += load(c5) * row.t345.z;
     total += row5 * col.t345.z;
-    return total;
+    return (total) * item.opacity;
 }
 
 // ---- area.effect ----
@@ -237,7 +238,7 @@ fn fs_area(i: Out) -> @location(0) vec4<f32> {
         y += 1.0;
         if y >= end.y { break; }
     }
-    return total;
+    return (total) * item.opacity;
 }
 
 @fragment
@@ -262,7 +263,7 @@ fn fs_area_upscale(i: Out) -> @location(0) vec4<f32> {
     } else {
         uv.y = (first.y + 0.5) * bdi.y;
     }
-    return textureSampleLevel(image, pick, uv, 0.0);
+    return (textureSampleLevel(image, pick, uv, 0.0)) * item.opacity;
 }
 
 // ---- bilinear_lowres_scale.effect: 8 samples, Direct3D's pattern ----
@@ -283,7 +284,7 @@ fn fs_lowres(i: Out) -> @location(0) vec4<f32> {
     c += textureSample(image, pick, uv + vec2<f32>(-s7.x, -s1.y));
     c += textureSample(image, pick, uv + vec2<f32>(s3.x, s7.y));
     c += textureSample(image, pick, uv + vec2<f32>(s7.x, -s7.y));
-    return c * 0.125;
+    return (c * 0.125) * item.opacity;
 }
 
 // ---- NV12 out (libobs's format_conversion.effect, NV12_Y and NV12_UV): BT.709, limited
