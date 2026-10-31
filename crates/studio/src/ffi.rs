@@ -140,9 +140,9 @@ pub const VIDEO_RANGE_PARTIAL: c_int = 1;
 pub const OBS_SCALE_BICUBIC: c_int = 2;
 pub const SPEAKERS_MONO: c_int = 1;
 pub const SPEAKERS_STEREO: c_int = 2;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub const GS_BGRA: c_int = 5;
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub const GS_ZS_NONE: c_int = 0;
 pub const OBS_VIDEO_SUCCESS: c_int = 0;
 /// `obs-source.h`: a kind replaced by a newer version, and one only for OBS's own use.
@@ -1071,7 +1071,7 @@ pub(crate) unsafe extern "C" fn store_level(param: *mut c_void, mag: *const f32,
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 /// What the preview's draw callback needs: libobs and the canvas size.
 #[derive(Debug)]
 pub(crate) struct DrawState {
@@ -1285,7 +1285,7 @@ fn draw_solid(api: &Api, w: f32, h: f32, rgba: &Vec4) {
     api.gs_matrix_pop();
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 /// Draws what's on air into a preview, fitted inside it (letterboxed), as OBS's own preview.
 pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) {
     // SAFETY: `param` is the boxed DrawState registered with this callback; lib.rs keeps the box
@@ -1377,7 +1377,7 @@ pub(crate) unsafe extern "C" fn draw_main(param: *mut c_void, cx: u32, cy: u32) 
 /// The native view a preview draws into, inside the window the dashboard lives in (macOS).
 /// What a projector shows, read by its draw callback (graphics thread) under the lock. Every
 /// source here holds a reference; scenes are also "showing" so their sources draw.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum Show {
     Program,
@@ -1392,7 +1392,7 @@ pub(crate) enum Show {
     },
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ProjectorState {
     pub api: *const Api,
@@ -1400,7 +1400,7 @@ pub(crate) struct ProjectorState {
     pub show: std::sync::Mutex<Show>,
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 impl Show {
     /// Lets go of every source (main thread, with the draw callback unable to read it).
     pub(crate) fn release(&mut self, api: &Api) {
@@ -1423,7 +1423,7 @@ impl Show {
 }
 
 /// A source by name, with our reference and showing (so it draws while projected).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn shown_source(api: &Api, name: &str) -> Option<*mut ObsSource> {
     let n = cstr(name);
     let src = api.obs_get_source_by_name(n.as_ptr());
@@ -1435,7 +1435,7 @@ pub(crate) fn shown_source(api: &Api, name: &str) -> Option<*mut ObsSource> {
 }
 
 /// A label for a multiview: white bold text, drawn by OBS's own text source.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn label(api: &Api, text: &str) -> *mut ObsSource {
     let settings = serde_json::json!({
         "text": text,
@@ -1516,7 +1516,7 @@ fn name_bar(api: &Api, a: crate::projector::Area, label: *mut ObsSource, band: &
 const RED: Vec4 = Vec4 { x: 0.86, y: 0.15, z: 0.15, w: 1.0 };
 
 /// Draws a projector: what's on air, one source, or a multiview (each fitted, letterboxed).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) unsafe extern "C" fn draw_projector(param: *mut c_void, cx: u32, cy: u32) {
     use crate::projector::{Area, multiview_in, safe_areas};
     // SAFETY: `param` is the boxed ProjectorState registered with this callback; lib.rs keeps
@@ -1639,6 +1639,8 @@ pub(crate) mod vision;
 /// The Studio's picture in the app's window on Windows (the macOS one is `mac::ChildView`).
 #[cfg(windows)]
 pub(crate) mod win;
+#[cfg(windows)]
+pub(crate) use win::projector as projector_window;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {

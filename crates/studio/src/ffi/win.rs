@@ -447,3 +447,304 @@ mod tests {
         assert_eq!(device(0.0, 0.0, 0.0, 0.0, 1.0), (0, 0, 1, 1));
     }
 }
+
+/// Projector windows on Windows (the macOS ones are `ffi::projector_window`): titled and
+/// resizable, or borderless over a whole display, with the same hooks.
+pub mod projector {
+    use std::rc::Rc;
+    use std::sync::Once;
+
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
+        GetClientRect, GetWindowLongPtrW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LoadCursorW, MONITORINFOF_PRIMARY,
+        PostMessageW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+        WM_NCDESTROY, WM_SIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT,
+        WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    };
+
+    use super::point_of;
+
+    /// What a projector window tells its owner.
+    pub struct Hooks {
+        /// A click at (x, y) in a view `w`×`h` big (device pixels), from its top left.
+        pub click: Box<dyn Fn(f64, f64, f64, f64)>,
+        /// Closed (its close button, or Esc): the owner drops it.
+        pub close: Box<dyn Fn()>,
+        /// The view's new size in pixels.
+        pub resize: Box<dyn Fn(u32, u32)>,
+    }
+
+    /// Posted to itself so `close` runs after the message that asked for it, never inside it
+    /// (the owner destroys the window from there).
+    const WM_CLOSE_LATER: u32 = WM_APP + 1;
+
+    const CLASS: &[u16] = &[
+        b'F' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'c' as u16,
+        b'a' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'P' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'j' as u16,
+        b'e' as u16,
+        b'c' as u16,
+        b't' as u16,
+        b'o' as u16,
+        b'r' as u16,
+        0,
+    ];
+
+    struct State {
+        hooks: Rc<Hooks>,
+        /// Width over height of the picture (a windowed projector keeps it as it's resized).
+        aspect: f64,
+        full: bool,
+    }
+
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // SAFETY: GWLP_USERDATA holds the State boxed in `open` for this window, cleared at
+        // WM_NCDESTROY before `Win` drops the box; null before it's set.
+        let state = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State).as_ref() };
+        let Some(state) = state else {
+            // SAFETY: the default procedure for messages before the state is set.
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        };
+        match msg {
+            WM_LBUTTONDOWN => {
+                let (x, y) = point_of(lparam);
+                let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: reads this live window's client size into `r`.
+                unsafe { GetClientRect(hwnd, &mut r) };
+                (state.hooks.click)(f64::from(x), f64::from(y), f64::from(r.right), f64::from(r.bottom));
+                0
+            }
+            WM_KEYDOWN if wparam == usize::from(VK_ESCAPE) => {
+                // SAFETY: posts to this live window's own queue.
+                unsafe { PostMessageW(hwnd, WM_CLOSE_LATER, 0, 0) };
+                0
+            }
+            WM_CLOSE => {
+                // The close button asks the owner to drop the projector (which closes it).
+                // SAFETY: as above.
+                unsafe { PostMessageW(hwnd, WM_CLOSE_LATER, 0, 0) };
+                0
+            }
+            WM_CLOSE_LATER => {
+                (state.hooks.close)();
+                0
+            }
+            WM_SIZE => {
+                let (w, h) = (lparam as u32 & 0xffff, (lparam as u32 >> 16) & 0xffff);
+                (state.hooks.resize)(w.max(1), h.max(1));
+                0
+            }
+            WM_SIZING if !state.full && state.aspect > 0.0 => {
+                // Keeps the picture's shape: the edge dragged leads, the other follows.
+                // SAFETY: lparam is the RECT Windows passes with WM_SIZING, ours to change.
+                let r = unsafe { &mut *(lparam as *mut RECT) };
+                let mut frame = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: the frame round an empty client area for this window's styles.
+                unsafe {
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                    AdjustWindowRectEx(&mut frame, WS_OVERLAPPEDWINDOW, 0, ex);
+                }
+                let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
+                let (cw, ch) = (r.right - r.left - fw, r.bottom - r.top - fh);
+                match wparam as u32 {
+                    WMSZ_TOP | WMSZ_BOTTOM => r.right = r.left + fw + (f64::from(ch) * state.aspect).round() as i32,
+                    WMSZ_LEFT | WMSZ_RIGHT | WMSZ_BOTTOMLEFT | WMSZ_BOTTOMRIGHT => {
+                        r.bottom = r.top + fh + (f64::from(cw) / state.aspect).round() as i32;
+                    }
+                    WMSZ_TOPLEFT | WMSZ_TOPRIGHT => {
+                        r.top = r.bottom - fh - (f64::from(cw) / state.aspect).round() as i32
+                    }
+                    _ => {}
+                }
+                TRUE as LRESULT
+            }
+            // libobs draws all of it.
+            WM_ERASEBKGND => 1,
+            WM_NCDESTROY => {
+                // SAFETY: clears the pointer before Win drops the State it points to.
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                // SAFETY: the default procedure finishes destroying the window.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+            // SAFETY: everything else goes to the default procedure.
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    fn register() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: registers this class once, with a procedure that lives forever and a
+            // static NUL-terminated UTF-16 name.
+            unsafe {
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(proc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: GetModuleHandleW(std::ptr::null()),
+                    hIcon: std::ptr::null_mut(),
+                    hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+                    hbrBackground: std::ptr::null_mut(),
+                    lpszMenuName: std::ptr::null(),
+                    lpszClassName: CLASS.as_ptr(),
+                };
+                RegisterClassW(&wc);
+            }
+        });
+    }
+
+    /// Each display: its name, its box on the desktop (device pixels) and whether it's the main one.
+    fn monitors() -> Vec<(String, RECT, bool)> {
+        unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> i32 {
+            // SAFETY: `out` is the Vec passed below, alive for the whole enumeration.
+            let out = unsafe { &mut *(out as *mut Vec<(String, RECT, bool)>) };
+            // SAFETY: a zeroed MONITORINFOEXW with its size set, filled in by Windows.
+            let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            // SAFETY: as above; MONITORINFOEXW starts with MONITORINFO.
+            if unsafe { GetMonitorInfoW(m, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) } != 0 {
+                let n = info.szDevice.iter().position(|c| *c == 0).unwrap_or(info.szDevice.len());
+                let device = String::from_utf16_lossy(&info.szDevice[..n]);
+                let main = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
+                out.push((device, info.monitorInfo.rcMonitor, main));
+            }
+            TRUE
+        }
+        let mut out: Vec<(String, RECT, bool)> = Vec::new();
+        // SAFETY: enumerates the displays into `out`, which outlives the call.
+        unsafe {
+            EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), &mut out as *mut _ as LPARAM)
+        };
+        // The main display first, as macOS lists them.
+        out.sort_by_key(|(_, _, main)| !main);
+        out
+    }
+
+    /// The displays, the main one first: (name, width, height in pixels).
+    pub fn screens() -> Vec<(String, f64, f64)> {
+        monitors()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, r, _))| {
+                let (w, h) = (r.right - r.left, r.bottom - r.top);
+                (format!("Display {}", i + 1), f64::from(w), f64::from(h))
+            })
+            .collect()
+    }
+
+    /// An open projector window.
+    pub struct Win {
+        hwnd: HWND,
+        full: bool,
+        _state: Box<State>,
+    }
+
+    impl std::fmt::Debug for Win {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Win").field("hwnd", &self.hwnd).finish_non_exhaustive()
+        }
+    }
+
+    /// Opens one: full screen on display `screen` (borderless, over the taskbar), or a window
+    /// the shape `aspect` (width / height). None for no such display.
+    pub fn open(title: &str, aspect: f64, screen: Option<usize>, hooks: Hooks) -> Option<Win> {
+        register();
+        let full = match screen {
+            Some(i) => Some(monitors().get(i)?.1),
+            None => None,
+        };
+        let aspect = if aspect > 0.0 { aspect } else { 16.0 / 9.0 };
+        let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let (style, ex, x, y, w, h) = match full {
+            Some(r) => (WS_POPUP | WS_VISIBLE, WS_EX_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => {
+                let mut r = RECT { left: 0, top: 0, right: 960, bottom: (960.0 / aspect).round() as i32 };
+                // SAFETY: grows `r` by the frame of a normal window.
+                unsafe { AdjustWindowRectEx(&mut r, WS_OVERLAPPEDWINDOW, 0, 0) };
+                // Windows places (and cascades) each new one.
+                (WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top)
+            }
+        };
+        // SAFETY: a top-level window of the class registered above, with a NUL-terminated title.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                ex,
+                CLASS.as_ptr(),
+                title.as_ptr(),
+                style,
+                x,
+                y,
+                w,
+                h,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            )
+        };
+        if hwnd.is_null() {
+            return None;
+        }
+        let state = Box::new(State { hooks: Rc::new(hooks), aspect, full: full.is_some() });
+        // SAFETY: the window keeps a pointer to the boxed State, which Win owns and frees only
+        // after DestroyWindow (whose WM_NCDESTROY clears it). Then shown and given the keys (Esc).
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*state as *const State as isize);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+        Some(Win { hwnd, full: full.is_some(), _state: state })
+    }
+
+    impl Win {
+        pub fn view_ptr(&self) -> *mut std::ffi::c_void {
+            self.hwnd
+        }
+
+        pub fn number(&self) -> isize {
+            self.hwnd as isize
+        }
+
+        /// The view's size in pixels now.
+        pub fn pixels(&self) -> (u32, u32) {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: reads this live window's client size into `r`.
+            unsafe { GetClientRect(self.hwnd, &mut r) };
+            ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)
+        }
+
+        /// Keeps a windowed projector above other apps' windows (OBS's "Always on top"); a
+        /// full-screen one stays above everything anyway.
+        pub fn set_on_top(&self, on: bool) {
+            if !self.full {
+                let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                // SAFETY: changes only this live window's z-order.
+                unsafe { SetWindowPos(self.hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+            }
+        }
+
+        pub fn close(&self) {
+            // SAFETY: destroys this module's own window (Win isn't Clone; DestroyWindow on a
+            // gone one just fails).
+            unsafe { DestroyWindow(self.hwnd) };
+        }
+    }
+}

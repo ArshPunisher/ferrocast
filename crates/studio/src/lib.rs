@@ -1478,9 +1478,10 @@ impl Drop for Preview {
     }
 }
 
-/// The displays a full-screen projector can go on (macOS; none elsewhere yet). Main thread.
+/// The displays a full-screen projector can go on (macOS and Windows; none elsewhere yet). Main
+/// thread.
 pub fn screens() -> Vec<Screen> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         ffi::projector_window::screens()
             .into_iter()
@@ -1494,7 +1495,7 @@ pub fn screens() -> Vec<Screen> {
             })
             .collect()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Vec::new()
     }
@@ -1512,7 +1513,7 @@ impl Studio {
 
     /// What a projector of `of` draws, holding its sources (`scenes` for a multiview, and
     /// Studio Mode's `preview` scene).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn show(&self, of: &ProjectorOf, scenes: &[String], preview: Option<&str>) -> Result<ffi::Show, StudioError> {
         let a = &self.inner.api;
         Ok(match of {
@@ -1532,8 +1533,8 @@ impl Studio {
 
     /// Opens a projector of `of`: full screen on display `screen` (from [`screens`]), or in a
     /// window. A multiview shows `scenes` in order and calls `on_pick` with the one clicked.
-    /// `on_close` runs when its window is closed (or Esc full screen): drop it then. macOS,
-    /// main thread.
+    /// `on_close` runs when its window is closed (or Esc full screen): drop it then. macOS
+    /// and Windows, main thread.
     pub fn projector(
         &self,
         of: &ProjectorOf,
@@ -1542,7 +1543,7 @@ impl Studio {
         on_close: Box<dyn Fn()>,
         on_pick: Box<dyn Fn(String)>,
     ) -> Result<Projector, StudioError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             use std::cell::{Cell, RefCell};
             use std::rc::Rc;
@@ -1633,7 +1634,7 @@ impl Studio {
                 laid_out,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = (of, scenes, screen, on_close, on_pick);
             Err(StudioError::Failed("projectors aren't on this system yet".into()))
@@ -1644,24 +1645,24 @@ impl Studio {
 /// A projector window. Closes when dropped.
 #[derive(Debug)]
 pub struct Projector {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     studio: Studio,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     display: *mut ffi::ObsDisplay,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     state: Box<ffi::ProjectorState>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     win: ffi::projector_window::Win,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     names: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     /// The display as the window's resize hook sees it; emptied before the display goes.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     shared_display: std::rc::Rc<std::cell::Cell<*mut ffi::ObsDisplay>>,
     /// A multiview's Studio Mode preview scene now.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     preview: std::cell::RefCell<Option<String>>,
     /// The layout clicks are read against, and whether a preview box shows.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     laid_out: std::rc::Rc<std::cell::Cell<(projector::MultiviewLook, bool)>>,
 }
 
@@ -1669,11 +1670,11 @@ impl Projector {
     /// Its window's number (to screenshot it in checks). macOS.
     #[doc(hidden)]
     pub fn window_number(&self) -> isize {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             self.win.number()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             0
         }
@@ -1681,27 +1682,27 @@ impl Projector {
 
     /// Keeps a windowed projector above other windows, or not (OBS's "Always on top").
     pub fn set_on_top(&self, on: bool) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         self.win.set_on_top(on);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = on;
     }
 
     /// A multiview follows the scenes as they change (added, removed, renamed, moved).
     pub fn set_scenes(&self, scenes: &[String]) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let preview = self.preview.borrow().clone();
             self.update(scenes, preview.as_deref());
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = scenes;
     }
 
     /// A multiview follows the scenes, Studio Mode's preview (None when it's off) and the
     /// Studio's multiview layout.
     pub fn update(&self, scenes: &[String], preview: Option<&str>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             if self.names.borrow().is_empty()
                 && !matches!(*self.state.show.lock().unwrap_or_else(|e| e.into_inner()), ffi::Show::Multi { .. })
@@ -1726,14 +1727,14 @@ impl Projector {
             *self.preview.borrow_mut() = preview.map(String::from);
             self.laid_out.set((look, has_preview));
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let _ = (scenes, preview);
     }
 }
 
 impl Drop for Projector {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let a = &self.studio.inner.api;
             // A resize arriving while the window closes must not reach a destroyed display.
