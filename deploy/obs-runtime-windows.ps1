@@ -71,6 +71,21 @@ foreach ($p in $Plugins) {
 foreach ($f in $Cef) { Take (Join-Path $src "obs-plugins\64bit\$f") $plugOut }
 foreach ($f in $Checks) { Take (Join-Path $src "bin\64bit\$f") $root }
 
+# Remove background's model (Robust Video Matting, MobileNetV3, GPL-3.0), which the Studio
+# finds at obs\data\ferrocast (crates/studio/src/ffi/matte.rs), checked by sha256.
+$RvmSha = '88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828'
+$rvm = Join-Path $cache 'rvm_mobilenetv3_fp32.onnx'
+if (-not (Test-Path $rvm) -or (Hash $rvm) -ne $RvmSha) {
+  $url = 'https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx'
+  Invoke-WebRequest -Uri $url -OutFile "$rvm.part" -UseBasicParsing
+  Move-Item -Force "$rvm.part" $rvm
+}
+$got = Hash $rvm
+if ($got -ne $RvmSha) { throw "Remove background's model checksum mismatch: $got" }
+$modelOut = Join-Path $obs 'data\ferrocast'
+New-Item -ItemType Directory -Force $modelOut | Out-Null
+Copy-Item -Force $rvm $modelOut
+
 # Microsoft's C++ runtime (allowed app-local), for OBS's DLLs and the encoder checks: from the
 # Visual Studio on this machine (CI's runner has it).
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -115,6 +130,10 @@ Qt and Chromium Embedded Framework, each under its own licence (see OBS Studio's
 
 Source: https://github.com/obsproject/obs-studio/tree/$ObsVersion
 Libraries' sources: https://github.com/obsproject/obs-deps
+
+data\ferrocast\rvm_mobilenetv3_fp32.onnx is Robust Video Matting (MobileNetV3) by Shanchuan Lin
+and others, under the GNU General Public License version 3:
+https://github.com/PeterL1n/RobustVideoMatting
 "@
 [IO.File]::WriteAllText((Join-Path $obs 'OBS-NOTICE.txt'), $notice, [Text.UTF8Encoding]::new($false))
 

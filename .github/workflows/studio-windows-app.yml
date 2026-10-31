@@ -67,6 +67,11 @@ jobs:
         run: |
           $env:FERROCAST_OBS_DIR = (Resolve-Path apps/desktop/obs-runtime/obs).Path
           cargo run --locked -p ferrocast-studio --example filters -- "$env:RUNNER_TEMP/filters"
+      - name: Remove background on D3D11 (RVM, the installer's model)
+        shell: pwsh
+        run: |
+          $env:FERROCAST_OBS_DIR = (Resolve-Path apps/desktop/obs-runtime/obs).Path
+          cargo run --locked -p ferrocast-studio --example cutout -- none "$env:RUNNER_TEMP/cutout"
       - name: The Studio in the app
         shell: pwsh
         run: deploy/studio-windows-check.ps1 -Exe target/debug/ferrocast.exe -Out "$env:RUNNER_TEMP/check"
