@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// OBS's helper: the one Ferrocast.app carries in Contents/Helpers, else an installed OBS's.
+/// OBS's helper: the one Ferrocast carries (Contents/Helpers on a Mac, obs/bin/64bit on
+/// Windows), else an installed OBS's.
 fn helper() -> Option<PathBuf> {
     // Linux has no OBS helper to look for, so nothing is added there.
     #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
@@ -24,6 +25,10 @@ fn helper() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
+        // …\Ferrocast\obs-ffmpeg-mux.exe (this) → …\Ferrocast\obs\bin\64bit\obs-ffmpeg-mux.exe
+        if let Some(dir) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
+            places.push(dir.join("obs").join("bin").join("64bit").join("obs-ffmpeg-mux.exe"));
+        }
         for var in ["ProgramFiles", "ProgramW6432"] {
             if let Some(p) = std::env::var_os(var) {
                 places.push(PathBuf::from(p).join("obs-studio/bin/64bit/obs-ffmpeg-mux.exe"));

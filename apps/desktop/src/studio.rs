@@ -108,6 +108,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     let mut p = c.vertical_preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    pass_input(&window, &p);
     let v = &h.vertical;
     if let Some(area) = v.canvas {
         p.set_area(rect, area, scale);
@@ -177,11 +178,39 @@ fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
             (Paths::from_obs_app(&c, metal), if metal { "metal" } else { "opengl" })
         })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        // The engine the installer puts beside Ferrocast (deploy/obs-runtime-windows.ps1),
+        // else an installed OBS (dev builds). D3D11 is OBS's renderer on Windows.
+        let _ = metal;
+        let own = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("obs")));
+        let mut places: Vec<PathBuf> = own.into_iter().collect();
+        for var in ["ProgramFiles", "ProgramW6432"] {
+            if let Some(p) = std::env::var_os(var) {
+                places.push(PathBuf::from(p).join("obs-studio"));
+            }
+        }
+        places
+            .into_iter()
+            .find(|p| p.join("bin/64bit/obs.dll").exists())
+            .map(|root| (Paths::from_obs_windows(&root), "d3d11"))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = metal;
         None
     }
+}
+
+/// Passes mouse actions over a picture on to the page (Windows: the picture's own window takes
+/// them, where on a Mac they go through to the page by themselves).
+fn pass_input(window: &tauri::WebviewWindow, p: &Preview) {
+    let w = window.clone();
+    p.set_input(Box::new(move |i| {
+        if let Ok(j) = serde_json::to_string(&i) {
+            let _ = w.eval(format!("window.__ferrocastPreviewInput && window.__ferrocastPreviewInput({j})"));
+        }
+    }));
 }
 
 /// What the Studio streams into Go live with: the Mac's hardware H.264 when there is one,
@@ -189,13 +218,22 @@ fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
 /// to 6000 kbps; Kick refuses over 8000, 25 Oct).
 /// How the settings ask to encode: the Mac's hardware H.264 (VideoToolbox) or x264.
 fn encode_of(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
-    const HARDWARE: &str = "com.apple.videotoolbox.videoencoder.ave.avc";
+    // The Mac's VideoToolbox; on Windows the GPU's own (NVIDIA, AMD, then Intel), as OBS lists them.
+    const HARDWARE: [&str; 5] = [
+        "com.apple.videotoolbox.videoencoder.ave.avc",
+        "obs_nvenc_h264_tex",
+        "jim_nvenc",
+        "h264_texture_amf",
+        "obs_qsv11_v2",
+    ];
     let kinds = studio.kinds();
-    let hardware = s.encoder == "hardware" && kinds.encoders.iter().any(|e| e.id == HARDWARE);
+    let hardware = (s.encoder == "hardware")
+        .then(|| HARDWARE.into_iter().find(|id| kinds.encoders.iter().any(|e| e.id == *id)))
+        .flatten();
     // A particular encoder (HEVC, AV1…) when it's on this computer.
     let chosen = s.video_encoder.as_ref().filter(|id| kinds.encoders.iter().any(|e| &e.id == *id));
     EncodeSettings {
-        video_encoder: chosen.cloned().unwrap_or_else(|| if hardware { HARDWARE } else { "obs_x264" }.into()),
+        video_encoder: chosen.cloned().unwrap_or_else(|| hardware.unwrap_or("obs_x264").into()),
         video_kbps: s.video_kbps,
         vbr: s.vbr,
         quality: None,
@@ -936,6 +974,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    pass_input(&window, &p);
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
         p.background(c);
@@ -954,6 +993,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     let mut p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    pass_input(&window, &p);
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
     }
@@ -1310,6 +1350,15 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn preview_cursor(&self, cursor: String) -> Result<(), String> {
+        self.on_main(move |h| {
+            for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+                p.set_cursor(&cursor);
+            }
+        })
+        .await
+    }
+
     async fn vertical_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
@@ -1425,6 +1474,7 @@ impl StudioHost for DesktopStudio {
                     (s, ids)
                 });
                 h.frames = if *frames { scene.clone() } else { None };
+                tracing::debug!(selected = ?h.selected, "picked in the preview");
                 // Each picture outlines only its own scenes' sources (the other finds no such scene).
                 for p in h.preview.iter().chain(h.vertical.view.iter()) {
                     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
