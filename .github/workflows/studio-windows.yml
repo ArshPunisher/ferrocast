@@ -12,6 +12,7 @@ on:
     branches: [main]
     paths:
       - crates/studio/**
+      - crates/av/**
       - .github/workflows/studio-windows.yml
 
 concurrency:
@@ -26,6 +27,9 @@ env:
   OBS_VERSION: 32.2.2
   # sha256 of OBS-Studio-32.2.2-Windows-x64.zip from obsproject/obs-studio's release.
   OBS_SHA256: 4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1
+  # The FFmpeg the app fetches (crates/engine/src/ffmpeg_get.rs): release and sha256.
+  FFMPEG_RELEASE: b6.1.1
+  FFMPEG_SHA256: 8883a3dffbd0a16cf4ef95206ea05283f78908dbfb118f73c83f4951dcc06d77
 
 jobs:
   probe:
@@ -64,3 +68,30 @@ jobs:
           name: studio-windows-probe
           path: ${{ runner.temp }}/probe
           if-no-files-found: ignore
+
+  own-engine:
+    # Ferrocast's own engine (ENGINE.md) on Windows: drawing through D3D12/WARP and encoding
+    # through the app's FFmpeg (whichever H.264 encoder works here; runners have no GPU).
+    name: Our engine on Windows
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: The app's FFmpeg
+        shell: pwsh
+        run: |
+          $gz = "$env:RUNNER_TEMP\ffmpeg.gz"
+          Invoke-WebRequest "https://github.com/eugeneware/ffmpeg-static/releases/download/$env:FFMPEG_RELEASE/ffmpeg-win32-x64.gz" -OutFile $gz
+          $hash = (Get-FileHash $gz -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:FFMPEG_SHA256) { throw "ffmpeg checksum mismatch: $hash" }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\ffmpeg" | Out-Null
+          $in = [IO.File]::OpenRead($gz)
+          $out = [IO.File]::Create("$env:RUNNER_TEMP\ffmpeg\ffmpeg.exe")
+          $z = New-Object IO.Compression.GZipStream($in, [IO.Compression.CompressionMode]::Decompress)
+          $z.CopyTo($out); $z.Close(); $out.Close(); $in.Close()
+          "$env:RUNNER_TEMP\ffmpeg" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Encoders and drawing
+        shell: pwsh
+        run: |
+          ffmpeg -hide_banner -encoders | Select-String "h264"
+          cargo test --locked -p ferrocast-av -- --nocapture
