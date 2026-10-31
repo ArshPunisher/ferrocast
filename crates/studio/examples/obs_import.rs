@@ -87,6 +87,24 @@ fn main() -> Result<()> {
     let mut t = c.transform("Nest", p.id)?;
     (t.x, t.y) = (900.0, 400.0);
     c.set_transform("Nest", p.id, &t)?;
+    // A group of two pictures, moved and turned as one, in a fourth scene.
+    c.add_scene("Grouped")?;
+    c.add_source(
+        "Grouped",
+        "color_source_v3",
+        "Sky",
+        &json!({ "color": 0xFF_60_30_00u32, "width": 1280, "height": 720 }),
+        false,
+    )?;
+    let a = c.add_existing("Grouped", "Pic")?;
+    let b = c.add_existing("Grouped", "Ramp")?;
+    let mut t = c.transform("Grouped", b.id)?;
+    (t.x, t.y) = (200.0, 120.0);
+    c.set_transform("Grouped", b.id, &t)?;
+    let g = c.group_together("Grouped", &[a.id, b.id], "Pair")?;
+    let mut t = c.transform("Grouped", g.id)?;
+    (t.x, t.y, t.rotation, t.scale_x, t.scale_y) = (500.0, 150.0, -10.0, 1.2, 1.2);
+    c.set_transform("Grouped", g.id, &t)?;
     std::thread::sleep(Duration::from_millis(500));
 
     let doc = c.save("Test");
@@ -111,7 +129,7 @@ fn main() -> Result<()> {
     std::thread::sleep(Duration::from_millis(500));
     let total = (W * H) as usize;
     let mut failed = Vec::new();
-    for scene in ["Main", "Keyed", "Nest"] {
+    for scene in ["Main", "Keyed", "Nest", "Grouped"] {
         let ours = engine.snapshot_scene(scene)?;
         let file = out.join(format!("{scene} obs.png"));
         c.screenshot(scene, &file)?;
