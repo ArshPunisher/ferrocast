@@ -18,6 +18,15 @@ ignore = [
   # webpki-roots 1, which is 1.0.10 here with those roots removed. The advisory's version range
   # still names 0.26. Revisit when tokio-tungstenite moves to webpki-roots 1.
   { id = "RUSTSEC-2026-0381", reason = "0.26.11 only re-exports webpki-roots 1.0.10, which drops the emSign roots" },
+  # tract 0.21.4, held for DeepFilterNet (Strong noise removal; later 0.21s move to ndarray 0.16,
+  # which it doesn't build with). The overflow is in tract-nnef's NNEF tensor reader on loading
+  # a crafted model; DeepFilterNet loads only its own ONNX model, built into the app, so no one
+  # can hand it one. Revisit when DeepFilterNet moves to a newer tract.
+  { id = "RUSTSEC-2026-0217", reason = "tract-nnef 0.21.4 for DeepFilterNet: only its built-in ONNX model is ever loaded, never NNEF from outside" },
+  # Unmaintained (not vulnerabilities), through tract: anymap2 (liquid, tract-hir's templates)
+  # and paste (a build-time macro). Revisit with tract.
+  { id = "RUSTSEC-2026-0319", reason = "unmaintained, only through tract (liquid via tract-hir)" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro, only through tract" },
   # Build-time macro crate pulled in by gtk-rs 0.18 (Tauri's Linux webview stack). Not a
   # vulnerability; no maintained replacement upstream yet. Revisit when Tauri moves to gtk4.
   { id = "RUSTSEC-2024-0370", reason = "unmaintained, transitive via gtk 0.18 in Tauri on Linux" },
