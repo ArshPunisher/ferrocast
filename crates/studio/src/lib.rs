@@ -371,20 +371,19 @@ impl Studio {
             return Err(StudioError::Video(code));
         }
         let (bin, pdata) = (cstr(&paths.plugin_bin), cstr(&paths.plugin_data));
-        // Windows: game capture copies its hooks from `..\..\data\obs-plugins\win-capture`, a
-        // path from the working folder, which is OBS's bin\64bit when OBS runs; so it's that
-        // folder while the plugins load, and back after.
+        // Windows: the working folder is OBS's bin\64bit from here on, as when OBS runs. libobs
+        // finds its plugins from there (`..\..\obs-plugins\64bit`), keeps their data folders
+        // relative to it (`..\..\data\obs-plugins\…`: effects, game capture's helpers and
+        // hooks), and starts their helpers from it; changing it back broke all three (31 Oct).
+        // Ferrocast's own paths are all absolute.
         #[cfg(windows)]
-        let was = paths.deps.as_ref().and_then(|bin| {
-            let was = std::env::current_dir().ok()?;
-            std::env::set_current_dir(bin).ok().map(|_| was)
-        });
+        let in_obs = paths.deps.as_ref().is_some_and(|bin| std::env::set_current_dir(bin).is_ok());
         // libobs already looks in some places itself: on a Mac the running app's own PlugIns
         // (its mainBundle), on Windows `..\..\obs-plugins\64bit` from the working folder. When
         // that's where the plugins are (Ferrocast.app carries them; the working folder is
         // OBS's bin\64bit), adding the folder again would load every plugin twice.
         #[cfg(windows)]
-        let found = was.is_some();
+        let found = in_obs;
         #[cfg(not(windows))]
         let found = own_plugins(&paths.plugin_bin);
         if !found {
@@ -405,10 +404,6 @@ impl Studio {
         let mut places = vec![(bin.as_c_str(), pdata.as_c_str())];
         places.extend(core.as_ref().map(|(b, d)| (b.as_c_str(), d.as_c_str())));
         ffi::load_modules(&api, &places);
-        #[cfg(windows)]
-        if let Some(was) = was {
-            let _ = std::env::set_current_dir(was);
-        }
         api.obs_post_load_modules();
         let cpu = api.os_cpu_usage_info_start();
         let inner = std::rc::Rc::new(Inner {
