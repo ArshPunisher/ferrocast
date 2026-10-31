@@ -53,7 +53,9 @@ struct Running {
 
 fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERROCAST_HOME") {
-        return PathBuf::from(dir);
+        // Absolute: on Windows the Studio moves the working folder to OBS's (studio crate).
+        let dir = PathBuf::from(dir);
+        return std::path::absolute(&dir).unwrap_or(dir);
     }
     // Debug builds never touch the installed app's data.
     let name = if cfg!(debug_assertions) { "Ferrocast-dev" } else { "Ferrocast" };
