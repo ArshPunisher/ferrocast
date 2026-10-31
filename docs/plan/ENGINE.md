@@ -195,6 +195,7 @@ Checked against libobs by `cargo run -p ferrocast-studio --example engine_match 
 | Blend modes (7), sRGB-off blending; Metal's alpha rule differs from D3D/GL's, both matched | `compose.rs` | 0 | 0 |
 | Groups, nested scenes (cropped, blended) | `compose.rs` | 0 | 0 |
 | Ferrocast's filters: rounded, border, shadow, shape, blur/pixelate, looks (chained) | `effects.wgsl` | 0 | — |
+| OBS's filters: Chroma Key, Color Correction, Color Key, Luma Key, Sharpen (v2, linear light). Not yet copied: libobs's "bypass" for a lone OBS filter on a scaled image (it filters at the final size; ours filters, then scales: edges differ slightly) | `effects.wgsl` | 0 | — |
 | Transitions: fade, fade to colour, slide, swipe, luma wipe (held at 40% by the T-bar) | `transition.wgsl` | 0 | — |
 | NV12 for encoders (BT.709 limited, chroma sited left) | `render_nv12` | 0 | — |
 

@@ -290,3 +290,55 @@ fn fs_color_correction(i: Out) -> @location(0) vec4<f32> {
     c = f.m * c;
     return vec4<f32>(c.rgb * c.a, c.a);
 }
+
+fn unpremultiplied(c: vec4<f32>) -> vec4<f32> {
+    if c.a > 0.0 {
+        return vec4<f32>(c.rgb / c.a, c.a);
+    }
+    return vec4<f32>(0.0, 0.0, 0.0, c.a);
+}
+
+// color_key_filter_v2.effect: q.rgb the key (as stored, non-linear); r similarity, smoothness,
+// opacity; p0 contrast, p1 brightness, p2 gamma.
+@fragment
+fn fs_color_key(i: Out) -> @location(0) vec4<f32> {
+    var rgba = unpremultiplied(textureSampleLevel(image, pick, i.uv, 0.0));
+    rgba.a *= f.r.z;
+    let dist = distance(f.q.rgb, nonlinear3(rgba.rgb));
+    rgba.a *= saturate(max(dist - f.r.x, 0.0) / f.r.y);
+    rgba = vec4<f32>(pow(rgba.rgb, vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
+    return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
+}
+
+// luma_key_filter_v2.effect: r max, min, max smoothness, min smoothness.
+@fragment
+fn fs_luma_key(i: Out) -> @location(0) vec4<f32> {
+    var rgba = unpremultiplied(textureSampleLevel(image, pick, i.uv, 0.0));
+    let l = dot(rgba.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let lo = smoothstep(f.r.y, f.r.y + f.r.w, l);
+    let hi = 1.0 - smoothstep(f.r.x - f.r.z, f.r.x, l);
+    rgba.a *= lo * hi;
+    return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
+}
+
+// sharpness.effect: p0 sharpness; the picture's own pixel size.
+@fragment
+fn fs_sharpen(i: Out) -> @location(0) vec4<f32> {
+    let d = 1.0 / f.size;
+    let at = i.uv;
+    let a = textureSampleLevel(image, pick, at + vec2<f32>(-d.x, -d.y), 0.0);
+    let b = textureSampleLevel(image, pick, at + vec2<f32>(0.0, -d.y), 0.0);
+    let c = textureSampleLevel(image, pick, at + vec2<f32>(d.x, -d.y), 0.0);
+    let dd = textureSampleLevel(image, pick, at + vec2<f32>(-d.x, 0.0), 0.0);
+    let e = textureSampleLevel(image, pick, at, 0.0);
+    let ff = textureSampleLevel(image, pick, at + vec2<f32>(d.x, 0.0), 0.0);
+    let g = textureSampleLevel(image, pick, at + vec2<f32>(-d.x, d.y), 0.0);
+    let h = textureSampleLevel(image, pick, at + vec2<f32>(0.0, d.y), 0.0);
+    let ii = textureSampleLevel(image, pick, at + vec2<f32>(d.x, d.y), 0.0);
+    let color = 8.0 * e - a - b - c - dd - ff - g - h - ii;
+    let edge = (distance(e, ff) != 0.0 && distance(e, dd) != 0.0) || (distance(e, b) != 0.0 && distance(e, h) != 0.0);
+    if edge {
+        return saturate(e + color * f.p0);
+    }
+    return e;
+}

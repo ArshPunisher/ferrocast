@@ -768,6 +768,16 @@ impl Compositor {
                         [0.0; 4],
                     )
                 }
+                Effect::ColorKey { key, similarity, smoothness, opacity, contrast, brightness, gamma } => {
+                    q = [f32::from(key[0]) / 255.0, f32::from(key[1]) / 255.0, f32::from(key[2]) / 255.0, 1.0];
+                    r = [similarity / 1000.0, smoothness / 1000.0, *opacity, 0.0];
+                    ("fs_color_key", [obs_contrast(*contrast), *brightness, obs_gamma(*gamma), 0.0, 0.0, 0.0], [0.0; 4])
+                }
+                Effect::LumaKey { max, min, max_smooth, min_smooth } => {
+                    r = [*max, *min, *max_smooth, *min_smooth];
+                    ("fs_luma_key", [0.0; 6], [0.0; 4])
+                }
+                Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::ColorCorrection {
                     gamma,
                     contrast,

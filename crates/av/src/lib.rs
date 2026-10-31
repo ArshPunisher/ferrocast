@@ -200,12 +200,42 @@ pub enum Effect {
         multiply: u32,
         add: u32,
     },
+    /// OBS's Color Key (similarity and smoothness 1 to 1000, opacity, contrast, brightness,
+    /// gamma as OBS keeps them; the key as RGB).
+    ColorKey {
+        key: [u8; 3],
+        similarity: f32,
+        smoothness: f32,
+        opacity: f32,
+        contrast: f32,
+        brightness: f32,
+        gamma: f32,
+    },
+    /// OBS's Luma Key (luminance 0 to 1: kept between `min` and `max`, softened by the two
+    /// smoothness widths).
+    LumaKey {
+        max: f32,
+        min: f32,
+        max_smooth: f32,
+        min_smooth: f32,
+    },
+    /// OBS's Sharpen (0 to 1).
+    Sharpen {
+        sharpness: f32,
+    },
 }
 
 impl Effect {
     /// OBS's own filters run in linear light (they're sRGB-aware); Ferrocast's in gamma space.
     pub fn linear(&self) -> bool {
-        matches!(self, Self::ChromaKey { .. } | Self::ColorCorrection { .. })
+        matches!(
+            self,
+            Self::ChromaKey { .. }
+                | Self::ColorCorrection { .. }
+                | Self::ColorKey { .. }
+                | Self::LumaKey { .. }
+                | Self::Sharpen { .. }
+        )
     }
 
     /// How far it draws past the picture on every side, in pixels.

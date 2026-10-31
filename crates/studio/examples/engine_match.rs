@@ -219,6 +219,29 @@ fn main() -> Result<()> {
         "Key",
         &json!({ "similarity": 380, "smoothness": 90, "spill": 120 }),
     )?;
+    // Colour key, luma key and sharpen, cropped, down the right edge.
+    for (i, (name, kind, settings)) in [
+        ("Col keyed", "color_key_filter_v2", json!({ "similarity": 300, "smoothness": 120 })),
+        (
+            "Luma keyed",
+            "luma_key_filter_v2",
+            json!({ "luma_max": 0.8, "luma_min": 0.25, "luma_max_smooth": 0.1, "luma_min_smooth": 0.05 }),
+        ),
+        ("Sharp", "sharpness_filter_v2", json!({ "sharpness": 0.4 })),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = if i == 0 { &green } else { &photo };
+        let it = image("Effects", name, file)?;
+        // At full size: shrunk, libobs draws a lone OBS filter straight into the scene (its
+        // "bypass"), which ours doesn't copy yet; its edges differ slightly (ENGINE.md).
+        place("Effects", it.id, &|t| {
+            (t.x, t.y) = (1050.0, 10.0 + 150.0 * i as f32);
+            (t.crop_right, t.crop_bottom) = (if i == 0 { 130 } else { 90 }, if i == 0 { 80 } else { 60 });
+        })?;
+        c.add_filter(name, kind, "Filter", &settings)?;
+    }
     let g = image("Effects", "Graded", &photo)?;
     place("Effects", g.id, &|t| (t.x, t.y) = (860.0, 480.0))?;
     c.add_filter(
@@ -402,6 +425,31 @@ fn effects_of(c: &Collection, name: &str) -> Result<Vec<Effect>> {
                     gamma: n("gamma", 0.0),
                 }
             }
+            "color_key_filter_v2" => {
+                let key = match s["key_color_type"].as_str().unwrap_or("green") {
+                    "blue" => 0xFF0000u32,
+                    "red" => 0x0000FF,
+                    "magenta" => 0xFF00FF,
+                    "custom" => s["key_color"].as_u64().unwrap_or(0x00FF00) as u32,
+                    _ => 0x00FF00,
+                };
+                Effect::ColorKey {
+                    key: [(key & 0xff) as u8, ((key >> 8) & 0xff) as u8, ((key >> 16) & 0xff) as u8],
+                    similarity: n("similarity", 80.0),
+                    smoothness: n("smoothness", 50.0),
+                    opacity: n("opacity", 1.0),
+                    contrast: n("contrast", 0.0),
+                    brightness: n("brightness", 0.0),
+                    gamma: n("gamma", 0.0),
+                }
+            }
+            "luma_key_filter_v2" => Effect::LumaKey {
+                max: n("luma_max", 1.0),
+                min: n("luma_min", 0.0),
+                max_smooth: n("luma_max_smooth", 0.0),
+                min_smooth: n("luma_min_smooth", 0.0),
+            },
+            "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
             "color_filter_v2" => Effect::ColorCorrection {
                 gamma: n("gamma", 0.0),
                 contrast: n("contrast", 0.0),
