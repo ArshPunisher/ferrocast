@@ -9,6 +9,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Streaming through Ferrocast's own encoders (the "own encoder" switch, ENGINE.md E1).
+ferrocast-av.workspace = true
+ferrocast-golive.workspace = true
+tokio.workspace = true
 libloading = "0.8"
 raw-window-handle = "0.6"
 serde.workspace = true
@@ -75,9 +79,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [dev-dependencies]
 tempfile = "3"
 # The engine_match and own_stream examples: our own engine beside libobs.
-ferrocast-av.workspace = true
-ferrocast-golive.workspace = true
-tokio.workspace = true
 bytes = "1"
 # The guest example: a browser's camera over WebRTC into the Studio.
 ferrocast-guest.workspace = true

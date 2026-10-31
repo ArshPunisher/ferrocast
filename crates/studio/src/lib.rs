@@ -9,6 +9,7 @@
 mod collection;
 mod ffi;
 pub mod import;
+mod own;
 pub mod projector;
 pub mod streamlabs;
 
@@ -1188,6 +1189,25 @@ impl Studio {
     /// Streams what's on air over RTMP to `server` with `key` (OBS's own RTMP output), with
     /// its reconnects and delay as `s` says. Stops when the handle is dropped.
     pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<Streaming, StudioError> {
+        if s.own_encoder {
+            match own::unsupported(s, true) {
+                None => {
+                    let own = own::OwnStream::start(self, server, key, s)?;
+                    return Ok(Streaming {
+                        studio: self.clone(),
+                        out: ptr::null_mut(),
+                        service: ptr::null_mut(),
+                        venc: ptr::null_mut(),
+                        aenc: ptr::null_mut(),
+                        vod: ptr::null_mut(),
+                        settings: s.clone(),
+                        directs: Vec::new(),
+                        own: Some(own),
+                    });
+                }
+                Some(why) => tracing::info!("Ferrocast's own encoder doesn't do {why} yet: libobs's encodes this stream"),
+            }
+        }
         self.stream_of(server, key, s, ptr::null_mut())
     }
 
@@ -1220,6 +1240,7 @@ impl Studio {
             vod: ptr::null_mut(),
             settings: s.clone(),
             directs: Vec::new(),
+            own: None,
         };
         if service.is_null() || out.is_null() {
             return Err(StudioError::Failed("the stream output couldn't be made".into()));
@@ -2600,6 +2621,11 @@ pub struct StreamSettings {
     /// while viewers hear track 1. None: one track.
     #[serde(default)]
     pub vod_track: Option<u8>,
+    /// Encode and send with Ferrocast's own encoders instead of libobs's (ENGINE.md E1). libobs
+    /// still draws and mixes. Where they can't (a delay, the VOD track, a scaled stream, not a
+    /// Mac yet), libobs's are used and the log says why.
+    #[serde(default)]
+    pub own_encoder: bool,
 }
 
 /// The engine's own load.
@@ -2643,6 +2669,8 @@ pub struct Streaming {
     settings: StreamSettings,
     /// Destinations sent straight from here (SRT, RIST, WebRTC), by id.
     directs: Vec<Direct>,
+    /// Sent through Ferrocast's own encoders instead (`out` and the encoders are null then).
+    own: Option<own::OwnStream>,
 }
 
 /// How a destination is sent straight from the Studio (not through Go live's RTMP forwarders).
@@ -2692,6 +2720,11 @@ impl Streaming {
     /// while running, as its dynamic bitrate does): the stream doctor's lighter bitrate helps
     /// the stream that's struggling, not only the next one.
     pub fn set_video_kbps(&mut self, kbps: u32) {
+        if self.own.is_some() {
+            // Our encoder takes the new bitrate at the next start.
+            self.settings.encode.video_kbps = kbps;
+            return;
+        }
         let a = &self.studio.inner.api;
         let d = a.obs_data_create();
         let k = cstr("bitrate");
@@ -2706,11 +2739,22 @@ impl Streaming {
     }
 
     pub fn stats(&self) -> StreamStats {
+        if let Some(o) = &self.own {
+            return o.stats();
+        }
         output_stats(&self.studio.inner.api, self.out)
+    }
+
+    /// Whether Ferrocast's own encoders send this stream.
+    pub fn own_encoder(&self) -> bool {
+        self.own.is_some()
     }
 
     /// The reason OBS gave for the last failure, if any.
     pub fn last_error(&self) -> Option<String> {
+        if let Some(o) = &self.own {
+            return o.last_error();
+        }
         let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
         (!e.is_empty()).then_some(e)
     }
@@ -2722,6 +2766,11 @@ impl Streaming {
     pub fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
         let proto = Protocol::of(url)
             .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
+        if self.own.is_some() {
+            return Err(StudioError::Failed(
+                "SRT, RIST and WebRTC go out with OBS's encoder: turn off Ferrocast's own encoder in Settings to use them.".into(),
+            ));
+        }
         self.remove_direct(id);
         let a = &self.studio.inner.api;
         let settings = a.obs_data_create();
@@ -2848,6 +2897,8 @@ fn stop_output(a: &Api, out: *mut ffi::ObsOutput) {
 
 impl Drop for Streaming {
     fn drop(&mut self) {
+        // Our own encoders' stream ends on its own (flushed, the server told).
+        self.own = None;
         // The direct ones first: they share this stream's encoders.
         for mut d in std::mem::take(&mut self.directs) {
             self.release_direct(&mut d);

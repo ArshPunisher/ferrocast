@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || serve(listener, tx));
     let mut enc = EncodeSettings::with_encoder("obs_x264");
     enc.video_kbps = 800;
-    let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: Some(2) };
+    let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: Some(2), own_encoder: false };
     let stream = studio.stream(&format!("rtmp://127.0.0.1:{port}/live"), "key", &settings)?;
     let (mut main, mut vod, mut vod_header) = (0, 0, false);
     let until = Instant::now() + Duration::from_secs(8);
