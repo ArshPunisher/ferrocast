@@ -114,6 +114,7 @@ impl Paths {
 
 /// Whether `plugin_bin` is the running app's own PlugIns (macOS), which libobs searches
 /// by itself.
+#[cfg(not(windows))]
 fn own_plugins(plugin_bin: &str) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -370,10 +371,23 @@ impl Studio {
             return Err(StudioError::Video(code));
         }
         let (bin, pdata) = (cstr(&paths.plugin_bin), cstr(&paths.plugin_data));
-        // On a Mac libobs already looks in the running app's own PlugIns (its mainBundle):
-        // when that's where the plugins are (Ferrocast.app carries them), adding the folder
-        // again would load every plugin twice.
-        if !own_plugins(&paths.plugin_bin) {
+        // Windows: game capture copies its hooks from `..\..\data\obs-plugins\win-capture`, a
+        // path from the working folder, which is OBS's bin\64bit when OBS runs; so it's that
+        // folder while the plugins load, and back after.
+        #[cfg(windows)]
+        let was = paths.deps.as_ref().and_then(|bin| {
+            let was = std::env::current_dir().ok()?;
+            std::env::set_current_dir(bin).ok().map(|_| was)
+        });
+        // libobs already looks in some places itself: on a Mac the running app's own PlugIns
+        // (its mainBundle), on Windows `..\..\obs-plugins\64bit` from the working folder. When
+        // that's where the plugins are (Ferrocast.app carries them; the working folder is
+        // OBS's bin\64bit), adding the folder again would load every plugin twice.
+        #[cfg(windows)]
+        let found = was.is_some();
+        #[cfg(not(windows))]
+        let found = own_plugins(&paths.plugin_bin);
+        if !found {
             api.obs_add_module_path(bin.as_ptr(), pdata.as_ptr());
         }
         for m in UI_ONLY {
@@ -390,14 +404,6 @@ impl Studio {
         let core = paths.core.as_ref().map(|(b, d)| (cstr(b), cstr(d)));
         let mut places = vec![(bin.as_c_str(), pdata.as_c_str())];
         places.extend(core.as_ref().map(|(b, d)| (b.as_c_str(), d.as_c_str())));
-        // Windows: game capture copies its hooks from `..\..\data\obs-plugins\win-capture`, a
-        // path from the working folder, which is OBS's bin\64bit when OBS runs; so it's that
-        // folder while the plugins load, and back after.
-        #[cfg(windows)]
-        let was = paths.deps.as_ref().and_then(|bin| {
-            let was = std::env::current_dir().ok()?;
-            std::env::set_current_dir(bin).ok().map(|_| was)
-        });
         ffi::load_modules(&api, &places);
         #[cfg(windows)]
         if let Some(was) = was {
