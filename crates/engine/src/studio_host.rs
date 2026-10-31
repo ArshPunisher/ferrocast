@@ -2267,7 +2267,7 @@ fn failed(message: String) -> EngineError {
         422,
         "studio_failed",
         message,
-        "Check the settings and try again. If it keeps failing, make sure OBS 32 or newer is installed.",
+        "Check the settings and try again. If it keeps failing, reinstall Ferrocast.",
     )
 }
 

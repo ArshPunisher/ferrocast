@@ -158,11 +158,15 @@ thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
 }
 
-/// Where OBS is installed (macOS), if it is.
+/// Where OBS's engine is (macOS): the one Ferrocast.app carries (deploy/obs-runtime-macos.sh),
+/// else an installed OBS.app (dev builds).
 fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
     #[cfg(target_os = "macos")]
     {
-        let mut places = vec![PathBuf::from("/Applications/OBS.app/Contents")];
+        // …/Ferrocast.app/Contents/MacOS/ferrocast-desktop → …/Contents
+        let own = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf()));
+        let mut places: Vec<PathBuf> = own.into_iter().collect();
+        places.push(PathBuf::from("/Applications/OBS.app/Contents"));
         if let Some(home) = dirs::home_dir() {
             places.push(home.join("Applications/OBS.app/Contents"));
         }
@@ -966,7 +970,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
-const NO_OBS: &str = "The Studio preview uses OBS's engine from the OBS installed on this computer. Install OBS 32 or newer (obsproject.com), then try again.";
+const NO_OBS: &str = "The Studio's engine is missing from this copy of Ferrocast. Reinstall Ferrocast from ferrocast.clearcraftlabs.com (or install OBS 32 from obsproject.com), then try again.";
 
 #[derive(Debug, Clone)]
 pub struct DesktopStudio {

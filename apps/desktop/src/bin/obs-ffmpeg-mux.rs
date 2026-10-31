@@ -1,18 +1,22 @@
-//! OBS's mux helper, run from where OBS is installed. libobs starts `obs-ffmpeg-mux` from
-//! the folder of the program it runs in (here, Ferrocast's), for MKV, FLV, TS and fragmented
-//! MP4/MOV recordings. This stands in for it: it runs OBS's own helper with the same
-//! arguments, input and output, so its exit is the helper's exit.
+//! OBS's mux helper, run from Ferrocast.app (or where OBS is installed). libobs starts
+//! `obs-ffmpeg-mux` from the folder of the program it runs in (here, Ferrocast's), for MKV,
+//! FLV, TS and fragmented MP4/MOV recordings. This stands in for it: it runs OBS's own helper
+//! with the same arguments, input and output, so its exit is the helper's exit.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// OBS's helper, where OBS is installed.
+/// OBS's helper: the one Ferrocast.app carries in Contents/Helpers, else an installed OBS's.
 fn helper() -> Option<PathBuf> {
     // Linux has no OBS helper to look for, so nothing is added there.
     #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
     let mut places: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "macos")]
     {
+        // …/Contents/MacOS/obs-ffmpeg-mux (this) → …/Contents/Helpers/obs-ffmpeg-mux
+        if let Some(contents) = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf())) {
+            places.push(contents.join("Helpers/obs-ffmpeg-mux"));
+        }
         places.push(PathBuf::from("/Applications/OBS.app/Contents/MacOS/obs-ffmpeg-mux"));
         if let Some(home) = std::env::var_os("HOME") {
             places.push(PathBuf::from(home).join("Applications/OBS.app/Contents/MacOS/obs-ffmpeg-mux"));
@@ -31,7 +35,7 @@ fn helper() -> Option<PathBuf> {
 
 fn main() -> ExitCode {
     let Some(exe) = helper() else {
-        eprintln!("obs-ffmpeg-mux: OBS isn't installed where Ferrocast looks for it");
+        eprintln!("obs-ffmpeg-mux: OBS's mux helper is missing from Ferrocast.app (reinstall Ferrocast)");
         return ExitCode::FAILURE;
     };
     let args: Vec<_> = std::env::args_os().skip(1).collect();
