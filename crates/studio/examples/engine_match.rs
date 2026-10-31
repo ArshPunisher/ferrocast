@@ -208,6 +208,25 @@ fn main() -> Result<()> {
         c.add_filter(name, kind, "Filter", settings)?;
     }
     c.add_filter("Vintage", "ferrocast_rounded_corners", "Round too", &json!({ "radius": 24 }))?;
+    // OBS's own: a green screen keyed out, and colour correction with every slider moved.
+    let green = out.join("green.png");
+    write_green(&green, 360, 220)?;
+    let k = image("Effects", "Keyed", &green)?;
+    place("Effects", k.id, &|t| (t.x, t.y) = (440.0, 480.0))?;
+    c.add_filter(
+        "Keyed",
+        "chroma_key_filter_v2",
+        "Key",
+        &json!({ "similarity": 380, "smoothness": 90, "spill": 120 }),
+    )?;
+    let g = image("Effects", "Graded", &photo)?;
+    place("Effects", g.id, &|t| (t.x, t.y) = (860.0, 480.0))?;
+    c.add_filter(
+        "Graded",
+        "color_filter_v2",
+        "Grade",
+        &json!({ "gamma": 0.3, "contrast": 0.4, "brightness": 0.05, "saturation": 0.6, "hue_shift": 25.0, "opacity": 0.9, "color_multiply": 0x00_E0_F0_FFu32, "color_add": 0x00_10_00_08u32 }),
+    )?;
     c.add_filter(
         "Vintage",
         "ferrocast_shadow",
@@ -365,6 +384,34 @@ fn effects_of(c: &Collection, name: &str) -> Result<Vec<Effect>> {
                 area: [n("area_x", 25.0), n("area_y", 25.0), n("area_w", 50.0), n("area_h", 50.0)],
             },
             "ferrocast_look" => Effect::Look { look: n("look", 0.0) as u32, strength: n("strength", 100.0) },
+            "chroma_key_filter_v2" => {
+                let key = match s["key_color_type"].as_str().unwrap_or("green") {
+                    "blue" => 0xFF9900u32,
+                    "magenta" => 0xFF00FF,
+                    "custom" => s["key_color"].as_u64().unwrap_or(0x00FF00) as u32,
+                    _ => 0x00FF00,
+                };
+                Effect::ChromaKey {
+                    key: [(key & 0xff) as u8, ((key >> 8) & 0xff) as u8, ((key >> 16) & 0xff) as u8],
+                    similarity: n("similarity", 400.0),
+                    smoothness: n("smoothness", 80.0),
+                    spill: n("spill", 100.0),
+                    opacity: n("opacity", 1.0),
+                    contrast: n("contrast", 0.0),
+                    brightness: n("brightness", 0.0),
+                    gamma: n("gamma", 0.0),
+                }
+            }
+            "color_filter_v2" => Effect::ColorCorrection {
+                gamma: n("gamma", 0.0),
+                contrast: n("contrast", 0.0),
+                brightness: n("brightness", 0.0),
+                saturation: n("saturation", 0.0),
+                hue_shift: n("hue_shift", 0.0),
+                opacity: n("opacity", 1.0),
+                multiply: s["color_multiply"].as_u64().unwrap_or(0x00FF_FFFF) as u32,
+                add: s["color_add"].as_u64().unwrap_or(0) as u32,
+            },
             other => return Err(format!("\"{name}\" has a filter our engine doesn't run yet: {other}").into()),
         });
     }
@@ -490,6 +537,24 @@ fn write_photo(path: &Path, w: u32, h: u32) -> Result<()> {
         for x in 0..w {
             let a = if x < w * 3 / 4 { 255 } else { 255 - (x - w * 3 / 4) * 255 / (w / 4) };
             px.extend_from_slice(&[(x * 255 / w) as u8, (y * 255 / h) as u8, 160, a as u8]);
+        }
+    }
+    write_png(path, w, h, &px)
+}
+
+/// A person-ish shape on a green screen: a warm disc with a soft edge on pure-ish green, with
+/// some green spill near it, for the chroma key.
+fn write_green(path: &Path, w: u32, h: u32) -> Result<()> {
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (x as f32 - w as f32 / 2.0, y as f32 - h as f32 / 2.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            let t = ((d - 70.0) / 6.0).clamp(0.0, 1.0);
+            let person = [220.0, 150.0, 120.0];
+            let screen = [30.0, 200.0 + (x % 7) as f32, 60.0];
+            let c: Vec<u8> = person.iter().zip(screen).map(|(a, b)| (a * (1.0 - t) + b * t) as u8).collect();
+            px.extend_from_slice(&[c[0], c[1], c[2], 255]);
         }
     }
     write_png(path, w, h, &px)

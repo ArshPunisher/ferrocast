@@ -16,6 +16,10 @@ struct F {
     p5: f32,
     _pad: f32,
     color: vec4<f32>,
+    // OBS's own filters (libobs's obs-filters effects) need more.
+    q: vec4<f32>,
+    r: vec4<f32>,
+    m: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> f: F;
@@ -213,4 +217,76 @@ fn fs_look(i: Out) -> @location(0) vec4<f32> {
         g = mix(ll, x, 0.8) * 0.85 + 0.1;
     }
     return premultiplied(vec4<f32>(mix(x, saturate(g), f.p1 * 0.01), c.a));
+}
+
+// ---- OBS's own filters (plugins/obs-filters/data), run in linear light like their v2 kinds ----
+
+fn nonlinear(u: f32) -> f32 {
+    if u <= 0.0031308 {
+        return 12.92 * u;
+    }
+    return 1.055 * pow(u, 1.0 / 2.4) - 0.055;
+}
+
+fn nonlinear3(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(nonlinear(c.r), nonlinear(c.g), nonlinear(c.b));
+}
+
+const CB: vec4<f32> = vec4<f32>(-0.100644, -0.338572, 0.439216, 0.501961);
+const CR: vec4<f32> = vec4<f32>(0.439216, -0.398942, -0.040274, 0.501961);
+
+fn chroma_dist(rgb: vec3<f32>) -> f32 {
+    let cb = dot(rgb, CB.xyz) + CB.w;
+    let cr = dot(rgb, CR.xyz) + CR.w;
+    return distance(f.q.xy, vec2<f32>(cb, cr));
+}
+
+fn sample_nl(uv: vec2<f32>) -> vec3<f32> {
+    return nonlinear3(textureSampleLevel(image, pick, uv, 0.0).rgb);
+}
+
+// chroma_key_filter_v2.effect: q.xy key (Cb, Cr), q.zw pixel size; r similarity, smoothness,
+// spill, opacity; p0 contrast, p1 brightness, p2 gamma.
+@fragment
+fn fs_chroma_key(i: Out) -> @location(0) vec4<f32> {
+    var rgba = textureSampleLevel(image, pick, i.uv, 0.0);
+    if rgba.a > 0.0 {
+        rgba = vec4<f32>(rgba.rgb / rgba.a, rgba.a);
+    } else {
+        rgba = vec4<f32>(0.0, 0.0, 0.0, rgba.a);
+    }
+    let ps = f.q.zw;
+    let hps = ps / 2.0;
+    let p0 = vec2<f32>(ps.x, hps.y);
+    let p1 = vec2<f32>(hps.x, -ps.y);
+    var d = chroma_dist(sample_nl(i.uv - p0));
+    d += chroma_dist(sample_nl(i.uv + p0));
+    d += chroma_dist(sample_nl(i.uv - p1));
+    d += chroma_dist(sample_nl(i.uv + p1));
+    d *= 2.0;
+    d += chroma_dist(nonlinear3(rgba.rgb));
+    d /= 9.0;
+    let base = d - f.r.x;
+    let full = pow(saturate(base / f.r.y), 1.5);
+    let spill = pow(saturate(base / f.r.z), 1.5);
+    rgba.a *= f.r.w;
+    rgba.a *= full;
+    let desat = dot(rgba.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    rgba = vec4<f32>(mix(vec3<f32>(desat), rgba.rgb, spill), rgba.a);
+    rgba = vec4<f32>(pow(rgba.rgb, vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
+    return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
+}
+
+// color_correction_filter.effect: p0 gamma, m the final colour matrix (libobs's rows).
+@fragment
+fn fs_color_correction(i: Out) -> @location(0) vec4<f32> {
+    var c = textureSampleLevel(image, pick, i.uv, 0.0);
+    if c.a > 0.0 {
+        c = vec4<f32>(c.rgb / c.a, c.a);
+    } else {
+        c = vec4<f32>(0.0, 0.0, 0.0, c.a);
+    }
+    c = vec4<f32>(pow(c.rgb, vec3<f32>(f.p0)), c.a);
+    c = f.m * c;
+    return vec4<f32>(c.rgb * c.a, c.a);
 }

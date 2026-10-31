@@ -90,7 +90,7 @@ pub struct Compositor {
     transition_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Ferrocast's filters: their shaders and pipelines (by entry point).
     effect_module: wgpu::ShaderModule,
-    effect_pipelines: Mutex<HashMap<&'static str, wgpu::RenderPipeline>>,
+    effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
     /// NV12 out: the Y and UV pipelines.
@@ -580,10 +580,12 @@ impl Compositor {
                 Content::Group { width, height, items } => (Src::Items(items), *width, *height, true),
             }
         } else {
-            // Filters run in gamma space (they aren't sRGB-aware), so the result mixes that way.
+            // Ferrocast's filters run in gamma space (they aren't sRGB-aware), OBS's own in linear
+            // light: the result mixes as the last one ran.
             let t = self.apply_effects(enc, item)?;
             let (w, h) = (t.width, t.height);
-            (Src::Tex(Box::new(t)), w, h, false)
+            let linear = item.effects.last().is_some_and(Effect::linear);
+            (Src::Tex(Box::new(t)), w, h, linear)
         };
         if w == 0 || h == 0 {
             return Ok(());
@@ -688,6 +690,9 @@ impl Compositor {
         let (w, h) = item.content.size();
         let mut cur = self.target(w.max(1), h.max(1), wgpu::TextureUsages::empty());
         self.clear(enc, &cur);
+        // The picture goes in as the first filter reads it: linear for OBS's, raw for ours.
+        let first_linear = item.effects.first().is_some_and(Effect::linear);
+        let base = if first_linear { LINEAR } else { GAMMA };
         match &item.content {
             Content::Picture(p) => {
                 let tex = self.new_picture(p);
@@ -696,11 +701,11 @@ impl Compositor {
                     &cur,
                     &Quad {
                         corners: corners(&Affine::IDENTITY, w as f32, h as f32),
-                        view: &view(&tex, GAMMA),
+                        view: &view(&tex, base),
                         size: (w, h),
                         shader: Shader::Default,
                         blend: Blend::Normal,
-                        linear: false,
+                        linear: first_linear,
                         straight: !p.premultiplied,
                         point: false,
                     },
@@ -713,11 +718,11 @@ impl Compositor {
                     &cur,
                     &Quad {
                         corners: corners(&Affine::IDENTITY, w as f32, h as f32),
-                        view: &view(&tex, GAMMA),
+                        view: &view(&tex, base),
                         size: (w, h),
                         shader: Shader::Default,
                         blend: Blend::Normal,
-                        linear: false,
+                        linear: first_linear,
                         straight: !premultiplied,
                         point: false,
                     },
@@ -732,6 +737,8 @@ impl Compositor {
             check_size(ow, oh)?;
             let next = self.target(ow, oh, wgpu::TextureUsages::empty());
             self.clear(enc, &next);
+            let lin = e.linear();
+            let (mut q, mut r, mut m) = ([0f32; 4], [0f32; 4], [0f32; 16]);
             let (entry, p, color) = match e {
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
@@ -745,6 +752,43 @@ impl Compositor {
                     [0.0; 4],
                 ),
                 Effect::Look { look, strength } => ("fs_look", [*look as f32, *strength, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                Effect::ChromaKey { key, similarity, smoothness, spill, opacity, contrast, brightness, gamma } => {
+                    let k = [f32::from(key[0]) / 255.0, f32::from(key[1]) / 255.0, f32::from(key[2]) / 255.0, 1.0];
+                    let dot = |v: [f32; 4]| k[0] * v[0] + k[1] * v[1] + k[2] * v[2] + k[3] * v[3];
+                    q = [
+                        dot([-0.100644, -0.338572, 0.439216, 0.501961]),
+                        dot([0.439216, -0.398942, -0.040274, 0.501961]),
+                        1.0 / cur.width as f32,
+                        1.0 / cur.height as f32,
+                    ];
+                    r = [similarity / 1000.0, smoothness / 1000.0, spill / 1000.0, *opacity];
+                    (
+                        "fs_chroma_key",
+                        [obs_contrast(*contrast), *brightness, obs_gamma(*gamma), 0.0, 0.0, 0.0],
+                        [0.0; 4],
+                    )
+                }
+                Effect::ColorCorrection {
+                    gamma,
+                    contrast,
+                    brightness,
+                    saturation,
+                    hue_shift,
+                    opacity,
+                    multiply,
+                    add,
+                } => {
+                    m = color_correction_matrix(
+                        *contrast,
+                        *brightness,
+                        *saturation,
+                        *hue_shift,
+                        *opacity,
+                        *multiply,
+                        *add,
+                    );
+                    ("fs_color_correction", [obs_gamma(*gamma), 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
             };
             let u = [
                 cur.width as f32,
@@ -763,23 +807,31 @@ impl Compositor {
                 color[1],
                 color[2],
                 color[3],
-            ];
+            ]
+            .into_iter()
+            .chain(q)
+            .chain(r)
+            .chain(m)
+            .collect::<Vec<f32>>();
             let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("effect"),
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&cur.gamma) },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(if lin { &cur.linear } else { &cur.gamma }),
+                    },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
                 ],
             });
-            let pipeline = self.effect_pipeline(entry);
+            let pipeline = self.effect_pipeline(entry, lin);
             {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("effect"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &next.gamma,
+                        view: if lin { &next.linear } else { &next.gamma },
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
@@ -795,10 +847,10 @@ impl Compositor {
         Ok(cur)
     }
 
-    fn effect_pipeline(&self, entry: &'static str) -> wgpu::RenderPipeline {
+    fn effect_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
         let mut cache = self.effect_pipelines.lock().unwrap_or_else(|e| e.into_inner());
         cache
-            .entry(entry)
+            .entry((entry, linear))
             .or_insert_with(|| {
                 self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(entry),
@@ -813,7 +865,7 @@ impl Compositor {
                         module: &self.effect_module,
                         entry_point: Some(entry),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: GAMMA,
+                            format: if linear { LINEAR } else { GAMMA },
                             blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
@@ -1112,6 +1164,82 @@ impl Compositor {
         }
         Ok(())
     }
+}
+
+/// OBS's filters' contrast setting → its multiplier.
+fn obs_contrast(c: f32) -> f32 {
+    if c < 0.0 { 1.0 / (-c + 1.0) } else { c + 1.0 }
+}
+
+/// OBS's filters' gamma setting → its exponent.
+fn obs_gamma(g: f32) -> f32 {
+    if g < 0.0 { -g + 1.0 } else { 1.0 / (g + 1.0) }
+}
+
+fn srgb_to_linear(u: f32) -> f32 {
+    if u <= 0.04045 { u / 12.92 } else { ((u + 0.055) / 1.055).powf(2.4) }
+}
+
+/// libobs's 4×4 matrices: four rows (x, y, z, t), points as rows; `mul(a, b)` is a then b.
+type M4 = [[f32; 4]; 4];
+
+fn m4_mul(a: &M4, b: &M4) -> M4 {
+    let mut out = [[0f32; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            out[i][j] = (0..4).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    out
+}
+
+/// color-correction-filter.c's `final_matrix`: contrast, brightness, saturation, hue and
+/// opacity, then the colour wash, as libobs builds it (rows, for the shader's `m * colour`).
+fn color_correction_matrix(
+    contrast: f32,
+    brightness: f32,
+    saturation: f32,
+    hue: f32,
+    opacity: f32,
+    multiply: u32,
+    add: u32,
+) -> [f32; 16] {
+    let c = obs_contrast(contrast);
+    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    let bright: M4 =
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [brightness, brightness, brightness, 1.0]];
+    let s = saturation + 1.0;
+    let (wr, wg, wb) = (0.299f32, 0.587f32, 0.114f32);
+    let (omr, omg, omb) = ((1.0 - s) * wr, (1.0 - s) * wg, (1.0 - s) * wb);
+    let sat: M4 = [[omr + s, omr, omr, 0.0], [omg, omg + s, omg, 0.0], [omb, omb, omb + s, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    let half = 0.5 * (hue / (180.0 / std::f32::consts::PI));
+    let rq = 0.57735f32 * half.sin();
+    let w = half.cos();
+    let cross = rq * rq;
+    let square = 2.0 * rq * rq;
+    let wimag = rq * w;
+    let diag = 0.5 - square;
+    let a = cross + wimag;
+    let b = cross - wimag;
+    let hue_op: M4 = [
+        [diag * 2.0, b * 2.0, a * 2.0, 0.0],
+        [a * 2.0, diag * 2.0, b * 2.0, 0.0],
+        [b * 2.0, a * 2.0, diag * 2.0, 0.0],
+        [0.0, 0.0, 0.0, opacity],
+    ];
+    let lin = |v: u32, shift: u32| srgb_to_linear(((v >> shift) & 0xff) as f32 / 255.0);
+    let wash: M4 = [
+        [lin(multiply, 0), 0.0, 0.0, 0.0],
+        [0.0, lin(multiply, 8), 0.0, 0.0],
+        [0.0, 0.0, lin(multiply, 16), 0.0],
+        [lin(add, 0), lin(add, 8), lin(add, 16), 1.0],
+    ];
+    let f = m4_mul(&m4_mul(&m4_mul(&m4_mul(&con, &bright), &sat), &hue_op), &wash);
+    let mut out = [0f32; 16];
+    for (i, row) in f.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(row);
+    }
+    out
 }
 
 /// BT.709 limited range, RGB → Y, Cb, Cr: each row's weights and offset, as libobs converts.
