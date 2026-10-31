@@ -192,7 +192,8 @@ jobs:
           # clang's runtime; newer Xcodes stopped linking it for us (2.3.0's first build failed).
           # The runtime library is universal, so one link argument covers both architectures.
           if [[ "$OS_NAME" == macOS ]]; then
-            export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$(xcrun clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"
+            clang_rt="$(xcrun clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"
+            export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$clang_rt"
           fi
           # shellcheck disable=SC2086 # matrix.args, $bundles and $obs hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
