@@ -24,6 +24,7 @@ ferrocast-secrets = { path = "crates/secrets" }
 ferrocast-engine = { path = "crates/engine" }
 ferrocast-server = { path = "crates/server" }
 ferrocast-testkit = { path = "crates/testkit" }
+ferrocast-guest = { path = "crates/guest" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
