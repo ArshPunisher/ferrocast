@@ -74,6 +74,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+# The engine_match and own_stream examples: our own engine beside libobs.
+ferrocast-av.workspace = true
+ferrocast-golive.workspace = true
+tokio.workspace = true
+bytes = "1"
 # The guest example: a browser's camera over WebRTC into the Studio.
 ferrocast-guest.workspace = true
 # The vod_track example's little RTMP server (as Go live's tests use).
