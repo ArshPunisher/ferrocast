@@ -6,6 +6,17 @@ use std::process::Command;
 use ferrocast_av::flv::{FlvFile, video_header, video_tag};
 use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder};
 
+/// Whether this computer encodes: the Mac always; elsewhere only with FFmpeg and a working H.264
+/// encoder (the shared CI machines have none, the engine's Windows job brings FFmpeg).
+fn encodes() -> bool {
+    let native = cfg!(target_os = "macos") && std::env::var("FERROCAST_AV_ENCODER").as_deref() != Ok("ffmpeg");
+    let ok = native || ferrocast_av::ffenc::h264_encoder().is_some();
+    if !ok {
+        eprintln!("skipped: no encoder here (FFmpeg isn't installed)");
+    }
+    ok
+}
+
 fn config(codec: VideoCodec, input: PixelFormat) -> VideoConfig {
     VideoConfig {
         codec,
@@ -70,6 +81,9 @@ fn probe(flv: &[u8], name: &str) -> Option<String> {
 
 #[test]
 fn h264_from_bgra() {
+    if !encodes() {
+        return;
+    }
     let (flv, keys) = run(VideoCodec::H264, PixelFormat::Bgra);
     assert_eq!(keys.len(), 60, "one packet a frame");
     assert!(keys[0], "starts on a keyframe");
@@ -81,6 +95,9 @@ fn h264_from_bgra() {
 
 #[test]
 fn hevc_from_nv12() {
+    if !encodes() {
+        return;
+    }
     if !cfg!(target_os = "macos") || std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg") {
         return; // HEVC is the Mac's own encoder only so far.
     }
@@ -93,6 +110,9 @@ fn hevc_from_nv12() {
 
 #[test]
 fn wrong_frames_are_refused() {
+    if !encodes() {
+        return;
+    }
     let mut enc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
     assert!(enc.encode(Frame::Bgra { data: &[0; 16], stride: 640 * 4 }, 0, false).is_err());
     assert!(VideoEncoder::new(VideoConfig { width: 641, ..config(VideoCodec::H264, PixelFormat::Bgra) }).is_err());
@@ -100,6 +120,9 @@ fn wrong_frames_are_refused() {
 
 #[test]
 fn aac_from_a_tone() {
+    if !encodes() {
+        return;
+    }
     use ferrocast_av::audio::{AudioConfig, AudioEncoder};
     use ferrocast_av::flv::{audio_header, audio_tag};
     let mut enc = AudioEncoder::new(AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 160 })
@@ -138,6 +161,9 @@ fn aac_from_a_tone() {
 /// file cut short mid-fragment (a crash) still plays up to its last whole fragment.
 #[test]
 fn mp4_recording_survives_a_crash() {
+    if !encodes() {
+        return;
+    }
     use ferrocast_av::audio::{AudioConfig, AudioEncoder};
     use ferrocast_av::mp4::{AudioTrack, Mp4Writer, VideoTrack};
     let mut venc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
@@ -211,6 +237,9 @@ fn mp4_recording_survives_a_crash() {
 /// platforms expect (an idle black screen still streams steadily).
 #[test]
 fn cbr_holds_the_rate_on_a_still_picture() {
+    if !encodes() {
+        return;
+    }
     let mut enc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
     let black = vec![0u8; 640 * 360 * 4];
     let mut bytes = 0usize;

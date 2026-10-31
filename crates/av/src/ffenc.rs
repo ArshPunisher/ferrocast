@@ -44,6 +44,15 @@ fn candidates() -> &'static [&'static str] {
     }
 }
 
+/// What an encoder needs to be the one we mean: Media Foundation's only as a GPU's (its software
+/// one keeps no keyframe interval or steady rate, and x264 beats it).
+fn must_have(enc: &str) -> &'static [&'static str] {
+    match enc {
+        "h264_mf" => &["-hw_encoding", "1"],
+        _ => &[],
+    }
+}
+
 /// The first H.264 encoder that encodes a few frames here (asked once).
 pub fn h264_encoder() -> Option<String> {
     // `FERROCAST_AV_FFMPEG_ENCODER=libx264` picks one (to test it, or to work round a driver).
@@ -68,7 +77,9 @@ pub fn h264_encoder() -> Option<String> {
                             "-i",
                             "color=c=black:s=256x144:r=30",
                         ])
-                        .args(["-frames:v", "3", "-c:v", e, "-f", "null", "-"])
+                        .args(["-frames:v", "3", "-c:v", e])
+                        .args(must_have(e))
+                        .args(["-f", "null", "-"])
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
@@ -252,7 +263,7 @@ impl Video {
             "h264_videotoolbox" => &["-realtime", "1"],
             _ => &[],
         };
-        a.extend(extra.iter().map(|s| s.to_string()));
+        a.extend(extra.iter().chain(must_have(&enc)).map(|s| s.to_string()));
         a.extend(["-f".into(), "flv".into(), "pipe:1".into()]);
         Ok(Self {
             proc: Proc::spawn(&a)?,
