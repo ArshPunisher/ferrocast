@@ -9,7 +9,7 @@ use crate::afx::AudioEffect;
 use crate::engine::{SceneItem, SourceKind};
 use crate::mix::{Monitoring, SourceSettings};
 use crate::source::text::{TextAlign, TextStyle};
-use crate::{Blend, Bounds, Effect, Filter, Placement};
+use crate::{Blend, Bounds, Effect, Filter, MaskKind, Placement};
 
 /// A source as the engine takes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +128,26 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
         }
         _ => return None,
     })
+}
+
+/// OBS's Image Mask/Blend with its picture under `image`, and the picture's file; None without
+/// one. v2 (OBS 27 on) takes its tint as sRGB and its opacity from 0 to 1; v1 neither.
+fn mask_from(kind: &str, s: &Value, image: u64) -> Option<(Effect, std::path::PathBuf)> {
+    let path = s.get("image_path").and_then(Value::as_str).filter(|p| !p.is_empty())?;
+    let v2 = kind == "mask_filter_v2";
+    let mask = match s.get("type").and_then(Value::as_str).unwrap_or("mask_color_filter.effect") {
+        "mask_alpha_filter.effect" => MaskKind::Alpha,
+        "blend_mul_filter.effect" => MaskKind::Multiply,
+        "blend_add_filter.effect" => MaskKind::Add,
+        "blend_sub_filter.effect" => MaskKind::Subtract,
+        _ => MaskKind::Color,
+    };
+    let c = Effect::rgba(s.get("color").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32);
+    let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let opacity = if v2 { f(s, "opacity", 1.0) } else { f(s, "opacity", 100.0) / 100.0 };
+    let rgba = if v2 { [lin(c[0]), lin(c[1]), lin(c[2]), opacity] } else { [c[0], c[1], c[2], opacity] };
+    let stretch = s.get("stretch").and_then(Value::as_bool).unwrap_or(false);
+    Some((Effect::Mask { kind: mask, image, rgba, stretch }, path.into()))
 }
 
 /// A source's sound filter, from OBS's id and settings.
@@ -332,7 +352,24 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             }
             let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
             let fs = flt.get("settings").cloned().unwrap_or(Value::Null);
-            if let Some(e) = effect_from(kind, &fs) {
+            if kind == "mask_filter" || kind == "mask_filter_v2" {
+                // Its picture becomes a source of its own, shown in no scene.
+                match mask_from(kind, &fs, next_id) {
+                    Some((e, path)) => {
+                        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                        out.sources.push(ImportedSource {
+                            id: next_id,
+                            name: format!("{name}: {fname}"),
+                            kind: SourceKind::Image(path),
+                            sound: None,
+                            sound_effects: Vec::new(),
+                        });
+                        next_id += 1;
+                        effects.push(e);
+                    }
+                    None => out.skipped.push(format!("{name}: the filter {kind} (no picture chosen)")),
+                }
+            } else if let Some(e) = effect_from(kind, &fs) {
                 effects.push(e);
             } else if let Some(e) = audio_effect_from(kind, &fs) {
                 sound_effects.push(e);
@@ -448,6 +485,22 @@ mod tests {
         assert_eq!(nested.scene.as_deref(), Some("One"));
         assert_eq!((nested.placement.x, nested.placement.scale_x), (10.0, 0.5));
         assert_eq!(nested.group, None);
+    }
+
+    #[test]
+    fn a_mask_brings_its_picture() {
+        let doc = json!({ "sources": [{ "id": "color_source", "name": "Card", "settings": {},
+            "filters": [{ "id": "mask_filter", "versioned_id": "mask_filter_v2", "name": "Round",
+                "settings": { "type": "blend_mul_filter.effect", "image_path": "/m.png", "color": 0x00FF_FFFFu32, "opacity": 0.5 } },
+                { "id": "mask_filter", "versioned_id": "mask_filter_v2", "name": "Empty", "settings": {} }] }] });
+        let got = import(&doc, (64, 64));
+        assert_eq!(got.sources.len(), 2, "the card and its mask's picture");
+        let pic = got.sources.iter().find(|s| s.name == "Card: Round").map(|s| (s.id, s.kind.clone()));
+        let Some((id, SourceKind::Image(path))) = pic else { panic!("no picture: {:?}", got.sources) };
+        assert_eq!(path, std::path::PathBuf::from("/m.png"));
+        assert!(got.skipped.iter().any(|s| s.contains("no picture")));
+        let card = got.sources.iter().find(|s| s.name == "Card").map(|s| s.id);
+        assert_ne!(card, Some(id));
     }
 
     #[test]

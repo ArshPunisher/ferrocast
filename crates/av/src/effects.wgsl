@@ -25,6 +25,8 @@ struct F {
 @group(0) @binding(0) var<uniform> f: F;
 @group(0) @binding(1) var image: texture_2d<f32>;
 @group(0) @binding(2) var pick: sampler;
+// A second picture (Image Mask/Blend's).
+@group(0) @binding(3) var second: texture_2d<f32>;
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -348,4 +350,26 @@ fn fs_sharpen(i: Out) -> @location(0) vec4<f32> {
 @fragment
 fn fs_crop(i: Out) -> @location(0) vec4<f32> {
     return src_at(i.uv * f.out_size + vec2<f32>(f.p0, f.p1));
+}
+
+// mask_*_filter.effect and blend_*_filter.effect (mask-filter.c): p0 which (0 alpha mask,
+// 1 colour mask, 2 multiply, 3 add, 4 subtract); color the tint; q the picture's mapping
+// (multiplier, offset).
+@fragment
+fn fs_mask(i: Out) -> @location(0) vec4<f32> {
+    var rgba = unpremultiplied(textureSampleLevel(image, pick, i.uv, 0.0)) * f.color;
+    let t = textureSampleLevel(second, pick, i.uv * f.q.xy + f.q.zw, 0.0);
+    let k = u32(f.p0 + 0.5);
+    if k == 0u {
+        rgba.a *= t.a;
+    } else if k == 1u {
+        rgba.a *= (t.r + t.g + t.b) / 3.0;
+    } else if k == 2u {
+        rgba = vec4<f32>(saturate(rgba.rgb * t.rgb), rgba.a);
+    } else if k == 3u {
+        rgba = vec4<f32>(saturate(rgba.rgb + t.rgb), rgba.a);
+    } else {
+        rgba = vec4<f32>(saturate(rgba.rgb - t.rgb), rgba.a);
+    }
+    return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
 }

@@ -11,8 +11,8 @@ use std::sync::{Mutex, mpsc};
 
 use crate::transform::{Affine, cropped, draw_transform, output_scale};
 use crate::{
-    AvError, Blend, Content, Effect, Filter, Item, Nv12, Picture, Scene, Transition, TransitionKind, cubic_ease_in_out,
-    smoothstep,
+    AvError, Blend, Content, Effect, Filter, Item, MaskKind, Nv12, Picture, Scene, Transition, TransitionKind,
+    cubic_ease_in_out, smoothstep,
 };
 
 /// Pictures and canvases are 8-bit RGBA holding sRGB values. Seen through `LINEAR` views the GPU
@@ -90,6 +90,11 @@ pub struct Compositor {
     transition_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Ferrocast's filters: their shaders and pipelines (by entry point).
     effect_module: wgpu::ShaderModule,
+    /// Filters read the picture before them and, for Image Mask/Blend, a second one.
+    effect_layout: wgpu::BindGroupLayout,
+    effect_pipeline_layout: wgpu::PipelineLayout,
+    /// What the second picture is when a filter has none.
+    blank: wgpu::Texture,
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
@@ -236,6 +241,38 @@ impl Compositor {
             bind_group_layouts: &[Some(&transition_layout)],
             ..Default::default()
         });
+        let effect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("effect"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                tex(1),
+                entry(2, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                tex(3),
+            ],
+        });
+        let effect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("effect"),
+            bind_group_layouts: &[Some(&effect_layout)],
+            ..Default::default()
+        });
+        let blank = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("blank"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GAMMA,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[LINEAR],
+        });
         let effect_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("effects"),
             source: wgpu::ShaderSource::Wgsl(include_str!("effects.wgsl").into()),
@@ -272,6 +309,9 @@ impl Compositor {
             uploads: Mutex::new(HashMap::new()),
             nv12,
             effect_module,
+            effect_layout,
+            effect_pipeline_layout,
+            blank,
             effect_pipelines: Mutex::new(HashMap::new()),
             transition_module,
             transition_layout,
@@ -753,6 +793,7 @@ impl Compositor {
             self.clear(enc, &next);
             let lin = e.linear();
             let (mut q, mut r, mut m) = ([0f32; 4], [0f32; 4], [0f32; 16]);
+            let mut second: Option<wgpu::Texture> = None;
             let (entry, p, color) = match e {
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
@@ -794,6 +835,19 @@ impl Compositor {
                 Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Crop { left, top, .. } => {
                     ("fs_crop", [*left as f32, *top as f32, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
+                Effect::Mask { kind, image, rgba, stretch } => {
+                    let t = self.uploaded(*image)?;
+                    q = mask_mapping((cur.width, cur.height), (t.width(), t.height()), *stretch);
+                    second = Some(t);
+                    let k = match kind {
+                        MaskKind::Alpha => 0.0,
+                        MaskKind::Color => 1.0,
+                        MaskKind::Multiply => 2.0,
+                        MaskKind::Add => 3.0,
+                        MaskKind::Subtract => 4.0,
+                    };
+                    ("fs_mask", [k, 0.0, 0.0, 0.0, 0.0, 0.0], *rgba)
                 }
                 Effect::ColorCorrection {
                     gamma,
@@ -841,9 +895,10 @@ impl Compositor {
             .chain(m)
             .collect::<Vec<f32>>();
             let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
+            let second = view(second.as_ref().unwrap_or(&self.blank), if lin { LINEAR } else { GAMMA });
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("effect"),
-                layout: &self.layout,
+                layout: &self.effect_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
                     wgpu::BindGroupEntry {
@@ -851,6 +906,7 @@ impl Compositor {
                         resource: wgpu::BindingResource::TextureView(if lin { &cur.linear } else { &cur.gamma }),
                     },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&second) },
                 ],
             });
             let pipeline = self.effect_pipeline(entry, lin);
@@ -881,7 +937,7 @@ impl Compositor {
             .or_insert_with(|| {
                 self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(entry),
-                    layout: Some(&self.pipeline_layout),
+                    layout: Some(&self.effect_pipeline_layout),
                     vertex: wgpu::VertexState {
                         module: &self.effect_module,
                         entry_point: Some("vs"),
@@ -1292,10 +1348,37 @@ fn corners(m: &Affine, w: f32, h: f32) -> [(f32, f32); 4] {
     [m.apply(0.0, 0.0), m.apply(w, 0.0), m.apply(0.0, h), m.apply(w, h)]
 }
 
+/// Where Image Mask/Blend reads its picture (mask-filter.c): a multiplier and an offset on the
+/// filtered picture's coordinates; kept in shape and centred unless stretched.
+fn mask_mapping(source: (u32, u32), mask: (u32, u32), stretch: bool) -> [f32; 4] {
+    let (sx, sy) = (source.0 as f32, source.1 as f32);
+    let (mx, my) = (mask.0.max(1) as f32, mask.1.max(1) as f32);
+    if stretch || sx <= 0.0 || sy <= 0.0 {
+        return [1.0, 1.0, 0.0, 0.0];
+    }
+    let fix = if sx / sy < mx / my { sx / mx } else { sy / my };
+    let (mx, my) = (mx * fix, my * fix);
+    [sx / mx, sy / my, -(sx / 2.0 - mx / 2.0) / mx, -(sy / 2.0 - my / 2.0) / my]
+}
+
 fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {
     texture.create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() })
 }
 
 fn floats(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::mask_mapping;
+
+    #[test]
+    fn a_mask_keeps_its_shape_centred() {
+        assert_eq!(mask_mapping((200, 100), (50, 50), true), [1.0, 1.0, 0.0, 0.0]);
+        // A square mask on a wide picture: as tall as it, centred across.
+        let [mx, my, ax, ay] = mask_mapping((200, 100), (50, 50), false);
+        assert_eq!((mx, my, ay), (2.0, 1.0, 0.0));
+        assert!((ax + 0.5).abs() < 1e-6, "{ax}");
+    }
 }

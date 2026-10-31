@@ -229,10 +229,30 @@ pub enum Effect {
         bottom: i32,
         size: Option<(u32, u32)>,
     },
+    /// OBS's Image Mask/Blend: a picture uploaded under `image` masks or blends with this
+    /// one, tinted by `rgba` (straight, 0 to 1); fitted to keep its shape unless `stretch`.
+    Mask {
+        kind: MaskKind,
+        image: u64,
+        rgba: [f32; 4],
+        stretch: bool,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
     },
+}
+
+/// What OBS's Image Mask/Blend does with its picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskKind {
+    /// Its alpha.
+    Alpha,
+    /// Its brightness (the average of red, green and blue).
+    Color,
+    Multiply,
+    Add,
+    Subtract,
 }
 
 impl Effect {
@@ -246,6 +266,7 @@ impl Effect {
                 | Self::LumaKey { .. }
                 | Self::Sharpen { .. }
                 | Self::Crop { .. }
+                | Self::Mask { .. }
         )
     }
 
