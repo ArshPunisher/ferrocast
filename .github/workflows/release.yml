@@ -157,6 +157,10 @@ jobs:
         if: matrix.name == 'macOS'
         shell: bash
         run: deploy/obs-runtime-macos.sh
+      - name: OBS's engine in the installer (Windows)
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        run: deploy/obs-runtime-windows.ps1
       - name: Build the app
         shell: bash
         env:
@@ -181,9 +185,9 @@ jobs:
         run: |
           bundles=""
           if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
-          # On macOS, deploy/obs-runtime-macos.sh wrote the list of OBS's engine files to copy in.
+          # deploy/obs-runtime-{macos.sh,windows.ps1} wrote the list of OBS's engine files to copy in.
           obs=""
-          if [[ "$OS_NAME" == macOS ]]; then obs="--config obs-runtime/tauri.obs.json"; fi
+          if [[ "$OS_NAME" == macOS || "$OS_NAME" == Windows ]]; then obs="--config obs-runtime/tauri.obs.json"; fi
           # shellcheck disable=SC2086 # matrix.args, $bundles and $obs hold separate words.
           cargo tauri build ${{ matrix.args }} $bundles $obs --config '{"bundle":{"createUpdaterArtifacts":true}}'
       - name: Remove the signing keychain
