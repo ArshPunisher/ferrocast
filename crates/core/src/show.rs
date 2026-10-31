@@ -266,6 +266,57 @@ pub struct ScenesConfig {
     /// A scene per game: when that app comes to the front, its scene goes on air (the Studio
     /// on a Mac). Empty: off.
     pub game_scenes: Vec<GameScene>,
+    /// "When X, do Y": a stream event puts a scene on air, or shows a source, for a while.
+    pub event_rules: Vec<EventRule>,
+}
+
+/// What sets a rule off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleWhen {
+    Follow,
+    /// A new or renewed sub (not one of a gifted batch: that's `gift`).
+    Sub,
+    /// Gifted subs: `min` is how many in the batch.
+    Gift,
+    /// A raid: `min` is how many viewers.
+    Raid,
+    /// A tip, a Super Chat or Bits: `min` is the amount (whole units of its currency, or Bits).
+    Money,
+}
+
+/// A rule: when `when` happens (at least `min`), put `scene` on air, or show `source` in the
+/// scene on air, for `seconds`, then back as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRule {
+    pub when: RuleWhen,
+    #[serde(default)]
+    pub min: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub seconds: u32,
+}
+
+impl EventRule {
+    /// Whether `kind` sets this rule off: its kind, at least `min` of it.
+    pub fn fires(&self, kind: &crate::event::EventKind) -> bool {
+        use crate::event::{EventKind as K, PaymentStatus};
+        let min = u64::from(self.min);
+        match (self.when, kind) {
+            (RuleWhen::Follow, K::Follow { .. }) => true,
+            (RuleWhen::Sub, K::Subscription { gifted_by: None, .. }) => true,
+            (RuleWhen::Gift, K::GiftBatch { count, .. }) => u64::from(*count) >= min.max(1),
+            (RuleWhen::Raid, K::Raid { viewers, .. }) => u64::from(*viewers) >= min,
+            (RuleWhen::Money, K::Tip { money, status, .. }) => {
+                *status == PaymentStatus::Captured && money.major() >= min as f64
+            }
+            (RuleWhen::Money, K::PaidMessage { money, .. }) => money.major() >= min as f64,
+            (RuleWhen::Money, K::PlatformGift { value, .. }) => value.amount >= min,
+            _ => false,
+        }
+    }
 }
 
 /// An app (by the name the Dock shows) and the scene for it.
@@ -293,6 +344,7 @@ impl Default for ScenesConfig {
             voice_commands: false,
             keep_transcript: false,
             game_scenes: Vec::new(),
+            event_rules: Vec::new(),
         }
     }
 }
@@ -311,6 +363,26 @@ impl ScenesConfig {
                 if t.is_empty() || t.chars().count() > 100 || t.contains('\n') {
                     return Err(format!("game_scenes.{i}.{field}: 1 to 100 characters on one line."));
                 }
+            }
+        }
+        if self.event_rules.len() > 20 {
+            return Err("event_rules: 20 at most.".into());
+        }
+        for (i, r) in self.event_rules.iter().enumerate() {
+            match (&r.scene, &r.source) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(format!("event_rules.{i}: a scene or a source, one of them."));
+                }
+                (Some(n), None) | (None, Some(n)) if !valid_scene_name(n) => {
+                    return Err(format!("event_rules.{i}: names are 1 to 100 characters."));
+                }
+                _ => {}
+            }
+            if !(1..=600).contains(&r.seconds) {
+                return Err(format!("event_rules.{i}.seconds: 1 to 600."));
+            }
+            if r.min > 1_000_000 {
+                return Err(format!("event_rules.{i}.min: 0 to 1000000."));
             }
         }
         if self.away_minutes > 60 {
@@ -534,6 +606,42 @@ pub fn recap_vars(thanks: &[String], follows: u64, subs: u64, duration_ms: i64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_rules_are_checked() {
+        let rule = |scene: Option<&str>, source: Option<&str>, seconds: u32| EventRule {
+            when: RuleWhen::Raid,
+            min: 10,
+            scene: scene.map(String::from),
+            source: source.map(String::from),
+            seconds,
+        };
+        let cfg = |r: EventRule| ScenesConfig { event_rules: vec![r], ..ScenesConfig::default() };
+        assert!(cfg(rule(Some("Raid!"), None, 20)).validate().is_ok());
+        assert!(cfg(rule(None, Some("Confetti"), 10)).validate().is_ok());
+        assert!(cfg(rule(Some("A"), Some("B"), 10)).validate().is_err(), "one thing to do");
+        assert!(cfg(rule(None, None, 10)).validate().is_err(), "something to do");
+        assert!(cfg(rule(Some("A"), None, 0)).validate().is_err(), "for a while");
+        assert!(cfg(rule(Some("A"), None, 601)).validate().is_err());
+        assert!(cfg(rule(Some(""), None, 5)).validate().is_err());
+        let many = ScenesConfig { event_rules: vec![rule(Some("A"), None, 5); 21], ..ScenesConfig::default() };
+        assert!(many.validate().is_err());
+        // What sets each off.
+        use crate::event::{Actor, EventKind as K, Platform};
+        let actor = || Actor::named(Platform::Twitch, "ana");
+        let when =
+            |w: RuleWhen, min: u32| EventRule { when: w, min, scene: Some("S".into()), source: None, seconds: 5 };
+        assert!(when(RuleWhen::Follow, 0).fires(&K::Follow { actor: actor() }));
+        assert!(!when(RuleWhen::Raid, 0).fires(&K::Follow { actor: actor() }));
+        let raid = |viewers| K::Raid { from: actor(), viewers };
+        assert!(when(RuleWhen::Raid, 10).fires(&raid(10)));
+        assert!(!when(RuleWhen::Raid, 10).fires(&raid(9)));
+        // As the dashboard sends it.
+        let r: EventRule =
+            serde_json::from_value(serde_json::json!({ "when": "money", "min": 5, "source": "Rain", "seconds": 8 }))
+                .unwrap();
+        assert_eq!(r.when, RuleWhen::Money);
+    }
 
     #[test]
     fn game_scenes_are_checked() {
