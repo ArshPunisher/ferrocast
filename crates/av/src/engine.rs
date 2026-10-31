@@ -41,10 +41,11 @@ pub enum SourceKind {
         every_ms: u64,
         beep_ms: u64,
     },
-    /// A display (macOS).
+    /// A display (macOS); with `sound`, what the Mac plays too (Ferrocast's own left out).
     #[cfg(target_os = "macos")]
     Screen {
         display: u32,
+        sound: bool,
     },
     /// A camera (macOS), by its id.
     #[cfg(target_os = "macos")]
@@ -285,14 +286,18 @@ impl Engine {
                 )
             }
             #[cfg(target_os = "macos")]
-            SourceKind::Screen { display } => {
-                let c = crate::screen::ScreenCapture::start(
+            SourceKind::Screen { display, sound } => {
+                let c = crate::screen::ScreenCapture::start_with(
                     crate::screen::Target::Display(display),
                     self.config.width,
                     self.config.height,
                     self.config.fps,
                     true,
+                    sound,
                 )?;
+                if sound {
+                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                }
                 (Live::Screen(c), None)
             }
             #[cfg(target_os = "macos")]
@@ -572,6 +577,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                 Live::Screen(cap) => {
                     if let Some(p) = cap.take() {
                         uploads.push((*id, p));
+                    }
+                    for (pcm, t) in cap.take_sound() {
+                        mx.push(*id, &pcm, 2, 48_000, t);
                     }
                 }
                 #[cfg(target_os = "macos")]

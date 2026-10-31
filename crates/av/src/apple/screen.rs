@@ -95,12 +95,17 @@ pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     }
 }
 
-/// What the stream's output keeps: the newest frame and how many came.
+/// What the stream's output keeps: the newest frame and how many came, and the sound
+/// (interleaved stereo float at 48 kHz, each piece with its host time) when it's captured.
 #[derive(Debug, Default)]
 struct Shared {
     latest: Mutex<Option<Picture>>,
     frames: AtomicU64,
+    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
 }
+
+/// Sound pieces kept before they're taken (about 5 s).
+const MAX_SOUND: usize = 500;
 
 define_class!(
     // SAFETY: NSObject may be subclassed; the ivars are an Arc (dropped with the object).
@@ -114,6 +119,17 @@ define_class!(
     unsafe impl SCStreamOutput for Output {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         fn did_output(&self, _stream: &SCStream, sample: &CMSampleBuffer, kind: SCStreamOutputType) {
+            if kind == SCStreamOutputType::Audio {
+                if let Some(piece) = sound_of(sample)
+                    && let Ok(mut q) = self.ivars().sound.lock()
+                {
+                    q.push_back(piece);
+                    while q.len() > MAX_SOUND {
+                        q.pop_front();
+                    }
+                }
+                return;
+            }
             if kind != SCStreamOutputType::Screen {
                 return;
             }
@@ -135,6 +151,39 @@ impl Output {
         let this = this.set_ivars(shared);
         // SAFETY: NSObject's init on a freshly allocated object with its ivars set.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// ScreenCaptureKit's sound: 32-bit float, one plane per channel (left, then right), in one
+/// block → interleaved stereo, with its host time.
+fn sound_of(sample: &CMSampleBuffer) -> Option<(Vec<f32>, u64)> {
+    // SAFETY: a live sample buffer; its block holds `frames` floats per channel, planes one
+    // after the other (ScreenCaptureKit's layout for the channel count asked).
+    unsafe {
+        let frames = usize::try_from(sample.num_samples()).ok()?;
+        let block = sample.data_buffer()?;
+        let len = block.data_length();
+        if frames == 0 || len < frames * 4 {
+            return None;
+        }
+        let mut bytes = vec![0u8; len];
+        let dst = std::ptr::NonNull::new(bytes.as_mut_ptr().cast())?;
+        if block.copy_data_bytes(0, len, dst) != 0 {
+            return None;
+        }
+        let all: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_ne_bytes(*b)).collect();
+        let (l, r) = if all.len() >= frames * 2 {
+            (&all[..frames], &all[frames..frames * 2])
+        } else {
+            (&all[..frames], &all[..frames])
+        };
+        let t = sample.presentation_time_stamp();
+        let ts = if t.timescale > 0 && t.value >= 0 {
+            (i128::from(t.value) * 1_000_000_000 / i128::from(t.timescale)) as u64
+        } else {
+            0
+        };
+        Some((l.iter().zip(r).flat_map(|(a, b)| [*a, *b]).collect(), ts))
     }
 }
 
@@ -192,6 +241,19 @@ pub enum Target {
 impl ScreenCapture {
     /// Starts capturing at `width`×`height` (scaled to fit), up to `fps` frames a second.
     pub fn start(target: Target, width: u32, height: u32, fps: u32, cursor: bool) -> Result<Self, AvError> {
+        Self::start_with(target, width, height, fps, cursor, false)
+    }
+
+    /// The same, and with `sound`, what the Mac plays too (all apps, or the window's app),
+    /// leaving out Ferrocast's own: OBS's macOS desktop audio, with no driver to install.
+    pub fn start_with(
+        target: Target,
+        width: u32,
+        height: u32,
+        fps: u32,
+        cursor: bool,
+        sound: bool,
+    ) -> Result<Self, AvError> {
         let c = content()?;
         // SAFETY: building ScreenCaptureKit objects from the live content's displays and
         // windows, on this thread; each call gets live arguments.
@@ -227,6 +289,12 @@ impl ScreenCapture {
             });
             config.setShowsCursor(cursor);
             config.setQueueDepth(5);
+            if sound {
+                config.setCapturesAudio(true);
+                config.setSampleRate(48_000);
+                config.setChannelCount(2);
+                config.setExcludesCurrentProcessAudio(true);
+            }
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
             let shared = Arc::new(Shared::default());
             let output = Output::new(shared.clone());
@@ -238,6 +306,17 @@ impl ScreenCapture {
                     Some(&queue),
                 )
                 .map_err(|e| AvError::Source(format!("the capture couldn't start ({})", e.localizedDescription())))?;
+            if sound {
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(
+                        ProtocolObject::from_ref(&*output),
+                        SCStreamOutputType::Audio,
+                        Some(&queue),
+                    )
+                    .map_err(|e| {
+                        AvError::Source(format!("the Mac's sound couldn't be captured ({})", e.localizedDescription()))
+                    })?;
+            }
             let (tx, rx) = mpsc::channel();
             let done = RcBlock::new(move |e: *mut NSError| {
                 // SAFETY: the error, when given, is live for the block's call.
@@ -262,6 +341,11 @@ impl ScreenCapture {
         self.shared.latest.lock().ok().and_then(|mut l| l.take())
     }
 
+    /// Sound since the last call (when started with sound), oldest first, with host times.
+    pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
+        self.shared.sound.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
+    }
+
     /// Frames received since the start.
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
@@ -282,6 +366,9 @@ impl Drop for ScreenCapture {
             let _ = self
                 .stream
                 .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), SCStreamOutputType::Screen);
+            let _ = self
+                .stream
+                .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), SCStreamOutputType::Audio);
         }
     }
 }
