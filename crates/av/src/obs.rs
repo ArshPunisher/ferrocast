@@ -29,6 +29,9 @@ pub struct Imported {
     /// Scenes in OBS's order, each with its items bottom first.
     pub scenes: Vec<(String, Vec<SceneItem>)>,
     pub current: Option<String>,
+    /// Which of `scenes` are groups (kept with the scenes so items can show them; not listed
+    /// as scenes in the app).
+    pub groups: Vec<String>,
     /// What couldn't come over yet ("Browser: OBS's Browser source"), for the app to say.
     pub skipped: Vec<String>,
 }
@@ -288,10 +291,21 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
     let sources = doc.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut ids: Vec<(String, u64, Vec<crate::Effect>, bool)> = Vec::new();
     let mut next_id = 1u64;
+    let is_scene = |s: &Value| matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"));
     let scene_names: Vec<String> = sources
         .iter()
-        .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
+        .filter(|s| is_scene(s))
         .filter_map(|s| s.get("name").and_then(Value::as_str).map(String::from))
+        .collect();
+    // Groups and their boxes.
+    let groups: Vec<(String, (u32, u32))> = sources
+        .iter()
+        .filter(|s| s.get("id").and_then(Value::as_str) == Some("group"))
+        .filter_map(|s| {
+            let set = s.get("settings")?;
+            let size = |k: &str| set.get(k).and_then(Value::as_u64).unwrap_or(0) as u32;
+            Some((s.get("name")?.as_str()?.to_string(), (size("cx"), size("cy"))))
+        })
         .collect();
     for s in &sources {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
@@ -338,11 +352,16 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             Err(what) => out.skipped.push(format!("{name}: {what}")),
         }
     }
-    // Scenes: their items, bottom first, with each source's filters; nested scenes by name.
-    for s in sources.iter().filter(|s| s.get("id").and_then(Value::as_str) == Some("scene")) {
+    // Scenes and groups: their items, bottom first, with each source's filters; nested scenes
+    // and groups by name.
+    for s in sources.iter().filter(|s| is_scene(s)) {
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
         let mut items = Vec::new();
         for it in s.get("settings").and_then(|v| v.get("items")).and_then(Value::as_array).into_iter().flatten() {
+            // Copies of a group's items OBS keeps in the scene for versions before groups.
+            if it.get("group_item_backup").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             let src = it.get("name").and_then(Value::as_str).unwrap_or_default();
             let mut si = if let Some((_, id, effects, _)) = ids.iter().find(|(n, ..)| n == src) {
                 let mut si = SceneItem::new(*id, placement_of(it));
@@ -351,6 +370,7 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             } else if scene_names.iter().any(|n| n == src) {
                 let mut si = SceneItem::new(0, placement_of(it));
                 si.scene = Some(src.to_string());
+                si.group = groups.iter().find(|(g, _)| g == src).map(|(_, size)| *size);
                 si
             } else {
                 continue;
@@ -359,6 +379,9 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             si.filter = Filter::from_name(it.get("scale_filter").and_then(Value::as_str).unwrap_or("disable"));
             si.blend = Blend::from_name(it.get("blend_type").and_then(Value::as_str).unwrap_or("normal"));
             items.push(si);
+        }
+        if groups.iter().any(|(g, _)| *g == name) {
+            out.groups.push(name.clone());
         }
         out.scenes.push((name, items));
     }
@@ -413,5 +436,22 @@ mod tests {
         let nested = &got.scenes[1].1[0];
         assert_eq!(nested.scene.as_deref(), Some("One"));
         assert_eq!((nested.placement.x, nested.placement.scale_x), (10.0, 0.5));
+        assert_eq!(nested.group, None);
+    }
+
+    #[test]
+    fn groups_come_over_once() {
+        let doc = json!({ "sources": [
+            { "id": "color_source", "name": "Dot", "settings": { "width": 8, "height": 8 } },
+            { "id": "group", "name": "Pair", "settings": { "cx": 120, "cy": 80, "items": [{ "name": "Dot" }] } },
+            { "id": "scene", "name": "Main", "settings": { "items": [
+                { "name": "Pair", "rot": 350.0 },
+                { "name": "Dot", "group_item_backup": true } ] } }
+        ]});
+        let got = import(&doc, (640, 360));
+        assert_eq!(got.groups, ["Pair"]);
+        let main = &got.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default();
+        assert_eq!(main.len(), 1, "the backup copy is left out");
+        assert_eq!((main[0].scene.as_deref(), main[0].group), (Some("Pair"), Some((120, 80))));
     }
 }

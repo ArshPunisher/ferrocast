@@ -76,6 +76,8 @@ pub struct SceneItem {
     pub animation: Vec<Track>,
     /// Another scene shown here (then `source` is unused), drawn at the canvas's size.
     pub scene: Option<String>,
+    /// With `scene`: that scene is a group, its items placed in a box of this size.
+    pub group: Option<(u32, u32)>,
 }
 
 impl SceneItem {
@@ -90,6 +92,7 @@ impl SceneItem {
             opacity: 1.0,
             animation: Vec::new(),
             scene: None,
+            group: None,
         }
     }
 }
@@ -297,6 +300,8 @@ struct State {
     stinger: Option<(String, u64, u64, u64)>,
     /// When each scene last went on air (its keyframes' time 0).
     started: std::collections::HashMap<String, u64>,
+    /// Scenes that are OBS groups (shown inside scenes, not listed as scenes).
+    groups: Vec<String>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
     video: VideoConfig,
@@ -358,6 +363,7 @@ impl Engine {
             #[cfg(target_os = "macos")]
             stinger: None,
             started: std::collections::HashMap::new(),
+            groups: Vec::new(),
             outputs: Vec::new(),
             next_output: 1,
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
@@ -524,6 +530,7 @@ impl Engine {
             st.started.clear();
             st.on_air = None;
             st.moving = None;
+            st.groups = imported.groups;
         }
         for s in imported.sources {
             match self.set_source(s.id, s.kind) {
@@ -539,16 +546,17 @@ impl Engine {
         for (name, items) in imported.scenes {
             self.set_scene(&name, items);
         }
-        let first = self.lock().scenes.keys().next().cloned();
+        let first = self.scene_names().into_iter().next();
         if let Some(cur) = imported.current.or(first) {
             let _ = self.go(&cur);
         }
         skipped
     }
 
-    /// The scenes there are.
+    /// The scenes there are (groups left out).
     pub fn scene_names(&self) -> Vec<String> {
-        self.lock().scenes.keys().cloned().collect()
+        let st = self.lock();
+        st.scenes.keys().filter(|n| !st.groups.contains(n)).cloned().collect()
     }
 
     /// Puts a scene on air (a cut).
@@ -782,7 +790,10 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
             // Its items keep the time of the scene showing it (as OBS: a nested scene plays along).
             let items =
                 scene.iter().filter(|i| i.visible).filter_map(|i| item_at(st, i, ms, depth + 1, canvas)).collect();
-            Content::Scene(Scene { width: canvas.0, height: canvas.1, items })
+            match it.group {
+                Some((width, height)) => Content::Group { width, height, items },
+                None => Content::Scene(Scene { width: canvas.0, height: canvas.1, items }),
+            }
         }
         Some(_) => return None,
         None => {
