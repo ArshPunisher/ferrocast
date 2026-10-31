@@ -839,6 +839,8 @@ api! {
     obs_data_set_default_bool: fn(a: *mut ObsData, b: *const c_char, c: bool);
     obs_get_video_info: fn(a: *mut VideoInfo) -> bool;
     obs_view_add2: fn(a: *mut ObsView, b: *mut VideoInfo) -> *mut VideoT;
+    obs_sceneitem_addref: fn(a: *mut ObsSceneItem);
+    obs_sceneitem_release: fn(a: *mut ObsSceneItem);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`

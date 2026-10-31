@@ -557,7 +557,12 @@ impl Studio {
         Kinds {
             inputs: list(&|i, p| self.inner.api.obs_enum_input_types(i, p), false, true),
             filters: list(&|i, p| self.inner.api.obs_enum_filter_types(i, p), false, true),
-            transitions: list(&|i, p| self.inner.api.obs_enum_transition_types(i, p), false, true),
+            transitions: {
+                let mut t = list(&|i, p| self.inner.api.obs_enum_transition_types(i, p), false, true);
+                // Ferrocast's own (a cut with a glide, `collection::moves`), not a libobs kind.
+                t.push(Kind { id: "ferrocast_move".into(), name: "Move".into() });
+                t
+            },
             encoders: list(&|i, p| self.inner.api.obs_enum_encoder_types(i, p), true, false),
             outputs: list(&|i, p| self.inner.api.obs_enum_output_types(i, p), false, false)
                 .into_iter()

@@ -19,6 +19,7 @@ use crate::ffi::{self, Api, Level, cstr, text};
 use crate::{OptionInfo, Studio, StudioError, check_name};
 
 mod follow;
+mod moves;
 mod vertical;
 pub use follow::{Face, FaceFollow, FollowLook, find_busy, find_faces};
 pub use vertical::{VERTICAL_SIZE, VerticalInfo};
@@ -48,7 +49,7 @@ pub struct SceneInfo {
 }
 
 /// OBS's names for its transitions, which a scene's override is saved by, with their kinds.
-const TRANSITION_NAMES: [(&str, &str); 7] = [
+const TRANSITION_NAMES: [(&str, &str); 8] = [
     ("fade_transition", "Fade"),
     ("cut_transition", "Cut"),
     ("swipe_transition", "Swipe"),
@@ -56,6 +57,8 @@ const TRANSITION_NAMES: [(&str, &str); 7] = [
     ("fade_to_color_transition", "Fade to Color"),
     ("wipe_transition", "Luma Wipe"),
     ("obs_stinger_transition", "Stinger"),
+    // Ferrocast's own: a cut on which what both scenes show glides into place (OBS's Move plugin).
+    (moves::MOVE, "Move"),
 ];
 
 /// A source in a scene, top first. A group lists its own items.
@@ -497,6 +500,8 @@ pub struct Collection {
     /// Each capture's last size, by its item: a window resized keeps its shape on the canvas
     /// (`follow_sizes`).
     sizes_seen: RefCell<std::collections::HashMap<(usize, i64, i64), Seen>>,
+    /// A Move transition under way (its items gliding into place).
+    moves: RefCell<Option<moves::MoveRun>>,
     /// The last capture check and when it ran (`capture_problems`).
     captures_seen: RefCell<(Option<std::time::Instant>, Vec<CaptureProblem>)>,
 }
@@ -580,6 +585,7 @@ impl Collection {
             waiting_fit: RefCell::new(Vec::new()),
             sizes_seen: RefCell::new(std::collections::HashMap::new()),
             captures_seen: RefCell::new((None, Vec::new())),
+            moves: RefCell::new(None),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -591,7 +597,9 @@ impl Collection {
 
     fn make_transition(&self, kind: &str) -> Result<(), StudioError> {
         let a = self.api();
-        let (id, n) = (cstr(kind), cstr("Transition"));
+        // Move is a cut underneath; the glide is ours (`moves`).
+        let made = if kind == moves::MOVE { "cut_transition" } else { kind };
+        let (id, n) = (cstr(made), cstr("Transition"));
         let settings = self.transition_settings.borrow().get(kind).cloned();
         let data = settings.map_or(ptr::null_mut(), |v| a.obs_data_create_from_json(cstr(&v.to_string()).as_ptr()));
         let t = a.obs_source_create_private(id.as_ptr(), n.as_ptr(), data);
@@ -902,6 +910,8 @@ impl Collection {
 
     /// Puts a scene on air through the transition.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
+        // A glide still going ends where it was going first.
+        self.finish_moves();
         if self.vertical_scene(name).is_some() {
             return self.set_vertical_current(name);
         }
@@ -917,7 +927,14 @@ impl Collection {
                 self.make_transition(&want.kind)?;
             }
         }
-        self.go(src, want.ms);
+        if want.kind == moves::MOVE {
+            // What both scenes show starts where it was, then glides (not in Studio Mode).
+            let run = self.preview.borrow().is_null().then(|| self.plan_move(src, want.ms)).flatten();
+            self.go(src, 0);
+            self.moves.replace(run);
+        } else {
+            self.go(src, want.ms);
+        }
         Ok(())
     }
 
@@ -2035,7 +2052,10 @@ impl Collection {
 
     /// An item's place, size, turn, bounding box and crop, as Edit Transform shows them.
     pub fn transform(&self, scene: &str, id: i64) -> Result<Transform, StudioError> {
-        let item = self.item(scene, id)?;
+        Ok(self.transform_of(self.item(scene, id)?))
+    }
+
+    fn transform_of(&self, item: *mut ffi::ObsSceneItem) -> Transform {
         let a = self.api();
         let (mut pos, mut scale, mut bounds) =
             (ffi::Vec2 { x: 0.0, y: 0.0 }, ffi::Vec2 { x: 1.0, y: 1.0 }, ffi::Vec2 { x: 0.0, y: 0.0 });
@@ -2045,7 +2065,7 @@ impl Collection {
         a.obs_sceneitem_get_bounds(item, &mut bounds);
         a.obs_sceneitem_get_crop(item, &mut crop);
         let src = a.obs_sceneitem_get_source(item);
-        Ok(Transform {
+        Transform {
             x: pos.x,
             y: pos.y,
             rotation: a.obs_sceneitem_get_rot(item),
@@ -2065,7 +2085,7 @@ impl Collection {
             crop_bottom: crop.bottom,
             width: a.obs_source_get_width(src),
             height: a.obs_source_get_height(src),
-        })
+        }
     }
 
     /// Sets all of an item's transform at once (its width and height are ignored) → the item.
@@ -2075,6 +2095,12 @@ impl Collection {
             .position(|b| *b == t.bounds)
             .ok_or_else(|| StudioError::Failed(format!("\"{}\" isn't a kind of bounding box", t.bounds)))?;
         let item = self.item(scene, id)?;
+        self.apply_transform(item, t, bounds);
+        Ok(self.info(item))
+    }
+
+    /// `t` on `item`, its bounding box kind already found (`bounds`, an index of [`BOUNDS`]).
+    fn apply_transform(&self, item: *mut ffi::ObsSceneItem, t: &Transform, bounds: usize) {
         let a = self.api();
         a.obs_sceneitem_set_bounds_type(item, c_int::try_from(bounds).unwrap_or(0));
         a.obs_sceneitem_set_bounds_alignment(item, t.bounds_alignment);
@@ -2087,7 +2113,6 @@ impl Collection {
         a.obs_sceneitem_set_rot(item, t.rotation.rem_euclid(360.0));
         a.obs_sceneitem_set_alignment(item, t.alignment);
         a.obs_sceneitem_set_pos(item, &ffi::Vec2 { x: t.x, y: t.y });
-        Ok(self.info(item))
     }
 
     /// Remembers an item as it is now (a top-level item of `scene`), to put back later.
@@ -3511,6 +3536,16 @@ impl Collection {
 
     /// The collection as OBS writes a scene collection.
     pub fn save(&self, name: &str) -> Value {
+        // Never a place half way through a glide: saved where it ends, and on gliding after.
+        let gliding = self.settle_moves();
+        let doc = self.save_now(name);
+        if gliding {
+            self.tick_moves();
+        }
+        doc
+    }
+
+    fn save_now(&self, name: &str) -> Value {
         let a = self.api();
         let mut doc = serde_json::Map::new();
         let mut skip: Vec<*mut ffi::ObsSource> = Vec::new();
