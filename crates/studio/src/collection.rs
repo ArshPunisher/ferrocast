@@ -2752,6 +2752,13 @@ impl Collection {
 
     // ---- Source settings ----
 
+    /// The source draws in linear light (OBS's sRGB-aware sources); libobs mixes the others into
+    /// a scene in gamma space. Ferrocast's own engine mixes each the same way.
+    pub fn linear_light(&self, name: &str) -> Result<bool, StudioError> {
+        let src = self.source(name)?;
+        Ok(self.api().obs_source_get_output_flags(src.ptr) & ffi::OBS_SOURCE_SRGB != 0)
+    }
+
     pub fn settings(&self, name: &str) -> Result<Value, StudioError> {
         let src = self.source(name)?;
         Ok(self.settings_of(src.ptr))

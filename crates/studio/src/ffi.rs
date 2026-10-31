@@ -172,6 +172,8 @@ pub const OBS_SOURCE_AUDIO: u32 = 1 << 1;
 pub const OBS_SOURCE_ASYNC: u32 = 1 << 2;
 /// `OBS_SOURCE_CONTROLLABLE_MEDIA`: a video, playlist or slideshow with play controls.
 pub const OBS_SOURCE_CONTROLLABLE_MEDIA: u32 = 1 << 13;
+/// It draws in linear light (sRGB-aware); libobs mixes the others in gamma space.
+pub const OBS_SOURCE_SRGB: u32 = 1 << 15;
 /// `enum obs_order_movement`.
 pub const OBS_ORDER_MOVE_UP: c_int = 0;
 pub const OBS_ORDER_MOVE_DOWN: c_int = 1;
@@ -841,6 +843,10 @@ api! {
     obs_view_add2: fn(a: *mut ObsView, b: *mut VideoInfo) -> *mut VideoT;
     obs_sceneitem_addref: fn(a: *mut ObsSceneItem);
     obs_sceneitem_release: fn(a: *mut ObsSceneItem);
+    obs_add_raw_video_callback: fn(a: *const c_void, b: feed::RawVideoCb, c: *mut c_void);
+    obs_remove_raw_video_callback: fn(a: feed::RawVideoCb, b: *mut c_void);
+    obs_add_raw_audio_callback: fn(a: usize, b: *const c_void, c: feed::RawAudioCb, d: *mut c_void);
+    obs_remove_raw_audio_callback: fn(a: usize, b: feed::RawAudioCb, c: *mut c_void);
 }
 
 /// Loads every `.dylib` in `dir`, retrying until no more load: a library whose own `@rpath`
@@ -1653,6 +1659,9 @@ pub(crate) mod speech;
 
 /// A sound's audio for any listener (Whisper captions).
 pub(crate) mod tap;
+
+/// What's on air, frame by frame, for Ferrocast's own encoders (ENGINE.md E1).
+pub(crate) mod feed;
 
 /// Faces in a picture with Apple's Vision (plan item 8, smart vertical).
 #[cfg(target_os = "macos")]

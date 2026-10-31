@@ -429,6 +429,51 @@ impl Studio {
         self.inner.canvas.get()
     }
 
+    /// The program as libobs finishes it, for Ferrocast's own encoders (ENGINE.md E1): each
+    /// frame (NV12, the output size) and the mixed sound (stereo float, the Studio's rate).
+    pub fn program_feed(&self) -> Result<ProgramFeed, StudioError> {
+        let a = &self.inner.api;
+        // Empty, for libobs to fill in with what's set now.
+        let mut v = ffi::VideoInfo {
+            graphics_module: ptr::null(),
+            fps_num: 0,
+            fps_den: 0,
+            base_width: 0,
+            base_height: 0,
+            output_width: 0,
+            output_height: 0,
+            output_format: 0,
+            adapter: 0,
+            gpu_conversion: false,
+            colorspace: 0,
+            range: 0,
+            scale_type: 0,
+        };
+        if !a.obs_get_video_info(&mut v) {
+            return Err(StudioError::Failed("the Studio's video isn't running".into()));
+        }
+        if v.output_format != ffi::feed::NV12 {
+            return Err(StudioError::Failed(
+                "the Studio's colour format isn't NV12, which Ferrocast's encoders take".into(),
+            ));
+        }
+        let mut info = ffi::AudioInfo2 { samples_per_sec: 0, speakers: 0, max_buffering_ms: 0, fixed_buffering: false };
+        let rate =
+            if a.obs_get_audio_info2(&mut info) && info.samples_per_sec > 0 { info.samples_per_sec } else { 48_000 };
+        let (feed, video, sound) = ffi::feed::Feed::start(a, v.output_width, v.output_height);
+        Ok(ProgramFeed {
+            feed,
+            _studio: self.clone(),
+            video,
+            sound,
+            width: v.output_width,
+            height: v.output_height,
+            fps_num: v.fps_num,
+            fps_den: v.fps_den,
+            sample_rate: rate,
+        })
+    }
+
     /// Changes the canvas (size, frame rate). Refused while streaming or recording, as OBS
     /// does; a preview made before shows the old size until it's made again.
     pub fn set_canvas(&self, canvas: Canvas, renderer: &Path) -> Result<(), StudioError> {
@@ -2917,5 +2962,29 @@ mod tests {
         assert_eq!(kind_name(6), "list");
         assert_eq!(kind_name(13), "color_alpha");
         assert_eq!(kind_name(99), "other");
+    }
+}
+
+pub use ffi::feed::{SoundChunk, VideoFrame};
+
+/// The program, frame by frame: see [`Studio::program_feed`]. Dropping it stops.
+#[derive(Debug)]
+pub struct ProgramFeed {
+    // Dropped first: it uses the Studio's libobs, kept alive by the field after it.
+    feed: ffi::feed::Feed,
+    _studio: Studio,
+    pub video: std::sync::mpsc::Receiver<VideoFrame>,
+    pub sound: std::sync::mpsc::Receiver<SoundChunk>,
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub sample_rate: u32,
+}
+
+impl ProgramFeed {
+    /// Frames and sound pieces lost because the reader fell behind.
+    pub fn dropped(&self) -> u64 {
+        self.feed.dropped()
     }
 }
