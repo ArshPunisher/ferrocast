@@ -8,6 +8,9 @@
 //! settings, and warnings show as system notifications while the window is hidden.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Debug builds of the whole app are big enough that macOS's linker notes its unwind table can't
+// be compact ("__eh_frame section too large"): harmless, and CI turns warnings into errors.
+#![allow(linker_messages)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

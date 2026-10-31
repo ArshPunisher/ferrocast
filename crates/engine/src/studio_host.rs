@@ -809,6 +809,10 @@ pub struct StudioSettings {
     pub true_peak: bool,
     /// OBS's Low Latency Audio Buffering (after a restart).
     pub low_latency_audio: bool,
+    /// Streams through Ferrocast's own encoder (ENGINE.md E1, a beta) instead of OBS's: libobs
+    /// still draws and mixes. From the next stream; a delay, Twitch's VOD track or a scaled
+    /// stream still use OBS's.
+    pub own_encoder: bool,
     /// How a Mac draws the picture: "metal" (Apple's own, the default from 29 Oct) or
     /// "opengl" (the older way, for a filter or plugin that draws wrong with Metal). After a
     /// restart; other systems ignore it.
@@ -881,6 +885,7 @@ impl Default for StudioSettings {
             speakers: None,
             true_peak: false,
             low_latency_audio: false,
+            own_encoder: false,
             renderer: "metal".into(),
             multiview_layout: "top".into(),
             multiview_labels: true,
