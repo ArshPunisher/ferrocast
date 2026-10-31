@@ -62,11 +62,11 @@ jobs:
           cargo build --locked -p ferrocast-desktop --bins
           Copy-Item -Recurse -Force apps/desktop/obs-runtime/obs target/debug/
           Copy-Item -Force apps/desktop/obs-runtime/root/* target/debug/
-      - name: Rounded corners on D3D11
+      - name: Ferrocast's filters on D3D11
         shell: pwsh
         run: |
           $env:FERROCAST_OBS_DIR = (Resolve-Path apps/desktop/obs-runtime/obs).Path
-          cargo run --locked -p ferrocast-studio --example rounded -- "$env:RUNNER_TEMP/rounded"
+          cargo run --locked -p ferrocast-studio --example filters -- "$env:RUNNER_TEMP/filters"
       - name: The Studio in the app
         shell: pwsh
         run: deploy/studio-windows-check.ps1 -Exe target/debug/ferrocast.exe -Out "$env:RUNNER_TEMP/check"
