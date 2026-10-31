@@ -390,7 +390,19 @@ impl Studio {
         let core = paths.core.as_ref().map(|(b, d)| (cstr(b), cstr(d)));
         let mut places = vec![(bin.as_c_str(), pdata.as_c_str())];
         places.extend(core.as_ref().map(|(b, d)| (b.as_c_str(), d.as_c_str())));
+        // Windows: game capture copies its hooks from `..\..\data\obs-plugins\win-capture`, a
+        // path from the working folder, which is OBS's bin\64bit when OBS runs; so it's that
+        // folder while the plugins load, and back after.
+        #[cfg(windows)]
+        let was = paths.deps.as_ref().and_then(|bin| {
+            let was = std::env::current_dir().ok()?;
+            std::env::set_current_dir(bin).ok().map(|_| was)
+        });
         ffi::load_modules(&api, &places);
+        #[cfg(windows)]
+        if let Some(was) = was {
+            let _ = std::env::set_current_dir(was);
+        }
         api.obs_post_load_modules();
         let cpu = api.os_cpu_usage_info_start();
         let inner = std::rc::Rc::new(Inner {
