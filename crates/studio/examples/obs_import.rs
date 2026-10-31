@@ -69,6 +69,12 @@ fn main() -> Result<()> {
     c.set_transform("Keyed", r.id, &t)?;
     c.add_filter("Ramp", "color_filter_v2", "Grade", &json!({ "gamma": 0.3, "contrast": 0.2, "saturation": -0.4 }))?;
     c.add_filter("Ramp", "luma_key_filter_v2", "Luma", &json!({ "luma_min": 0.1, "luma_min_smooth": 0.05 }))?;
+    // The ramp again, cut on three sides and padded on top by OBS's Crop/Pad filter, then turned.
+    let cut = c.add_source("Keyed", "image_source", "Cut", &json!({ "file": ramp.display().to_string() }), false)?;
+    c.add_filter("Cut", "crop_filter", "Crop", &json!({ "left": 30, "top": -20, "right": 10, "bottom": 40 }))?;
+    let mut t = c.transform("Keyed", cut.id)?;
+    (t.x, t.y, t.rotation) = (980.0, 380.0, 12.0);
+    c.set_transform("Keyed", cut.id, &t)?;
 
     // A third: Main inside it at half size, next to a copy of the picture.
     c.add_scene("Nest")?;
