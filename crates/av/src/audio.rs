@@ -34,33 +34,61 @@ pub fn aac_config(sample_rate: u32, channels: u32) -> Option<[u8; 2]> {
     Some(v.to_be_bytes())
 }
 
+enum Inner {
+    #[cfg(target_os = "macos")]
+    Native(crate::apple::aac::Encoder),
+    Ffmpeg(crate::ffenc::Audio),
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => f.write_str("AudioToolbox"),
+            Self::Ffmpeg(a) => a.fmt(f),
+        }
+    }
+}
+
+/// An AAC encoder: the system's own (AudioToolbox on a Mac), else FFmpeg's.
 #[derive(Debug)]
 pub struct AudioEncoder {
-    #[cfg(target_os = "macos")]
-    inner: crate::apple::aac::Encoder,
+    inner: Inner,
     config: AudioConfig,
     pending: Vec<f32>,
     /// AAC frames made so far: the next one's time.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     frames: i64,
 }
 
 impl AudioEncoder {
     pub fn new(config: AudioConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        #[cfg(target_os = "macos")]
+        if !std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg") {
+            return Ok(Self {
+                inner: Inner::Native(crate::apple::aac::Encoder::new(&config)?),
+                config,
+                pending: Vec::new(),
+                frames: 0,
+            });
+        }
+        Self::ffmpeg(config)
+    }
+
+    /// Through FFmpeg, whatever the system.
+    pub fn ffmpeg(config: AudioConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        Ok(Self { inner: Inner::Ffmpeg(crate::ffenc::Audio::new(&config)?), config, pending: Vec::new(), frames: 0 })
+    }
+
+    fn check(config: &AudioConfig) -> Result<(), AvError> {
         if aac_config(config.sample_rate, config.channels).is_none() || config.channels > 2 {
             return Err(AvError::Encoder(format!(
                 "AAC takes 1 or 2 channels at a standard rate, not {} at {} Hz",
                 config.channels, config.sample_rate
             )));
         }
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Self { inner: crate::apple::aac::Encoder::new(&config)?, config, pending: Vec::new(), frames: 0 })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(AvError::Encoder("this system's AAC encoder isn't built yet".into()))
-        }
+        Ok(())
     }
 
     pub fn config(&self) -> &AudioConfig {
@@ -72,25 +100,54 @@ impl AudioEncoder {
         aac_config(self.config.sample_rate, self.config.channels).map(|c| c.to_vec()).unwrap_or_default()
     }
 
+    /// Ends: the frames still inside the encoder (FFmpeg keeps some back; the Mac's gives each
+    /// at once). Samples short of a whole frame are left out.
+    pub fn flush(&mut self) -> Result<Vec<AudioPacket>, AvError> {
+        let rest = match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(_) => Vec::new(),
+            Inner::Ffmpeg(e) => e.flush(),
+        };
+        Ok(self.stamp(rest, self.priming()))
+    }
+
+    fn priming(&self) -> u32 {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.priming,
+            Inner::Ffmpeg(_) => crate::ffenc::PRIMING,
+        }
+    }
+
+    /// Times for frames as they come out: the encoder's output starts `priming` samples early
+    /// (its warm-up); frames wholly inside it are dropped; times are where the real sound is.
+    fn stamp(&mut self, made: Vec<Vec<u8>>, priming: u32) -> Vec<AudioPacket> {
+        let mut out = Vec::new();
+        for data in made {
+            let at = self.frames * AAC_FRAME as i64 - i64::from(priming);
+            self.frames += 1;
+            if at + (AAC_FRAME as i64) <= 0 {
+                continue;
+            }
+            let pts_us = at.max(0) * 1_000_000 / i64::from(self.config.sample_rate);
+            out.push(AudioPacket { pts_us, data });
+        }
+        out
+    }
+
     /// Adds interleaved samples; returns every whole AAC frame now ready.
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<AudioPacket>, AvError> {
         self.pending.extend_from_slice(pcm);
         let n = AAC_FRAME * self.config.channels as usize;
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut out = Vec::new();
         while self.pending.len() >= n {
-            #[cfg(target_os = "macos")]
-            for data in self.inner.encode(&self.pending[..n])? {
-                // The encoder's output starts `priming` samples early: those are its warm-up.
-                // Frames wholly inside it are dropped; times are where the real sound is.
-                let at = self.frames * AAC_FRAME as i64 - i64::from(self.inner.priming);
-                self.frames += 1;
-                if at + (AAC_FRAME as i64) <= 0 {
-                    continue;
-                }
-                let pts_us = at.max(0) * 1_000_000 / i64::from(self.config.sample_rate);
-                out.push(AudioPacket { pts_us, data });
-            }
+            let made = match &mut self.inner {
+                #[cfg(target_os = "macos")]
+                Inner::Native(e) => e.encode(&self.pending[..n])?,
+                Inner::Ffmpeg(e) => e.encode(&self.pending[..n])?,
+            };
+            let priming = self.priming();
+            out.extend(self.stamp(made, priming));
             self.pending.drain(..n);
         }
         Ok(out)

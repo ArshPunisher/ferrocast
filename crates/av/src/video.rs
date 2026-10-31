@@ -66,16 +66,55 @@ pub struct VideoPacket {
     pub data: Vec<u8>,
 }
 
-/// A hardware video encoder.
+/// The encoder doing the work.
+enum Inner {
+    /// The Mac's own media engine.
+    #[cfg(target_os = "macos")]
+    Native(crate::apple::vt::Encoder),
+    /// FFmpeg, with the best H.264 encoder it has here.
+    Ffmpeg(crate::ffenc::Video),
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Native(_) => f.write_str("VideoToolbox"),
+            Self::Ffmpeg(v) => v.fmt(f),
+        }
+    }
+}
+
+/// A video encoder: the system's own (VideoToolbox on a Mac), else FFmpeg's best here.
 #[derive(Debug)]
 pub struct VideoEncoder {
-    #[cfg(target_os = "macos")]
-    inner: crate::apple::vt::Encoder,
+    inner: Inner,
     config: VideoConfig,
+}
+
+/// `FERROCAST_AV_ENCODER=ffmpeg` uses FFmpeg even where a native encoder exists (to compare).
+fn ffmpeg_asked() -> bool {
+    std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg")
 }
 
 impl VideoEncoder {
     pub fn new(config: VideoConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        #[cfg(target_os = "macos")]
+        if !ffmpeg_asked() {
+            return Ok(Self { inner: Inner::Native(crate::apple::vt::Encoder::new(&config)?), config });
+        }
+        let _ = ffmpeg_asked();
+        Self::ffmpeg(config)
+    }
+
+    /// Through FFmpeg, whatever the system.
+    pub fn ffmpeg(config: VideoConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        Ok(Self { inner: Inner::Ffmpeg(crate::ffenc::Video::new(&config)?), config })
+    }
+
+    fn check(config: &VideoConfig) -> Result<(), AvError> {
         if config.width == 0
             || config.height == 0
             || !config.width.is_multiple_of(2)
@@ -89,34 +128,33 @@ impl VideoEncoder {
         if config.fps_num == 0 || config.fps_den == 0 || config.bitrate_kbps == 0 {
             return Err(AvError::Encoder("the frame rate and bitrate must be above 0".into()));
         }
-        #[cfg(target_os = "macos")]
-        {
-            Ok(Self { inner: crate::apple::vt::Encoder::new(&config)?, config })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(AvError::Encoder("this system's hardware encoder isn't built yet".into()))
-        }
+        Ok(())
     }
 
     pub fn config(&self) -> &VideoConfig {
         &self.config
     }
 
-    /// The decoder configuration record (avcC for H.264, hvcC for HEVC): the codec header FLV
-    /// and MP4 send first. Known once the first frame is encoded.
-    pub fn header(&self) -> Option<Vec<u8>> {
-        #[cfg(target_os = "macos")]
-        {
-            self.inner.header()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
+    /// Which encoder does the work ("VideoToolbox", or FFmpeg's: "h264_nvenc", "libx264"…).
+    pub fn name(&self) -> String {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(_) => "VideoToolbox".into(),
+            Inner::Ffmpeg(v) => v.name.clone(),
         }
     }
 
-    /// Hands a frame in (`key` forces a keyframe); returns what's ready.
+    /// The decoder configuration record (avcC for H.264, hvcC for HEVC): the codec header FLV
+    /// and MP4 send first. Known once the first frame is encoded.
+    pub fn header(&self) -> Option<Vec<u8>> {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.header(),
+            Inner::Ffmpeg(e) => e.header(),
+        }
+    }
+
+    /// Hands a frame in (`key` forces a keyframe where the encoder can); returns what's ready.
     pub fn encode(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
         let ok = match (frame, self.config.input) {
             (Frame::Bgra { data, stride }, PixelFormat::Bgra) => {
@@ -134,26 +172,23 @@ impl VideoEncoder {
         if !ok {
             return Err(AvError::Encoder("a frame doesn't match the encoder's size or pixel format".into()));
         }
-        #[cfg(target_os = "macos")]
-        {
-            self.inner.encode(frame, pts_us, key)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (pts_us, key);
-            Ok(Vec::new())
+        match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.encode(frame, pts_us, key),
+            // FFmpeg starts on a keyframe and keeps the interval itself.
+            Inner::Ffmpeg(e) => {
+                let _ = key;
+                e.encode(frame, pts_us)
+            }
         }
     }
 
     /// Everything still inside the encoder.
     pub fn flush(&mut self) -> Result<Vec<VideoPacket>, AvError> {
-        #[cfg(target_os = "macos")]
-        {
-            self.inner.flush()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Vec::new())
+        match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.flush(),
+            Inner::Ffmpeg(e) => e.flush(),
         }
     }
 }

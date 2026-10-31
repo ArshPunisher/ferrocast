@@ -1,5 +1,5 @@
-//! The hardware encoder on this computer: frames in, a stream FFmpeg reads back out.
-#![cfg(target_os = "macos")]
+//! The encoders on this computer (the Mac's own, or FFmpeg's elsewhere and with
+//! FERROCAST_AV_ENCODER=ffmpeg): frames in, a stream FFmpeg reads back out.
 
 use std::process::Command;
 
@@ -81,6 +81,9 @@ fn h264_from_bgra() {
 
 #[test]
 fn hevc_from_nv12() {
+    if !cfg!(target_os = "macos") || std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg") {
+        return; // HEVC is the Mac's own encoder only so far.
+    }
     let (flv, keys) = run(VideoCodec::Hevc, PixelFormat::Nv12);
     assert!(keys[0]);
     if let Some(p) = probe(&flv, "ferrocast-av-hevc.flv") {
@@ -112,6 +115,7 @@ fn aac_from_a_tone() {
     for chunk in pcm.chunks(960) {
         packets.extend(enc.encode(chunk).unwrap_or_else(|e| panic!("{e}")));
     }
+    packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
     assert!(packets.len() >= 90, "about 93 frames, got {}", packets.len());
     assert!(packets.windows(2).all(|w| w[1].pts_us > w[0].pts_us));
     let mut flv = FlvFile::new(true, false);
@@ -156,6 +160,7 @@ fn mp4_recording_survives_a_crash() {
         apk.extend(aenc.encode(&pcm).unwrap_or_else(|e| panic!("{e}")));
     }
     vpk.extend(venc.flush().unwrap_or_else(|e| panic!("{e}")));
+    apk.extend(aenc.flush().unwrap_or_else(|e| panic!("{e}")));
     let video =
         VideoTrack { codec: VideoCodec::H264, width: 640, height: 360, config: venc.header().unwrap_or_default() };
     let audio = AudioTrack { sample_rate: 48000, channels: 2, config: aenc.header(), bitrate_kbps: 128 };
@@ -217,11 +222,15 @@ fn cbr_holds_the_rate_on_a_still_picture() {
             bytes += p.data.len();
         }
     }
+    for p in enc.flush().unwrap_or_else(|e| panic!("{e}")) {
+        bytes += p.data.len();
+    }
     // 3 s at 2500 kbps is about 937 KB; Apple silicon pads to it, Intel Macs fall back to an
     // average (no padding), so only an upper bound is sure there.
     let kbps = bytes * 8 / 3 / 1000;
     assert!(kbps <= 3000, "{kbps} kbps");
-    if cfg!(target_arch = "aarch64") {
+    // Apple silicon pads; so do x264 and the GPUs' encoders through FFmpeg.
+    if cfg!(target_arch = "aarch64") || !cfg!(target_os = "macos") {
         assert!(kbps >= 1500, "{kbps} kbps on a still picture");
     }
 }

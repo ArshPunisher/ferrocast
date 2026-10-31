@@ -115,7 +115,13 @@ impl Pipeline {
     /// Ends: what's still in the encoder is sent, and the recording closed.
     pub fn finish(mut self) -> Result<Vec<Tag>, AvError> {
         let packets = self.video.flush()?;
-        let tags = self.video_out(packets)?;
+        let mut tags = self.video_out(packets)?;
+        let offset = self.audio_offset_us.unwrap_or(0);
+        for mut p in self.audio.flush()? {
+            p.pts_us += offset;
+            tags.push(Tag::Audio { ms: (p.pts_us / 1000) as u32, body: flv::audio_tag(&p.data) });
+            self.record_audio(p);
+        }
         if let Some(Recording::On(w)) = self.recording.take() {
             w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
         }

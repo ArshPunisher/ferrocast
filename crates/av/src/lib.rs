@@ -19,6 +19,7 @@ pub mod afx;
 pub mod audio;
 mod compose;
 pub mod engine;
+pub mod ffenc;
 pub mod flv;
 pub mod mix;
 pub mod mp4;
