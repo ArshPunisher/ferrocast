@@ -120,6 +120,8 @@ impl Engine {
         };
         self.set_relay_state("connected", None);
         let (mut tx, mut rx) = ws.split();
+        // Answers to guests' offers, made on their own tasks (the Studio takes a moment).
+        let (replies_tx, mut replies) = tokio::sync::mpsc::unbounded_channel::<String>();
         // `bot_seen` every 30 s while the cloud bot is on: the cloud stands by (cloud_bot.rs).
         let mut beat = tokio::time::interval(crate::cloud_bot::HEARTBEAT);
         let mut heard = tokio::time::Instant::now();
@@ -134,6 +136,10 @@ impl Engine {
                     }
                     continue;
                 }
+                Some(r) = replies.recv() => {
+                    tx.send(Message::text(r)).await.map_err(|e| e.to_string())?;
+                    continue;
+                }
                 _ = tokio::time::sleep_until(heard + Duration::from_secs(90)) => None,
                 m = rx.next() => Some(m),
             };
@@ -146,6 +152,13 @@ impl Engine {
             heard = tokio::time::Instant::now();
             let Message::Text(text) = msg else { continue };
             let Ok(item) = serde_json::from_str::<Value>(&text) else { continue };
+            if item["type"] == "guest_offer" {
+                let (engine, out) = (self.clone(), replies_tx.clone());
+                tokio::spawn(async move {
+                    let _ = out.send(engine.guest_offer(&item).await.to_string());
+                });
+                continue;
+            }
             if item["type"] != "item" {
                 continue;
             }

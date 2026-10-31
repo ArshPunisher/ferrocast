@@ -206,6 +206,19 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn record_source(&self, _name: String, _on: bool) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// A guest asked to join (crates/guest): answers their browser's offer (its JSON) and puts
+    /// their camera in the Studio as a source → the answer's JSON.
+    async fn guest_join(&self, _name: String, _offer: String) -> Result<String, String> {
+        Err(NOT_HERE.into())
+    }
+    /// The guests now: `[{ name, source, connected, video, audio }]`.
+    async fn guests(&self) -> Result<Value, String> {
+        Ok(Value::Array(Vec::new()))
+    }
+    /// Hangs up on a guest (their source stays, showing nothing).
+    async fn guest_leave(&self, _name: String) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
     /// Starts the virtual camera showing what's on air (`source` None) or one scene or
     /// source, or stops it → `{ active }`.
     async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {

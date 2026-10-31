@@ -103,6 +103,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/audio", put(engine_set_audio))
         .route("/studio/engine/sources/{name}/filters", get(engine_filters).post(engine_add_filter))
         .route("/studio/engine/sources/{name}/record", post(engine_record_source))
+        .route("/studio/guests", get(guests))
+        .route("/studio/guests/invites", post(guest_invite))
+        .route("/studio/guests/invites/{id}", delete(guest_invite_delete))
+        .route("/studio/guests/{name}", delete(guest_hang_up))
         .route("/studio/engine/sources/{name}/filters/{filter}", delete(engine_remove_filter))
         .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
         .route("/studio/engine/sources/{name}/web", post(engine_web))
@@ -1200,6 +1204,34 @@ async fn engine_record_source(
     Body(b): Body<OnBody>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_record_source(&name, b.on).await?))
+}
+
+/// `GET /studio/guests` → `{ invites: [{ id, label, url, created_ms, expires_ms }], guests: [...] }`.
+async fn guests(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.guests_view().await?))
+}
+
+#[derive(serde::Deserialize)]
+struct InviteBody {
+    #[serde(default)]
+    label: String,
+}
+
+/// `POST /studio/guests/invites` `{ label }` → the new guest link (201).
+async fn guest_invite(State(app): State<AppState>, Body(b): Body<InviteBody>) -> ApiResult<Response> {
+    Ok((StatusCode::CREATED, Json(app.engine.guest_invite_create(&b.label).await?)).into_response())
+}
+
+/// `DELETE /studio/guests/invites/{id}`: the link stops working.
+async fn guest_invite_delete(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.guest_invite_delete(&id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /studio/guests/{name}`: hangs up on a guest (by their name, or their source's).
+async fn guest_hang_up(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    app.engine.guest_hang_up(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /studio/engine/sources/{name}/media` → `{ state, time_ms, duration_ms }`.

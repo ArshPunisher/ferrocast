@@ -26,6 +26,7 @@ mod ferro_account;
 pub mod ffmpeg_get;
 mod giveaways;
 pub mod golive;
+mod guests;
 mod history;
 pub mod import;
 mod loyalty;
@@ -352,6 +353,7 @@ impl Engine {
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
+        engine.guests_at_start();
         tokio::spawn(cloud_sync::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
