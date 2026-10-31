@@ -70,12 +70,120 @@ pub struct SceneItem {
     pub filter: Filter,
     pub blend: Blend,
     pub effects: Vec<Effect>,
+    /// 0 to 1.
+    pub opacity: f32,
+    /// Keyframed properties, timed from when the scene went on air.
+    pub animation: Vec<Track>,
 }
 
 impl SceneItem {
     pub fn new(source: u64, placement: Placement) -> Self {
-        Self { source, visible: true, placement, filter: Filter::Disable, blend: Blend::Normal, effects: Vec::new() }
+        Self {
+            source,
+            visible: true,
+            placement,
+            filter: Filter::Disable,
+            blend: Blend::Normal,
+            effects: Vec::new(),
+            opacity: 1.0,
+            animation: Vec::new(),
+        }
     }
+}
+
+/// How a keyframe is reached from the one before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ease {
+    #[default]
+    Linear,
+    In,
+    Out,
+    InOut,
+    /// Jumps there at the keyframe's time.
+    Hold,
+}
+
+impl Ease {
+    fn apply(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::Linear => t,
+            Self::In => t * t * t,
+            Self::Out => 1.0 - (1.0 - t).powi(3),
+            Self::InOut => crate::cubic_ease_in_out(t),
+            Self::Hold => {
+                if t >= 1.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+/// What a track animates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prop {
+    X,
+    Y,
+    ScaleX,
+    ScaleY,
+    /// Degrees.
+    Rotation,
+    Opacity,
+}
+
+/// A keyframe: at this time (ms from the scene going on air), this value, reached this way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Key {
+    pub at_ms: u64,
+    pub value: f32,
+    pub ease: Ease,
+}
+
+/// One property's keyframes, in time order; with `repeat`, it starts over after the last.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Track {
+    pub prop: Prop,
+    pub keys: Vec<Key>,
+    pub repeat: bool,
+}
+
+impl Track {
+    /// The value `ms` in (None with no keyframes).
+    pub fn value_at(&self, ms: u64) -> Option<f32> {
+        let first = self.keys.first()?;
+        let last = self.keys.last()?;
+        let ms = if self.repeat && last.at_ms > 0 { ms % last.at_ms.max(1) } else { ms };
+        if ms <= first.at_ms {
+            return Some(first.value);
+        }
+        if ms >= last.at_ms {
+            return Some(last.value);
+        }
+        let i = self.keys.iter().position(|k| k.at_ms > ms)?;
+        let (a, b) = (self.keys[i - 1], self.keys[i]);
+        let t = (ms - a.at_ms) as f32 / (b.at_ms - a.at_ms).max(1) as f32;
+        Some(a.value + (b.value - a.value) * b.ease.apply(t))
+    }
+}
+
+/// A placement and opacity with an item's tracks applied `ms` in.
+fn animated(it: &SceneItem, ms: u64) -> (Placement, f32) {
+    let (mut p, mut o) = (it.placement, it.opacity);
+    for tr in &it.animation {
+        let Some(v) = tr.value_at(ms) else { continue };
+        match tr.prop {
+            Prop::X => p.x = v,
+            Prop::Y => p.y = v,
+            Prop::ScaleX => p.scale_x = v,
+            Prop::ScaleY => p.scale_y = v,
+            Prop::Rotation => p.rotation = v,
+            Prop::Opacity => o = v,
+        }
+    }
+    (p, o.clamp(0.0, 1.0))
 }
 
 /// An output: where the encoded stream goes.
@@ -180,6 +288,8 @@ struct State {
     on_air: Option<String>,
     /// A transition under way: from which scene, how, when it began and how long it lasts (ns).
     moving: Option<(String, TransitionKind, u64, u64)>,
+    /// When each scene last went on air (its keyframes' time 0).
+    started: std::collections::HashMap<String, u64>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
     video: VideoConfig,
@@ -238,6 +348,7 @@ impl Engine {
             scenes: BTreeMap::new(),
             on_air: None,
             moving: None,
+            started: std::collections::HashMap::new(),
             outputs: Vec::new(),
             next_output: 1,
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
@@ -398,9 +509,13 @@ impl Engine {
         if !st.scenes.contains_key(name) {
             return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
         }
+        let now = now_ns();
         let from = st.on_air.replace(name.to_string());
+        if from.as_deref() != Some(name) {
+            st.started.insert(name.to_string(), now);
+        }
         st.moving = match from {
-            Some(f) if kind != TransitionKind::Cut && ms > 0 && f != name => Some((f, kind, now_ns(), ms * 1_000_000)),
+            Some(f) if kind != TransitionKind::Cut && ms > 0 && f != name => Some((f, kind, now, ms * 1_000_000)),
             _ => None,
         };
         Ok(())
@@ -484,7 +599,7 @@ impl Engine {
             if !st.scenes.contains_key(name) {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
-            build(&st, self.config.width, self.config.height, Some(name))
+            build(&st, self.config.width, self.config.height, Some(name), now_ns())
         };
         self.gpu.render(&scene)
     }
@@ -524,37 +639,93 @@ enum Draw {
 /// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps).
 fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64) -> Draw {
     if let Some(name) = scene {
-        return Draw::Scene(build(st, width, height, Some(name)));
+        return Draw::Scene(build(st, width, height, Some(name), ts));
     }
-    let to = build(st, width, height, st.on_air.as_deref());
     match &st.moving {
+        Some((from, TransitionKind::Move, start, dur)) if ts < start + dur => {
+            let t = crate::cubic_ease_in_out(ts.saturating_sub(*start) as f32 / *dur as f32);
+            Draw::Scene(moved(st, width, height, from, st.on_air.as_deref().unwrap_or_default(), t, ts))
+        }
         Some((from, kind, start, dur)) if ts < start + dur => {
             let t = ts.saturating_sub(*start) as f32 / *dur as f32;
-            Draw::Moving(Box::new(Transition { kind: kind.clone(), t, from: build(st, width, height, Some(from)), to }))
+            let to = build(st, width, height, st.on_air.as_deref(), ts);
+            Draw::Moving(Box::new(Transition {
+                kind: kind.clone(),
+                t,
+                from: build(st, width, height, Some(from), ts),
+                to,
+            }))
         }
-        _ => Draw::Scene(to),
+        _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts)),
     }
 }
 
-/// A scene as the compositor takes it (sources without a picture yet are left out).
-fn build(st: &State, width: u32, height: u32, name: Option<&str>) -> Scene {
+/// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
+fn item_of(st: &State, it: &SceneItem, ms: u64) -> Option<Item> {
+    let src = st.sources.get(&it.source)?;
+    let (width, height, premultiplied) = src.size?;
+    let (placement, opacity) = animated(it, ms);
+    Some(Item {
+        content: Content::Uploaded { id: it.source, width, height, premultiplied },
+        effects: it.effects.clone(),
+        placement,
+        filter: it.filter,
+        blend: it.blend,
+        srgb_off: false,
+        linear: true,
+        opacity,
+    })
+}
+
+fn scene_ms(st: &State, name: &str, ts: u64) -> u64 {
+    st.started.get(name).map_or(0, |s| ts.saturating_sub(*s) / 1_000_000)
+}
+
+/// A scene as the compositor takes it at `ts` (sources without a picture yet are left out).
+fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Scene {
     let mut items = Vec::new();
     if let Some(name) = name
         && let Some(scene) = st.scenes.get(name)
     {
-        for it in scene.iter().filter(|i| i.visible) {
-            let Some(src) = st.sources.get(&it.source) else { continue };
-            let Some((width, height, premultiplied)) = src.size else { continue };
-            items.push(Item {
-                content: Content::Uploaded { id: it.source, width, height, premultiplied },
-                effects: it.effects.clone(),
-                placement: it.placement,
-                filter: it.filter,
-                blend: it.blend,
-                srgb_off: false,
-                linear: true,
-            });
+        let ms = scene_ms(st, name, ts);
+        items.extend(scene.iter().filter(|i| i.visible).filter_map(|it| item_of(st, it, ms)));
+    }
+    Scene { width, height, items }
+}
+
+/// The Move transition `t` of the way (eased): a source in both scenes glides from its old
+/// place to its new one; one only in the old scene fades out underneath, one only in the new
+/// fades in.
+fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: u64) -> Scene {
+    let (empty, empty2) = (Vec::new(), Vec::new());
+    let a = st.scenes.get(from).unwrap_or(&empty);
+    let b = st.scenes.get(to).unwrap_or(&empty2);
+    let (ma, mb) = (scene_ms(st, from, ts), scene_ms(st, to, ts));
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    let mut items = Vec::new();
+    for old in a.iter().filter(|i| i.visible && !b.iter().any(|n| n.visible && n.source == i.source)) {
+        if let Some(mut it) = item_of(st, old, ma) {
+            it.opacity *= 1.0 - t;
+            items.push(it);
         }
+    }
+    for new in b.iter().filter(|i| i.visible) {
+        let Some(mut it) = item_of(st, new, mb) else { continue };
+        match a.iter().find(|o| o.visible && o.source == new.source).and_then(|o| item_of(st, o, ma)) {
+            Some(o) => {
+                let (p, q) = (o.placement, it.placement);
+                it.placement.x = lerp(p.x, q.x);
+                it.placement.y = lerp(p.y, q.y);
+                it.placement.scale_x = lerp(p.scale_x, q.scale_x);
+                it.placement.scale_y = lerp(p.scale_y, q.scale_y);
+                it.placement.rotation = lerp(p.rotation, q.rotation);
+                it.placement.bounds_width = lerp(p.bounds_width, q.bounds_width);
+                it.placement.bounds_height = lerp(p.bounds_height, q.bounds_height);
+                it.opacity = lerp(o.opacity, it.opacity);
+            }
+            None => it.opacity *= t,
+        }
+        items.push(it);
     }
     Scene { width, height, items }
 }
@@ -759,6 +930,57 @@ mod tests {
         // Studio Mode: A previewed while B is on air.
         assert_eq!(&e.snapshot_scene("A").unwrap_or_default()[0..4], &[255, 0, 0, 255]);
         assert!(e.snapshot_scene("Nope").is_err());
+    }
+
+    #[test]
+    fn keyframes_move_items_over_time() {
+        let track = Track {
+            prop: Prop::X,
+            keys: vec![
+                Key { at_ms: 0, value: 0.0, ease: Ease::Linear },
+                Key { at_ms: 1000, value: 100.0, ease: Ease::Linear },
+            ],
+            repeat: false,
+        };
+        assert_eq!(track.value_at(0), Some(0.0));
+        assert_eq!(track.value_at(500), Some(50.0));
+        assert_eq!(track.value_at(5000), Some(100.0));
+        let looped = Track { repeat: true, ..track.clone() };
+        assert_eq!(looped.value_at(1250), Some(25.0));
+        let held = Track { keys: vec![track.keys[0], Key { ease: Ease::Hold, ..track.keys[1] }], ..track };
+        assert_eq!(held.value_at(999), Some(0.0));
+        // An eased move is slow at both ends.
+        assert!(Ease::InOut.apply(0.1) < 0.1 && Ease::InOut.apply(0.9) > 0.9);
+    }
+
+    #[test]
+    fn move_glides_shared_sources() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 40, height: 40, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene(
+            "Left",
+            vec![
+                SceneItem::new(1, Placement::default()),
+                SceneItem::new(2, Placement { x: 0.0, y: 160.0, ..Default::default() }),
+            ],
+        );
+        e.set_scene(
+            "Right",
+            vec![
+                SceneItem::new(1, Placement::default()),
+                SceneItem::new(2, Placement { x: 600.0, y: 160.0, ..Default::default() }),
+            ],
+        );
+        e.go("Left").unwrap_or_else(|x| panic!("{x}"));
+        e.go_with("Right", TransitionKind::Move, 1000).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(500));
+        let px = e.snapshot().unwrap_or_default();
+        // Half way the square is in the middle, not at either end.
+        let white_at = (0..640).find(|x| px[(180 * 640 + x) * 4] > 200).unwrap_or(0);
+        assert!((200..440).contains(&white_at), "the square is part way: x {white_at}");
     }
 
     #[test]
