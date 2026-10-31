@@ -419,6 +419,9 @@ impl Studio {
         ffi::shaders::register(&inner.api);
         // Remove background: Apple's Vision on macOS, RVM elsewhere (when its model is installed).
         ffi::cutout::register(&inner.api, &paths.data);
+        // Strong noise removal, where it's built (DeepFilterNet: release builds).
+        #[cfg(feature = "deepfilter")]
+        ffi::denoise::register(&inner.api);
         Ok(Studio { inner })
     }
 

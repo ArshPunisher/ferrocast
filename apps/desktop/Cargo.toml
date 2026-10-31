@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "obs-ffmpeg-mux"
 path = "src/bin/obs-ffmpeg-mux.rs"
 
+[features]
+# The Studio's Strong noise removal (DeepFilterNet): on in CI and release builds.
+deepfilter = ["ferrocast-studio/deepfilter"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

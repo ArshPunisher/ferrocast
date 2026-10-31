@@ -20,10 +20,30 @@ png = "0.17"
 base64 = "0.23"
 # Remove background where Apple's Vision isn't: Robust Video Matting run by tract (pure Rust).
 tract-onnx = { version = "0.23", optional = true }
+# Strong noise removal: DeepFilterNet 3 with its model built in, at one exact commit (it isn't on
+# crates.io with its model). Release builds only: see the `deepfilter` feature.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model"], optional = true }
+ndarray15 = { package = "ndarray", version = "0.15", optional = true }
+# DeepFilterNet builds against the tract its own Cargo.lock has (later 0.21s moved to ndarray 0.16
+# and no longer build it): held there.
+tract-core-df = { package = "tract-core", version = "=0.21.4", optional = true }
+tract-onnx-df = { package = "tract-onnx", version = "=0.21.4", optional = true }
+tract-pulse-df = { package = "tract-pulse", version = "=0.21.4", optional = true }
+tract-hir-df = { package = "tract-hir", version = "=0.21.4", optional = true }
 
 [features]
 # Remove background with RVM on macOS too (to try it; Vision is the default there).
 onnx-matte = ["dep:tract-onnx"]
+# The Strong noise removal filter (DeepFilterNet). CI and releases build it; day-to-day builds
+# don't need to compile the model.
+deepfilter = [
+  "dep:deep_filter",
+  "dep:ndarray15",
+  "dep:tract-core-df",
+  "dep:tract-onnx-df",
+  "dep:tract-pulse-df",
+  "dep:tract-hir-df",
+]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

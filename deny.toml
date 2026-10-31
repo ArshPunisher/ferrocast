@@ -65,3 +65,5 @@ deny = [{ name = "tauri", wrappers = ["ferrocast-desktop", "tauri-plugin-single-
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# DeepFilterNet (Strong noise removal): its crates.io release lacks the model; pinned by rev.
+allow-git = ["https://github.com/Rikorose/DeepFilterNet"]

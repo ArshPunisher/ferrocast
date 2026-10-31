@@ -1665,6 +1665,10 @@ pub(crate) mod cutout;
 #[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
 pub(crate) mod matte;
 
+/// Strong noise removal: DeepFilterNet on the CPU (the `deepfilter` feature).
+#[cfg(feature = "deepfilter")]
+pub(crate) mod denoise;
+
 /// Ferrocast's own picture filters (every platform): Rounded corners, Border, Shadow and glow,
 /// Shape, Blur or pixelate an area, Colour looks.
 pub(crate) mod shaders;
