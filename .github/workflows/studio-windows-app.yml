@@ -59,7 +59,7 @@ jobs:
         env:
           FERROCAST_WEB_DIST: ${{ github.workspace }}/ferrocast-web/dist
         run: |
-          cargo build --locked -p ferrocast-desktop --bins
+          cargo build --locked -p ferrocast-desktop --bins --features deepfilter
           Copy-Item -Recurse -Force apps/desktop/obs-runtime/obs target/debug/
           Copy-Item -Force apps/desktop/obs-runtime/root/* target/debug/
       - name: Ferrocast's filters on D3D11
@@ -67,6 +67,9 @@ jobs:
         run: |
           $env:FERROCAST_OBS_DIR = (Resolve-Path apps/desktop/obs-runtime/obs).Path
           cargo run --locked -p ferrocast-studio --example filters -- "$env:RUNNER_TEMP/filters"
+      - name: Strong noise removal (DeepFilterNet)
+        shell: pwsh
+        run: cargo test --locked -p ferrocast-studio --features deepfilter --lib denoise
       - name: Remove background on D3D11 (RVM, the installer's model)
         shell: pwsh
         run: |
@@ -95,7 +98,7 @@ jobs:
           FERROCAST_YOUTUBE_CLIENT_ID: ${{ vars.FERROCAST_YOUTUBE_CLIENT_ID }}
           FERROCAST_YOUTUBE_CLIENT_SECRET: ${{ secrets.FERROCAST_YOUTUBE_CLIENT_SECRET }}
           FERROCAST_RELAY_URL: https://ferrocast-relay.clearcraftlabs.com
-        run: cargo tauri build --bundles nsis --config obs-runtime/tauri.obs.json
+        run: cargo tauri build --bundles nsis --features deepfilter --config obs-runtime/tauri.obs.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ferrocast-windows-test-installer
