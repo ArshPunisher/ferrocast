@@ -385,83 +385,12 @@ fn effects_of(c: &Collection, name: &str) -> Result<Vec<Effect>> {
         if !f.enabled {
             continue;
         }
+        // The same reading the engine uses to open collections.
         let s = c.filter_settings(name, &f.name)?;
-        let n = |k: &str, d: f64| s[k].as_f64().unwrap_or(d) as f32;
-        let colour = |d: u32| Effect::rgba(s["color"].as_u64().map_or(d, |v| v as u32));
-        out.push(match f.kind.as_str() {
-            "ferrocast_rounded_corners" => Effect::RoundedCorners { radius: n("radius", 40.0) },
-            "ferrocast_border" => {
-                Effect::Border { width: n("width", 8.0), rgba: colour(0xFFFF_FFFF), radius: n("radius", 0.0) }
-            }
-            "ferrocast_shadow" => {
-                Effect::Shadow { rgba: colour(0xB300_0000), blur: n("blur", 24.0), x: n("x", 0.0), y: n("y", 12.0) }
-            }
-            "ferrocast_shape" => Effect::Shape {
-                shape: n("shape", 0.0) as u32,
-                feather: n("feather", 0.0),
-                stretch: s["stretch"].as_bool().unwrap_or(false),
-            },
-            "ferrocast_blur_area" => Effect::BlurArea {
-                pixelate: n("mode", 0.0) > 0.5,
-                strength: n("strength", 24.0),
-                area: [n("area_x", 25.0), n("area_y", 25.0), n("area_w", 50.0), n("area_h", 50.0)],
-            },
-            "ferrocast_look" => Effect::Look { look: n("look", 0.0) as u32, strength: n("strength", 100.0) },
-            "chroma_key_filter_v2" => {
-                let key = match s["key_color_type"].as_str().unwrap_or("green") {
-                    "blue" => 0xFF9900u32,
-                    "magenta" => 0xFF00FF,
-                    "custom" => s["key_color"].as_u64().unwrap_or(0x00FF00) as u32,
-                    _ => 0x00FF00,
-                };
-                Effect::ChromaKey {
-                    key: [(key & 0xff) as u8, ((key >> 8) & 0xff) as u8, ((key >> 16) & 0xff) as u8],
-                    similarity: n("similarity", 400.0),
-                    smoothness: n("smoothness", 80.0),
-                    spill: n("spill", 100.0),
-                    opacity: n("opacity", 1.0),
-                    contrast: n("contrast", 0.0),
-                    brightness: n("brightness", 0.0),
-                    gamma: n("gamma", 0.0),
-                }
-            }
-            "color_key_filter_v2" => {
-                let key = match s["key_color_type"].as_str().unwrap_or("green") {
-                    "blue" => 0xFF0000u32,
-                    "red" => 0x0000FF,
-                    "magenta" => 0xFF00FF,
-                    "custom" => s["key_color"].as_u64().unwrap_or(0x00FF00) as u32,
-                    _ => 0x00FF00,
-                };
-                Effect::ColorKey {
-                    key: [(key & 0xff) as u8, ((key >> 8) & 0xff) as u8, ((key >> 16) & 0xff) as u8],
-                    similarity: n("similarity", 80.0),
-                    smoothness: n("smoothness", 50.0),
-                    opacity: n("opacity", 1.0),
-                    contrast: n("contrast", 0.0),
-                    brightness: n("brightness", 0.0),
-                    gamma: n("gamma", 0.0),
-                }
-            }
-            "luma_key_filter_v2" => Effect::LumaKey {
-                max: n("luma_max", 1.0),
-                min: n("luma_min", 0.0),
-                max_smooth: n("luma_max_smooth", 0.0),
-                min_smooth: n("luma_min_smooth", 0.0),
-            },
-            "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
-            "color_filter_v2" => Effect::ColorCorrection {
-                gamma: n("gamma", 0.0),
-                contrast: n("contrast", 0.0),
-                brightness: n("brightness", 0.0),
-                saturation: n("saturation", 0.0),
-                hue_shift: n("hue_shift", 0.0),
-                opacity: n("opacity", 1.0),
-                multiply: s["color_multiply"].as_u64().unwrap_or(0x00FF_FFFF) as u32,
-                add: s["color_add"].as_u64().unwrap_or(0) as u32,
-            },
-            other => return Err(format!("\"{name}\" has a filter our engine doesn't run yet: {other}").into()),
-        });
+        out.push(
+            ferrocast_av::obs::effect_from(&f.kind, &s)
+                .ok_or_else(|| format!("\"{name}\" has a filter our engine doesn't run yet: {}", f.kind))?,
+        );
     }
     Ok(out)
 }
