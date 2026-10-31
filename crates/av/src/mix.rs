@@ -24,6 +24,17 @@ const MAX_QUEUE_SECS: usize = 5;
 /// Input frames the resampler takes at a time.
 const RESAMPLE_CHUNK: usize = 480;
 
+/// Whether a source is heard here (OBS's Audio Monitoring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Monitoring {
+    #[default]
+    Off,
+    /// Heard here only: left out of the tracks.
+    Only,
+    /// Heard here and sent.
+    AndOutput,
+}
+
 /// One source's settings, as OBS's mixer shows them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceSettings {
@@ -38,11 +49,20 @@ pub struct SourceSettings {
     pub sync_offset_ns: i64,
     /// Which tracks it's in: bit 0 is track 1.
     pub tracks: u8,
+    pub monitoring: Monitoring,
 }
 
 impl Default for SourceSettings {
     fn default() -> Self {
-        Self { volume: 1.0, muted: false, balance: 0.5, mono: false, sync_offset_ns: 0, tracks: 1 }
+        Self {
+            volume: 1.0,
+            muted: false,
+            balance: 0.5,
+            mono: false,
+            sync_offset_ns: 0,
+            tracks: 1,
+            monitoring: Monitoring::Off,
+        }
     }
 }
 
@@ -58,6 +78,8 @@ pub struct Levels {
 pub struct Block {
     pub ts_ns: u64,
     pub tracks: Vec<Vec<f32>>,
+    /// What's heard here: the monitored sources mixed (interleaved stereo).
+    pub monitor: Vec<f32>,
 }
 
 struct Source {
@@ -245,6 +267,7 @@ impl Mixer {
     fn mix_block(&mut self, start: u64) -> Block {
         let rate = self.rate;
         let mut tracks = vec![vec![0f32; BLOCK * 2]; TRACKS];
+        let mut monitor = vec![0f32; BLOCK * 2];
         for src in self.sources.values_mut() {
             let mut buf = vec![0f32; BLOCK * 2];
             if let Some(s0) = src.start_ns {
@@ -306,8 +329,13 @@ impl Mixer {
                 peak: [db(peak[0]), db(peak[1])],
                 rms: [db((sq[0] / BLOCK as f32).sqrt()), db((sq[1] / BLOCK as f32).sqrt())],
             };
+            if s.monitoring != Monitoring::Off {
+                for (o, v) in monitor.iter_mut().zip(&buf) {
+                    *o += v;
+                }
+            }
             for (t, track) in tracks.iter_mut().enumerate() {
-                if s.tracks & (1 << t) != 0 {
+                if s.monitoring != Monitoring::Only && s.tracks & (1 << t) != 0 {
                     for (o, v) in track.iter_mut().zip(&buf) {
                         *o += v;
                     }
@@ -319,7 +347,10 @@ impl Mixer {
                 *v = v.clamp(-1.0, 1.0);
             }
         }
-        Block { ts_ns: start, tracks }
+        for v in &mut monitor {
+            *v = v.clamp(-1.0, 1.0);
+        }
+        Block { ts_ns: start, tracks, monitor }
     }
 }
 
@@ -460,6 +491,22 @@ mod tests {
         let b = &m.mix_until(t0 + ns(3072, RATE))[1];
         // 0.4 doubled, turned over, halved.
         assert!((b.tracks[0][0] + 0.4).abs() < 1e-3, "{}", b.tracks[0][0]);
+    }
+
+    #[test]
+    fn monitoring_hears_without_or_with_sending() {
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings { monitoring: Monitoring::Only, ..Default::default() });
+        m.set(2, SourceSettings { monitoring: Monitoring::AndOutput, ..Default::default() });
+        m.set(3, SourceSettings::default());
+        let t0 = 1_000_000_000;
+        m.mix_until(t0);
+        m.push(1, &vec![0.1; 4096 * 2], 2, RATE, t0);
+        m.push(2, &vec![0.2; 4096 * 2], 2, RATE, t0);
+        m.push(3, &vec![0.4; 4096 * 2], 2, RATE, t0);
+        let b = &m.mix_until(t0 + ns(3072, RATE))[1];
+        assert!((b.monitor[0] - 0.3).abs() < 1e-6, "1 and 2 heard: {}", b.monitor[0]);
+        assert!((b.tracks[0][0] - 0.6).abs() < 1e-6, "2 and 3 sent: {}", b.tracks[0][0]);
     }
 
     #[test]

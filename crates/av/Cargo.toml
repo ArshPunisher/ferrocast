@@ -15,12 +15,17 @@ rubato = "0.14"
 cosmic-text = "0.19"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 thiserror.workspace = true
+tracing.workspace = true
 
 
 [dev-dependencies]
 # The own_engine example streams through Go live's hub, as the app will.
 ferrocast-golive.workspace = true
 tokio.workspace = true
+
+# Hearing a sound locally (monitoring). Linux would need ALSA's headers; not there yet.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+cpal = "0.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

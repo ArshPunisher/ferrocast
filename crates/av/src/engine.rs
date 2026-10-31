@@ -184,6 +184,9 @@ struct State {
     next_output: u64,
     video: VideoConfig,
     audio: AudioConfig,
+    /// Where monitored sound is played, when monitoring is on.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    monitor: Option<crate::monitor::Feeder>,
     stats: Stats,
     error: Option<String>,
 }
@@ -191,6 +194,9 @@ struct State {
 /// The engine. Dropping it stops its thread and closes its outputs.
 pub struct Engine {
     config: EngineConfig,
+    /// The device monitored sound plays on (it stays on this side: its feeder goes to the loop).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    monitor: Mutex<Option<crate::monitor::Monitor>>,
     state: Arc<Mutex<State>>,
     gpu: Arc<Compositor>,
     mixer: Arc<Mutex<Mixer>>,
@@ -236,6 +242,8 @@ impl Engine {
             next_output: 1,
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio },
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            monitor: None,
             stats: Stats::default(),
             error: None,
         }));
@@ -247,7 +255,17 @@ impl Engine {
                 .spawn(move || run(config, &state, &gpu, &mixer, &stop))
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
-        Ok(Self { config, state, gpu, mixer, text: Mutex::new(TextRenderer::new()), stop, thread: Some(thread) })
+        Ok(Self {
+            config,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            monitor: Mutex::new(None),
+            state,
+            gpu,
+            mixer,
+            text: Mutex::new(TextRenderer::new()),
+            stop,
+            thread: Some(thread),
+        })
     }
 
     pub fn config(&self) -> EngineConfig {
@@ -336,6 +354,22 @@ impl Engine {
     /// A source's sound settings (volume, mute, balance, tracks…), for sources with sound.
     pub fn set_sound(&self, id: u64, settings: SourceSettings) {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, settings);
+    }
+
+    /// Plays monitored sound (sources set to `Monitoring::Only` or `AndOutput`) on `device` (a
+    /// name from `monitor::devices()`; None is the system's), or stops with `on` false.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn set_monitoring(&self, on: bool, device: Option<&str>) -> Result<(), AvError> {
+        let m = if on { Some(crate::monitor::Monitor::start(device, self.config.sample_rate)?) } else { None };
+        self.lock().monitor = m.as_ref().map(|m| m.feeder());
+        *self.monitor.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        Ok(())
+    }
+
+    /// Monitoring's device so far: times it ran short of sound, and samples played.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn monitoring_stats(&self) -> Option<(u64, u64)> {
+        self.monitor.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.stats())
     }
 
     /// A source's sound filters, in order (gate, compressor, EQ…), replacing any before.
@@ -614,6 +648,12 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
         }
         let blocks = mx.mix_until(now_ns());
         drop(mx);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some(f) = &st.monitor {
+            for b in &blocks {
+                f.push(&b.monitor);
+            }
+        }
 
         if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
             st.moving = None;
@@ -791,6 +831,24 @@ mod tests {
             // Half the rate: about half the frames.
             assert!((n(&pt) * 2).abs_diff(n(&pw)) <= 4, "{pw} / {pt}");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn monitoring_plays_on_the_speakers() {
+        use crate::mix::{Monitoring, SourceSettings};
+        let Some(e) = engine() else { return };
+        // A quiet beep heard here only (left out of every output).
+        e.set_source(1, SourceKind::Tone { hz: 660.0, every_ms: 400, beep_ms: 60 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_sound(1, SourceSettings { volume: 0.1, monitoring: Monitoring::Only, ..Default::default() });
+        if e.set_monitoring(true, None).is_err() {
+            return; // no speakers here (a CI machine)
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        let (short, played) = e.monitoring_stats().unwrap_or_default();
+        e.set_monitoring(false, None).unwrap_or_else(|x| panic!("{x}"));
+        assert!(played > 40_000, "about a second played: {played}");
+        assert!(short < 10, "the device seldom ran short: {short}");
     }
 
     #[test]
