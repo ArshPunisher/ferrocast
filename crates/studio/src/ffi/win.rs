@@ -543,7 +543,10 @@ pub mod projector {
                 0
             }
             WM_CLOSE_LATER => {
-                (state.hooks.close)();
+                // The owner drops the projector from here, which destroys this window and its
+                // State: the hooks are held here until the call is over (as macOS's `later`).
+                let hooks = state.hooks.clone();
+                (hooks.close)();
                 0
             }
             WM_SIZE => {
