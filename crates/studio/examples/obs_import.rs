@@ -72,6 +72,24 @@ fn main() -> Result<()> {
     // The ramp again, cut on three sides and padded on top by OBS's Crop/Pad filter, then turned.
     let cut = c.add_source("Keyed", "image_source", "Cut", &json!({ "file": ramp.display().to_string() }), false)?;
     c.add_filter("Cut", "crop_filter", "Crop", &json!({ "left": 30, "top": -20, "right": 10, "bottom": 40 }))?;
+    // OBS's Image Mask/Blend on it: a soft round picture as its brightness mask, tinted.
+    let mask = out.join("mask.png");
+    let px: Vec<u8> = (0..120u32)
+        .flat_map(|y| {
+            (0..160u32).flat_map(move |x| {
+                let d = (((x as f32 - 80.0) / 80.0).powi(2) + ((y as f32 - 60.0) / 60.0).powi(2)).sqrt();
+                let v = ((1.0 - d).clamp(0.0, 1.0) * 255.0) as u8;
+                [v, v, v, 255]
+            })
+        })
+        .collect();
+    image::save_buffer(&mask, &px, 160, 120, image::ExtendedColorType::Rgba8)?;
+    c.add_filter(
+        "Cut",
+        "mask_filter_v2",
+        "Mask",
+        &json!({ "type": "mask_color_filter.effect", "image_path": mask.display().to_string(), "color": 0x00_C0_FF_FFu32, "opacity": 0.9 }),
+    )?;
     let mut t = c.transform("Keyed", cut.id)?;
     (t.x, t.y, t.rotation) = (980.0, 380.0, 12.0);
     c.set_transform("Keyed", cut.id, &t)?;
