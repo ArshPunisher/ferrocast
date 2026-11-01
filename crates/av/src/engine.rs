@@ -4,7 +4,7 @@
 //! output), and keeps numbers on how it's doing. The caller changes things through `Engine`'s
 //! methods, from any thread.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -307,6 +307,9 @@ struct State {
     groups: Vec<String>,
     /// Sources heard whatever is on air (OBS's Desktop Audio and Mic/Aux channels).
     globals: std::collections::HashSet<u64>,
+    /// Sources a collection brought, by name: their id here and what they are (kept running
+    /// when the collection is opened again unchanged).
+    opened: HashMap<String, (u64, SourceKind)>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
     video: VideoConfig,
@@ -370,6 +373,7 @@ impl Engine {
             started: std::collections::HashMap::new(),
             groups: Vec::new(),
             globals: std::collections::HashSet::new(),
+            opened: HashMap::new(),
             outputs: Vec::new(),
             next_output: 1,
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
@@ -545,12 +549,46 @@ impl Engine {
     /// Opens an OBS scene collection (the JSON OBS and Ferrocast's Studio save): its sources,
     /// scenes and the scene on air replace what the engine had. Returns what couldn't come over
     /// (sources or filters it doesn't run yet, files that are gone).
+    /// Opened again (the Studio changed), a source with the same name and settings keeps
+    /// running: a camera doesn't blink when something else moves.
     pub fn load_obs(&self, doc: &serde_json::Value) -> Vec<String> {
-        let imported = crate::obs::import(doc, (self.config.width, self.config.height));
-        let mut skipped = imported.skipped;
-        let old: Vec<u64> = self.lock().sources.keys().copied().collect();
+        let mut imported = crate::obs::import(doc, (self.config.width, self.config.height));
+        let mut skipped = std::mem::take(&mut imported.skipped);
+        // Which imported sources are already here, running as they should; the rest get ids
+        // after every id in use.
+        let (keep, ids) = {
+            let st = self.lock();
+            let mut next = st.sources.keys().max().map_or(1, |m| m + 1);
+            let mut ids: HashMap<u64, u64> = HashMap::new();
+            let mut keep: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for src in &imported.sources {
+                match st.opened.get(&src.name) {
+                    Some((id, kind)) if *kind == src.kind && st.sources.contains_key(id) && !keep.contains(id) => {
+                        ids.insert(src.id, *id);
+                        keep.insert(*id);
+                    }
+                    _ => {
+                        ids.insert(src.id, next);
+                        next += 1;
+                    }
+                }
+            }
+            (keep, ids)
+        };
+        let old: Vec<u64> = self.lock().sources.keys().copied().filter(|id| !keep.contains(id)).collect();
         for id in old {
             self.remove_source(id);
+        }
+        let to = |id: u64| ids.get(&id).copied().unwrap_or(id);
+        for (_, items) in &mut imported.scenes {
+            for it in items.iter_mut() {
+                it.source = to(it.source);
+                for e in &mut it.effects {
+                    if let Effect::Mask { image, .. } = e {
+                        *image = to(*image);
+                    }
+                }
+            }
         }
         {
             // A fresh start: nothing on air, every scene's clock unset.
@@ -561,14 +599,18 @@ impl Engine {
             st.moving = None;
             st.groups = imported.groups;
             st.globals.clear();
+            st.opened.clear();
         }
-        for s in imported.sources {
-            match self.set_source(s.id, s.kind) {
+        for mut s in imported.sources {
+            s.id = to(s.id);
+            let started = if keep.contains(&s.id) { Ok(()) } else { self.set_source(s.id, s.kind.clone()) };
+            match started {
                 Ok(()) => {
                     if let Some(sound) = s.sound {
                         self.set_sound(s.id, sound);
                         self.set_sound_effects(s.id, &s.sound_effects);
                     }
+                    self.lock().opened.insert(s.name.clone(), (s.id, s.kind));
                 }
                 Err(e) => skipped.push(format!("{}: {e}", s.name)),
             }
@@ -1232,6 +1274,40 @@ mod tests {
         e.set_global(2, true);
         std::thread::sleep(Duration::from_millis(400));
         assert!(peak(&e) > -12.0, "global: {}", peak(&e));
+    }
+
+    #[test]
+    fn reopening_keeps_what_did_not_change() {
+        let Some(e) = engine() else { return };
+        let doc = |x: f64, blue: u32| {
+            serde_json::json!({
+                "current_program_scene": "Main",
+                "sources": [
+                    { "id": "color_source", "name": "Back", "settings": { "color": 0xFF00_00FFu32 } },
+                    { "id": "color_source", "name": "Box", "settings": { "color": blue, "width": 64, "height": 64 } },
+                    { "id": "scene", "name": "Main", "settings": { "items": [
+                        { "name": "Back" }, { "name": "Box", "pos": { "x": x, "y": 0.0 } } ] } }
+                ]
+            })
+        };
+        let ids = |e: &Engine| {
+            let st = e.lock();
+            let id = |n: &str| st.opened.get(n).map(|(i, _)| *i);
+            (id("Back"), id("Box"))
+        };
+        assert!(e.load_obs(&doc(0.0, 0xFFFF_0000)).is_empty());
+        let (back, bx) = ids(&e);
+        // Only the box moved: both keep running as they were.
+        e.load_obs(&doc(100.0, 0xFFFF_0000));
+        assert_eq!(ids(&e), (back, bx));
+        // The box's colour changed: it's made again, the background stays.
+        e.load_obs(&doc(100.0, 0xFF00_FF00));
+        let (back2, bx2) = ids(&e);
+        assert_eq!(back2, back);
+        assert_ne!(bx2, bx);
+        let px = e.snapshot_scene("Main").unwrap_or_else(|x| panic!("{x}"));
+        let at = (10 * 640 + 110) * 4;
+        assert_eq!(&px[at..at + 4], &[0, 255, 0, 255], "the new box, where it moved");
     }
 
     #[test]
