@@ -21,6 +21,7 @@ use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConf
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
 use ferrocast_golive::{Hub, Target};
 
+use crate::collection::VERTICAL_SIZE;
 use crate::{EncodeSettings, ProgramFeed, RecordPlan, RecordStats, StreamSettings, StreamStats, Studio, StudioError};
 
 /// x264 (and Lossless) run through FFmpeg, which Ferrocast fetches the first time it's needed.
@@ -152,6 +153,29 @@ struct Drawn {
     skipped: Vec<String>,
     /// A recording's plan (its names and when to split), and when the file now written began.
     plan: Option<(RecordPlan, std::time::Instant)>,
+    /// The vertical picture's scene on air, when this draws the vertical picture.
+    vertical: Option<Option<String>>,
+}
+
+/// What a drawn output is: where it goes, how it's encoded, and which picture.
+pub(crate) struct Drawing<'a> {
+    pub send_to: Option<Send<'a>>,
+    pub record: Option<&'a std::path::Path>,
+    pub encode: &'a EncodeSettings,
+    /// OBS's sound tracks (1 to 6) a recording carries; empty is track 1.
+    pub tracks: &'a [u8],
+    /// Seconds the stream is held back.
+    pub delay_s: u32,
+    /// The vertical picture (9:16, its own scenes) instead of the main one.
+    pub vertical: bool,
+}
+
+/// The vertical picture's scene on air in a saved collection.
+fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
+    doc.pointer("/ferrocast/vertical/current_scene")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// The stream on its way to Go live's hub, held back `delay` first (OBS's stream delay: what
@@ -374,17 +398,10 @@ impl OwnStream {
         })
     }
 
-    /// A stream (`send_to`) or recording (`record`) drawn by our engine from the collection
-    /// `doc` (as `Collection::save` gives it) at the Studio's canvas.
-    pub(crate) fn drawn(
-        studio: &Studio,
-        doc: &serde_json::Value,
-        send_to: Option<Send<'_>>,
-        record: Option<&std::path::Path>,
-        e: &EncodeSettings,
-        tracks: &[u8],
-        delay_s: u32,
-    ) -> Result<Self, StudioError> {
+    /// A stream or recording drawn by our engine from the collection `doc` (as
+    /// `Collection::save` gives it), as `how` says.
+    pub(crate) fn drawn(studio: &Studio, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
+        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical } = how;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -434,9 +451,16 @@ impl OwnStream {
             }
         };
         // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
-        let mut out = match e.scale {
-            Some((w, h)) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
-            None => AvCanvas::main(config),
+        let mut out = match (vertical, e.scale) {
+            // The vertical picture: its own size and its own scene on air.
+            (true, _) => AvCanvas {
+                width: VERTICAL_SIZE.0,
+                height: VERTICAL_SIZE.1,
+                scene: vertical_on_air(doc),
+                ..AvCanvas::main(config)
+            },
+            (false, Some((w, h))) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
+            (false, None) => AvCanvas::main(config),
         };
         // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
         let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
@@ -463,6 +487,7 @@ impl OwnStream {
                 on_air,
                 skipped,
                 plan: None,
+                vertical: vertical.then(|| vertical_on_air(doc)),
             }),
             hub: Some(hub),
         })
@@ -473,6 +498,16 @@ impl OwnStream {
     /// whether it was opened again. Nothing for a stream libobs draws.
     pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
         let Some(d) = self.drawn.as_mut() else { return false };
+        // The vertical picture follows its own scene on air (a cut).
+        if let Some(shown) = d.vertical.as_mut() {
+            let now = vertical_on_air(doc);
+            if now != *shown {
+                if let Err(e) = d.engine.set_output_scene(d.output, now.clone()) {
+                    tracing::warn!("Ferrocast's own engine couldn't follow the vertical scene: {e}");
+                }
+                *shown = now;
+            }
+        }
         let bare = without_on_air(doc);
         if bare != d.shown && d.opened.elapsed() >= REOPEN_EVERY {
             d.skipped = d.engine.load_obs(doc);

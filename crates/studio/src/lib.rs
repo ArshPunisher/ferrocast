@@ -2791,6 +2791,21 @@ struct Direct {
 }
 
 impl Streaming {
+    /// A stream that only our engine runs (no libobs output under it).
+    pub(crate) fn own(studio: Studio, settings: StreamSettings, own: own::OwnStream) -> Self {
+        Self {
+            studio,
+            out: std::ptr::null_mut(),
+            service: std::ptr::null_mut(),
+            venc: std::ptr::null_mut(),
+            aenc: std::ptr::null_mut(),
+            vod: std::ptr::null_mut(),
+            settings,
+            directs: Vec::new(),
+            own: Some(own),
+        }
+    }
+
     /// Changes the bitrate of the stream on air, at once (OBS's encoders take a new bitrate
     /// while running, as its dynamic bitrate does): the stream doctor's lighter bitrate helps
     /// the stream that's struggling, not only the next one.

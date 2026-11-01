@@ -217,6 +217,35 @@ impl Collection {
         self.studio.stream_of(server, key, &s, video)
     }
 
+    /// Streams the vertical picture drawn by Ferrocast's own engine (its own scenes, at its
+    /// own size), as `stream_drawn` streams the main one; `Streaming::follow` keeps it on the
+    /// vertical scene on air.
+    pub fn vertical_stream_drawn(
+        &self,
+        server: &str,
+        key: &str,
+        s: &crate::StreamSettings,
+    ) -> Result<crate::Streaming, StudioError> {
+        if self.vertical().is_none() {
+            return Err(StudioError::Failed("The vertical picture is off.".into()));
+        }
+        let mut s = s.clone();
+        s.encode.scale = None;
+        if let Some(why) = crate::own::unsupported(&s, true) {
+            return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let how = crate::own::Drawing {
+            send_to: Some(crate::own::Send { server, key, reconnect: s.reconnect }),
+            record: None,
+            encode: &s.encode,
+            tracks: &[],
+            delay_s: s.delay_s,
+            vertical: true,
+        };
+        let own = crate::own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        Ok(crate::Streaming::own(self.studio.clone(), s, own))
+    }
+
     /// The vertical scene called `name`.
     pub(super) fn vertical_scene(&self, name: &str) -> Option<*mut ffi::ObsSource> {
         let a = self.api();

@@ -1120,7 +1120,7 @@ impl DesktopStudio {
             let _ = self
                 .on_main(|h| {
                     let Some(c) = h.collection.as_ref() else { return };
-                    if let Some(s) = h.stream.as_mut().filter(|s| s.drawn()) {
+                    for s in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten().filter(|s| s.drawn()) {
                         s.follow(c);
                     }
                     if let Some((r, file, _)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
@@ -2683,7 +2683,7 @@ impl StudioHost for DesktopStudio {
                 kbps = settings.encode.video_kbps,
                 "the Studio's vertical picture starts streaming into Go live"
             );
-            h.vstream = Some(c.vertical_stream(&server, &key, &settings).map_err(|e| e.to_string())?);
+            h.vstream = Some(c.vertical_stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?);
             Ok(true)
         })
         .await?

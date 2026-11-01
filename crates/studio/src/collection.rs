@@ -3551,19 +3551,16 @@ impl Collection {
             return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
         let send = own::Send { server, key, reconnect: s.reconnect };
-        let own =
-            own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), Some(send), None, &s.encode, &[], s.delay_s)?;
-        Ok(Streaming {
-            studio: self.studio.clone(),
-            out: std::ptr::null_mut(),
-            service: std::ptr::null_mut(),
-            venc: std::ptr::null_mut(),
-            aenc: std::ptr::null_mut(),
-            vod: std::ptr::null_mut(),
-            settings: s.clone(),
-            directs: Vec::new(),
-            own: Some(own),
-        })
+        let how = own::Drawing {
+            send_to: Some(send),
+            record: None,
+            encode: &s.encode,
+            tracks: &[],
+            delay_s: s.delay_s,
+            vertical: false,
+        };
+        let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        Ok(Streaming::own(self.studio.clone(), s.clone(), own))
     }
 
     /// Records this collection drawn by Ferrocast's own engine to `path` (a crash-safe MP4), as
@@ -3572,15 +3569,15 @@ impl Collection {
         if let Some(why) = own::unsupported_recording(plan) {
             return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
-        let mut own = own::OwnStream::drawn(
-            &self.studio,
-            &self.save("Ferrocast"),
-            None,
-            Some(path),
-            &plan.encode,
-            &plan.tracks,
-            0,
-        )?;
+        let how = own::Drawing {
+            send_to: None,
+            record: Some(path),
+            encode: &plan.encode,
+            tracks: &plan.tracks,
+            delay_s: 0,
+            vertical: false,
+        };
+        let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         own.set_plan(plan);
         Ok(Recording {
             studio: self.studio.clone(),
