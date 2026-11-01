@@ -19,6 +19,8 @@ pub const TRACKS: usize = 6;
 /// Timestamps closer than this to where a source's sound would continue are taken as continuing
 /// (libobs's `TS_SMOOTHING_THRESHOLD`).
 const SMOOTHING_NS: u64 = 70_000_000;
+/// The longest gap ahead filled with silence; beyond it, the queue starts again.
+const MAX_GAP_NS: u64 = 2_000_000_000;
 /// A source never holds more than this much sound waiting (a stalled mixer can't grow memory).
 const MAX_QUEUE_SECS: usize = 5;
 /// Input frames the resampler takes at a time.
@@ -176,25 +178,36 @@ impl Mixer {
         if channels == 0 || rate == 0 || pcm.is_empty() {
             return;
         }
-        // Stereo, planar.
+        let ts = (ts_ns as i64 + src.settings.sync_offset_ns).max(0) as u64;
+        // Where this sound would continue what's queued: jitter is smoothed over; a gap ahead
+        // (a source that went quiet, beeps scheduled apart) is filled with silence, as libobs
+        // does, so nothing queued is lost; a jump back or a long jump (a seek) restarts the queue.
+        let queued = src.queue.len() / 2
+            + src.resampler.as_ref().map_or(0, |(_, _, p)| p[0].len() * out_rate as usize / rate as usize);
+        let mut gap = 0usize;
+        let at = match src.start_ns {
+            Some(start) => {
+                let expected = start + queued as u64 * 1_000_000_000 / u64::from(out_rate);
+                if ts.abs_diff(expected) < SMOOTHING_NS {
+                    None
+                } else if ts > expected && ts - expected <= MAX_GAP_NS {
+                    gap = ((ts - expected) * u64::from(rate) / 1_000_000_000) as usize;
+                    None
+                } else {
+                    Some(ts)
+                }
+            }
+            None => Some(ts),
+        };
+        // Stereo, planar, after the silence that fills a gap.
         let frames = pcm.len() / channels;
-        let (mut l, mut r) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
+        let (mut l, mut r) = (vec![0.0; gap], vec![0.0; gap]);
+        l.reserve(frames);
+        r.reserve(frames);
         for f in pcm.chunks_exact(channels) {
             l.push(f[0]);
             r.push(if channels > 1 { f[1] } else { f[0] });
         }
-        let ts = (ts_ns as i64 + src.settings.sync_offset_ns).max(0) as u64;
-        // Where this sound would continue what's queued; jitter is smoothed over, a real jump
-        // (a pause, a seek) restarts the queue.
-        let queued = src.queue.len() / 2
-            + src.resampler.as_ref().map_or(0, |(_, _, p)| p[0].len() * out_rate as usize / rate as usize);
-        let at = match src.start_ns {
-            Some(start) => {
-                let expected = start + queued as u64 * 1_000_000_000 / u64::from(out_rate);
-                if ts.abs_diff(expected) < SMOOTHING_NS { None } else { Some(ts) }
-            }
-            None => Some(ts),
-        };
         if let Some(t) = at {
             src.queue.clear();
             src.start_ns = Some(t);
@@ -408,6 +421,22 @@ mod tests {
         let first = out.iter().position(|v| *v > 0.2).unwrap_or(0);
         let lit = out[first..].iter().take_while(|v| **v > 0.2).count() / 2;
         assert_eq!(lit, 1920, "two pieces back to back");
+    }
+
+    #[test]
+    fn a_gap_ahead_is_silence_and_nothing_queued_is_lost() {
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings::default());
+        let t0 = 2_000_000_000;
+        m.mix_until(t0);
+        // Two 20 ms beeps 200 ms apart, both sent before either is mixed (as a source that
+        // schedules ahead, or one that went quiet in between).
+        m.push(1, &vec![0.3; 960 * 2], 2, RATE, t0);
+        m.push(1, &vec![0.3; 960 * 2], 2, RATE, t0 + 200_000_000);
+        let out = run(&mut m, t0, t0 + 400_000_000);
+        let lit: Vec<usize> = out.chunks(2).enumerate().filter(|(_, f)| f[0] > 0.2).map(|(i, _)| i).collect();
+        assert_eq!(lit.len(), 1920, "both beeps are heard");
+        assert_eq!(lit[960] - lit[0], 9600, "the second 200 ms after the first");
     }
 
     #[test]
