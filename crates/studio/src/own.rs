@@ -129,7 +129,7 @@ struct Drawn {
     engine: Engine,
     output: u64,
     /// The collection as last opened, without the scene on air: when it differs, it's opened
-    /// again (at most every few seconds, as that restarts its sources).
+    /// again (at most twice a second).
     shown: serde_json::Value,
     opened: std::time::Instant,
     on_air: Option<String>,
@@ -137,9 +137,9 @@ struct Drawn {
     skipped: Vec<String>,
 }
 
-/// At most how often edits reopen the collection in a drawn stream (a reopen restarts its
-/// sources; edits in between go with the next one).
-const REOPEN_EVERY: Duration = Duration::from_secs(2);
+/// At most how often edits reopen the collection in a drawn stream (edits in between go with
+/// the next one; sources that didn't change keep running).
+const REOPEN_EVERY: Duration = Duration::from_millis(500);
 
 /// A collection without which scene is on air (what a reopen depends on).
 fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
@@ -395,7 +395,7 @@ impl OwnStream {
     }
 
     /// Keeps a drawn stream with the Studio: a new scene on air goes on through the Studio's
-    /// transition; any other change opens the collection again (sources restart). Returns
+    /// transition; any other change opens the collection again (only changed sources restart). Returns
     /// whether it was opened again. Nothing for a stream libobs draws.
     pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
         let Some(d) = self.drawn.as_mut() else { return false };

@@ -2818,7 +2818,7 @@ impl Streaming {
 
     /// Keeps a stream our engine draws (`Collection::stream_drawn`) with the collection: a
     /// new scene on air goes on through the Studio's transition; any other change opens the
-    /// collection again in the engine (its sources restart). Call it after changes, or every
+    /// collection again in the engine (only changed sources restart). Call it after changes, or every
     /// second or so. Returns whether the collection was opened again; nothing for a stream
     /// libobs draws.
     pub fn follow(&mut self, c: &Collection) -> bool {

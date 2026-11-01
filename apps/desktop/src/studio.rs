@@ -1113,7 +1113,7 @@ impl DesktopStudio {
     }
 
     /// Four times a second, a stream or recording our engine draws catches up with the Studio
-    /// (scene changes go on at once; edits reopen the scenes in it, at most every 2 s).
+    /// (scene changes go on at once; edits within half a second).
     async fn own_engine_loop(&self) {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
