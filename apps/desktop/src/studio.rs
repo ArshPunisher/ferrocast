@@ -1123,8 +1123,12 @@ impl DesktopStudio {
                     if let Some(s) = h.stream.as_mut().filter(|s| s.drawn()) {
                         s.follow(c);
                     }
-                    if let Some((r, ..)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
+                    if let Some((r, file, _)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
                         r.follow(c);
+                        // A split by the plan's minutes or megabytes moves on to a new file.
+                        if r.path() != file.as_path() {
+                            *file = r.path().to_path_buf();
+                        }
                     }
                 })
                 .await;
@@ -2154,8 +2158,11 @@ impl StudioHost for DesktopStudio {
 
     async fn record_split(&self) -> Result<(), String> {
         self.on_main(|h| {
-            let r = h.record.as_ref().ok_or("Nothing is recording.")?;
-            r.0.split().map_err(|e| e.to_string())
+            let r = h.record.as_mut().ok_or("Nothing is recording.")?;
+            r.0.split().map_err(|e| e.to_string())?;
+            // The file written from now on.
+            r.1 = r.0.path().to_path_buf();
+            Ok(())
         })
         .await?
     }

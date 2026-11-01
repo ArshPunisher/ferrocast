@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p = plan("mp4");
     let path = studio.record_path(&p);
     assert!(file_name(&path).starts_with("Test 20"), "{path:?}");
-    let rec = studio.record_to(&path, &p)?;
+    let mut rec = studio.record_to(&path, &p)?;
     std::thread::sleep(Duration::from_millis(1500));
     rec.chapter("Big moment")?;
     std::thread::sleep(Duration::from_millis(1500));

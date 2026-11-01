@@ -2494,6 +2494,12 @@ impl RecordPlan {
 impl Recording {
     /// Keeps a recording our engine draws with the collection (see `Streaming::follow`).
     pub fn follow(&mut self, c: &Collection) -> bool {
+        // A new file when the plan's minutes or megabytes are reached.
+        if self.own.as_ref().is_some_and(|o| o.split_due())
+            && let Err(e) = self.split()
+        {
+            tracing::warn!("the recording couldn't go on in a new file: {e}");
+        }
         match self.own.as_mut().filter(|o| o.is_drawn()) {
             Some(o) => o.follow(&c.save("Ferrocast")),
             None => false,
@@ -2516,9 +2522,13 @@ impl Recording {
     }
 
     /// Starts a new file now (OBS's "Split recording"). Err when this format can't.
-    pub fn split(&self) -> Result<(), StudioError> {
-        if self.own.is_some() {
-            return Err(StudioError::Failed(OWN_CANT.into()));
+    pub fn split(&mut self) -> Result<(), StudioError> {
+        if let Some(o) = self.own.as_mut() {
+            let plan = o.plan().cloned().ok_or_else(|| StudioError::Failed(OWN_CANT.into()))?;
+            let next = self.studio.record_path(&plan);
+            o.split(&next)?;
+            self.path = next;
+            return Ok(());
         }
         let mut stack = [0u8; 128];
         let mut cd = ffi::CallData::fixed(&mut stack);
@@ -2564,8 +2574,8 @@ impl Recording {
     }
 
     pub fn pause(&self, on: bool) -> Result<(), StudioError> {
-        if self.own.is_some() {
-            return Err(StudioError::Failed(OWN_CANT.into()));
+        if let Some(o) = &self.own {
+            return if o.is_drawn() { o.pause(on) } else { Err(StudioError::Failed(OWN_CANT.into())) };
         }
         if self.studio.inner.api.obs_output_pause(self.out, on) {
             Ok(())

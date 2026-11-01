@@ -53,10 +53,8 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
 /// Why this recording can't use our encoders, or None when it can.
 pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
     let tracks_one = plan.tracks.is_empty() || plan.tracks == [1];
-    if !matches!(plan.format.as_str(), "mp4" | "fmp4") {
-        Some("this format (ours writes MP4)")
-    } else if plan.split_minutes > 0 || plan.split_mb > 0 {
-        Some("splitting a recording")
+    if !matches!(plan.format.as_str(), "mp4" | "fmp4" | "mkv") {
+        Some("this format (ours writes MP4 and MKV)")
     } else if !tracks_one {
         Some("more than one sound track")
     } else if !plan.muxer.trim().is_empty() {
@@ -161,6 +159,8 @@ struct Drawn {
     on_air: Option<String>,
     /// What couldn't come over.
     skipped: Vec<String>,
+    /// A recording's plan (its names and when to split), and when the file now written began.
+    plan: Option<(RecordPlan, std::time::Instant)>,
 }
 
 /// At most how often edits reopen the collection in a drawn stream (edits in between go with
@@ -417,6 +417,7 @@ impl OwnStream {
                 opened: std::time::Instant::now(),
                 on_air,
                 skipped,
+                plan: None,
             }),
             hub: Some(hub),
         })
@@ -460,6 +461,47 @@ impl OwnStream {
         }
     }
 
+    /// Keeps a recording's plan: what the next file is called, and when it splits on its own.
+    pub(crate) fn set_plan(&mut self, plan: &RecordPlan) {
+        if let Some(d) = self.drawn.as_mut() {
+            d.plan = Some((plan.clone(), std::time::Instant::now()));
+        }
+    }
+
+    pub(crate) fn plan(&self) -> Option<&RecordPlan> {
+        self.drawn.as_ref().and_then(|d| d.plan.as_ref()).map(|(p, _)| p)
+    }
+
+    /// Pauses or resumes the recording (no gap in the file).
+    pub(crate) fn pause(&self, on: bool) -> Result<(), StudioError> {
+        let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("This recording can't pause.".into()))?;
+        d.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
+    }
+
+    /// Goes on in a new file at `path` from the next frame.
+    pub(crate) fn split(&mut self, path: &std::path::Path) -> Result<(), StudioError> {
+        let d = self.drawn.as_mut().ok_or_else(|| StudioError::Failed("This recording can't be split.".into()))?;
+        d.engine.split_output(d.output, path).map_err(|e| StudioError::Failed(e.to_string()))?;
+        if let Some((_, since)) = d.plan.as_mut() {
+            *since = std::time::Instant::now();
+        }
+        tracing::info!(file = %path.display(), "the recording goes on in a new file");
+        Ok(())
+    }
+
+    /// Whether the plan says it's time for a new file (its minutes or megabytes are reached).
+    pub(crate) fn split_due(&self) -> bool {
+        let Some(d) = &self.drawn else { return false };
+        let Some((plan, since)) = &d.plan else { return false };
+        let Ok(state) = d.engine.output_record_state(d.output) else { return false };
+        if state.splitting {
+            return false;
+        }
+        let bytes = state.bytes;
+        (plan.split_minutes > 0 && since.elapsed() >= Duration::from_secs(u64::from(plan.split_minutes) * 60))
+            || (plan.split_mb > 0 && bytes >= u64::from(plan.split_mb) * 1024 * 1024)
+    }
+
     /// Whether our engine draws this (not libobs).
     pub(crate) fn is_drawn(&self) -> bool {
         self.drawn.is_some()
@@ -493,7 +535,9 @@ impl OwnStream {
 
     pub(crate) fn record_stats(&self) -> RecordStats {
         let s = self.stats();
-        RecordStats { active: s.active, paused: false, bytes: s.bytes, frames: s.frames }
+        let paused =
+            self.drawn.as_ref().is_some_and(|d| d.engine.output_record_state(d.output).is_ok_and(|r| r.paused));
+        RecordStats { active: s.active, paused, bytes: s.bytes, frames: s.frames }
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {
@@ -628,8 +672,14 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(unsupported_recording(&plan), None);
         }
-        assert!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }).is_some());
-        assert!(unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_some());
+        assert!(unsupported_recording(&RecordPlan { format: "flv".into(), ..plan.clone() }).is_some());
+        if cfg!(target_os = "macos") {
+            assert_eq!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }), None);
+        }
+        assert!(
+            unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_none()
+                == cfg!(target_os = "macos")
+        );
         assert!(unsupported_recording(&RecordPlan { tracks: vec![1, 2], ..plan.clone() }).is_some());
         // Recordings default to constant quality: ours does it on the Mac.
         let mut cq = plan.clone();
