@@ -3,6 +3,7 @@
 //! crash-safe MP4, both from the same packets. Time 0 is the first frame; sound from before it
 //! is left out, so picture and sound start together.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -43,6 +44,96 @@ pub struct Pipeline {
     key_next: bool,
     /// A new file to go on in at the next keyframe ("Split recording").
     split_to: Option<(File, bool)>,
+    /// The replay buffer's memory, when this output is one.
+    replay: Option<Replay>,
+}
+
+/// The last seconds of encoded picture and sound, kept from a keyframe on (OBS's replay buffer).
+#[derive(Debug)]
+struct Replay {
+    keep_us: i64,
+    max_bytes: usize,
+    video: VecDeque<VideoPacket>,
+    /// Sound with its track (0 is the first).
+    audio: VecDeque<(usize, AudioPacket)>,
+    bytes: usize,
+}
+
+impl Replay {
+    fn video(&mut self, p: &VideoPacket) {
+        self.bytes += p.data.len();
+        self.video.push_back(p.clone());
+        let newest = p.pts_us;
+        // Drop whole keyframe runs from the front while what's left still covers `keep_us`
+        // (or while it's over the size limit and another keyframe follows).
+        loop {
+            let next_key = self.video.iter().skip(1).position(|v| v.key).map(|i| i + 1);
+            let Some(k) = next_key else { break };
+            let long = newest - self.video[k].pts_us >= self.keep_us;
+            let big = self.max_bytes > 0 && self.bytes > self.max_bytes;
+            if !(long || big) {
+                break;
+            }
+            for v in self.video.drain(..k) {
+                self.bytes -= v.data.len();
+            }
+        }
+        let first = self.video.front().map_or(0, |v| v.dts_us.min(v.pts_us));
+        while self.audio.front().is_some_and(|(_, a)| a.pts_us < first) {
+            if let Some((_, a)) = self.audio.pop_front() {
+                self.bytes -= a.data.len();
+            }
+        }
+    }
+
+    fn audio(&mut self, track: usize, p: &AudioPacket) {
+        if self.video.is_empty() {
+            return;
+        }
+        self.bytes += p.data.len();
+        self.audio.push_back((track, p.clone()));
+    }
+}
+
+/// What a replay buffer held when asked to save: written to a file by `write`, off the
+/// engine's thread.
+#[derive(Debug)]
+pub struct ReplayClip {
+    video: VideoTrack,
+    audio: AudioTrack,
+    tracks: usize,
+    packets: Vec<VideoPacket>,
+    sound: Vec<(usize, AudioPacket)>,
+}
+
+impl ReplayClip {
+    /// Writes the clip as MP4, or MKV when `path` ends in `.mkv`; it plays from 0.
+    pub fn write(self, path: &Path) -> Result<(), AvError> {
+        let fail =
+            |e: std::io::Error| AvError::Encoder(format!("the replay couldn't be written at {} ({e})", path.display()));
+        let file = BufWriter::new(File::create(path).map_err(fail)?);
+        let mut w = Writer::new(file, is_mkv(path), self.video, vec![self.audio; self.tracks]).map_err(fail)?;
+        // In time order, as a recording receives them.
+        let mut sound = self.sound.into_iter().peekable();
+        for v in &self.packets {
+            while let Some((t, a)) = sound.next_if(|(_, a)| a.pts_us <= v.dts_us) {
+                w.audio(t, &a).map_err(fail)?;
+            }
+            w.video(v).map_err(fail)?;
+        }
+        for (t, a) in sound {
+            w.audio(t, &a).map_err(fail)?;
+        }
+        w.finish().map_err(fail)
+    }
+
+    /// Seconds of picture in the clip.
+    pub fn seconds(&self) -> f64 {
+        match (self.packets.first(), self.packets.last()) {
+            (Some(a), Some(b)) => (b.pts_us - a.pts_us) as f64 / 1e6,
+            _ => 0.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +235,43 @@ impl Pipeline {
             paused_ns: 0,
             key_next: false,
             split_to: None,
+            replay: None,
+        })
+    }
+
+    /// Makes this output a replay buffer: it keeps the last `seconds` (and at most `mb`
+    /// megabytes, 0: no limit) in memory instead of writing a file; `replay_clip` takes it.
+    pub fn keep_replay(&mut self, seconds: u32, mb: u32) {
+        self.replay = Some(Replay {
+            keep_us: i64::from(seconds.max(1)) * 1_000_000,
+            max_bytes: mb as usize * 1024 * 1024,
+            video: VecDeque::new(),
+            audio: VecDeque::new(),
+            bytes: 0,
+        });
+    }
+
+    /// What the replay buffer holds now, ready to write (None: not a replay buffer, or nothing
+    /// kept yet).
+    pub fn replay_clip(&self) -> Option<ReplayClip> {
+        let r = self.replay.as_ref()?;
+        let header = self.video.header()?;
+        let cfg = *self.video.config();
+        let acfg = *self.audio.config();
+        if r.video.is_empty() {
+            return None;
+        }
+        Some(ReplayClip {
+            video: VideoTrack { codec: cfg.codec, width: cfg.width, height: cfg.height, config: header },
+            audio: AudioTrack {
+                sample_rate: acfg.sample_rate,
+                channels: acfg.channels,
+                config: self.audio.header(),
+                bitrate_kbps: acfg.bitrate_kbps,
+            },
+            tracks: 1 + self.extra.len(),
+            packets: r.video.iter().cloned().collect(),
+            sound: r.audio.iter().cloned().collect(),
         })
     }
 
@@ -329,6 +457,9 @@ impl Pipeline {
     }
 
     fn record_video(&mut self, p: &VideoPacket) {
+        if let Some(r) = self.replay.as_mut() {
+            r.video(p);
+        }
         let header = self.video.header();
         let cfg = *self.video.config();
         let acfg = *self.audio.config();
@@ -383,6 +514,9 @@ impl Pipeline {
     }
 
     fn record_audio(&mut self, track: usize, p: AudioPacket) {
+        if let Some(r) = self.replay.as_mut() {
+            r.audio(track, &p);
+        }
         match &mut self.recording {
             Some(Recording::Waiting { held, .. }) => held.push((track, p)),
             Some(Recording::On(w)) => {

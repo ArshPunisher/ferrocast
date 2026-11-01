@@ -199,8 +199,11 @@ fn animated(it: &SceneItem, ms: u64) -> (Placement, f32) {
 pub enum OutputKind {
     /// Tags for a stream (Go live's hub takes them: `Hub::video` / `Hub::audio`).
     Stream(Box<dyn FnMut(Tag) + Send>),
-    /// A crash-safe MP4.
+    /// A crash-safe MP4 (MKV when the name ends in `.mkv`).
     Record(PathBuf),
+    /// A replay buffer: the last `seconds` kept in memory (at most `mb` megabytes, 0: no
+    /// limit), saved with `Engine::replay_clip`.
+    Replay { seconds: u32, mb: u32 },
 }
 
 impl std::fmt::Debug for OutputKind {
@@ -208,6 +211,7 @@ impl std::fmt::Debug for OutputKind {
         match self {
             Self::Stream(_) => f.write_str("Stream"),
             Self::Record(p) => f.debug_tuple("Record").field(p).finish(),
+            Self::Replay { seconds, mb } => f.debug_struct("Replay").field("seconds", seconds).field("mb", mb).finish(),
         }
     }
 }
@@ -764,7 +768,7 @@ impl Engine {
         }
         let record = match &kind {
             OutputKind::Record(p) => Some(p.clone()),
-            OutputKind::Stream(_) => None,
+            OutputKind::Stream(_) | OutputKind::Replay { .. } => None,
         };
         let video = VideoConfig {
             width: canvas.width,
@@ -773,9 +777,16 @@ impl Engine {
             fps_den: 1,
             ..st.video
         };
-        // Extra tracks only mean something in a file.
-        let more = if record.is_some() { canvas.more_tracks.len() } else { 0 };
-        let pipe = Pipeline::with_tracks(video, st.audio, record.as_deref(), more)?;
+        // Extra tracks only mean something in a file (a recording, or a saved replay).
+        let replay = match &kind {
+            OutputKind::Replay { seconds, mb } => Some((*seconds, *mb)),
+            _ => None,
+        };
+        let more = if record.is_some() || replay.is_some() { canvas.more_tracks.len() } else { 0 };
+        let mut pipe = Pipeline::with_tracks(video, st.audio, record.as_deref(), more)?;
+        if let Some((seconds, mb)) = replay {
+            pipe.keep_replay(seconds, mb);
+        }
         let id = st.next_output;
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
@@ -803,6 +814,14 @@ impl Engine {
             .ok_or_else(|| AvError::Source(format!("there's no output {id}")))?;
         canvas.scene = scene;
         Ok(())
+    }
+
+    /// What a replay buffer output holds now, to write with `ReplayClip::write` (off this
+    /// thread: it can be tens of megabytes).
+    pub fn replay_clip(&self, id: u64) -> Result<crate::pipeline::ReplayClip, AvError> {
+        self.with_output(id, |pipe| {
+            pipe.replay_clip().ok_or_else(|| AvError::Encoder("the replay buffer has nothing kept yet".into()))
+        })
     }
 
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
@@ -1844,5 +1863,31 @@ mod tests {
         };
         assert!(a[0] > 200 && a[2] < 60, "red first: {:?}", &a[..3]);
         assert!(b[2] > 200 && b[0] < 60, "then blue: {:?}", &b[..3]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_replay_buffer_keeps_the_last_seconds() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 500, beep_ms: 100 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let id = e.start_output(OutputKind::Replay { seconds: 2, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(4500));
+        let clip = e.replay_clip(id).unwrap_or_else(|x| panic!("{x}"));
+        // From a keyframe (one a second here): 2 s, up to a second more.
+        assert!((1.9..3.1).contains(&clip.seconds()), "{} s kept", clip.seconds());
+        let file = std::env::temp_dir().join("ferrocast-av-replay.mkv");
+        clip.write(&file).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let Some((secs, av)) = probed(&file) else {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        };
+        assert!(av && (1.9..3.2).contains(&secs), "{secs:.2} s");
+        assert!(mean_db(&file, 0).is_some_and(|db| db > -40.0), "the sound came along");
     }
 }
