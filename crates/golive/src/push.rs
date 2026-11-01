@@ -267,9 +267,10 @@ pub(crate) fn now_ms() -> u64 {
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
-    let tcp = match via {
-        None => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
-        Some(n) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
+    let tcp = match (via, t.pin) {
+        (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
+        (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
+        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
     }
     .map_err(|_| PushError::Slow(host.clone()))?
     .map_err(|_| PushError::Unreachable(host.clone()))?;
