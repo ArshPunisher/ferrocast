@@ -225,6 +225,14 @@ impl Shared {
         self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Keeps a source shown alone (a projector of it) through reopens.
+    pub(crate) fn keep_alone(&self, name: &str) {
+        let mut seen = self.seen();
+        if !seen.alone.iter().any(|n| n == name) {
+            seen.alone.push(name.to_string());
+        }
+    }
+
     pub(crate) fn skipped(&self) -> Vec<String> {
         self.seen().skipped.clone()
     }
@@ -362,7 +370,7 @@ fn alone_scene(name: &str) -> String {
 /// Shows a scene, or a source alone, for a Source Record → the scene to draw and the size: a
 /// scene at `canvas`; a source at its own size (waited for up to 2 s while it starts; `canvas`
 /// if it has none by then), even-sided for the encoder.
-fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Result<(String, u32, u32), StudioError> {
+pub(crate) fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Result<(String, u32, u32), StudioError> {
     if engine.scene_names().iter().any(|s| s == name) {
         return Ok((name.to_string(), canvas.0, canvas.1));
     }

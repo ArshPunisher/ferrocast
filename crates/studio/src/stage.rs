@@ -2645,6 +2645,89 @@ impl Drop for StageView {
     }
 }
 
+/// A projector: a window of its own (or a display, full screen) showing what's on air, a scene,
+/// or a source alone, drawn by our engine. Closed when dropped.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct StageProjector {
+    shared: Arc<own::Shared>,
+    id: u64,
+    win: crate::ffi::projector_window::Win,
+}
+
+#[cfg(target_os = "macos")]
+impl Stage {
+    /// Opens a projector of `of` on `screen` (full screen) or in a window; `on_close` runs when
+    /// it's closed there (Esc, the window's button). Main thread. The multiview isn't drawn by
+    /// our engine yet.
+    pub fn projector(
+        &self,
+        of: &crate::ProjectorOf,
+        screen: Option<usize>,
+        on_close: Box<dyn Fn()>,
+    ) -> Result<StageProjector, StudioError> {
+        use crate::ProjectorOf as P;
+        let shared = self.engine()?;
+        let (title, scene, size) = match of {
+            P::Program => ("Projector: what's on air".to_string(), None, (self.canvas.width, self.canvas.height)),
+            P::Multiview => return Err(fail("The multiview isn't in Ferrocast's own engine yet.")),
+            P::Source(name) => {
+                let canvas = self.canvas_of(name);
+                let (scene, w, h) = own::show_alone(&shared.engine, name, canvas)?;
+                shared.keep_alone(name);
+                (format!("Projector: {name}"), Some(scene), (w, h))
+            }
+        };
+        let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
+        // Resizes reach the engine once the preview is there.
+        let id_cell = std::rc::Rc::new(std::cell::Cell::new(None::<u64>));
+        let resize = {
+            let (shared, id_cell) = (shared.clone(), id_cell.clone());
+            Box::new(move |w: u32, h: u32| {
+                if let Some(id) = id_cell.get() {
+                    shared.engine.resize_preview(id, w, h);
+                }
+            })
+        };
+        let hooks = crate::ffi::projector_window::Hooks { click: Box::new(|_, _, _, _| {}), close: on_close, resize };
+        let win = crate::ffi::projector_window::open(&title, aspect, screen, hooks)
+            .ok_or_else(|| fail("The projector's window couldn't be made."))?;
+        let (pw, ph) = win.pixels();
+        // SAFETY: the window's view lives as long as the StageProjector, which stops the engine
+        // drawing in it before the window goes (`Drop`).
+        #[allow(unsafe_code)]
+        let id = unsafe { shared.engine.start_preview_of(win.view_ptr(), pw, ph, size, scene) }
+            .map_err(|e| fail(format!("the projector couldn't be drawn: {e}")))?;
+        id_cell.set(Some(id));
+        shared.engine.set_preview_look(
+            id,
+            ferrocast_av::preview::PreviewLook { background: [0.0, 0.0, 0.0, 1.0], ..Default::default() },
+        );
+        Ok(StageProjector { shared, id, win })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl StageProjector {
+    /// Its window's number (to screenshot it in checks).
+    pub fn window_number(&self) -> isize {
+        self.win.number()
+    }
+
+    /// Keeps the window above the others, or not.
+    pub fn set_on_top(&self, on: bool) {
+        self.win.set_on_top(on);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StageProjector {
+    fn drop(&mut self) {
+        self.shared.engine.stop_preview(self.id);
+        self.win.close();
+    }
+}
+
 /// Off a Mac our engine draws no preview yet: the view can't be made (its calls are the same,
 /// so the app builds everywhere).
 #[cfg(not(target_os = "macos"))]
