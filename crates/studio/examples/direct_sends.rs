@@ -58,9 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     for (id, url) in sends {
         let Some(url) = url.filter(|u| !u.is_empty()) else { continue };
+        // FERROCAST_SRT_KEY, FERROCAST_RIST_KEY, FERROCAST_WHIP_KEY: each one's key (a stream id,
+        // a passphrase or login password, a token).
+        let key = std::env::var(format!("FERROCAST_{}_KEY", id.to_uppercase())).unwrap_or_default();
         let added = match (&lighter, id) {
-            (Some(l), "whip") => live.add_direct_layered(id, url, "", l),
-            _ => live.add_direct(id, url, ""),
+            (Some(l), "whip") => live.add_direct_layered(id, url, &key, l),
+            _ => live.add_direct(id, url, &key),
         };
         match added {
             Ok(()) => println!("{id}: added {url}"),

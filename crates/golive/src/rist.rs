@@ -8,6 +8,9 @@
 //!   PBKDF2-HMAC-SHA256). Picked by `profile=1`, or by a passphrase (the key, or `secret=`);
 //!   `aes-type=` 128 or 256 (the default, as librist).
 //!
+//! The main profile also logs in with `username=` (the key its password), as librist's EAP-SRP
+//! does: the stream waits for the login, and a `secret=` beside it still encrypts.
+//!
 //! Either profile goes over two connections at once with `via=` (`via=en0,en7`): every packet
 //! by each, the receiver keeping the first copy (SMPTE 2022-7 style; librist merges them), so
 //! the stream rides out one of them dropping.
@@ -57,6 +60,8 @@ impl Shared {
     async fn send_rtp(&self, p: &[u8]) -> std::io::Result<()> {
         let wrapped;
         let p = match &self.main {
+            // Not a packet before logging in: none goes out in the clear.
+            Some(m) if !m.ready() => return Ok(()),
             Some(m) => {
                 wrapped = m.wrap(DATA_SRC_PORT, DATA_DST_PORT, p);
                 &wrapped[..]
@@ -126,10 +131,11 @@ pub(crate) async fn session(
         main,
     });
     let mut sink = RistSink { shared: shared.clone(), seq: fastrand::u16(..), started: Instant::now(), name };
-    // Answering runs beside sending, and stops with it however the session ends.
+    // Answering runs beside sending, and stops with it however the session ends (or ends it,
+    // when the receiver refuses the login).
     tokio::select! {
         out = feed_ts(hub, health, stream, &mut sink) => out,
-        () = answer(shared.clone(), rtcp, rtcp_to, health) => Ok(Ended::StreamEnded),
+        e = answer(shared.clone(), rtcp, rtcp_to, health) => Err(e),
     }
 }
 
@@ -175,7 +181,9 @@ pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
     let here = sock.local_addr().map(|l| l.port()).unwrap_or(0);
     let ssrc = fastrand::u32(..) & !1;
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // A login takes a few round trips more.
+    let wait = if main.as_ref().is_some_and(|m| m.login.is_some()) { 6 } else { 3 };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     let mut again = tokio::time::interval(Duration::from_millis(500));
     let (mut buf, mut unread) = (vec![0u8; 2048], 0u32);
     loop {
@@ -194,6 +202,15 @@ pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
                 if from.ip() != to.ip() {
                     continue;
                 }
+                // The login first, as the stream does (librist answers nothing else before it).
+                if let Some(m) = main.as_ref().filter(|m| m.login.is_some())
+                    && let Some(eapol) = Main::login_packet(&buf[..n])
+                {
+                    for r in m.on_login(&eapol)? {
+                        let _ = sock.send_to(&r, to).await;
+                    }
+                    continue;
+                }
                 let got = match &main {
                     Some(m) => m.unwrap(&buf[..n]),
                     None => Some(buf[..n].to_vec()),
@@ -204,7 +221,8 @@ pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                return Err(if unread > 0 && main.as_ref().is_some_and(|m| m.crypt.is_some()) {
+                let encrypted = main.as_ref().is_some_and(|m| m.crypt.read().unwrap_or_else(|e| e.into_inner()).is_some());
+                return Err(if unread > 0 && encrypted {
                     DirectError::Refused(format!("{name} answered, but its answers don't open: check the passphrase."))
                 } else {
                     DirectError::Unreachable(format!("{name} (no answer: is the receiver listening, on this profile?)"))
@@ -214,14 +232,25 @@ pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
     }
 }
 
-/// The passphrase: the key, or `secret=` in the address.
+/// The login: `username=` in the address, its password the key (kept in the keychain).
+fn login_of<'a>(d: &'a Direct, a: &'a Address) -> Option<(&'a str, &'a str)> {
+    a.param("username").filter(|u| !u.is_empty()).map(|u| (u, d.key.trim()))
+}
+
+/// The passphrase: the key, or `secret=` in the address (with a login only `secret=`: the key
+/// is its password).
 fn passphrase<'a>(d: &'a Direct, a: &'a Address) -> Option<&'a str> {
+    if login_of(d, a).is_some() {
+        return a.param("secret").filter(|s| !s.is_empty());
+    }
     Some(d.key.trim()).filter(|k| !k.is_empty()).or_else(|| a.param("secret").filter(|s| !s.is_empty()))
 }
 
-/// Whether the address asks for the main profile (or a passphrase needs it).
+/// Whether the address asks for the main profile (or a passphrase or login needs it).
 fn wants_main(d: &Direct, a: &Address) -> bool {
-    passphrase(d, a).is_some() || a.param("profile").is_some_and(|p| p == "1" || p.eq_ignore_ascii_case("main"))
+    passphrase(d, a).is_some()
+        || login_of(d, a).is_some()
+        || a.param("profile").is_some_and(|p| p == "1" || p.eq_ignore_ascii_case("main"))
 }
 
 /// What can't work whatever the network does: an unknown profile, a bad key size or passphrase,
@@ -233,6 +262,14 @@ pub(crate) fn check(d: &Direct, a: &Address) -> Result<(), DirectError> {
         return Err(DirectError::Address(format!(
             "Ferrocast sends RIST's simple (profile=0) or main (profile=1) profile, not profile={p}."
         )));
+    }
+    if let Some((_, password)) = login_of(d, a) {
+        if password.is_empty() {
+            return Err(DirectError::Address("A RIST username needs its password: put it in the key.".into()));
+        }
+        if a.param("profile").is_some_and(|p| p == "0" || p.eq_ignore_ascii_case("simple")) {
+            return Err(DirectError::Address("A RIST login needs the main profile: leave profile=0 out.".into()));
+        }
     }
     if let Some(bits) = a.param("aes-type").filter(|b| !matches!(*b, "128" | "256")) {
         return Err(DirectError::Address(format!("RIST's aes-type is 128 or 256, not {bits}.")));
@@ -264,9 +301,18 @@ const PBKDF2_ROUNDS: u32 = 1024;
 /// The shortest time between two keys made for the receiver's nonces.
 const REKEY_EVERY: Duration = Duration::from_millis(10);
 
-/// The main profile's GRE wrapping, and with a passphrase its encryption.
+/// GRE's protocol for EAPOL (the login).
+const GRE_EAPOL: u16 = 0x888E;
+
+/// The main profile's GRE wrapping, and with a passphrase (or a login's key) its encryption.
 struct Main {
-    crypt: Option<Crypt>,
+    crypt: std::sync::RwLock<Option<Crypt>>,
+    /// A username and password: no stream goes out until logged in, then the login's key
+    /// encrypts it (a new one each time the receiver logs us in again).
+    login: Option<std::sync::Mutex<crate::rist_eap::Login>>,
+    /// With a login and no secret, librist encrypts its answers under the session key: ours to
+    /// read them (the stream itself goes in the clear).
+    answers: std::sync::RwLock<Option<Crypt>>,
     /// GRE's sequence number: one count over every packet sent (the AES counter's top half).
     seq: AtomicU32,
 }
@@ -285,23 +331,85 @@ struct Crypt {
     rx: std::sync::Mutex<Option<RxKey>>,
 }
 
+impl Crypt {
+    /// `pass` with a fresh random nonce (top bit clear: the "even" key).
+    fn new(pass: &[u8], size: usize) -> Self {
+        let mut nonce = [0u8; 4];
+        while nonce == [0; 4] {
+            nonce = fastrand::u32(..).to_be_bytes();
+            nonce[0] &= 0x7F;
+        }
+        let key = aes_key(pass, &nonce, size);
+        Crypt { pass: pass.to_vec(), size, tx: (nonce, key), rx: std::sync::Mutex::new(None) }
+    }
+}
+
 impl Main {
     fn of(d: &Direct, a: &Address) -> Option<Self> {
         if !wants_main(d, a) {
             return None;
         }
-        let crypt = passphrase(d, a).map(|pass| {
-            // 256 bits unless told otherwise, as librist.
-            let size = if a.param("aes-type") == Some("128") { 16 } else { 32 };
-            let mut nonce = [0u8; 4];
-            while nonce == [0; 4] {
-                nonce = fastrand::u32(..).to_be_bytes();
-                nonce[0] &= 0x7F;
+        // 256 bits unless told otherwise, as librist.
+        let size = if a.param("aes-type") == Some("128") { 16 } else { 32 };
+        let crypt = passphrase(d, a).map(|pass| Crypt::new(pass.as_bytes(), size));
+        let secret = passphrase(d, a).map(str::as_bytes);
+        let login = login_of(d, a).map(|(u, p)| std::sync::Mutex::new(crate::rist_eap::Login::new(u, p, secret)));
+        Some(Self {
+            crypt: std::sync::RwLock::new(crypt),
+            login,
+            answers: std::sync::RwLock::new(None),
+            seq: AtomicU32::new(fastrand::u32(..)),
+        })
+    }
+
+    /// The stream may go out: no login, or logged in.
+    fn ready(&self) -> bool {
+        self.login.is_none() || self.logged_in()
+    }
+
+    /// A login packet (EAPOL) as GRE: never encrypted, as librist sends it.
+    fn wrap_login(&self, eapol: &[u8]) -> Vec<u8> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let mut p = vec![0x10, 1 << 3];
+        p.extend_from_slice(&GRE_EAPOL.to_be_bytes());
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(eapol);
+        p
+    }
+
+    /// What a GRE packet carries when it's the login (EAPOL, in the clear).
+    fn login_packet(p: &[u8]) -> Option<Vec<u8>> {
+        let (flags1, flags2) = (*p.first()?, *p.get(1)?);
+        if u16::from_be_bytes([*p.get(2)?, *p.get(3)?]) != GRE_EAPOL || flags1 & 0x60 != 0 || flags2 & 0x07 != 0 {
+            return None;
+        }
+        let at = 4 + if flags1 & 0x80 != 0 { 4 } else { 0 } + if flags1 & 0x10 != 0 { 4 } else { 0 };
+        p.get(at..).map(<[u8]>::to_vec)
+    }
+
+    /// A login packet from the receiver: what to send back (as GRE), a new key taken; Err when
+    /// it refused us.
+    fn on_login(&self, eapol: &[u8]) -> Result<Vec<Vec<u8>>, DirectError> {
+        let Some(login) = &self.login else { return Ok(Vec::new()) };
+        let (step, key) = {
+            let mut l = login.lock().unwrap_or_else(|e| e.into_inner());
+            (l.handle(eapol).map_err(DirectError::Refused)?, l.key())
+        };
+        // No secret: the receiver's answers come under the session key (256 bits).
+        if let Some(k) = key
+            && self.crypt.read().unwrap_or_else(|e| e.into_inner()).is_none()
+        {
+            let mut answers = self.answers.write().unwrap_or_else(|e| e.into_inner());
+            if answers.as_ref().is_none_or(|c| c.pass != k) {
+                *answers = Some(Crypt::new(&k, 32));
             }
-            let key = aes_key(pass.as_bytes(), &nonce, size);
-            Crypt { pass: pass.as_bytes().to_vec(), size, tx: (nonce, key), rx: std::sync::Mutex::new(None) }
-        });
-        Some(Self { crypt, seq: AtomicU32::new(fastrand::u32(..)) })
+        }
+        Ok(step.replies.iter().map(|r| self.wrap_login(r)).collect())
+    }
+
+    /// Logged in (the receiver proved itself).
+    fn logged_in(&self) -> bool {
+        self.login.as_ref().is_some_and(|l| l.lock().unwrap_or_else(|e| e.into_inner()).authenticated)
     }
 
     /// `inner` (RTP or RTCP) as a GRE packet (version 1, reduced header with the virtual ports).
@@ -309,13 +417,14 @@ impl Main {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let mut p = Vec::with_capacity(16 + inner.len());
         // Flags: sequence number (bit 4), key (bit 5); version 1, and H for a 256-bit key.
-        let (flags1, flags2) = match &self.crypt {
+        let crypt = self.crypt.read().unwrap_or_else(|e| e.into_inner());
+        let (flags1, flags2) = match crypt.as_ref() {
             Some(c) => (0x30, 1 << 3 | if c.size == 32 { 0x40 } else { 0 }),
             None => (0x10, 1 << 3),
         };
         p.extend_from_slice(&[flags1, flags2]);
         p.extend_from_slice(&GRE_REDUCED.to_be_bytes());
-        if let Some(c) = &self.crypt {
+        if let Some(c) = crypt.as_ref() {
             p.extend_from_slice(&c.tx.0);
         }
         p.extend_from_slice(&seq.to_be_bytes());
@@ -323,7 +432,7 @@ impl Main {
         p.extend_from_slice(&src_port.to_be_bytes());
         p.extend_from_slice(&dst_port.to_be_bytes());
         p.extend_from_slice(inner);
-        if let Some(c) = &self.crypt {
+        if let Some(c) = crypt.as_ref() {
             aes_ctr(&c.tx.1, seq, &mut p[body..]);
         }
         p
@@ -353,7 +462,11 @@ impl Main {
             None
         };
         let mut body = p.get(at..)?.to_vec();
-        match (&self.crypt, nonce, seq) {
+        let (crypt, answers) = (
+            self.crypt.read().unwrap_or_else(|e| e.into_inner()),
+            self.answers.read().unwrap_or_else(|e| e.into_inner()),
+        );
+        match (crypt.as_ref().or(answers.as_ref()), nonce, seq) {
             (Some(c), Some(nonce), Some(seq)) if nonce != [0; 4] => {
                 // The receiver's own key size: H set is 256 bits (librist's default), else ours.
                 let size = if flags2 & 0x40 != 0 { 32 } else { c.size };
@@ -548,7 +661,15 @@ pub(crate) fn lost(buf: &[u8]) -> Vec<u16> {
 }
 
 /// Sends reports, and sends again what the receiver asks for.
-async fn answer(shared: Arc<Shared>, rtcp: Vec<Arc<UdpSocket>>, rtcp_to: SocketAddr, health: &watch::Sender<Health>) {
+/// How long the login may take before the session gives up.
+const LOGIN_DEADLINE: Duration = Duration::from_secs(10);
+
+async fn answer(
+    shared: Arc<Shared>,
+    rtcp: Vec<Arc<UdpSocket>>,
+    rtcp_to: SocketAddr,
+    health: &watch::Sender<Health>,
+) -> DirectError {
     let started = Instant::now();
     // Every connection's answers into one queue (the readers stop when this does).
     let (tx, mut answers) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(256);
@@ -578,6 +699,18 @@ async fn answer(shared: Arc<Shared>, rtcp: Vec<Arc<UdpSocket>>, rtcp_to: SocketA
     loop {
         tokio::select! {
             _ = every_second.tick() => {
+                // Logging in: hello again each second until the receiver answers, for so long.
+                if let Some(m) = shared.main.as_ref().filter(|m| m.login.is_some() && !m.logged_in()) {
+                    if started.elapsed() > LOGIN_DEADLINE {
+                        return DirectError::Refused(format!(
+                            "{rtcp_to} didn't answer the login: is it set for a username (the main profile)?"
+                        ));
+                    }
+                    let hello = m.wrap_login(&crate::rist_eap::Login::start());
+                    for s in &rtcp {
+                        let _ = s.send_to(&hello, rtcp_to).await;
+                    }
+                }
                 let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
                 let now = (load(&shared.sent), load(&shared.asked), load(&shared.resent));
                 let sent = now.0.saturating_sub(counted.0).max(1) as f32;
@@ -593,6 +726,8 @@ async fn answer(shared: Arc<Shared>, rtcp: Vec<Arc<UdpSocket>>, rtcp_to: SocketA
                 }
             }
             _ = tick.tick() => {
+                // Before logging in too: a report is what makes librist meet us and start the
+                // login (the stream itself waits for it).
                 let mut r = report(shared.ssrc, started);
                 r.extend_from_slice(&echo_request(shared.ssrc));
                 // Over every connection, so the receiver knows each way back.
@@ -608,6 +743,22 @@ async fn answer(shared: Arc<Shared>, rtcp: Vec<Arc<UdpSocket>>, rtcp_to: SocketA
             Some((buf, from)) = answers.recv() => {
                 // Only the receiver's answers (a stranger's packets could make us work for nothing).
                 if from.ip() != rtcp_to.ip() {
+                    continue;
+                }
+                // The login (again every minute, for a new key): answered over every connection.
+                if let Some(m) = shared.main.as_ref().filter(|m| m.login.is_some())
+                    && let Some(eapol) = Main::login_packet(&buf)
+                {
+                    match m.on_login(&eapol) {
+                        Ok(replies) => {
+                            for r in &replies {
+                                for s in &rtcp {
+                                    let _ = s.send_to(r, rtcp_to).await;
+                                }
+                            }
+                        }
+                        Err(e) => return e,
+                    }
                     continue;
                 }
                 let got = match &shared.main {

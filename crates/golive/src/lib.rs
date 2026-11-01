@@ -21,6 +21,8 @@ pub mod push;
 pub mod quality;
 pub mod reach;
 mod rist;
+mod rist_eap;
+mod rist_srp;
 pub mod target;
 pub mod ts;
 mod whip;
