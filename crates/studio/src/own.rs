@@ -31,8 +31,6 @@ const NO_FFMPEG: &str =
 pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'static str> {
     if !main_canvas {
         Some("the vertical picture's stream")
-    } else if s.delay_s > 0 {
-        Some("a stream delay")
     } else if s.vod_track.is_some() {
         Some("Twitch's VOD track")
     } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&s.encode.video_encoder) {
@@ -154,6 +152,51 @@ struct Drawn {
     skipped: Vec<String>,
     /// A recording's plan (its names and when to split), and when the file now written began.
     plan: Option<(RecordPlan, std::time::Instant)>,
+}
+
+/// The stream on its way to Go live's hub, held back `delay` first (OBS's stream delay: what
+/// you do shows that much later, so viewers can't snipe). Ending sends what's still held, so
+/// the last seconds aren't lost.
+struct Delayed {
+    hub: Arc<Hub>,
+    counts: Arc<Counts>,
+    delay: Duration,
+    held: std::collections::VecDeque<(std::time::Instant, Tag)>,
+}
+
+impl Delayed {
+    fn send(&mut self, t: Tag) {
+        if self.delay.is_zero() {
+            return self.pass(t);
+        }
+        self.held.push_back((std::time::Instant::now(), t));
+        while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
+            if let Some((_, t)) = self.held.pop_front() {
+                self.pass(t);
+            }
+        }
+    }
+
+    fn pass(&self, t: Tag) {
+        match t {
+            Tag::Video { ms, body } => {
+                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                self.hub.video(ms, body.into());
+            }
+            Tag::Audio { ms, body } => {
+                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                self.hub.audio(ms, body.into());
+            }
+        }
+    }
+}
+
+impl Drop for Delayed {
+    fn drop(&mut self) {
+        while let Some((_, t)) = self.held.pop_front() {
+            self.pass(t);
+        }
+    }
 }
 
 /// At most how often edits reopen the collection in a drawn stream (edits in between go with
@@ -340,6 +383,7 @@ impl OwnStream {
         record: Option<&std::path::Path>,
         e: &EncodeSettings,
         tracks: &[u8],
+        delay_s: u32,
     ) -> Result<Self, StudioError> {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
@@ -380,17 +424,13 @@ impl OwnStream {
         let kind = match record {
             Some(p) => OutputKind::Record(p.to_path_buf()),
             None => {
-                let (hub, counts) = (hub.clone(), counts.clone());
-                OutputKind::Stream(Box::new(move |t: Tag| match t {
-                    Tag::Video { ms, body } => {
-                        counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                        hub.video(ms, body.into());
-                    }
-                    Tag::Audio { ms, body } => {
-                        counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                        hub.audio(ms, body.into());
-                    }
-                }))
+                let mut out = Delayed {
+                    hub: hub.clone(),
+                    counts: counts.clone(),
+                    delay: Duration::from_secs(u64::from(delay_s)),
+                    held: std::collections::VecDeque::new(),
+                };
+                OutputKind::Stream(Box::new(move |t: Tag| out.send(t)))
             }
         };
         // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
@@ -651,6 +691,25 @@ mod tests {
     }
 
     #[test]
+    fn a_delayed_stream_holds_back_then_sends_the_rest_at_the_end() {
+        let counts = Arc::new(Counts::default());
+        let mut out = Delayed {
+            hub: Hub::new(),
+            counts: counts.clone(),
+            delay: Duration::from_millis(200),
+            held: std::collections::VecDeque::new(),
+        };
+        let sent = || counts.bytes.load(Ordering::Relaxed);
+        out.send(Tag::Video { ms: 0, body: vec![0; 10] });
+        assert_eq!(sent(), 0, "held back");
+        std::thread::sleep(Duration::from_millis(250));
+        out.send(Tag::Audio { ms: 250, body: vec![0; 5] });
+        assert_eq!(sent(), 10, "the first goes once it's 200 ms old; the second waits");
+        drop(out);
+        assert_eq!(sent(), 15, "ending sends what's left");
+    }
+
+    #[test]
     fn only_what_ours_does_goes_through_ours() {
         let hw = "com.apple.videotoolbox.videoencoder.ave.avc";
         if cfg!(target_os = "macos") {
@@ -664,7 +723,6 @@ mod tests {
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));
         assert!(unsupported(&extra, true).is_some());
-        assert!(unsupported(&StreamSettings { delay_s: 5, ..settings(hw) }, true).is_some());
         assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_some());
     }
 

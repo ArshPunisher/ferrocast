@@ -3551,7 +3551,8 @@ impl Collection {
             return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
         let send = own::Send { server, key, reconnect: s.reconnect };
-        let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), Some(send), None, &s.encode, &[])?;
+        let own =
+            own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), Some(send), None, &s.encode, &[], s.delay_s)?;
         Ok(Streaming {
             studio: self.studio.clone(),
             out: std::ptr::null_mut(),
@@ -3571,8 +3572,15 @@ impl Collection {
         if let Some(why) = own::unsupported_recording(plan) {
             return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
-        let mut own =
-            own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), None, Some(path), &plan.encode, &plan.tracks)?;
+        let mut own = own::OwnStream::drawn(
+            &self.studio,
+            &self.save("Ferrocast"),
+            None,
+            Some(path),
+            &plan.encode,
+            &plan.tracks,
+            0,
+        )?;
         own.set_plan(plan);
         Ok(Recording {
             studio: self.studio.clone(),
