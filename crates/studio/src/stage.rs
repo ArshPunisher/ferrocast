@@ -1211,6 +1211,212 @@ impl StageOutput {
     }
 }
 
+/// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS). Its
+/// outlines and handles come from the stage's own items. Removed when dropped.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct StageView {
+    shared: Arc<own::Shared>,
+    id: u64,
+    view: crate::ffi::mac::ChildView,
+    look: RefCell<ViewLook>,
+}
+
+/// What a view keeps to draw round and over the picture.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct ViewLook {
+    background: [f32; 4],
+    /// Where the canvas is in the view (device pixels), when the page says.
+    area: Option<(f32, f32, f32, f32)>,
+    margin: f32,
+    /// The scene and items picked (outlined with handles).
+    picked: Option<(String, Vec<i64>)>,
+    /// A scene whose sources all get an outline.
+    frames: Option<String>,
+    shade: f32,
+    /// The scene shown instead of what's on air (Studio Mode), and the canvas it's on.
+    scene: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl Stage {
+    /// A preview of the stage over `window`'s page at `rect` (points), `scale` its pixels per
+    /// point: what's on air, or `scene` (Studio Mode's preview).
+    pub fn view(
+        &self,
+        window: raw_window_handle::RawWindowHandle,
+        rect: crate::Rect,
+        scale: f64,
+    ) -> Result<StageView, StudioError> {
+        let raw_window_handle::RawWindowHandle::AppKit(h) = window else {
+            return Err(fail("that isn't a macOS window"));
+        };
+        let shared = self.engine()?;
+        let r = crate::with_edge(rect);
+        let view = crate::ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
+            .ok_or_else(|| fail("the preview can only be made on the main thread"))?;
+        let (cx, cy) = view.pixels().unwrap_or_else(|| crate::px(r, scale));
+        let size = (self.canvas.width, self.canvas.height);
+        // SAFETY: the view lives as long as the StageView, which stops the engine drawing in it
+        // before it goes (`Drop`).
+        #[allow(unsafe_code)]
+        let started = unsafe { shared.engine.start_preview_of(view.ptr(), cx, cy, size, None) };
+        let id = match started {
+            Ok(id) => id,
+            Err(e) => {
+                view.remove();
+                return Err(fail(format!("the preview couldn't be made: {e}")));
+            }
+        };
+        let look = ViewLook {
+            background: [10.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0],
+            margin: crate::edge_px(scale) as f32,
+            ..Default::default()
+        };
+        let v = StageView { shared, id, view, look: RefCell::new(look) };
+        v.refresh(self);
+        Ok(v)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl StageView {
+    /// Moves or resizes it (the page's box changed). Main thread.
+    pub fn set_rect(&self, stage: &Stage, rect: crate::Rect, scale: f64) {
+        let r = crate::with_edge(rect);
+        self.view.set_frame(r.x, r.y, r.w, r.h, r.vh);
+        {
+            let mut l = self.look.borrow_mut();
+            l.area = None;
+            l.margin = crate::edge_px(scale) as f32;
+        }
+        let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(r, scale));
+        self.shared.engine.resize_preview(self.id, cx, cy);
+        self.refresh(stage);
+    }
+
+    /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
+    /// from the area's top left). Main thread.
+    pub fn set_area(&self, stage: &Stage, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+        self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        self.look.borrow_mut().area =
+            Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
+        let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(area, scale));
+        self.shared.engine.resize_preview(self.id, cx, cy);
+        self.refresh(stage);
+    }
+
+    /// Shows `scene` instead of what's on air (Studio Mode), or what's on air again.
+    pub fn show_scene(&self, stage: &Stage, scene: Option<&str>) {
+        self.look.borrow_mut().scene = scene.map(String::from);
+        self.shared.engine.set_preview_scene(self.id, scene.map(String::from));
+        self.refresh(stage);
+    }
+
+    pub fn shown_scene(&self) -> Option<String> {
+        self.look.borrow().scene.clone()
+    }
+
+    /// Outlines `ids` of `scene` with handles, or nothing.
+    pub fn select(&self, stage: &Stage, pick: Option<(&str, &[i64])>) {
+        self.look.borrow_mut().picked = pick.map(|(s, i)| (s.to_string(), i.to_vec()));
+        self.refresh(stage);
+    }
+
+    /// Outlines every source of `scene` in its own colour, or none.
+    pub fn frames(&self, stage: &Stage, scene: Option<&str>) {
+        self.look.borrow_mut().frames = scene.map(String::from);
+        self.refresh(stage);
+    }
+
+    /// The colour round the canvas (0xAABBGGRR).
+    pub fn background(&self, stage: &Stage, abgr: u32) {
+        let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
+        self.look.borrow_mut().background = [c(0), c(8), c(16), 1.0];
+        self.view.set_backdrop(abgr);
+        self.refresh(stage);
+    }
+
+    /// A dark layer over the view, 0 to 1 (a dialog's backdrop).
+    pub fn set_shade(&self, stage: &Stage, shade: f64) {
+        self.look.borrow_mut().shade = shade.clamp(0.0, 1.0) as f32;
+        self.refresh(stage);
+    }
+
+    /// Leaves the picture out where the page's menus lie over it (points from the box's top
+    /// left: x, y, w, h, corner radius). Main thread.
+    pub fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
+        let edge = if self.look.borrow().area.is_none() { crate::PREVIEW_EDGE } else { 0.0 };
+        let moved: Vec<_> = holes.iter().map(|&(x, y, w, h, r)| (x + edge, y + edge, w, h, r)).collect();
+        self.view.set_holes(&moved);
+    }
+
+    /// How much of the picture shows, 0 to 1. Main thread.
+    pub fn set_opacity(&self, opacity: f64) {
+        self.view.set_opacity(opacity);
+    }
+
+    /// Sends the look to the engine, the outlines from the stage's items as they are now. Call
+    /// it after edits (a drag) too.
+    pub fn refresh(&self, stage: &Stage) {
+        let l = self.look.borrow();
+        let corners = |f: &[f32; 6]| {
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .map(|(u, v): (f32, f32)| (f[4] + u * f[0] + v * f[2], f[5] + u * f[1] + v * f[3]))
+        };
+        let color = |id: i64| {
+            let (r, g, b) = crate::ffi::FRAME_COLORS[id.rem_euclid(8) as usize];
+            [r, g, b, 1.0]
+        };
+        let mut outlines = Vec::new();
+        let picked = l.picked.clone();
+        if let Some(scene) = &l.frames {
+            for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| i.visible) {
+                if picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&it.id)) {
+                    continue;
+                }
+                outlines.push(ferrocast_av::preview::Outline {
+                    corners: corners(&it.frame),
+                    color: color(it.id),
+                    width: 1.5,
+                    handles: false,
+                });
+            }
+        }
+        if let Some((scene, ids)) = &picked {
+            for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| ids.contains(&i.id)) {
+                outlines.push(ferrocast_av::preview::Outline {
+                    corners: corners(&it.frame),
+                    color: color(it.id),
+                    width: 2.0,
+                    handles: true,
+                });
+            }
+        }
+        self.shared.engine.set_preview_look(
+            self.id,
+            ferrocast_av::preview::PreviewLook {
+                background: l.background,
+                area: l.area,
+                margin: l.margin,
+                outlines,
+                shade: l.shade,
+            },
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for StageView {
+    fn drop(&mut self) {
+        // The engine lets go of the view before it goes.
+        self.shared.engine.stop_preview(self.id);
+        self.view.remove();
+    }
+}
+
 /// A recording's next file name (as `Stage::record_path`).
 fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
     let out = plan.encode.scale.unwrap_or((canvas.width, canvas.height));

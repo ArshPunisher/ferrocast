@@ -1484,7 +1484,7 @@ fn srgb_encoded(abgr: u32) -> u32 {
 /// The margin round a preview's picture, in points, as OBS's own: the outline and handles of
 /// an item at the canvas's edge show in it instead of being cut off. The native view is this
 /// much bigger than the page's box on every side, so the picture stays exactly on the box.
-const PREVIEW_EDGE: f64 = 10.0;
+pub(crate) const PREVIEW_EDGE: f64 = 10.0;
 
 pub(crate) fn with_edge(r: Rect) -> Rect {
     Rect {
@@ -1497,13 +1497,13 @@ pub(crate) fn with_edge(r: Rect) -> Rect {
 }
 
 /// The margin in device pixels.
-fn edge_px(scale: f64) -> u32 {
+pub(crate) fn edge_px(scale: f64) -> u32 {
     let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     (PREVIEW_EDGE * s).round() as u32
 }
 
 /// A rectangle in device pixels (at least 1x1).
-fn px(rect: Rect, scale: f64) -> (u32, u32) {
+pub(crate) fn px(rect: Rect, scale: f64) -> (u32, u32) {
     let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     ((rect.w * s).round().clamp(1.0, 16_384.0) as u32, (rect.h * s).round().clamp(1.0, 16_384.0) as u32)
 }
