@@ -10,6 +10,7 @@
 
 pub mod cut;
 pub mod cutter;
+pub mod demux;
 pub mod direct;
 pub mod flv;
 pub mod hub;
