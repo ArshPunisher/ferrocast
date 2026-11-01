@@ -1569,7 +1569,7 @@ impl Engine {
             Ok(dest) => {
                 lock(&g.blocked).remove(&d.id);
                 let (health_tx, health) =
-                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
                 let (stop, stop_rx) = watch::channel(false);
                 tokio::spawn(ferrocast_golive::push::run(dest, self.hub_of(d).clone(), health_tx, stop_rx));
                 lock(&g.running).insert(d.id.clone(), Running { stop, health, light: self.on_light(d) });
@@ -1607,7 +1607,7 @@ impl Engine {
         lock(&g.blocked).remove(&d.id);
         let now_ms = || u64::try_from(now().0).unwrap_or(0);
         let (health_tx, health) =
-            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, since_ms: now_ms() });
+            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, sent: 0, since_ms: now_ms() });
         let (stop, mut stop_rx) = watch::channel(false);
         let id = d.id.clone();
         tokio::spawn(async move {
@@ -1707,6 +1707,7 @@ impl Engine {
             state: PushState::Paused { until_ms: now_ms + left, reason },
             kbps: 0,
             dropped: 0,
+            sent: 0,
             since_ms: now_ms,
         };
         lock(&g.paused).insert(id, health);

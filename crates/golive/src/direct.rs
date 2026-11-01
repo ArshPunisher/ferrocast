@@ -182,7 +182,13 @@ pub(crate) fn whip_address(url: &str) -> Result<reqwest::Url, DirectError> {
 /// Sends the hub's streams to `d` until `stop` (as `push::run` does for RTMP).
 pub async fn run(d: Direct, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
     let mut live = hub.live();
-    health.send_replace(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: crate::push::now_ms() });
+    health.send_replace(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        since_ms: crate::push::now_ms(),
+    });
     let mut done = 0u64;
     'streams: loop {
         let stream = tokio::select! {
@@ -294,7 +300,10 @@ pub(crate) async fn feed_ts(
         }
         if window.elapsed() >= Duration::from_secs(1) {
             let kbps = (sent * 8 / 1000) as u32;
-            health.send_modify(|h| h.kbps = kbps);
+            health.send_modify(|h| {
+                h.kbps = kbps;
+                h.sent += sent;
+            });
             (window, sent) = (Instant::now(), 0);
         }
     }
@@ -412,7 +421,8 @@ mod tests {
         });
         let hub = Hub::new();
         hub.start();
-        let (health, h) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (health, h) =
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "t".into(),

@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     let hub = Hub::new();
     let (health_tx, health) =
-        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
     let (stop_tx, stop) = tokio::sync::watch::channel(false);
     let dest = Destination {
         id: "local".into(),

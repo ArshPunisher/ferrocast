@@ -251,7 +251,8 @@ mod tests {
     fn a_passphrase_or_main_profile_is_refused_plainly() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| panic!("{e}"));
         let hub = Hub::new();
-        let (health, _) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (health, _) =
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
         let d = |url: &str, key: &str| Direct {
             id: "r".into(),
             kind: Kind::Rist,
@@ -333,7 +334,8 @@ mod tests {
         });
         let hub = Hub::new();
         hub.start();
-        let (health, h) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (health, h) =
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "r".into(),

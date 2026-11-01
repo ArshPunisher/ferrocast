@@ -296,7 +296,10 @@ async fn stream_to(
         }
         if window.elapsed() >= Duration::from_secs(1) {
             let k = (sent * 8 / 1000) as u32;
-            health.send_modify(|h| h.kbps = k);
+            health.send_modify(|h| {
+                h.kbps = k;
+                h.sent += sent;
+            });
             (window, sent) = (Instant::now(), 0);
         }
         let wait = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(50));
@@ -508,7 +511,8 @@ mod tests {
     async fn send(tags: Vec<(u8, u32, Vec<u8>)>, port: u16) -> watch::Receiver<Health> {
         let hub = Hub::new();
         hub.start();
-        let (health, h) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (health, h) =
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "w".into(),

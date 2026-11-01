@@ -93,13 +93,16 @@ pub struct Health {
     pub kbps: u32,
     /// Packets skipped because this destination fell behind (counted per stream).
     pub dropped: u64,
+    /// Bytes sent since this destination started (for callers that work out their own rate).
+    #[serde(skip)]
+    pub sent: u64,
     /// When the current state began (ms since the Unix epoch).
     pub since_ms: u64,
 }
 
 impl Health {
     fn new(state: PushState) -> Self {
-        Self { state, kbps: 0, dropped: 0, since_ms: now_ms() }
+        Self { state, kbps: 0, dropped: 0, sent: 0, since_ms: now_ms() }
     }
 }
 
@@ -331,7 +334,10 @@ async fn session(
         if window.0.elapsed() >= HEALTH_EVERY {
             let secs = window.0.elapsed().as_secs_f64();
             let kbps = ((p.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
-            health.send_modify(|h| h.kbps = kbps);
+            health.send_modify(|h| {
+                h.kbps = kbps;
+                h.sent += p.sent - window.1;
+            });
             window = (Instant::now(), p.sent);
         }
     }

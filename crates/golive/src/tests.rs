@@ -218,7 +218,7 @@ fn destination(port: u16, key: &str) -> Destination {
 }
 
 fn start(w: &World, d: Destination) -> watch::Receiver<Health> {
-    let (tx, rx) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+    let (tx, rx) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
     tokio::spawn(push::run(d, w.hub.clone(), tx, w.stop.subscribe()));
     rx
 }

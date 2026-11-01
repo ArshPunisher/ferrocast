@@ -644,8 +644,13 @@ impl OwnStream {
             retry: Retry::default(),
         };
         ferrocast_golive::direct::check(&d).map_err(|e| StudioError::Failed(e.to_string()))?;
-        let (health_tx, health) =
-            tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (health_tx, health) = tokio::sync::watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            since_ms: 0,
+        });
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
         rt.spawn(ferrocast_golive::direct::run(d, hub.clone(), health_tx, stop_rx));
         self.directs.insert(id.to_string(), (stop, health));
@@ -665,7 +670,7 @@ impl OwnStream {
         Some(StreamStats {
             active: h.state == PushState::Live,
             reconnecting: matches!(h.state, PushState::Reconnecting { .. } | PushState::Connecting),
-            bytes: 0,
+            bytes: h.sent,
             frames: 0,
             dropped: h.dropped.min(u64::from(u32::MAX)) as u32,
         })
@@ -721,7 +726,7 @@ fn sender(
     // without one has none to send.
     let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: true };
     let (health_tx, h) =
-        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
     let (sp, stop_rx) = tokio::sync::watch::channel(false);
     rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
     Ok((Some(rt), Some(h), Some(sp)))
