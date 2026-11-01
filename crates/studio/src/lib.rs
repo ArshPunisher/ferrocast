@@ -34,7 +34,7 @@ pub use collection::{
     AudioInfo, BOUNDS, CHANNEL_KEYS, Captions, DEINTERLACE, Face, FaceFollow, FilterInfo, FollowLook, ItemEdit,
     ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SoundTap, SourceUse, StudioOptions,
     TBarState, TapReader, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access,
-    captions_access, find_busy, find_faces,
+    captions_access, find_busy, find_faces, focus_x,
 };
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
 

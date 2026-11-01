@@ -55,6 +55,21 @@ pub fn find_busy(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
     }
 }
 
+/// A face at least this share of the picture's width is the subject (a camera filling it);
+/// a smaller one is a facecam in a corner, and the action is followed instead.
+const BIG_FACE: f64 = 0.12;
+
+/// Where to keep the eye in an RGBA picture, across (0 to 1): a face big enough to be the
+/// subject, else what stands out; None when nothing does.
+pub fn focus_x(rgba: &[u8], w: u32, h: u32) -> Option<f32> {
+    let pick = |f: &Face| (f.x + f.w / 2.0) as f32;
+    find_faces(rgba, w, h)
+        .iter()
+        .find(|f| f.w >= BIG_FACE)
+        .map(pick)
+        .or_else(|| find_busy(rgba, w, h).first().map(pick))
+}
+
 /// A small picture of what an item shows, to look for faces in.
 #[derive(Debug, Clone)]
 pub struct FollowLook {
@@ -101,6 +116,23 @@ pub(crate) fn shown_mid(face: &Face, src_w: f32, crop_left: f32, crop_right: f32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vision finds what stands out: a bright square on the right of a dark picture.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_eye_goes_to_what_stands_out() {
+        let (w, h) = (320u32, 180u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 60..120 {
+            for x in 230..290 {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[255, 220, 40, 255]);
+            }
+        }
+        let x = focus_x(&rgba, w, h).expect("something stands out");
+        // Vision boxes attention loosely: right of the middle is enough.
+        assert!(x > 0.55, "{x}");
+    }
 
     #[test]
     fn the_face_goes_to_the_middle_without_showing_an_edge() {
