@@ -261,7 +261,12 @@ async fn advanced_settings_are_checked_and_saved() {
     assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("per.twitch.server"));
     a.per.insert(
         "twitch".into(),
-        DestAdvanced { server: Some("rtmps://live-fra.twitch.tv/app".into()), first_retry_s: 2, max_retry_s: 60, backup: None },
+        DestAdvanced {
+            server: Some("rtmps://live-fra.twitch.tv/app".into()),
+            first_retry_s: 2,
+            max_retry_s: 60,
+            backup: None,
+        },
     );
     a.keep_free_pct = 30;
     e.set_golive_advanced(a.clone()).await.unwrap();

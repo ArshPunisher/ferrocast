@@ -818,6 +818,9 @@ type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_co
 type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;
                          enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
                          blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */;
+                         lighter_for_route?: true /* on the lighter stream for now: its route fell behind while the others kept up
+                                                     (RTMP on the main picture, while the Studio streams). It tries the full stream
+                                                     again after 2 min, doubling up to 20 min if it comes back down within 5 */;
                          backup_for?: string /* a backup sending now, for this destination's name */;
                          standby_for?: string /* a backup waiting: it sends only while that one can't */ }
 type UploadRow = { id: string; name: string; server: string | null; delay_ms: number | null; need_kbps: number; problem?: string }

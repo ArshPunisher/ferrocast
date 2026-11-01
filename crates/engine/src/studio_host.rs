@@ -2154,7 +2154,7 @@ impl Engine {
     pub(crate) async fn studio_sync_light(&self) -> Option<String> {
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
-        let wanted = self.golive_config().destinations.iter().any(|d| d.enabled && d.wants_light());
+        let wanted = self.golive_config().destinations.iter().any(|d| d.enabled && self.wants_light_now(d));
         if !streaming || !wanted {
             if let Err(e) = host.light_stream_stop().await {
                 tracing::warn!(error = %e, "the Studio's lighter stream didn't stop");

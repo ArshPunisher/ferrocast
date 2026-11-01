@@ -447,6 +447,10 @@ pub struct DestinationView {
     /// Takes the Studio's lighter stream (left out when not).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// On the lighter stream for now: its route fell behind while the others kept up. It tries
+    /// the full stream again by itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lighter_for_route: bool,
     /// A backup sending now, instead of this destination (its name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_for: Option<String>,
@@ -489,6 +493,9 @@ pub(crate) struct GoLive {
     /// Backups: since when each destination with one has been failing (or back), and those
     /// failing long enough that their backup sends.
     backup: Mutex<BackupState>,
+    /// Quality per destination: the ones moved to the lighter stream because their own route
+    /// couldn't keep up while the others could.
+    quality: Mutex<ferrocast_golive::quality::Quality>,
 }
 
 #[derive(Debug, Default)]
@@ -527,6 +534,7 @@ impl Default for GoLive {
             ingest_task: Mutex::new(None),
             ffmpeg_fetch: Mutex::new(None),
             backup: Mutex::new(BackupState::default()),
+            quality: Mutex::new(Default::default()),
         }
     }
 }
@@ -789,7 +797,16 @@ impl Engine {
     /// Whether a destination takes the lighter stream now: it wants it and the Studio sends it.
     /// Until then (or streaming from OBS, which has no lighter copy) it takes the full one.
     fn on_light(&self, d: &DestinationConfig) -> bool {
-        d.wants_light() && self.golive().lhub.live().borrow().on
+        self.wants_light_now(d) && self.golive().lhub.live().borrow().on
+    }
+
+    /// Takes the lighter stream: set so, or moved there for a slow route (RTMP only: SRT,
+    /// RIST and WebRTC go from the Studio's own stream).
+    pub(crate) fn wants_light_now(&self, d: &DestinationConfig) -> bool {
+        d.wants_light()
+            || (d.canvas == Canvas::Main
+                && d.url.as_deref().and_then(direct_kind).is_none()
+                && lock(&self.golive().quality).is_light(&d.id))
     }
 
     /// The stream a destination takes: the lighter one, the vertical one or the main one.
@@ -864,6 +881,7 @@ impl Engine {
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
+                    lighter_for_route: !d.wants_light() && self.wants_light_now(d),
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                 }
@@ -1542,6 +1560,7 @@ impl Engine {
             lock(&g.protector).reset();
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
+            lock(&g.quality).reset();
         }
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
@@ -1888,6 +1907,55 @@ impl Engine {
         }
     }
 
+    /// One second of quality per destination: one that falls behind alone (others keep up, so
+    /// it's its route, not the upload) takes the lighter stream, and tries the full one again
+    /// later. OBS can only lower every destination at once.
+    async fn quality_tick(&self) {
+        use ferrocast_golive::protect::Sample;
+        use ferrocast_golive::quality::Move;
+        let g = self.golive();
+        let cfg = self.golive_config();
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        let want_kbps = g.hub.stats().kbps;
+        // RTMP destinations on the main picture's full stream (SRT, RIST and WebRTC go from the
+        // Studio's own stream and can't move).
+        let movable = |id: &str| {
+            cfg.destinations
+                .iter()
+                .any(|d| d.id == id && d.canvas == Canvas::Main && d.url.as_deref().and_then(direct_kind).is_none())
+        };
+        let healths: Vec<(String, Health)> = lock(&g.running)
+            .iter()
+            .filter(|(id, r)| !r.light && movable(id))
+            .map(|(id, r)| (id.clone(), r.health.borrow().clone()))
+            .filter(|(_, h)| h.state == PushState::Live)
+            .collect();
+        let samples: Vec<Sample<'_>> = healths
+            .iter()
+            .map(|(id, h)| Sample {
+                id,
+                kbps: h.kbps,
+                want_kbps,
+                dropped: h.dropped,
+                live_ms: now_ms.saturating_sub(h.since_ms),
+            })
+            .collect();
+        let moves = lock(&g.quality).tick(std::time::Instant::now(), &samples, cfg.advanced.rules.slow_pct);
+        for m in &moves {
+            match m {
+                Move::Lighter(id, wait) => {
+                    tracing::info!(dest = %id, wait_s = wait.as_secs(), "Go live: a slow route takes the lighter stream");
+                }
+                Move::Full(id) => tracing::info!(dest = %id, "Go live: trying the full stream again"),
+            }
+        }
+        if !moves.is_empty() {
+            // The Studio's lighter stream starts (or stops) to match, then each moves.
+            self.studio_sync_light().await;
+            self.reconcile().await;
+        }
+    }
+
     /// One second of upload protection while live.
     async fn protect_tick(&self) {
         use ferrocast_golive::protect::{Action, Sample};
@@ -2010,6 +2078,7 @@ pub(crate) async fn run(engine: Engine) {
             g.last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
         }
         engine.backup_tick().await;
+        engine.quality_tick().await;
         engine.protect_tick().await;
         engine.send_golive();
     }
