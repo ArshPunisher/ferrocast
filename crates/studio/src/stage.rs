@@ -5,7 +5,8 @@
 //! over call by call (ENGINE.md, step 3).
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 
@@ -13,7 +14,8 @@ use crate::collection::{
     AudioInfo, BLENDS, BOUNDS, FilterInfo, ItemEdit, ItemInfo, Monitor, SCALE_FILTERS, SceneInfo, SourceUse, Transform,
     TransitionInfo,
 };
-use crate::{Canvas, StudioError, check_name, own};
+use crate::naming::{NameVideo, file_name};
+use crate::{Canvas, RecordPlan, RecordStats, ReplayPlan, StreamSettings, StreamStats, StudioError, check_name, own};
 
 /// OBS's global sound channels, in its saved collection: Desktop Audio 1-2, Mic/Aux 1-4.
 const CHANNEL_KEYS: [&str; 6] = [
@@ -1005,6 +1007,86 @@ impl Stage {
         crate::collection::png_data_url(&px, w, h, scene)
     }
 
+    // ------------------------------------------------------------------ outputs
+
+    /// Where a recording of `plan` goes now: its folder and OBS's name pattern, with " (2)"…
+    /// added when the name's taken (unless it may be overwritten).
+    pub fn record_path(&self, plan: &RecordPlan) -> PathBuf {
+        path_for(self.canvas, plan)
+    }
+
+    fn output(&self, how: own::Drawing<'_>) -> Result<own::OwnStream, StudioError> {
+        let doc = self.doc.borrow().clone();
+        own::OwnStream::drawn(self.engine()?, &doc, how)
+    }
+
+    /// Streams what's on air over RTMP to `server` with `key`.
+    pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+        if let Some(why) = own::unsupported(s, true) {
+            return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let how = own::Drawing {
+            send_to: Some(own::Send { server, key, reconnect: s.reconnect }),
+            record: None,
+            encode: &s.encode,
+            tracks: &[],
+            delay_s: s.delay_s,
+            vertical: false,
+            replay: None,
+            solo: None,
+        };
+        Ok(StageOutput::new(self.output(how)?, None, self.canvas))
+    }
+
+    /// Records what's on air (or `solo`, one scene or source on its own) to a file named as
+    /// `plan` says → the recording; `StageOutput::path` says where.
+    pub fn record(&self, plan: &RecordPlan, solo: Option<&str>) -> Result<StageOutput, StudioError> {
+        if let Some(why) = own::unsupported_recording(plan) {
+            return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        std::fs::create_dir_all(&plan.folder)
+            .map_err(|e| fail(format!("The recordings folder {} can't be made: {e}", plan.folder.display())))?;
+        let path = self.record_path(plan);
+        let how = own::Drawing {
+            send_to: None,
+            record: Some(&path),
+            encode: &plan.encode,
+            tracks: &plan.tracks,
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo,
+        };
+        let mut own = self.output(how)?;
+        own.set_plan(plan);
+        Ok(StageOutput::new(own, Some(path), self.canvas))
+    }
+
+    /// OBS's replay buffer: the last `plan.seconds` kept, saved on request (`save_replay`).
+    pub fn replay(&self, plan: &ReplayPlan) -> Result<StageOutput, StudioError> {
+        if !(5..=21_600).contains(&plan.seconds) {
+            return Err(fail("seconds: 5 to 21600."));
+        }
+        if !matches!(plan.format.as_str(), "mkv" | "mp4") {
+            return Err(fail(
+                "Ferrocast's own engine saves replays as MKV or MP4: pick one of those in Settings › Recording.",
+            ));
+        }
+        let how = own::Drawing {
+            send_to: None,
+            record: None,
+            encode: &plan.encode,
+            tracks: &plan.tracks,
+            delay_s: 0,
+            vertical: false,
+            replay: Some((plan.seconds, plan.mb)),
+            solo: None,
+        };
+        let mut out = StageOutput::new(self.output(how)?, None, self.canvas);
+        out.replay = Some((plan.clone(), Arc::default()));
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------ transitions
 
     /// The Studio's transition: its kind and length.
@@ -1041,6 +1123,108 @@ impl Stage {
         });
         Ok(())
     }
+}
+
+/// A stream, recording or replay buffer our engine runs for the stage. Dropping it ends it
+/// (encoders flushed, the server told, the file closed).
+#[derive(Debug)]
+pub struct StageOutput {
+    own: own::OwnStream,
+    /// A recording's file now (a split moves it on).
+    path: Option<PathBuf>,
+    canvas: Canvas,
+    /// A replay buffer's plan, and how its saves went.
+    replay: Option<(ReplayPlan, Arc<Mutex<own::ReplaySaved>>)>,
+}
+
+impl StageOutput {
+    fn new(own: own::OwnStream, path: Option<PathBuf>, canvas: Canvas) -> Self {
+        Self { own, path, canvas, replay: None }
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        self.own.stats()
+    }
+
+    pub fn record_stats(&self) -> RecordStats {
+        self.own.record_stats()
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.own.last_error().or_else(|| {
+            self.replay.as_ref().and_then(|(_, d)| d.lock().unwrap_or_else(|e| e.into_inner()).failed.clone())
+        })
+    }
+
+    /// What our engine couldn't bring over from the collection (left out of the picture).
+    pub fn skipped(&self) -> Vec<String> {
+        self.own.skipped()
+    }
+
+    /// A new video bitrate while live.
+    pub fn set_video_kbps(&self, kbps: u32) {
+        self.own.set_video_kbps(kbps);
+    }
+
+    /// The file a recording writes now.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn pause(&self, on: bool) -> Result<(), StudioError> {
+        self.own.pause(on)
+    }
+
+    /// Goes on in a new file, named as the recording's plan says.
+    pub fn split(&mut self) -> Result<(), StudioError> {
+        let plan = self.own.plan().cloned().ok_or_else(|| fail("Only a recording can be split."))?;
+        let next = path_for(self.canvas, &plan);
+        self.own.split(&next)?;
+        self.path = Some(next);
+        Ok(())
+    }
+
+    /// Splits when the plan's minutes or megabytes are reached; call it often (a tick).
+    pub fn tick(&mut self) {
+        if self.own.split_due()
+            && let Err(e) = self.split()
+        {
+            tracing::warn!("the recording couldn't go on in a new file: {e}");
+        }
+    }
+
+    /// Saves what a replay buffer holds, written in the background (`last_replay` names it).
+    pub fn save_replay(&self) -> Result<(), StudioError> {
+        let (plan, done) = self.replay.as_ref().ok_or_else(|| fail("This isn't a replay buffer."))?;
+        let as_record = RecordPlan {
+            folder: plan.folder.clone(),
+            name: plan.name.clone(),
+            format: plan.format.clone(),
+            spaces: plan.spaces,
+            ..RecordPlan::default()
+        };
+        self.own.save_replay(&path_for(self.canvas, &as_record), done.clone())
+    }
+
+    pub fn last_replay(&self) -> Option<PathBuf> {
+        self.replay.as_ref().and_then(|(_, d)| d.lock().unwrap_or_else(|e| e.into_inner()).last.clone())
+    }
+}
+
+/// A recording's next file name (as `Stage::record_path`).
+fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
+    let out = plan.encode.scale.unwrap_or((canvas.width, canvas.height));
+    let video = NameVideo { fps: canvas.fps, canvas: (canvas.width, canvas.height), output: out };
+    let first = plan.folder.join(file_name(&plan.name, plan.extension(), plan.spaces, video, chrono::Local::now()));
+    if plan.overwrite || !first.exists() {
+        return first;
+    }
+    let stem = first.file_stem().and_then(|s| s.to_str()).unwrap_or("Recording").to_string();
+    let gap = if plan.spaces { " " } else { "_" };
+    (2..)
+        .map(|n| plan.folder.join(format!("{stem}{gap}({n}).{}", plan.extension())))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 #[cfg(test)]
@@ -1173,5 +1357,54 @@ mod tests {
         assert_eq!(px(300, 10), [255, 0, 0]);
         ok(s.edit_item("Main", red.id, ItemEdit::Hide));
         assert_eq!(px(300, 10), [0, 0, 0], "hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn records_splits_and_replays_with_no_libobs() {
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        ok(s.add_source("Main", "color_source_v3", "Card", &json!({ "color": 4278255360u32 }), false));
+        let dir = std::env::temp_dir().join(format!("ferrocast-stage-{}", std::process::id()));
+        let plan = RecordPlan {
+            folder: dir.clone(),
+            name: "Take %hh%mm%ss".into(),
+            format: "mkv".into(),
+            encode: crate::EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc"),
+            ..RecordPlan::default()
+        };
+        let mut rec = ok(s.record(&plan, None));
+        let first = rec.path().map(Path::to_path_buf).unwrap_or_default();
+        assert!(first.starts_with(&dir) && first.extension().is_some_and(|e| e == "mkv"), "{}", first.display());
+        let replay = ok(s.replay(&ReplayPlan {
+            folder: dir.clone(),
+            name: "Replay %hh%mm%ss".into(),
+            format: "mp4".into(),
+            spaces: true,
+            seconds: 5,
+            mb: 0,
+            tracks: vec![1],
+            encode: plan.encode.clone(),
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        ok(rec.split());
+        let second = rec.path().map(Path::to_path_buf).unwrap_or_default();
+        assert_ne!(first, second, "a new file, named again (\" (2)\" if in the same second)");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        ok(replay.save_replay());
+        drop(rec);
+        for _ in 0..50 {
+            if replay.last_replay().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let saved = replay.last_replay().unwrap_or_else(|| panic!("the replay was saved: {:?}", replay.last_error()));
+        for f in [&first, &second, &saved] {
+            assert!(std::fs::metadata(f).is_ok_and(|m| m.len() > 1000), "{} was written", f.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
