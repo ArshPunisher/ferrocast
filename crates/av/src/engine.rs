@@ -1041,7 +1041,7 @@ impl Engine {
     ///
     /// # Safety
     /// `ns_view` must be a live `NSView` that outlives the preview (`stop_preview` first).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[allow(unsafe_code)]
     pub unsafe fn start_preview(
         &self,
@@ -1058,7 +1058,7 @@ impl Engine {
     ///
     /// # Safety
     /// As `start_preview`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[allow(unsafe_code)]
     pub unsafe fn start_preview_of(
         &self,

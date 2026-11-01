@@ -108,6 +108,31 @@ impl Compositor {
         self.surface_from(surface, width, height)
     }
 
+    /// A surface on a Windows window (`HWND`), `width`×`height` device pixels.
+    ///
+    /// # Safety
+    /// `hwnd` must be a live window that outlives the returned surface.
+    #[cfg(target_os = "windows")]
+    #[allow(unsafe_code)]
+    pub unsafe fn preview_surface(
+        &self,
+        hwnd: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<PreviewSurface, AvError> {
+        use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
+        let h =
+            std::num::NonZeroIsize::new(hwnd as isize).ok_or_else(|| AvError::NoGpu("no window to draw in".into()))?;
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(RawDisplayHandle::Windows(WindowsDisplayHandle::new())),
+            raw_window_handle: RawWindowHandle::Win32(Win32WindowHandle::new(h)),
+        };
+        // SAFETY: the caller keeps the window alive for the surface's life.
+        let surface = unsafe { self.instance.create_surface_unsafe(target) }
+            .map_err(|e| AvError::NoGpu(format!("the preview's surface couldn't be made: {e}")))?;
+        self.surface_from(surface, width, height)
+    }
+
     fn surface_from(
         &self,
         surface: wgpu::Surface<'static>,
