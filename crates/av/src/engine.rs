@@ -234,6 +234,16 @@ impl Canvas {
     }
 }
 
+/// A recording output's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordState {
+    pub paused: bool,
+    /// Bytes in the file being written now.
+    pub bytes: u64,
+    /// A split waits for its first frame (the next file isn't written to yet).
+    pub splitting: bool,
+}
+
 /// How the engine is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Stats {
@@ -747,13 +757,37 @@ impl Engine {
     /// A new video bitrate for an output from now on; false when its encoder takes it only at
     /// the next start (FFmpeg's).
     pub fn set_output_kbps(&self, id: u64, kbps: u32) -> Result<bool, AvError> {
+        self.with_output(id, |pipe| pipe.set_video_kbps(kbps))
+    }
+
+    /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
+    pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
+        self.with_output(id, |pipe| {
+            pipe.pause(on, now_ns());
+            Ok(())
+        })
+    }
+
+    /// Goes on recording into a new file at `path` from the next frame ("Split recording").
+    pub fn split_output(&self, id: u64, path: &std::path::Path) -> Result<(), AvError> {
+        self.with_output(id, |pipe| pipe.split(path))
+    }
+
+    /// An output's recording now.
+    pub fn output_record_state(&self, id: u64) -> Result<RecordState, AvError> {
+        self.with_output(id, |pipe| {
+            Ok(RecordState { paused: pipe.paused(), bytes: pipe.recorded_bytes(), splitting: pipe.splitting() })
+        })
+    }
+
+    fn with_output<T>(&self, id: u64, f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>) -> Result<T, AvError> {
         let mut st = self.lock();
         let (_, pipe, ..) = st
             .outputs
             .iter_mut()
             .find(|(i, ..)| *i == id)
             .ok_or_else(|| AvError::Source(format!("there's no output {id}")))?;
-        pipe.set_video_kbps(kbps)
+        f(pipe)
     }
 
     /// Stops an output: what's in its encoders is sent and a recording is closed.
@@ -1522,6 +1556,94 @@ mod tests {
         {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             assert!(text.contains("h264") && text.contains("aac"), "{text}");
+        }
+    }
+
+    /// The length ffprobe reads, and whether it has picture and sound.
+    #[cfg(target_os = "macos")]
+    fn probed(file: &std::path::Path) -> Option<(f64, bool)> {
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration:stream=codec_name", "-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let secs = text.lines().filter_map(|l| l.trim().parse::<f64>().ok()).next()?;
+        Some((secs, text.contains("h264") && text.contains("aac")))
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_recording_pauses_and_splits() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Tone { hz: 1000.0, every_ms: 500, beep_ms: 50 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let dir = std::env::temp_dir();
+        let (one, two) = (dir.join("ferrocast-av-split-1.mp4"), dir.join("ferrocast-av-split-2.mp4"));
+        let id = e.start_output(OutputKind::Record(one.clone())).unwrap_or_else(|x| panic!("{x}"));
+        let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
+        // 2 s, 2 s paused, 1 s, then a new file for 2 s.
+        sleep(2000);
+        e.pause_output(id, true).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.output_record_state(id).map(|s| s.paused).ok(), Some(true));
+        sleep(2000);
+        e.pause_output(id, false).unwrap_or_else(|x| panic!("{x}"));
+        sleep(1000);
+        let written = e.output_record_state(id).map(|s| s.bytes).unwrap_or(0);
+        assert!(written > 10_000, "the first file grows: {written} bytes");
+        e.split_output(id, &two).unwrap_or_else(|x| panic!("{x}"));
+        // One split at a time: another waits until this one has its first frame.
+        assert!(e.split_output(id, &dir.join("ferrocast-av-split-3.mp4")).is_err());
+        sleep(2000);
+        assert_eq!(e.output_record_state(id).map(|s| s.splitting).ok(), Some(false));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.error(), None);
+        let (Some((a, a_av)), Some((b, b_av))) = (probed(&one), probed(&two)) else {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        };
+        assert!(a_av && b_av, "both files have picture and sound");
+        // The pause left no gap: about 3 s in the first file, not 5.
+        assert!((2.6..3.6).contains(&a), "first file {a:.2} s");
+        assert!((1.6..2.5).contains(&b), "second file {b:.2} s, from 0");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn records_mkv_that_decodes_cleanly() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [200, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 500, beep_ms: 100 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let dir = std::env::temp_dir();
+        let (one, two) = (dir.join("ferrocast-av-rec-1.mkv"), dir.join("ferrocast-av-rec-2.mkv"));
+        let id = e.start_output(OutputKind::Record(one.clone())).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(2500));
+        e.split_output(id, &two).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1500));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let (Some((a, a_av)), Some((b, b_av))) = (probed(&one), probed(&two)) else {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        };
+        assert!(a_av && b_av, "both files have picture and sound");
+        assert!((2.1..3.0).contains(&a) && (1.1..1.9).contains(&b), "{a:.2} s, then {b:.2} s");
+        for f in [&one, &two] {
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(f)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap_or_else(|x| panic!("{x}"));
+            let errors = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(out.status.success() && errors.trim().is_empty(), "{}: {errors}", f.display());
         }
     }
 }

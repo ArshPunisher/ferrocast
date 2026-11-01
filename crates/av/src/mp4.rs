@@ -65,6 +65,8 @@ pub struct Mp4Writer<W: Write> {
     sequence: u32,
     /// Video's last sample duration, for the fragment's final frame.
     v_last_dur: u32,
+    /// Bytes written so far.
+    written: u64,
 }
 
 fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -109,9 +111,11 @@ impl<W: Write> Mp4Writer<W> {
         } else {
             ftyp.extend_from_slice(b"avc1");
         }
-        out.write_all(&boxed(b"ftyp", &ftyp))?;
-        out.write_all(&moov(video.as_ref(), audio.as_ref()))?;
+        let (ftyp, moov) = (boxed(b"ftyp", &ftyp), moov(video.as_ref(), audio.as_ref()));
+        out.write_all(&ftyp)?;
+        out.write_all(&moov)?;
         out.flush()?;
+        let written = (ftyp.len() + moov.len()) as u64;
         Ok(Self {
             out,
             video,
@@ -123,6 +127,7 @@ impl<W: Write> Mp4Writer<W> {
             v_start: None,
             sequence: 0,
             v_last_dur: 0,
+            written,
         })
     }
 
@@ -166,6 +171,11 @@ impl<W: Write> Mp4Writer<W> {
             self.fragment()?;
         }
         Ok(())
+    }
+
+    /// Bytes written to the output so far (what's still waiting for its fragment isn't).
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Writes out what's waiting and hands the output back.
@@ -242,6 +252,7 @@ impl<W: Write> Mp4Writer<W> {
         self.out.write_all(&(payload.len() as u32 + 8).to_be_bytes())?;
         self.out.write_all(b"mdat")?;
         self.out.write_all(&payload)?;
+        self.written += (moof.len() + payload.len() + 8) as u64;
         self.out.flush()
     }
 }
