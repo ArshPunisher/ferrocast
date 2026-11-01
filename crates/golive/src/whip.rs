@@ -170,24 +170,7 @@ pub(crate) async fn session(
         api.apply().ok_or_else(|| DirectError::Refused("The WebRTC offer couldn't be made.".into()))?;
 
     // The offer posted; the answer and the session's own address back.
-    let client =
-        reqwest::Client::builder().timeout(ANSWER_DEADLINE).build().map_err(|e| DirectError::Refused(e.to_string()))?;
-    let mut req = client.post(url.clone()).header("content-type", "application/sdp").body(offer.to_sdp_string());
-    if !d.key.trim().is_empty() {
-        req = req.bearer_auth(d.key.trim());
-    }
-    let resp = req.send().await.map_err(|e| {
-        if e.is_timeout() { DirectError::Slow(name.clone()) } else { DirectError::Unreachable(name.clone()) }
-    })?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(DirectError::Refused(format!("{name} refused the token (the key).")));
-    }
-    if !status.is_success() {
-        return Err(DirectError::Refused(format!("{name} answered {status}.")));
-    }
-    let session_url = resp.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|l| url.join(l).ok());
-    let text = resp.text().await.map_err(|_| DirectError::Broken(name.clone()))?;
+    let (client, session_url, text) = post_offer(&url, d.key.trim(), offer.to_sdp_string(), &name).await?;
     let answer = SdpAnswer::from_sdp_string(&text)
         .map_err(|_| DirectError::Refused(format!("{name} answered something that isn't WebRTC.")))?;
     rtc.sdp_api()
@@ -199,6 +182,64 @@ pub(crate) async fn session(
     let out = stream_to(&mut rtc, &socket, local, hub, health, stream, vmid, amid, &name).await;
     rtc.disconnect();
     out
+}
+
+/// Offers a session as the stream would (picture and sound), checks the answer, and deletes it
+/// again: how long the server took to answer.
+pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
+    let url = crate::direct::whip_address(&d.url)?;
+    let host = url.host_str().unwrap_or_default().to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let ip = local_ip(&host, port).await.ok_or_else(|| DirectError::Unreachable(host.clone()))?;
+    let socket = UdpSocket::bind((ip, 0)).await.map_err(|_| DirectError::Unreachable(host.clone()))?;
+    let local = socket.local_addr().map_err(|_| DirectError::Unreachable(host.clone()))?;
+    let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).enable_opus(true, false).build(Instant::now());
+    let cand = Candidate::host(local, "udp").map_err(|e| DirectError::Refused(e.to_string()))?;
+    rtc.add_local_candidate(cand);
+    let mut api = rtc.sdp_api();
+    api.add_media(MediaKind::Video, Direction::SendOnly, Some("ferrocast".into()), Some("video".into()), None);
+    api.add_media(MediaKind::Audio, Direction::SendOnly, Some("ferrocast".into()), Some("audio".into()), None);
+    let (offer, pending) =
+        api.apply().ok_or_else(|| DirectError::Refused("The WebRTC offer couldn't be made.".into()))?;
+    let started = Instant::now();
+    let (client, session_url, text) = post_offer(&url, d.key.trim(), offer.to_sdp_string(), &host).await?;
+    let took = started.elapsed();
+    let _end = session_url.map(|url| EndSession { client, url, key: d.key.trim().to_string() });
+    let answer = SdpAnswer::from_sdp_string(&text)
+        .map_err(|_| DirectError::Refused(format!("{host} answered something that isn't WebRTC.")))?;
+    rtc.sdp_api()
+        .accept_answer(pending, answer)
+        .map_err(|e| DirectError::Refused(format!("{host}'s answer won't do: {e}.")))?;
+    Ok(took)
+}
+
+/// Posts a WHIP offer (with the token, if any) → the client, the session's address and the
+/// answer.
+async fn post_offer(
+    url: &reqwest::Url,
+    key: &str,
+    sdp: String,
+    name: &str,
+) -> Result<(reqwest::Client, Option<reqwest::Url>, String), DirectError> {
+    let client =
+        reqwest::Client::builder().timeout(ANSWER_DEADLINE).build().map_err(|e| DirectError::Refused(e.to_string()))?;
+    let mut req = client.post(url.clone()).header("content-type", "application/sdp").body(sdp);
+    if !key.is_empty() {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_timeout() { DirectError::Slow(name.to_string()) } else { DirectError::Unreachable(name.to_string()) }
+    })?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(DirectError::Refused(format!("{name} refused the token (the key).")));
+    }
+    if !status.is_success() {
+        return Err(DirectError::Refused(format!("{name} answered {status}.")));
+    }
+    let session_url = resp.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|l| url.join(l).ok());
+    let text = resp.text().await.map_err(|_| DirectError::Broken(name.to_string()))?;
+    Ok((client, session_url, text))
 }
 
 /// Deletes the WHIP session when dropped (a server that keeps it a while anyway lets it go).

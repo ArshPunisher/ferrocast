@@ -380,12 +380,49 @@ fn srt_bandwidth(a: &Address) -> Result<Option<LiveBandwidthMode>, DirectError> 
 async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stream: u64) -> Result<Ended, DirectError> {
     let a = Address::parse(&d.url)?;
     let name = a.name();
-    let mode = SrtMode::of(&a)?;
+    let mut sock = srt_connect(d, &a, None).await?;
+    // A delay the streamer didn't set follows the network: SRT wants at least four round
+    // trips to resend in time, so a far server gets a longer one (once, on connecting).
+    if a.param("latency").is_none()
+        && let Some(want) = srt_latency_for(sock.settings().rtt)
+    {
+        tracing::info!(dest = %d.id, latency_ms = want.as_millis() as u64, "SRT delay follows the network");
+        let _ = sock.close().await;
+        sock = srt_connect(d, &a, Some(want)).await?;
+    }
+    let stats = sock.statistics().clone();
+    let mut sink = SrtSink { sock, name };
+    let out = tokio::select! {
+        out = feed_ts(hub, health, stream, &mut sink) => out,
+        () = srt_link(stats, health) => Ok(Ended::StreamEnded),
+    };
+    let _ = sink.sock.close().await;
+    out
+}
+
+/// SRT's delay when the streamer didn't set one.
+const SRT_LATENCY: Duration = Duration::from_millis(120);
+
+/// The delay a round trip asks for, when more than the default: four round trips (as
+/// Haivision advises), to the next 10 ms, at most 8 s.
+pub(crate) fn srt_latency_for(rtt: Duration) -> Option<Duration> {
+    let want = (rtt * 4).as_millis().div_ceil(10) as u64 * 10;
+    (Duration::from_millis(want) > SRT_LATENCY).then(|| Duration::from_millis(want.min(8_000)))
+}
+
+/// An SRT connection made as the address says (`latency` instead of its own, if given).
+async fn srt_connect(d: &Direct, a: &Address, latency: Option<Duration>) -> Result<srt_tokio::SrtSocket, DirectError> {
+    let name = a.name();
+    let mode = SrtMode::of(a)?;
     let stream_id = Some(d.key.trim()).filter(|k| !k.is_empty()).or_else(|| a.param("streamid"));
     let mut b = srt_tokio::SrtSocket::builder();
-    let latency_us = a.param("latency").and_then(|v| v.parse::<u64>().ok()).unwrap_or(120_000);
-    b = b.latency(Duration::from_micros(latency_us.clamp(20_000, 8_000_000)));
-    if let Some(bw) = srt_bandwidth(&a)? {
+    let latency = latency.unwrap_or_else(|| {
+        a.param("latency")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(SRT_LATENCY, |us| Duration::from_micros(us.clamp(20_000, 8_000_000)))
+    });
+    b = b.latency(latency);
+    if let Some(bw) = srt_bandwidth(a)? {
         b = b.bandwidth(bw);
     }
     if let Some(pass) = a.param("passphrase").filter(|p| !p.is_empty()) {
@@ -396,11 +433,11 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
             a.param("pbkeylen").and_then(|v| v.parse::<u16>().ok()).filter(|n| matches!(n, 16 | 24 | 32)).unwrap_or(16);
         b = b.encryption(size, pass);
     }
-    let sock = match mode {
+    match mode {
         SrtMode::Listener => {
-            let here = listen_addr(&a)?;
+            let here = listen_addr(a)?;
             // No deadline: it waits for the receiver as long as the stream runs.
-            b.listen_on(here).await.map_err(|e| DirectError::Refused(format!("Couldn't listen on {name} ({e}).")))?
+            b.listen_on(here).await.map_err(|e| DirectError::Refused(format!("Couldn't listen on {name} ({e}).")))
         }
         SrtMode::Caller | SrtMode::Rendezvous => {
             let addr = tokio::net::lookup_host((a.host.as_str(), a.port))
@@ -416,21 +453,48 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
                     b.local_port(local).rendezvous(addr).await
                 }
             };
+            let secret = a.param("passphrase").is_some_and(|p| !p.is_empty());
             tokio::time::timeout(CONNECT_DEADLINE, connect)
                 .await
                 .map_err(|_| DirectError::Slow(name.clone()))?
-                .map_err(|e| DirectError::Refused(format!("{name} refused the SRT connection ({e}).")))?
+                .map_err(|e| srt_refusal(&name, &e.to_string(), secret))
         }
-    };
-    let mut sock = sock;
-    let stats = sock.statistics().clone();
-    let mut sink = SrtSink { sock, name };
-    let out = tokio::select! {
-        out = feed_ts(hub, health, stream, &mut sink) => out,
-        () = srt_link(stats, health) => Ok(Ended::StreamEnded),
-    };
-    let _ = sink.sock.close().await;
-    out
+    }
+}
+
+/// Why SRT didn't connect, in words: nothing there, a refusal (the passphrase or stream id, when
+/// there's one to check), or what the server said.
+fn srt_refusal(name: &str, why: &str, secret: bool) -> DirectError {
+    let why = why.trim();
+    if why.is_empty() || (why.contains("refused") && !why.contains("ejected")) {
+        DirectError::Unreachable(format!("{name} (nothing answered there)"))
+    } else if why.contains("ejected") && secret {
+        DirectError::Refused(format!("{name} refused the connection: check the passphrase and the stream id."))
+    } else if why.contains("ejected") {
+        DirectError::Refused(format!(
+            "{name} refused the connection: check the stream id (the key), and whether it wants a passphrase."
+        ))
+    } else {
+        DirectError::Refused(format!("{name} refused the SRT connection ({why})."))
+    }
+}
+
+/// Connects to an SRT server and lets go (a caller or rendezvous): the round trip, and the
+/// delay it asks for when the address doesn't set one. A listener can't be tried from here.
+pub(crate) async fn srt_reach(d: &Direct) -> Result<(Duration, Option<Duration>), DirectError> {
+    let a = Address::parse(&d.url)?;
+    if SrtMode::of(&a)? == SrtMode::Listener {
+        return Err(DirectError::Address(format!(
+            "This waits on port {} for your receiver to connect, so there's nothing to try from here.",
+            a.port
+        )));
+    }
+    let mut sock = srt_connect(d, &a, None).await?;
+    let rtt = sock.settings().rtt;
+    let _ = sock.close().await;
+    // A longer delay than the address sets (or SRT's own), when the network asks for it.
+    let set = a.param("latency").and_then(|v| v.parse::<u64>().ok()).map_or(SRT_LATENCY, Duration::from_micros);
+    Ok((rtt, srt_latency_for(rtt).filter(|want| *want > set)))
 }
 
 /// The SRT connection's ping, loss and resends, from its statistics (once a second), until they
@@ -570,6 +634,23 @@ mod tests {
         if let Some(p) = crate::ts::tests::probe(&got) {
             assert!(p.starts_with("h264,") && p.contains("aac,"), "{p}");
         }
+    }
+
+    #[test]
+    fn srt_delay_follows_the_round_trip() {
+        assert_eq!(srt_latency_for(Duration::from_millis(20)), None, "near: SRT's own 120 ms");
+        assert_eq!(srt_latency_for(Duration::from_millis(31)), Some(Duration::from_millis(130)));
+        assert_eq!(srt_latency_for(Duration::from_millis(250)), Some(Duration::from_millis(1000)));
+        assert_eq!(srt_latency_for(Duration::from_secs(5)), Some(Duration::from_secs(8)), "at most 8 s");
+    }
+
+    #[test]
+    fn srt_refusals_say_what_to_check() {
+        let say = |why: &str, secret: bool| srt_refusal("h:1", why, secret).to_string();
+        assert!(say("", false).contains("nothing answered"));
+        assert!(say("Connection refused (os error 61)", false).contains("nothing answered"));
+        assert!(say("Remote rejected connection: peer", true).contains("check the passphrase"));
+        assert!(say("Remote rejected connection: peer", false).contains("wants a passphrase"));
     }
 
     #[test]

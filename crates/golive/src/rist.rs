@@ -102,6 +102,65 @@ pub(crate) async fn session(
     }
 }
 
+/// Pings a RIST receiver (an echo request with our report, as the stream would send) and
+/// waits for its answer: the round trip. With a passphrase, an answer that won't open says the
+/// passphrase is wrong.
+pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
+    let a = Address::parse(&d.url)?;
+    check(d, &a)?;
+    let name = format!("{}:{}", a.host, a.port);
+    let to = tokio::net::lookup_host((a.host.as_str(), a.port))
+        .await
+        .ok()
+        .and_then(|mut it| it.next())
+        .ok_or_else(|| DirectError::Unreachable(name.clone()))?;
+    let main = Main::of(d, &a);
+    // Reports go to the port after the stream's in the simple profile.
+    let to = if main.is_some() { to } else { SocketAddr::new(to.ip(), to.port() + 1) };
+    let any = if to.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = UdpSocket::bind(any).await.map_err(|_| DirectError::Unreachable(name.clone()))?;
+    let here = sock.local_addr().map(|l| l.port()).unwrap_or(0);
+    let ssrc = fastrand::u32(..) & !1;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut again = tokio::time::interval(Duration::from_millis(500));
+    let (mut buf, mut unread) = (vec![0u8; 2048], 0u32);
+    loop {
+        tokio::select! {
+            _ = again.tick() => {
+                let mut r = report(ssrc, started);
+                r.extend_from_slice(&echo_request(ssrc));
+                let r = match &main {
+                    Some(m) => m.wrap(here, to.port(), &r),
+                    None => r,
+                };
+                let _ = sock.send_to(&r, to).await;
+            }
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { continue };
+                if from.ip() != to.ip() {
+                    continue;
+                }
+                let got = match &main {
+                    Some(m) => m.unwrap(&buf[..n]),
+                    None => Some(buf[..n].to_vec()),
+                };
+                match got.as_deref().and_then(echo_round_trip) {
+                    Some(rtt) => return Ok(rtt),
+                    None => unread += 1,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(if unread > 0 && main.as_ref().is_some_and(|m| m.crypt.is_some()) {
+                    DirectError::Refused(format!("{name} answered, but its answers don't open: check the passphrase."))
+                } else {
+                    DirectError::Unreachable(format!("{name} (no answer: is the receiver listening, on this profile?)"))
+                });
+            }
+        }
+    }
+}
+
 /// The passphrase: the key, or `secret=` in the address.
 fn passphrase<'a>(d: &'a Direct, a: &'a Address) -> Option<&'a str> {
     Some(d.key.trim()).filter(|k| !k.is_empty()).or_else(|| a.param("secret").filter(|s| !s.is_empty()))

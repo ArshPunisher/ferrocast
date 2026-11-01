@@ -152,9 +152,9 @@ pub(crate) enum Ended {
     Stopped,
 }
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-type Stream = Pin<Box<dyn Io>>;
+pub(crate) type Stream = Pin<Box<dyn Io>>;
 
 /// Runs one destination until `stop` turns true. Health is sent on `health`.
 pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
@@ -238,7 +238,7 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-async fn connect(t: &Target) -> Result<Stream, PushError> {
+pub(crate) async fn connect(t: &Target) -> Result<Stream, PushError> {
     let host = t.host.clone();
     let tcp = timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port)))
         .await
