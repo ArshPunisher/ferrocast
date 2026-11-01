@@ -225,12 +225,26 @@ pub struct Canvas {
     pub every: u32,
     /// The mixer's track it sends (0 is track 1).
     pub track: usize,
+    /// Drawn at this size first, then scaled to `width`×`height` with this filter (OBS's
+    /// output resolution: a 720p stream from a 1080p canvas). None draws at `width`×`height`.
+    pub scaled_from: Option<(u32, u32, Filter)>,
 }
 
 impl Canvas {
     /// The engine's own canvas: its size and rate, what's on air, track 1.
     pub fn main(config: EngineConfig) -> Self {
-        Self { width: config.width, height: config.height, scene: None, every: 1, track: 0 }
+        Self { width: config.width, height: config.height, scene: None, every: 1, track: 0, scaled_from: None }
+    }
+
+    /// The engine's canvas scaled to `width`×`height` (bicubic, OBS's default downscale filter).
+    pub fn scaled(config: EngineConfig, width: u32, height: u32) -> Self {
+        let from = (width, height) != (config.width, config.height);
+        Self {
+            width,
+            height,
+            scaled_from: from.then_some((config.width, config.height, Filter::Bicubic)),
+            ..Self::main(config)
+        }
     }
 }
 
@@ -905,6 +919,26 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     }
 }
 
+/// A scene drawn at its own size, then stretched to `width`×`height` with `filter`.
+fn scaled(scene: Scene, width: u32, height: u32, filter: Filter) -> Scene {
+    let item = Item {
+        content: Content::Scene(scene),
+        effects: Vec::new(),
+        placement: Placement {
+            bounds: crate::Bounds::Stretch,
+            bounds_width: width as f32,
+            bounds_height: height as f32,
+            ..Default::default()
+        },
+        filter,
+        blend: crate::Blend::Normal,
+        srgb_off: false,
+        linear: true,
+        opacity: 1.0,
+    };
+    Scene { width, height, items: vec![item] }
+}
+
 /// The sources heard now: the global ones, and every source shown (scenes inside scenes and
 /// groups too) by the scene on air, the one a transition or stinger leaves, and each output's
 /// own scene; the stinger itself.
@@ -1175,7 +1209,17 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                 if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
                     continue;
                 }
-                let frame = match what_to_draw(&st, canvas.width, canvas.height, canvas.scene.as_deref(), ts) {
+                let (w, h) = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
+                let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts), canvas.scaled_from) {
+                    (d, None) => d,
+                    (Draw::Scene(s), Some((.., f))) => Draw::Scene(scaled(s, canvas.width, canvas.height, f)),
+                    (Draw::Moving(mut t), Some((.., f))) => {
+                        t.from = scaled(t.from, canvas.width, canvas.height, f);
+                        t.to = scaled(t.to, canvas.width, canvas.height, f);
+                        Draw::Moving(t)
+                    }
+                };
+                let frame = match draw {
                     Draw::Scene(s) => gpu.render_nv12(&s),
                     Draw::Moving(t) => gpu.render_transition_nv12(&t),
                 };
@@ -1476,7 +1520,7 @@ mod tests {
         let b = e
             .start_output_on(
                 OutputKind::Record(tall.clone()),
-                Canvas { width: 360, height: 640, scene: Some("Tall".into()), every: 2, track: 0 },
+                Canvas { width: 360, height: 640, scene: Some("Tall".into()), every: 2, track: 0, scaled_from: None },
             )
             .unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_secs(2));
@@ -1645,5 +1689,44 @@ mod tests {
             let errors = String::from_utf8_lossy(&out.stderr).to_string();
             assert!(out.status.success() && errors.trim().is_empty(), "{}: {errors}", f.display());
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_output_scales_the_whole_canvas() {
+        let Some(e) = engine() else { return };
+        // Red on the left half, blue on the right, of a 640×360 canvas.
+        e.set_source(1, SourceKind::Color { width: 320, height: 360, rgba: [255, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 320, height: 360, rgba: [0, 0, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene(
+            "Main",
+            vec![
+                SceneItem::new(1, Placement::default()),
+                SceneItem::new(2, Placement { x: 320.0, ..Default::default() }),
+            ],
+        );
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let file = std::env::temp_dir().join("ferrocast-av-scaled.mp4");
+        let canvas = Canvas::scaled(e.config(), 320, 180);
+        let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1500));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&file)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+        else {
+            eprintln!("skipped the check: no ffmpeg");
+            return;
+        };
+        let px = out.stdout;
+        assert_eq!(px.len(), 320 * 180 * 3, "the whole canvas, at 320×180");
+        let at = |x: usize, y: usize| &px[(y * 320 + x) * 3..(y * 320 + x) * 3 + 3];
+        // Both halves are there, scaled (not the top-left corner cut out).
+        assert!(at(40, 90)[0] > 200 && at(40, 90)[2] < 60, "red left: {:?}", at(40, 90));
+        assert!(at(280, 90)[2] > 200 && at(280, 90)[0] < 60, "blue right: {:?}", at(280, 90));
     }
 }
