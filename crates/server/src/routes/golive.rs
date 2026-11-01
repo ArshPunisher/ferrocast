@@ -21,6 +21,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/ingest", get(ingest))
         .route("/golive/destinations", put(order).post(add))
         .route("/golive/destinations/{id}", delete(remove))
+        .route("/golive/destinations/{id}/test", post(test_destination))
+        .route("/golive/test", post(test_address))
         .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
@@ -77,6 +79,24 @@ struct AddBody {
     /// `vertical` for a server that takes OBS's vertical canvas.
     #[serde(default)]
     canvas: ferrocast_engine::golive::Canvas,
+}
+
+/// "Test connection" on a saved destination → `{ ok, rtt_ms?, message, srt_latency_ms? }`.
+async fn test_destination(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_test(&id).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestBody {
+    url: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// "Test connection" in the add dialog, before saving.
+async fn test_address(State(app): State<AppState>, Body(b): Body<TestBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_test_address(&b.url, &b.key).await?)))
 }
 
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {

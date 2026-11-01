@@ -1156,6 +1156,45 @@ impl Engine {
 
     /// Removes a custom destination and its key. The three platforms can't be removed, only
     /// switched off.
+    /// "Test connection" on a destination: tries its server as the stream would (a platform's
+    /// RTMP server; a server of your own with its saved key) and says how it went.
+    pub async fn golive_test(&self, id: &str) -> Result<ferrocast_golive::reach::Reach, EngineError> {
+        let d = self
+            .golive_config()
+            .destinations
+            .into_iter()
+            .find(|d| d.id == id)
+            .ok_or(EngineError::NotFound("destination"))?;
+        if d.kind == Service::Custom {
+            let url = d.url.clone().unwrap_or_default();
+            let key =
+                self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
+            return Ok(ferrocast_golive::reach::reach(&url, &key).await);
+        }
+        match self.resolve(&d).await {
+            Ok(dest) => {
+                let t = &dest.target;
+                let url = format!("{}://{}:{}/{}", if t.tls { "rtmps" } else { "rtmp" }, t.host, t.port, t.app);
+                Ok(ferrocast_golive::reach::reach(&url, "").await)
+            }
+            Err(why) => {
+                Ok(ferrocast_golive::reach::Reach { ok: false, rtt_ms: None, message: why, srt_latency_ms: None })
+            }
+        }
+    }
+
+    /// "Test connection" in the add dialog, before the server is saved.
+    pub async fn golive_test_address(
+        &self,
+        url: &str,
+        key: &str,
+    ) -> Result<ferrocast_golive::reach::Reach, EngineError> {
+        if url.trim().is_empty() || url.len() > 2048 || key.len() > 512 {
+            return Err(EngineError::Invalid("url: an address up to 2048 letters; key: up to 512.".into()));
+        }
+        Ok(ferrocast_golive::reach::reach(url, key).await)
+    }
+
     pub async fn remove_golive_destination(&self, id: &str) -> Result<(), EngineError> {
         let one_at_a_time = self.config_lock().await;
         let mut cfg = self.golive_config();
@@ -1568,8 +1607,14 @@ impl Engine {
         match self.resolve(d).await {
             Ok(dest) => {
                 lock(&g.blocked).remove(&d.id);
-                let (health_tx, health) =
-                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+                let (health_tx, health) = watch::channel(Health {
+                    state: PushState::Waiting,
+                    kbps: 0,
+                    dropped: 0,
+                    sent: 0,
+                    link: None,
+                    since_ms: 0,
+                });
                 let (stop, stop_rx) = watch::channel(false);
                 tokio::spawn(ferrocast_golive::push::run(dest, self.hub_of(d).clone(), health_tx, stop_rx));
                 lock(&g.running).insert(d.id.clone(), Running { stop, health, light: self.on_light(d) });
@@ -1606,8 +1651,14 @@ impl Engine {
         };
         lock(&g.blocked).remove(&d.id);
         let now_ms = || u64::try_from(now().0).unwrap_or(0);
-        let (health_tx, health) =
-            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: now_ms() });
+        let (health_tx, health) = watch::channel(Health {
+            state: PushState::Connecting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            since_ms: now_ms(),
+        });
         let (stop, mut stop_rx) = watch::channel(false);
         let id = d.id.clone();
         tokio::spawn(async move {

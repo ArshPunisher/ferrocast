@@ -586,3 +586,25 @@ async fn srt_rist_and_webrtc_servers_go_straight_from_the_studio() {
     }
     assert_eq!(studio.stopped.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn test_connection_tries_the_server_and_says_how_it_went() {
+    use crate::EngineError;
+    use crate::golive::Canvas;
+    let (e, _dir) = engine().await;
+    // A plain RTMP server here: reached and shaken hands with, key saved but not needed.
+    let (port, _got) = ferrocast_testkit::rtmp::platform("k").await;
+    let d =
+        e.add_golive_destination("Mine", &format!("rtmp://127.0.0.1:{port}/live"), "k", Canvas::Main).await.unwrap();
+    let r = e.golive_test(&d.id).await.unwrap();
+    assert!(r.ok && r.message.contains("answered"), "{r:?}");
+    // Nothing there: said, not an error.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let r = e.golive_test_address(&format!("rtmp://127.0.0.1:{closed}/live"), "").await.unwrap();
+    assert!(!r.ok && r.message.contains("Couldn't reach"), "{r:?}");
+    // Addresses that can't work, and unknown destinations.
+    let r = e.golive_test_address("srt://:9000", "").await.unwrap();
+    assert!(!r.ok && r.message.contains("host"), "{r:?}");
+    assert!(e.golive_test_address(" ", "").await.is_err());
+    assert!(matches!(e.golive_test("nope").await, Err(EngineError::NotFound(_))));
+}

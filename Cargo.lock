@@ -2353,6 +2353,7 @@ dependencies = [
  "rml_rtmp",
  "rustls",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "srt-tokio",
  "str0m",
