@@ -916,6 +916,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             done(c.set_channel(channel, device.as_ref().map(|d| (d.kind.as_str(), d.name.as_str(), &d.settings))))
         }
         A::Levels { names } => v(to_json!(c.levels(&names))),
+        A::Look { names } => v(to_json!(c.look(&names)?)),
         A::Filters { name } => v(to_json!(c.filters(&name)?)),
         A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),

@@ -455,6 +455,41 @@ pub struct EngineStats {
     pub encoded: u32,
 }
 
+/// How a source's picture looks now (`Stage::look`): for catching a black or frozen camera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Look {
+    /// Average brightness, 0 (black) to 255.
+    pub luma: u8,
+    /// How much the brightness varies across the picture (0: one flat colour).
+    pub spread: u8,
+    /// Changes whenever the picture does (a frozen one keeps it).
+    pub sig: u64,
+}
+
+impl Look {
+    /// From an RGBA picture.
+    pub fn of(rgba: &[u8]) -> Look {
+        let lumas: Vec<u32> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| (u32::from(p[0]) * 54 + u32::from(p[1]) * 183 + u32::from(p[2]) * 19) >> 8)
+            .collect();
+        let n = lumas.len().max(1) as u32;
+        let mean = lumas.iter().sum::<u32>() / n;
+        let var = lumas.iter().map(|l| l.abs_diff(mean).pow(2)).sum::<u32>() / n;
+        // FNV-1a over the brightness in steps of 4 (sensor noise doesn't change it much).
+        let sig =
+            lumas.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, l| (h ^ u64::from(*l >> 2)).wrapping_mul(0x100_0000_01b3));
+        Look { luma: mean.min(255) as u8, spread: (var as f32).sqrt().min(255.0) as u8, sig }
+    }
+
+    /// Black: dark and flat (a covered lens, a camera another app holds).
+    pub fn black(&self) -> bool {
+        self.luma < 12 && self.spread < 6
+    }
+}
+
 /// How a stream is going.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStats {
@@ -528,5 +563,25 @@ mod tests {
         for bad in ["", " lead", "a\nb", &"x".repeat(101)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::Look;
+
+    #[test]
+    fn a_black_flat_picture_is_black_and_a_moving_one_changes() {
+        let black = Look::of(&[0u8, 0, 0, 255].repeat(32 * 18));
+        assert!(black.black());
+        let mut grad = Vec::new();
+        for i in 0..(32 * 18) {
+            let v = (i % 32 * 8) as u8;
+            grad.extend_from_slice(&[v, v, v, 255]);
+        }
+        let a = Look::of(&grad);
+        assert!(!a.black() && a.spread > 20, "{a:?}");
+        grad[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        assert_ne!(Look::of(&grad).sig, a.sig, "a change shows");
     }
 }

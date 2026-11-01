@@ -17,6 +17,10 @@ use crate::collection::{
 use crate::naming::{NameVideo, file_name};
 use crate::{Canvas, RecordPlan, RecordStats, ReplayPlan, StreamSettings, StreamStats, StudioError, check_name, own};
 
+/// The size a picture is glanced at (`look`).
+const LOOK_W: u32 = 32;
+const LOOK_H: u32 = 18;
+
 /// OBS's global sound channels, in its saved collection: Desktop Audio 1-2, Mic/Aux 1-4.
 const CHANNEL_KEYS: [&str; 6] = [
     "DesktopAudioDevice1",
@@ -1615,6 +1619,21 @@ impl Stage {
                 Some((n.clone(), crate::collection::LevelInfo { peak: l.peak, magnitude: l.rms }))
             })
             .collect()
+    }
+
+    /// How these sources' pictures look now (a 32x18 glance): brightness, how much it varies, and a
+    /// fingerprint that changes when the picture does. Sources with no picture yet are left out.
+    pub fn look(&self, names: &[String]) -> Result<std::collections::HashMap<String, crate::Look>, StudioError> {
+        // Started if it isn't yet (a camera only loaded has no picture to look at otherwise).
+        let e = self.engine()?;
+        Ok(names
+            .iter()
+            .filter_map(|n| {
+                let (id, _) = e.engine.source_named(n)?;
+                let rgba = e.engine.snapshot_source_at(id, (LOOK_W, LOOK_H))?;
+                Some((n.clone(), crate::Look::of(&rgba)))
+            })
+            .collect())
     }
 
     /// Puts a device on global channel `ch` (1-6: Desktop Audio 1-2, Mic/Aux 1-4), heard in every
