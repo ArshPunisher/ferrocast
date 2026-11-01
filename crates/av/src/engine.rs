@@ -678,6 +678,14 @@ impl Engine {
     }
 
     /// The scenes there are (groups left out).
+    /// A source an opened collection brought, by name: its id, and its picture's size once
+    /// it has one.
+    pub fn source_named(&self, name: &str) -> Option<(u64, Option<(u32, u32)>)> {
+        let st = self.lock();
+        let (id, _) = st.opened.get(name)?;
+        Some((*id, st.sources.get(id).and_then(|s| s.size).map(|(w, h, _)| (w, h))))
+    }
+
     pub fn scene_names(&self) -> Vec<String> {
         let st = self.lock();
         st.scenes.keys().filter(|n| !st.groups.contains(n)).cloned().collect()
