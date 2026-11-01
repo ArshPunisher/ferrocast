@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ffi::{self, Api, Level, cstr, text};
-use crate::{OptionInfo, Studio, StudioError, check_name};
+use crate::{OptionInfo, RecordPlan, Recording, StreamSettings, Streaming, Studio, StudioError, check_name, own};
 
 mod follow;
 mod moves;
@@ -3539,6 +3539,48 @@ impl Collection {
             return Value::Null;
         }
         serde_json::from_str(&text(self.api().obs_data_get_json(data))).unwrap_or(Value::Null)
+    }
+
+    /// Streams this collection drawn, mixed and encoded by Ferrocast's own engine (ENGINE.md
+    /// E7, beta) instead of libobs, over RTMP to `server` with `key`. Keep it with the Studio
+    /// with `Streaming::follow`; `Streaming::skipped` says what it couldn't bring over (those
+    /// sources and filters are left out). Refuses what our encoders don't do (`own_encoder`'s
+    /// limits).
+    pub fn stream_drawn(&self, server: &str, key: &str, s: &StreamSettings) -> Result<Streaming, StudioError> {
+        if let Some(why) = own::unsupported(s, true) {
+            return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let send = own::Send { server, key, reconnect: s.reconnect };
+        let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), Some(send), None, &s.encode)?;
+        Ok(Streaming {
+            studio: self.studio.clone(),
+            out: std::ptr::null_mut(),
+            service: std::ptr::null_mut(),
+            venc: std::ptr::null_mut(),
+            aenc: std::ptr::null_mut(),
+            vod: std::ptr::null_mut(),
+            settings: s.clone(),
+            directs: Vec::new(),
+            own: Some(own),
+        })
+    }
+
+    /// Records this collection drawn by Ferrocast's own engine to `path` (a crash-safe MP4), as
+    /// `stream_drawn` streams it.
+    pub fn record_drawn(&self, path: &std::path::Path, plan: &RecordPlan) -> Result<Recording, StudioError> {
+        if let Some(why) = own::unsupported_recording(plan) {
+            return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), None, Some(path), &plan.encode)?;
+        Ok(Recording {
+            studio: self.studio.clone(),
+            out: std::ptr::null_mut(),
+            venc: std::ptr::null_mut(),
+            audio: Vec::new(),
+            path: path.to_path_buf(),
+            view: std::ptr::null_mut(),
+            own: Some(own),
+        })
     }
 
     /// The collection as OBS writes a scene collection.

@@ -3,13 +3,19 @@
 //! ferrocast-av's encoders, out over RTMP by Go live's own sender to the same server libobs
 //! would send to (Go live's ingest on this computer), or into a crash-safe MP4. Everything after
 //! looks the same to the rest of the app.
+//!
+//! With the engine drawing too (E7, `OwnStream::drawn`), libobs isn't in the picture at all:
+//! the collection is opened in ferrocast-av's engine, which draws, mixes and encodes it, and
+//! follows the Studio's scene changes and edits (`OwnStream::follow`).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ferrocast_av::TransitionKind;
 use ferrocast_av::audio::AudioConfig;
+use ferrocast_av::engine::{Engine, EngineConfig, OutputKind};
 use ferrocast_av::pipeline::{Pipeline, Tag};
 use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
@@ -110,6 +116,49 @@ pub(crate) struct OwnStream {
     /// libobs's side of the hand-over (kept on this thread: it holds the Studio); its
     /// channels are with the encoder thread.
     feed: Option<ProgramFeed>,
+    /// Our engine drawing the collection (instead of libobs's frames).
+    drawn: Option<Drawn>,
+    hub: Option<Arc<Hub>>,
+}
+
+/// Our engine with the collection open, and what it last opened.
+#[derive(Debug)]
+struct Drawn {
+    engine: Engine,
+    output: u64,
+    /// The collection as last opened, without the scene on air: when it differs, it's opened
+    /// again.
+    shown: serde_json::Value,
+    on_air: Option<String>,
+    /// What couldn't come over.
+    skipped: Vec<String>,
+}
+
+/// A collection without which scene is on air (what a reopen depends on).
+fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
+    let mut d = doc.clone();
+    if let Some(m) = d.as_object_mut() {
+        m.remove("current_scene");
+        m.remove("current_program_scene");
+    }
+    d
+}
+
+/// The engine's transition for the Studio's (by OBS's id); the rest fade for now.
+fn transition_of(doc: &serde_json::Value) -> (TransitionKind, u64) {
+    let ms = doc.get("transition_duration").and_then(serde_json::Value::as_u64).unwrap_or(300);
+    let name = doc.get("current_transition").and_then(serde_json::Value::as_str).unwrap_or("Fade");
+    let id = doc
+        .get("transitions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|t| t.iter().find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(name)))
+        .and_then(|t| t.get("id").and_then(serde_json::Value::as_str))
+        .unwrap_or(if name == "Cut" { "cut_transition" } else { "fade_transition" });
+    match id {
+        "cut_transition" => (TransitionKind::Cut, 0),
+        "ferrocast_move" | "move_transition" => (TransitionKind::Move, ms),
+        _ => (TransitionKind::Fade, ms),
+    }
 }
 
 impl OwnStream {
@@ -156,25 +205,7 @@ impl OwnStream {
         let mut pipe = Pipeline::new(video, audio, record).map_err(|e| fail(e.to_string()))?;
 
         let hub = Hub::new();
-        let (mut runtime, mut health, mut stop_push) = (None, None, None);
-        if let (Some(d), Some(target)) = (send_to, target) {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .thread_name("ferrocast-own-stream")
-                .build()
-                .map_err(|e| fail(e.to_string()))?;
-            let retry = match d.reconnect {
-                Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
-                None => Retry::default(),
-            };
-            let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: false };
-            let (health_tx, h) =
-                tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
-            let (sp, stop_rx) = tokio::sync::watch::channel(false);
-            rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
-            (runtime, health, stop_push) = (Some(rt), Some(h), Some(sp));
-        }
+        let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
@@ -254,11 +285,137 @@ impl OwnStream {
             recording = record.is_some(),
             "the Studio uses Ferrocast's own encoder"
         );
-        Ok(Self { stop, thread: Some(thread), counts, health, stop_push, runtime, feed: Some(feed) })
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+            counts,
+            health,
+            stop_push,
+            runtime,
+            feed: Some(feed),
+            drawn: None,
+            hub: None,
+        })
+    }
+
+    /// A stream (`send_to`) or recording (`record`) drawn by our engine from the collection
+    /// `doc` (as `Collection::save` gives it) at the Studio's canvas.
+    pub(crate) fn drawn(
+        studio: &Studio,
+        doc: &serde_json::Value,
+        send_to: Option<Send<'_>>,
+        record: Option<&std::path::Path>,
+        e: &EncodeSettings,
+    ) -> Result<Self, StudioError> {
+        let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
+        let target = match &send_to {
+            Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
+            None => None,
+        };
+        let canvas = studio.canvas();
+        let codec =
+            if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
+        let video = VideoConfig {
+            codec,
+            input: PixelFormat::Nv12,
+            width: canvas.width,
+            height: canvas.height,
+            fps_num: canvas.fps.max(1),
+            fps_den: 1,
+            bitrate_kbps: e.video_kbps.max(100),
+            rate: if e.vbr { RateControl::Average } else { RateControl::Cbr },
+            keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+        };
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let config = EngineConfig {
+            width: canvas.width,
+            height: canvas.height,
+            fps: canvas.fps.max(1),
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(config, video, audio).map_err(|e| fail(e.to_string()))?;
+        let skipped = engine.load_obs(doc);
+        for s in &skipped {
+            tracing::info!("Ferrocast's own engine doesn't bring this over yet: {s}");
+        }
+        let hub = Hub::new();
+        let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
+        let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
+        hub.start();
+        let kind = match record {
+            Some(p) => OutputKind::Record(p.to_path_buf()),
+            None => {
+                let (hub, counts) = (hub.clone(), counts.clone());
+                OutputKind::Stream(Box::new(move |t: Tag| match t {
+                    Tag::Video { ms, body } => {
+                        counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                        hub.video(ms, body.into());
+                    }
+                    Tag::Audio { ms, body } => {
+                        counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                        hub.audio(ms, body.into());
+                    }
+                }))
+            }
+        };
+        let output = engine.start_output(kind).map_err(|e| fail(e.to_string()))?;
+        tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
+        let on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        Ok(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            counts,
+            health,
+            stop_push,
+            runtime,
+            feed: None,
+            drawn: Some(Drawn { engine, output, shown: without_on_air(doc), on_air, skipped }),
+            hub: Some(hub),
+        })
+    }
+
+    /// Keeps a drawn stream with the Studio: a new scene on air goes on through the Studio's
+    /// transition; any other change opens the collection again (sources restart). Returns
+    /// whether it was opened again. Nothing for a stream libobs draws.
+    pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
+        let Some(d) = self.drawn.as_mut() else { return false };
+        let bare = without_on_air(doc);
+        if bare != d.shown {
+            d.skipped = d.engine.load_obs(doc);
+            d.shown = bare;
+            d.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+            return true;
+        }
+        let now = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        if now != d.on_air
+            && let Some(name) = &now
+        {
+            let (kind, ms) = transition_of(doc);
+            if let Err(e) = d.engine.go_with(name, kind, ms) {
+                tracing::warn!("Ferrocast's own engine couldn't follow the scene change: {e}");
+            }
+            d.on_air = now;
+        }
+        false
+    }
+
+    /// What our engine couldn't bring over (empty when libobs draws).
+    pub(crate) fn skipped(&self) -> &[String] {
+        self.drawn.as_ref().map_or(&[], |d| &d.skipped)
     }
 
     pub(crate) fn stats(&self) -> StreamStats {
         let state = self.health.as_ref().map(|h| h.borrow().state.clone());
+        if let Some(d) = &self.drawn {
+            let s = d.engine.stats();
+            return StreamStats {
+                active: d.engine.error().is_none(),
+                reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
+                bytes: self.counts.bytes.load(Ordering::Relaxed),
+                frames: s.frames.min(u64::from(u32::MAX)) as u32,
+                dropped: s.skipped.min(u64::from(u32::MAX)) as u32,
+            };
+        }
         StreamStats {
             active: self.counts.running.load(Ordering::Acquire),
             reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
@@ -274,6 +431,9 @@ impl OwnStream {
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {
+        if let Some(e) = self.drawn.as_ref().and_then(|d| d.engine.error()) {
+            return Some(e);
+        }
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {
             return Some(e);
         }
@@ -284,14 +444,55 @@ impl OwnStream {
     }
 }
 
+/// Go live's sender to the server, when streaming: its runtime, health and stop.
+#[allow(clippy::type_complexity)]
+fn sender(
+    send_to: Option<Send<'_>>,
+    target: Option<Target>,
+    hub: &Arc<Hub>,
+) -> Result<
+    (
+        Option<tokio::runtime::Runtime>,
+        Option<tokio::sync::watch::Receiver<Health>>,
+        Option<tokio::sync::watch::Sender<bool>>,
+    ),
+    String,
+> {
+    let (Some(d), Some(target)) = (send_to, target) else { return Ok((None, None, None)) };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("ferrocast-own-stream")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let retry = match d.reconnect {
+        Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
+        None => Retry::default(),
+    };
+    let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: false };
+    let (health_tx, h) =
+        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+    let (sp, stop_rx) = tokio::sync::watch::channel(false);
+    rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
+    Ok((Some(rt), Some(h), Some(sp)))
+}
+
 impl Drop for OwnStream {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        // libobs stops handing frames over.
+        // libobs stops handing frames over; our engine closes its output (encoders flushed).
         self.feed = None;
+        if let Some(d) = self.drawn.take() {
+            if let Err(e) = d.engine.stop_output(d.output) {
+                tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
+            }
+            if let Some(hub) = self.hub.take() {
+                hub.end();
+            }
+        }
         // A moment for the last packets to leave, then the sender stops.
         if let Some(sp) = self.stop_push.take() {
             std::thread::sleep(Duration::from_millis(300));
@@ -316,6 +517,22 @@ mod tests {
             vod_track: None,
             own_encoder: true,
         }
+    }
+
+    #[test]
+    fn a_drawn_stream_follows_the_studios_transition() {
+        let doc = serde_json::json!({
+            "current_transition": "Swoosh",
+            "transition_duration": 700,
+            "transitions": [{ "name": "Swoosh", "id": "cut_transition" }],
+        });
+        assert_eq!(transition_of(&doc), (TransitionKind::Cut, 0));
+        let fade = serde_json::json!({ "current_transition": "Fade", "transition_duration": 500 });
+        assert_eq!(transition_of(&fade), (TransitionKind::Fade, 500));
+        // Only which scene is on air changed: not a reopen.
+        let a = serde_json::json!({ "current_program_scene": "A", "current_scene": "A", "sources": [1] });
+        let b = serde_json::json!({ "current_program_scene": "B", "current_scene": "B", "sources": [1] });
+        assert_eq!(without_on_air(&a), without_on_air(&b));
     }
 
     #[test]

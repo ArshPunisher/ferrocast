@@ -2492,6 +2492,19 @@ impl RecordPlan {
 }
 
 impl Recording {
+    /// Keeps a recording our engine draws with the collection (see `Streaming::follow`).
+    pub fn follow(&mut self, c: &Collection) -> bool {
+        match self.own.as_mut() {
+            Some(o) => o.follow(&c.save("Ferrocast")),
+            None => false,
+        }
+    }
+
+    /// What our engine couldn't bring over from the collection (empty when libobs draws).
+    pub fn skipped(&self) -> Vec<String> {
+        self.own.as_ref().map(|o| o.skipped().to_vec()).unwrap_or_default()
+    }
+
     /// The file it started writing.
     pub fn path(&self) -> &Path {
         &self.path
@@ -2795,6 +2808,23 @@ impl Streaming {
     /// Whether Ferrocast's own encoders send this stream.
     pub fn own_encoder(&self) -> bool {
         self.own.is_some()
+    }
+
+    /// Keeps a stream our engine draws (`Collection::stream_drawn`) with the collection: a
+    /// new scene on air goes on through the Studio's transition; any other change opens the
+    /// collection again in the engine (its sources restart). Call it after changes, or every
+    /// second or so. Returns whether the collection was opened again; nothing for a stream
+    /// libobs draws.
+    pub fn follow(&mut self, c: &Collection) -> bool {
+        match self.own.as_mut() {
+            Some(o) => o.follow(&c.save("Ferrocast")),
+            None => false,
+        }
+    }
+
+    /// What our engine couldn't bring over from the collection (empty when libobs draws).
+    pub fn skipped(&self) -> Vec<String> {
+        self.own.as_ref().map(|o| o.skipped().to_vec()).unwrap_or_default()
     }
 
     /// The reason OBS gave for the last failure, if any.
