@@ -1090,12 +1090,17 @@ impl Stage {
     /// Records what's on air (or `solo`, one scene or source on its own) to a file named as
     /// `plan` says → the recording; `StageOutput::path` says where.
     pub fn record(&self, plan: &RecordPlan, solo: Option<&str>) -> Result<StageOutput, StudioError> {
+        std::fs::create_dir_all(&plan.folder)
+            .map_err(|e| fail(format!("The recordings folder {} can't be made: {e}", plan.folder.display())))?;
+        self.record_at(&self.record_path(plan), plan, solo)
+    }
+
+    /// The same, to `path` (named already).
+    pub fn record_at(&self, path: &Path, plan: &RecordPlan, solo: Option<&str>) -> Result<StageOutput, StudioError> {
         if let Some(why) = own::unsupported_recording(plan) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
-        std::fs::create_dir_all(&plan.folder)
-            .map_err(|e| fail(format!("The recordings folder {} can't be made: {e}", plan.folder.display())))?;
-        let path = self.record_path(plan);
+        let path = path.to_path_buf();
         let how = own::Drawing {
             send_to: None,
             record: Some(&path),
@@ -1109,6 +1114,32 @@ impl Stage {
         let mut own = self.output(how)?;
         own.set_plan(plan);
         Ok(StageOutput::new(own, Some(path), self.canvas))
+    }
+
+    /// `Collection`'s names for the same, so the app calls either.
+    pub fn stream_drawn(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+        self.stream(server, key, s)
+    }
+
+    pub fn vertical_stream_drawn(
+        &self,
+        server: &str,
+        key: &str,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
+        self.stream_vertical(server, key, s)
+    }
+
+    pub fn record_drawn(&self, path: &Path, plan: &RecordPlan) -> Result<StageOutput, StudioError> {
+        self.record_at(path, plan, None)
+    }
+
+    pub fn record_source_drawn(&self, name: &str, path: &Path, plan: &RecordPlan) -> Result<StageOutput, StudioError> {
+        self.record_at(path, plan, Some(name))
+    }
+
+    pub fn replay_drawn(&self, plan: &ReplayPlan) -> Result<StageOutput, StudioError> {
+        self.replay(plan)
     }
 
     /// OBS's replay buffer: the last `plan.seconds` kept, saved on request (`save_replay`).
@@ -2041,9 +2072,14 @@ impl StageOutput {
         self.own.set_video_kbps(kbps);
     }
 
-    /// The file a recording writes now.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+    /// The file a recording writes now (empty for a stream).
+    pub fn path(&self) -> &Path {
+        self.path.as_deref().unwrap_or(Path::new(""))
+    }
+
+    /// Stats of a direct send (none: those aren't in our engine yet).
+    pub fn direct_stats(&self, _id: &str) -> Option<StreamStats> {
+        None
     }
 
     pub fn pause(&self, on: bool) -> Result<(), StudioError> {
@@ -2084,10 +2120,49 @@ impl StageOutput {
     pub fn last_replay(&self) -> Option<PathBuf> {
         self.replay.as_ref().and_then(|(_, d)| d.lock().unwrap_or_else(|e| e.into_inner()).last.clone())
     }
+
+    // `Streaming`'s, `Recording`'s and `ReplayBuffer`'s names, so the app calls either.
+
+    /// Keeps it with the stage (the app's tick): a recording splits when its plan says.
+    /// Returns false: the stage's edits reach our engine as they're made.
+    pub fn follow(&mut self, _stage: &Stage) -> bool {
+        self.tick();
+        false
+    }
+
+    /// Drawn by our engine: always.
+    pub fn drawn(&self) -> bool {
+        true
+    }
+
+    /// Running (not stopped by a problem).
+    pub fn active(&self) -> bool {
+        self.last_error().is_none()
+    }
+
+    /// Saves the replay buffer (as `save_replay`).
+    pub fn save(&self) -> Result<(), StudioError> {
+        self.save_replay()
+    }
+
+    /// Chapter marks aren't in our engine's files yet.
+    pub fn chapter(&self, _name: &str) -> Result<(), StudioError> {
+        Err(fail("Chapter marks aren't in Ferrocast's own engine yet."))
+    }
+
+    /// SRT, RIST and WebRTC sends aren't in our engine yet.
+    pub fn add_direct(&mut self, _id: &str, _url: &str, _key: &str) -> Result<(), StudioError> {
+        Err(fail(
+            "SRT, RIST and WebRTC aren't in Ferrocast's own engine yet: those destinations go through Go live's RTMP.",
+        ))
+    }
+
+    pub fn remove_direct(&mut self, _id: &str) {}
 }
 
-/// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS). Its
-/// outlines and handles come from the stage's own items. Removed when dropped.
+/// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS): the
+/// same calls as `Preview`. Its outlines and handles come from the stage's own items, taken on
+/// each `follow` (the app's tick) and kept between. Removed when dropped.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct StageView {
@@ -2095,6 +2170,8 @@ pub struct StageView {
     id: u64,
     view: crate::ffi::mac::ChildView,
     look: RefCell<ViewLook>,
+    /// Shows the vertical picture (it follows that picture's scene on air).
+    vertical: bool,
 }
 
 /// What a view keeps to draw round and over the picture.
@@ -2110,19 +2187,44 @@ struct ViewLook {
     /// A scene whose sources all get an outline.
     frames: Option<String>,
     shade: f32,
-    /// The scene shown instead of what's on air (Studio Mode), and the canvas it's on.
+    /// The scene shown instead of what's on air (Studio Mode).
     scene: Option<String>,
+    /// The outlines as last taken from the stage.
+    outlines: Vec<ferrocast_av::preview::Outline>,
 }
 
 #[cfg(target_os = "macos")]
 impl Stage {
     /// A preview of the stage over `window`'s page at `rect` (points), `scale` its pixels per
-    /// point: what's on air, or `scene` (Studio Mode's preview).
-    pub fn view(
+    /// point: what's on air.
+    pub fn preview_drawn(
         &self,
         window: raw_window_handle::RawWindowHandle,
         rect: crate::Rect,
         scale: f64,
+    ) -> Result<StageView, StudioError> {
+        self.view_of(window, rect, scale, false)
+    }
+
+    /// The vertical picture's preview (its own scenes, 9:16).
+    pub fn vertical_preview_drawn(
+        &self,
+        window: raw_window_handle::RawWindowHandle,
+        rect: crate::Rect,
+        scale: f64,
+    ) -> Result<StageView, StudioError> {
+        if self.vertical().is_none() {
+            return Err(fail("The vertical picture is off."));
+        }
+        self.view_of(window, rect, scale, true)
+    }
+
+    fn view_of(
+        &self,
+        window: raw_window_handle::RawWindowHandle,
+        rect: crate::Rect,
+        scale: f64,
+        vertical: bool,
     ) -> Result<StageView, StudioError> {
         let raw_window_handle::RawWindowHandle::AppKit(h) = window else {
             return Err(fail("that isn't a macOS window"));
@@ -2132,11 +2234,15 @@ impl Stage {
         let view = crate::ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
             .ok_or_else(|| fail("the preview can only be made on the main thread"))?;
         let (cx, cy) = view.pixels().unwrap_or_else(|| crate::px(r, scale));
-        let size = (self.canvas.width, self.canvas.height);
+        let (size, scene) = if vertical {
+            (crate::collection::VERTICAL_SIZE, self.vertical().map(|v| v.current))
+        } else {
+            ((self.canvas.width, self.canvas.height), None)
+        };
         // SAFETY: the view lives as long as the StageView, which stops the engine drawing in it
         // before it goes (`Drop`).
         #[allow(unsafe_code)]
-        let started = unsafe { shared.engine.start_preview_of(view.ptr(), cx, cy, size, None) };
+        let started = unsafe { shared.engine.start_preview_of(view.ptr(), cx, cy, size, scene) };
         let id = match started {
             Ok(id) => id,
             Err(e) => {
@@ -2149,8 +2255,8 @@ impl Stage {
             margin: crate::edge_px(scale) as f32,
             ..Default::default()
         };
-        let v = StageView { shared, id, view, look: RefCell::new(look) };
-        v.refresh(self);
+        let v = StageView { shared, id, view, look: RefCell::new(look), vertical };
+        v.follow(self);
         Ok(v)
     }
 }
@@ -2158,7 +2264,7 @@ impl Stage {
 #[cfg(target_os = "macos")]
 impl StageView {
     /// Moves or resizes it (the page's box changed). Main thread.
-    pub fn set_rect(&self, stage: &Stage, rect: crate::Rect, scale: f64) {
+    pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
         let r = crate::with_edge(rect);
         self.view.set_frame(r.x, r.y, r.w, r.h, r.vh);
         {
@@ -2168,56 +2274,53 @@ impl StageView {
         }
         let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(r, scale));
         self.shared.engine.resize_preview(self.id, cx, cy);
-        self.refresh(stage);
+        self.push();
     }
 
     /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
     /// from the area's top left). Main thread.
-    pub fn set_area(&self, stage: &Stage, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+    pub fn set_area(&mut self, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
         self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         self.look.borrow_mut().area =
             Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
         let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(area, scale));
         self.shared.engine.resize_preview(self.id, cx, cy);
-        self.refresh(stage);
+        self.push();
     }
 
     /// Shows `scene` instead of what's on air (Studio Mode), or what's on air again.
-    pub fn show_scene(&self, stage: &Stage, scene: Option<&str>) {
+    pub fn show_scene(&self, scene: Option<&str>) {
         self.look.borrow_mut().scene = scene.map(String::from);
         self.shared.engine.set_preview_scene(self.id, scene.map(String::from));
-        self.refresh(stage);
     }
 
     pub fn shown_scene(&self) -> Option<String> {
         self.look.borrow().scene.clone()
     }
 
-    /// Outlines `ids` of `scene` with handles, or nothing.
-    pub fn select(&self, stage: &Stage, pick: Option<(&str, &[i64])>) {
+    /// Outlines `ids` of `scene` with handles, or nothing (from the next tick).
+    pub fn select(&self, pick: Option<(&str, &[i64])>) {
         self.look.borrow_mut().picked = pick.map(|(s, i)| (s.to_string(), i.to_vec()));
-        self.refresh(stage);
     }
 
-    /// Outlines every source of `scene` in its own colour, or none.
-    pub fn frames(&self, stage: &Stage, scene: Option<&str>) {
+    /// Outlines every source of `scene` in its own colour, or none (from the next tick).
+    pub fn frames(&self, scene: Option<&str>) {
         self.look.borrow_mut().frames = scene.map(String::from);
-        self.refresh(stage);
     }
 
     /// The colour round the canvas (0xAABBGGRR).
-    pub fn background(&self, stage: &Stage, abgr: u32) {
+    pub fn background(&self, abgr: u32) {
         let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
         self.look.borrow_mut().background = [c(0), c(8), c(16), 1.0];
         self.view.set_backdrop(abgr);
-        self.refresh(stage);
+        self.push();
     }
 
     /// A dark layer over the view, 0 to 1 (a dialog's backdrop).
-    pub fn set_shade(&self, stage: &Stage, shade: f64) {
+    pub fn set_shade(&self, shade: f64) {
         self.look.borrow_mut().shade = shade.clamp(0.0, 1.0) as f32;
-        self.refresh(stage);
+        self.push();
     }
 
     /// Leaves the picture out where the page's menus lie over it (points from the box's top
@@ -2233,10 +2336,18 @@ impl StageView {
         self.view.set_opacity(opacity);
     }
 
-    /// Sends the look to the engine, the outlines from the stage's items as they are now. Call
-    /// it after edits (a drag) too.
-    pub fn refresh(&self, stage: &Stage) {
-        let l = self.look.borrow();
+    /// Mouse actions over it go to `cb` (Windows only; on a Mac the page gets them itself).
+    pub fn set_input(&self, _cb: Box<dyn Fn(crate::PreviewInput)>) {}
+
+    /// The cursor over it (Windows only).
+    pub fn set_cursor(&self, _css: &str) {}
+
+    /// Keeps it with the stage (the app's tick): the vertical picture's scene on air, and the
+    /// outlines taken from the items as they are now.
+    pub fn follow(&self, stage: &Stage) {
+        if self.vertical {
+            self.shared.engine.set_preview_scene(self.id, stage.vertical().map(|v| v.current));
+        }
         let corners = |f: &[f32; 6]| {
             [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
                 .map(|(u, v): (f32, f32)| (f[4] + u * f[0] + v * f[2], f[5] + u * f[1] + v * f[3]))
@@ -2246,37 +2357,46 @@ impl StageView {
             [r, g, b, 1.0]
         };
         let mut outlines = Vec::new();
-        let picked = l.picked.clone();
-        if let Some(scene) = &l.frames {
-            for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| i.visible) {
-                if picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&it.id)) {
-                    continue;
+        {
+            let l = self.look.borrow();
+            if let Some(scene) = &l.frames {
+                for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| i.visible) {
+                    if l.picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&it.id)) {
+                        continue;
+                    }
+                    outlines.push(ferrocast_av::preview::Outline {
+                        corners: corners(&it.frame),
+                        color: color(it.id),
+                        width: 1.5,
+                        handles: false,
+                    });
                 }
-                outlines.push(ferrocast_av::preview::Outline {
-                    corners: corners(&it.frame),
-                    color: color(it.id),
-                    width: 1.5,
-                    handles: false,
-                });
+            }
+            if let Some((scene, ids)) = &l.picked {
+                for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| ids.contains(&i.id)) {
+                    outlines.push(ferrocast_av::preview::Outline {
+                        corners: corners(&it.frame),
+                        color: color(it.id),
+                        width: 2.0,
+                        handles: true,
+                    });
+                }
             }
         }
-        if let Some((scene, ids)) = &picked {
-            for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| ids.contains(&i.id)) {
-                outlines.push(ferrocast_av::preview::Outline {
-                    corners: corners(&it.frame),
-                    color: color(it.id),
-                    width: 2.0,
-                    handles: true,
-                });
-            }
-        }
+        self.look.borrow_mut().outlines = outlines;
+        self.push();
+    }
+
+    /// Sends the look to the engine.
+    fn push(&self) {
+        let l = self.look.borrow();
         self.shared.engine.set_preview_look(
             self.id,
             ferrocast_av::preview::PreviewLook {
                 background: l.background,
                 area: l.area,
                 margin: l.margin,
-                outlines,
+                outlines: l.outlines.clone(),
                 shade: l.shade,
             },
         );
@@ -2289,6 +2409,53 @@ impl Drop for StageView {
         // The engine lets go of the view before it goes.
         self.shared.engine.stop_preview(self.id);
         self.view.remove();
+    }
+}
+
+/// Off a Mac our engine draws no preview yet: the view can't be made (its calls are the same,
+/// so the app builds everywhere).
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct StageView(());
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_self)]
+impl StageView {
+    pub fn set_rect(&mut self, _rect: crate::Rect, _scale: f64) {}
+    pub fn set_area(&mut self, _area: crate::Rect, _canvas: (f64, f64, f64, f64), _scale: f64) {}
+    pub fn show_scene(&self, _scene: Option<&str>) {}
+    pub fn shown_scene(&self) -> Option<String> {
+        None
+    }
+    pub fn select(&self, _pick: Option<(&str, &[i64])>) {}
+    pub fn frames(&self, _scene: Option<&str>) {}
+    pub fn background(&self, _abgr: u32) {}
+    pub fn set_shade(&self, _shade: f64) {}
+    pub fn set_holes(&self, _holes: &[(f64, f64, f64, f64, f64)]) {}
+    pub fn set_opacity(&self, _opacity: f64) {}
+    pub fn set_input(&self, _cb: Box<dyn Fn(crate::PreviewInput)>) {}
+    pub fn set_cursor(&self, _css: &str) {}
+    pub fn follow(&self, _stage: &Stage) {}
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Stage {
+    pub fn preview_drawn(
+        &self,
+        _window: raw_window_handle::RawWindowHandle,
+        _rect: crate::Rect,
+        _scale: f64,
+    ) -> Result<StageView, StudioError> {
+        Err(fail("Ferrocast's own engine draws the preview on a Mac only so far."))
+    }
+
+    pub fn vertical_preview_drawn(
+        &self,
+        window: raw_window_handle::RawWindowHandle,
+        rect: crate::Rect,
+        scale: f64,
+    ) -> Result<StageView, StudioError> {
+        self.preview_drawn(window, rect, scale)
     }
 }
 
@@ -2468,7 +2635,7 @@ mod tests {
             ..RecordPlan::default()
         };
         let mut rec = ok(s.record(&plan, None));
-        let first = rec.path().map(Path::to_path_buf).unwrap_or_default();
+        let first = rec.path().to_path_buf();
         assert!(first.starts_with(&dir) && first.extension().is_some_and(|e| e == "mkv"), "{}", first.display());
         let replay = ok(s.replay(&ReplayPlan {
             folder: dir.clone(),
@@ -2482,7 +2649,7 @@ mod tests {
         }));
         std::thread::sleep(std::time::Duration::from_millis(1500));
         ok(rec.split());
-        let second = rec.path().map(Path::to_path_buf).unwrap_or_default();
+        let second = rec.path().to_path_buf();
         assert_ne!(first, second, "a new file, named again (\" (2)\" if in the same second)");
         std::thread::sleep(std::time::Duration::from_millis(1200));
         ok(replay.save_replay());

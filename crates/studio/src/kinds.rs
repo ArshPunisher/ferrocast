@@ -58,7 +58,16 @@ pub fn kinds() -> Kinds {
             kind("fade_transition", "Fade"),
             kind("ferrocast_move", "Move"),
         ],
-        encoders: Vec::new(),
+        encoders: if cfg!(target_os = "macos") {
+            vec![
+                kind("com.apple.videotoolbox.videoencoder.ave.avc", "Apple VT H264 Hardware Encoder"),
+                kind("com.apple.videotoolbox.videoencoder.ave.hevc", "Apple VT HEVC Hardware Encoder"),
+                kind("obs_x264", "x264"),
+            ]
+        } else {
+            // Through FFmpeg: the graphics card's encoder that works here, or x264.
+            vec![kind("ffmpeg_hardware", "Hardware (NVENC, AMF or Quick Sync)"), kind("obs_x264", "x264")]
+        },
         outputs: Vec::new(),
     }
 }
