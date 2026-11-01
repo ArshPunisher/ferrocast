@@ -480,7 +480,7 @@ mod tests {
                   "settings": { "color": 0xFF00_80FFu32 },
                   "filters": [{ "id": "sharpness_filter", "versioned_id": "sharpness_filter_v2", "settings": {} },
                               { "id": "gain_filter", "settings": { "db": 3.0 } },
-                              { "id": "scroll_filter", "settings": {} }] },
+                              { "id": "gpu_delay", "settings": {} }] },
                 { "id": "browser_source", "name": "Web", "settings": {} },
                 { "id": "scene", "name": "Two", "settings": { "items": [
                     { "name": "One", "pos": { "x": 10.0, "y": 20.0 }, "scale": { "x": 0.5, "y": 0.5 }, "visible": true } ] } },
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(got.sources.len(), 1);
         assert_eq!(got.sources[0].kind, SourceKind::Color { width: 640, height: 360, rgba: [0xFF, 0x80, 0, 0xFF] });
         assert!(got.skipped.iter().any(|s| s.contains("browser_source")));
-        assert!(got.skipped.iter().any(|s| s.contains("scroll_filter")));
+        assert!(got.skipped.iter().any(|s| s.contains("gpu_delay")));
         let names: Vec<&str> = got.scenes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["One", "Two"]);
         let back = &got.scenes[0].1[0];
