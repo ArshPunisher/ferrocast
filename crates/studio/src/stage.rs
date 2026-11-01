@@ -1202,11 +1202,13 @@ impl Stage {
         if let Some(why) = own::unsupported(s, true) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
+        // Track 1 to viewers; Twitch's VOD track after it (sent as Enhanced RTMP multitrack audio).
+        let tracks: Vec<u8> = std::iter::once(1).chain(s.vod_track).collect();
         let how = own::Drawing {
             send_to: Some(own::Send { server, key, reconnect: s.reconnect }),
             record: None,
             encode: &s.encode,
-            tracks: &[],
+            tracks: &tracks,
             delay_s: s.delay_s,
             vertical: false,
             replay: None,
@@ -1751,6 +1753,8 @@ impl Stage {
         }
         let mut s = s.clone();
         s.encode.scale = None;
+        // Twitch's VOD track is the main picture's only.
+        s.vod_track = None;
         if let Some(why) = own::unsupported(&s, true) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }

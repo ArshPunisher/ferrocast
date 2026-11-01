@@ -49,8 +49,8 @@ const NO_FFMPEG: &str =
 pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'static str> {
     if !main_canvas {
         Some("the vertical picture's stream")
-    } else if s.vod_track.is_some() {
-        Some("Twitch's VOD track")
+    } else if s.vod_track.is_some_and(|t| !(2..=6).contains(&t)) {
+        Some("a VOD track other than 2 to 6")
     } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&s.encode.video_encoder) {
         Some("constant quality")
     } else if !s.encode.extra.is_empty() {
@@ -896,7 +896,9 @@ fn sender(
         Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
         None => Retry::default(),
     };
-    let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: false };
+    // Every track goes on (Go live then gives Twitch's VOD track to Twitch only); a stream
+    // without one has none to send.
+    let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: true };
     let (health_tx, h) =
         tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
     let (sp, stop_rx) = tokio::sync::watch::channel(false);
@@ -1000,7 +1002,8 @@ mod tests {
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));
         assert!(unsupported(&extra, true).is_some());
-        assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_some());
+        assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_none());
+        assert!(unsupported(&StreamSettings { vod_track: Some(7), ..settings(hw) }, true).is_some());
     }
 
     #[test]
