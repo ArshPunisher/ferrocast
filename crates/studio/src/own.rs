@@ -190,6 +190,9 @@ impl Shared {
 
     /// The same at `canvas`, with no libobs Studio (the scene store our engine keeps).
     pub(crate) fn open_at(canvas: crate::Canvas, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
+        // The strong noise removal, when this build has it.
+        #[cfg(feature = "deepfilter")]
+        crate::denoiser::install();
         let config = EngineConfig {
             width: canvas.width,
             height: canvas.height,

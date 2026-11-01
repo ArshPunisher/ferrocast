@@ -7,6 +7,8 @@
 //! dropping the [`Studio`] shuts it down after every scene, source and output is released.
 
 mod collection;
+#[cfg(feature = "deepfilter")]
+mod denoiser;
 mod ffi;
 pub mod import;
 pub mod kinds;

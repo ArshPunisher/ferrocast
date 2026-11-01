@@ -53,7 +53,11 @@ pub fn kinds() -> Kinds {
             kind("upward_compressor_filter", "Upward Compressor"),
             kind("basic_eq_filter", "3-Band Equalizer"),
             kind("invert_polarity_filter", "Invert Polarity"),
-        ],
+        ]
+        .into_iter()
+        // Strong noise removal (DeepFilterNet), in builds that have it.
+        .chain(cfg!(feature = "deepfilter").then(|| kind("ferrocast_deepfilter", "Strong Noise Removal")))
+        .collect(),
         transitions: vec![
             kind("cut_transition", "Cut"),
             kind("fade_transition", "Fade"),
@@ -345,6 +349,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("high", "High", "float").range(-20.0, 20.0, 0.1).slider().unit(" dB"),
         ],
         "invert_polarity_filter" => Vec::new(),
+        "ferrocast_deepfilter" => vec![opt("strength", "Strength", "int").range(1.0, 100.0, 1.0).slider()],
         "ferrocast_rounded_corners" => {
             vec![opt("radius", "Radius", "int").range(0.0, 1000.0, 1.0).slider().unit(" px")]
         }
@@ -410,6 +415,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": false, "cx": 100, "limit_cy": false, "cy": 100, "loop": true })
         }
         "gain_filter" => json!({ "db": 0.0 }),
+        "ferrocast_deepfilter" => json!({ "strength": 100 }),
         "noise_gate_filter" => {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
         }
