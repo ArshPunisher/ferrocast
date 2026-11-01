@@ -1094,6 +1094,8 @@ impl DesktopStudio {
         let me = DesktopStudio { app, data };
         let watcher = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
         tauri::async_runtime::spawn(async move { watcher.session_loop().await });
+        let follower = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
+        tauri::async_runtime::spawn(async move { follower.own_engine_loop().await });
         me
     }
 
@@ -1107,6 +1109,25 @@ impl DesktopStudio {
                 write_session(now.as_ref());
                 last = Some(now);
             }
+        }
+    }
+
+    /// Four times a second, a stream or recording our engine draws catches up with the Studio
+    /// (scene changes go on at once; edits reopen the scenes in it, at most every 2 s).
+    async fn own_engine_loop(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let _ = self
+                .on_main(|h| {
+                    let Some(c) = h.collection.as_ref() else { return };
+                    if let Some(s) = h.stream.as_mut().filter(|s| s.drawn()) {
+                        s.follow(c);
+                    }
+                    if let Some((r, ..)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
+                        r.follow(c);
+                    }
+                })
+                .await;
         }
     }
 
@@ -1770,7 +1791,20 @@ impl StudioHost for DesktopStudio {
                 own_encoder: s.own_encoder,
             };
             let file = studio.record_path(&plan);
-            let rec = studio.record_to(&file, &plan).map_err(|e| e.to_string())?;
+            let drawn = match h.collection.as_ref().filter(|_| s.own_drawing) {
+                Some(c) => match c.record_drawn(&file, &plan) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::info!("libobs draws this recording: {e}");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let rec = match drawn {
+                Some(r) => r,
+                None => studio.record_to(&file, &plan).map_err(|e| e.to_string())?,
+            };
             tracing::info!(file = %file.display(), "the Studio is recording");
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
@@ -2577,7 +2611,22 @@ impl StudioHost for DesktopStudio {
             let s = h.settings.clone().unwrap_or_default();
             let settings = stream_settings(studio, &s);
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, "the Studio starts streaming into Go live");
-            let stream = studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?;
+            // With the beta switch on, our engine draws what goes out; what it can't do yet (a
+            // stream delay, Twitch's VOD track…) goes out through libobs as before.
+            let drawn = match h.collection.as_ref().filter(|_| s.own_drawing) {
+                Some(c) => match c.stream_drawn(&server, &key, &settings) {
+                    Ok(st) => Some(st),
+                    Err(e) => {
+                        tracing::info!("libobs draws this stream: {e}");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let stream = match drawn {
+                Some(st) => st,
+                None => studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?,
+            };
             let v = stats_of(&stream);
             h.stream = Some(stream);
             Ok(v)
