@@ -272,8 +272,9 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
     /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
-    /// when the Studio isn't streaming.
-    async fn direct_start(&self, _id: String, _url: String, _key: String) -> Result<(), String> {
+    /// when the Studio isn't streaming. `simulcast` (WebRTC): the lighter stream goes beside it
+    /// as a second layer, while it runs.
+    async fn direct_start(&self, _id: String, _url: String, _key: String, _simulcast: bool) -> Result<(), String> {
         Err(NOT_HERE.into())
     }
     async fn direct_stop(&self, _id: String) -> Result<(), String> {
@@ -2154,7 +2155,12 @@ impl Engine {
     pub(crate) async fn studio_sync_light(&self) -> Option<String> {
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
-        let wanted = self.golive_config().destinations.iter().any(|d| d.enabled && self.wants_light_now(d));
+        // For a platform that takes it, or as a WebRTC server's simulcast layer.
+        let wanted = self
+            .golive_config()
+            .destinations
+            .iter()
+            .any(|d| d.enabled && (self.wants_light_now(d) || self.simulcast(d)));
         if !streaming || !wanted {
             if let Err(e) = host.light_stream_stop().await {
                 tracing::warn!(error = %e, "the Studio's lighter stream didn't stop");

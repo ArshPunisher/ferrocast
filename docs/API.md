@@ -843,7 +843,10 @@ type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number
                                              backup?: string /* another destination's id: it waits on standby (ticked or not) and sends
                                                                only after this one can't for 10 s, until this one has sent again for 10 s.
                                                                Same picture (main or vertical); not one with a backup of its own, nor
-                                                               one already backing up another. Removing it clears this */ } } }
+                                                               one already backing up another. Removing it clears this */;
+                                             simulcast?: true /* WebRTC (WHIP) servers only: the Studio's lighter stream goes beside the
+                                                                 full one as a second layer ("h" and "l"), for a server that gives each
+                                                                 viewer the one that fits; a server that doesn't take it gets the full one */ } } }
 type FfmpegState = { state: "ready" | "missing" | "unsupported" } | { state: "downloading"; percent: number } | { state: "failed"; reason: string }
 type CutBox = { x: number; y: number; w: number; h: number }   // fractions (0–1) of the normal picture
 type CutConfig = { layout: "camera_top" | "small_camera" | "half_half" | "game_only"; camera: CutBox; game: CutBox;

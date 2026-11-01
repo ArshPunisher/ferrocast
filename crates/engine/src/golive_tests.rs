@@ -266,6 +266,7 @@ async fn advanced_settings_are_checked_and_saved() {
             first_retry_s: 2,
             max_retry_s: 60,
             backup: None,
+            simulcast: false,
         },
     );
     a.keep_free_pct = 30;
@@ -491,7 +492,7 @@ impl crate::studio_host::StudioHost for DirectStudio {
     async fn import_obs(&self, _id: String) -> Result<serde_json::Value, String> {
         Err("n/a".into())
     }
-    async fn direct_start(&self, id: String, url: String, key: String) -> Result<(), String> {
+    async fn direct_start(&self, id: String, url: String, key: String, _simulcast: bool) -> Result<(), String> {
         self.started.lock().unwrap().push((id, url, key));
         Ok(())
     }
@@ -678,4 +679,21 @@ async fn a_backup_sends_while_its_destination_cannot() {
     // Removing the backup clears it from the one it backed up.
     e.remove_golive_destination(&backup.id).await.unwrap();
     assert_eq!(e.golive_config().advanced.per.get(&main.id).and_then(|a| a.backup.clone()), None);
+}
+
+#[tokio::test]
+async fn simulcast_is_for_webrtc_servers_only() {
+    use crate::golive::{Canvas, DestAdvanced};
+    let (e, _dir) = engine().await;
+    let rtmp = e.add_golive_destination("Mine", "rtmp://127.0.0.1:1935/app", "k", Canvas::Main).await.unwrap();
+    let whip = e.add_golive_destination("Web", "https://whip.example/x", "", Canvas::Main).await.unwrap();
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(rtmp.id.clone(), DestAdvanced { simulcast: true, ..Default::default() });
+    let err = e.set_golive_advanced(adv).await.unwrap_err().to_string();
+    assert!(err.contains("simulcast"), "{err}");
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(whip.id.clone(), DestAdvanced { simulcast: true, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    let d = e.golive_config().destinations.into_iter().find(|d| d.id == whip.id).unwrap();
+    assert!(e.simulcast(&d));
 }

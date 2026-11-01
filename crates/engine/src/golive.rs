@@ -183,11 +183,15 @@ pub struct DestAdvanced {
     /// one is back for as long.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
+    /// A WebRTC (WHIP) server: the Studio's lighter stream goes beside the full one as a second
+    /// layer (simulcast), for a server that gives each viewer the one that fits.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub simulcast: bool,
 }
 
 impl Default for DestAdvanced {
     fn default() -> Self {
-        Self { server: None, first_retry_s: 1, max_retry_s: 30, backup: None }
+        Self { server: None, first_retry_s: 1, max_retry_s: 30, backup: None, simulcast: false }
     }
 }
 
@@ -223,6 +227,9 @@ impl Advanced {
             }
             if a.max_retry_s < a.first_retry_s || a.max_retry_s > 600 {
                 return Err(format!("per.{id}.max_retry_s: at least the first wait, at most 600 seconds."));
+            }
+            if a.simulcast && d.url.as_deref().and_then(direct_kind) != Some("whip") {
+                return Err(format!("per.{id}.simulcast: only a WebRTC (WHIP) server takes simulcast."));
             }
             if let Some(b) = &a.backup {
                 let backup = destinations
@@ -807,6 +814,13 @@ impl Engine {
             || (d.canvas == Canvas::Main
                 && d.url.as_deref().and_then(direct_kind).is_none()
                 && lock(&self.golive().quality).is_light(&d.id))
+    }
+
+    /// A WebRTC server set to simulcast (the lighter stream as its second layer).
+    pub(crate) fn simulcast(&self, d: &DestinationConfig) -> bool {
+        d.canvas == Canvas::Main
+            && d.url.as_deref().and_then(direct_kind) == Some("whip")
+            && self.golive_config().advanced.per.get(&d.id).is_some_and(|a| a.simulcast)
     }
 
     /// The stream a destination takes: the lighter one, the vertical one or the main one.
@@ -1735,8 +1749,13 @@ impl Engine {
     async fn start_direct(&self, d: &DestinationConfig, url: String) {
         let g = self.golive();
         let key = self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
+        let simulcast = self.simulcast(d);
+        if simulcast {
+            // Its second layer, the lighter stream, starts first.
+            self.studio_sync_light().await;
+        }
         let started = match self.studio_host() {
-            Ok(host) => host.direct_start(d.id.clone(), url, key).await.map(|()| host),
+            Ok(host) => host.direct_start(d.id.clone(), url, key, simulcast).await.map(|()| host),
             Err(_) => Err(String::new()),
         };
         let host = match started {

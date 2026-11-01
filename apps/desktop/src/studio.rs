@@ -2646,11 +2646,16 @@ impl StudioHost for DesktopStudio {
         self.on_main(|h| h.stream.as_ref().map_or(Value::Null, stats_of)).await
     }
 
-    async fn direct_start(&self, id: String, url: String, key: String) -> Result<(), String> {
+    async fn direct_start(&self, id: String, url: String, key: String, simulcast: bool) -> Result<(), String> {
         self.on_main(move |h| {
             let s = h.stream.as_mut().filter(|s| s.stats().active).ok_or("The Studio isn't streaming.")?;
-            tracing::info!(dest = %id, "the Studio sends straight to a server (SRT, RIST or WebRTC)");
-            s.add_direct(&id, &url, &key).map_err(|e| e.to_string())
+            tracing::info!(dest = %id, simulcast, "the Studio sends straight to a server (SRT, RIST or WebRTC)");
+            // Simulcast's lower layer is the lighter stream, when it runs.
+            match h.lstream.as_ref().filter(|l| simulcast && l.stats().active) {
+                Some(lower) => s.add_direct_layered(&id, &url, &key, lower),
+                None => s.add_direct(&id, &url, &key),
+            }
+            .map_err(|e| e.to_string())
         })
         .await?
     }
