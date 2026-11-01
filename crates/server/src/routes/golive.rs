@@ -23,6 +23,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/destinations/{id}", delete(remove))
         .route("/golive/destinations/{id}/test", post(test_destination))
         .route("/golive/test", post(test_address))
+        .route("/golive/networks", get(networks))
         .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
@@ -92,6 +93,11 @@ struct TestBody {
     url: String,
     #[serde(default)]
     key: String,
+}
+
+/// This computer's network connections, for sending RIST over two at once (`via=`).
+async fn networks(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.golive_networks()))
 }
 
 /// "Test connection" in the add dialog, before saving.

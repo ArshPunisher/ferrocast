@@ -1254,6 +1254,11 @@ impl Engine {
         }
     }
 
+    /// This computer's network connections, for RIST's `via=` (two at once).
+    pub fn golive_networks(&self) -> Vec<ferrocast_golive::links::Network> {
+        ferrocast_golive::links::networks()
+    }
+
     /// "Test connection" in the add dialog, before the server is saved.
     pub async fn golive_test_address(
         &self,
