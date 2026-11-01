@@ -314,11 +314,15 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             };
             (SourceKind::Text { text: text_of("text"), style }, false)
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         "ffmpeg_source" => {
             // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
             // with FFmpeg and hands its pictures in, fitted into 1280x720.
             if s.get("is_local_file").and_then(Value::as_bool) == Some(false) {
+                // Nothing reads network addresses into a Windows Studio yet: said, not blank.
+                #[cfg(target_os = "windows")]
+                return Err("a network address in a Media Source (not on Windows yet)".into());
+                #[cfg(not(target_os = "windows"))]
                 return Ok((SourceKind::Fed { width: 1280, height: 720 }, true));
             }
             (
@@ -365,6 +369,54 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             } else {
                 dev
             };
+            (SourceKind::Microphone(dev), true)
+        }
+        // Windows: OBS's own source kinds.
+        #[cfg(target_os = "windows")]
+        "monitor_capture" => {
+            // OBS 30 keeps the monitor's device path ("monitor_id"), older ones its place
+            // ("monitor"): the place, else the first.
+            let display = s.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
+            (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
+        }
+        #[cfg(target_os = "windows")]
+        "window_capture" | "game_capture" => {
+            // Game Capture of one window is a window here; "any full-screen game" isn't yet.
+            if id == "game_capture"
+                && s.get("capture_mode").and_then(Value::as_str).unwrap_or("any_fullscreen") != "window"
+            {
+                return Err("Game Capture of any full-screen game (use Display Capture)".into());
+            }
+            let w = match s.get("window") {
+                Some(Value::Number(n)) => n.as_u64().map(|v| v as u32),
+                // OBS's "title:class:exe" (its colons written #3A): the open window of that title.
+                Some(Value::String(t)) => {
+                    let title = t.split(':').next().unwrap_or("").replace("#3A", ":");
+                    crate::screen::shareable()
+                        .ok()
+                        .and_then(|(_, ws)| ws.into_iter().find(|w| w.title == title).map(|w| w.id))
+                }
+                _ => None,
+            };
+            match w {
+                Some(w) => (SourceKind::Window(w), false),
+                None => return Err("a window capture whose window isn't open".into()),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        "dshow_input" => (SourceKind::Camera(text_of("video_device_id")), false),
+        #[cfg(target_os = "windows")]
+        "wasapi_output_capture" | "wasapi_process_output_capture" => {
+            if id == "wasapi_process_output_capture" {
+                return Err("one app's sound (Application Audio Capture)".into());
+            }
+            (SourceKind::DesktopSound, true)
+        }
+        #[cfg(target_os = "windows")]
+        "wasapi_input_capture" => {
+            // OBS keeps Windows' endpoint id ("{0.0.1…}"): the system's microphone stands in.
+            let dev = text_of("device_id");
+            let dev = if dev.is_empty() || dev.starts_with('{') { "default".to_string() } else { dev };
             (SourceKind::Microphone(dev), true)
         }
         // A web page (OBS's Browser source, or Ferrocast's own): the app renders it and hands

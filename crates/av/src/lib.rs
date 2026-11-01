@@ -15,11 +15,23 @@ pub use apple::media;
 /// Screen and window capture (macOS: ScreenCaptureKit).
 #[cfg(target_os = "macos")]
 pub use apple::screen;
+#[cfg(target_os = "windows")]
+mod win;
+/// Cameras and microphones (Windows: DirectShow through FFmpeg, WASAPI).
+#[cfg(target_os = "windows")]
+pub use win::camera;
+/// Video and sound files (Windows: through FFmpeg).
+#[cfg(target_os = "windows")]
+pub use win::media;
+/// Screen and window capture (Windows: Desktop Duplication or GDI through FFmpeg).
+#[cfg(target_os = "windows")]
+pub use win::screen;
 pub mod afx;
 pub mod audio;
 mod compose;
 pub mod engine;
 pub mod ffenc;
+pub mod ffsrc;
 pub mod flv;
 pub mod level;
 pub mod lut;
@@ -31,6 +43,9 @@ pub mod mp4;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+/// Sound in through cpal: microphones, and the computer's own sound (Windows).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod sound_in;
 pub mod source;
 mod transform;
 pub mod video;
