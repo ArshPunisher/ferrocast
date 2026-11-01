@@ -17,8 +17,13 @@ use ferrocast_studio::stage::Stage as Collection;
 use ferrocast_studio::stage::StageOutput as Streaming;
 use ferrocast_studio::stage::StageOutput as Recording;
 use ferrocast_studio::stage::StageView as Preview;
+/// A projector window (our engine draws them on a Mac; none elsewhere yet).
+#[cfg(target_os = "macos")]
+type ProjectorWin = ferrocast_studio::stage::StageProjector;
+#[cfg(not(target_os = "macos"))]
+type ProjectorWin = ();
 use ferrocast_studio::{
-    Canvas, EncodeSettings, ItemEdit, Monitor, Projector, Rect, StreamSettings, StudioOptions, TransitionInfo,
+    Canvas, EncodeSettings, ItemEdit, Monitor, Rect, StreamSettings, StudioOptions, TransitionInfo,
 };
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -77,7 +82,8 @@ struct Held {
     program_view: Option<Preview>,
     program_at: Option<(Rect, f64)>,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
-    projectors: Vec<(u64, Projector)>,
+    projectors: Vec<(u64, ProjectorWin)>,
+    last_projector: u64,
     /// The vertical picture's preview, beside the main one.
     vertical: VerticalView,
     /// Live captions, and the sound they listen to.
@@ -131,18 +137,9 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
-fn refresh_projectors(h: &Held) {
-    if h.projectors.is_empty() {
-        return;
-    }
-    if let Some(c) = &h.collection {
-        let names: Vec<String> = c.scenes().into_iter().map(|s| s.name).collect();
-        let preview = c.preview_scene();
-        for (_, p) in &h.projectors {
-            p.update(&names, preview.as_deref());
-        }
-    }
-}
+/// Projectors drawn by our engine follow the scenes by themselves (the multiview, which needed
+/// telling, isn't drawn by our engine yet).
+fn refresh_projectors(_h: &Held) {}
 
 thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
@@ -2444,9 +2441,40 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn projector(&self, p: ProjectorReq) -> Result<Value, String> {
-        // Projector windows aren't drawn by Ferrocast's own engine yet.
-        let _ = p;
-        Err("Projectors aren't in Ferrocast's own engine yet.".into())
+        #[cfg(target_os = "macos")]
+        {
+            self.on_main(move |h| {
+                let c = h.collection.as_ref().ok_or(STOPPED)?;
+                let of = match p.what.as_str() {
+                    "program" => ferrocast_studio::ProjectorOf::Program,
+                    "multiview" => ferrocast_studio::ProjectorOf::Multiview,
+                    _ => ferrocast_studio::ProjectorOf::Source(p.name.clone().unwrap_or_default()),
+                };
+                h.last_projector += 1;
+                let id = h.last_projector;
+                // Closed by its own button or Esc: out of the list (and dropped) after the borrow.
+                let on_close = Box::new(move || {
+                    let gone = HELD.with(|h| {
+                        let mut h = h.try_borrow_mut().ok()?;
+                        let i = h.projectors.iter().position(|(pid, _)| *pid == id)?;
+                        Some(h.projectors.remove(i))
+                    });
+                    drop(gone);
+                });
+                let made = c.projector(&of, p.screen.map(|s| s as usize), on_close).map_err(|e| e.to_string())?;
+                if p.on_top {
+                    made.set_on_top(true);
+                }
+                h.projectors.push((id, made));
+                Ok(json!({ "id": id }))
+            })
+            .await?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = p;
+            Err("Projectors are drawn by Ferrocast's own engine on a Mac only so far.".into())
+        }
     }
 
     async fn close_projectors(&self) -> Result<(), String> {
