@@ -802,9 +802,21 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
             Content::Uploaded { id: it.source, width, height, premultiplied }
         }
     };
+    // Filters that move with time are told how long the scene has been on.
+    let effects = it
+        .effects
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            if let Effect::Scroll { elapsed_ms, .. } = &mut e {
+                *elapsed_ms = ms;
+            }
+            e
+        })
+        .collect();
     Some(Item {
         content,
-        effects: it.effects.clone(),
+        effects,
         placement,
         filter: it.filter,
         blend: it.blend,

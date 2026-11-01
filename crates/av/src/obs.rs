@@ -115,6 +115,22 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             min_smooth: n("luma_min_smooth", 0.0),
         },
         "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        "scroll_filter" => {
+            let size = |on: &str, k: &str| {
+                s.get(on)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    .then(|| s.get(k).and_then(Value::as_u64).unwrap_or(100) as u32)
+            };
+            Effect::Scroll {
+                speed_x: n("speed_x", 0.0),
+                speed_y: n("speed_y", 0.0),
+                width: size("limit_cx", "cx"),
+                height: size("limit_cy", "cy"),
+                looping: s.get("loop").and_then(Value::as_bool).unwrap_or(true),
+                elapsed_ms: 0,
+            }
+        }
         // Its table is read here; one that won't read leaves the filter out (listed as skipped).
         "clut_filter" => Effect::Lut {
             lut: std::sync::Arc::new(

@@ -886,6 +886,12 @@ impl Compositor {
                     m[4..7].copy_from_slice(&hi);
                     ("fs_lut", [tech, *amount, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
+                Effect::Scroll { speed_x, speed_y, looping, elapsed_ms, .. } => {
+                    let (bw, bh) = (cur.width as f32, cur.height as f32);
+                    let (ox, oy) = scroll_offset(*speed_x / bw, *speed_y / bh, *elapsed_ms, *looping);
+                    q = [ow as f32 / bw, oh as f32 / bh, ox, oy];
+                    ("fs_scroll", [if *looping { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
                 Effect::Mask { kind, image, rgba, stretch } => {
                     let t = self.uploaded(*image)?;
                     q = mask_mapping((cur.width, cur.height), (t.width(), t.height()), *stretch);
@@ -1466,6 +1472,23 @@ fn lut_view_format(format: wgpu::TextureFormat, linear: bool) -> wgpu::TextureFo
     if format == GAMMA && linear { LINEAR } else { format }
 }
 
+/// How far Scroll has moved, as a share of the picture each way, `ms` after it was shown:
+/// scroll-filter.c adds speed × seconds each frame and takes 1 off past 1 when looping (else stops
+/// at 1); this is the same without a frame's rounding.
+fn scroll_offset(per_sec_x: f32, per_sec_y: f32, ms: u64, looping: bool) -> (f32, f32) {
+    let secs = ms as f64 / 1000.0;
+    let one = |v: f32| {
+        let o = f64::from(v) * secs;
+        if looping {
+            // Past 1 wraps; below 0 it keeps going (the sampler wraps it), as OBS's.
+            if o > 1.0 { o.fract() as f32 } else { o as f32 }
+        } else {
+            o.min(1.0) as f32
+        }
+    };
+    (one(per_sec_x), one(per_sec_y))
+}
+
 /// Where Image Mask/Blend reads its picture (mask-filter.c): a multiplier and an offset on the
 /// filtered picture's coordinates; kept in shape and centred unless stretched.
 fn mask_mapping(source: (u32, u32), mask: (u32, u32), stretch: bool) -> [f32; 4] {
@@ -1489,7 +1512,16 @@ fn floats(v: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod mask_tests {
-    use super::mask_mapping;
+    use super::{mask_mapping, scroll_offset};
+
+    #[test]
+    fn scroll_wraps_or_stops() {
+        // A quarter of the picture a second, 6 s on: once round and half again.
+        let (x, y) = scroll_offset(0.25, 0.0, 6_000, true);
+        assert!((x - 0.5).abs() < 1e-6 && y == 0.0, "{x} {y}");
+        assert_eq!(scroll_offset(0.25, 0.0, 6_000, false).0, 1.0, "not looping: it's gone");
+        assert!((scroll_offset(-0.25, 0.0, 2_000, true).0 + 0.5).abs() < 1e-6, "backwards keeps going");
+    }
 
     #[test]
     fn a_mask_keeps_its_shape_centred() {

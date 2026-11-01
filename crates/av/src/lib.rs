@@ -245,6 +245,17 @@ pub enum Effect {
         amount: f32,
         passthrough_alpha: bool,
     },
+    /// OBS's Scroll: moving `speed` pixels a second each way, optionally shown at a size of its
+    /// own, wrapping round when `looping` (else it scrolls away); `elapsed_ms` since it was shown
+    /// (the engine sets it each frame).
+    Scroll {
+        speed_x: f32,
+        speed_y: f32,
+        width: Option<u32>,
+        height: Option<u32>,
+        looping: bool,
+        elapsed_ms: u64,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
@@ -276,6 +287,7 @@ impl Effect {
                 | Self::Crop { .. }
                 | Self::Mask { .. }
                 | Self::Lut { .. }
+                | Self::Scroll { .. }
         )
     }
 
@@ -291,6 +303,9 @@ impl Effect {
     /// OBS's).
     pub fn out_size(&self, w: u32, h: u32) -> (u32, u32) {
         match self {
+            Self::Scroll { width, height, .. } => {
+                (width.unwrap_or(w).clamp(1, 16_384), height.unwrap_or(h).clamp(1, 16_384))
+            }
             Self::Crop { size: Some((cw, ch)), .. } => ((*cw).clamp(1, 16_384), (*ch).clamp(1, 16_384)),
             Self::Crop { left, top, right, bottom, size: None } => (
                 (i64::from(w) - i64::from(*left) - i64::from(*right)).clamp(1, 16_384) as u32,

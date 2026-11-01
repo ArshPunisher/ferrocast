@@ -424,3 +424,30 @@ fn fs_lut(i: Out) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(c.rgb * c.a, c.a);
 }
+
+// One texel of the picture: wrapped round, or transparent past its edges.
+fn texel(p: vec2<i32>, size: vec2<i32>, wrap: bool) -> vec4<f32> {
+    if wrap {
+        return textureLoad(image, ((p % size) + size) % size, 0);
+    }
+    if any(p < vec2<i32>(0)) || any(p >= size) {
+        return vec4<f32>(0.0);
+    }
+    return textureLoad(image, p, 0);
+}
+
+// scroll-filter.c through crop_filter.effect: the picture at uv × mul + offset (q), filtered
+// linearly with a wrapping sampler when looping (p0 1), a transparent border otherwise. Done by
+// hand: our sampler clamps.
+@fragment
+fn fs_scroll(i: Out) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(textureDimensions(image));
+    let at = (i.uv * f.q.xy + f.q.zw) * vec2<f32>(size) - 0.5;
+    let base = floor(at);
+    let t = at - base;
+    let p = vec2<i32>(base);
+    let wrap = f.p0 > 0.5;
+    let top = mix(texel(p, size, wrap), texel(p + vec2<i32>(1, 0), size, wrap), t.x);
+    let bottom = mix(texel(p + vec2<i32>(0, 1), size, wrap), texel(p + vec2<i32>(1, 1), size, wrap), t.x);
+    return mix(top, bottom, t.y);
+}
