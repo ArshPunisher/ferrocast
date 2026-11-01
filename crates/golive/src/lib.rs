@@ -17,6 +17,7 @@ pub mod ingest;
 pub mod probe;
 pub mod protect;
 pub mod push;
+pub mod quality;
 pub mod reach;
 mod rist;
 pub mod target;
