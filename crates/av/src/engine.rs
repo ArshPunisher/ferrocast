@@ -659,6 +659,16 @@ impl Engine {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, settings);
     }
 
+    /// Music quieter while the voices talk (None: off).
+    pub fn set_ducking(&self, ducking: Option<crate::level::Ducking>) {
+        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_ducking(ducking);
+    }
+
+    /// Every track steered to `target_lufs` and kept under -1 dBFS (None: off).
+    pub fn set_loudness(&self, target_lufs: Option<f32>) {
+        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_loudness(target_lufs);
+    }
+
     /// Plays monitored sound (sources set to `Monitoring::Only` or `AndOutput`) on `device` (a
     /// name from `monitor::devices()`; None is the system's), or stops with `on` false.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -802,11 +812,36 @@ impl Engine {
         for (name, items) in imported.scenes {
             self.set_scene(&name, items);
         }
+        self.load_audio_care(doc);
         let first = self.scene_names().into_iter().next();
         if let Some(cur) = imported.current.or(first) {
             let _ = self.go(&cur);
         }
         skipped
+    }
+
+    /// Ferrocast's own sound care in the document (`ferrocast.audio`): ducking (`ducking`:
+    /// `{ voices, music }` source names and `depth_db`) and loudness (`loudness_lufs`).
+    fn load_audio_care(&self, doc: &serde_json::Value) {
+        let a = &doc["ferrocast"]["audio"];
+        let ids = |key: &str| -> Vec<u64> {
+            let st = self.lock();
+            a["ducking"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|n| st.opened.get(n).map(|(id, _)| *id))
+                .collect()
+        };
+        let ducking = a["ducking"].is_object().then(|| crate::level::Ducking {
+            voices: ids("voices"),
+            music: ids("music"),
+            depth_db: a["ducking"]["depth_db"].as_f64().map_or(-12.0, |d| (d as f32).clamp(-40.0, -3.0)),
+            ..Default::default()
+        });
+        self.set_ducking(ducking);
+        self.set_loudness(a["loudness_lufs"].as_f64().map(|l| (l as f32).clamp(-30.0, -8.0)));
     }
 
     /// Makes a source heard whatever is on air (OBS's Desktop Audio and Mic/Aux), or not.

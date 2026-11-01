@@ -21,6 +21,7 @@ mod compose;
 pub mod engine;
 pub mod ffenc;
 pub mod flv;
+pub mod level;
 pub mod lut;
 pub mod mix;
 pub mod mkv;

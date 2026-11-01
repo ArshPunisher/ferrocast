@@ -112,6 +112,10 @@ pub struct Mixer {
     next_ns: Option<u64>,
     /// Listeners to one source's sound (captions), by source; gone when their tap is dropped.
     taps: Vec<(u64, std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>)>,
+    /// Music quieter while the voices talk, and each track steered to a loudness.
+    ducker: Option<crate::level::Ducker>,
+    loudness: Option<Vec<crate::level::Loudness>>,
+    loudness_target: Option<f32>,
 }
 
 /// One source's sound as it comes in (mono, the mixer's rate, before its volume and filters),
@@ -170,7 +174,16 @@ fn feed_taps(
 impl Mixer {
     /// `rate` Hz stereo out; blocks are made `latency_ns` behind the clock.
     pub fn new(rate: u32, latency_ns: u64) -> Self {
-        Self { rate, latency_ns, sources: BTreeMap::new(), next_ns: None, taps: Vec::new() }
+        Self {
+            rate,
+            latency_ns,
+            sources: BTreeMap::new(),
+            next_ns: None,
+            taps: Vec::new(),
+            ducker: None,
+            loudness: None,
+            loudness_target: None,
+        }
     }
 
     pub fn rate(&self) -> u32 {
@@ -215,6 +228,26 @@ impl Mixer {
 
     pub fn remove(&mut self, id: u64) {
         self.sources.remove(&id);
+    }
+
+    /// Music quieter while the voices talk (None: off). Kept going when only its settings change.
+    pub fn set_ducking(&mut self, ducking: Option<crate::level::Ducking>) {
+        match (ducking, self.ducker.as_mut()) {
+            (Some(d), Some(on)) => on.cfg = d,
+            (Some(d), None) => self.ducker = Some(crate::level::Ducker::new(d)),
+            (None, _) => self.ducker = None,
+        }
+    }
+
+    /// Each track steered to `target_lufs` (-14 for most platforms) and kept under -1 dBFS
+    /// (None: off).
+    pub fn set_loudness(&mut self, target_lufs: Option<f32>) {
+        // The same target again (a scene edit reloads it): kept going, its gain where it is.
+        if target_lufs == self.loudness_target {
+            return;
+        }
+        self.loudness_target = target_lufs;
+        self.loudness = target_lufs.map(|t| (0..TRACKS).map(|_| crate::level::Loudness::new(t, self.rate)).collect());
     }
 
     pub fn levels(&self, id: u64) -> Option<Levels> {
@@ -335,7 +368,15 @@ impl Mixer {
         let rate = self.rate;
         let mut tracks = vec![vec![0f32; BLOCK * 2]; TRACKS];
         let mut monitor = vec![0f32; BLOCK * 2];
-        for src in self.sources.values_mut() {
+        // Talking, from the voices' last block (a block late: about 20 ms, nothing to hear).
+        let duck = self.ducker.as_mut().map(|d| {
+            let talking = d.cfg.voices.iter().any(|v| {
+                self.sources.get(v).is_some_and(|s| s.levels.peak[0].max(s.levels.peak[1]) > d.cfg.threshold_db)
+            });
+            let (from, to) = d.step(talking, BLOCK as f32 / rate as f32);
+            (d.cfg.music.clone(), from, to)
+        });
+        for (id, src) in self.sources.iter_mut() {
             let mut buf = vec![0f32; BLOCK * 2];
             if let Some(s0) = src.start_ns {
                 // Drop what's before this block; place what's in it.
@@ -373,6 +414,17 @@ impl Mixer {
                 f[0] *= gl;
                 f[1] *= gr;
             }
+            if let Some((music, from, to)) = &duck
+                && music.contains(id)
+                && (from - 1.0).abs().max((to - 1.0).abs()) > 1e-4
+            {
+                // Smoothly across the block, no click.
+                for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let g = from + (to - from) * i as f32 / BLOCK as f32;
+                    f[0] *= g;
+                    f[1] *= g;
+                }
+            }
             if !src.filters.is_empty() {
                 let (mut l, mut r): (Vec<f32>, Vec<f32>) = buf.as_chunks::<2>().0.iter().map(|f| (f[0], f[1])).unzip();
                 for f in &mut src.filters {
@@ -407,6 +459,11 @@ impl Mixer {
                         *o += v;
                     }
                 }
+            }
+        }
+        if let Some(loud) = self.loudness.as_mut() {
+            for (track, l) in tracks.iter_mut().zip(loud.iter_mut()) {
+                l.process(track);
             }
         }
         for track in &mut tracks {
@@ -607,6 +664,29 @@ mod tests {
         let b = &m.mix_until(t0 + ns(3072, RATE))[1];
         assert!((b.monitor[0] - 0.3).abs() < 1e-6, "1 and 2 heard: {}", b.monitor[0]);
         assert!((b.tracks[0][0] - 0.6).abs() < 1e-6, "2 and 3 sent: {}", b.tracks[0][0]);
+    }
+
+    /// Music (2) ducks under a voice (1) a block after it's heard, and comes back after.
+    #[test]
+    fn music_ducks_under_the_voice() {
+        let mut m = Mixer::new(RATE, 0);
+        // The voice on track 2 only, the music on track 1 only: track 1 is the music alone.
+        m.set(1, SourceSettings { tracks: 0b10, ..Default::default() });
+        m.set(2, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set_ducking(Some(crate::level::Ducking { voices: vec![1], music: vec![2], ..Default::default() }));
+        let t0 = 1_000_000_000;
+        m.mix_until(t0);
+        let secs = 3 * RATE as usize;
+        m.push(2, &vec![0.1; secs * 2], 2, RATE, t0);
+        // A second of talking, then quiet.
+        m.push(1, &tone(300.0, RATE as usize, RATE, 0.3), 2, RATE, t0);
+        let blocks = m.mix_until(t0 + ns(secs, RATE));
+        let music = |b: &Block| b.tracks[0][0];
+        // Half a second in, the music is down about 12 dB.
+        let mid = &blocks[blocks.len() / 6];
+        assert!((music(mid) - 0.025).abs() < 0.005, "ducked: {}", music(mid));
+        // Two seconds after the voice stopped (it fades back), it's back.
+        assert!((music(blocks.last().unwrap()) - 0.1).abs() < 0.005, "back: {}", music(blocks.last().unwrap()));
     }
 
     #[test]
