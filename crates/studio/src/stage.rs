@@ -204,13 +204,27 @@ impl Stage {
 
     // ------------------------------------------------------------------ scenes
 
+    /// The vertical picture's scenes, in order (kept beside the main ones in the collection).
+    fn vertical_order(&self) -> Vec<String> {
+        let d = self.doc.borrow();
+        d.pointer("/ferrocast/vertical/scene_order")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("name").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    /// The main picture's scenes, in order.
     fn order(&self) -> Vec<String> {
+        let vertical = self.vertical_order();
         let d = self.doc.borrow();
         let scenes: Vec<String> = self
             .sources_list()
             .iter()
             .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
             .map(|s| name_of(s).to_string())
+            .filter(|n| !vertical.contains(n))
             .collect();
         let mut out: Vec<String> = d
             .get("scene_order")
@@ -1319,6 +1333,221 @@ impl Stage {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ meters and channels
+
+    /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.
+    pub fn levels(&self, names: &[String]) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
+        let Some(e) = self.engine.borrow().clone() else { return Default::default() };
+        names
+            .iter()
+            .filter_map(|n| {
+                let (id, _) = e.engine.source_named(n)?;
+                let l = e.engine.levels(id)?;
+                Some((n.clone(), crate::collection::LevelInfo { peak: l.peak, magnitude: l.rms }))
+            })
+            .collect()
+    }
+
+    /// Puts a device on global channel `ch` (1-6: Desktop Audio 1-2, Mic/Aux 1-4), heard in every
+    /// scene, or takes it off (None). The device is (kind, name, settings).
+    pub fn set_channel(&self, ch: u32, device: Option<(&str, &str, &Value)>) -> Result<(), StudioError> {
+        let key = *CHANNEL_KEYS.get(ch.wrapping_sub(1) as usize).ok_or_else(|| fail("channel: 1 to 6."))?;
+        match device {
+            None => {
+                self.edit(|d| d.as_object_mut().map(|m| m.remove(key)));
+            }
+            Some((kind, name, settings)) => {
+                let taken = self.doc.borrow().get(key).is_some_and(|s| name_of(s) == name);
+                if !taken {
+                    self.name_free(name)?;
+                }
+                let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
+                if let (Some(base), Some(given)) = (set.as_object_mut(), settings.as_object()) {
+                    for (k, v) in given {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+                let src = json!({
+                    "id": kind, "versioned_id": kind, "name": name, "uuid": uuid(), "settings": set,
+                    "mixers": 255, "sync": 0, "flags": 0, "volume": 1.0, "balance": 0.5,
+                    "enabled": true, "muted": false, "monitoring_type": 0, "filters": [],
+                });
+                self.edit(|d| d[key] = src);
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ files
+
+    /// Files sources and filters use that aren't there any more (OBS's Missing Files).
+    pub fn missing_files(&self) -> Vec<crate::collection::MissingFile> {
+        const KEYS: [(&str, &str); 4] =
+            [("file", "Image File"), ("local_file", "Local File"), ("image_path", "Path"), ("text_file", "Text File")];
+        let mut out = Vec::new();
+        let mut check = |s: &Value, parent: Option<&str>| {
+            for (k, label) in KEYS {
+                let Some(p) = s.pointer(&format!("/settings/{k}")).and_then(Value::as_str) else { continue };
+                // A text file is only read when "from file" is on; a network media address isn't a file.
+                if (k == "text_file" && s.pointer("/settings/from_file").and_then(Value::as_bool) != Some(true))
+                    || (k == "local_file"
+                        && s.pointer("/settings/is_local_file").and_then(Value::as_bool) == Some(false))
+                {
+                    continue;
+                }
+                if !p.is_empty() && !Path::new(p).exists() {
+                    out.push(crate::collection::MissingFile {
+                        source: name_of(s).to_string(),
+                        parent: parent.map(String::from),
+                        kind: kind_of(s).to_string(),
+                        key: k.to_string(),
+                        label: label.to_string(),
+                        path: p.to_string(),
+                    });
+                }
+            }
+        };
+        for s in self.sources_list().iter().chain(self.channels_list().iter()) {
+            check(s, None);
+            for f in s.get("filters").and_then(Value::as_array).into_iter().flatten() {
+                check(f, Some(name_of(s)));
+            }
+        }
+        out
+    }
+
+    /// Points a missing file's setting at `to` instead.
+    pub fn replace_file(&self, m: &crate::collection::MissingFile, to: &str) -> Result<(), StudioError> {
+        let set = json!({ m.key.clone(): to });
+        match &m.parent {
+            Some(parent) => self.update_filter(parent, &m.source, &set),
+            None => self.update(&m.source, &set),
+        }
+    }
+
+    /// A picture of a scene (at its canvas's size) as a PNG at `path`.
+    pub fn screenshot(&self, name: &str, path: &Path) -> Result<(), StudioError> {
+        let size = if self.vertical_order().iter().any(|n| n == name) {
+            crate::collection::VERTICAL_SIZE
+        } else {
+            self.scene_index(name)?;
+            (self.canvas.width, self.canvas.height)
+        };
+        let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
+        write_png(path, &px, size)
+    }
+
+    /// A picture of what's on air exactly, as a PNG at `path`.
+    pub fn screenshot_program(&self, path: &Path) -> Result<(), StudioError> {
+        let px = self.engine()?.engine.snapshot().map_err(|e| fail(e.to_string()))?;
+        write_png(path, &px, (self.canvas.width, self.canvas.height))
+    }
+
+    // ------------------------------------------------------------------ the vertical picture
+
+    fn vertical_doc(&self) -> Option<Value> {
+        self.doc.borrow().pointer("/ferrocast/vertical").cloned()
+    }
+
+    /// The vertical picture (9:16, its own scenes) when it's on.
+    pub fn vertical(&self) -> Option<crate::collection::VerticalInfo> {
+        let v = self.vertical_doc()?;
+        if v.get("on").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        let current = v.get("current_scene").and_then(Value::as_str).unwrap_or_default().to_string();
+        let (w, h) = crate::collection::VERTICAL_SIZE;
+        Some(crate::collection::VerticalInfo {
+            width: w,
+            height: h,
+            scenes: self
+                .vertical_order()
+                .into_iter()
+                .map(|name| SceneInfo {
+                    items: self.scene_items(&name).map_or(0, |i| i.len()),
+                    current: name == current,
+                    name,
+                    preview: false,
+                    transition: None,
+                })
+                .collect(),
+            current,
+        })
+    }
+
+    /// Turns the vertical picture on: as it was, or with a first scene.
+    pub fn start_vertical(&self, first_scene: &str) -> Result<(), StudioError> {
+        if self.vertical_order().is_empty() {
+            self.add_scene(first_scene)?;
+            let order: Vec<String> = self.order().into_iter().filter(|n| n != first_scene).collect();
+            self.set_order(&order);
+            self.edit(|d| {
+                if !d.get("ferrocast").is_some_and(Value::is_object) {
+                    d["ferrocast"] = json!({});
+                }
+                d["ferrocast"]["vertical"] =
+                    json!({ "on": true, "current_scene": first_scene, "scene_order": [{ "name": first_scene }] });
+            });
+        } else {
+            self.edit(|d| d["ferrocast"]["vertical"]["on"] = json!(true));
+        }
+        Ok(())
+    }
+
+    /// Turns it off, keeping its scenes for next time.
+    pub fn stop_vertical(&self) {
+        if self.vertical_doc().is_some() {
+            self.edit(|d| d["ferrocast"]["vertical"]["on"] = json!(false));
+        }
+    }
+
+    pub fn add_vertical_scene(&self, name: &str) -> Result<(), StudioError> {
+        if self.vertical().is_none() {
+            return Err(fail("Turn the vertical picture on first."));
+        }
+        let main = self.order();
+        self.add_scene(name)?;
+        self.set_order(&main);
+        self.edit(|d| {
+            if let Some(l) = d.pointer_mut("/ferrocast/vertical/scene_order").and_then(Value::as_array_mut) {
+                l.push(json!({ "name": name }));
+            }
+        });
+        Ok(())
+    }
+
+    /// Puts one of the vertical picture's scenes on air there.
+    pub fn set_vertical_current(&self, name: &str) -> Result<(), StudioError> {
+        if !self.vertical_order().iter().any(|n| n == name) {
+            return Err(fail(format!("The vertical picture has no scene called \"{name}\".")));
+        }
+        self.edit(|d| d["ferrocast"]["vertical"]["current_scene"] = json!(name));
+        Ok(())
+    }
+
+    /// Streams the vertical picture (its own scenes, 9:16), as `stream` streams the main one.
+    pub fn stream_vertical(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+        if self.vertical().is_none() {
+            return Err(fail("The vertical picture is off."));
+        }
+        let mut s = s.clone();
+        s.encode.scale = None;
+        if let Some(why) = own::unsupported(&s, true) {
+            return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let how = own::Drawing {
+            send_to: Some(own::Send { server, key, reconnect: s.reconnect }),
+            record: None,
+            encode: &s.encode,
+            tracks: &[],
+            delay_s: s.delay_s,
+            vertical: true,
+            replay: None,
+            solo: None,
+        };
+        Ok(StageOutput::new(self.output(how)?, None, self.canvas))
+    }
+
     // ------------------------------------------------------------------ transitions
 
     /// The Studio's transition: its kind and length.
@@ -1649,6 +1878,17 @@ impl Drop for StageView {
     }
 }
 
+/// RGBA rows saved as a PNG.
+fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), StudioError> {
+    let file = std::fs::File::create(path).map_err(|e| fail(format!("the screenshot couldn't be saved ({e})")))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .and_then(|mut wr| wr.write_image_data(px))
+        .map_err(|e| fail(format!("the screenshot couldn't be saved ({e})")))
+}
+
 /// A recording's next file name (as `Stage::record_path`).
 fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
     let out = plan.encode.scale.unwrap_or((canvas.width, canvas.height));
@@ -1909,5 +2149,51 @@ mod tests {
         assert!(ok(s.options("Back")).iter().any(|o| o.key == "color"));
         ok(s.add_filter("Back", "chroma_key_filter_v2", "Key", &json!({})));
         assert!(ok(s.filter_options("Back", "Key")).iter().any(|o| o.key == "similarity"));
+    }
+
+    #[test]
+    fn the_vertical_picture_keeps_its_own_scenes() {
+        let s = stage();
+        assert!(s.vertical().is_none());
+        ok(s.start_vertical("Tall"));
+        ok(s.add_vertical_scene("Tall 2"));
+        ok(s.set_vertical_current("Tall 2"));
+        let v = s.vertical().unwrap_or_else(|| panic!("on"));
+        assert_eq!((v.width, v.height, v.current.as_str(), v.scenes.len()), (1080, 1920, "Tall 2", 2));
+        assert_eq!(s.scenes().len(), 1, "the main picture's list stays its own");
+        assert!(s.set_vertical_current("Main").is_err());
+        s.stop_vertical();
+        assert!(s.vertical().is_none());
+        ok(s.start_vertical("Other"));
+        assert_eq!(s.vertical().map(|v| v.scenes.len()), Some(2), "back as it was");
+    }
+
+    #[test]
+    fn missing_files_are_found_and_replaced() {
+        let s = stage();
+        ok(s.add_source("Main", "image_source", "Logo", &json!({ "file": "/nowhere/logo.png" }), false));
+        ok(s.add_source(
+            "Main",
+            "ffmpeg_source",
+            "Web",
+            &json!({ "is_local_file": false, "local_file": "/nowhere/x.mp4" }),
+            false,
+        ));
+        let m = s.missing_files();
+        assert_eq!(m.len(), 1, "a network address isn't a file: {m:?}");
+        let here = std::env::temp_dir();
+        ok(s.replace_file(&m[0], &here.display().to_string()));
+        assert!(s.missing_files().is_empty());
+    }
+
+    #[test]
+    fn a_global_channel_comes_and_goes() {
+        let s = stage();
+        ok(s.set_channel(4, Some(("coreaudio_input_capture", "Mic/Aux", &json!({})))));
+        assert_eq!(s.channels().first().map(|c| (c.channel, c.name.clone())), Some((Some(4), "Mic/Aux".to_string())));
+        ok(s.set_volume("Mic/Aux", -3.0));
+        assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
+        ok(s.set_channel(4, None));
+        assert!(s.channels().is_empty());
     }
 }

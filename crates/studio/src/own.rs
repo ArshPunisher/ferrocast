@@ -176,6 +176,8 @@ struct Seen {
     skipped: Vec<String>,
     /// Sources shown on their own (Source Record): their scenes come back after a reopen.
     alone: Vec<String>,
+    /// Outputs showing the vertical picture: they follow its scene on air.
+    vertical: Vec<u64>,
 }
 
 impl Shared {
@@ -211,6 +213,7 @@ impl Shared {
                 on_air,
                 skipped,
                 alone: Vec::new(),
+                vertical: Vec::new(),
             }),
         }))
     }
@@ -236,6 +239,10 @@ impl Shared {
         seen.shown = without_on_air(doc);
         seen.opened = std::time::Instant::now();
         seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        let on = vertical_on_air(doc);
+        for id in &seen.vertical {
+            let _ = self.engine.set_output_scene(*id, on.clone());
+        }
     }
 
     /// Puts `scene` on air now through a transition of its own (Studio Mode's quick
@@ -645,6 +652,9 @@ impl OwnStream {
             out.more_tracks = picked.collect();
         }
         let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
+        if vertical {
+            shared.seen().vertical.push(output);
+        }
         tracing::info!(codec = ?video.codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
@@ -856,6 +866,7 @@ impl Drop for OwnStream {
             if let Err(e) = d.shared.engine.stop_output(d.output) {
                 tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
             }
+            d.shared.seen().vertical.retain(|o| *o != d.output);
             // A source no longer recorded alone needn't come back after a reopen.
             if let Some(name) = &d.solo {
                 d.shared.seen().alone.retain(|n| n != name);
