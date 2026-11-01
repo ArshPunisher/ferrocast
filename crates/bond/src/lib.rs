@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::watch;
 
+pub mod irl;
+pub mod push;
 pub mod token;
 
 /// The service's settings (from the environment in `main`).
@@ -47,6 +49,14 @@ pub struct Config {
     /// Platforms on private networks allowed (tests only: otherwise a streamer could point
     /// the service at the server's own network).
     pub allow_private: bool,
+    /// The service's own HTTPS address (the phone page's link starts with it).
+    pub public_url: String,
+    /// Phones' WebRTC: the address to take it on (None: the one traffic leaves by) and the
+    /// UDP ports open for it.
+    pub rtc_ip: Option<std::net::IpAddr>,
+    pub rtc_ports: (u16, u16),
+    /// The key pushes to phones are signed with (PKCS#8, base64url; None: no pushes).
+    pub vapid: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -63,8 +73,10 @@ impl std::fmt::Debug for Config {
 
 /// After this long with nothing arriving, the Be right back picture goes out.
 const QUIET: Duration = Duration::from_secs(3);
-/// A session nobody sends to in this long is forgotten.
+/// A session nobody sends to in this long is forgotten (a phone's waits longer: it's made
+/// before setting out).
 const UNUSED: Duration = Duration::from_secs(120);
+const UNUSED_IRL: Duration = Duration::from_secs(12 * 3600);
 /// An ended session's health can still be read this long.
 const ENDED_KEPT: Duration = Duration::from_secs(300);
 const MAX_DESTINATIONS: usize = 8;
@@ -115,7 +127,7 @@ impl Clock {
     }
 }
 
-struct Session {
+pub(crate) struct Session {
     id: String,
     account: String,
     hub: Arc<Hub>,
@@ -126,6 +138,10 @@ struct Session {
     feed: Mutex<Feed>,
     /// The Be right back picture as tags, made once the session starts (None: none here).
     brb: Mutex<Option<Arc<Vec<Tag>>>>,
+    /// Streamed from a phone (the IRL page): its secret and its connection now.
+    irl: Option<irl::Irl>,
+    /// Sends pushes to that phone (when this service has a key).
+    pusher: Option<Arc<push::Pusher>>,
 }
 
 struct Feed {
@@ -184,9 +200,32 @@ impl Session {
             m.encoder = Some("Ferrocast Bond".into());
             self.hub.metadata(m);
         }
+        let back = f.input == Input::Away;
         f.input = Input::Live;
         f.last_input = Some(Instant::now());
         f.away_since = None;
+        drop(f);
+        if back {
+            self.notify("You're live again", "Your stream is back on every platform.");
+        }
+    }
+
+    /// A push to the phone the session streams from (when it asked for them).
+    pub(crate) fn notify(&self, title: &str, body: &str) {
+        let (Some(irl), Some(p)) = (&self.irl, &self.pusher) else { return };
+        let subs = irl.subscriptions();
+        if subs.is_empty() {
+            return;
+        }
+        let (p, m) = (p.clone(), json!({ "title": title, "body": body, "tag": format!("ferrocast-{}", self.id) }));
+        tokio::spawn(async move {
+            for s in subs {
+                match p.send(&s, &m).await {
+                    Ok(()) => tracing::info!("Bond: a push went to the phone"),
+                    Err(e) => tracing::info!(error = %e, "Bond: a push didn't go"),
+                }
+            }
+        });
     }
 
     fn end(&self) {
@@ -197,6 +236,9 @@ impl Session {
         f.input = Input::Ended;
         f.ended_at = Some(Instant::now());
         drop(f);
+        if let Some(i) = &self.irl {
+            i.stop();
+        }
         self.hub.end();
         for d in &self.dests {
             let _ = d.stop.send(true);
@@ -219,6 +261,7 @@ impl Session {
 pub struct Bond {
     cfg: Arc<Config>,
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    pusher: Option<Arc<push::Pusher>>,
 }
 
 impl std::fmt::Debug for Bond {
@@ -263,6 +306,9 @@ pub struct NewSession {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Sent from a phone (the IRL page, its link in the answer): waits up to 12 hours for it.
+    #[serde(default)]
+    pub irl: bool,
 }
 
 /// Where `host` is, when every address it has is on the internet (not this server, its
@@ -320,7 +366,8 @@ fn random_id() -> String {
 
 impl Bond {
     pub fn new(cfg: Config) -> Self {
-        Bond { cfg: Arc::new(cfg), sessions: Arc::new(Mutex::new(HashMap::new())) }
+        let pusher = cfg.vapid.as_deref().and_then(push::Pusher::new).map(Arc::new);
+        Bond { cfg: Arc::new(cfg), sessions: Arc::new(Mutex::new(HashMap::new())), pusher }
     }
 
     /// The HTTP API.
@@ -329,6 +376,7 @@ impl Bond {
             .route("/health", get(|| async { "ok" }))
             .route("/v1/sessions", post(create))
             .route("/v1/sessions/{id}", get(read).delete(stop))
+            .merge(irl::routes())
             .with_state(self.clone())
     }
 
@@ -418,6 +466,8 @@ impl Bond {
             dests,
             created: Instant::now(),
             picture: (n.width, n.height, n.fps),
+            irl: n.irl.then(irl::Irl::new),
+            pusher: self.pusher.clone(),
             feed: Mutex::new(Feed {
                 input: Input::Waiting,
                 last_input: None,
@@ -460,10 +510,13 @@ impl Bond {
                 }
             });
         }
-        tracing::info!(session = %id, %account, "Bond: a session started");
-        Ok(
-            json!({ "id": id, "stream_id": format!("bond:{id}"), "srtla_port": self.cfg.srtla.port(), "srt_port": self.cfg.srt.port() }),
-        )
+        tracing::info!(session = %id, %account, irl = n.irl, "Bond: a session started");
+        let mut out = json!({ "id": id, "stream_id": format!("bond:{id}"), "srtla_port": self.cfg.srtla.port(), "srt_port": self.cfg.srt.port() });
+        if let Some(i) = &session.irl {
+            // The secret rides in the link's #fragment: it never reaches a server's log.
+            out["phone_url"] = json!(format!("{}/irl#{id}.{}", self.cfg.public_url, i.secret));
+        }
+        Ok(out)
     }
 
     /// The media side: the SRTLA receiver, the SRT listener, and the keep-alive watch. Runs
@@ -516,7 +569,9 @@ impl Bond {
                     (f.input, f.last_input.map(|t| t.elapsed()), f.away_since.map(|t| t.elapsed()), f.ended_at)
                 };
                 match input {
-                    Input::Waiting if s.created.elapsed() > UNUSED => s.end(),
+                    Input::Waiting if s.created.elapsed() > if s.irl.is_some() { UNUSED_IRL } else { UNUSED } => {
+                        s.end()
+                    }
                     Input::Live if quiet.is_some_and(|q| q > QUIET) => {
                         let brb = s.brb.lock().unwrap_or_else(|p| p.into_inner()).clone();
                         match brb {
@@ -527,6 +582,10 @@ impl Bond {
                                     f.away_since = Some(Instant::now());
                                 }
                                 tracing::info!(session = %s.id, "Bond: the computer went quiet, Be right back is out");
+                                s.notify(
+                                    "Signal lost",
+                                    "Your channels show Be right back. Open Ferrocast IRL to carry on.",
+                                );
                                 tokio::spawn(play_brb(s.clone(), tags));
                             }
                             // Nothing to show: the stream ends as it would have.
@@ -535,6 +594,7 @@ impl Bond {
                     }
                     Input::Away if away.is_some_and(|a| a > self.cfg.keepalive) => {
                         tracing::info!(session = %s.id, "Bond: the computer didn't come back, the stream ends");
+                        s.notify("Stream ended", "Your phone didn't come back in time, so the stream ended.");
                         s.end();
                     }
                     _ => {}

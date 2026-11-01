@@ -26,6 +26,10 @@ fn bond(ffmpeg: Option<std::path::PathBuf>) -> Bond {
         max_sessions: 2,
         ffmpeg,
         allow_private: true,
+        public_url: "http://127.0.0.1:8795".into(),
+        rtc_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        rtc_ports: (41000, 41099),
+        vapid: None,
     })
 }
 
