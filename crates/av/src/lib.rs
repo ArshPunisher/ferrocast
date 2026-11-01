@@ -29,6 +29,7 @@ pub mod monitor;
 pub mod mp4;
 pub mod obs;
 pub mod pipeline;
+pub mod preview;
 pub mod source;
 mod transform;
 pub mod video;

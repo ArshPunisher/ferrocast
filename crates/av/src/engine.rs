@@ -358,6 +358,24 @@ struct State {
     monitor: Option<crate::monitor::Feeder>,
     stats: Stats,
     error: Option<String>,
+    /// The Studio's preview, when a window shows one.
+    preview: Option<Preview>,
+}
+
+/// How the preview looks, and what it shows (its window is with its own thread).
+#[derive(Debug, Default)]
+struct Preview {
+    look: crate::preview::PreviewLook,
+    /// A scene instead of what's on air (Studio Mode's preview).
+    scene: Option<String>,
+}
+
+/// The preview's own thread and its window: a window that's slow to take a frame (hidden,
+/// covered) only ever holds this thread up, never the outputs.
+struct PreviewThread {
+    surface: Arc<Mutex<crate::preview::PreviewSurface>>,
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
 }
 
 /// The engine. Dropping it stops its thread and closes its outputs.
@@ -372,6 +390,7 @@ pub struct Engine {
     text: Mutex<TextRenderer>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    preview: Mutex<Option<PreviewThread>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -421,6 +440,7 @@ impl Engine {
             monitor: None,
             stats: Stats::default(),
             error: None,
+            preview: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -440,6 +460,7 @@ impl Engine {
             text: Mutex::new(TextRenderer::new()),
             stop,
             thread: Some(thread),
+            preview: Mutex::new(None),
         })
     }
 
@@ -849,6 +870,64 @@ impl Engine {
         })
     }
 
+    /// Shows the preview in a Mac view (`NSView *`, `width`×`height` device pixels), drawn
+    /// each frame from now on; replaces one shown before.
+    ///
+    /// # Safety
+    /// `ns_view` must be a live `NSView` that outlives the preview (`stop_preview` first).
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub unsafe fn start_preview(&self, ns_view: *mut std::ffi::c_void, width: u32, height: u32) -> Result<(), AvError> {
+        // SAFETY: passed on from the caller's promise.
+        let surface = unsafe { self.gpu.preview_surface(ns_view, width, height) }?;
+        self.stop_preview();
+        self.lock().preview.get_or_insert_with(Preview::default);
+        let surface = Arc::new(Mutex::new(surface));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (state, gpu, surface, stop) = (self.state.clone(), self.gpu.clone(), surface.clone(), stop.clone());
+            let (size, every) =
+                ((self.config.width, self.config.height), Duration::from_secs(1) / self.config.fps.max(1));
+            std::thread::Builder::new()
+                .name("ferrocast-preview".into())
+                .spawn(move || preview_loop(&state, &gpu, &surface, &stop, size, every))
+                .map_err(|e| AvError::Source(format!("the preview's thread didn't start ({e})")))?
+        };
+        *self.preview.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreviewThread { surface, stop, thread });
+        Ok(())
+    }
+
+    /// Stops drawing the preview; once it returns, its window may go.
+    pub fn stop_preview(&self) {
+        let running = self.preview.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(p) = running {
+            p.stop.store(true, Ordering::Release);
+            let _ = p.thread.join();
+        }
+        self.lock().preview = None;
+    }
+
+    /// The preview's view changed size (device pixels).
+    pub fn resize_preview(&self, width: u32, height: u32) {
+        if let Some(p) = self.preview.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            self.gpu.resize_preview(&mut p.surface.lock().unwrap_or_else(|e| e.into_inner()), width, height);
+        }
+    }
+
+    /// How the preview looks round and over the picture (outlines, where the canvas sits…).
+    pub fn set_preview_look(&self, look: crate::preview::PreviewLook) {
+        if let Some(p) = self.lock().preview.as_mut() {
+            p.look = look;
+        }
+    }
+
+    /// A scene the preview shows instead of what's on air (Studio Mode), or None.
+    pub fn set_preview_scene(&self, scene: Option<String>) {
+        if let Some(p) = self.lock().preview.as_mut() {
+            p.scene = scene;
+        }
+    }
+
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
     pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
         self.with_output(id, |pipe| {
@@ -932,6 +1011,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.stop_preview();
         self.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -940,6 +1020,38 @@ impl Drop for Engine {
         for id in ids {
             let _ = self.stop_output(id);
         }
+    }
+}
+
+/// The preview's thread: what's on air (or Studio Mode's scene) at the engine's rate, taken
+/// from the state in a moment and drawn into the window outside its lock.
+fn preview_loop(
+    state: &Mutex<State>,
+    gpu: &Compositor,
+    surface: &Mutex<crate::preview::PreviewSurface>,
+    stop: &AtomicBool,
+    size: (u32, u32),
+    every: Duration,
+) {
+    while !stop.load(Ordering::Acquire) {
+        let started = Instant::now();
+        let next = {
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
+            st.preview
+                .as_ref()
+                .map(|p| (what_to_draw(&st, size.0, size.1, p.scene.as_deref(), now_ns()), p.look.clone()))
+        };
+        if let Some((draw, look)) = next {
+            let shown = match &draw {
+                Draw::Scene(s) => crate::preview::Shown::Scene(s),
+                Draw::Moving(t) => crate::preview::Shown::Moving(t),
+            };
+            let mut s = surface.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = gpu.present(&mut s, shown, &look) {
+                tracing::warn!("the preview couldn't be drawn: {e}");
+            }
+        }
+        std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
 }
 

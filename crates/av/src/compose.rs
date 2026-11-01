@@ -73,15 +73,18 @@ fn blend_state(b: Blend, metal: bool) -> wgpu::BlendState {
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
 pub struct Compositor {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    /// Kept for window surfaces (the preview): they must come from the device's own instance.
+    pub(crate) instance: wgpu::Instance,
+    pub(crate) adapter: wgpu::Adapter,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     module: wgpu::ShaderModule,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(Shader, Blend, bool), wgpu::RenderPipeline>>,
     /// Alpha blends as libobs's Metal renderer does (see `blend_state`).
     metal_alpha: bool,
-    bilinear: wgpu::Sampler,
+    pub(crate) bilinear: wgpu::Sampler,
     point: wgpu::Sampler,
     /// Transitions: their shaders, layout and pipelines (by entry point and target view).
     transition_module: wgpu::ShaderModule,
@@ -103,6 +106,8 @@ pub struct Compositor {
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
     /// NV12 out: the Y and UV pipelines.
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
+    /// The preview's painter, by the window surface's format.
+    pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
 }
 
 /// What an item draws: a picture, a texture made on the GPU (filtered), or other items.
@@ -115,12 +120,12 @@ enum Src<'a> {
 }
 
 /// A texture drawn into: its two views and size.
-struct Target {
-    texture: wgpu::Texture,
-    linear: wgpu::TextureView,
-    gamma: wgpu::TextureView,
-    width: u32,
-    height: u32,
+pub(crate) struct Target {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) linear: wgpu::TextureView,
+    pub(crate) gamma: wgpu::TextureView,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// One quad to draw: where it goes and how.
@@ -328,6 +333,9 @@ impl Compositor {
         };
         let nv12 = (conv("fs_y", wgpu::TextureFormat::R8Unorm), conv("fs_uv", wgpu::TextureFormat::Rg8Unorm));
         Ok(Self {
+            instance,
+            adapter,
+            preview_pipelines: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             nv12,
             effect_module,
@@ -440,7 +448,12 @@ impl Compositor {
         self.nv12_out(enc, &canvas)
     }
 
-    fn transition_into(&self, enc: &mut wgpu::CommandEncoder, canvas: &Target, tr: &Transition) -> Result<(), AvError> {
+    pub(crate) fn transition_into(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        canvas: &Target,
+        tr: &Transition,
+    ) -> Result<(), AvError> {
         let (w, h) = (tr.from.width, tr.from.height);
         check_size(w, h)?;
         self.validate(&tr.from.items)?;
@@ -592,7 +605,7 @@ impl Compositor {
             .clone()
     }
 
-    fn target(&self, width: u32, height: u32, extra: wgpu::TextureUsages) -> Target {
+    pub(crate) fn target(&self, width: u32, height: u32, extra: wgpu::TextureUsages) -> Target {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("canvas"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -606,7 +619,7 @@ impl Compositor {
         Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height }
     }
 
-    fn clear(&self, enc: &mut wgpu::CommandEncoder, t: &Target) {
+    pub(crate) fn clear(&self, enc: &mut wgpu::CommandEncoder, t: &Target) {
         enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -622,7 +635,7 @@ impl Compositor {
         });
     }
 
-    fn draw_items(
+    pub(crate) fn draw_items(
         &self,
         enc: &mut wgpu::CommandEncoder,
         target: &Target,
@@ -1271,7 +1284,13 @@ impl Compositor {
     }
 
     /// Copies the canvas into memory, row by row.
-    fn read_back(&self, enc: wgpu::CommandEncoder, target: &wgpu::Texture, w: u32, h: u32) -> Result<Vec<u8>, AvError> {
+    pub(crate) fn read_back(
+        &self,
+        enc: wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, AvError> {
         Ok(self.read_planes(enc, &[(target, w, h, 4)])?.pop().unwrap_or_default())
     }
 
@@ -1337,7 +1356,7 @@ impl Compositor {
 
     /// Every picture's size and pixel count, and that uploaded ones are there, before anything
     /// goes to the GPU.
-    fn validate(&self, items: &[Item]) -> Result<(), AvError> {
+    pub(crate) fn validate(&self, items: &[Item]) -> Result<(), AvError> {
         for item in items {
             match &item.content {
                 Content::Picture(p) => {
@@ -1457,7 +1476,7 @@ pub fn bt709_limited() -> [[f32; 4]; 3] {
     ]
 }
 
-fn check_size(w: u32, h: u32) -> Result<(), AvError> {
+pub(crate) fn check_size(w: u32, h: u32) -> Result<(), AvError> {
     if w == 0 || h == 0 || w > MAX || h > MAX { Err(AvError::BadSize(w, h)) } else { Ok(()) }
 }
 
