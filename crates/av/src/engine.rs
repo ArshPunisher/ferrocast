@@ -758,6 +758,23 @@ impl Engine {
 
     /// Starts an output on a canvas of its own (another size, scene, rate or track).
     pub fn start_output_on(&self, kind: OutputKind, canvas: Canvas) -> Result<u64, AvError> {
+        let (video, audio) = {
+            let st = self.lock();
+            (st.video, st.audio)
+        };
+        self.start_output_with(kind, canvas, video, audio)
+    }
+
+    /// As `start_output_on`, encoded its own way (each output its encoder, bitrate and quality:
+    /// a stream at 6 Mbps and a recording at high quality from one engine). The canvas sets the
+    /// picture's size and rate.
+    pub fn start_output_with(
+        &self,
+        kind: OutputKind,
+        canvas: Canvas,
+        video: VideoConfig,
+        audio: AudioConfig,
+    ) -> Result<u64, AvError> {
         if canvas.every == 0
             || canvas.track >= crate::mix::TRACKS
             || canvas.more_tracks.iter().any(|t| *t >= crate::mix::TRACKS)
@@ -783,7 +800,7 @@ impl Engine {
             height: canvas.height,
             fps_num: (self.config.fps / canvas.every).max(1),
             fps_den: 1,
-            ..st.video
+            ..video
         };
         // Extra tracks only mean something in a file (a recording, or a saved replay).
         let replay = match &kind {
@@ -791,7 +808,7 @@ impl Engine {
             _ => None,
         };
         let more = if record.is_some() || replay.is_some() { canvas.more_tracks.len() } else { 0 };
-        let mut pipe = Pipeline::with_tracks(video, st.audio, record.as_deref(), more)?;
+        let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
         if let Some((seconds, mb)) = replay {
             pipe.keep_replay(seconds, mb);
         }
