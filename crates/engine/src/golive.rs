@@ -8,6 +8,8 @@
 //! Settings: `golive` (the destinations, top first). Secrets: the ingest key, each custom
 //! destination's key, and OBS's own stream setting from before "Point OBS at Ferrocast".
 
+mod bond;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -143,6 +145,10 @@ pub struct GoLiveConfig {
     /// Advanced mode's settings (A2.5): defaults that work for most people.
     #[serde(default)]
     pub advanced: Advanced,
+    /// Ferrocast Bond (Pro): the main picture's RTMP platforms are sent from the cloud, this
+    /// computer uploading one stream over every connection at once.
+    #[serde(default)]
+    pub bond: bool,
 }
 
 /// Go live's Advanced settings (board items 2B and 3).
@@ -312,6 +318,7 @@ impl Default for GoLiveConfig {
             vertical_source: VerticalSource::Canvas,
             cut: CutConfig::default(),
             advanced: Advanced::default(),
+            bond: false,
         }
     }
 }
@@ -359,6 +366,9 @@ pub struct GoLiveView {
     pub cut: CutView,
     /// Advanced mode's settings (A2.5).
     pub advanced: Advanced,
+    /// Ferrocast Bond is on, and whether it sends this stream now.
+    pub bond: bool,
+    pub bond_sending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -505,6 +515,9 @@ pub(crate) struct GoLive {
     quality: Mutex<ferrocast_golive::quality::Quality>,
     /// Pre-flight's last Test connection per destination, and when.
     tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
+    /// Ferrocast Bond sending this stream, and whether it couldn't (this stream goes from here).
+    bond: Mutex<Option<bond::BondRun>>,
+    bond_failed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -545,6 +558,8 @@ impl Default for GoLive {
             backup: Mutex::new(BackupState::default()),
             quality: Mutex::new(Default::default()),
             tested: Mutex::new(HashMap::new()),
+            bond: Mutex::new(None),
+            bond_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -916,6 +931,8 @@ impl Engine {
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
             advanced: cfg.advanced.clone(),
+            bond: cfg.bond,
+            bond_sending: lock(&g.bond).is_some(),
             cut: CutView {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
@@ -1078,6 +1095,15 @@ impl Engine {
                 .map(|(name, live)| AitumOutput { platform: aitum_platform(host(&name).as_deref(), &name), name, live })
                 .collect(),
         )
+    }
+
+    /// Ferrocast Bond on or off (from the next stream: one running carries on as it is).
+    pub async fn set_golive_bond(&self, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        cfg.bond = on;
+        self.save_golive(cfg.clone()).await?;
+        Ok(cfg)
     }
 
     /// "I use it on purpose": hides the Aitum Multistream setup note.
@@ -1677,6 +1703,8 @@ impl Engine {
             *lock(&g.backup) = BackupState::default();
             lock(&g.quality).reset();
         }
+        // Bond takes the platforms it can first; the rest start from here.
+        self.bond_reconcile(&want, main_on).await;
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
                 continue;

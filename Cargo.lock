@@ -2330,6 +2330,7 @@ dependencies = [
  "base64 0.23.1",
  "fastrand",
  "ferrocast-av",
+ "ferrocast-bond",
  "ferrocast-connector",
  "ferrocast-core",
  "ferrocast-golive",
