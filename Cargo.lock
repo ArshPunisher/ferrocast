@@ -2342,14 +2342,18 @@ dependencies = [
 name = "ferrocast-golive"
 version = "2.3.0"
 dependencies = [
+ "aes 0.8.4",
  "bytes",
+ "ctr 0.9.2",
  "fastrand",
  "futures",
  "opus",
+ "pbkdf2",
  "reqwest",
  "rml_rtmp",
  "rustls",
  "serde",
+ "sha2 0.10.9",
  "srt-tokio",
  "str0m",
  "symphonia-codec-aac",

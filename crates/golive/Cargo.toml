@@ -31,6 +31,12 @@ reqwest = { version = "0.13" }
 symphonia-core = "0.6.1"
 symphonia-codec-aac = "0.6.1"
 opus = "0.4"
+# RIST's main profile with a passphrase (VSF TR-06-2, as librist does it): AES-CTR keyed by
+# PBKDF2-HMAC-SHA256 (RustCrypto, MIT/Apache-2.0).
+aes = "0.8"
+ctr = "0.9"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true
