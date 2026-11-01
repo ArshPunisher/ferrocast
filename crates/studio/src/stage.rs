@@ -2095,23 +2095,86 @@ impl Stage {
         if mode == "disable" { Ok(()) } else { Err(fail("Ferrocast's own engine doesn't deinterlace yet.")) }
     }
 
-    /// Media controls (play, pause, seek) aren't in our engine yet; files play and loop as set.
+    /// OBS's media controls on a video or sound file → where it stands after.
     pub fn media(
         &self,
         name: &str,
-        _what: crate::collection::MediaAct,
+        what: crate::collection::MediaAct,
     ) -> Result<crate::collection::MediaInfo, StudioError> {
-        self.source(name)?;
-        Err(fail("Play and pause aren't in Ferrocast's own engine yet: the file plays as its settings say."))
+        #[cfg(target_os = "macos")]
+        {
+            use crate::collection::MediaAct as A;
+            use ferrocast_av::media::Control as C;
+            let e = self.engine()?;
+            let id = self.media_id(&e, name)?;
+            let c = match what {
+                A::Play => C::Play,
+                A::Pause => C::Pause,
+                A::PlayPause => match e.engine.media_state(id).map(|s| s.0) {
+                    Some(ferrocast_av::media::MediaState::Playing) => C::Pause,
+                    _ => C::Play,
+                },
+                A::Restart => C::Restart,
+                A::Stop => C::Stop,
+                // One file: next and previous start it again (OBS's for a playlist).
+                A::Next | A::Previous => C::Restart,
+            };
+            e.engine.media_control(id, c).map_err(|e| fail(e.to_string()))?;
+            self.media_state(name)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = what;
+            Err(fail(format!("\"{name}\": media files play on a Mac for now.")))
+        }
     }
 
     pub fn media_state(&self, name: &str) -> Result<crate::collection::MediaInfo, StudioError> {
-        self.source(name)?;
-        Ok(crate::collection::MediaInfo { state: "playing", time_ms: 0, duration_ms: 0 })
+        #[cfg(target_os = "macos")]
+        {
+            use ferrocast_av::media::MediaState as S;
+            let e = self.engine()?;
+            let id = self.media_id(&e, name)?;
+            let (state, at, dur) =
+                e.engine.media_state(id).ok_or_else(|| fail(format!("\"{name}\" isn't playing.")))?;
+            Ok(crate::collection::MediaInfo {
+                state: match state {
+                    S::Playing => "playing",
+                    S::Paused => "paused",
+                    S::Stopped => "stopped",
+                    S::Ended => "ended",
+                },
+                time_ms: (at / 1_000_000) as i64,
+                duration_ms: (dur / 1_000_000) as i64,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(fail(format!("\"{name}\": media files play on a Mac for now.")))
+        }
     }
 
-    pub fn media_seek(&self, name: &str, _ms: i64) -> Result<crate::collection::MediaInfo, StudioError> {
-        self.media(name, crate::collection::MediaAct::Play)
+    /// Jumps to `ms` into a video or sound file.
+    pub fn media_seek(&self, name: &str, ms: i64) -> Result<crate::collection::MediaInfo, StudioError> {
+        #[cfg(target_os = "macos")]
+        {
+            let e = self.engine()?;
+            let id = self.media_id(&e, name)?;
+            let ns = u64::try_from(ms.max(0)).unwrap_or(0) * 1_000_000;
+            e.engine.media_control(id, ferrocast_av::media::Control::Seek(ns)).map_err(|e| fail(e.to_string()))?;
+            self.media_state(name)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ms;
+            self.media_state(name)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn media_id(&self, e: &own::Shared, name: &str) -> Result<u64, StudioError> {
+        self.source(name)?;
+        e.engine.source_named(name).map(|(id, _)| id).ok_or_else(|| fail(format!("\"{name}\" isn't playing yet.")))
     }
 
     /// Clicks into a web page source (in a window), stops, or reloads it.
