@@ -1,7 +1,7 @@
 //! WebRTC by WHIP (RFC 9725), as OBS's WHIP output sends: an offer posted to the endpoint (its
-//! bearer token the key), the answer back, then the stream over WebRTC with str0m: H.264 as it is
-//! (no B-frames: WebRTC can't carry them), and the AAC made Opus (WebRTC's sound). The session
-//! is deleted at the end, as the spec asks.
+//! bearer token the key), the answer back, then the stream over WebRTC with str0m: H.264, or
+//! HEVC to a server that takes it, as it is (no B-frames: WebRTC can't carry them), and the AAC
+//! made Opus (WebRTC's sound). The session is deleted at the end, as the spec asks.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
