@@ -16,13 +16,13 @@ use std::time::Duration;
 use ferrocast_av::TransitionKind;
 use ferrocast_av::audio::AudioConfig;
 use ferrocast_av::engine::{Canvas as AvCanvas, Engine, EngineConfig, OutputKind};
-use ferrocast_av::pipeline::{Pipeline, Tag};
-use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
+use ferrocast_av::pipeline::Tag;
+use ferrocast_av::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
 use ferrocast_golive::{Hub, Target};
 
 use crate::collection::VERTICAL_SIZE;
-use crate::{EncodeSettings, ProgramFeed, RecordPlan, RecordStats, StreamSettings, StreamStats, Studio, StudioError};
+use crate::{EncodeSettings, RecordPlan, RecordStats, StreamSettings, StreamStats, StudioError};
 
 /// Our encoder's settings for `e` at a picture of this size and rate.
 fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoConfig {
@@ -148,9 +148,6 @@ pub(crate) struct OwnStream {
     health: Option<tokio::sync::watch::Receiver<Health>>,
     stop_push: Option<tokio::sync::watch::Sender<bool>>,
     runtime: Option<tokio::runtime::Runtime>,
-    /// libobs's side of the hand-over (kept on this thread: it holds the Studio); its
-    /// channels are with the encoder thread.
-    feed: Option<ProgramFeed>,
     /// Our engine drawing the collection (instead of libobs's frames).
     drawn: Option<Drawn>,
     hub: Option<Arc<Hub>>,
@@ -183,12 +180,7 @@ struct Seen {
 }
 
 impl Shared {
-    /// Starts the engine at the Studio's canvas with the collection `doc` open.
-    pub(crate) fn open(studio: &Studio, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
-        Self::open_at(studio.canvas(), doc)
-    }
-
-    /// The same at `canvas`, with no libobs Studio (the scene store our engine keeps).
+    /// Starts the engine at `canvas` with the collection `doc` open.
     pub(crate) fn open_at(canvas: crate::Canvas, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
         // The strong noise removal, when this build has it.
         #[cfg(feature = "deepfilter")]
@@ -291,38 +283,6 @@ impl Shared {
         Ok(())
     }
 
-    /// Keeps the engine with the Studio: a new scene on air goes on through the Studio's
-    /// transition; any other change opens the collection again (only changed sources restart).
-    /// Returns whether it was opened again. Many outputs may call it each tick: only the first
-    /// finds something to do.
-    pub(crate) fn follow(&self, doc: &serde_json::Value) -> bool {
-        let mut seen = self.seen();
-        let bare = without_on_air(doc);
-        if bare != seen.shown && seen.opened.elapsed() >= REOPEN_EVERY {
-            seen.skipped = self.engine.load_obs(doc);
-            // Opening again clears the scenes: sources shown alone get their scenes back.
-            for name in seen.alone.clone() {
-                if let Err(e) = show_alone(&self.engine, &name, (0, 0)) {
-                    tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
-                }
-            }
-            seen.shown = bare;
-            seen.opened = std::time::Instant::now();
-            seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
-            return true;
-        }
-        let now = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
-        if now != seen.on_air
-            && let Some(name) = &now
-        {
-            let (kind, ms) = transition_of(doc);
-            if let Err(e) = self.engine.go_with(name, kind, ms) {
-                tracing::warn!("Ferrocast's own engine couldn't follow the scene change: {e}");
-            }
-            seen.on_air = now;
-        }
-        false
-    }
 }
 
 /// An output on the shared engine.
@@ -332,8 +292,6 @@ struct Drawn {
     output: u64,
     /// A recording's plan (its names and when to split), and when the file now written began.
     plan: Option<(RecordPlan, std::time::Instant)>,
-    /// The vertical picture's scene on air, when this draws the vertical picture.
-    vertical: Option<Option<String>>,
     /// The scene or source shown on its own, when this is a Source Record.
     solo: Option<String>,
 }
@@ -455,10 +413,6 @@ impl Drop for Delayed {
     }
 }
 
-/// At most how often edits reopen the collection in a drawn stream (edits in between go with
-/// the next one; sources that didn't change keep running).
-const REOPEN_EVERY: Duration = Duration::from_millis(100);
-
 /// A collection without which scene is on air (what a reopen depends on).
 fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
     let mut d = doc.clone();
@@ -473,19 +427,6 @@ fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
     d
 }
 
-/// The engine's transition for the Studio's (by OBS's id); the rest fade for now.
-fn transition_of(doc: &serde_json::Value) -> (TransitionKind, u64) {
-    let ms = doc.get("transition_duration").and_then(serde_json::Value::as_u64).unwrap_or(300);
-    let name = doc.get("current_transition").and_then(serde_json::Value::as_str).unwrap_or("Fade");
-    let id = doc
-        .get("transitions")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|t| t.iter().find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(name)))
-        .and_then(|t| t.get("id").and_then(serde_json::Value::as_str))
-        .unwrap_or(if name == "Cut" { "cut_transition" } else { "fade_transition" });
-    transition_kind(id, ms)
-}
-
 /// The engine's transition for one of OBS's transition ids (the rest fade for now).
 pub(crate) fn transition_kind(id: &str, ms: u64) -> (TransitionKind, u64) {
     match id {
@@ -496,149 +437,6 @@ pub(crate) fn transition_kind(id: &str, ms: u64) -> (TransitionKind, u64) {
 }
 
 impl OwnStream {
-    /// A stream as `s` says.
-    pub(crate) fn stream(studio: &Studio, server: &str, key: &str, s: &StreamSettings) -> Result<Self, StudioError> {
-        Self::start(studio, Some(Send { server, key, reconnect: s.reconnect }), None, &s.encode)
-    }
-
-    /// A recording to `path` (a fragmented MP4: it plays even after a crash).
-    pub(crate) fn record(studio: &Studio, path: &std::path::Path, plan: &RecordPlan) -> Result<Self, StudioError> {
-        Self::start(studio, None, Some(path), &plan.encode)
-    }
-
-    fn start(
-        studio: &Studio,
-        send_to: Option<Send<'_>>,
-        record: Option<&std::path::Path>,
-        e: &EncodeSettings,
-    ) -> Result<Self, StudioError> {
-        let fail = |e: String| StudioError::Failed(format!("Ferrocast's own encoder couldn't start: {e}"));
-        let target = match &send_to {
-            Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
-            None => None,
-        };
-        let mut feed = studio.program_feed()?;
-        // The channels go to the encoder thread; the feed itself stays here.
-        let frames = std::mem::replace(&mut feed.video, std::sync::mpsc::sync_channel(0).1);
-        let sound = std::mem::replace(&mut feed.sound, std::sync::mpsc::sync_channel(0).1);
-        let codec =
-            if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
-        let video = VideoConfig {
-            codec,
-            input: PixelFormat::Nv12,
-            width: feed.width,
-            height: feed.height,
-            fps_num: feed.fps_num,
-            fps_den: feed.fps_den.max(1),
-            bitrate_kbps: e.video_kbps.max(100),
-            rate: rate_of(e),
-            keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
-            software: is_x264(&e.video_encoder),
-        };
-        let audio =
-            AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let mut pipe = Pipeline::new(video, audio, record).map_err(|e| fail(e.to_string()))?;
-
-        let hub = Hub::new();
-        let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
-        let thread = {
-            let (stop, counts) = (stop.clone(), counts.clone());
-            std::thread::Builder::new()
-                .name("ferrocast-own-encoder".into())
-                .spawn(move || {
-                    hub.start();
-                    let send = |tags: Vec<Tag>, counts: &Counts| {
-                        for t in tags {
-                            match t {
-                                Tag::Video { ms, body } => {
-                                    counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                                    hub.video(ms, body.into());
-                                }
-                                Tag::Audio { ms, body } => {
-                                    counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                                    hub.audio(ms, body.into());
-                                }
-                            }
-                        }
-                    };
-                    // The first error shows at once (the app polls last_error) and ends the stream.
-                    let fail_now = |e: String| {
-                        if let Ok(mut err) = counts.error.lock()
-                            && err.is_none()
-                        {
-                            *err = Some(e);
-                        }
-                    };
-                    while !stop.load(Ordering::Acquire) {
-                        let kbps = counts.new_kbps.swap(0, Ordering::AcqRel);
-                        if kbps > 0
-                            && let Err(e) = pipe.set_video_kbps(kbps)
-                        {
-                            tracing::warn!("Ferrocast's own encoder kept its bitrate: {e}");
-                        }
-                        if let Ok(f) = frames.recv_timeout(Duration::from_millis(100)) {
-                            let frame =
-                                Frame::Nv12 { y: &f.y, y_stride: f.y_stride, uv: &f.uv, uv_stride: f.uv_stride };
-                            match pipe.video(frame, f.timestamp_ns) {
-                                Ok(t) => {
-                                    send(t, &counts);
-                                    counts.frames.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    fail_now(e.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        let mut sound_failed = false;
-                        while let Ok(snd) = sound.try_recv() {
-                            match pipe.audio(&snd.samples, snd.timestamp_ns) {
-                                Ok(t) => send(t, &counts),
-                                Err(e) => {
-                                    fail_now(e.to_string());
-                                    sound_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if sound_failed {
-                            break;
-                        }
-                        if pipe.recording_failed() {
-                            fail_now("the recording couldn't be written (is the disk full?)".into());
-                            break;
-                        }
-                    }
-                    if let Ok(t) = pipe.finish() {
-                        send(t, &counts);
-                    }
-                    hub.end();
-                    counts.running.store(false, Ordering::Release);
-                })
-                .map_err(|e| fail(e.to_string()))?
-        };
-        tracing::info!(
-            ?codec,
-            kbps = video.bitrate_kbps,
-            recording = record.is_some(),
-            "the Studio uses Ferrocast's own encoder"
-        );
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-            counts,
-            health,
-            stop_push,
-            runtime,
-            feed: Some(feed),
-            drawn: None,
-            hub: None,
-        })
-    }
-
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(shared: Arc<Shared>, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
@@ -707,34 +505,14 @@ impl OwnStream {
             health,
             stop_push,
             runtime,
-            feed: None,
             drawn: Some(Drawn {
                 shared,
                 output,
                 plan: None,
-                vertical: vertical.then(|| vertical_on_air(doc)),
                 solo: solo.map(String::from),
             }),
             hub: Some(hub),
         })
-    }
-
-    /// Keeps a drawn output with the Studio (the shared engine follows the collection; the
-    /// vertical picture follows its own scene on air). Returns whether the collection was
-    /// opened again. Nothing for an output libobs draws.
-    pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
-        let Some(d) = self.drawn.as_mut() else { return false };
-        // The vertical picture follows its own scene on air (a cut).
-        if let Some(shown) = d.vertical.as_mut() {
-            let now = vertical_on_air(doc);
-            if now != *shown {
-                if let Err(e) = d.shared.engine.set_output_scene(d.output, now.clone()) {
-                    tracing::warn!("Ferrocast's own engine couldn't follow the vertical scene: {e}");
-                }
-                *shown = now;
-            }
-        }
-        d.shared.follow(doc)
     }
 
     /// A new video bitrate while live (the stream doctor's lighter one, a manual change).
@@ -822,11 +600,6 @@ impl OwnStream {
             || (plan.split_mb > 0 && bytes >= u64::from(plan.split_mb) * 1024 * 1024)
     }
 
-    /// Whether our engine draws this (not libobs).
-    pub(crate) fn is_drawn(&self) -> bool {
-        self.drawn.is_some()
-    }
-
     /// What our engine couldn't bring over (empty when libobs draws).
     pub(crate) fn skipped(&self) -> Vec<String> {
         self.drawn.as_ref().map(|d| d.shared.skipped()).unwrap_or_default()
@@ -849,7 +622,7 @@ impl OwnStream {
             reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
             bytes: self.counts.bytes.load(Ordering::Relaxed),
             frames: self.counts.frames.load(Ordering::Relaxed),
-            dropped: self.feed.as_ref().map_or(0, |f| f.dropped()).min(u64::from(u32::MAX)) as u32,
+            dropped: 0,
         }
     }
 
@@ -915,8 +688,7 @@ impl Drop for OwnStream {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        // libobs stops handing frames over; our engine closes its output (encoders flushed).
-        self.feed = None;
+        // Our engine closes its output (encoders flushed).
         if let Some(d) = self.drawn.take() {
             if let Err(e) = d.shared.engine.stop_output(d.output) {
                 tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
@@ -957,15 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn a_drawn_stream_follows_the_studios_transition() {
-        let doc = serde_json::json!({
-            "current_transition": "Swoosh",
-            "transition_duration": 700,
-            "transitions": [{ "name": "Swoosh", "id": "cut_transition" }],
-        });
-        assert_eq!(transition_of(&doc), (TransitionKind::Cut, 0));
-        let fade = serde_json::json!({ "current_transition": "Fade", "transition_duration": 500 });
-        assert_eq!(transition_of(&fade), (TransitionKind::Fade, 500));
+    fn transitions_map_and_scene_changes_dont_reopen() {
+        assert_eq!(transition_kind("cut_transition", 700), (TransitionKind::Cut, 0));
+        assert_eq!(transition_kind("fade_transition", 500), (TransitionKind::Fade, 500));
+        assert_eq!(transition_kind("ferrocast_move", 400), (TransitionKind::Move, 400));
         // Only which scene is on air changed: not a reopen.
         let a = serde_json::json!({ "current_program_scene": "A", "current_scene": "A", "sources": [1] });
         let b = serde_json::json!({ "current_program_scene": "B", "current_scene": "B", "sources": [1] });

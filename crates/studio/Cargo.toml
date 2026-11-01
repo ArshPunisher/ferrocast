@@ -1,6 +1,6 @@
 [package]
 name = "ferrocast-studio"
-description = "The Studio's engine: OBS's libobs and its plugins, loaded at runtime."
+description = "The Studio: scene collections (OBS's format) drawn, mixed and sent by Ferrocast's own engine."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,20 +9,19 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Streaming through Ferrocast's own encoders (the "own encoder" switch, ENGINE.md E1).
+# Ferrocast's own engine: drawing, mixing, encoding and sending.
 ferrocast-av.workspace = true
 ferrocast-golive.workspace = true
 tokio.workspace = true
-libloading = "0.8"
 raw-window-handle = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 png = "0.17"
-# Recording names from OBS's pattern (%CCYY-%MM-%DD…) in local time, with no libobs.
+# Recording names from OBS's pattern (%CCYY-%MM-%DD…) in local time.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Free disk space and the app's own CPU and memory use, with no libobs.
+# Free disk space and the app's own CPU and memory use.
 sysinfo = { version = "0.37", default-features = false, features = ["disk", "system"] }
 # Scene pictures as data URLs (the Scenes grid), on every platform.
 base64 = "0.23"
@@ -82,22 +81,16 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
-# The engine_match and own_stream examples: our own engine beside libobs.
-bytes = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
 # The guest example: a browser's camera over WebRTC into the Studio.
 ferrocast-guest.workspace = true
 # The vod_track example's little RTMP server (as Go live's tests use).
 rml_rtmp = "0.8"
-# The examples print libobs's own log (FERROCAST_LOG=info).
+# The examples print their log (FERROCAST_LOG=info).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# The workspace forbids unsafe code. Calling libobs needs it, so here it is denied instead and
-# allowed in src/ffi.rs only, each block with its SAFETY reason (LESSONS R-73).
-[[example]]
-name = "denoise"
-required-features = ["deepfilter"]
-
+# The workspace forbids unsafe code. Native calls (AppKit, WebKit, Speech, Vision, Win32) need
+# it, so here it is denied instead and allowed in src/ffi.rs and segment.rs only, each block
+# with its SAFETY reason (LESSONS R-73).
 [lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"

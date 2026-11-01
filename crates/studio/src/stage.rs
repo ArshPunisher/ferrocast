@@ -1956,7 +1956,7 @@ impl Stage {
                     })
                     .map_err(|e| fail(format!("Captions couldn't start: {e}")))?
             };
-            Ok(crate::Captions { listener, _studio: None, pump: Some((stop, thread)) })
+            Ok(crate::Captions { listener, pump: Some((stop, thread)) })
         }
         #[cfg(not(target_os = "macos"))]
         {

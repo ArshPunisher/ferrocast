@@ -4,7 +4,6 @@
 //! the next takes over, as Apple's requests are meant to be short.
 
 use std::cell::RefCell;
-use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -20,7 +19,6 @@ use objc2_speech::{
     SFSpeechRecognitionTaskHint, SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
 };
 
-use super::{Api, AudioData, ObsSource};
 
 /// How long one recognition runs before the next takes over.
 const TURN_SECS: u64 = 50;
@@ -68,16 +66,13 @@ struct Feed {
 // and format are only touched under the Mutex.
 unsafe impl Send for Feed {}
 
-/// What's handed to libobs's audio callback.
+/// What the Feeder hands sound to.
 struct Tap {
     feed: Mutex<Feed>,
 }
 
 /// A running caption recognizer for one source. Dropping it stops listening.
 pub struct Listener {
-    /// The Studio's libobs and the source it listens to, when libobs feeds it (its owner,
-    /// `crate::Captions`, keeps the Studio alive longer); None when fed by `Feeder`.
-    from: Option<(*const Api, *mut ObsSource)>,
     tap: Arc<Tap>,
     /// Only ever used on the main thread (macOS calls the handlers there).
     turn: Rc<RefCell<Turn>>,
@@ -111,23 +106,6 @@ pub enum Unavailable {
 }
 
 impl Listener {
-    /// Starts listening to `source` (its audio after its filters), at `rate` Hz. `on_text`
-    /// gets the words heard so far in this sentence, and true when it's finished. Called on
-    /// the main thread.
-    pub fn start(
-        api: &Api,
-        source: *mut ObsSource,
-        rate: u32,
-        on_text: impl Fn(String, bool) + 'static,
-    ) -> Result<Listener, Unavailable> {
-        let mut l = Self::start_fed(rate, on_text)?.0;
-        let param = Arc::as_ptr(&l.tap) as *mut c_void;
-        api.obs_source_add_audio_capture_callback(source, take_audio, param);
-        api.obs_source_get_ref(source);
-        l.from = Some((api as *const Api, source));
-        Ok(l)
-    }
-
     /// Starts listening to mono sound at `rate` Hz handed to the returned `Feeder` (from any
     /// thread): Ferrocast's own engine's tap. Called on the main thread.
     pub fn start_fed(rate: u32, on_text: impl Fn(String, bool) + 'static) -> Result<(Listener, Feeder), Unavailable> {
@@ -161,7 +139,7 @@ impl Listener {
         }));
         begin(&tap, &turn);
         let feeder = Feeder(tap.clone());
-        Ok((Listener { from: None, tap, turn }, feeder))
+        Ok((Listener { tap, turn }, feeder))
     }
 
     /// False once recognition kept failing and stopped.
@@ -172,13 +150,6 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Some((api, source)) = self.from {
-            // SAFETY: the owner keeps the Studio, and so this Api, alive until after this drop.
-            let api = unsafe { &*api };
-            let param = Arc::as_ptr(&self.tap) as *mut c_void;
-            api.obs_source_remove_audio_capture_callback(source, take_audio, param);
-            api.obs_source_release(source);
-        }
         if let Ok(mut f) = self.tap.feed.lock()
             && let Some(r) = f.request.take()
         {
@@ -298,22 +269,4 @@ fn append(tap: &Tap, samples: &[f32]) {
         std::ptr::copy_nonoverlapping(samples.as_ptr(), (*chans).as_ptr(), samples.len());
         request.appendAudioPCMBuffer(&buf);
     }
-}
-
-/// libobs's audio capture callback: the first channel of each chunk (float planar, the
-/// Studio's rate) appended to the current request.
-unsafe extern "C" fn take_audio(param: *mut c_void, _src: *mut ObsSource, audio: *const AudioData, muted: bool) {
-    if param.is_null() || audio.is_null() || muted {
-        return;
-    }
-    // SAFETY: `param` is the Tap the Listener keeps alive until it removes this callback;
-    // `audio` is valid for the call, its first plane `frames` floats long.
-    let (tap, audio) = unsafe { (&*(param as *const Tap), &*audio) };
-    let plane = audio.data[0];
-    if plane.is_null() || audio.frames == 0 {
-        return;
-    }
-    // SAFETY: plane 0 holds `frames` floats for the call.
-    let samples = unsafe { std::slice::from_raw_parts(plane as *const f32, audio.frames as usize) };
-    append(tap, samples);
 }
