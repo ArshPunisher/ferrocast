@@ -71,6 +71,15 @@ pub fn audio_tag(frame: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An extra AAC track's tag (Enhanced RTMP multitrack audio, as OBS sends Twitch's VOD
+/// track): `header` for its AudioSpecificConfig, else one frame; `track` is 1 or more.
+pub fn audio_track_tag(track: u8, header: bool, data: &[u8]) -> Vec<u8> {
+    // ExHeader (9) with MultiTrack (5); one track, sequence start (0) or coded frames (1).
+    let mut out = vec![0x95, if header { 0 } else { 1 }, b'm', b'p', b'4', b'a', track];
+    out.extend_from_slice(data);
+    out
+}
+
 /// A whole FLV file: its header, then each tag with its size after it. For recordings and tests;
 /// streams send the tag bodies over RTMP.
 #[derive(Debug, Default)]

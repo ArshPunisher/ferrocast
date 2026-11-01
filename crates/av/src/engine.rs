@@ -944,13 +944,17 @@ impl Engine {
             fps_den: 1,
             ..video
         };
-        // Extra tracks only mean something in a file (a recording, or a saved replay).
+        // Extra tracks go in a file (a recording, or a saved replay), or with a stream as its
+        // further tracks (Twitch's VOD track).
         let replay = match &kind {
             OutputKind::Replay { seconds, mb } => Some((*seconds, *mb)),
             _ => None,
         };
-        let more = if record.is_some() || replay.is_some() { canvas.more_tracks.len() } else { 0 };
+        let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
+        if matches!(kind, OutputKind::Stream(_)) {
+            pipe.stream_extra_tracks();
+        }
         if let Some((seconds, mb)) = replay {
             pipe.keep_replay(seconds, mb);
         }
@@ -1721,8 +1725,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                         Err(e) => failed = Some(e.to_string()),
                     }
                     for (i, t) in canvas.more_tracks.iter().enumerate() {
-                        if let Err(e) = pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
-                            failed = Some(e.to_string());
+                        match pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
+                            Ok(t) => tags.extend(t),
+                            Err(e) => failed = Some(e.to_string()),
                         }
                     }
                 }

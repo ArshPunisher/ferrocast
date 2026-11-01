@@ -46,6 +46,9 @@ pub struct Pipeline {
     split_to: Option<(File, bool)>,
     /// The replay buffer's memory, when this output is one.
     replay: Option<Replay>,
+    /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
+    stream_extra: bool,
+    sent_extra_headers: Vec<bool>,
 }
 
 /// The last seconds of encoded picture and sound, kept from a keyframe on (OBS's replay buffer).
@@ -243,6 +246,8 @@ impl Pipeline {
             key_next: false,
             split_to: None,
             replay: None,
+            stream_extra: false,
+            sent_extra_headers: Vec::new(),
         })
     }
 
@@ -390,11 +395,11 @@ impl Pipeline {
 
     /// Sound for extra track `i` (0 is the recording's second track), as `audio` takes it.
     /// Recorded only: the stream carries the first track.
-    pub fn audio_extra(&mut self, i: usize, pcm: &[f32], ts_ns: u64) -> Result<(), AvError> {
+    pub fn audio_extra(&mut self, i: usize, pcm: &[f32], ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         if self.paused_at.is_some() || i >= self.extra.len() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let Some(start) = self.start_ns else { return Ok(()) };
+        let Some(start) = self.start_ns else { return Ok(Vec::new()) };
         let (enc, offset) = &mut self.extra[i];
         let mut pcm = pcm;
         if offset.is_none() {
@@ -403,7 +408,7 @@ impl Pipeline {
                 let rate = u64::from(enc.config().sample_rate);
                 let skip = ((start - ts_ns) * rate / 1_000_000_000 * ch) as usize;
                 if skip >= pcm.len() {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 *offset = Some(0);
                 pcm = &pcm[skip..];
@@ -412,11 +417,40 @@ impl Pipeline {
             }
         }
         let offset = offset.unwrap_or(0);
-        for mut p in enc.encode(pcm)? {
+        let packets = enc.encode(pcm)?;
+        let mut tags = Vec::new();
+        for mut p in packets {
             p.pts_us += offset;
+            tags.extend(self.extra_tag(i, &p));
             self.record_audio(i + 1, p);
         }
-        Ok(())
+        Ok(tags)
+    }
+
+    /// Makes a stream send its extra sound tracks too (track ids 1, 2… after the main one),
+    /// as OBS sends Twitch's VOD track.
+    pub fn stream_extra_tracks(&mut self) {
+        self.stream_extra = true;
+        self.sent_extra_headers = vec![false; self.extra.len()];
+    }
+
+    /// An extra track's packet as stream tags (its header first), when streamed.
+    fn extra_tag(&mut self, i: usize, p: &AudioPacket) -> Vec<Tag> {
+        if !self.stream_extra {
+            return Vec::new();
+        }
+        let track = u8::try_from(i + 1).unwrap_or(u8::MAX);
+        let mut tags = Vec::new();
+        if let Some(sent) = self.sent_extra_headers.get_mut(i)
+            && !*sent
+        {
+            *sent = true;
+            let header = self.extra[i].0.header();
+            tags.push(Tag::Audio { ms: 0, body: flv::audio_track_tag(track, true, &header) });
+        }
+        let ms = (p.pts_us.max(0) / 1000) as u32;
+        tags.push(Tag::Audio { ms, body: flv::audio_track_tag(track, false, &p.data) });
+        tags
     }
 
     /// Ends: what's still in the encoder is sent, and the recording closed.
@@ -433,6 +467,7 @@ impl Pipeline {
             let offset = self.extra[i].1.unwrap_or(0);
             for mut p in self.extra[i].0.flush()? {
                 p.pts_us += offset;
+                tags.extend(self.extra_tag(i, &p));
                 self.record_audio(i + 1, p);
             }
         }
