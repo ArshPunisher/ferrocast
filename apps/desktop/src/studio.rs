@@ -12,9 +12,14 @@ use ferrocast_engine::studio_host::{
     CaptionsSet, FilePick, FilterEdit, FollowSet, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq,
     STOPPED, ShelfAct, StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
+// The Studio's scenes kept by Ferrocast's own engine (ENGINE.md step 3): no libobs.
+use ferrocast_studio::stage::Stage as Collection;
+use ferrocast_studio::stage::StageOutput as Streaming;
+use ferrocast_studio::stage::StageOutput as Recording;
+use ferrocast_studio::stage::StageView as Preview;
 use ferrocast_studio::{
-    AudioSetup, Canvas, Collection, EncodeSettings, ItemEdit, Monitor, Paths, Preview, Projector, ProjectorOf,
-    Recording, Rect, StreamSettings, Streaming, Studio, StudioOptions, TransitionInfo,
+    AudioSetup, Canvas, EncodeSettings, ItemEdit, Monitor, Paths, Projector, ProjectorOf, Rect, StreamSettings, Studio,
+    StudioOptions, TransitionInfo,
 };
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -47,7 +52,7 @@ struct Held {
     source_records: Vec<(String, Recording, PathBuf)>,
     /// Guests here now (crates/guest): their name, their source, their connection.
     guests: Vec<(String, String, ferrocast_guest::Guest)>,
-    replay: Option<ferrocast_studio::ReplayBuffer>,
+    replay: Option<ferrocast_studio::stage::StageOutput>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
     settings: Option<StudioSettings>,
     renderer: &'static str,
@@ -375,13 +380,13 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     }
     // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
     let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
-        Some(Ok(d)) => Collection::load(&studio, &d, FIRST_SCENE),
+        Some(Ok(d)) => Collection::load(studio.canvas(), &d, FIRST_SCENE),
         Some(Err(e)) => {
             tracing::warn!(error = %e, file = %to.display(), "a scene collection didn't read; kept aside");
             let _ = std::fs::rename(to, to.with_extension("json.unreadable"));
-            Collection::new(&studio, FIRST_SCENE)
+            Collection::new(studio.canvas(), FIRST_SCENE)
         }
-        None => Collection::new(&studio, FIRST_SCENE),
+        None => Collection::new(studio.canvas(), FIRST_SCENE),
     };
     match made {
         Ok(c) => {
@@ -394,7 +399,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
         }
         Err(e) => {
             if let Some(old) = old {
-                h.collection = Collection::load(&studio, &old, FIRST_SCENE).ok();
+                h.collection = Collection::load(studio.canvas(), &old, FIRST_SCENE).ok();
             }
             sync_views(h);
             Err(format!("That scene collection didn't load: {e}"))
@@ -1369,13 +1374,13 @@ impl StudioHost for DesktopStudio {
             // kept aside (never overwritten) and the Studio starts fresh.
             let saved = std::fs::read(&file).ok().map(|b| serde_json::from_slice::<Value>(&b));
             let collection = match saved {
-                Some(Ok(doc)) => Collection::load(studio, &doc, FIRST_SCENE),
+                Some(Ok(doc)) => Collection::load(studio.canvas(), &doc, FIRST_SCENE),
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "the Studio's scenes didn't read; starting with a new set");
                     let _ = std::fs::rename(&file, file.with_extension("json.unreadable"));
-                    Collection::new(studio, FIRST_SCENE)
+                    Collection::new(studio.canvas(), FIRST_SCENE)
                 }
-                None => Collection::new(studio, FIRST_SCENE),
+                None => Collection::new(studio.canvas(), FIRST_SCENE),
             }
             .map_err(|e| e.to_string())?;
             save(&collection, &file);
@@ -1423,20 +1428,14 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn kinds(&self) -> Result<Value, String> {
-        self.on_main(|h| {
-            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
-            serde_json::to_value(s.kinds()).map_err(|e| e.to_string())
-        })
-        .await?
+        // The kinds Ferrocast's own engine runs.
+        serde_json::to_value(ferrocast_studio::kinds::kinds()).map_err(|e| e.to_string())
     }
 
     async fn options(&self, kind: String) -> Result<Value, String> {
-        self.on_main(move |h| {
-            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
-            let opts = s.options(&kind).map_err(|e| e.to_string())?;
-            serde_json::to_value(opts).map_err(|e| e.to_string())
-        })
-        .await?
+        let opts = ferrocast_studio::kinds::options(&kind)
+            .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))?;
+        serde_json::to_value(opts).map_err(|e| e.to_string())
     }
 
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
@@ -1553,11 +1552,8 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn defaults(&self, kind: String) -> Result<Value, String> {
-        self.on_main(move |h| {
-            let s = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
-            s.defaults(&kind).map_err(|e| e.to_string())
-        })
-        .await?
+        ferrocast_studio::kinds::defaults(&kind)
+            .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))
     }
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
@@ -2687,7 +2683,8 @@ impl StudioHost for DesktopStudio {
             settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
             settings.vod_track = None;
             tracing::info!(kbps = settings.encode.video_kbps, "the Studio's lighter stream starts into Go live");
-            h.lstream = Some(studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?);
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            h.lstream = Some(c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?);
             Ok(())
         })
         .await?

@@ -2,14 +2,16 @@
 //! Transform, show and hide, lock, order, fit, flips and turns, blending and scaling, adding,
 //! duplicating and removing. Scenes: adding, copying, removing, reordering, renaming and their
 //! own transition. Filters (every change), a source's settings, and its sound (volume, mute,
-//! monitoring, balance, sync, mono, tracks). Each step remembers things as they were (a removed
-//! source or scene is held, so it can come back); undoing one remembers them as they are, for
-//! redo.
+//! monitoring, balance, sync, mono, tracks).
+//!
+//! Each step keeps the whole collection as it was before and after (the scene store hands it
+//! over as one document), so undoing and redoing put back exactly what was there: a removed
+//! source or scene with everything it had, ids and all.
 
 use std::time::{Duration, Instant};
 
 use ferrocast_engine::studio_host::{ItemEdit as Edit, StudioAct};
-use ferrocast_studio::{AudioSnap, Collection, FilterSnap, ItemEdit, ItemSnap, SceneSnap, TransitionInfo};
+use ferrocast_studio::stage::Stage as Collection;
 use serde_json::Value;
 
 /// Steps kept each way.
@@ -20,43 +22,11 @@ const MERGE: Duration = Duration::from_secs(3);
 const NUDGES: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
-// The history keeps a few dozen steps, so an item snapshot inline costs nothing worth boxing.
-#[allow(clippy::large_enum_variant)]
-enum Change {
-    /// Put this item back as it was.
-    Item(ItemSnap),
-    /// This item wasn't there: take it out.
-    Gone { scene: String, id: i64 },
-    /// Bring this removed scene back.
-    SceneBack(SceneSnap),
-    /// This scene wasn't there: take it out.
-    SceneGone(String),
-    /// Put this scene back at this place in the list.
-    SceneAt(String, usize),
-    /// Rename the first back to the second.
-    Rename(String, String),
-    /// Put this source's filters back.
-    Filters(FilterSnap),
-    /// Put this source's settings back.
-    Settings(String, Value),
-    /// Put this sound's mixer settings back.
-    Audio(AudioSnap),
-    /// Give this scene back its own transition (or none).
-    SceneTransition(String, Option<TransitionInfo>),
-    /// Put this source's deinterlacing back (mode, top field first).
-    Deinterlace(String, String, bool),
-    /// Put this item back at this place among its neighbours (from the top).
-    Order { scene: String, id: i64, at: usize },
-    /// Take this group apart (its sources stay where they are).
-    Ungroup { scene: String, id: i64 },
-    /// Group these sources of the scene again under this name.
-    Regroup { scene: String, name: String, sources: Vec<String> },
-}
-
-#[derive(Debug)]
 struct Step {
     label: String,
-    changes: Vec<Change>,
+    /// The collection before the step and after it.
+    before: Value,
+    after: Value,
     /// What a following act of the same kind on the same item joins ("box", "transform").
     key: Option<(&'static str, String, i64)>,
     at: Instant,
@@ -68,14 +38,10 @@ struct Step {
 #[derive(Debug)]
 pub struct Before {
     label: String,
-    changes: Vec<Change>,
+    doc: Value,
     key: Option<(&'static str, String, i64)>,
     /// Joins the newest step instead of making one.
     join: bool,
-    /// The scene and its item ids before an act that adds items.
-    added: Option<(String, Vec<i64>)>,
-    /// The scene an act grouped sources in (undone by taking the new group apart).
-    grouped: Option<String>,
     /// The drag ends with this act.
     closes: bool,
     open: bool,
@@ -120,153 +86,78 @@ fn verb(e: &Edit) -> &'static str {
     }
 }
 
+/// An item's source name, for a step's label.
+fn item_name(c: &Collection, scene: &str, id: i64) -> Option<String> {
+    c.items(scene).ok()?.into_iter().find(|i| i.id == id).map(|i| i.name)
+}
+
 impl History {
     /// What to remember before `act` runs, or None for acts that aren't undone.
     pub fn before(&mut self, c: &Collection, act: &StudioAct) -> Option<Before> {
-        let fresh = |label: String, changes, key, open| Before {
-            label,
-            changes,
-            key,
-            join: false,
-            added: None,
-            grouped: None,
-            closes: false,
-            open,
-        };
+        let fresh =
+            |label: String, key, open| Before { label, doc: c.snapshot(), key, join: false, closes: false, open };
+        let joined =
+            |closes| Before { label: String::new(), doc: Value::Null, key: None, join: true, closes, open: false };
         match act {
-            StudioAct::EditItem { scene, id, edit: Edit::Duplicate } => {
-                let snap = c.snap(scene, *id).ok()?;
-                Some(Before {
-                    added: Some((scene.clone(), c.item_ids(scene).ok()?)),
-                    ..fresh(format!("Duplicate {}", snap.name), Vec::new(), None, false)
-                })
-            }
             StudioAct::EditItem { scene, id, edit } => {
-                let snap = c.snap(scene, *id).ok()?;
-                Some(fresh(format!("{} {}", verb(edit), snap.name), vec![Change::Item(snap)], None, false))
+                Some(fresh(format!("{} {}", verb(edit), item_name(c, scene, *id)?), None, false))
             }
             StudioAct::ItemOrder { scene, id, .. } => {
-                // Its place, not a snapshot: a source in a group can be reordered too.
-                let (at, name) = c.item_place(scene, *id).ok()?;
-                Some(fresh(
-                    format!("Reorder {name}"),
-                    vec![Change::Order { scene: scene.clone(), id: *id, at }],
-                    None,
-                    false,
-                ))
+                Some(fresh(format!("Reorder {}", item_name(c, scene, *id)?), None, false))
             }
             StudioAct::SetItemBox { scene, id, save, .. } => {
                 let key = ("box", scene.clone(), *id);
                 // A drag's moves, or nudges with the arrow keys in a row, are one step.
                 if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
                 {
-                    return Some(Before { join: true, closes: *save, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(*save));
                 }
-                let snap = c.snap(scene, *id).ok()?;
-                Some(fresh(format!("Move {}", snap.name), vec![Change::Item(snap)], Some(key), !*save))
+                Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
             }
             StudioAct::SetItemCrop { scene, id, save, .. } => {
                 let key = ("crop", scene.clone(), *id);
                 // A drag's crops are one step.
                 if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.open) {
-                    return Some(Before { join: true, closes: *save, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(*save));
                 }
-                let snap = c.snap(scene, *id).ok()?;
-                Some(fresh(format!("Crop {}", snap.name), vec![Change::Item(snap)], Some(key), !*save))
+                Some(fresh(format!("Crop {}", item_name(c, scene, *id)?), Some(key), !*save))
             }
             StudioAct::SetTransform { scene, id, .. } => {
                 let key = ("transform", scene.clone(), *id);
                 if self.joins(&key) {
-                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(false));
                 }
-                let snap = c.snap(scene, *id).ok()?;
-                Some(fresh(format!("Transform {}", snap.name), vec![Change::Item(snap)], Some(key), false))
+                Some(fresh(format!("Transform {}", item_name(c, scene, *id)?), Some(key), false))
             }
-            StudioAct::AddSource { scene, source, .. } => Some(Before {
-                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
-                ..fresh(format!("Add {}", source.name), Vec::new(), None, false)
-            }),
-            StudioAct::AddGroup { scene, name } => Some(Before {
-                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
-                ..fresh(format!("Add group {name}"), Vec::new(), None, false)
-            }),
-            StudioAct::GroupItems { scene, name, .. } => Some(Before {
-                grouped: Some(scene.clone()),
-                ..fresh(format!("Group into {name}"), Vec::new(), None, false)
-            }),
-            StudioAct::PasteCopy { scene, name } => Some(Before {
-                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
-                ..fresh(format!("Paste a copy of {name}"), Vec::new(), None, false)
-            }),
-            StudioAct::AddExisting { scene, name } => Some(Before {
-                added: Some((scene.clone(), c.item_ids(scene).ok()?)),
-                ..fresh(format!("Add {name}"), Vec::new(), None, false)
-            }),
+            StudioAct::AddSource { source, .. } => Some(fresh(format!("Add {}", source.name), None, false)),
+            StudioAct::AddGroup { name, .. } => Some(fresh(format!("Add group {name}"), None, false)),
+            StudioAct::GroupItems { name, .. } => Some(fresh(format!("Group into {name}"), None, false)),
+            StudioAct::PasteCopy { name, .. } => Some(fresh(format!("Paste a copy of {name}"), None, false)),
+            StudioAct::AddExisting { name, .. } => Some(fresh(format!("Add {name}"), None, false)),
             StudioAct::SetItemTransition { scene, id, show, .. } => {
-                let snap = c.snap(scene, *id).ok()?;
                 let what = if *show { "Show" } else { "Hide" };
-                Some(fresh(format!("{what} transition of {}", snap.name), vec![Change::Item(snap)], None, false))
+                Some(fresh(format!("{what} transition of {}", item_name(c, scene, *id)?), None, false))
             }
-            StudioAct::SetDeinterlace { name, .. } => {
-                let (mode, top) = c.deinterlace_of(name).ok()?;
-                Some(fresh(
-                    format!("Deinterlacing of {name}"),
-                    vec![Change::Deinterlace(name.clone(), mode, top)],
-                    None,
-                    false,
-                ))
+            StudioAct::SetDeinterlace { name, .. } => Some(fresh(format!("Deinterlacing of {name}"), None, false)),
+            StudioAct::ReplaceFile { source, .. } if !source.is_empty() => {
+                Some(fresh(format!("Replace a file of {source}"), None, false))
             }
-            // A source's own file: its settings come back; a filter's: the source's filters.
-            StudioAct::ReplaceFile { source, parent, .. } if !source.is_empty() => match parent {
-                Some(p) => self.filters(c, p, format!("Replace a file of {source}"), None),
-                None => {
-                    let was = c.snap_settings(source).ok()?;
-                    Some(fresh(
-                        format!("Replace a file of {source}"),
-                        vec![Change::Settings(source.clone(), was)],
-                        None,
-                        false,
-                    ))
-                }
-            },
-            StudioAct::AddScene { name, .. } => {
-                Some(fresh(format!("Add scene {name}"), vec![Change::SceneGone(name.clone())], None, false))
-            }
-            StudioAct::DuplicateScene { scene, name } => {
-                Some(fresh(format!("Copy scene {scene}"), vec![Change::SceneGone(name.clone())], None, false))
-            }
-            StudioAct::RemoveScene { scene } => {
-                let snap = c.snap_scene(scene).ok()?;
-                Some(fresh(format!("Remove scene {scene}"), vec![Change::SceneBack(snap)], None, false))
-            }
-            StudioAct::MoveScene { scene, .. } => {
-                let at = c.scene_index(scene).ok()?;
-                Some(fresh(format!("Reorder {scene}"), vec![Change::SceneAt(scene.clone(), at)], None, false))
-            }
+            StudioAct::AddScene { name, .. } => Some(fresh(format!("Add scene {name}"), None, false)),
+            StudioAct::DuplicateScene { scene, .. } => Some(fresh(format!("Copy scene {scene}"), None, false)),
+            StudioAct::RemoveScene { scene } => Some(fresh(format!("Remove scene {scene}"), None, false)),
+            StudioAct::MoveScene { scene, .. } => Some(fresh(format!("Reorder {scene}"), None, false)),
             StudioAct::Rename { name, new_name } if name != new_name => {
-                Some(fresh(format!("Rename {name}"), vec![Change::Rename(new_name.clone(), name.clone())], None, false))
+                Some(fresh(format!("Rename {name}"), None, false))
             }
             StudioAct::SetSceneTransition { scene, .. } => {
-                let t = c.scene_transition_of(scene).ok()?;
-                Some(fresh(
-                    format!("Change transition of {scene}"),
-                    vec![Change::SceneTransition(scene.clone(), t)],
-                    None,
-                    false,
-                ))
+                Some(fresh(format!("Change transition of {scene}"), None, false))
             }
             StudioAct::Update { name, .. } => {
                 let key = ("settings", name.clone(), 0);
                 if self.joins(&key) {
-                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(false));
                 }
-                let was = c.snap_settings(name).ok()?;
-                Some(fresh(
-                    format!("Change settings of {name}"),
-                    vec![Change::Settings(name.clone(), was)],
-                    Some(key),
-                    false,
-                ))
+                Some(fresh(format!("Change settings of {name}"), Some(key), false))
             }
             // Shortcuts (mute, push-to-talk) aren't undo steps, as in OBS.
             StudioAct::SetAudio { change, .. } if change.by_shortcut => None,
@@ -275,7 +166,7 @@ impl History {
                 // A volume or balance slider's moves are one step.
                 let slide = change.volume_db.is_some() || change.balance.is_some() || change.sync_ms.is_some();
                 if slide && self.joins(&key) {
-                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(false));
                 }
                 let label = match (change.muted, change.mono) {
                     (Some(true), _) => format!("Mute {name}"),
@@ -287,23 +178,20 @@ impl History {
                     _ if change.sync_ms.is_some() => format!("Change sync of {name}"),
                     _ => format!("Change volume of {name}"),
                 };
-                let snap = c.snap_audio(name).ok()?;
-                Some(fresh(label, vec![Change::Audio(snap)], slide.then_some(key), false))
+                Some(fresh(label, slide.then_some(key), false))
             }
-            StudioAct::AddFilter { name, filter } => self.filters(c, name, format!("Add filter {}", filter.name), None),
-            StudioAct::RemoveFilter { name, filter } => self.filters(c, name, format!("Remove filter {filter}"), None),
-            StudioAct::EditFilter { name, filter, .. } => {
-                self.filters(c, name, format!("Change filter {filter}"), None)
-            }
+            StudioAct::AddFilter { filter, .. } => Some(fresh(format!("Add filter {}", filter.name), None, false)),
+            StudioAct::RemoveFilter { filter, .. } => Some(fresh(format!("Remove filter {filter}"), None, false)),
+            StudioAct::EditFilter { filter, .. } => Some(fresh(format!("Change filter {filter}"), None, false)),
             StudioAct::PasteFilters { name, from } => {
-                self.filters(c, name, format!("Paste filters from {from} to {name}"), None)
+                Some(fresh(format!("Paste filters from {from} to {name}"), None, false))
             }
             StudioAct::UpdateFilter { name, filter, .. } => {
                 let key = ("filter", format!("{name}\n{filter}"), 0);
                 if self.joins(&key) {
-                    return Some(Before { join: true, ..fresh(String::new(), Vec::new(), None, false) });
+                    return Some(joined(false));
                 }
-                self.filters(c, name, format!("Change filter {filter}"), Some(key))
+                Some(fresh(format!("Change filter {filter}"), Some(key), false))
             }
             _ => None,
         }
@@ -314,120 +202,56 @@ impl History {
         self.undo.last().is_some_and(|s| s.key.as_ref() == Some(key) && s.at.elapsed() < MERGE)
     }
 
-    fn filters(
-        &self,
-        c: &Collection,
-        name: &str,
-        label: String,
-        key: Option<(&'static str, String, i64)>,
-    ) -> Option<Before> {
-        let snap = c.snap_filters(name).ok()?;
-        Some(Before {
-            label,
-            changes: vec![Change::Filters(snap)],
-            key,
-            join: false,
-            added: None,
-            grouped: None,
-            closes: false,
-            open: false,
-        })
-    }
-
-    /// Records the step once the act ran (nothing if it failed).
+    /// Records the step once the act ran (nothing if it failed or changed nothing).
     pub fn after<E>(&mut self, c: &Collection, b: Before, out: &Result<Value, E>) {
         if out.is_err() {
             return;
         }
-        self.redo.clear();
+        let now = c.snapshot();
         if b.join {
             if let Some(top) = self.undo.last_mut() {
                 top.at = Instant::now();
+                top.after = now;
                 if b.closes {
                     top.open = false;
                 }
             }
+            self.redo.clear();
             return;
         }
-        let mut changes = b.changes;
-        if let (Some(scene), Ok(v)) = (b.grouped, out)
-            && let Some(id) = v.get("id").and_then(Value::as_i64)
-        {
-            changes.push(Change::Ungroup { scene, id });
-        }
-        if let Some((scene, before)) = b.added {
-            let now = c.item_ids(&scene).unwrap_or_default();
-            changes.extend(
-                now.into_iter().filter(|id| !before.contains(id)).map(|id| Change::Gone { scene: scene.clone(), id }),
-            );
-        }
-        if changes.is_empty() {
+        if now == b.doc {
             return;
         }
-        self.undo.push(Step { label: b.label, changes, key: b.key, at: Instant::now(), open: b.open });
+        self.redo.clear();
+        self.undo.push(Step {
+            label: b.label,
+            before: b.doc,
+            after: now,
+            key: b.key,
+            at: Instant::now(),
+            open: b.open,
+        });
         if self.undo.len() > KEEP {
             self.undo.remove(0);
         }
     }
 
-    /// Undoes the newest step → its label. Err when it can't be (its scene is gone); the step
-    /// is dropped then.
+    /// Undoes the newest step → its label.
     pub fn undo(&mut self, c: &Collection) -> Result<Option<String>, String> {
-        self.step(c, true)
+        let Some(mut step) = self.undo.pop() else { return Ok(None) };
+        c.restore_all(&step.before);
+        step.key = None;
+        step.open = false;
+        let label = step.label.clone();
+        self.redo.push(step);
+        Ok(Some(label))
     }
 
     pub fn redo(&mut self, c: &Collection) -> Result<Option<String>, String> {
-        self.step(c, false)
-    }
-
-    fn step(&mut self, c: &Collection, back: bool) -> Result<Option<String>, String> {
-        let popped = if back { self.undo.pop() } else { self.redo.pop() };
-        let Some(step) = popped else { return Ok(None) };
-        let mut inverse = Vec::new();
-        let mut moved: Vec<Remap> = Vec::new();
-        for change in step.changes.into_iter().rev() {
-            match apply(c, change) {
-                Ok((inv, remap)) => {
-                    inverse.push(inv);
-                    moved.extend(remap);
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "\"{}\" can't be {} any more: {e}",
-                        step.label,
-                        if back { "undone" } else { "redone" }
-                    ));
-                }
-            }
-        }
-        // A source that came back has a new id: later steps follow it.
-        for (scene, old, new) in &moved {
-            for s in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-                for ch in &mut s.changes {
-                    match ch {
-                        Change::Item(snap) if snap.scene == *scene && snap.id == *old => snap.id = *new,
-                        Change::Gone { scene: sc, id } if sc == scene && *id == *old => *id = *new,
-                        Change::Order { scene: sc, id, .. } if sc == scene && *id == *old => *id = *new,
-                        _ => {}
-                    }
-                }
-            }
-            for ch in &mut inverse {
-                match ch {
-                    Change::Item(snap) if snap.scene == *scene && snap.id == *old => snap.id = *new,
-                    Change::Gone { scene: sc, id } if sc == scene && *id == *old => *id = *new,
-                    Change::Order { scene: sc, id, .. } if sc == scene && *id == *old => *id = *new,
-                    _ => {}
-                }
-            }
-        }
+        let Some(step) = self.redo.pop() else { return Ok(None) };
+        c.restore_all(&step.after);
         let label = step.label.clone();
-        let done = Step { label: step.label, changes: inverse, key: None, at: Instant::now(), open: false };
-        if back {
-            self.redo.push(done)
-        } else {
-            self.undo.push(done)
-        }
+        self.undo.push(step);
         Ok(Some(label))
     }
 
@@ -451,81 +275,42 @@ impl History {
     }
 }
 
-/// A source that came back under a new id: (scene, old id, new id).
-type Remap = (String, i64, i64);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrocast_studio::Canvas;
 
-/// Applies one change → its opposite, and the new id when an item came back.
-fn apply(c: &Collection, change: Change) -> Result<(Change, Option<Remap>), String> {
-    match change {
-        Change::Item(snap) => {
-            let now = c.snap(&snap.scene, snap.id).ok();
-            let id = c.restore(&snap).map_err(|e| e.to_string())?;
-            let remap = (id != snap.id).then(|| (snap.scene.clone(), snap.id, id));
-            let inv = now.map(Change::Item).unwrap_or(Change::Gone { scene: snap.scene.clone(), id });
-            Ok((inv, remap))
+    fn stage() -> Collection {
+        Collection::new(Canvas { width: 1920, height: 1080, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn steps_undo_redo_and_drags_join() {
+        let c = stage();
+        let mut h = History::default();
+        let add = StudioAct::AddScene { name: "Two".into(), vertical: false };
+        let b = h.before(&c, &add);
+        let out: Result<Value, String> = c.add_scene("Two").map(|_| Value::Null).map_err(|e| e.to_string());
+        h.after(&c, b.unwrap_or_else(|| panic!("a step")), &out);
+        assert_eq!(h.labels(), (Some("Add scene Two"), None));
+        assert_eq!(h.undo(&c), Ok(Some("Add scene Two".into())));
+        assert_eq!(c.scenes().len(), 1);
+        assert_eq!(h.redo(&c), Ok(Some("Add scene Two".into())));
+        assert_eq!(c.scenes().len(), 2);
+        // A drag: its moves are one step, closed by the one that saves.
+        let id = c
+            .add_source("Main", "color_source_v3", "Box", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+        for (x, save) in [(10.0, false), (20.0, false), (30.0, true)] {
+            let act = StudioAct::SetItemBox { scene: "Main".into(), id, x, y: 0.0, w: 10.0, h: 10.0, save };
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", id, x, 0.0, 10.0, 10.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, b, &out);
         }
-        Change::Gone { scene, id } => {
-            let now = c.snap(&scene, id).map_err(|e| e.to_string())?;
-            c.edit_item(&scene, id, ItemEdit::Remove).map_err(|e| e.to_string())?;
-            Ok((Change::Item(now), None))
-        }
-        Change::SceneBack(snap) => {
-            c.restore_scene(&snap).map_err(|e| e.to_string())?;
-            Ok((Change::SceneGone(snap.name.clone()), None))
-        }
-        Change::SceneGone(name) => {
-            let now = c.snap_scene(&name).map_err(|e| e.to_string())?;
-            c.remove_scene(&name).map_err(|e| e.to_string())?;
-            Ok((Change::SceneBack(now), None))
-        }
-        Change::SceneAt(name, at) => {
-            let now = c.scene_index(&name).map_err(|e| e.to_string())?;
-            c.move_scene(&name, at).map_err(|e| e.to_string())?;
-            Ok((Change::SceneAt(name, now), None))
-        }
-        Change::Rename(from, to) => {
-            c.rename(&from, &to).map_err(|e| e.to_string())?;
-            Ok((Change::Rename(to, from), None))
-        }
-        Change::Filters(snap) => {
-            let now = c.snap_filters(&snap.source).map_err(|e| e.to_string())?;
-            c.restore_filters(&snap).map_err(|e| e.to_string())?;
-            Ok((Change::Filters(now), None))
-        }
-        Change::Ungroup { scene, id } => {
-            let (name, sources) = c.group_parts(&scene, id).map_err(|e| e.to_string())?;
-            c.ungroup(&scene, id).map_err(|e| e.to_string())?;
-            Ok((Change::Regroup { scene, name, sources }, None))
-        }
-        Change::Regroup { scene, name, sources } => {
-            let ids = c.ids_named(&scene, &sources).map_err(|e| e.to_string())?;
-            let group = c.group_together(&scene, &ids, &name).map_err(|e| e.to_string())?;
-            Ok((Change::Ungroup { scene, id: group.id }, None))
-        }
-        Change::Settings(name, was) => {
-            let now = c.snap_settings(&name).map_err(|e| e.to_string())?;
-            c.restore_settings(&name, &was).map_err(|e| e.to_string())?;
-            Ok((Change::Settings(name, now), None))
-        }
-        Change::Audio(snap) => {
-            let now = c.snap_audio(&snap.source).map_err(|e| e.to_string())?;
-            c.restore_audio(&snap).map_err(|e| e.to_string())?;
-            Ok((Change::Audio(now), None))
-        }
-        Change::Order { scene, id, at } => {
-            let (now, _) = c.item_place(&scene, id).map_err(|e| e.to_string())?;
-            c.item_order(&scene, id, at).map_err(|e| e.to_string())?;
-            Ok((Change::Order { scene, id, at: now }, None))
-        }
-        Change::Deinterlace(name, mode, top) => {
-            let (now, now_top) = c.deinterlace_of(&name).map_err(|e| e.to_string())?;
-            c.set_deinterlace(&name, &mode, top).map_err(|e| e.to_string())?;
-            Ok((Change::Deinterlace(name, now, now_top), None))
-        }
-        Change::SceneTransition(scene, t) => {
-            let now = c.scene_transition_of(&scene).map_err(|e| e.to_string())?;
-            c.set_scene_transition(&scene, t.as_ref()).map_err(|e| e.to_string())?;
-            Ok((Change::SceneTransition(scene, now), None))
-        }
+        assert_eq!(h.list().0, ["Move Box", "Add scene Two"]);
+        assert_eq!(h.undo(&c), Ok(Some("Move Box".into())));
+        assert_eq!(c.transform("Main", id).map(|t| t.x).ok(), Some(0.0), "back to before the drag");
     }
 }
