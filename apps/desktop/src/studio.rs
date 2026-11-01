@@ -917,6 +917,8 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::Levels { names } => v(to_json!(c.levels(&names))),
         A::Look { names } => v(to_json!(c.look(&names)?)),
+        A::AudioCare => v(Ok(c.audio_care())),
+        A::SetAudioCare { care } => done(c.set_audio_care(&care)),
         A::Filters { name } => v(to_json!(c.filters(&name)?)),
         A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
         A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),

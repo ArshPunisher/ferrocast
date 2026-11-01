@@ -1621,6 +1621,54 @@ impl Stage {
             .collect()
     }
 
+    /// Ferrocast's sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs:
+    /// number | null }` (music quieter while you talk; every track steered to a loudness).
+    pub fn audio_care(&self) -> Value {
+        let a = &self.doc.borrow()["ferrocast"]["audio"];
+        json!({
+            "ducking": if a["ducking"].is_object() { a["ducking"].clone() } else { Value::Null },
+            "loudness_lufs": a["loudness_lufs"].clone(),
+        })
+    }
+
+    /// Sets the sound care (as `audio_care` gives it); an undo step like any edit.
+    pub fn set_audio_care(&self, care: &Value) -> Result<(), StudioError> {
+        let names = |k: &str| -> Result<Vec<String>, StudioError> {
+            let list = care["ducking"][k].as_array().cloned().unwrap_or_default();
+            if list.len() > 16 {
+                return Err(fail(format!("ducking.{k}: 16 sources at most.")));
+            }
+            list.iter()
+                .map(|n| n.as_str().map(String::from).ok_or_else(|| fail(format!("ducking.{k}: source names."))))
+                .collect()
+        };
+        let ducking = if care["ducking"].is_object() {
+            let (voices, music) = (names("voices")?, names("music")?);
+            if voices.iter().any(|v| music.contains(v)) {
+                return Err(fail("ducking: a source can't duck itself."));
+            }
+            let depth = care["ducking"]["depth_db"].as_f64().unwrap_or(-12.0);
+            if !(-40.0..=-3.0).contains(&depth) {
+                return Err(fail("ducking.depth_db: -40 to -3 dB."));
+            }
+            json!({ "voices": voices, "music": music, "depth_db": depth })
+        } else {
+            Value::Null
+        };
+        let loudness = match care["loudness_lufs"].as_f64() {
+            Some(l) if (-30.0..=-8.0).contains(&l) => json!(l),
+            Some(_) => return Err(fail("loudness_lufs: -30 to -8 LUFS (-14 for most platforms).")),
+            None => Value::Null,
+        };
+        self.edit(|d| {
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"]["audio"] = json!({ "ducking": ducking, "loudness_lufs": loudness });
+        });
+        Ok(())
+    }
+
     /// How these sources' pictures look now (a 32x18 glance): brightness, how much it varies, and a
     /// fingerprint that changes when the picture does. Sources with no picture yet are left out.
     pub fn look(&self, names: &[String]) -> Result<std::collections::HashMap<String, crate::Look>, StudioError> {
@@ -3074,6 +3122,29 @@ mod tests {
 
     fn stage() -> Stage {
         Stage::new(Canvas { width: 1920, height: 1080, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn sound_care_is_kept_in_the_document_and_checked() {
+        let s = stage();
+        assert_eq!(s.audio_care(), json!({ "ducking": null, "loudness_lufs": null }));
+        let care =
+            json!({ "ducking": { "voices": ["Mic"], "music": ["Music"], "depth_db": -15.0 }, "loudness_lufs": -14.0 });
+        s.set_audio_care(&care).unwrap();
+        assert_eq!(s.audio_care(), care);
+        // Bad ones refused, the good one kept.
+        let bad = [
+            json!({ "ducking": { "voices": ["Mic"], "music": ["Mic"] } }),
+            json!({ "ducking": { "voices": [], "music": [], "depth_db": 3.0 } }),
+            json!({ "loudness_lufs": -2.0 }),
+        ];
+        for b in bad {
+            assert!(s.set_audio_care(&b).is_err(), "{b}");
+        }
+        assert_eq!(s.audio_care(), care);
+        // Off again.
+        s.set_audio_care(&json!({})).unwrap();
+        assert_eq!(s.audio_care(), json!({ "ducking": null, "loudness_lufs": null }));
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {
