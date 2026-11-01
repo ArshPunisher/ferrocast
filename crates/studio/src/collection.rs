@@ -3151,7 +3151,6 @@ impl Collection {
     /// A small picture of a scene as it looks now (`width` pixels wide, the canvas's shape), as a
     /// PNG data URL: the Scenes grid's tiles, as OBS's multiview.
     pub fn thumbnail(&self, scene: &str, width: u32) -> Result<String, StudioError> {
-        use base64::Engine as _;
         let s = self.any_scene(scene)?;
         let a = self.api();
         let c = Size::of(self.size_of(a.obs_scene_from_source(s)));
@@ -3160,6 +3159,15 @@ impl Collection {
         }
         let w = width.clamp(64, 640);
         let h = ((w as u64 * c.height as u64) / c.width as u64).max(1) as u32;
+        // Ferrocast's own engine, when it's running, draws it (everything there runs anyway).
+        let own = self.own_engine.borrow().upgrade();
+        if let Some(shared) = own {
+            let px = shared
+                .engine
+                .snapshot_scene_at(scene, (c.width, c.height), (w, h))
+                .map_err(|e| StudioError::Failed(format!("\"{scene}\" couldn't be drawn: {e}")))?;
+            return png_data_url(&px, w, h, scene);
+        }
         {
             let mut held = self.thumb_showing.borrow_mut();
             match held.get_mut(scene) {
@@ -3181,17 +3189,27 @@ impl Collection {
         let src = Ref { api: a, ptr: a.obs_source_get_ref(s) };
         let px = ffi::snapshot_scaled(a, src.ptr, (c.width, c.height), w, h)
             .ok_or_else(|| StudioError::Failed(format!("\"{scene}\" couldn't be drawn")))?;
+        png_data_url(&px, w, h, scene)
+    }
+}
+
+/// RGBA rows as a PNG data URL (a scene's tile).
+fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, StudioError> {
+    use base64::Engine as _;
+    {
         let mut out = Vec::with_capacity(px.len() / 4);
         let mut enc = png::Encoder::new(&mut out, w, h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(png::Compression::Fast);
         enc.write_header()
-            .and_then(|mut wr| wr.write_image_data(&px))
+            .and_then(|mut wr| wr.write_image_data(px))
             .map_err(|e| StudioError::Failed(format!("\"{scene}\"'s picture couldn't be made ({e})")))?;
         Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&out)))
     }
+}
 
+impl Collection {
     /// Lets go of scenes kept showing for pictures that haven't been asked for in a while (the
     /// grid closed, or the scene went), or of all of them with `all`.
     /// Fits again the items fitted before their source had a size, once it has one. One still
