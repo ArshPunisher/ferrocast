@@ -407,6 +407,32 @@ struct Preview {
     scene: Option<String>,
     /// The canvas's size.
     size: (u32, u32),
+    /// Every scene in boxes instead (a multiview projector).
+    multiview: Option<Multiview>,
+}
+
+/// One box of a multiview: a scene (None: what's on air) stretched into `area` (the
+/// multiview's pixels: x, y, w, h), framed in `frame` (straight RGBA; clear for none) and
+/// named under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiviewBox {
+    pub scene: Option<String>,
+    pub area: (f32, f32, f32, f32),
+    pub frame: [u8; 4],
+    /// Framed in this instead while its scene is the one on air (a scene box, as OBS marks it).
+    pub live: Option<[u8; 4]>,
+    /// Thin lines round these boxes over the picture (the safe areas).
+    pub marks: Vec<(f32, f32, f32, f32)>,
+    pub label: Option<String>,
+}
+
+/// A multiview a preview shows: its size, the canvas its scenes are drawn at, and its boxes
+/// with their names drawn once.
+#[derive(Debug)]
+struct Multiview {
+    size: (u32, u32),
+    canvas: (u32, u32),
+    boxes: Vec<(MultiviewBox, Option<Picture>)>,
 }
 
 /// The preview's own thread and its window: a window that's slow to take a frame (hidden,
@@ -1001,7 +1027,7 @@ impl Engine {
         // SAFETY: passed on from the caller's promise.
         let surface = unsafe { self.gpu.preview_surface(ns_view, width, height) }?;
         let id = self.next_preview.fetch_add(1, Ordering::Relaxed);
-        self.lock().previews.insert(id, Preview { look: Default::default(), scene, size });
+        self.lock().previews.insert(id, Preview { look: Default::default(), scene, size, multiview: None });
         let surface = Arc::new(Mutex::new(surface));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -1048,6 +1074,33 @@ impl Engine {
     pub fn set_preview_scene(&self, id: u64, scene: Option<String>) {
         if let Some(p) = self.lock().previews.get_mut(&id) {
             p.scene = scene;
+        }
+    }
+
+    /// Makes a preview a multiview `size` big, its boxes' scenes drawn at `canvas` (OBS's
+    /// multiview projector); no boxes makes it a plain preview again.
+    pub fn set_preview_multiview(&self, id: u64, size: (u32, u32), canvas: (u32, u32), boxes: Vec<MultiviewBox>) {
+        let mv = (!boxes.is_empty()).then(|| {
+            let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
+            let boxes = boxes
+                .into_iter()
+                .map(|b| {
+                    // White on a dark band, sized to the box (OBS's labels).
+                    let style = TextStyle {
+                        size: (b.area.3 * 0.07).clamp(12.0, 48.0),
+                        color: [255, 255, 255, 255],
+                        background: Some([0, 0, 0, 170]),
+                        padding: (b.area.3 * 0.015).clamp(2.0, 10.0) as u32,
+                        ..Default::default()
+                    };
+                    let label = b.label.as_deref().filter(|l| !l.is_empty()).map(|l| text.render(l, &style));
+                    (b, label)
+                })
+                .collect();
+            Multiview { size, canvas, boxes }
+        });
+        if let Some(p) = self.lock().previews.get_mut(&id) {
+            p.multiview = mv;
         }
     }
 
@@ -1197,9 +1250,13 @@ fn preview_loop(
         let started = Instant::now();
         let next = {
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.previews
-                .get(&id)
-                .map(|p| (what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()), p.look.clone()))
+            st.previews.get(&id).map(|p| {
+                let draw = match &p.multiview {
+                    Some(mv) => Draw::Scene(multiview_scene(&st, mv, now_ns())),
+                    None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()),
+                };
+                (draw, p.look.clone())
+            })
         };
         if let Some((draw, look)) = next {
             let shown = match &draw {
@@ -1264,6 +1321,61 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
         }
         _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts)),
     }
+}
+
+/// A multiview's frame: each box's scene stretched into it (what's on air for the program box,
+/// past any transition), its frame round it and its name along its bottom.
+fn multiview_scene(st: &State, mv: &Multiview, ts: u64) -> Scene {
+    let at = |content: Content, (x, y, w, h): (f32, f32, f32, f32)| Item {
+        content,
+        effects: Vec::new(),
+        placement: Placement {
+            x,
+            y,
+            bounds: crate::Bounds::Stretch,
+            bounds_width: w.max(1.0),
+            bounds_height: h.max(1.0),
+            ..Default::default()
+        },
+        filter: Filter::Bilinear,
+        blend: crate::Blend::Normal,
+        srgb_off: false,
+        linear: true,
+        opacity: 1.0,
+    };
+    let solid =
+        |rgba: [u8; 4]| Content::Picture(Picture { width: 1, height: 1, rgba: rgba.to_vec(), premultiplied: false });
+    let t = (mv.size.1 as f32 * 0.004).max(2.0);
+    let mut items = Vec::new();
+    for (b, label) in &mv.boxes {
+        let (x, y, w, h) = b.area;
+        let name = b.scene.as_deref().or(st.on_air.as_deref());
+        items.push(at(Content::Scene(build(st, mv.canvas.0, mv.canvas.1, name, ts)), b.area));
+        let frame = match b.live {
+            Some(live) if b.scene.is_some() && b.scene.as_deref() == st.on_air.as_deref() => live,
+            _ => b.frame,
+        };
+        let mut ring = |(x, y, w, h): (f32, f32, f32, f32), t: f32, rgba: [u8; 4]| {
+            for bar in
+                [(x - t, y - t, w + 2.0 * t, t), (x - t, y + h, w + 2.0 * t, t), (x - t, y, t, h), (x + w, y, t, h)]
+            {
+                items.push(at(solid(rgba), bar));
+            }
+        };
+        for m in &b.marks {
+            ring(*m, (t / 2.0).max(1.0), [255, 255, 255, 140]);
+        }
+        if frame[3] > 0 {
+            ring(b.area, t, frame);
+        }
+        if let Some(p) = label {
+            let (lw, lh) = (p.width as f32, p.height as f32);
+            let k = (w * 0.95 / lw.max(1.0)).min(1.0);
+            let (lw, lh) = (lw * k, lh * k);
+            items.push(at(Content::Picture(p.clone()), (x + (w - lw) / 2.0, y + h - lh - t, lw, lh)));
+        }
+    }
+    Scene { width: mv.size.0, height: mv.size.1, items }
 }
 
 /// A scene drawn at its own size, then stretched to `width`×`height` with `filter`.
@@ -1680,6 +1792,56 @@ mod tests {
         assert_eq!(tile.len(), 64 * 36 * 4);
         assert_eq!(&tile[(30 * 64 + 50) * 4..(30 * 64 + 50) * 4 + 4], &[255, 0, 0, 255]);
         assert_eq!(&tile[(5 * 64 + 5) * 4..(5 * 64 + 5) * 4 + 4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_multiview_boxes_frames_and_names_the_scenes() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 640, height: 360, rgba: [0, 0, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("A", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("B", vec![SceneItem::new(2, Placement::default())]);
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        let on_air = MultiviewBox {
+            scene: None,
+            area: (20.0, 20.0, 160.0, 90.0),
+            frame: [0, 255, 0, 255],
+            live: None,
+            marks: Vec::new(),
+            label: Some("Program".into()),
+        };
+        let b = MultiviewBox {
+            scene: Some("B".into()),
+            area: (220.0, 20.0, 160.0, 90.0),
+            frame: [0; 4],
+            live: Some([255, 255, 0, 255]),
+            marks: Vec::new(),
+            label: None,
+        };
+        let label = e.text.lock().unwrap_or_else(|x| x.into_inner()).render(
+            "Program",
+            &TextStyle {
+                size: 14.0,
+                color: [255, 255, 255, 255],
+                background: Some([0, 0, 0, 170]),
+                ..Default::default()
+            },
+        );
+        let mv = Multiview { size: (400, 300), canvas: (640, 360), boxes: vec![(on_air, Some(label)), (b, None)] };
+        let px = e.gpu.render(&multiview_scene(&e.lock(), &mv, now_ns())).unwrap_or_else(|x| panic!("{x}"));
+        let at = |x: usize, y: usize| px[(y * 400 + x) * 4..(y * 400 + x) * 4 + 3].to_vec();
+        assert_eq!(at(100, 40), [255, 0, 0], "what's on air in the first box");
+        assert_eq!(at(300, 40), [0, 0, 255], "scene B in its own");
+        assert_eq!(at(19, 60), [0, 255, 0], "the first box's frame");
+        assert_eq!(at(219, 60), [0, 0, 0], "no frame round the second");
+        assert_ne!(at(100, 103), [255, 0, 0], "the name along the first box's bottom");
+        assert_eq!(at(200, 200), [0, 0, 0], "nothing outside the boxes");
+        // B goes on air: its box is framed as live.
+        e.go("B").unwrap_or_else(|x| panic!("{x}"));
+        let px = e.gpu.render(&multiview_scene(&e.lock(), &mv, now_ns())).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(&px[(60 * 400 + 219) * 4..(60 * 400 + 219) * 4 + 3], &[255, 255, 0], "B framed as on air");
     }
 
     #[test]
