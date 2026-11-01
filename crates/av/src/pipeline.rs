@@ -32,6 +32,9 @@ pub struct Pipeline {
     sent_video_header: bool,
     sent_audio_header: bool,
     recording: Option<Recording>,
+    /// More sound tracks, recorded only (OBS's tracks 2-6): each its encoder, and where its
+    /// first sample sits.
+    extra: Vec<(AudioEncoder, Option<i64>)>,
     /// Paused since this time (ns): nothing is encoded until it resumes.
     paused_at: Option<u64>,
     /// Time spent paused so far, taken off every later frame's time (no gap in the file).
@@ -48,7 +51,8 @@ enum Recording {
     Waiting {
         file: BufWriter<File>,
         mkv: bool,
-        held: Vec<AudioPacket>,
+        /// Sound that came before the header, with its track.
+        held: Vec<(usize, AudioPacket)>,
     },
     On(Box<Writer>),
     Failed,
@@ -62,11 +66,11 @@ enum Writer {
 }
 
 impl Writer {
-    fn new(file: BufWriter<File>, mkv: bool, v: VideoTrack, a: AudioTrack) -> std::io::Result<Self> {
+    fn new(file: BufWriter<File>, mkv: bool, v: VideoTrack, a: Vec<AudioTrack>) -> std::io::Result<Self> {
         Ok(if mkv {
-            Self::Mkv(MkvWriter::new(file, Some(v), Some(a))?)
+            Self::Mkv(MkvWriter::with_tracks(file, Some(v), a)?)
         } else {
-            Self::Mp4(Mp4Writer::new(file, Some(v), Some(a))?)
+            Self::Mp4(Mp4Writer::with_tracks(file, Some(v), a)?)
         })
     }
 
@@ -77,10 +81,10 @@ impl Writer {
         }
     }
 
-    fn audio(&mut self, p: &AudioPacket) -> std::io::Result<()> {
+    fn audio(&mut self, track: usize, p: &AudioPacket) -> std::io::Result<()> {
         match self {
-            Self::Mp4(w) => w.audio(p),
-            Self::Mkv(w) => w.audio(p),
+            Self::Mp4(w) => w.audio_on(track, p),
+            Self::Mkv(w) => w.audio_on(track, p),
         }
     }
 
@@ -108,6 +112,16 @@ impl Pipeline {
     /// Starts the encoders; with `record`, also writes an MP4 there (made now, so a path that
     /// can't be written fails at once).
     pub fn new(video: VideoConfig, audio: AudioConfig, record: Option<&Path>) -> Result<Self, AvError> {
+        Self::with_tracks(video, audio, record, 0)
+    }
+
+    /// As `new`, with `extra` more sound tracks in the recording (fed by `audio_extra`).
+    pub fn with_tracks(
+        video: VideoConfig,
+        audio: AudioConfig,
+        record: Option<&Path>,
+        extra: usize,
+    ) -> Result<Self, AvError> {
         let recording = match record {
             Some(p) => {
                 let f = File::create(p).map_err(|e| {
@@ -125,6 +139,7 @@ impl Pipeline {
             sent_video_header: false,
             sent_audio_header: false,
             recording,
+            extra: (0..extra).map(|_| AudioEncoder::new(audio).map(|e| (e, None))).collect::<Result<_, _>>()?,
             paused_at: None,
             paused_ns: 0,
             key_next: false,
@@ -233,9 +248,40 @@ impl Pipeline {
         for mut p in self.audio.encode(pcm)? {
             p.pts_us += offset;
             tags.push(Tag::Audio { ms: (p.pts_us / 1000) as u32, body: flv::audio_tag(&p.data) });
-            self.record_audio(p);
+            self.record_audio(0, p);
         }
         Ok(tags)
+    }
+
+    /// Sound for extra track `i` (0 is the recording's second track), as `audio` takes it.
+    /// Recorded only: the stream carries the first track.
+    pub fn audio_extra(&mut self, i: usize, pcm: &[f32], ts_ns: u64) -> Result<(), AvError> {
+        if self.paused_at.is_some() || i >= self.extra.len() {
+            return Ok(());
+        }
+        let Some(start) = self.start_ns else { return Ok(()) };
+        let (enc, offset) = &mut self.extra[i];
+        let mut pcm = pcm;
+        if offset.is_none() {
+            if ts_ns < start {
+                let ch = enc.config().channels as u64;
+                let rate = u64::from(enc.config().sample_rate);
+                let skip = ((start - ts_ns) * rate / 1_000_000_000 * ch) as usize;
+                if skip >= pcm.len() {
+                    return Ok(());
+                }
+                *offset = Some(0);
+                pcm = &pcm[skip..];
+            } else {
+                *offset = Some(((ts_ns - start) / 1000) as i64);
+            }
+        }
+        let offset = offset.unwrap_or(0);
+        for mut p in enc.encode(pcm)? {
+            p.pts_us += offset;
+            self.record_audio(i + 1, p);
+        }
+        Ok(())
     }
 
     /// Ends: what's still in the encoder is sent, and the recording closed.
@@ -246,7 +292,14 @@ impl Pipeline {
         for mut p in self.audio.flush()? {
             p.pts_us += offset;
             tags.push(Tag::Audio { ms: (p.pts_us / 1000) as u32, body: flv::audio_tag(&p.data) });
-            self.record_audio(p);
+            self.record_audio(0, p);
+        }
+        for i in 0..self.extra.len() {
+            let offset = self.extra[i].1.unwrap_or(0);
+            for mut p in self.extra[i].0.flush()? {
+                p.pts_us += offset;
+                self.record_audio(i + 1, p);
+            }
         }
         if let Some(Recording::On(w)) = self.recording.take() {
             w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
@@ -302,9 +355,11 @@ impl Pipeline {
                         config: aheader,
                         bitrate_kbps: acfg.bitrate_kbps,
                     };
-                    match Writer::new(file, mkv, v, a) {
+                    // Every track the same shape (the extra encoders share the first's settings).
+                    let tracks = vec![a; 1 + self.extra.len()];
+                    match Writer::new(file, mkv, v, tracks) {
                         Ok(mut w) => {
-                            let ok = w.video(p).is_ok() && held.iter().all(|a| w.audio(a).is_ok());
+                            let ok = w.video(p).is_ok() && held.iter().all(|(t, a)| w.audio(*t, a).is_ok());
                             if ok { Recording::On(Box::new(w)) } else { Recording::Failed }
                         }
                         Err(_) => Recording::Failed,
@@ -327,11 +382,11 @@ impl Pipeline {
         self.recording = Some(rec);
     }
 
-    fn record_audio(&mut self, p: AudioPacket) {
+    fn record_audio(&mut self, track: usize, p: AudioPacket) {
         match &mut self.recording {
-            Some(Recording::Waiting { held, .. }) => held.push(p),
+            Some(Recording::Waiting { held, .. }) => held.push((track, p)),
             Some(Recording::On(w)) => {
-                if w.audio(&p).is_err() {
+                if w.audio(track, &p).is_err() {
                     self.recording = Some(Recording::Failed);
                 }
             }

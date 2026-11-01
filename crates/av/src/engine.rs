@@ -228,12 +228,23 @@ pub struct Canvas {
     /// Drawn at this size first, then scaled to `width`×`height` with this filter (OBS's
     /// output resolution: a 720p stream from a 1080p canvas). None draws at `width`×`height`.
     pub scaled_from: Option<(u32, u32, Filter)>,
+    /// More of the mixer's tracks a recording carries after `track`, each its own sound track
+    /// in the file (OBS's recording tracks 2-6).
+    pub more_tracks: Vec<usize>,
 }
 
 impl Canvas {
     /// The engine's own canvas: its size and rate, what's on air, track 1.
     pub fn main(config: EngineConfig) -> Self {
-        Self { width: config.width, height: config.height, scene: None, every: 1, track: 0, scaled_from: None }
+        Self {
+            width: config.width,
+            height: config.height,
+            scene: None,
+            every: 1,
+            track: 0,
+            scaled_from: None,
+            more_tracks: Vec::new(),
+        }
     }
 
     /// The engine's canvas scaled to `width`×`height` (bicubic, OBS's default downscale filter).
@@ -737,6 +748,7 @@ impl Engine {
     pub fn start_output_on(&self, kind: OutputKind, canvas: Canvas) -> Result<u64, AvError> {
         if canvas.every == 0
             || canvas.track >= crate::mix::TRACKS
+            || canvas.more_tracks.iter().any(|t| *t >= crate::mix::TRACKS)
             || !canvas.width.is_multiple_of(2)
             || !canvas.height.is_multiple_of(2)
         {
@@ -761,7 +773,9 @@ impl Engine {
             fps_den: 1,
             ..st.video
         };
-        let pipe = Pipeline::new(video, st.audio, record.as_deref())?;
+        // Extra tracks only mean something in a file.
+        let more = if record.is_some() { canvas.more_tracks.len() } else { 0 };
+        let pipe = Pipeline::with_tracks(video, st.audio, record.as_deref(), more)?;
         let id = st.next_output;
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
@@ -1245,6 +1259,11 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                         Ok(t) => tags.extend(t),
                         Err(e) => failed = Some(e.to_string()),
                     }
+                    for (i, t) in canvas.more_tracks.iter().enumerate() {
+                        if let Err(e) = pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
+                            failed = Some(e.to_string());
+                        }
+                    }
                 }
                 if let OutputKind::Stream(send) = kind {
                     for t in tags {
@@ -1520,7 +1539,7 @@ mod tests {
         let b = e
             .start_output_on(
                 OutputKind::Record(tall.clone()),
-                Canvas { width: 360, height: 640, scene: Some("Tall".into()), every: 2, track: 0, scaled_from: None },
+                Canvas { width: 360, height: 640, scene: Some("Tall".into()), every: 2, ..Canvas::main(e.config()) },
             )
             .unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_secs(2));
@@ -1728,5 +1747,50 @@ mod tests {
         // Both halves are there, scaled (not the top-left corner cut out).
         assert!(at(40, 90)[0] > 200 && at(40, 90)[2] < 60, "red left: {:?}", at(40, 90));
         assert!(at(280, 90)[2] > 200 && at(280, 90)[0] < 60, "blue right: {:?}", at(280, 90));
+    }
+
+    /// ffmpeg's mean volume (dB) of one sound stream in a file.
+    #[cfg(target_os = "macos")]
+    fn mean_db(file: &std::path::Path, stream: usize) -> Option<f32> {
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "info", "-nostats", "-i"])
+            .arg(file)
+            .args(["-map", &format!("0:a:{stream}"), "-af", "volumedetect", "-f", "null", "-"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stderr).to_string();
+        let line = text.lines().find(|l| l.contains("mean_volume:"))?;
+        line.split("mean_volume:").nth(1)?.trim().trim_end_matches("dB").trim().parse().ok()
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_recording_carries_more_tracks() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        // A short beep on track 1 only, a long one on track 2 only.
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 500, beep_ms: 40 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(3, SourceKind::Tone { hz: 880.0, every_ms: 500, beep_ms: 300 }).unwrap_or_else(|x| panic!("{x}"));
+        for (id, tracks) in [(2, 0b01), (3, 0b10)] {
+            e.set_global(id, true);
+            e.set_sound(id, SourceSettings { tracks, ..Default::default() });
+        }
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        for name in ["ferrocast-av-tracks.mp4", "ferrocast-av-tracks.mkv"] {
+            let file = std::env::temp_dir().join(name);
+            let canvas = Canvas { more_tracks: vec![1], ..Canvas::main(e.config()) };
+            let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
+            std::thread::sleep(Duration::from_millis(2500));
+            e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+            let (Some(one), Some(two)) = (mean_db(&file, 0), mean_db(&file, 1)) else {
+                eprintln!("skipped the check of {name}: no ffmpeg, or a track is missing");
+                assert!(mean_db(&file, 0).is_none(), "{name}: track 2 is missing");
+                continue;
+            };
+            // The long beep holds about 7 times the sound of the short one: about 8 dB more.
+            assert!(two > one + 5.0, "{name}: track 1 {one} dB, track 2 {two} dB");
+        }
     }
 }

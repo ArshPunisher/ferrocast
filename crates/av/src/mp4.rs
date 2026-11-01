@@ -54,12 +54,13 @@ struct Sample {
 pub struct Mp4Writer<W: Write> {
     out: W,
     video: Option<VideoTrack>,
-    audio: Option<AudioTrack>,
+    /// Sound tracks, first to last (track ids 2, 3…; the first plays by default).
+    audio: Vec<AudioTrack>,
     vq: Vec<Sample>,
-    aq: Vec<Sample>,
+    aq: Vec<Vec<Sample>>,
     /// Each track's next decode time (its own clock): where a fragment starts.
     v_next: Option<i64>,
-    a_next: Option<i64>,
+    a_next: Vec<Option<i64>>,
     /// The first video decode time, so the file starts at 0.
     v_start: Option<i64>,
     sequence: u32,
@@ -97,8 +98,13 @@ fn matrix() -> Vec<u8> {
 
 impl<W: Write> Mp4Writer<W> {
     /// Writes the header at once: the file is valid (empty) from here.
-    pub fn new(mut out: W, video: Option<VideoTrack>, audio: Option<AudioTrack>) -> io::Result<Self> {
-        if video.is_none() && audio.is_none() {
+    pub fn new(out: W, video: Option<VideoTrack>, audio: Option<AudioTrack>) -> io::Result<Self> {
+        Self::with_tracks(out, video, audio.into_iter().collect())
+    }
+
+    /// With several sound tracks (OBS records up to six): `audio_on` fills each.
+    pub fn with_tracks(mut out: W, video: Option<VideoTrack>, audio: Vec<AudioTrack>) -> io::Result<Self> {
+        if video.is_none() && audio.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a recording needs video or sound"));
         }
         let mut ftyp = b"iso6".to_vec();
@@ -111,7 +117,8 @@ impl<W: Write> Mp4Writer<W> {
         } else {
             ftyp.extend_from_slice(b"avc1");
         }
-        let (ftyp, moov) = (boxed(b"ftyp", &ftyp), moov(video.as_ref(), audio.as_ref()));
+        let (ftyp, moov) = (boxed(b"ftyp", &ftyp), moov(video.as_ref(), &audio));
+        let tracks = audio.len();
         out.write_all(&ftyp)?;
         out.write_all(&moov)?;
         out.flush()?;
@@ -121,9 +128,9 @@ impl<W: Write> Mp4Writer<W> {
             video,
             audio,
             vq: Vec::new(),
-            aq: Vec::new(),
+            aq: vec![Vec::new(); tracks],
             v_next: None,
-            a_next: None,
+            a_next: vec![None; tracks],
             v_start: None,
             sequence: 0,
             v_last_dur: 0,
@@ -154,9 +161,14 @@ impl<W: Write> Mp4Writer<W> {
         Ok(())
     }
 
-    /// An AAC frame.
+    /// An AAC frame for the first sound track.
     pub fn audio(&mut self, p: &AudioPacket) -> io::Result<()> {
-        let Some(a) = &self.audio else { return Ok(()) };
+        self.audio_on(0, p)
+    }
+
+    /// An AAC frame for sound track `track` (0 is the first).
+    pub fn audio_on(&mut self, track: usize, p: &AudioPacket) -> io::Result<()> {
+        let Some(a) = self.audio.get(track) else { return Ok(()) };
         let start = self.v_start.unwrap_or(0);
         if self.video.is_some() && self.v_start.is_none() {
             // Sound before the first picture waits out (it'd start the file early).
@@ -166,8 +178,8 @@ impl<W: Write> Mp4Writer<W> {
             return Ok(());
         }
         let ticks = (p.pts_us - start) * i64::from(a.sample_rate) / 1_000_000;
-        self.aq.push(Sample { dts: ticks, cts: 0, key: true, data: p.data.clone() });
-        if self.video.is_none() && self.aq.len() >= AUDIO_ONLY_FRAGMENT {
+        self.aq[track].push(Sample { dts: ticks, cts: 0, key: true, data: p.data.clone() });
+        if self.video.is_none() && self.aq[0].len() >= AUDIO_ONLY_FRAGMENT {
             self.fragment()?;
         }
         Ok(())
@@ -180,7 +192,7 @@ impl<W: Write> Mp4Writer<W> {
 
     /// Writes out what's waiting and hands the output back.
     pub fn finish(mut self) -> io::Result<W> {
-        if !self.vq.is_empty() || !self.aq.is_empty() {
+        if !self.vq.is_empty() || self.aq.iter().any(|q| !q.is_empty()) {
             self.fragment()?;
         }
         self.out.flush()?;
@@ -190,7 +202,7 @@ impl<W: Write> Mp4Writer<W> {
     fn fragment(&mut self) -> io::Result<()> {
         self.sequence += 1;
         let vq = std::mem::take(&mut self.vq);
-        let aq = std::mem::take(&mut self.aq);
+        let aqs: Vec<Vec<Sample>> = self.aq.iter_mut().map(std::mem::take).collect();
         let mut trafs: Vec<(u32, i64, Vec<Row>)> = Vec::new();
         let mut payload = Vec::new();
         if !vq.is_empty() {
@@ -209,15 +221,15 @@ impl<W: Write> Mp4Writer<W> {
             trafs.push((VIDEO, base, rows));
             self.v_next = Some(vq.last().map_or(base, |s| s.dts) + i64::from(self.v_last_dur));
         }
-        if !aq.is_empty() {
+        for (i, aq) in aqs.iter().enumerate().filter(|(_, q)| !q.is_empty()) {
             let mut rows = Vec::new();
-            for s in &aq {
+            for s in aq {
                 rows.push((AAC_FRAME as u32, s.data.len() as u32, KEY_FLAGS, 0));
                 payload.extend_from_slice(&s.data);
             }
-            let base = self.a_next.unwrap_or(aq[0].dts).max(aq[0].dts);
-            trafs.push((AUDIO, base, rows));
-            self.a_next = Some(base + aq.len() as i64 * AAC_FRAME as i64);
+            let base = self.a_next[i].unwrap_or(aq[0].dts).max(aq[0].dts);
+            trafs.push((AUDIO + i as u32, base, rows));
+            self.a_next[i] = Some(base + aq.len() as i64 * AAC_FRAME as i64);
         }
         // The moof's size is needed for each trun's data offset: build it twice.
         let build = |offsets: &[u32]| -> Vec<u8> {
@@ -240,7 +252,7 @@ impl<W: Write> Mp4Writer<W> {
             }
             boxed(b"moof", &cat(&parts))
         };
-        let size = build(&[0, 0]).len() as u32;
+        let size = build(&vec![0; trafs.len()]).len() as u32;
         let mut offsets = Vec::new();
         let mut at = size + 8;
         for (_, _, rows) in &trafs {
@@ -257,7 +269,7 @@ impl<W: Write> Mp4Writer<W> {
     }
 }
 
-fn moov(video: Option<&VideoTrack>, audio: Option<&AudioTrack>) -> Vec<u8> {
+fn moov(video: Option<&VideoTrack>, audio: &[AudioTrack]) -> Vec<u8> {
     let mut mvhd = vec![0u8; 8];
     mvhd.extend_from_slice(&1000u32.to_be_bytes());
     mvhd.extend_from_slice(&0u32.to_be_bytes());
@@ -266,16 +278,17 @@ fn moov(video: Option<&VideoTrack>, audio: Option<&AudioTrack>) -> Vec<u8> {
     mvhd.extend_from_slice(&[0; 10]);
     mvhd.extend_from_slice(&matrix());
     mvhd.extend_from_slice(&[0; 24]);
-    mvhd.extend_from_slice(&3u32.to_be_bytes());
+    mvhd.extend_from_slice(&(AUDIO + audio.len() as u32).to_be_bytes());
     let mut parts = vec![full(b"mvhd", 0, 0, &mvhd)];
     let mut trex = Vec::new();
     if let Some(v) = video {
         parts.push(video_trak(v));
         trex.push(trex_box(VIDEO));
     }
-    if let Some(a) = audio {
-        parts.push(audio_trak(a));
-        trex.push(trex_box(AUDIO));
+    for (i, a) in audio.iter().enumerate() {
+        let id = AUDIO + i as u32;
+        parts.push(audio_trak(a, id, i == 0));
+        trex.push(trex_box(id));
     }
     parts.push(boxed(b"mvex", &cat(&trex)));
     boxed(b"moov", &cat(&parts))
@@ -288,21 +301,23 @@ fn trex_box(track: u32) -> Vec<u8> {
     full(b"trex", 0, 0, &b)
 }
 
-fn tkhd(track: u32, audio: bool, w: u32, h: u32) -> Vec<u8> {
+/// A track's header; `enabled` plays it by default (the other sound tracks are alternates).
+fn tkhd(track: u32, audio: bool, enabled: bool, w: u32, h: u32) -> Vec<u8> {
     let mut b = vec![0u8; 8];
     b.extend_from_slice(&track.to_be_bytes());
     b.extend_from_slice(&[0; 4]);
     b.extend_from_slice(&0u32.to_be_bytes());
     b.extend_from_slice(&[0; 8]);
     b.extend_from_slice(&0u16.to_be_bytes());
-    b.extend_from_slice(&0u16.to_be_bytes());
+    // Sound tracks share alternate group 1: a player plays one of them.
+    b.extend_from_slice(&(if audio { 1u16 } else { 0 }).to_be_bytes());
     b.extend_from_slice(&(if audio { 0x0100u16 } else { 0 }).to_be_bytes());
     b.extend_from_slice(&[0; 2]);
     b.extend_from_slice(&matrix());
     b.extend_from_slice(&(w << 16).to_be_bytes());
     b.extend_from_slice(&(h << 16).to_be_bytes());
-    // Enabled, in the movie, in the preview.
-    full(b"tkhd", 0, 3, &b)
+    // Enabled (or not), and in the movie.
+    full(b"tkhd", 0, if enabled { 3 } else { 2 }, &b)
 }
 
 fn mdhd(scale: u32) -> Vec<u8> {
@@ -369,7 +384,7 @@ fn video_trak(v: &VideoTrack) -> Vec<u8> {
     e.extend_from_slice(&boxed(b"colr", &colr));
     let minf = boxed(b"minf", &cat(&[full(b"vmhd", 0, 1, &[0; 8]), dinf(), boxed(b"stbl", &stbl(boxed(entry, &e)))]));
     let mdia = boxed(b"mdia", &cat(&[mdhd(VIDEO_SCALE), hdlr(b"vide", "Ferrocast video"), minf]));
-    boxed(b"trak", &cat(&[tkhd(VIDEO, false, v.width, v.height), mdia]))
+    boxed(b"trak", &cat(&[tkhd(VIDEO, false, true, v.width, v.height), mdia]))
 }
 
 /// An MPEG-4 descriptor: tag, size (one byte while small), body.
@@ -386,7 +401,7 @@ fn descriptor(tag: u8, body: &[u8]) -> Vec<u8> {
     v
 }
 
-fn audio_trak(a: &AudioTrack) -> Vec<u8> {
+fn audio_trak(a: &AudioTrack, id: u32, enabled: bool) -> Vec<u8> {
     let mut e = vec![0u8; 6];
     e.extend_from_slice(&1u16.to_be_bytes());
     e.extend_from_slice(&[0; 8]);
@@ -401,11 +416,11 @@ fn audio_trak(a: &AudioTrack) -> Vec<u8> {
     dc.extend_from_slice(&bits.to_be_bytes());
     dc.extend_from_slice(&bits.to_be_bytes());
     dc.extend_from_slice(&descriptor(0x05, &a.config));
-    let mut es = vec![0, AUDIO as u8, 0];
+    let mut es = vec![0, id as u8, 0];
     es.extend_from_slice(&descriptor(0x04, &dc));
     es.extend_from_slice(&descriptor(0x06, &[0x02]));
     e.extend_from_slice(&full(b"esds", 0, 0, &descriptor(0x03, &es)));
     let minf = boxed(b"minf", &cat(&[full(b"smhd", 0, 0, &[0; 4]), dinf(), boxed(b"stbl", &stbl(boxed(b"mp4a", &e)))]));
     let mdia = boxed(b"mdia", &cat(&[mdhd(a.sample_rate), hdlr(b"soun", "Ferrocast sound"), minf]));
-    boxed(b"trak", &cat(&[tkhd(AUDIO, true, 0, 0), mdia]))
+    boxed(b"trak", &cat(&[tkhd(id, true, enabled, 0, 0), mdia]))
 }

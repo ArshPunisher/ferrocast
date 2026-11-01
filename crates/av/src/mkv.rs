@@ -66,12 +66,20 @@ pub struct MkvWriter<W: Write> {
     /// The cluster being gathered: its time (ms) and its blocks.
     cluster: Option<(i64, Vec<u8>)>,
     written: u64,
+    /// How many sound tracks.
+    tracks: usize,
 }
 
 impl<W: Write> MkvWriter<W> {
     /// Writes the header at once: the file is valid (empty) from here.
-    pub fn new(mut out: W, video: Option<VideoTrack>, audio: Option<AudioTrack>) -> io::Result<Self> {
-        if video.is_none() && audio.is_none() {
+    pub fn new(out: W, video: Option<VideoTrack>, audio: Option<AudioTrack>) -> io::Result<Self> {
+        Self::with_tracks(out, video, audio.into_iter().collect())
+    }
+
+    /// With several sound tracks (OBS records up to six): `audio_on` fills each; the first plays
+    /// by default.
+    pub fn with_tracks(mut out: W, video: Option<VideoTrack>, audio: Vec<AudioTrack>) -> io::Result<Self> {
+        if video.is_none() && audio.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a recording needs video or sound"));
         }
         let ebml = element(
@@ -107,13 +115,15 @@ impl<W: Write> MkvWriter<W> {
                 .concat(),
             ));
         }
-        if let Some(a) = &audio {
+        for (i, a) in audio.iter().enumerate() {
+            let n = u64::from(AUDIO) + i as u64;
             tracks.extend(element(
                 0xAE,
                 &[
-                    uint(0xD7, u64::from(AUDIO)),
-                    uint(0x73C5, u64::from(AUDIO)),
+                    uint(0xD7, n),
+                    uint(0x73C5, n),
                     uint(0x83, 2),
+                    uint(0x88, u64::from(i == 0)),
                     uint(0x9C, 0),
                     string(0x86, "A_AAC"),
                     element(0x63A2, &a.config),
@@ -129,7 +139,14 @@ impl<W: Write> MkvWriter<W> {
         head.extend(element(0x1654_AE6B, &tracks));
         out.write_all(&head)?;
         out.flush()?;
-        Ok(Self { out, has_video: video.is_some(), start_us: None, cluster: None, written: head.len() as u64 })
+        Ok(Self {
+            out,
+            has_video: video.is_some(),
+            start_us: None,
+            cluster: None,
+            written: head.len() as u64,
+            tracks: audio.len(),
+        })
     }
 
     /// A video frame (shown at its presentation time). A keyframe starts a new cluster.
@@ -143,8 +160,16 @@ impl<W: Write> MkvWriter<W> {
         self.block(VIDEO, ms, p.key, &p.data, p.key)
     }
 
-    /// An AAC frame.
+    /// An AAC frame for the first sound track.
     pub fn audio(&mut self, p: &AudioPacket) -> io::Result<()> {
+        self.audio_on(0, p)
+    }
+
+    /// An AAC frame for sound track `track` (0 is the first).
+    pub fn audio_on(&mut self, track: usize, p: &AudioPacket) -> io::Result<()> {
+        if track >= self.tracks {
+            return Ok(());
+        }
         let start = match self.start_us {
             Some(s) => s,
             // Sound before the first picture waits out (it'd start the file early).
@@ -155,8 +180,10 @@ impl<W: Write> MkvWriter<W> {
             return Ok(());
         }
         let ms = (p.pts_us - start) / 1000;
-        let new = !self.has_video && self.cluster.as_ref().is_none_or(|(at, _)| ms - at >= AUDIO_ONLY_CLUSTER_MS);
-        self.block(AUDIO, ms, true, &p.data, new)
+        let new = !self.has_video
+            && track == 0
+            && self.cluster.as_ref().is_none_or(|(at, _)| ms - at >= AUDIO_ONLY_CLUSTER_MS);
+        self.block(AUDIO + track as u8, ms, true, &p.data, new)
     }
 
     fn block(&mut self, track: u8, ms: i64, key: bool, data: &[u8], new_cluster: bool) -> io::Result<()> {
