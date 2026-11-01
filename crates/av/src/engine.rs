@@ -74,14 +74,14 @@ pub enum SourceKind {
 }
 
 /// Where an outside source (`SourceKind::Fed`) hands in its pictures and sound, from any
-/// thread: the newest picture wins; sound is stereo at 48 kHz, stamped on `now_ns`'s clock.
+/// thread: the newest picture wins; sound is stereo, stamped on `now_ns`'s clock.
 #[derive(Debug, Clone, Default)]
 pub struct Feed(Arc<FeedSlot>);
 
 #[derive(Debug, Default)]
 struct FeedSlot {
     picture: Mutex<Option<Picture>>,
-    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
+    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u32, u64)>>,
 }
 
 impl Feed {
@@ -89,11 +89,11 @@ impl Feed {
         *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
 
-    /// Stereo, interleaved, 48 kHz; its first sample at `ts_ns` (`now_ns`'s clock). At most
-    /// a few seconds wait (a stalled engine can't grow memory).
-    pub fn sound(&self, pcm: Vec<f32>, ts_ns: u64) {
+    /// Stereo, interleaved, at `rate` Hz; its first sample at `ts_ns` (`now_ns`'s clock). At
+    /// most a few seconds wait (a stalled engine can't grow memory).
+    pub fn sound(&self, pcm: Vec<f32>, rate: u32, ts_ns: u64) {
         let mut q = self.0.sound.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back((pcm, ts_ns));
+        q.push_back((pcm, rate, ts_ns));
         while q.len() > 400 {
             q.pop_front();
         }
@@ -1501,8 +1501,8 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                     }
                     let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                     if heard.contains(id) {
-                        for (pcm, t) in sound {
-                            mx.push(*id, &pcm, 2, 48_000, t);
+                        for (pcm, rate, t) in sound {
+                            mx.push(*id, &pcm, 2, rate, t);
                         }
                     }
                 }
