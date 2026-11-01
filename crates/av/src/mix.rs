@@ -110,6 +110,24 @@ pub struct Mixer {
     sources: BTreeMap<u64, Source>,
     /// The next block's start; set by the first `mix_until`.
     next_ns: Option<u64>,
+    /// Listeners to one source's sound (captions), by source; gone when their tap is dropped.
+    taps: Vec<(u64, std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>)>,
+}
+
+/// One source's sound as it comes in (mono, the mixer's rate, before its volume and filters),
+/// for something that listens (live captions). At most `TAP_SECONDS` are kept unread; nothing
+/// while the source is muted. Dropping it stops listening.
+#[derive(Debug, Clone)]
+pub struct Tap(pub std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>);
+
+/// The most a tap keeps unread.
+pub const TAP_SECONDS: usize = 30;
+
+impl Tap {
+    /// Everything heard since the last take, oldest first.
+    pub fn take(&self) -> Vec<f32> {
+        self.0.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
+    }
 }
 
 fn block_ns(rate: u32) -> u64 {
@@ -124,14 +142,47 @@ fn db(v: f32) -> f32 {
     if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() }
 }
 
+/// Gives source `id`'s sound to its taps (at the mixer's rate only: every capture here gives
+/// it; other rates aren't tapped).
+#[allow(clippy::type_complexity)]
+fn feed_taps(
+    taps: &[(u64, std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>)],
+    id: u64,
+    (l, r): (&[f32], &[f32]),
+    rate: u32,
+    mixer_rate: u32,
+) {
+    if rate != mixer_rate {
+        return;
+    }
+    let max = TAP_SECONDS * mixer_rate as usize;
+    for (_, t) in taps.iter().filter(|(i, _)| *i == id) {
+        if let Some(buf) = t.upgrade()
+            && let Ok(mut b) = buf.lock()
+        {
+            b.extend(l.iter().zip(r).map(|(a, b)| (a + b) * 0.5));
+            let over = b.len().saturating_sub(max);
+            b.drain(..over);
+        }
+    }
+}
+
 impl Mixer {
     /// `rate` Hz stereo out; blocks are made `latency_ns` behind the clock.
     pub fn new(rate: u32, latency_ns: u64) -> Self {
-        Self { rate, latency_ns, sources: BTreeMap::new(), next_ns: None }
+        Self { rate, latency_ns, sources: BTreeMap::new(), next_ns: None, taps: Vec::new() }
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Starts listening to source `id`'s sound (see [`Tap`]).
+    pub fn tap(&mut self, id: u64) -> Tap {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        self.taps.retain(|(_, t)| t.strong_count() > 0);
+        self.taps.push((id, std::sync::Arc::downgrade(&buf)));
+        Tap(buf)
     }
 
     /// Adds a source (or changes its settings).
@@ -207,6 +258,9 @@ impl Mixer {
         for f in pcm.chunks_exact(channels) {
             l.push(f[0]);
             r.push(if channels > 1 { f[1] } else { f[0] });
+        }
+        if !self.taps.is_empty() && !src.settings.muted {
+            feed_taps(&self.taps, id, (&l[gap..], &r[gap..]), rate, out_rate);
         }
         if let Some(t) = at {
             src.queue.clear();
@@ -437,6 +491,23 @@ mod tests {
         let lit: Vec<usize> = out.chunks(2).enumerate().filter(|(_, f)| f[0] > 0.2).map(|(i, _)| i).collect();
         assert_eq!(lit.len(), 1920, "both beeps are heard");
         assert_eq!(lit[960] - lit[0], 9600, "the second 200 ms after the first");
+    }
+
+    #[test]
+    fn a_tap_hears_one_source_until_it_is_muted() {
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings::default());
+        m.set(2, SourceSettings::default());
+        let tap = m.tap(1);
+        m.push(1, &[0.2, 0.4, 0.2, 0.4], 2, RATE, 0);
+        m.push(2, &[0.9, 0.9], 2, RATE, 0);
+        assert_eq!(tap.take(), [0.3, 0.3], "source 1 only, as mono");
+        m.set(1, SourceSettings { muted: true, ..Default::default() });
+        m.push(1, &[0.2, 0.4], 2, RATE, 10_000);
+        assert!(tap.take().is_empty(), "nothing while muted");
+        drop(tap);
+        m.push(1, &[0.2, 0.4], 2, RATE, 20_000);
+        assert!(m.taps.iter().all(|(_, t)| t.strong_count() == 0), "a dropped tap gets nothing");
     }
 
     #[test]

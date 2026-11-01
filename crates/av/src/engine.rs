@@ -615,6 +615,11 @@ impl Engine {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_effects(id, effects);
     }
 
+    /// Listens to one source's sound (mono, 48 kHz, as it comes in): live captions.
+    pub fn tap_sound(&self, id: u64) -> crate::mix::Tap {
+        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).tap(id)
+    }
+
     /// A source's sound levels over the last block (for meters).
     pub fn levels(&self, id: u64) -> Option<crate::mix::Levels> {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).levels(id)
