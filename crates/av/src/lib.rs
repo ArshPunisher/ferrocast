@@ -23,6 +23,7 @@ pub mod ffenc;
 pub mod flv;
 pub mod lut;
 pub mod mix;
+pub mod mkv;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod monitor;
 pub mod mp4;
