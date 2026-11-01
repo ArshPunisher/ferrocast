@@ -2240,6 +2240,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrocast-bond"
+version = "2.3.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "ferrocast-golive",
+ "futures",
+ "getrandom 0.3.4",
+ "hmac 0.12.1",
+ "http-body-util",
+ "rml_rtmp",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "srt-tokio",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ferrocast-connector"
 version = "2.3.0"
 dependencies = [
