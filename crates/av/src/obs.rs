@@ -332,6 +332,12 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
             };
             (SourceKind::Microphone(dev), true)
         }
+        // A web page (OBS's Browser source, or Ferrocast's own): the app renders it and hands
+        // its pictures in. OBS's own size keys; 800x600 when it says none.
+        "browser_source" | "ferrocast_web" => {
+            let n = |k: &str, d: u32| s.get(k).and_then(Value::as_u64).filter(|v| *v > 0).map_or(d, |v| v as u32);
+            (SourceKind::Fed { width: n("width", 800), height: n("height", 600) }, true)
+        }
         other => return Err(other.to_string()),
     })
 }
@@ -532,9 +538,9 @@ mod tests {
         });
         let got = import(&doc, (640, 360));
         assert_eq!(got.current.as_deref(), Some("Two"));
-        assert_eq!(got.sources.len(), 1);
+        assert_eq!(got.sources.len(), 2, "the web page comes over, for the app to render");
         assert_eq!(got.sources[0].kind, SourceKind::Color { width: 640, height: 360, rgba: [0xFF, 0x80, 0, 0xFF] });
-        assert!(got.skipped.iter().any(|s| s.contains("browser_source")));
+        assert_eq!(got.sources[1].kind, SourceKind::Fed { width: 800, height: 600 });
         assert!(got.skipped.iter().any(|s| s.contains("gpu_delay")));
         let names: Vec<&str> = got.scenes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["One", "Two"]);
@@ -544,7 +550,7 @@ mod tests {
         assert_eq!(back.filter, Filter::Lanczos);
         assert_eq!(back.effects.len(), 1);
         assert_eq!((back.placement.rotation, back.placement.bounds, back.placement.crop[0]), (30.0, Bounds::Fit, 4));
-        assert_eq!(got.scenes[0].1.len(), 1, "the browser source's item is left out");
+        assert_eq!(got.scenes[0].1.len(), 2, "the web page's item stays (its pictures come from the app)");
         let nested = &got.scenes[1].1[0];
         assert_eq!(nested.scene.as_deref(), Some("One"));
         assert_eq!((nested.placement.x, nested.placement.scale_x), (10.0, 0.5));

@@ -65,6 +65,39 @@ pub enum SourceKind {
         path: PathBuf,
         looping: bool,
     },
+    /// Pictures and sound handed in from outside (a web page rendered by the app), through
+    /// `Engine::fed`; `width`×`height` until the first picture says otherwise.
+    Fed {
+        width: u32,
+        height: u32,
+    },
+}
+
+/// Where an outside source (`SourceKind::Fed`) hands in its pictures and sound, from any
+/// thread: the newest picture wins; sound is stereo at 48 kHz, stamped on `now_ns`'s clock.
+#[derive(Debug, Clone, Default)]
+pub struct Feed(Arc<FeedSlot>);
+
+#[derive(Debug, Default)]
+struct FeedSlot {
+    picture: Mutex<Option<Picture>>,
+    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
+}
+
+impl Feed {
+    pub fn picture(&self, p: Picture) {
+        *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    /// Stereo, interleaved, 48 kHz; its first sample at `ts_ns` (`now_ns`'s clock). At most
+    /// a few seconds wait (a stalled engine can't grow memory).
+    pub fn sound(&self, pcm: Vec<f32>, ts_ns: u64) {
+        let mut q = self.0.sound.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back((pcm, ts_ns));
+        while q.len() > 400 {
+            q.pop_front();
+        }
+    }
 }
 
 /// A source in a scene: which, where, and how.
@@ -325,6 +358,7 @@ enum Live {
     Microphone(crate::camera::Capture),
     #[cfg(target_os = "macos")]
     Media(crate::media::Media),
+    Fed(Feed),
 }
 
 struct Src {
@@ -567,6 +601,11 @@ impl Engine {
                 }
                 (Live::Media(m), None)
             }
+            SourceKind::Fed { width, height } => {
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                // Clear until the first picture comes.
+                (Live::Fed(Feed::default()), Some(Picture::solid(width.max(1), height.max(1), [0, 0, 0, 0])))
+            }
         };
         let size = match &picture {
             Some(p) => {
@@ -613,6 +652,14 @@ impl Engine {
     /// A source's sound filters, in order (gate, compressor, EQ…), replacing any before.
     pub fn set_sound_effects(&self, id: u64, effects: &[crate::afx::AudioEffect]) {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_effects(id, effects);
+    }
+
+    /// Where an outside source (`SourceKind::Fed`) is handed its pictures and sound.
+    pub fn fed(&self, id: u64) -> Option<Feed> {
+        match self.lock().sources.get(&id).map(|s| &s.live) {
+            Some(Live::Fed(f)) => Some(f.clone()),
+            _ => None,
+        }
     }
 
     /// Listens to one source's sound (mono, 48 kHz, as it comes in): live captions.
@@ -1448,6 +1495,17 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                         }
                     }
                 }
+                Live::Fed(feed) => {
+                    if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        uploads.push((*id, p));
+                    }
+                    let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+                    if heard.contains(id) {
+                        for (pcm, t) in sound {
+                            mx.push(*id, &pcm, 2, 48_000, t);
+                        }
+                    }
+                }
             }
         }
         for (id, p) in uploads {
@@ -2120,5 +2178,19 @@ mod tests {
         };
         assert!(av && (1.9..3.2).contains(&secs), "{secs:.2} s");
         assert!(mean_db(&file, 0).is_some_and(|db| db > -40.0), "the sound came along");
+    }
+
+    #[test]
+    fn a_fed_source_shows_what_it_is_handed() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Fed { width: 640, height: 360 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[0, 0, 0, 0], "clear until a picture comes");
+        let feed = e.fed(1).unwrap_or_else(|| panic!("a fed source"));
+        feed.picture(Picture::solid(320, 180, [255, 0, 0, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[255, 0, 0, 255], "the picture handed in");
+        assert!(e.fed(2).is_none());
     }
 }
