@@ -260,9 +260,17 @@ come from the system (`system.rs`), undo keeps whole snapshots, and recordings a
 FFmpeg. **The app's Studio starts with no libobs**: run from a folder with no OBS files, it
 records H.264 and AAC at 1080p with no libobs loaded.
 
-Left: Windows capture and preview; web page sources; projectors and the multiview; media
-play/pause; guests; SRT, RIST and WHIP sends; chapters and Twitch's VOD track; the virtual
-camera (needs Apple signing); then libobs's code, its bundled files and its CI jobs deleted.
+**Then (1 Nov evening):** web page sources, projectors and the multiview, media play/pause/seek,
+network media and guests (FFmpeg reads the stream), chapter marks in MP4 and MKV, Twitch's VOD
+track (Enhanced RTMP multitrack audio), Strong noise removal (DeepFilterNet as an engine sound
+plugin) and Remove background (Vision's person mask into a Cutout effect) all run on our engine.
+
+**libobs is gone from the branch:** its code (the old `Studio`, `Collection`, streams,
+recordings, filters, ~11,000 lines), the libobs examples, the bundled OBS runtime
+(`deploy/obs-runtime-*`), the `obs-ffmpeg-mux` helper and the OBS-only Windows CI jobs.
+
+Left: Windows capture and preview (step 6; Remove background there waits on it, its RVM model
+kept in `ffi/matte.rs`); SRT, RIST and WHIP sends; the virtual camera (needs Apple signing).
 
 ### Honest sizes and risks
 
