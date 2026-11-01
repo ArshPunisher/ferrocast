@@ -20,7 +20,19 @@ pub struct ImportedSource {
     /// Its sound settings, for kinds with sound.
     pub sound: Option<SourceSettings>,
     pub sound_effects: Vec<AudioEffect>,
+    /// Heard whatever is on air: OBS's Desktop Audio and Mic/Aux channels.
+    pub global: bool,
 }
+
+/// Where OBS keeps its global sound sources in a collection.
+const CHANNELS: [&str; 6] = [
+    "DesktopAudioDevice1",
+    "DesktopAudioDevice2",
+    "AuxAudioDevice1",
+    "AuxAudioDevice2",
+    "AuxAudioDevice3",
+    "AuxAudioDevice4",
+];
 
 /// A collection as the engine takes it.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -291,6 +303,14 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
         "av_capture_input" | "av_capture_input_v2" | "macos-avcapture" | "macos-avcapture-fast" => {
             (SourceKind::Camera(text_of("device")), false)
         }
+        // What the Mac plays: all of it (an app's own sound isn't separated yet).
+        #[cfg(target_os = "macos")]
+        "sck_audio_capture" | "coreaudio_output_capture" => {
+            if s.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
+                return Err("one app's sound (Application Audio Capture)".into());
+            }
+            (SourceKind::DesktopSound, true)
+        }
         #[cfg(target_os = "macos")]
         "coreaudio_input_capture" => {
             let dev = text_of("device_id");
@@ -362,7 +382,8 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             Some((s.get("name")?.as_str()?.to_string(), (size("cx"), size("cy"))))
         })
         .collect();
-    for s in &sources {
+    let channels: Vec<Value> = CHANNELS.iter().filter_map(|k| doc.get(*k).cloned()).collect();
+    for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
         if id == "scene" || id == "group" {
@@ -387,6 +408,7 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                             kind: SourceKind::Image(path),
                             sound: None,
                             sound_effects: Vec::new(),
+                            global: false,
                         });
                         next_id += 1;
                         effects.push(e);
@@ -417,7 +439,14 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                         _ => Monitoring::Off,
                     },
                 });
-                out.sources.push(ImportedSource { id: next_id, name: name.clone(), kind, sound, sound_effects });
+                out.sources.push(ImportedSource {
+                    id: next_id,
+                    name: name.clone(),
+                    kind,
+                    sound,
+                    sound_effects,
+                    global,
+                });
                 ids.push((name, next_id, effects, true));
                 next_id += 1;
             }
@@ -525,6 +554,24 @@ mod tests {
         assert!(got.skipped.iter().any(|s| s.contains("no picture")));
         let card = got.sources.iter().find(|s| s.name == "Card").map(|s| s.id);
         assert_ne!(card, Some(id));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn global_sound_comes_over() {
+        let doc = json!({
+            "DesktopAudioDevice1": { "id": "sck_audio_capture", "name": "Desktop Audio", "settings": { "type": 0 },
+                "volume": 0.5, "monitoring_type": 0 },
+            "AuxAudioDevice1": { "id": "coreaudio_input_capture", "name": "Mic/Aux", "settings": { "device_id": "x" } },
+            "DesktopAudioDevice2": { "id": "sck_audio_capture", "name": "One app", "settings": { "type": 1 } },
+            "sources": []
+        });
+        let got = import(&doc, (64, 64));
+        let desk = got.sources.iter().find(|s| s.name == "Desktop Audio");
+        assert!(desk.is_some_and(|d| d.global && d.kind == SourceKind::DesktopSound), "{:?}", got.sources);
+        assert_eq!(desk.and_then(|d| d.sound.as_ref()).map(|s| s.volume), Some(0.5));
+        assert!(got.sources.iter().any(|s| s.name == "Mic/Aux" && s.global));
+        assert!(got.skipped.iter().any(|s| s.starts_with("One app")));
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //! seconds, and says how many frames came and how big they were. No picture is saved (what's
 //! on screen is private).
 //!
-//!   cargo run -p ferrocast-av --example capture -- [seconds] [--sound]
+//!   cargo run -p ferrocast-av --example capture -- [seconds] [--sound] [--tiny]
+//!
+//! `--tiny` takes a 2×2 picture once a second, as the engine's desktop sound source does.
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main = displays.first().ok_or("no display")?;
     // `--sound` also captures what the Mac plays (a short quiet tone is played to check).
     let sound = std::env::args().any(|a| a == "--sound");
-    let cap = ScreenCapture::start_with(Target::Display(main.id), 1280, 720, 30, true, sound)?;
+    let (w, h, fps) = if std::env::args().any(|a| a == "--tiny") { (2, 2, 1) } else { (1280, 720, 30) };
+    let cap = ScreenCapture::start_with(Target::Display(main.id), w, h, fps, true, sound)?;
     let tone = if sound {
         let wav = std::env::temp_dir().join("ferrocast-tone.wav");
         write_tone(&wav)?;

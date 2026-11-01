@@ -47,6 +47,9 @@ pub enum SourceKind {
         display: u32,
         sound: bool,
     },
+    /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
+    #[cfg(target_os = "macos")]
+    DesktopSound,
     /// A camera (macOS), by its id.
     #[cfg(target_os = "macos")]
     Camera(String),
@@ -448,6 +451,25 @@ impl Engine {
                 (Live::Screen(c), None)
             }
             #[cfg(target_os = "macos")]
+            SourceKind::DesktopSound => {
+                // ScreenCaptureKit gives the sound with a display's picture: the smallest, slowest one.
+                let display = crate::screen::shareable()?
+                    .0
+                    .first()
+                    .map(|d| d.id)
+                    .ok_or_else(|| AvError::Source("there's no display to take the Mac's sound with".into()))?;
+                let c = crate::screen::ScreenCapture::start_with(
+                    crate::screen::Target::Display(display),
+                    2,
+                    2,
+                    1,
+                    false,
+                    true,
+                )?;
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                (Live::Screen(c), None)
+            }
+            #[cfg(target_os = "macos")]
             SourceKind::Camera(dev) => (Live::Camera(crate::camera::Capture::camera(&dev)?), None),
             #[cfg(target_os = "macos")]
             SourceKind::Microphone(dev) => {
@@ -549,6 +571,9 @@ impl Engine {
                     }
                 }
                 Err(e) => skipped.push(format!("{}: {e}", s.name)),
+            }
+            if s.global {
+                self.set_global(s.id, true);
             }
         }
         for (name, items) in imported.scenes {
