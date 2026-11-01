@@ -47,6 +47,9 @@ pub enum SourceKind {
         display: u32,
         sound: bool,
     },
+    /// One window (macOS), by its window number, as it looks wherever it is.
+    #[cfg(target_os = "macos")]
+    Window(u32),
     /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
     #[cfg(target_os = "macos")]
     DesktopSound,
@@ -516,6 +519,18 @@ impl Engine {
                 if sound {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 }
+                (Live::Screen(c), None)
+            }
+            #[cfg(target_os = "macos")]
+            SourceKind::Window(window) => {
+                let c = crate::screen::ScreenCapture::start_with(
+                    crate::screen::Target::Window(window),
+                    self.config.width,
+                    self.config.height,
+                    self.config.fps,
+                    true,
+                    false,
+                )?;
                 (Live::Screen(c), None)
             }
             #[cfg(target_os = "macos")]

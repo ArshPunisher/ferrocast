@@ -239,8 +239,9 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
     Ok(match id {
         "color_source" | "color_source_v2" | "color_source_v3" => (
             SourceKind::Color {
-                width: s.get("width").and_then(Value::as_u64).map_or(canvas.0, |v| v as u32),
-                height: s.get("height").and_then(Value::as_u64).map_or(canvas.1, |v| v as u32),
+                // 0 (or none) is the canvas's size, as OBS's defaults have it.
+                width: s.get("width").and_then(Value::as_u64).filter(|v| *v > 0).map_or(canvas.0, |v| v as u32),
+                height: s.get("height").and_then(Value::as_u64).filter(|v| *v > 0).map_or(canvas.1, |v| v as u32),
                 rgba: color(s.get("color").and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF)),
             },
             false,
@@ -295,9 +296,19 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
         }
         #[cfg(target_os = "macos")]
         "screen_capture" | "display_capture" => {
-            // The first display (OBS keeps a display's UUID; ours are listed by number).
-            let display = crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id)).unwrap_or(0);
-            (SourceKind::Screen { display, sound: false }, false)
+            let n = |k: &str| s.get(k).and_then(Value::as_u64).map(|v| v as u32);
+            match (s.get("type").and_then(Value::as_u64).unwrap_or(0), n("window")) {
+                // Window Capture, by its window number (as OBS keeps it).
+                (1, Some(w)) => (SourceKind::Window(w), false),
+                (1, None) => return Err("a window capture with no window picked".into()),
+                (0, _) => {
+                    // The display picked (by number), else the first (OBS keeps a display's UUID).
+                    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
+                    let display = n("display").or_else(first).unwrap_or(0);
+                    (SourceKind::Screen { display, sound: false }, false)
+                }
+                _ => return Err("one app's windows (Application Capture)".into()),
+            }
         }
         #[cfg(target_os = "macos")]
         "av_capture_input" | "av_capture_input_v2" | "macos-avcapture" | "macos-avcapture-fast" => {
