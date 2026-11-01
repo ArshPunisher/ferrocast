@@ -567,11 +567,15 @@ async fn limits_and_rates() {
     assert!(v["error"]["message"].as_str().unwrap().contains("50"));
 
     let r = w.user("rate@example.com");
-    let mut last = 0;
-    for _ in 0..=WRITES_PER_MINUTE {
+    // The bucket refills as time passes, so a slow machine may get a write or two more than
+    // the limit; it's refused well before twice the limit.
+    let (mut last, mut sent) = (0, 0);
+    while sent < 2 * WRITES_PER_MINUTE && last != 429 {
         last = w.web(&r, Method::POST, "/c/v1/cloud/enable", None).await.0;
+        sent += 1;
     }
     assert_eq!(last, 429);
+    assert!(sent > WRITES_PER_MINUTE, "refused only past the limit: after {sent}");
     let res = w
         .http
         .post(format!("{}/c/v1/cloud/enable", w.base))
