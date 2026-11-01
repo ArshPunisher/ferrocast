@@ -156,6 +156,7 @@ pub(crate) async fn session(
     let mut rtc = Rtc::builder()
         .clear_codecs()
         .enable_h264(true)
+        .enable_h265(true)
         .enable_opus(true, false)
         .set_stats_interval(Some(Duration::from_secs(1)))
         .build(Instant::now());
@@ -193,7 +194,12 @@ pub(crate) async fn reach(d: &Direct) -> Result<Duration, DirectError> {
     let ip = local_ip(&host, port).await.ok_or_else(|| DirectError::Unreachable(host.clone()))?;
     let socket = UdpSocket::bind((ip, 0)).await.map_err(|_| DirectError::Unreachable(host.clone()))?;
     let local = socket.local_addr().map_err(|_| DirectError::Unreachable(host.clone()))?;
-    let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).enable_opus(true, false).build(Instant::now());
+    let mut rtc = Rtc::builder()
+        .clear_codecs()
+        .enable_h264(true)
+        .enable_h265(true)
+        .enable_opus(true, false)
+        .build(Instant::now());
     let cand = Candidate::host(local, "udp").map_err(|e| DirectError::Refused(e.to_string()))?;
     rtc.add_local_candidate(cand);
     let mut api = rtc.sdp_api();
@@ -299,9 +305,23 @@ async fn stream_to(
     {
         sound = Some(Sound::new(a.get(2..).unwrap_or_default(), kbps)?);
     }
-    let (vpt, apt) = (pt_for(rtc, vmid, Codec::H264), pt_for(rtc, amid, Codec::Opus));
-    if vpt.is_none() && apt.is_none() {
-        return Err(DirectError::Refused(format!("{name} takes neither H.264 nor Opus.")));
+    let (vpt, hpt, apt) =
+        (pt_for(rtc, vmid, Codec::H264), pt_for(rtc, vmid, Codec::H265), pt_for(rtc, amid, Codec::Opus));
+    if vpt.is_none() && hpt.is_none() && apt.is_none() {
+        return Err(DirectError::Refused(format!("{name} takes neither H.264, HEVC nor Opus.")));
+    }
+    // The picture's codec, as the server took it: HEVC only where it said yes.
+    let pt_of = |setup: &VideoSetup| -> Result<Option<Pt>, DirectError> {
+        match (setup.hevc, hpt) {
+            (true, None) => Err(DirectError::Refused(format!(
+                "{name} doesn't take HEVC over WebRTC: pick an H.264 encoder in the Studio's video settings."
+            ))),
+            (true, pt) => Ok(pt),
+            (false, _) => Ok(vpt),
+        }
+    };
+    if let Some(v) = &video {
+        pt_of(v)?;
     }
     let started = Instant::now();
     let mut connected = false;
@@ -388,11 +408,14 @@ async fn stream_to(
                     Frame::Metadata(_) => {}
                     Frame::Video { ts, data, .. } => {
                         if crate::flv::video_is_header(&data) {
-                            video = Some(video_ready(&data)?);
+                            let v = video_ready(&data)?;
+                            pt_of(&v)?;
+                            video = Some(v);
                             waiting_for_key = true;
                             continue;
                         }
-                        let (Some(setup), Some(pt), true) = (&video, vpt, connected) else { continue };
+                        let Some(setup) = &video else { continue };
+                        let (Some(pt), true) = (pt_of(setup)?, connected) else { continue };
                         let Some((key, cts, es)) = annex_b(setup, &data, false) else { continue };
                         if cts != 0 {
                             return Err(DirectError::Refused(
@@ -439,15 +462,9 @@ async fn stream_to(
     }
 }
 
-/// The video's setup from its header: H.264 only (WebRTC endpoints rarely take HEVC).
+/// The video's setup from its header: H.264, or HEVC for a server that takes it.
 fn video_ready(header: &[u8]) -> Result<VideoSetup, DirectError> {
-    match video_setup(header) {
-        Some(s) if !s.hevc => Ok(s),
-        Some(_) => Err(DirectError::Refused(
-            "WebRTC (WHIP) sends H.264: pick an H.264 encoder in the Studio's video settings.".into(),
-        )),
-        None => Err(DirectError::Refused("The stream's video can't go over WebRTC.".into())),
-    }
+    video_setup(header).ok_or_else(|| DirectError::Refused("The stream's video can't go over WebRTC.".into()))
 }
 
 #[cfg(test)]
