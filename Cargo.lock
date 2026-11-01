@@ -7898,8 +7898,6 @@ dependencies = [
 [[package]]
 name = "srt-protocol"
 version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22790a85cd5d34355e9fc246ded6a1f037add6fd0e0efe4d4914c2d51c20f246"
 dependencies = [
  "aes 0.8.4",
  "array-init",
