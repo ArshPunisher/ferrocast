@@ -224,13 +224,17 @@ Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps
 | OBS scene collections open in the engine: colour, image, text, media, screen, camera and microphone sources; every item setting (place, turn, scale, crop, bounds, blend, scale filter, shown); scenes inside scenes; picture and sound filters; volume, balance, mono, sync, tracks, monitoring. Whatever it can't run yet (a browser source, an unported filter) is listed by name | `obs.rs`, `Engine::load_obs` | `obs_import`: three scenes made in libobs, saved, opened by the engine: 0 pixels apart |
 | Groups in imported collections (OBS's backup copies of their items skipped) | `obs.rs`, `engine.rs` | `obs_import` Grouped: a turned, scaled group, 313 edge pixels of 921,600 apart |
 | More of OBS's filters: Crop/Pad, Image Mask/Blend (all five kinds), Apply LUT (PNG and .cube, 1D and 3D, amount, domain, alpha passed through), Scroll (wrapping, or scrolling away; its position from the scene's clock, so dropped frames don't make it drift) | `effects.wgsl`, `lut.rs`, `compose.rs` | `obs_import`: worst difference 1 (Scroll compared at rest) |
+| Only what's on air is heard (and monitored), as libobs mixes its program's tree; OBS's Desktop Audio and Mic/Aux come over as global sources; the Mac's sound without a screen picture | `engine.rs`, `obs.rs` | unit tests (a tone heard only when its scene, or a scene showing it, is on air); `capture --sound --tiny` |
+| **The engine draws for the app** (switch "Ferrocast's own engine", beta, off by default): streams and recordings drawn, mixed and encoded with no libobs frames; the Studio's scene changes follow within a quarter second, other edits reopen the scenes (at most every 2 s) | `own.rs` (`Collection::stream_drawn`, `record_drawn`, `follow`), the desktop app, dashboard | `own_draw`: two scenes over real RTMP, a switch and an edit mid-stream: every frame and the sound arrive, each part 0.5-0.7 steps on average from libobs's own picture |
+| A new bitrate while live (VideoToolbox), for both own paths | `apple/vt.rs` | 11,976 kbps, then 2,166 a second after asking for 2,000 |
 
 CI: Linux's software OpenGL can't give a texture two views, so the compositor refuses it with
 a reason (tests skip there); macOS and Windows run every engine test.
 Still to do: Windows capture (WGC, WASAPI, Media Foundation cameras) and native encoders (FFmpeg
 covers encoding there for now); the engine drawing for the app (E7: it opens the app's
 collections now; next it takes over the preview and output); zero-copy (IOSurface and shared
-D3D textures from capture to encoder); the rest of libobs's filters (Scale/Aspect Ratio, render
+D3D textures from capture to encoder); the preview drawn by the engine too (libobs still
+draws it); edits applied in place instead of reopening the scenes; the rest of libobs's filters (Scale/Aspect Ratio, render
 and video delay, HDR tone mapping); sound filters compared against libobs's output; web pages;
 game capture (E5); helper processes (E6).
 
