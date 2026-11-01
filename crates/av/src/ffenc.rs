@@ -26,6 +26,11 @@ pub fn set_ffmpeg(path: &Path) {
 }
 
 fn ffmpeg() -> Option<PathBuf> {
+    ffmpeg_path()
+}
+
+/// FFmpeg's path, as set or found on the PATH.
+pub(crate) fn ffmpeg_path() -> Option<PathBuf> {
     if let Some(p) = FFMPEG.lock().ok().and_then(|p| p.clone()) {
         return Some(p);
     }
