@@ -1897,17 +1897,19 @@ impl Engine {
             return;
         }
         let now_ms = u64::try_from(now().0).unwrap_or(0);
-        let healths: Vec<(String, Health)> =
-            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone())).collect();
+        let healths: Vec<(String, Health, bool)> =
+            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone(), r.light)).collect();
         let canvas_of = |id: &str| cfg.destinations.iter().find(|d| d.id == id).map(|d| d.canvas).unwrap_or_default();
-        let (main_kbps, vertical_kbps) = (g.hub.stats().kbps, g.vhub.stats().kbps);
+        let (main_kbps, vertical_kbps, light_kbps) = (g.hub.stats().kbps, g.vhub.stats().kbps, g.lhub.stats().kbps);
         let samples: Vec<Sample<'_>> = healths
             .iter()
-            .filter(|(_, h)| h.state == PushState::Live)
-            .map(|(id, h)| Sample {
+            .filter(|(_, h, _)| h.state == PushState::Live)
+            .map(|(id, h, light)| Sample {
                 id,
                 kbps: h.kbps,
+                // Measured against the stream it sends: the lighter one is meant to be less.
                 want_kbps: match canvas_of(id) {
+                    Canvas::Main if *light => light_kbps,
                     Canvas::Main => main_kbps,
                     Canvas::Vertical => vertical_kbps,
                 },
