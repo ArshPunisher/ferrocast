@@ -7,6 +7,10 @@
 //!   a passphrase encrypted (AES-CTR, the key made from the passphrase and a random nonce by
 //!   PBKDF2-HMAC-SHA256). Picked by `profile=1`, or by a passphrase (the key, or `secret=`);
 //!   `aes-type=` 128 or 256 (the default, as librist).
+//!
+//! Either profile goes over two connections at once with `via=` (`via=en0,en7`): every packet
+//! by each, the receiver keeping the first copy (SMPTE 2022-7 style; librist merges them), so
+//! the stream rides out one of them dropping.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -34,7 +38,8 @@ type Sent = (u16, Bytes);
 
 /// What both the sending and the answering side reach.
 struct Shared {
-    rtp: Arc<UdpSocket>,
+    /// One socket per connection the stream goes over (`via=`), each packet sent by all.
+    rtp: Vec<Arc<UdpSocket>>,
     to: SocketAddr,
     kept: Mutex<VecDeque<Sent>>,
     ssrc: u32,
@@ -47,12 +52,26 @@ struct Shared {
 }
 
 impl Shared {
-    /// An RTP packet as it goes on the wire.
-    async fn send_rtp(&self, p: &[u8]) -> std::io::Result<usize> {
-        match &self.main {
-            Some(m) => self.rtp.send_to(&m.wrap(DATA_SRC_PORT, DATA_DST_PORT, p), self.to).await,
-            None => self.rtp.send_to(p, self.to).await,
+    /// An RTP packet as it goes on the wire, over every connection: fine while one of them
+    /// takes it.
+    async fn send_rtp(&self, p: &[u8]) -> std::io::Result<()> {
+        let wrapped;
+        let p = match &self.main {
+            Some(m) => {
+                wrapped = m.wrap(DATA_SRC_PORT, DATA_DST_PORT, p);
+                &wrapped[..]
+            }
+            None => p,
+        };
+        let mut last = Ok(());
+        let mut any = false;
+        for s in &self.rtp {
+            match s.send_to(p, self.to).await {
+                Ok(_) => any = true,
+                Err(e) => last = Err(e),
+            }
         }
+        if any { Ok(()) } else { last }
     }
 }
 
@@ -70,18 +89,30 @@ pub(crate) async fn session(
         .ok()
         .and_then(|mut it| it.next())
         .ok_or_else(|| DirectError::Unreachable(name.clone()))?;
-    let any: SocketAddr = if to.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }
-        .parse()
-        .map_err(|_| DirectError::Unreachable(name.clone()))?;
     let main = Main::of(d, &a);
-    let rtp = Arc::new(UdpSocket::bind(any).await.map_err(|_| DirectError::Unreachable(name.clone()))?);
     // The main profile sends its reports on the same port; the simple one on the next.
-    let (rtcp, rtcp_to) = if main.is_some() {
-        (rtp.clone(), to)
-    } else {
-        let rtcp = UdpSocket::bind(any).await.map_err(|_| DirectError::Unreachable(name.clone()))?;
-        (Arc::new(rtcp), SocketAddr::new(to.ip(), to.port() + 1))
-    };
+    let rtcp_to = if main.is_some() { to } else { SocketAddr::new(to.ip(), to.port() + 1) };
+    let (mut rtp, mut rtcp) = (Vec::new(), Vec::new());
+    for via in vias(&a) {
+        let pair = async {
+            let r = Arc::new(socket(via.as_deref(), to).await?);
+            let c = if main.is_some() { r.clone() } else { Arc::new(socket(via.as_deref(), to).await?) };
+            Ok::<_, std::io::Error>((r, c))
+        };
+        match pair.await {
+            Ok((r, c)) => {
+                rtp.push(r);
+                rtcp.push(c);
+            }
+            // A connection that isn't up now (the hotspot unplugged): the others carry it.
+            Err(e) => {
+                tracing::info!(dest = %d.id, via = via.as_deref().unwrap_or("default"), error = %e, "RIST: a connection isn't there")
+            }
+        }
+    }
+    if rtp.is_empty() {
+        return Err(DirectError::Unreachable(format!("{name} (none of the connections in via= is up)")));
+    }
     // Retransmissions use the same SSRC with its lowest bit set (TR-06-1).
     let ssrc = fastrand::u32(..) & !1;
     let shared = Arc::new(Shared {
@@ -99,6 +130,28 @@ pub(crate) async fn session(
     tokio::select! {
         out = feed_ts(hub, health, stream, &mut sink) => out,
         () = answer(shared.clone(), rtcp, rtcp_to, health) => Ok(Ended::StreamEnded),
+    }
+}
+
+/// The connections to send over: `via=` names them (or their addresses), comma between;
+/// without it, whichever the system picks (`None`).
+fn vias(a: &Address) -> Vec<Option<String>> {
+    let named: Vec<Option<String>> = a
+        .param("via")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| Some(v.to_string()))
+        .collect();
+    if named.is_empty() { vec![None] } else { named }
+}
+
+/// A UDP socket to reach `to`, over `via` or the system's choice.
+async fn socket(via: Option<&str>, to: SocketAddr) -> std::io::Result<UdpSocket> {
+    match via {
+        Some(v) => crate::links::socket_via(v, to),
+        None => UdpSocket::bind(if to.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }).await,
     }
 }
 
@@ -495,16 +548,33 @@ pub(crate) fn lost(buf: &[u8]) -> Vec<u16> {
 }
 
 /// Sends reports, and sends again what the receiver asks for.
-async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr, health: &watch::Sender<Health>) {
+async fn answer(shared: Arc<Shared>, rtcp: Vec<Arc<UdpSocket>>, rtcp_to: SocketAddr, health: &watch::Sender<Health>) {
     let started = Instant::now();
+    // Every connection's answers into one queue (the readers stop when this does).
+    let (tx, mut answers) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(256);
+    let mut readers = tokio::task::JoinSet::new();
+    for s in &rtcp {
+        let (s, tx) = (s.clone(), tx.clone());
+        readers.spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                match s.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if tx.send((buf[..n].to_vec(), from)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A connection gone for now: don't spin on it.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        });
+    }
     let mut tick = tokio::time::interval(REPORT_EVERY);
     // The link's health: the last round trip, and the counts a second ago.
     let mut rtt = None::<Duration>;
     let mut every_second = tokio::time::interval(Duration::from_secs(1));
     let mut counted = (0u64, 0u64, 0u64);
-    let mut buf = vec![0u8; 2048];
-    // The main profile's reports go in GRE, from and to the real ports.
-    let here = rtcp.local_addr().map(|a| a.port()).unwrap_or(0);
     loop {
         tokio::select! {
             _ = every_second.tick() => {
@@ -525,24 +595,27 @@ async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr, 
             _ = tick.tick() => {
                 let mut r = report(shared.ssrc, started);
                 r.extend_from_slice(&echo_request(shared.ssrc));
-                let r = match &shared.main {
-                    Some(m) => m.wrap(here, rtcp_to.port(), &r),
-                    None => r,
-                };
-                let _ = rtcp.send_to(&r, rtcp_to).await;
+                // Over every connection, so the receiver knows each way back.
+                for s in &rtcp {
+                    let wire = match &shared.main {
+                        // The main profile's reports go in GRE, from and to the real ports.
+                        Some(m) => m.wrap(s.local_addr().map(|a| a.port()).unwrap_or(0), rtcp_to.port(), &r),
+                        None => r.clone(),
+                    };
+                    let _ = s.send_to(&wire, rtcp_to).await;
+                }
             }
-            r = rtcp.recv_from(&mut buf) => {
-                let Ok((n, from)) = r else { continue };
+            Some((buf, from)) = answers.recv() => {
                 // Only the receiver's answers (a stranger's packets could make us work for nothing).
                 if from.ip() != rtcp_to.ip() {
                     continue;
                 }
                 let got = match &shared.main {
-                    Some(m) => match m.unwrap(&buf[..n]) {
+                    Some(m) => match m.unwrap(&buf) {
                         Some(inner) => inner,
                         None => continue,
                     },
-                    None => buf[..n].to_vec(),
+                    None => buf,
                 };
                 rtt = echo_round_trip(&got).or(rtt);
                 let want = lost(&got);

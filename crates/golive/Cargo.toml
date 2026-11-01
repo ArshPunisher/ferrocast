@@ -37,6 +37,10 @@ aes = "0.8"
 ctr = "0.9"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
+# Sending over two connections at once (RIST over Wi-Fi and a phone's hotspot): the computer's
+# networks (if-addrs, MIT/BSD-3) and a socket held to one of them (socket2, MIT/Apache-2.0).
+if-addrs = "0.13"
+socket2 = { version = "0.6", features = ["all"] }
 
 [lints]
 workspace = true
