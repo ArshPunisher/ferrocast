@@ -447,6 +447,9 @@ pub struct ScenesConfig {
     pub clip_on_big_moments: bool,
     /// Each saved clip also as a 1080×1920 copy for Shorts, TikTok and Reels (ffmpeg).
     pub vertical_clips: bool,
+    /// The vertical copy fills the frame, following a face that fills the picture (else the
+    /// action), instead of the whole clip over a blurred copy of itself.
+    pub vertical_fill: bool,
     /// Away: while live, the BRB scene after this many minutes with the Show's mics silent,
     /// and back when you talk again (0: off; the Studio only).
     pub away_minutes: u32,
@@ -537,6 +540,7 @@ impl Default for ScenesConfig {
             clip_command: true,
             clip_on_big_moments: false,
             vertical_clips: false,
+            vertical_fill: false,
             away_minutes: 0,
             clip_by_voice: false,
             clip_captions: false,

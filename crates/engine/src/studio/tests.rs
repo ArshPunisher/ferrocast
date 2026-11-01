@@ -893,6 +893,31 @@ async fn markers_export_as_csv_and_text() {
     assert!(err.to_string().starts_with("sound:"));
 }
 
+/// A 30 s clip looked at twice a second: 60 pictures in batches, the frame on the right.
+#[tokio::test]
+async fn a_clip_is_looked_at_in_batches_to_fill_the_frame() {
+    let Some(ffmpeg) = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    else {
+        return;
+    };
+    let (e, d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let clip = d.path().join("clip.mp4");
+    let ok = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10:duration=30"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let expr = e.clip_focus(&ffmpeg, &clip).await.expect("a path");
+    assert_eq!(*studio.focus_batches.lock().unwrap(), [40, 20]);
+    assert!(expr.contains("0.8000"), "{expr}");
+}
+
 #[tokio::test]
 async fn a_scene_change_while_live_is_a_chapter() {
     let (e, _d) = engine().await;
@@ -1112,6 +1137,8 @@ struct FakeStudio {
     /// What the mic hears (dBFS), and whether the camera's picture is black.
     mic_db: Mutex<f32>,
     cam_black: Mutex<bool>,
+    /// How many pictures each `focus` call got.
+    focus_batches: Mutex<Vec<usize>>,
 }
 
 #[async_trait]
@@ -1137,6 +1164,12 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn defaults(&self, _kind: String) -> Result<Value, String> {
         Ok(json!({}))
     }
+    async fn focus(&self, pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
+        // The eye on the right, in every picture.
+        self.focus_batches.lock().unwrap().push(pictures.len());
+        Ok(vec![Some(0.8); pictures.len()])
+    }
+
     async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
         use crate::studio_host::StudioAct as A;
         let lock = |m: &Mutex<String>| m.lock().unwrap().clone();

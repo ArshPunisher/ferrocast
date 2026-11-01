@@ -2120,6 +2120,15 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn focus(&self, pictures: Vec<Vec<u8>>, w: u32, h: u32) -> Result<Vec<Option<f32>>, String> {
+        // Vision takes a moment per picture: off the async threads.
+        tokio::task::spawn_blocking(move || {
+            pictures.iter().map(|p| ferrocast_studio::focus_x(p, w, h)).collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     async fn record_chapter(&self, name: String) -> Result<(), String> {
         self.on_main(move |h| {
             let r = h.record.as_ref().ok_or("Nothing is recording.")?;
