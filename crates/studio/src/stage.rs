@@ -1669,6 +1669,47 @@ impl Stage {
         Ok(())
     }
 
+    /// The privacy guard: `{ hide_notifications: bool, hide_apps: string[] }`, what a display
+    /// capture leaves out (notifications unless turned off; apps by bundle id or name).
+    pub fn privacy(&self) -> Value {
+        let p = &self.doc.borrow()["ferrocast"]["privacy"];
+        json!({
+            "hide_notifications": p["hide_notifications"].as_bool() != Some(false),
+            "hide_apps": p["hide_apps"].as_array().cloned().unwrap_or_default(),
+        })
+    }
+
+    /// Sets it (as `privacy` gives it); an undo step like any edit. Display captures start again
+    /// with the new apps left out.
+    pub fn set_privacy(&self, privacy: &Value) -> Result<(), StudioError> {
+        let notifications = match &privacy["hide_notifications"] {
+            Value::Null => true,
+            Value::Bool(b) => *b,
+            _ => return Err(fail("hide_notifications: true or false.")),
+        };
+        let list = privacy["hide_apps"].as_array().cloned().unwrap_or_default();
+        if list.len() > 32 {
+            return Err(fail("hide_apps: 32 apps at most."));
+        }
+        let mut apps: Vec<String> = Vec::new();
+        for a in &list {
+            let a = a.as_str().map(str::trim).unwrap_or_default();
+            if a.is_empty() || a.len() > 200 || a.chars().any(char::is_control) {
+                return Err(fail("hide_apps: app names or bundle ids."));
+            }
+            if !apps.iter().any(|b| b.eq_ignore_ascii_case(a)) {
+                apps.push(a.to_string());
+            }
+        }
+        self.edit(|d| {
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"]["privacy"] = json!({ "hide_notifications": notifications, "hide_apps": apps });
+        });
+        Ok(())
+    }
+
     /// How these sources' pictures look now (a 32x18 glance): brightness, how much it varies, and a
     /// fingerprint that changes when the picture does. Sources with no picture yet are left out.
     pub fn look(&self, names: &[String]) -> Result<std::collections::HashMap<String, crate::Look>, StudioError> {
@@ -3145,6 +3186,27 @@ mod tests {
         // Off again.
         s.set_audio_care(&json!({})).unwrap();
         assert_eq!(s.audio_care(), json!({ "ducking": null, "loudness_lufs": null }));
+    }
+
+    #[test]
+    fn the_privacy_guard_is_kept_in_the_document_and_checked() {
+        let s = stage();
+        assert_eq!(s.privacy(), json!({ "hide_notifications": true, "hide_apps": [] }));
+        s.set_privacy(&json!({ "hide_notifications": false, "hide_apps": ["Mail", " com.hnc.Discord ", "mail"] }))
+            .unwrap();
+        let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord"] });
+        assert_eq!(s.privacy(), kept);
+        assert_eq!(ferrocast_av::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord"]);
+        let many: Vec<String> = (0..33).map(|i| format!("App {i}")).collect();
+        for b in [json!({ "hide_apps": [""] }), json!({ "hide_apps": [1] }), json!({ "hide_apps": many })] {
+            assert!(s.set_privacy(&b).is_err(), "{b}");
+        }
+        assert_eq!(s.privacy(), kept);
+        s.set_privacy(&json!({})).unwrap();
+        assert_eq!(
+            ferrocast_av::obs::privacy_hide(&s.doc.borrow()),
+            vec![ferrocast_av::obs::NOTIFICATIONS.to_string()]
+        );
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {

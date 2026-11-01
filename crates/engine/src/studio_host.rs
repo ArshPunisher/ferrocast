@@ -1322,6 +1322,12 @@ pub enum StudioAct {
     SetAudioCare {
         care: Value,
     },
+    /// The privacy guard: `{ hide_notifications, hide_apps }`, what a display capture leaves out.
+    Privacy,
+    /// Sets it (as `Privacy` gives it).
+    SetPrivacy {
+        privacy: Value,
+    },
     Filters {
         name: String,
     },
@@ -1554,7 +1560,13 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources | A::StopVertical | A::AudioCare => Ok(()),
+            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy => Ok(()),
+            A::SetPrivacy { privacy } => {
+                if !privacy.is_object() || privacy.to_string().len() > 8_000 {
+                    return Err(EngineError::Invalid("privacy: { hide_notifications, hide_apps }.".into()));
+                }
+                Ok(())
+            }
             // The Studio checks the names and numbers (it knows the sources); here only its size.
             A::SetAudioCare { care } => {
                 if !care.is_object() || care.to_string().len() > 8_000 {
@@ -1808,6 +1820,7 @@ impl StudioAct {
                 | A::Levels { .. }
                 | A::Look { .. }
                 | A::AudioCare
+                | A::Privacy
                 | A::Filters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
