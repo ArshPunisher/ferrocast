@@ -21,7 +21,7 @@ use crate::{
     check_name, own,
 };
 
-mod follow;
+pub(crate) mod follow;
 mod moves;
 mod vertical;
 pub use follow::{Face, FaceFollow, FollowLook, find_busy, find_faces};

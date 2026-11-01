@@ -1548,6 +1548,95 @@ impl Stage {
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
     }
 
+    // ------------------------------------------------------------------ face follow
+
+    /// Starts an item following faces (or what stands out, `action`): it fills the picture's
+    /// height, centred; how it was comes back with `stop_follow`.
+    pub fn start_follow(&self, scene: &str, id: i64, action: bool) -> Result<crate::FaceFollow, StudioError> {
+        use crate::collection::follow::aim;
+        let before = self.transform(scene, id)?;
+        if before.width == 0 || before.height == 0 {
+            return Err(fail("That source shows no picture yet."));
+        }
+        let (cw, ch) = self.canvas_of(scene);
+        let shown_w = (before.width as i32 - before.crop_left - before.crop_right).max(1) as f32;
+        let shown_h = (before.height as i32 - before.crop_top - before.crop_bottom).max(1) as f32;
+        let scale = ch as f32 / shown_h;
+        let t = Transform {
+            x: aim(0.5, shown_w * scale, cw as f32),
+            y: 0.0,
+            rotation: 0.0,
+            scale_x: scale,
+            scale_y: scale,
+            alignment: 5,
+            bounds: "none".into(),
+            bounds_alignment: 0,
+            bounds_width: 0.0,
+            bounds_height: 0.0,
+            ..before.clone()
+        };
+        self.set_transform(scene, id, &t)?;
+        Ok(crate::FaceFollow { scene: scene.into(), id, action, before, misses: 0 })
+    }
+
+    /// A small picture of the following item's source, to find the face in.
+    pub fn follow_look(&self, f: &crate::FaceFollow) -> Result<Option<crate::FollowLook>, StudioError> {
+        use crate::collection::follow::LOOK_WIDTH;
+        let name = name_of(&self.item(&f.scene, f.id)?).to_string();
+        let (sw, sh) = self.size_of(&name);
+        let e = self.engine()?;
+        let Some((id, _)) = e.engine.source_named(&name) else { return Ok(None) };
+        if sw == 0 || sh == 0 {
+            return Ok(None);
+        }
+        let h = ((LOOK_WIDTH as f32 * sh as f32 / sw as f32).round() as u32).clamp(1, LOOK_WIDTH * 4);
+        Ok(e.engine.snapshot_source_at(id, (LOOK_WIDTH, h)).map(|rgba| crate::FollowLook {
+            rgba,
+            width: LOOK_WIDTH,
+            height: h,
+        }))
+    }
+
+    /// Moves the item a step toward `face` (the biggest found), or keeps it where it is.
+    pub fn follow_step(&self, f: &mut crate::FaceFollow, face: Option<crate::Face>) -> Result<(), StudioError> {
+        use crate::collection::follow::{aim, ease, shown_mid};
+        let Some(face) = face else {
+            f.misses += 1;
+            return Ok(());
+        };
+        f.misses = 0;
+        let t = self.transform(&f.scene, f.id)?;
+        let (cw, _) = self.canvas_of(&f.scene);
+        let shown_w = (t.width as i32 - t.crop_left - t.crop_right).max(1) as f32 * t.scale_x.abs();
+        let mid = shown_mid(&face, t.width as f32, t.crop_left as f32, t.crop_right as f32);
+        let left = match t.alignment & 3 {
+            1 => t.x,
+            2 => t.x - shown_w,
+            _ => t.x - shown_w / 2.0,
+        };
+        let to = ease(left, aim(mid, shown_w, cw as f32), cw as f32);
+        if to != left {
+            self.set_transform(&f.scene, f.id, &Transform { x: t.x + (to - left), ..t })?;
+        }
+        Ok(())
+    }
+
+    /// Puts the item back as it was before following.
+    pub fn stop_follow(&self, f: &crate::FaceFollow) {
+        if self.item(&f.scene, f.id).is_ok() {
+            let _ = self.set_transform(&f.scene, f.id, &f.before);
+        }
+    }
+
+    /// The canvas a scene is drawn on: the vertical picture's, or the main one.
+    fn canvas_of(&self, scene: &str) -> (u32, u32) {
+        if self.vertical_order().iter().any(|n| n == scene) {
+            crate::collection::VERTICAL_SIZE
+        } else {
+            (self.canvas.width, self.canvas.height)
+        }
+    }
+
     // ------------------------------------------------------------------ Studio Mode's extras
 
     /// Ferrocast's own settings kept in the collection (Studio Mode's options, quick
@@ -2499,5 +2588,33 @@ mod tests {
         assert!(!ok(s.fade_to_black()));
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(px(), [255, 0, 0], "back");
+    }
+
+    #[test]
+    fn face_follow_fills_the_height_looks_and_goes_back() {
+        let s = Stage::new(Canvas { width: 1080, height: 1920, fps: 30 }, "Tall").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        let cam = ok(s.add_source(
+            "Tall",
+            "color_source_v3",
+            "Cam",
+            &json!({ "color": 4278255360u32, "width": 1920, "height": 1080 }),
+            false,
+        ));
+        let mut f = ok(s.start_follow("Tall", cam.id, false));
+        let t = ok(s.transform("Tall", cam.id));
+        assert!((t.scale_y - 1920.0 / 1080.0).abs() < 1e-3, "fills the height");
+        assert!((t.x - (540.0 - 1920.0 * t.scale_x / 2.0)).abs() < 0.5, "centred");
+        let look = ok(s.follow_look(&f)).unwrap_or_else(|| panic!("a picture to look at"));
+        assert_eq!((look.width, look.height, look.rgba.len()), (320, 180, 320 * 180 * 4));
+        assert_eq!(&look.rgba[0..3], &[0, 255, 0], "the source itself");
+        // A face at the left edge: the item steps right (never past its edge).
+        let face = crate::Face { x: 0.0, y: 0.4, w: 0.1, h: 0.2 };
+        ok(s.follow_step(&mut f, Some(face)));
+        assert!(ok(s.transform("Tall", cam.id)).x > t.x);
+        s.stop_follow(&f);
+        assert_eq!(ok(s.transform("Tall", cam.id)).scale_x, 1.0, "back as it was");
     }
 }

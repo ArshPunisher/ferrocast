@@ -10,7 +10,7 @@ use crate::StudioError;
 use crate::ffi;
 
 /// How wide the snapshot faces are looked for in is (small: a face fills plenty of it).
-const LOOK_WIDTH: u32 = 320;
+pub(crate) const LOOK_WIDTH: u32 = 320;
 
 /// A move smaller than this share of the picture's width isn't made (no jitter).
 const DEAD_ZONE: f32 = 0.03;
@@ -69,7 +69,7 @@ pub struct FaceFollow {
     pub id: i64,
     /// Follows what stands out (the action) instead of a face.
     pub action: bool,
-    before: Transform,
+    pub(crate) before: Transform,
     /// Looks in a row without a face.
     pub misses: u32,
 }
