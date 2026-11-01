@@ -1028,6 +1028,19 @@ impl Engine {
         self.gpu.render(&scene)
     }
 
+    /// A scene drawn on a canvas of `canvas` size and scaled down whole to `size` (bicubic),
+    /// RGBA: the Scenes grid's tiles, a vertical scene's at its own shape.
+    pub fn snapshot_scene_at(&self, name: &str, canvas: (u32, u32), size: (u32, u32)) -> Result<Vec<u8>, AvError> {
+        let scene = {
+            let st = self.lock();
+            if !st.scenes.contains_key(name) {
+                return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+            }
+            build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns())
+        };
+        self.gpu.render(&scaled(scene, size.0.max(1), size.1.max(1), Filter::Bicubic))
+    }
+
     /// The scene on air drawn now, RGBA (a preview or a screenshot).
     pub fn snapshot(&self) -> Result<Vec<u8>, AvError> {
         let frame = {
@@ -1539,6 +1552,11 @@ mod tests {
         // Studio Mode: A previewed while B is on air.
         assert_eq!(&e.snapshot_scene("A").unwrap_or_default()[0..4], &[255, 0, 0, 255]);
         assert!(e.snapshot_scene("Nope").is_err());
+        // A tile: the whole scene scaled to 64x36 (the blue square at 10,10 now at 1,1).
+        let tile = e.snapshot_scene_at("A", (640, 360), (64, 36)).unwrap_or_default();
+        assert_eq!(tile.len(), 64 * 36 * 4);
+        assert_eq!(&tile[(30 * 64 + 50) * 4..(30 * 64 + 50) * 4 + 4], &[255, 0, 0, 255]);
+        assert_eq!(&tile[(5 * 64 + 5) * 4..(5 * 64 + 5) * 4 + 4], &[0, 0, 255, 255]);
     }
 
     #[test]
