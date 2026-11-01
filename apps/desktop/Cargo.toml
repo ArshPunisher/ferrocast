@@ -14,10 +14,6 @@ name = "ferrocast"
 path = "src/main.rs"
 
 # Stands in for OBS's mux helper next to Ferrocast (MKV, FLV, TS recordings); bundled beside it.
-[[bin]]
-name = "obs-ffmpeg-mux"
-path = "src/bin/obs-ffmpeg-mux.rs"
-
 [features]
 # The Studio's Strong noise removal (DeepFilterNet): on in CI and release builds.
 deepfilter = ["ferrocast-studio/deepfilter"]
