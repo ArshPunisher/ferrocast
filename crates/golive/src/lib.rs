@@ -20,6 +20,7 @@ pub mod push;
 mod rist;
 pub mod target;
 pub mod ts;
+mod whip;
 
 mod conn;
 

@@ -35,8 +35,8 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// The video's parameter sets, as Annex B, and how long its NAL lengths are.
 #[derive(Debug, Clone, Default)]
-struct VideoSetup {
-    hevc: bool,
+pub(crate) struct VideoSetup {
+    pub(crate) hevc: bool,
     length_size: usize,
     /// SPS and PPS (H.264), or VPS, SPS and PPS (HEVC), each with its start code.
     params: Vec<u8>,
@@ -118,6 +118,59 @@ fn pes_time(prefix: u8, t: u64) -> [u8; 5] {
     ]
 }
 
+/// The video's setup from its header tag (H.264 or HEVC), or None for anything else.
+pub(crate) fn video_setup(header: &[u8]) -> Option<VideoSetup> {
+    match flv::video_codec(header) {
+        Some(flv::VideoCodec::H264) => header.get(5..).and_then(avcc),
+        Some(flv::VideoCodec::Hevc) => header.get(5..).and_then(hvcc),
+        _ => None,
+    }
+}
+
+/// A frame tag as Annex B (with the parameter sets before a keyframe, and an access unit
+/// delimiter first when `aud`): whether it's a keyframe, its composition offset (ms), and the
+/// bytes. None for anything that isn't a coded frame.
+pub(crate) fn annex_b(setup: &VideoSetup, data: &[u8], aud: bool) -> Option<(bool, i32, Vec<u8>)> {
+    let key = flv::video_is_keyframe(data);
+    let &b = data.first()?;
+    // Classic AVC: type, packet type, 3-byte CTS. Enhanced: header, FourCC, then a CTS only for
+    // CodedFrames (1), not CodedFramesX (3).
+    let (cts, body) = if b & 0x80 != 0 {
+        match b & 0x0F {
+            1 => (data.get(5..8).map_or(0, cts24), data.get(8..)?),
+            3 => (0, data.get(5..)?),
+            _ => return None,
+        }
+    } else {
+        if data.get(1) != Some(&1) {
+            return None;
+        }
+        (data.get(2..5).map_or(0, cts24), data.get(5..)?)
+    };
+    let mut es = Vec::with_capacity(body.len() + setup.params.len() + 16);
+    if aud {
+        // An access unit delimiter first, as broadcast receivers like.
+        if setup.hevc {
+            es.extend_from_slice(&[0, 0, 0, 1, 0x46, 0x01, 0x50]);
+        } else {
+            es.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]);
+        }
+    }
+    if key {
+        es.extend_from_slice(&setup.params);
+    }
+    let mut at = 0;
+    while at + setup.length_size <= body.len() {
+        let n = body[at..at + setup.length_size].iter().fold(0usize, |n, b| (n << 8) | usize::from(*b));
+        at += setup.length_size;
+        let Some(nal) = body.get(at..at + n) else { break };
+        es.extend_from_slice(&[0, 0, 0, 1]);
+        es.extend_from_slice(nal);
+        at += n;
+    }
+    Some((key, cts, es))
+}
+
 /// Writes TS as tags come; each call hands back the whole packets it made.
 #[derive(Debug, Default)]
 pub struct TsMuxer {
@@ -140,11 +193,7 @@ impl TsMuxer {
     /// before the header) are left out.
     pub fn video(&mut self, ts: u32, data: &[u8]) -> Vec<u8> {
         if flv::video_is_header(data) {
-            let setup = match flv::video_codec(data) {
-                Some(flv::VideoCodec::H264) => data.get(5..).and_then(avcc),
-                Some(flv::VideoCodec::Hevc) => data.get(5..).and_then(hvcc),
-                _ => None,
-            };
+            let setup = video_setup(data);
             if setup.is_some() {
                 self.video = setup;
                 self.started = false;
@@ -156,41 +205,7 @@ impl TsMuxer {
         if !self.started && !key {
             return Vec::new();
         }
-        let Some(&b) = data.first() else { return Vec::new() };
-        // Classic AVC: type, packet type, 3-byte CTS. Enhanced: header, FourCC, then a CTS
-        // only for CodedFrames (1), not CodedFramesX (3).
-        let (cts, body) = if b & 0x80 != 0 {
-            match b & 0x0F {
-                1 => (data.get(5..8).map_or(0, cts24), data.get(8..)),
-                3 => (0, data.get(5..)),
-                _ => return Vec::new(),
-            }
-        } else {
-            if data.get(1) != Some(&1) {
-                return Vec::new();
-            }
-            (data.get(2..5).map_or(0, cts24), data.get(5..))
-        };
-        let Some(body) = body else { return Vec::new() };
-        let mut es = Vec::with_capacity(body.len() + setup.params.len() + 16);
-        // An access unit delimiter first, as broadcast receivers like.
-        if setup.hevc {
-            es.extend_from_slice(&[0, 0, 0, 1, 0x46, 0x01, 0x50]);
-        } else {
-            es.extend_from_slice(&[0, 0, 0, 1, 0x09, 0xF0]);
-        }
-        if key {
-            es.extend_from_slice(&setup.params);
-        }
-        let mut at = 0;
-        while at + setup.length_size <= body.len() {
-            let n = body[at..at + setup.length_size].iter().fold(0usize, |n, b| (n << 8) | usize::from(*b));
-            at += setup.length_size;
-            let Some(nal) = body.get(at..at + n) else { break };
-            es.extend_from_slice(&[0, 0, 0, 1]);
-            es.extend_from_slice(nal);
-            at += n;
-        }
+        let Some((key, cts, es)) = annex_b(&setup, data, true) else { return Vec::new() };
         let dts = self.time(ts);
         let pts = (dts as i64 + i64::from(cts) * 90).max(0) as u64;
         let mut out = Vec::new();
@@ -252,7 +267,7 @@ impl TsMuxer {
     /// A tag's time on the 90 kHz clock.
     fn time(&mut self, ts: u32) -> u64 {
         let base = *self.base.get_or_insert(ts);
-        START + u64::from(ts.wrapping_sub(base)) * 90
+        START + u64::from(ts.saturating_sub(base)) * 90
     }
 
     /// PAT and PMT.
@@ -426,12 +441,18 @@ pub(crate) mod tests {
     /// Three seconds of FFmpeg's own FLV (H.264 with B-frames, AAC) as tags; None without an
     /// FFmpeg with x264.
     pub(crate) fn sample_tags() -> Option<Vec<(u8, u32, Vec<u8>)>> {
+        sample_tags_with(2)
+    }
+
+    /// The same with `bframes` B-frames between pictures (0: none, as WebRTC needs).
+    pub(crate) fn sample_tags_with(bframes: u32) -> Option<Vec<(u8, u32, Vec<u8>)>> {
         use std::process::Command;
         let path =
             std::env::temp_dir().join(format!("ferrocast-sample-{}-{}.flv", std::process::id(), fastrand::u32(..)));
         let made = Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30", "-f", "lavfi"])
-            .args(["-i", "sine=frequency=440", "-t", "3", "-c:v", "libx264", "-bf", "2", "-g", "30", "-c:a", "aac"])
+            .args(["-i", "sine=frequency=440", "-t", "3", "-c:v", "libx264", "-g", "30", "-c:a", "aac"])
+            .args(["-bf", &bframes.to_string()])
             .arg(&path)
             .status();
         if !made.is_ok_and(|s| s.success()) {

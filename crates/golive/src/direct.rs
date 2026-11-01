@@ -156,7 +156,26 @@ pub fn check(d: &Direct) -> Result<(), DirectError> {
             Ok(())
         }
         Kind::Rist => crate::rist::check(d, &Address::parse(&d.url)?),
-        Kind::Whip => Err(DirectError::Refused("WebRTC (WHIP) isn't in this build yet.".into())),
+        Kind::Whip => whip_address(&d.url).map(|_| ()),
+    }
+}
+
+/// A WHIP endpoint: https, or plain http only to this computer (the token never crosses the
+/// network unencrypted). Read as a URL, so a host hidden after `user@` is the host it is.
+pub(crate) fn whip_address(url: &str) -> Result<reqwest::Url, DirectError> {
+    let u = reqwest::Url::parse(url.trim())
+        .map_err(|_| DirectError::Address("The WHIP address isn't a web address.".into()))?;
+    let here = u.host_str().is_some_and(|h| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if u.scheme() == "https" || (u.scheme() == "http" && here) {
+        Ok(u)
+    } else {
+        Err(DirectError::Address("A WHIP address is https:// (plain http:// only on this computer).".into()))
     }
 }
 
@@ -220,7 +239,7 @@ async fn session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stream: 
     match d.kind {
         Kind::Srt => srt_session(d, hub, health, stream).await,
         Kind::Rist => crate::rist::session(d, hub, health, stream).await,
-        Kind::Whip => Err(DirectError::Refused("WebRTC (WHIP) isn't in this build yet.".into())),
+        Kind::Whip => crate::whip::session(d, hub, health, stream).await,
     }
 }
 
@@ -337,6 +356,18 @@ mod tests {
         assert_eq!(Kind::of("http://localhost:8889/whip"), Some(Kind::Whip));
         assert_eq!(Kind::of("http://example.com/whip"), None, "plain http only on this computer");
         assert_eq!(Kind::of("rtmp://a/live"), None);
+    }
+
+    #[test]
+    fn a_whip_token_never_goes_unencrypted_off_this_computer() {
+        assert!(whip_address("https://whip.example/x").is_ok());
+        assert!(whip_address("http://127.0.0.1:8889/whip").is_ok());
+        assert!(whip_address("http://[::1]/whip").is_ok());
+        assert!(whip_address("http://localhost/whip").is_ok());
+        // A remote host hidden behind "localhost:80@".
+        assert!(whip_address("http://localhost:80@evil.example/whip").is_err());
+        assert!(whip_address("http://example.com/whip").is_err());
+        assert!(whip_address("ftp://localhost/x").is_err());
     }
 
     #[test]

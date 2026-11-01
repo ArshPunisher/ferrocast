@@ -23,6 +23,14 @@ tokio.workspace = true
 # SRT sends (the Studio's direct destinations): pure Rust SRT, Apache-2.0.
 srt-tokio = "0.4.4"
 futures = "0.3"
+# WHIP sends: WebRTC (sans-IO, as the guest crate uses it), the offer posted over HTTPS, and the
+# stream's AAC made Opus (WebRTC's sound): Symphonia's AAC decoder (MPL-2.0), libopus (BSD-3,
+# built from its source).
+str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
+reqwest = { version = "0.13" }
+symphonia-core = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+opus = "0.4"
 
 [lints]
 workspace = true
