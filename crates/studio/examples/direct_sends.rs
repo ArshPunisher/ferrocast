@@ -40,7 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
     )?;
     // The app's own defaults (B-frames on), as a user would send.
-    let mut enc = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+    // FERROCAST_ENCODER picks another (the Mac's HEVC, say); H.264 otherwise.
+    let encoder =
+        std::env::var("FERROCAST_ENCODER").unwrap_or_else(|_| "com.apple.videotoolbox.videoencoder.ave.avc".into());
+    let mut enc = EncodeSettings::with_encoder(&encoder);
     enc.video_kbps = 2500;
     let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: None, own_encoder: true };
     let mut live = c.stream("rtmp://127.0.0.1:1935/main", "", &settings)?;
