@@ -444,6 +444,30 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                     }
                     None => out.skipped.push(format!("{name}: the filter {kind} (no picture chosen)")),
                 }
+            } else if kind == "ferrocast_remove_background" && !cfg!(target_os = "macos") {
+                // Nothing finds the person here yet: left out, not a picture cut away.
+                out.skipped.push(format!("{name}: the filter {kind} (on a Mac only so far)"));
+            } else if kind == "ferrocast_remove_background" {
+                // The person mask comes in as a picture of its own (the app finds the person
+                // and hands it in), shown in no scene.
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                out.sources.push(ImportedSource {
+                    id: next_id,
+                    name: format!("{name}: {fname}"),
+                    kind: SourceKind::Fed { width: 320, height: 180 },
+                    sound: None,
+                    sound_effects: Vec::new(),
+                    global: false,
+                });
+                let int =
+                    |k: &str, d: i64, lo: i64, hi: i64| fs.get(k).and_then(Value::as_i64).unwrap_or(d).clamp(lo, hi);
+                effects.push(Effect::Cutout {
+                    mask: next_id,
+                    blur: int("mode", 0, 0, 1) == 1,
+                    blur_px: int("blur", 24, 2, 100) as f32,
+                    soft: int("soft", 10, 0, 40) as f32 / 100.0,
+                });
+                next_id += 1;
             } else if let Some(e) = effect_from(kind, &fs) {
                 effects.push(e);
             } else if let Some(e) = audio_effect_from(kind, &fs) {

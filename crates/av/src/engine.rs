@@ -765,7 +765,7 @@ impl Engine {
             for it in items.iter_mut() {
                 it.source = to(it.source);
                 for e in &mut it.effects {
-                    if let Effect::Mask { image, .. } = e {
+                    if let Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } = e {
                         *image = to(*image);
                     }
                 }
@@ -1472,7 +1472,10 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
         .effects
         .iter()
         .filter(|e| match e {
-            Effect::Mask { image, .. } => st.sources.get(image).is_some_and(|s| s.size.is_some()),
+            // A mask not here yet (Remove background's first one too): the picture as it is.
+            Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } => {
+                st.sources.get(image).is_some_and(|s| s.size.is_some())
+            }
             _ => true,
         })
         .map(|e| {
@@ -1852,6 +1855,39 @@ mod tests {
         e.go("B").unwrap_or_else(|x| panic!("{x}"));
         let px = e.gpu.render(&multiview_scene(&e.lock(), &mv, now_ns())).unwrap_or_else(|x| panic!("{x}"));
         assert_eq!(&px[(60 * 400 + 219) * 4..(60 * 400 + 219) * 4 + 3], &[255, 255, 0], "B framed as on air");
+    }
+
+    #[test]
+    fn remove_background_keeps_the_person_and_blurs_or_drops_the_rest() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 255, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Fed { width: 4, height: 2 }).unwrap_or_else(|x| panic!("{x}"));
+        // The person on the left half.
+        let mut mask = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                let v = if x < 2 { 255 } else { 0 };
+                mask.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let feed = e.fed(2).unwrap_or_else(|| panic!("fed"));
+        feed.picture(Picture { width: 4, height: 2, rgba: mask, premultiplied: false });
+        let mut it = SceneItem::new(1, Placement::default());
+        it.effects = vec![Effect::Cutout { mask: 2, blur: false, blur_px: 24.0, soft: 0.1 }];
+        e.set_scene("A", vec![it]);
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        let mut px = Vec::new();
+        for _ in 0..50 {
+            px = e.snapshot().unwrap_or_else(|x| panic!("{x}"));
+            if px[(180 * 640 + 600) * 4 + 1] < 10 && px[(180 * 640 + 40) * 4 + 1] > 245 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let at = |x: usize| px[(180 * 640 + x) * 4 + 1];
+        assert!(at(40) > 245, "the person stays: {}", at(40));
+        assert!(at(600) < 10, "the background goes: {}", at(600));
     }
 
     #[test]

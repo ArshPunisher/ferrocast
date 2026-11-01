@@ -262,6 +262,15 @@ pub enum Effect {
     Sharpen {
         sharpness: f32,
     },
+    /// Ferrocast's Remove background: the person in the picture kept by the mask uploaded under
+    /// `mask` (its red: 1 a person, 0 not; stretched over the picture), the rest taken out, or
+    /// blurred `blur_px` when `blur`; `soft` (0 to 0.4) softens the edge.
+    Cutout {
+        mask: u64,
+        blur: bool,
+        blur_px: f32,
+        soft: f32,
+    },
 }
 
 /// What OBS's Image Mask/Blend does with its picture.

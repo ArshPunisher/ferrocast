@@ -905,6 +905,10 @@ impl Compositor {
                     q = [ow as f32 / bw, oh as f32 / bh, ox, oy];
                     ("fs_scroll", [if *looping { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
+                Effect::Cutout { mask, blur, blur_px, soft } => {
+                    second = Some(self.uploaded(*mask)?);
+                    ("fs_cutout", [if *blur { 1.0 } else { 0.0 }, *soft, *blur_px, 0.0, 0.0, 0.0], [0.0; 4])
+                }
                 Effect::Mask { kind, image, rgba, stretch } => {
                     let t = self.uploaded(*image)?;
                     q = mask_mapping((cur.width, cur.height), (t.width(), t.height()), *stretch);

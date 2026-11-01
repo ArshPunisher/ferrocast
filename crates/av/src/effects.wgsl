@@ -376,6 +376,28 @@ fn fs_mask(i: Out) -> @location(0) vec4<f32> {
     return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
 }
 
+// Remove background (ffi/cutout.rs's shader): `second` is the person mask (red), stretched over
+// the picture; p0 mode (0 remove, 1 blur), p1 soft edge (0 to 0.4), p2 blur radius (pixels).
+@fragment
+fn fs_cutout(i: Out) -> @location(0) vec4<f32> {
+    let p = src_px(i.uv);
+    let c = src_at(p);
+    let m = textureSampleLevel(second, pick, p / f.size, 0.0).r;
+    let e = max(f.p1, 0.01);
+    let k = smoothstep(0.5 - e, 0.5 + e, m);
+    if f.p0 < 0.5 {
+        return premultiplied(vec4<f32>(c.rgb, c.a * k));
+    }
+    // Blur behind the person: the background's own pixels only, softly.
+    var acc = vec4<f32>(0.0);
+    for (var n = 0; n < 48; n++) {
+        let t = (f32(n) + 0.5) / 48.0;
+        let ang = f32(n) * 2.39996323;
+        acc += src_at(clamp(p + vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p2), vec2<f32>(0.0, 0.0), f.size - 1.0));
+    }
+    return premultiplied(mix(acc / 48.0, c, k));
+}
+
 fn srgb_nonlinear(u: f32) -> f32 {
     if u <= 0.0031308 {
         return 12.92 * u;
