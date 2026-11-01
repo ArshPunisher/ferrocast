@@ -24,6 +24,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      web_ref:
+        description: "ferrocast-web branch to build the dashboard from (empty: its default branch)"
+        required: false
+        default: ""
 
 # Read-only by default; only the job that drafts the release may write.
 permissions:
@@ -87,6 +92,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/ferrocast-web
+          # A test build can take a branch of it; a release takes its default branch.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.web_ref || '' }}
           # ferrocast-web is public, so the built-in token can read it.
           token: ${{ github.token }}
           path: ferrocast-web
