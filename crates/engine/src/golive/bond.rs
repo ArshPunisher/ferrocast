@@ -125,25 +125,8 @@ impl Engine {
         dests: &[ferrocast_golive::Destination],
     ) -> Result<(BondRun, Vec<(String, (watch::Sender<bool>, watch::Receiver<Health>))>), String> {
         let g = self.golive();
-        let t = self
-            .pro_call(reqwest::Method::POST, "/v1/pro/bond/token", Some(json!({})))
-            .await
-            .map_err(|e: EngineError| e.to_string())?;
-        let (Some(token), Some(api), Some(host), Some(port)) = (
-            t["token"].as_str().map(String::from),
-            t["api"].as_str().map(String::from),
-            t["srtla_host"].as_str().map(String::from),
-            t["srtla_port"].as_u64(),
-        ) else {
-            return Err("the relay's answer was incomplete".into());
-        };
         // Stream keys only ever go there encrypted (or to this computer, testing).
-        let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-            .iter()
-            .any(|p| api.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with([':', '/'])));
-        if !api.starts_with("https://") && !local {
-            return Err("its address isn't https".into());
-        }
+        let (token, api, host, port) = self.bond_token().await.map_err(|e| e.to_string())?;
         let stats = g.hub.stats();
         let (w, h) = (stats.width.unwrap_or(1920), stats.height.unwrap_or(1080));
         let fps = stats.fps.map_or(30, |f| f.round() as u32).clamp(1, 120);
@@ -191,6 +174,112 @@ impl Engine {
         }
         tokio::spawn(watch_bond(http, api, token, id, watches, stop.clone(), stop_rx, link_rx));
         Ok((BondRun { stop }, platforms))
+    }
+}
+
+/// A phone stream (IRL) made here: where its session is and the link for the phone.
+#[derive(Debug, Clone)]
+pub(crate) struct IrlRun {
+    api: String,
+    token: String,
+    id: String,
+    phone_url: String,
+}
+
+impl Engine {
+    /// A token from the relay and where Bond is: (token, api, srtla host, srtla port).
+    async fn bond_token(&self) -> Result<(String, String, String, u64), EngineError> {
+        let t = self.pro_call(reqwest::Method::POST, "/v1/pro/bond/token", Some(json!({}))).await?;
+        let (Some(token), Some(api), Some(host), Some(port)) = (
+            t["token"].as_str().map(String::from),
+            t["api"].as_str().map(String::from),
+            t["srtla_host"].as_str().map(String::from),
+            t["srtla_port"].as_u64(),
+        ) else {
+            return Err(EngineError::Unavailable("Ferrocast Bond's answer was incomplete: try again.".into()));
+        };
+        let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|p| api.strip_prefix(p).is_some_and(|r| r.is_empty() || r.starts_with([':', '/'])));
+        if !api.starts_with("https://") && !local {
+            return Err(EngineError::Unavailable("Ferrocast Bond's address isn't https: it can't be used.".into()));
+        }
+        Ok((token, api, host, port))
+    }
+
+    /// "Stream from your phone": a Bond session for the ticked platforms that waits for the
+    /// phone (up to 12 hours) → `{ phone_url }`. A new one replaces the one before.
+    pub async fn golive_irl_start(&self) -> Result<Value, EngineError> {
+        let cfg = self.golive_config();
+        let mut dests = Vec::new();
+        for d in cfg.destinations.iter().filter(|d| d.enabled && d.canvas == Canvas::Main) {
+            if d.url.as_deref().and_then(direct_kind).is_some() {
+                continue;
+            }
+            match self.resolve(d).await {
+                Ok(dest) => dests.push(dest),
+                Err(why) => return Err(EngineError::Invalid(format!("{}: {why}", d.id))),
+            }
+        }
+        if dests.is_empty() {
+            return Err(EngineError::Invalid("Tick at least one platform above first.".into()));
+        }
+        let (token, api, _, _) = self.bond_token().await?;
+        let body = json!({
+            "token": token, "irl": true, "width": 1280, "height": 720, "fps": 30,
+            "destinations": dests.iter().map(|d| json!({ "id": d.id, "url": d.target.tc_url, "key": d.key })).collect::<Vec<_>>(),
+        });
+        let res = self
+            .relay_http()
+            .post(format!("{api}/v1/sessions"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| EngineError::Unavailable("Ferrocast Bond didn't answer: try again in a minute.".into()))?;
+        let status = res.status().as_u16();
+        let v: Value = res.json().await.unwrap_or(Value::Null);
+        let (Some(id), Some(phone_url)) = (v["id"].as_str(), v["phone_url"].as_str()) else {
+            return Err(EngineError::Unavailable(refusal(&v, status)));
+        };
+        let run = IrlRun { api, token, id: id.into(), phone_url: phone_url.into() };
+        let old = lock(&self.golive().irl).replace(run.clone());
+        if let Some(old) = old {
+            self.irl_delete(&old).await;
+        }
+        Ok(json!({ "phone_url": run.phone_url }))
+    }
+
+    /// The phone stream: `{ phone_url, input, destinations }`, or `{ phone_url: null }`.
+    pub async fn golive_irl(&self) -> Value {
+        let Some(run) = lock(&self.golive().irl).clone() else { return json!({ "phone_url": null }) };
+        let res =
+            self.relay_http().get(format!("{}/v1/sessions/{}", run.api, run.id)).bearer_auth(&run.token).send().await;
+        let v: Value = match res {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
+            Ok(r) if r.status().as_u16() == 404 => {
+                lock(&self.golive().irl).take();
+                return json!({ "phone_url": null });
+            }
+            _ => Value::Null,
+        };
+        json!({ "phone_url": run.phone_url, "input": v["input"], "destinations": v["destinations"] })
+    }
+
+    /// Ends the phone stream on every platform.
+    pub async fn golive_irl_end(&self) {
+        let run = lock(&self.golive().irl).take();
+        if let Some(run) = run {
+            self.irl_delete(&run).await;
+        }
+    }
+
+    async fn irl_delete(&self, run: &IrlRun) {
+        let _ = self
+            .relay_http()
+            .delete(format!("{}/v1/sessions/{}", run.api, run.id))
+            .bearer_auth(&run.token)
+            .send()
+            .await;
     }
 }
 

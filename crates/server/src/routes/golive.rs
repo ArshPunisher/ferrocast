@@ -31,6 +31,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
         .route("/golive/bond", put(bond_on))
+        .route("/golive/irl", get(irl).post(irl_start).delete(irl_end))
         .route("/golive/vertical/obs/setup", post(point_vertical))
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
@@ -165,6 +166,22 @@ struct AitumBody {
 #[derive(Deserialize)]
 struct BondBody {
     on: bool,
+}
+
+/// "Stream from your phone" (Bond, Pro): the link for the phone.
+async fn irl_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.golive_irl_start().await?))
+}
+
+/// The phone stream: its link, and how it and the platforms are doing.
+async fn irl(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.golive_irl().await))
+}
+
+/// Ends the phone stream.
+async fn irl_end(State(app): State<AppState>) -> ApiResult<axum::http::StatusCode> {
+    app.engine.golive_irl_end().await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Ferrocast Bond (Pro) on or off, from the next stream.

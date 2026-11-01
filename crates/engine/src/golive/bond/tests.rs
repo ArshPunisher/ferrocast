@@ -49,6 +49,10 @@ async fn with_bond_on_the_platform_is_sent_from_the_service() {
         max_sessions: 4,
         ffmpeg: None,
         allow_private: true,
+        public_url: "http://127.0.0.1:8795".into(),
+        rtc_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        rtc_ports: (41000, 41099),
+        vapid: None,
     });
     let media = bond.clone();
     tokio::spawn(async move { media.run_media().await });
@@ -150,4 +154,69 @@ async fn with_bond_on_the_platform_is_sent_from_the_service() {
     }
     assert!(ended, "the platform's stream ended");
     assert!(!e.golive_view().await.bond_sending);
+}
+
+/// "Stream from your phone": a Bond session for the ticked platforms that waits for the phone,
+/// its link (secret in the fragment), its state read back, and ended.
+#[tokio::test]
+async fn a_phone_link_is_made_for_the_ticked_platforms() {
+    let free = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let (srtla, srt) = (free(), free());
+    let bond = ferrocast_bond::Bond::new(ferrocast_bond::Config {
+        secret: SECRET.to_vec(),
+        srtla,
+        srt,
+        keepalive: Duration::from_secs(60),
+        max_sessions: 4,
+        ffmpeg: None,
+        allow_private: true,
+        public_url: "https://bond.example".into(),
+        rtc_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        rtc_ports: (41100, 41199),
+        vapid: None,
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = format!("http://{}", l.local_addr().unwrap());
+    let router = bond.router();
+    tokio::spawn(async move { axum::serve(l, router).await });
+    let api2 = api.clone();
+    let relay = axum::Router::new()
+        .route(
+            "/v1/installs",
+            post(|| async {
+                (axum::http::StatusCode::CREATED, Json(json!({"install_id": "in1", "install_secret": "sec"})))
+            }),
+        )
+        .route(
+            "/v1/pro/bond/token",
+            post(move || {
+                let api = api2.clone();
+                async move {
+                    let exp = crate::now().0 + 3_600_000;
+                    Json(json!({ "token": ferrocast_bond::token::sign(SECRET, "acct", exp), "expires_ms": exp,
+                        "api": api, "srtla_host": "127.0.0.1", "srtla_port": srtla.port() }))
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, relay).await });
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay_url), ..Default::default() };
+    let e = Engine::start_with(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()), apps).await.unwrap();
+    // Nothing ticked that can go (the built-in platforms aren't connected): says so.
+    let order: Vec<(String, bool)> = e.golive_config().destinations.iter().map(|d| (d.id.clone(), false)).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    assert!(e.golive_irl_start().await.unwrap_err().to_string().contains("Tick at least one platform"));
+    e.add_golive_destination("Mine", "rtmp://127.0.0.1:9/app", "key-p", Canvas::Main).await.unwrap();
+    let v = e.golive_irl_start().await.unwrap();
+    let link = v["phone_url"].as_str().unwrap();
+    assert!(link.starts_with("https://bond.example/irl#"), "{link}");
+    let (sid, secret) = link.split_once('#').unwrap().1.split_once('.').unwrap();
+    assert_eq!((sid.len(), secret.len()), (32, 32));
+    let now = e.golive_irl().await;
+    assert_eq!(now["input"], "waiting");
+    assert_eq!(now["destinations"][0]["health"]["state"], "waiting");
+    e.golive_irl_end().await;
+    assert_eq!(e.golive_irl().await["phone_url"], serde_json::Value::Null);
 }

@@ -518,6 +518,8 @@ pub(crate) struct GoLive {
     /// Ferrocast Bond sending this stream, and whether it couldn't (this stream goes from here).
     bond: Mutex<Option<bond::BondRun>>,
     bond_failed: std::sync::atomic::AtomicBool,
+    /// A phone stream through Bond (IRL), made here, while it lasts.
+    irl: Mutex<Option<bond::IrlRun>>,
 }
 
 #[derive(Debug, Default)]
@@ -560,6 +562,7 @@ impl Default for GoLive {
             tested: Mutex::new(HashMap::new()),
             bond: Mutex::new(None),
             bond_failed: std::sync::atomic::AtomicBool::new(false),
+            irl: Mutex::new(None),
         }
     }
 }
