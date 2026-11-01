@@ -62,10 +62,13 @@ const MAX_NAK_RANGE: u32 = 1024;
 
 /// The receiver acknowledges every this many packets per connection.
 const ACK_EVERY: usize = 10;
-/// Receiver limits.
+/// Receiver limits: connections per group, groups, groups one address may start, and how
+/// long a group no connection joined is kept.
 const MAX_CONNS: usize = 8;
 const MAX_GROUPS: usize = 200;
+const GROUPS_PER_IP: usize = 4;
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+const EMPTY_GROUP: Duration = Duration::from_secs(5);
 
 fn kind(p: &[u8]) -> u16 {
     if p.len() < 2 { 0 } else { u16::from_be_bytes([p[0], p[1]]) }
@@ -468,6 +471,8 @@ struct Group {
     conns: Vec<Conn>,
     created: Instant,
     last_addr: SocketAddr,
+    /// Who asked for it (a few per address).
+    started_by: std::net::IpAddr,
     /// To the SRT server, opened on the first packet; its reader sends answers back.
     srt: Option<(Arc<UdpSocket>, JoinHandle<()>)>,
 }
@@ -504,7 +509,7 @@ pub async fn receive(sock: UdpSocket, srt: SocketAddr) -> io::Result<()> {
                     for gr in g.iter_mut() {
                         gr.conns.retain(|c| now.duration_since(c.last) < RECV_TIMEOUT);
                     }
-                    g.retain(|gr| !gr.conns.is_empty() || now.duration_since(gr.created) < RECV_TIMEOUT);
+                    g.retain(|gr| !gr.conns.is_empty() || now.duration_since(gr.created) < EMPTY_GROUP);
                 }
             }
         }
@@ -526,7 +531,8 @@ fn handle(
     let now = Instant::now();
     let member = |g: &Group| g.conns.iter().any(|c| c.addr == from);
     if kind(p) == REG1 && p.len() == 2 + ID_LEN {
-        if gs.len() >= MAX_GROUPS || gs.iter().any(|g| member(g) || g.last_addr == from) {
+        let from_ip = gs.iter().filter(|g| g.started_by == from.ip()).count();
+        if gs.len() >= MAX_GROUPS || from_ip >= GROUPS_PER_IP || gs.iter().any(|g| member(g) || g.last_addr == from) {
             reply(REG_ERR, None);
             return None;
         }
@@ -536,7 +542,7 @@ fn handle(
             reply(REG_ERR, None);
             return None;
         }
-        gs.push(Group { id, conns: Vec::new(), created: now, last_addr: from, srt: None });
+        gs.push(Group { id, conns: Vec::new(), created: now, last_addr: from, started_by: from.ip(), srt: None });
         reply(REG2, Some(&id));
         return None;
     }
@@ -732,6 +738,19 @@ mod tests {
             handle(&sock, &groups, &packet(REG2, Some(&id)), b, srt);
             handle(&sock, &groups, &packet(REG2, Some(&[9u8; ID_LEN])), "127.0.0.1:5003".parse().unwrap(), srt);
             assert_eq!(count(&groups), (1, 2));
+            // One address can't take every group.
+            for i in 0..10u8 {
+                let mut other = [i; ID_LEN];
+                other[0] = 200;
+                handle(
+                    &sock,
+                    &groups,
+                    &packet(REG1, Some(&other)),
+                    format!("127.0.0.9:{}", 6000 + u16::from(i)).parse().unwrap(),
+                    srt,
+                );
+            }
+            assert_eq!(count(&groups).0, 1 + GROUPS_PER_IP);
             // A member's data goes on to SRT.
             assert!(handle(&sock, &groups, &[0u8; 100], b, srt).is_some());
         });
