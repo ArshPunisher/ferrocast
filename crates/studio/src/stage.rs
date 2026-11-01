@@ -70,6 +70,10 @@ fn db_of(mul: f64) -> f32 {
     if mul <= 0.0 { -100.0 } else { (20.0 * mul.log10()).max(-100.0) as f32 }
 }
 
+fn ok_or<T>(v: Option<T>) -> Result<T, StudioError> {
+    v.ok_or_else(|| fail("Pick the sources to group first."))
+}
+
 /// A new item as OBS saves one: its own size at the top left, shown.
 fn new_item(source: &Value, id: i64) -> Value {
     json!({
@@ -1087,6 +1091,203 @@ impl Stage {
         Ok(out)
     }
 
+    // ------------------------------------------------------------------ undo
+
+    /// The whole collection as it is now, to put back with `restore_all` (undo and redo).
+    pub fn snapshot(&self) -> Value {
+        self.doc.borrow().clone()
+    }
+
+    /// Puts the collection back as `snapshot` had it; the engine follows (unchanged sources keep
+    /// running).
+    pub fn restore_all(&self, snapshot: &Value) {
+        let on_air = self.current();
+        self.edit(|d| {
+            *d = snapshot.clone();
+            // Undo changes the scenes, not what's on air.
+            if d.get("sources").and_then(Value::as_array).is_some_and(|l| l.iter().any(|s| name_of(s) == on_air)) {
+                d["current_program_scene"] = json!(on_air);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ Studio Mode
+
+    /// Studio Mode's preview scene (what goes on air next), or None when it's off.
+    pub fn preview_scene(&self) -> Option<String> {
+        self.doc.borrow().pointer("/ferrocast/studio_mode").and_then(Value::as_str).map(String::from)
+    }
+
+    /// Turns Studio Mode on (the preview starts on what's on air) or off.
+    pub fn set_studio_mode(&self, on: bool) {
+        let now = self.current();
+        let mut d = self.doc.borrow_mut();
+        if !d.get("ferrocast").is_some_and(Value::is_object) {
+            d["ferrocast"] = json!({});
+        }
+        d["ferrocast"]["studio_mode"] = if on { json!(now) } else { Value::Null };
+        d["current_scene"] = json!(now);
+    }
+
+    /// Picks the scene Studio Mode's preview shows.
+    pub fn set_preview(&self, name: &str) -> Result<(), StudioError> {
+        self.scene_index(name)?;
+        if self.preview_scene().is_none() {
+            return Err(fail("Studio Mode is off."));
+        }
+        let mut d = self.doc.borrow_mut();
+        d["ferrocast"]["studio_mode"] = json!(name);
+        // OBS saves Studio Mode's preview as `current_scene`.
+        d["current_scene"] = json!(name);
+        Ok(())
+    }
+
+    /// Sends the preview on air (OBS's Transition button), through `quick` or the Studio's
+    /// transition; the preview then shows what was on air (OBS's "swap").
+    pub fn transition_now(&self, quick: Option<&TransitionInfo>) -> Result<(), StudioError> {
+        let pre = self.preview_scene().ok_or_else(|| fail("Studio Mode is off."))?;
+        let old = self.current();
+        if pre == old {
+            return Ok(());
+        }
+        match quick {
+            Some(t) => {
+                if t.ms > 20_000 {
+                    return Err(fail("ms: a transition lasts 0 to 20000 ms."));
+                }
+                self.doc.borrow_mut()["current_program_scene"] = json!(pre);
+                if let Some(e) = self.engine.borrow().as_ref() {
+                    e.go_with(&pre, &t.kind, u64::from(t.ms))?;
+                }
+            }
+            None => self.set_current(&pre)?,
+        }
+        let mut d = self.doc.borrow_mut();
+        d["ferrocast"]["studio_mode"] = json!(old);
+        d["current_scene"] = json!(old);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ groups
+
+    /// Puts items `ids` of `scene` into a new group `name`, each staying where it shows → the
+    /// group's item.
+    pub fn group_together(&self, scene: &str, ids: &[i64], name: &str) -> Result<ItemInfo, StudioError> {
+        self.name_free(name)?;
+        let items = self.scene_items(scene)?;
+        let picked: Vec<Value> = items
+            .iter()
+            .filter(|i| i.get("id").and_then(Value::as_i64).is_some_and(|id| ids.contains(&id)))
+            .cloned()
+            .collect();
+        if picked.is_empty() {
+            return Err(fail("Pick the sources to group first."));
+        }
+        // The box round them all on the canvas: the group's place and size.
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for it in &picked {
+            let f = self.info_of(it).frame;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let (x, y) = (f[4] + u * f[0] + v * f[2], f[5] + u * f[1] + v * f[3]);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        let children: Vec<Value> = picked
+            .into_iter()
+            .map(|mut it| {
+                let (x, y) = (
+                    it.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    it.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                it["pos"] = json!({ "x": x - x0, "y": y - y0 });
+                it
+            })
+            .collect();
+        let (cx, cy) = ((x1 - x0).max(1.0).ceil() as u32, (y1 - y0).max(1.0).ceil() as u32);
+        let group = json!({
+            "id": "group", "versioned_id": "group", "name": name, "uuid": uuid(),
+            "settings": { "items": children, "cx": cx, "cy": cy, "id_counter": 0, "custom_size": true },
+            "mixers": 0, "flags": 0, "volume": 1.0, "balance": 0.5, "enabled": true, "muted": false, "filters": [],
+        });
+        self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(group.clone())));
+        // Where the topmost picked item was, the group goes.
+        let top = ok_or(self.item_ids(scene)?.into_iter().find(|i| ids.contains(i)))?;
+        let (at, _) = self.item_place(scene, top)?;
+        self.with_items(scene, |l, _| {
+            l.retain(|i| !i.get("id").and_then(Value::as_i64).is_some_and(|id| ids.contains(&id)))
+        })?;
+        let info = self.place(scene, &group)?;
+        self.with_item(scene, info.id, |i| i["pos"] = json!({ "x": x0, "y": y0 }))?;
+        self.item_order(scene, info.id, at)?;
+        Ok(self.info_of(&self.item(scene, info.id)?))
+    }
+
+    /// An empty group at the top of `scene`.
+    pub fn add_group(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
+        self.scene_items(scene)?;
+        self.name_free(name)?;
+        let group = json!({
+            "id": "group", "versioned_id": "group", "name": name, "uuid": uuid(),
+            "settings": { "items": [], "cx": 0, "cy": 0, "id_counter": 0, "custom_size": false },
+            "mixers": 0, "flags": 0, "volume": 1.0, "balance": 0.5, "enabled": true, "muted": false, "filters": [],
+        });
+        self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(group.clone())));
+        self.place(scene, &group)
+    }
+
+    /// Takes a group's items out into its scene, each where it shows; the group goes.
+    pub fn ungroup(&self, scene: &str, id: i64) -> Result<(), StudioError> {
+        let g = self.item(scene, id)?;
+        let name = name_of(&g).to_string();
+        let src = self.source(&name)?;
+        if kind_of(&src) != "group" {
+            return Err(fail(format!("\"{name}\" isn't a group.")));
+        }
+        let p = ferrocast_av::obs::placement_of(&g);
+        let (gw, gh) = self.size_of(&name);
+        let to_canvas = ferrocast_av::draw_transform(&p, gw, gh);
+        let (scale, turn) =
+            ((p.scale_x * p.scale_x + p.scale_y * p.scale_y).sqrt() / std::f32::consts::SQRT_2, p.rotation);
+        let children: Vec<Value> =
+            src.pointer("/settings/items").and_then(Value::as_array).cloned().unwrap_or_default();
+        let (at, _) = self.item_place(scene, id)?;
+        self.with_items(scene, |l, set| {
+            l.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id));
+            let mut next = set
+                .get("id_counter")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(l.iter().filter_map(|i| i.get("id")?.as_i64()).max().unwrap_or(0));
+            // Bottom first, at the group's place in the list (counted from the top).
+            let at_bottom = l.len().saturating_sub(at);
+            for (k, mut c) in children.into_iter().enumerate() {
+                let (x, y) = (
+                    c.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    c.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                let (nx, ny) = to_canvas.apply(x, y);
+                c["pos"] = json!({ "x": nx, "y": ny });
+                let (sx, sy) = (
+                    c.pointer("/scale/x").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+                    c.pointer("/scale/y").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+                );
+                c["scale"] = json!({ "x": sx * scale, "y": sy * scale });
+                c["rot"] = json!((c.get("rot").and_then(Value::as_f64).unwrap_or(0.0) as f32 + turn).rem_euclid(360.0));
+                next += 1;
+                c["id"] = json!(next);
+                l.insert((at_bottom + k).min(l.len()), c);
+            }
+            set.insert("id_counter".into(), json!(next));
+        })?;
+        // The group goes when no scene shows it any more.
+        let shown =
+            self.order().iter().any(|sc| self.scene_items(sc).is_ok_and(|i| i.iter().any(|i| name_of(i) == name)));
+        if !shown {
+            self.edit(|d| d["sources"].as_array_mut().map(|l| l.retain(|s| name_of(s) != name)));
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ transitions
 
     /// The Studio's transition: its kind and length.
@@ -1612,5 +1813,58 @@ mod tests {
             assert!(std::fs::metadata(f).is_ok_and(|m| m.len() > 1000), "{} was written", f.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn studio_mode_previews_then_sends_on_air() {
+        let s = stage();
+        ok(s.add_scene("Next"));
+        assert_eq!(s.preview_scene(), None);
+        assert!(s.set_preview("Next").is_err(), "Studio Mode is off");
+        s.set_studio_mode(true);
+        assert_eq!(s.preview_scene().as_deref(), Some("Main"));
+        ok(s.set_preview("Next"));
+        ok(s.transition_now(None));
+        assert_eq!((s.current().as_str(), s.preview_scene().as_deref()), ("Next", Some("Main")), "swapped");
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        assert_eq!(s.current(), "Main");
+        let saved = s.save("x");
+        assert_eq!(saved["current_scene"], "Next", "OBS keeps Studio Mode's preview as current_scene");
+        s.set_studio_mode(false);
+        assert_eq!(s.preview_scene(), None);
+    }
+
+    #[test]
+    fn groups_keep_their_items_where_they_show() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.set_item_box("Main", a.id, 100.0, 100.0, 100.0, 100.0));
+        ok(s.set_item_box("Main", b.id, 300.0, 150.0, 50.0, 50.0));
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        assert_eq!(g.frame, [250.0, 0.0, 0.0, 100.0, 100.0, 100.0], "the box round both");
+        assert_eq!(ok(s.items("Main")).len(), 1);
+        // Our engine reads the group with both inside, each where it was.
+        let got = ferrocast_av::obs::import(&s.save("x"), (1920, 1080));
+        assert!(got.groups.iter().any(|n| n == "Pair") && got.skipped.is_empty());
+        ok(s.ungroup("Main", g.id));
+        let back: Vec<[f32; 6]> = ok(s.items("Main")).iter().map(|i| i.frame).collect();
+        assert!(
+            back.contains(&[100.0, 0.0, 0.0, 100.0, 100.0, 100.0])
+                && back.contains(&[50.0, 0.0, 0.0, 50.0, 300.0, 150.0]),
+            "{back:?}"
+        );
+        assert!(!s.sources().iter().any(|u| u.name == "Pair"), "the empty group went");
+    }
+
+    #[test]
+    fn undo_puts_the_whole_collection_back() {
+        let s = stage();
+        let before = s.snapshot();
+        ok(s.add_source("Main", "color_source_v3", "A", &json!({}), false));
+        ok(s.add_scene("Two"));
+        s.restore_all(&before);
+        assert_eq!(s.scenes().len(), 1);
+        assert!(ok(s.items("Main")).is_empty());
     }
 }

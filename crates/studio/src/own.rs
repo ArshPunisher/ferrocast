@@ -238,6 +238,15 @@ impl Shared {
         seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
     }
 
+    /// Puts `scene` on air now through a transition of its own (Studio Mode's quick
+    /// transitions), whatever the collection's transition is.
+    pub(crate) fn go_with(&self, scene: &str, id: &str, ms: u64) -> Result<(), StudioError> {
+        let (kind, ms) = transition_kind(id, ms);
+        self.engine.go_with(scene, kind, ms).map_err(|e| StudioError::Failed(e.to_string()))?;
+        self.seen().on_air = Some(scene.to_string());
+        Ok(())
+    }
+
     /// Keeps the engine with the Studio: a new scene on air goes on through the Studio's
     /// transition; any other change opens the collection again (only changed sources restart).
     /// Returns whether it was opened again. Many outputs may call it each tick: only the first
@@ -423,6 +432,11 @@ fn transition_of(doc: &serde_json::Value) -> (TransitionKind, u64) {
         .and_then(|t| t.iter().find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some(name)))
         .and_then(|t| t.get("id").and_then(serde_json::Value::as_str))
         .unwrap_or(if name == "Cut" { "cut_transition" } else { "fade_transition" });
+    transition_kind(id, ms)
+}
+
+/// The engine's transition for one of OBS's transition ids (the rest fade for now).
+pub(crate) fn transition_kind(id: &str, ms: u64) -> (TransitionKind, u64) {
     match id {
         "cut_transition" => (TransitionKind::Cut, 0),
         "ferrocast_move" | "move_transition" => (TransitionKind::Move, ms),
