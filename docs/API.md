@@ -810,12 +810,16 @@ type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "youtub
 type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                  | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string }
                  | { state: "paused"; until_ms: number /* earliest it comes back */; reason: string /* upload protection */ })
-                 & { kbps: number; dropped: number; since_ms: number }
+                 & { kbps: number; dropped: number; since_ms: number;
+                     link?: { rtt_ms: number; lost_pct: number; resent_pct: number } /* SRT, RIST and WebRTC once connected: the
+                       round trip, and of the packets sent the share lost and the share sent again, over the last second */ }
 type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
 type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;
                          enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
-                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */ }
+                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */;
+                         backup_for?: string /* a backup sending now, for this destination's name */;
+                         standby_for?: string /* a backup waiting: it sends only while that one can't */ }
 type UploadRow = { id: string; name: string; server: string | null; delay_ms: number | null; need_kbps: number; problem?: string }
 type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: UploadRow[];
                      verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
@@ -832,7 +836,11 @@ type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number
                             first_pause_s: number /* 10–3600, 60 */; max_pause_s: number /* ≥ first, ≤ 7200; 600 */; first_to_pause: string | null };
                   keep_free_pct: number /* 0–50, 20: the upload check's reserve */; port: number /* the local server's, from the next start */;
                   per: { [destination id]: { server: string | null /* a platform's own address instead (region, rtmp or rtmps) */;
-                                             first_retry_s: number /* 1–30 */; max_retry_s: number /* ≥ first, ≤ 600 */ } } }
+                                             first_retry_s: number /* 1–30 */; max_retry_s: number /* ≥ first, ≤ 600 */;
+                                             backup?: string /* another destination's id: it waits on standby (ticked or not) and sends
+                                                               only after this one can't for 10 s, until this one has sent again for 10 s.
+                                                               Same picture (main or vertical); not one with a backup of its own, nor
+                                                               one already backing up another. Removing it clears this */ } } }
 type FfmpegState = { state: "ready" | "missing" | "unsupported" } | { state: "downloading"; percent: number } | { state: "failed"; reason: string }
 type CutBox = { x: number; y: number; w: number; h: number }   // fractions (0–1) of the normal picture
 type CutConfig = { layout: "camera_top" | "small_camera" | "half_half" | "game_only"; camera: CutBox; game: CutBox;

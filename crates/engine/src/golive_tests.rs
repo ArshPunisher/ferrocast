@@ -261,7 +261,7 @@ async fn advanced_settings_are_checked_and_saved() {
     assert!(e.set_golive_advanced(a.clone()).await.unwrap_err().to_string().contains("per.twitch.server"));
     a.per.insert(
         "twitch".into(),
-        DestAdvanced { server: Some("rtmps://live-fra.twitch.tv/app".into()), first_retry_s: 2, max_retry_s: 60 },
+        DestAdvanced { server: Some("rtmps://live-fra.twitch.tv/app".into()), first_retry_s: 2, max_retry_s: 60, backup: None },
     );
     a.keep_free_pct = 30;
     e.set_golive_advanced(a.clone()).await.unwrap();
@@ -607,4 +607,70 @@ async fn test_connection_tries_the_server_and_says_how_it_went() {
     assert!(!r.ok && r.message.contains("host"), "{r:?}");
     assert!(e.golive_test_address(" ", "").await.is_err());
     assert!(matches!(e.golive_test("nope").await, Err(EngineError::NotFound(_))));
+}
+
+/// A destination that can't send hands over to its backup, which waited on standby, and takes
+/// back once it's sending again.
+#[tokio::test]
+async fn a_backup_sends_while_its_destination_cannot() {
+    use crate::golive::{Canvas, DestAdvanced};
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{Got, Obs, platform, platform_on};
+    use tokio::time::{Duration, timeout};
+    async fn until(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: impl Fn(&Got) -> bool) -> Got {
+        loop {
+            let g = timeout(Duration::from_secs(8), rx.recv()).await.expect("in time").expect("open");
+            if want(&g) {
+                return g;
+            }
+        }
+    }
+    let publish = |g: &Got| matches!(g, Got::Publish(_));
+    let (e, _dir) = engine().await;
+    // The main one's server is down (a free port, nothing on it); the backup's is up.
+    let down = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (port_b, mut got_b) = platform("key-b").await;
+    let main =
+        e.add_golive_destination("Main", &format!("rtmp://127.0.0.1:{down}/app"), "key-a", Canvas::Main).await.unwrap();
+    let backup = e
+        .add_golive_destination("Backup", &format!("rtmp://127.0.0.1:{port_b}/app"), "key-b", Canvas::Main)
+        .await
+        .unwrap();
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(main.id.clone(), DestAdvanced { backup: Some(backup.id.clone()), ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    // On standby: ticked or not, it waits.
+    let v = e.golive_view().await;
+    assert_eq!(
+        v.destinations.iter().find(|d| d.id == backup.id).and_then(|d| d.standby_for.clone()),
+        Some("Main".into())
+    );
+
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+    assert!(timeout(Duration::from_millis(500), got_b.recv()).await.is_err(), "the backup waits at first");
+    // The main one keeps failing: the backup takes over.
+    assert_eq!(until(&mut got_b, publish).await, Got::Publish("key-b".into()));
+    let v = e.golive_view().await;
+    assert_eq!(
+        v.destinations.iter().find(|d| d.id == backup.id).and_then(|d| d.backup_for.clone()),
+        Some("Main".into())
+    );
+
+    // Its server comes back: once it's sent long enough, the backup stops.
+    let (_, mut got_a) = platform_on(down, "key-a").await;
+    assert_eq!(until(&mut got_a, publish).await, Got::Publish("key-a".into()));
+    until(&mut got_b, |g| *g == Got::Closed).await;
+    let v = e.golive_view().await;
+    let main_state = v.destinations.iter().find(|d| d.id == main.id).and_then(|d| d.health.clone()).map(|h| h.state);
+    assert_eq!(main_state, Some(PushState::Live));
+
+    // A backup that can't be: itself, or one already backing up another.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(main.id.clone(), DestAdvanced { backup: Some(main.id.clone()), ..Default::default() });
+    assert!(e.set_golive_advanced(adv).await.is_err());
+    // Removing the backup clears it from the one it backed up.
+    e.remove_golive_destination(&backup.id).await.unwrap();
+    assert_eq!(e.golive_config().advanced.per.get(&main.id).and_then(|a| a.backup.clone()), None);
 }

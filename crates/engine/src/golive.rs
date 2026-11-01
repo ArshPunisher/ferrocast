@@ -178,13 +178,21 @@ pub struct DestAdvanced {
     pub server: Option<String>,
     pub first_retry_s: u32,
     pub max_retry_s: u32,
+    /// Another destination that sends instead while this one can't (an SRT server's RTMP
+    /// twin): it waits on standby, starts after `BACKUP_AFTER` of failing, and stops once this
+    /// one is back for as long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
 }
 
 impl Default for DestAdvanced {
     fn default() -> Self {
-        Self { server: None, first_retry_s: 1, max_retry_s: 30 }
+        Self { server: None, first_retry_s: 1, max_retry_s: 30, backup: None }
     }
 }
+
+/// How long a destination fails before its backup sends, and is back before the backup stops.
+const BACKUP_AFTER: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 impl Advanced {
     /// Messages name the field.
@@ -215,6 +223,24 @@ impl Advanced {
             }
             if a.max_retry_s < a.first_retry_s || a.max_retry_s > 600 {
                 return Err(format!("per.{id}.max_retry_s: at least the first wait, at most 600 seconds."));
+            }
+            if let Some(b) = &a.backup {
+                let backup = destinations
+                    .iter()
+                    .find(|x| &x.id == b)
+                    .ok_or_else(|| format!("per.{id}.backup: no such destination."))?;
+                if b == id {
+                    return Err(format!("per.{id}.backup: a destination can't back itself up."));
+                }
+                if backup.canvas != d.canvas {
+                    return Err(format!("per.{id}.backup: the backup sends the same picture (main or vertical)."));
+                }
+                if self.per.get(b).is_some_and(|x| x.backup.is_some()) {
+                    return Err(format!("per.{id}.backup: that one has a backup of its own; pick another."));
+                }
+                if self.per.iter().any(|(other, x)| other != id && x.backup.as_ref() == Some(b)) {
+                    return Err(format!("per.{id}.backup: that one already backs up another destination."));
+                }
             }
         }
         Ok(())
@@ -421,6 +447,12 @@ pub struct DestinationView {
     /// Takes the Studio's lighter stream (left out when not).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// A backup sending now, instead of this destination (its name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_for: Option<String>,
+    /// A backup on standby: it sends only while this destination (its name) can't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby_for: Option<String>,
 }
 
 /// Go live's runtime state, one per engine.
@@ -454,6 +486,17 @@ pub(crate) struct GoLive {
     ingest_task: Mutex<Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>>,
     /// Fetching ffmpeg: progress or why it failed (`None`: not fetching).
     ffmpeg_fetch: Mutex<Option<crate::ffmpeg_get::FfmpegState>>,
+    /// Backups: since when each destination with one has been failing (or back), and those
+    /// failing long enough that their backup sends.
+    backup: Mutex<BackupState>,
+}
+
+#[derive(Debug, Default)]
+struct BackupState {
+    /// When a destination with a backup last changed between sending and not.
+    since: HashMap<String, (bool, std::time::Instant)>,
+    /// Destinations whose backup is sending for them.
+    failing: std::collections::HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -483,6 +526,7 @@ impl Default for GoLive {
             data_dir: Mutex::new(None),
             ingest_task: Mutex::new(None),
             ffmpeg_fetch: Mutex::new(None),
+            backup: Mutex::new(BackupState::default()),
         }
     }
 }
@@ -493,6 +537,12 @@ struct Running {
     health: watch::Receiver<Health>,
     /// Sending the lighter stream (it moves when that starts or stops).
     light: bool,
+}
+
+/// The destination `id` backs up, if any.
+fn backs_up<'a>(cfg: &'a GoLiveConfig, id: &str) -> Option<&'a DestinationConfig> {
+    let (primary, _) = cfg.advanced.per.iter().find(|(_, a)| a.backup.as_deref() == Some(id))?;
+    cfg.destinations.iter().find(|d| &d.id == primary)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -776,6 +826,7 @@ impl Engine {
         let paused = lock(&g.paused);
         let blocked = lock(&g.blocked);
         let st = self.state();
+        let failing = lock(&g.backup).failing.clone();
         let destinations = cfg
             .destinations
             .iter()
@@ -813,6 +864,8 @@ impl Engine {
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
+                    backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
+                    standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                 }
             })
             .collect();
@@ -1205,8 +1258,14 @@ impl Engine {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
         cfg.destinations.remove(i);
-        // Its Advanced settings go with it, so a saved set never names a missing destination.
+        // Its Advanced settings go with it, so a saved set never names a missing destination
+        // (nor one that backed something up).
         cfg.advanced.per.remove(id);
+        for a in cfg.advanced.per.values_mut() {
+            if a.backup.as_deref() == Some(id) {
+                a.backup = None;
+            }
+        }
         if cfg.advanced.rules.first_to_pause.as_deref() == Some(id) {
             cfg.advanced.rules.first_to_pause = None;
         }
@@ -1455,8 +1514,14 @@ impl Engine {
             Canvas::Main => main_on || (d.wants_light() && light_on),
             Canvas::Vertical => vertical_on,
         };
-        let want: Vec<DestinationConfig> =
-            self.golive_config().destinations.into_iter().filter(|d| d.enabled && on(d)).collect();
+        let cfg = self.golive_config();
+        let failing = lock(&g.backup).failing.clone();
+        // A backup sends while the one it backs up fails, and waits otherwise.
+        let sends = |d: &DestinationConfig| match backs_up(&cfg, &d.id) {
+            Some(p) if p.enabled => failing.contains(&p.id),
+            _ => d.enabled,
+        };
+        let want: Vec<DestinationConfig> = cfg.destinations.iter().filter(|d| sends(d) && on(d)).cloned().collect();
         // One whose stream changed (the lighter one started or stopped) starts again on the other.
         for d in &want {
             let moved = lock(&g.running).get(&d.id).is_some_and(|r| r.light != self.on_light(d));
@@ -1769,6 +1834,58 @@ impl Engine {
         self.send_golive();
     }
 
+    /// One second of backups while live: a destination that can't send for `BACKUP_AFTER`
+    /// hands over to its backup, and takes back once it's sent for as long.
+    async fn backup_tick(&self) {
+        let g = self.golive();
+        let cfg = self.golive_config();
+        let now = std::time::Instant::now();
+        let mut changed = Vec::new();
+        {
+            let running = lock(&g.running);
+            let blocked = lock(&g.blocked);
+            let mut b = lock(&g.backup);
+            let primaries: Vec<&String> =
+                cfg.advanced.per.iter().filter(|(_, a)| a.backup.is_some()).map(|(id, _)| id).collect();
+            b.since.retain(|id, _| primaries.contains(&id));
+            for id in primaries {
+                let Some(d) = cfg.destinations.iter().find(|d| &d.id == id).filter(|d| d.enabled) else {
+                    if b.failing.remove(id) {
+                        changed.push((id.clone(), false));
+                    }
+                    continue;
+                };
+                let sending = running.get(id).is_some_and(|r| r.health.borrow().state == PushState::Live);
+                // Running or not, one that can't start is failing too.
+                let trying = running.contains_key(id) || blocked.contains_key(id);
+                if !trying {
+                    continue;
+                }
+                let since = match b.since.get(id) {
+                    Some((was, at)) if *was == sending => *at,
+                    _ => {
+                        b.since.insert(id.clone(), (sending, now));
+                        now
+                    }
+                };
+                let long = now.duration_since(since) >= BACKUP_AFTER;
+                let failing = b.failing.contains(id);
+                if !sending && long && !failing {
+                    tracing::info!(dest = %d.id, "Go live: a destination can't send, its backup takes over");
+                    b.failing.insert(id.clone());
+                    changed.push((id.clone(), true));
+                } else if sending && long && failing {
+                    tracing::info!(dest = %d.id, "Go live: a destination is back, its backup stops");
+                    b.failing.remove(id);
+                    changed.push((id.clone(), false));
+                }
+            }
+        }
+        if !changed.is_empty() {
+            self.reconcile().await;
+        }
+    }
+
     /// One second of upload protection while live.
     async fn protect_tick(&self) {
         use ferrocast_golive::protect::{Action, Sample};
@@ -1888,6 +2005,7 @@ pub(crate) async fn run(engine: Engine) {
         if k > 0 {
             g.last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
         }
+        engine.backup_tick().await;
         engine.protect_tick().await;
         engine.send_golive();
     }
