@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::direct::{Direct, DirectError};
 use crate::hub::{Frame, Hub, Subscription};
-use crate::push::{Ended, Health, PushState, set_state};
+use crate::push::{Ended, Health, Link, PushState, set_state};
 use crate::ts::{VideoSetup, annex_b, video_setup};
 
 /// Opus frames: 20 ms at 48 kHz.
@@ -152,7 +152,13 @@ pub(crate) async fn session(
     let ip = local_ip(&host, port).await.ok_or_else(|| DirectError::Unreachable(name.clone()))?;
     let socket = UdpSocket::bind((ip, 0)).await.map_err(|_| DirectError::Unreachable(name.clone()))?;
     let local = socket.local_addr().map_err(|_| DirectError::Unreachable(name.clone()))?;
-    let mut rtc = Rtc::builder().clear_codecs().enable_h264(true).enable_opus(true, false).build(Instant::now());
+    // Stats once a second: the link's ping, loss and resends.
+    let mut rtc = Rtc::builder()
+        .clear_codecs()
+        .enable_h264(true)
+        .enable_opus(true, false)
+        .set_stats_interval(Some(Duration::from_secs(1)))
+        .build(Instant::now());
     let cand = Candidate::host(local, "udp").map_err(|e| DirectError::Refused(e.to_string()))?;
     rtc.add_local_candidate(cand);
     let mut api = rtc.sdp_api();
@@ -265,6 +271,8 @@ async fn stream_to(
     let mut audio_base: Option<u64> = None;
     let mut buf = vec![0u8; 2048];
     let (mut window, mut sent) = (Instant::now(), 0u64);
+    // The picture's packets and the receiver's asks for them again, at the last stats.
+    let mut counted = (0u64, 0u64);
     loop {
         // Everything str0m has to say, until it wants time.
         let deadline = loop {
@@ -285,6 +293,18 @@ async fn stream_to(
                     }
                     _ => {}
                 },
+                Output::Event(Event::MediaEgressStats(st)) if st.mid == vmid => {
+                    let packets = st.packets.saturating_sub(counted.0).max(1) as f32;
+                    let link = Link {
+                        rtt_ms: st.rtt.map_or(0, |d| d.as_millis() as u32),
+                        lost_pct: st.loss.unwrap_or(0.0) * 100.0,
+                        resent_pct: st.nacks.saturating_sub(counted.1) as f32 * 100.0 / packets,
+                    };
+                    counted = (st.packets, st.nacks);
+                    if st.rtt.is_some() {
+                        health.send_modify(|h| h.link = Some(link));
+                    }
+                }
                 Output::Event(_) => {}
             }
         };
@@ -512,7 +532,7 @@ mod tests {
         let hub = Hub::new();
         hub.start();
         let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "w".into(),

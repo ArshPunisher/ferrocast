@@ -11,7 +11,7 @@ use srt_tokio::options::{DataRate, LiveBandwidthMode, Percent};
 use tokio::sync::{broadcast, watch};
 
 use crate::hub::{Frame, Hub, Live, Subscription};
-use crate::push::{Ended, Health, PushState, Retry, backoff, set_state};
+use crate::push::{Ended, Health, Link, PushState, Retry, backoff, set_state};
 use crate::ts::{PACKET, TsMuxer};
 
 /// How long a connection may take.
@@ -194,6 +194,7 @@ pub async fn run(d: Direct, hub: Arc<Hub>, health: watch::Sender<Health>, mut st
         kbps: 0,
         dropped: 0,
         sent: 0,
+        link: None,
         since_ms: crate::push::now_ms(),
     });
     let mut done = 0u64;
@@ -421,10 +422,40 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
                 .map_err(|e| DirectError::Refused(format!("{name} refused the SRT connection ({e}).")))?
         }
     };
+    let mut sock = sock;
+    let stats = sock.statistics().clone();
     let mut sink = SrtSink { sock, name };
-    let out = feed_ts(hub, health, stream, &mut sink).await;
+    let out = tokio::select! {
+        out = feed_ts(hub, health, stream, &mut sink) => out,
+        () = srt_link(stats, health) => Ok(Ended::StreamEnded),
+    };
     let _ = sink.sock.close().await;
     out
+}
+
+/// The SRT connection's ping, loss and resends, from its statistics (once a second), until they
+/// end with it.
+async fn srt_link(
+    mut stats: impl futures::Stream<Item = srt_tokio::SocketStatistics> + Unpin,
+    health: &watch::Sender<Health>,
+) {
+    use futures::StreamExt;
+    let mut last: Option<(u64, u64, u64)> = None;
+    while let Some(s) = stats.next().await {
+        let now = (s.tx_data, s.tx_loss_data, s.tx_retransmit_data);
+        if let Some((data, loss, resent)) = last {
+            let sent = now.0.saturating_sub(data).max(1) as f32;
+            let link = Link {
+                rtt_ms: s.tx_average_rtt.as_millis() as u32,
+                lost_pct: now.1.saturating_sub(loss) as f32 * 100.0 / sent,
+                resent_pct: now.2.saturating_sub(resent) as f32 * 100.0 / sent,
+            };
+            health.send_modify(|h| h.link = Some(link));
+        }
+        last = Some(now);
+    }
+    // Ended: the sending side says why.
+    std::future::pending::<()>().await;
 }
 
 struct SrtSink {
@@ -507,7 +538,7 @@ mod tests {
         let hub = Hub::new();
         hub.start();
         let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "t".into(),
@@ -579,7 +610,7 @@ mod tests {
         let hub = Hub::new();
         hub.start();
         let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct { id: "t".into(), kind: Kind::Srt, url, key: String::new(), retry: Retry::default() };
         let sender = tokio::spawn(run(d, hub.clone(), health, stop));

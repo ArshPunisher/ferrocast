@@ -96,14 +96,28 @@ pub struct Health {
     /// Bytes sent since this destination started (for callers that work out their own rate).
     #[serde(skip)]
     pub sent: u64,
+    /// How the network to it is doing (direct destinations, once connected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
     /// When the current state began (ms since the Unix epoch).
     pub since_ms: u64,
 }
 
 impl Health {
     fn new(state: PushState) -> Self {
-        Self { state, kbps: 0, dropped: 0, sent: 0, since_ms: now_ms() }
+        Self { state, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: now_ms() }
     }
+}
+
+/// The network to a destination over the last few seconds, as its sender measures it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, serde::Deserialize)]
+pub struct Link {
+    /// The round trip (ping), in milliseconds.
+    pub rtt_ms: u32,
+    /// Of the packets sent, the share the network lost (most come back resent), in percent.
+    pub lost_pct: f32,
+    /// Of the packets sent, the share sent again, in percent.
+    pub resent_pct: f32,
 }
 
 /// Why a try failed, in words.

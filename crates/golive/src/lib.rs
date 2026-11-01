@@ -27,7 +27,7 @@ mod conn;
 pub use hub::{Hub, StreamStats};
 pub use ingest::Ingest;
 pub use probe::{Need, Service, Verdict};
-pub use push::{Destination, Health, PushError, PushState};
+pub use push::{Destination, Health, Link, PushError, PushState};
 pub use target::{Target, TargetError};
 
 #[cfg(test)]

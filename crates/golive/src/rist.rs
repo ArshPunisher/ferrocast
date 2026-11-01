@@ -6,12 +6,12 @@
 //! - Main profile (TR-06-2, as librist sends it): RTP and RTCP both in GRE to one port, and with
 //!   a passphrase encrypted (AES-CTR, the key made from the passphrase and a random nonce by
 //!   PBKDF2-HMAC-SHA256). Picked by `profile=1`, or by a passphrase (the key, or `secret=`);
-//!   `aes-type=` 128 (the default) or 256.
+//!   `aes-type=` 128 or 256 (the default, as librist).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, watch};
 
 use crate::direct::{Address, Direct, DirectError, TsSink, feed_ts};
 use crate::hub::Hub;
-use crate::push::{Ended, Health};
+use crate::push::{Ended, Health, Link};
 
 /// RTP's payload type for MPEG-TS.
 const MP2T: u8 = 33;
@@ -38,6 +38,10 @@ struct Shared {
     to: SocketAddr,
     kept: Mutex<VecDeque<Sent>>,
     ssrc: u32,
+    /// Stream packets sent, asked for again, and sent again (for the link's health).
+    sent: AtomicU64,
+    asked: AtomicU64,
+    resent: AtomicU64,
     /// The main profile's GRE (and encryption); None for the simple profile.
     main: Option<Main>,
 }
@@ -80,18 +84,21 @@ pub(crate) async fn session(
     };
     // Retransmissions use the same SSRC with its lowest bit set (TR-06-1).
     let ssrc = fastrand::u32(..) & !1;
-    let shared = Arc::new(Shared { rtp, to, kept: Mutex::new(VecDeque::with_capacity(KEPT)), ssrc, main });
+    let shared = Arc::new(Shared {
+        rtp,
+        to,
+        kept: Mutex::new(VecDeque::with_capacity(KEPT)),
+        ssrc,
+        sent: AtomicU64::new(0),
+        asked: AtomicU64::new(0),
+        resent: AtomicU64::new(0),
+        main,
+    });
     let mut sink = RistSink { shared: shared.clone(), seq: fastrand::u16(..), started: Instant::now(), name };
-    // Stopped however the session ends (a stop drops this future mid-send).
-    let _answers = AbortOnDrop(tokio::spawn(answer(shared.clone(), rtcp, rtcp_to)));
-    feed_ts(hub, health, stream, &mut sink).await
-}
-
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+    // Answering runs beside sending, and stops with it however the session ends.
+    tokio::select! {
+        out = feed_ts(hub, health, stream, &mut sink) => out,
+        () = answer(shared.clone(), rtcp, rtcp_to, health) => Ok(Ended::StreamEnded),
     }
 }
 
@@ -172,7 +179,8 @@ impl Main {
             return None;
         }
         let crypt = passphrase(d, a).map(|pass| {
-            let size = if a.param("aes-type") == Some("256") { 32 } else { 16 };
+            // 256 bits unless told otherwise, as librist.
+            let size = if a.param("aes-type") == Some("128") { 16 } else { 32 };
             let mut nonce = [0u8; 4];
             while nonce == [0; 4] {
                 nonce = fastrand::u32(..).to_be_bytes();
@@ -235,13 +243,15 @@ impl Main {
         let mut body = p.get(at..)?.to_vec();
         match (&self.crypt, nonce, seq) {
             (Some(c), Some(nonce), Some(seq)) if nonce != [0; 4] => {
+                // The receiver's own key size: H set is 256 bits (librist's default), else ours.
+                let size = if flags2 & 0x40 != 0 { 32 } else { c.size };
                 let mut rx = c.rx.lock().unwrap_or_else(|e| e.into_inner());
-                if rx.as_ref().is_none_or(|(n, _, _)| *n != nonce) {
+                if rx.as_ref().is_none_or(|(n, key, _)| *n != nonce || key.len() != size) {
                     // A new key at most every 10 ms, as librist (PBKDF2 isn't free).
                     if rx.as_ref().is_some_and(|(_, _, at)| at.elapsed() < REKEY_EVERY) {
                         return None;
                     }
-                    *rx = Some((nonce, aes_key(&c.pass, &nonce, c.size), Instant::now()));
+                    *rx = Some((nonce, aes_key(&c.pass, &nonce, size), Instant::now()));
                 }
                 let (_, key, _) = rx.as_ref()?;
                 aes_ctr(key, seq, &mut body);
@@ -299,6 +309,7 @@ impl TsSink for RistSink {
             kept.push_back((self.seq, Bytes::from(p)));
         }
         self.seq = self.seq.wrapping_add(1);
+        self.shared.sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -316,11 +327,55 @@ fn rtp(pt: u8, seq: u16, ts: u32, ssrc: u32, payload: &[u8]) -> Vec<u8> {
 
 /// The sender's report (an empty SR, as RIST receivers need only the clock pairing and its
 /// name) and SDES with its CNAME, in one compound packet.
-fn report(ssrc: u32, started: Instant) -> Vec<u8> {
+/// The time now in NTP's form: seconds since 1900, and the fraction of a second (of 2^32).
+fn ntp_now() -> (u64, u32) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    // NTP time: seconds since 1900, and the fraction.
-    let secs = now.as_secs() + 2_208_988_800;
-    let frac = ((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000) as u32;
+    (now.as_secs() + 2_208_988_800, ((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000) as u32)
+}
+
+/// NTP time as one number (seconds in the top half, the fraction in the bottom).
+fn ntp64() -> u64 {
+    let (secs, frac) = ntp_now();
+    (secs << 32) | u64::from(frac)
+}
+
+/// RIST's echo request (APP 204 "RIST", subtype 2): our time now, which the receiver sends
+/// straight back for the round trip.
+fn echo_request(ssrc: u32) -> Vec<u8> {
+    let mut p = vec![0x82, 204, 0, 5];
+    p.extend_from_slice(&ssrc.to_be_bytes());
+    p.extend_from_slice(b"RIST");
+    p.extend_from_slice(&ntp64().to_be_bytes());
+    // The receiver's wait before answering (ours to fill only in a response).
+    p.extend_from_slice(&[0; 4]);
+    p
+}
+
+/// The round trip an echo response (subtype 3) in a compound RTCP packet shows.
+pub(crate) fn echo_round_trip(buf: &[u8]) -> Option<Duration> {
+    let mut at = 0;
+    while at + 4 <= buf.len() {
+        let (b0, pt) = (buf[at], buf[at + 1]);
+        let words = usize::from(u16::from_be_bytes([buf[at + 2], buf[at + 3]]));
+        if pt == 204 && b0 & 0x1F == 3 && buf.get(at + 8..at + 12) == Some(b"RIST") {
+            let sent = u64::from_be_bytes(buf.get(at + 12..at + 20)?.try_into().ok()?);
+            let delay = u64::from(u32::from_be_bytes(buf.get(at + 20..at + 24)?.try_into().ok()?));
+            // NTP fractions (of 2^32 s) to microseconds; the delay is in microseconds.
+            let rtt = ntp64().checked_sub(sent)?.saturating_mul(1_000_000) >> 32;
+            let rtt = rtt.saturating_sub(delay);
+            // More than a minute: a clock or answer that doesn't add up.
+            return (rtt < 60_000_000).then(|| Duration::from_micros(rtt));
+        }
+        if words == 0 {
+            break;
+        }
+        at += 4 + words * 4;
+    }
+    None
+}
+
+fn report(ssrc: u32, started: Instant) -> Vec<u8> {
+    let (secs, frac) = ntp_now();
     let rtp_ts = (started.elapsed().as_micros() * 9 / 100) as u32;
     let mut p = vec![0x80, 200, 0, 6];
     p.extend_from_slice(&ssrc.to_be_bytes());
@@ -381,16 +436,36 @@ pub(crate) fn lost(buf: &[u8]) -> Vec<u16> {
 }
 
 /// Sends reports, and sends again what the receiver asks for.
-async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr) {
+async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr, health: &watch::Sender<Health>) {
     let started = Instant::now();
     let mut tick = tokio::time::interval(REPORT_EVERY);
+    // The link's health: the last round trip, and the counts a second ago.
+    let mut rtt = None::<Duration>;
+    let mut every_second = tokio::time::interval(Duration::from_secs(1));
+    let mut counted = (0u64, 0u64, 0u64);
     let mut buf = vec![0u8; 2048];
     // The main profile's reports go in GRE, from and to the real ports.
     let here = rtcp.local_addr().map(|a| a.port()).unwrap_or(0);
     loop {
         tokio::select! {
+            _ = every_second.tick() => {
+                let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
+                let now = (load(&shared.sent), load(&shared.asked), load(&shared.resent));
+                let sent = now.0.saturating_sub(counted.0).max(1) as f32;
+                // Lost: what the receiver asked for again (its reports don't count loss).
+                let link = Link {
+                    rtt_ms: rtt.map_or(0, |d| d.as_millis() as u32),
+                    lost_pct: now.1.saturating_sub(counted.1) as f32 * 100.0 / sent,
+                    resent_pct: now.2.saturating_sub(counted.2) as f32 * 100.0 / sent,
+                };
+                counted = now;
+                if rtt.is_some() || link.resent_pct > 0.0 {
+                    health.send_modify(|h| h.link = Some(link));
+                }
+            }
             _ = tick.tick() => {
-                let r = report(shared.ssrc, started);
+                let mut r = report(shared.ssrc, started);
+                r.extend_from_slice(&echo_request(shared.ssrc));
                 let r = match &shared.main {
                     Some(m) => m.wrap(here, rtcp_to.port(), &r),
                     None => r,
@@ -410,7 +485,9 @@ async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr) 
                     },
                     None => buf[..n].to_vec(),
                 };
+                rtt = echo_round_trip(&got).or(rtt);
                 let want = lost(&got);
+                shared.asked.fetch_add(want.len() as u64, Ordering::Relaxed);
                 if want.is_empty() {
                     continue;
                 }
@@ -423,6 +500,7 @@ async fn answer(shared: Arc<Shared>, rtcp: Arc<UdpSocket>, rtcp_to: SocketAddr) 
                     let mut p = p.to_vec();
                     p[11] |= 1;
                     let _ = shared.send_rtp(&p).await;
+                    shared.resent.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -451,6 +529,21 @@ mod tests {
         both.extend_from_slice(&nack);
         assert_eq!(lost(&both), [100, 101, 103]);
         assert!(lost(&[0x80, 200, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn an_echo_answer_gives_the_round_trip() {
+        // Our request, answered as librist does (subtype 3, our time back, no wait), after a
+        // receiver report in the same compound packet.
+        let mut req = echo_request(7);
+        req[0] = 0x83;
+        let mut both = vec![0x80, 201, 0, 1, 0, 0, 0, 9];
+        both.extend_from_slice(&req);
+        std::thread::sleep(Duration::from_millis(20));
+        let rtt = echo_round_trip(&both).unwrap_or_default();
+        assert!(rtt >= Duration::from_millis(20) && rtt < Duration::from_secs(2), "{rtt:?}");
+        // A request isn't an answer.
+        assert_eq!(echo_round_trip(&echo_request(7)), None);
     }
 
     fn direct(url: &str, key: &str) -> Direct {
@@ -545,7 +638,7 @@ mod tests {
         let hub = Hub::new();
         hub.start();
         let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let sender = tokio::spawn(run(direct(&url, "pass-word-1"), hub.clone(), health, stop));
         let mut h2 = h.clone();
@@ -637,7 +730,7 @@ mod tests {
         let hub = Hub::new();
         hub.start();
         let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "r".into(),

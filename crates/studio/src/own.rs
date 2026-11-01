@@ -613,6 +613,8 @@ impl OwnStream {
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.min(u64::from(u32::MAX)) as u32,
                 dropped: s.skipped.min(u64::from(u32::MAX)) as u32,
+                link: None,
+                reason: None,
             };
         }
         StreamStats {
@@ -621,6 +623,8 @@ impl OwnStream {
             bytes: self.counts.bytes.load(Ordering::Relaxed),
             frames: self.counts.frames.load(Ordering::Relaxed),
             dropped: 0,
+            link: None,
+            reason: None,
         }
     }
 
@@ -649,6 +653,7 @@ impl OwnStream {
             kbps: 0,
             dropped: 0,
             sent: 0,
+            link: None,
             since_ms: 0,
         });
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
@@ -673,6 +678,11 @@ impl OwnStream {
             bytes: h.sent,
             frames: 0,
             dropped: h.dropped.min(u64::from(u32::MAX)) as u32,
+            link: h.link,
+            reason: match &h.state {
+                PushState::Reconnecting { reason, .. } => Some(reason.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -726,7 +736,7 @@ fn sender(
     // without one has none to send.
     let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: true };
     let (health_tx, h) =
-        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
     let (sp, stop_rx) = tokio::sync::watch::channel(false);
     rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
     Ok((Some(rt), Some(h), Some(sp)))

@@ -1569,7 +1569,7 @@ impl Engine {
             Ok(dest) => {
                 lock(&g.blocked).remove(&d.id);
                 let (health_tx, health) =
-                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
                 let (stop, stop_rx) = watch::channel(false);
                 tokio::spawn(ferrocast_golive::push::run(dest, self.hub_of(d).clone(), health_tx, stop_rx));
                 lock(&g.running).insert(d.id.clone(), Running { stop, health, light: self.on_light(d) });
@@ -1607,7 +1607,7 @@ impl Engine {
         lock(&g.blocked).remove(&d.id);
         let now_ms = || u64::try_from(now().0).unwrap_or(0);
         let (health_tx, health) =
-            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, sent: 0, since_ms: now_ms() });
+            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: now_ms() });
         let (stop, mut stop_rx) = watch::channel(false);
         let id = d.id.clone();
         tokio::spawn(async move {
@@ -1633,7 +1633,9 @@ impl Engine {
                     PushState::Reconnecting {
                         attempt: 0,
                         retry_in_ms: 0,
-                        reason: "The server dropped the connection; trying again.".into(),
+                        reason: st["reason"]
+                            .as_str()
+                            .map_or_else(|| "The server dropped the connection; trying again.".into(), String::from),
                     }
                 } else if st["active"].as_bool().unwrap_or(false) {
                     PushState::Live
@@ -1647,6 +1649,7 @@ impl Engine {
                     h.state = state;
                     h.kbps = kbps;
                     h.dropped = st["dropped"].as_u64().unwrap_or(0);
+                    h.link = serde_json::from_value(st["link"].clone()).ok();
                 });
             }
             let _ = host.direct_stop(id).await;
@@ -1708,6 +1711,7 @@ impl Engine {
             kbps: 0,
             dropped: 0,
             sent: 0,
+            link: None,
             since_ms: now_ms,
         };
         lock(&g.paused).insert(id, health);

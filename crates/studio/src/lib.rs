@@ -456,13 +456,19 @@ pub struct EngineStats {
 }
 
 /// How a stream is going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StreamStats {
     pub active: bool,
     pub reconnecting: bool,
     pub bytes: u64,
     pub frames: u32,
     pub dropped: u32,
+    /// A direct destination's network (ping, loss, resends), once it's connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<ferrocast_golive::Link>,
+    /// Why a direct destination is trying again, in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The app in front (its name as the Dock shows it), for a scene per game. None where it
