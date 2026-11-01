@@ -382,8 +382,10 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
     let name = a.name();
     let mut sock = srt_connect(d, &a, None).await?;
     // A delay the streamer didn't set follows the network: SRT wants at least four round
-    // trips to resend in time, so a far server gets a longer one (once, on connecting).
+    // trips to resend in time, so a far server gets a longer one (once, on connecting). Only as
+    // the caller: a listener or rendezvous would drop the receiver that just connected.
     if a.param("latency").is_none()
+        && SrtMode::of(&a)? == SrtMode::Caller
         && let Some(want) = srt_latency_for(sock.settings().rtt)
     {
         tracing::info!(dest = %d.id, latency_ms = want.as_millis() as u64, "SRT delay follows the network");
