@@ -38,6 +38,9 @@ pub struct Stage {
     /// Web page sources, each a page rendered for our engine, with the settings it opened with.
     #[cfg(target_os = "macos")]
     pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
+    /// Media from network addresses (guests' cameras, streams), each read by FFmpeg.
+    #[cfg(target_os = "macos")]
+    nets: RefCell<std::collections::HashMap<String, (Value, crate::netmedia::NetMedia)>>,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -119,6 +122,8 @@ impl Stage {
             engine: RefCell::new(None),
             #[cfg(target_os = "macos")]
             pages: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            nets: RefCell::default(),
         };
         s.add_scene(first_scene)?;
         Ok(s)
@@ -136,6 +141,8 @@ impl Stage {
             engine: RefCell::new(None),
             #[cfg(target_os = "macos")]
             pages: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            nets: RefCell::default(),
         };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
@@ -178,6 +185,33 @@ impl Stage {
         out
     }
 
+    /// Starts, restarts or stops reading the network media sources (a guest's camera…), and
+    /// hands each its source's feed.
+    #[cfg(target_os = "macos")]
+    fn sync_nets(&self, e: &own::Shared) {
+        let net: Vec<(String, Value)> = self
+            .sources_list()
+            .iter()
+            .filter(|s| kind_of(s) == "ffmpeg_source")
+            .filter(|s| s.pointer("/settings/is_local_file").and_then(Value::as_bool) == Some(false))
+            .map(|s| (name_of(s).to_string(), s.get("settings").cloned().unwrap_or_default()))
+            .collect();
+        let mut nets = self.nets.borrow_mut();
+        nets.retain(|name, (was, _)| net.iter().any(|(n, set)| n == name && set == was));
+        for (name, set) in net {
+            let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
+            match nets.get(&name) {
+                Some((_, m)) => m.set_feed(feed),
+                None => match crate::netmedia::NetMedia::start(&name, &set, feed) {
+                    Ok(m) => {
+                        nets.insert(name, (set, m));
+                    }
+                    Err(e) => tracing::warn!(source = %name, "a network media source didn't start: {e}"),
+                },
+            }
+        }
+    }
+
     /// Opens, updates or closes the web pages our engine shows, as the collection has them, and
     /// hands each its source's feed (a new one after the collection is opened again). Main
     /// thread (WebKit).
@@ -191,6 +225,7 @@ impl Stage {
                 .filter(|s| matches!(kind_of(s), "browser_source" | "ferrocast_web"))
                 .map(|s| (name_of(s).to_string(), s.get("settings").cloned().unwrap_or_default()))
                 .collect();
+            self.sync_nets(&e);
             let mut pages = self.pages.borrow_mut();
             pages.retain(|name, _| web.iter().any(|(n, _)| n == name));
             for (name, set) in web {

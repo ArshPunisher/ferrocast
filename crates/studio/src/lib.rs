@@ -11,6 +11,8 @@ mod ffi;
 pub mod import;
 pub mod kinds;
 mod naming;
+#[cfg(target_os = "macos")]
+mod netmedia;
 mod own;
 pub mod projector;
 pub mod stage;
