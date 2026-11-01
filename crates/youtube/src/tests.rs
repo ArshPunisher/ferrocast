@@ -342,8 +342,16 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
         .route(
             "/api/liveBroadcasts",
             axum::routing::get(move |Query(q): Query<HashMap<String, String>>| async move {
-                let upcoming = q.get("broadcastStatus").map(String::as_str) == Some("upcoming");
-                let items = if upcoming && scheduled { json!([{ "id": "vid-1" }]) } else { json!([]) };
+                let status = q.get("broadcastStatus").map(String::as_str);
+                let items = match status {
+                    Some("upcoming") if scheduled => json!([{ "id": "vid-1" }]),
+                    // Two ended streams: yesterday's, and the one that just ended.
+                    Some("completed") => json!([
+                        { "id": "old", "snippet": { "actualStartTime": "2026-11-01T10:00:00Z" } },
+                        { "id": "vid-1", "snippet": { "actualStartTime": "2026-11-02T01:00:00.250Z" } },
+                    ]),
+                    _ => json!([]),
+                };
                 axum::Json(json!({ "items": items }))
             })
             // With no broadcast, one is made (recorded like a PUT, as {"made": body}).
@@ -431,6 +439,35 @@ async fn stream_info_updates_the_broadcast_video_and_keeps_its_description() {
     assert!(api.update_broadcast_info(&long).await.unwrap_err().to_string().contains("100 characters"));
     assert_eq!(crate::api::search_video_categories("gam")[0].id, "20");
     assert_eq!(crate::api::search_video_categories("").len(), crate::api::VIDEO_CATEGORIES.len());
+}
+
+#[tokio::test]
+async fn chapters_go_at_the_end_of_the_ended_streams_description() {
+    let (ep, puts) = fake_videos(false).await;
+    let api = video_api(ep);
+    let start = crate::api::parse_rfc3339_ms("2026-11-02T01:00:00.250Z").unwrap();
+    assert_eq!(start, 1_793_581_200_250);
+    // Yesterday's is too early; this one went live a minute after the stream began here.
+    assert_eq!(api.last_broadcast(start - 60_000).await.unwrap(), Some(("vid-1".into(), start)));
+    assert_eq!(api.last_broadcast(start + 3_600_000).await.unwrap(), None);
+    api.set_chapters("vid-1", "0:00 Start\n3:05 Gameplay\n10:00 Chat\n").await.unwrap();
+    let body = puts.lock().unwrap()[0].clone();
+    assert_eq!(body["snippet"]["description"], "Keep me\n\nChapters:\n0:00 Start\n3:05 Gameplay\n10:00 Chat");
+    assert_eq!(body["snippet"]["title"], "Old");
+    // Chapters put there before are replaced, the rest kept.
+    let again = crate::api::with_chapters("Hi\n\nChapters:\n0:00 A\n1:00 B\n", "0:00 C\n");
+    assert_eq!(again, "Hi\n\nChapters:\n0:00 C");
+    assert_eq!(crate::api::with_chapters("", "0:00 C\n"), "Chapters:\n0:00 C");
+    // Text after the old chapters (links, tags) stays, the new ones going last.
+    assert_eq!(
+        crate::api::with_chapters("Hi\n\nChapters:\n0:00 A\n1:02:03 B\n\nFollow me: x.com/me\n#gaming", "0:00 C\n"),
+        "Hi\n\nFollow me: x.com/me\n#gaming\n\nChapters:\n0:00 C"
+    );
+    assert_eq!(
+        crate::api::parse_rfc3339_ms("2026-11-02T06:30:00+05:30"),
+        crate::api::parse_rfc3339_ms("2026-11-02T01:00:00Z")
+    );
+    assert_eq!(crate::api::parse_rfc3339_ms("yesterday"), None);
 }
 
 #[tokio::test]
