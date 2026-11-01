@@ -50,11 +50,8 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
 
 /// Why this recording can't use our encoders, or None when it can.
 pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
-    let tracks_one = plan.tracks.is_empty() || plan.tracks == [1];
     if !matches!(plan.format.as_str(), "mp4" | "fmp4" | "mkv") {
         Some("this format (ours writes MP4 and MKV)")
-    } else if !tracks_one {
-        Some("more than one sound track")
     } else if !plan.muxer.trim().is_empty() {
         Some("custom muxer settings")
     } else if plan.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&plan.encode.video_encoder) {
@@ -342,6 +339,7 @@ impl OwnStream {
         send_to: Option<Send<'_>>,
         record: Option<&std::path::Path>,
         e: &EncodeSettings,
+        tracks: &[u8],
     ) -> Result<Self, StudioError> {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
@@ -396,10 +394,16 @@ impl OwnStream {
             }
         };
         // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
-        let out = match e.scale {
+        let mut out = match e.scale {
             Some((w, h)) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
             None => AvCanvas::main(config),
         };
+        // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
+        let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
+        if let Some(first) = picked.next() {
+            out.track = first;
+            out.more_tracks = picked.collect();
+        }
         let output = engine.start_output_on(kind, out).map_err(|e| fail(e.to_string()))?;
         tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         let on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
@@ -681,7 +685,6 @@ mod tests {
             unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_none()
                 == cfg!(target_os = "macos")
         );
-        assert!(unsupported_recording(&RecordPlan { tracks: vec![1, 2], ..plan.clone() }).is_some());
         // Recordings default to constant quality: ours does it on the Mac.
         let mut cq = plan.clone();
         cq.encode.quality = Some(16);
