@@ -1540,6 +1540,8 @@ impl Engine {
         lock(&g.paused).retain(|id, _| wanted(id));
         if !main_on && !vertical_on {
             lock(&g.protector).reset();
+            // The next stream starts with every destination given its own chance again.
+            *lock(&g.backup) = BackupState::default();
         }
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
