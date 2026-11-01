@@ -1104,6 +1104,11 @@ impl Engine {
         }
     }
 
+    /// A chapter mark in an output's recording here (named, or "Chapter n").
+    pub fn chapter_output(&self, id: u64, name: &str) -> Result<(), AvError> {
+        self.with_output(id, |pipe| pipe.chapter(name))
+    }
+
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
     pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
         self.with_output(id, |pipe| {

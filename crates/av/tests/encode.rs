@@ -158,21 +158,23 @@ fn aac_from_a_tone() {
     }
 }
 
-/// Five seconds of picture and sound into a fragmented MP4, read back by ffprobe; then the same
-/// file cut short mid-fragment (a crash) still plays up to its last whole fragment.
-#[test]
-fn mp4_recording_survives_a_crash() {
-    if !encodes() {
-        return;
-    }
+/// `frames` of picture (30 fps) and their sound, encoded, with their tracks' shapes.
+fn encoded(
+    frames: u32,
+) -> (
+    ferrocast_av::mp4::VideoTrack,
+    ferrocast_av::mp4::AudioTrack,
+    Vec<ferrocast_av::video::VideoPacket>,
+    Vec<ferrocast_av::audio::AudioPacket>,
+) {
     use ferrocast_av::audio::{AudioConfig, AudioEncoder};
-    use ferrocast_av::mp4::{AudioTrack, Mp4Writer, VideoTrack};
+    use ferrocast_av::mp4::{AudioTrack, VideoTrack};
     let mut venc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
     let acfg = AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 };
     let mut aenc = AudioEncoder::new(acfg).unwrap_or_else(|e| panic!("{e}"));
     let mut vpk = Vec::new();
     let mut apk = Vec::new();
-    for i in 0..150u32 {
+    for i in 0..frames {
         let px = bgra(i);
         vpk.extend(
             venc.encode(Frame::Bgra { data: &px, stride: 640 * 4 }, i64::from(i) * 33_333, false)
@@ -191,6 +193,18 @@ fn mp4_recording_survives_a_crash() {
     let video =
         VideoTrack { codec: VideoCodec::H264, width: 640, height: 360, config: venc.header().unwrap_or_default() };
     let audio = AudioTrack { sample_rate: 48000, channels: 2, config: aenc.header(), bitrate_kbps: 128 };
+    (video, audio, vpk, apk)
+}
+
+/// Five seconds of picture and sound into a fragmented MP4, read back by ffprobe; then the same
+/// file cut short mid-fragment (a crash) still plays up to its last whole fragment.
+#[test]
+fn mp4_recording_survives_a_crash() {
+    if !encodes() {
+        return;
+    }
+    use ferrocast_av::mp4::Mp4Writer;
+    let (video, audio, vpk, apk) = encoded(150);
     let mut w = Mp4Writer::new(Vec::new(), Some(video), Some(audio)).unwrap_or_else(|e| panic!("{e}"));
     // Interleaved by time, as they'd arrive live.
     let (mut vi, mut ai) = (0, 0);
@@ -231,6 +245,69 @@ fn mp4_recording_survives_a_crash() {
         let frames: u32 =
             p.split(' ').next().and_then(|v| v.split(',').nth(1)).and_then(|n| n.parse().ok()).unwrap_or(0);
         assert!(frames >= 120, "plays up to the last whole fragment: {p}");
+    }
+}
+
+/// Chapter marks (OBS's "Add Chapter Marker") in an MP4 and an MKV, as ffprobe reads them:
+/// named where asked, "Chapter n" where not, at the time they were added.
+#[test]
+fn chapter_marks_are_in_the_file() {
+    if !encodes() {
+        return;
+    }
+    use ferrocast_av::mkv::MkvWriter;
+    use ferrocast_av::mp4::Mp4Writer;
+    use std::io::Cursor;
+    let (video, audio, vpk, apk) = encoded(90);
+    let chapters = |name: &str, data: &[u8]| -> Option<String> {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, data).ok()?;
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "chapter=start_time:chapter_tags=title", "-of", "csv=p=0"])
+            .arg(&path)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&path);
+        Some(String::from_utf8_lossy(&out.stdout).trim().replace('\n', "|"))
+    };
+    // A mark at the start, one named a second in, one unnamed two seconds in.
+    let marks = |i: usize, mark: &mut dyn FnMut(&str)| match i {
+        0 => mark("Intro"),
+        30 => mark("Game"),
+        60 => mark(""),
+        _ => {}
+    };
+    let mut mp4 = Mp4Writer::new(Cursor::new(Vec::new()), Some(video.clone()), Some(audio.clone()))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut mkv = MkvWriter::new(Cursor::new(Vec::new()), Some(video), Some(audio)).unwrap_or_else(|e| panic!("{e}"));
+    let mut ai = 0;
+    for (i, v) in vpk.iter().enumerate() {
+        while ai < apk.len() && apk[ai].pts_us <= v.dts_us {
+            mp4.audio(&apk[ai]).unwrap_or_else(|e| panic!("{e}"));
+            mkv.audio(&apk[ai]).unwrap_or_else(|e| panic!("{e}"));
+            ai += 1;
+        }
+        mp4.video(v).unwrap_or_else(|e| panic!("{e}"));
+        mkv.video(v).unwrap_or_else(|e| panic!("{e}"));
+        marks(i, &mut |n| assert!(mp4.chapter(n)));
+        marks(i, &mut |n| assert!(mkv.chapter(n)));
+    }
+    let mp4 = mp4.finish_with_chapters().unwrap_or_else(|e| panic!("{e}")).into_inner();
+    let mkv = mkv.finish_with_chapters().unwrap_or_else(|e| panic!("{e}")).into_inner();
+    for (name, data) in [("ferrocast-chapters.mp4", &mp4), ("ferrocast-chapters.mkv", &mkv)] {
+        let Some(c) = chapters(name, data) else { continue };
+        let got: Vec<(f64, String)> = c
+            .split('|')
+            .filter_map(|l| {
+                let (t, n) = l.split_once(',')?;
+                Some((t.parse().ok()?, n.to_string()))
+            })
+            .collect();
+        let names: Vec<&str> = got.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["Intro", "Game", "Chapter 3"], "{name}: {c}");
+        for ((t, _), want) in got.iter().zip([0.0, 1.0, 2.0]) {
+            assert!((t - want).abs() < 0.1, "{name}: a mark at {t}, not {want}");
+        }
     }
 }
 

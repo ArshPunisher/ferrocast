@@ -186,10 +186,17 @@ impl Writer {
         }
     }
 
+    fn chapter(&mut self, name: &str) -> bool {
+        match self {
+            Self::Mp4(w) => w.chapter(name),
+            Self::Mkv(w) => w.chapter(name),
+        }
+    }
+
     fn finish(self) -> std::io::Result<()> {
         match self {
-            Self::Mp4(w) => w.finish().map(drop),
-            Self::Mkv(w) => w.finish().map(drop),
+            Self::Mp4(w) => w.finish_with_chapters().map(drop),
+            Self::Mkv(w) => w.finish_with_chapters().map(drop),
         }
     }
 }
@@ -433,6 +440,25 @@ impl Pipeline {
             w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
         }
         Ok(tags)
+    }
+
+    /// A chapter mark in the recording here, named ("Chapter n" when not). Err without a
+    /// recording, or before its first frame.
+    pub fn chapter(&mut self, name: &str) -> Result<(), AvError> {
+        match self.recording.as_mut() {
+            Some(Recording::On(w)) => {
+                if w.chapter(name) {
+                    Ok(())
+                } else {
+                    Err(AvError::Encoder(format!(
+                        "this file has {} chapter marks already, the most it takes (split the recording for more)",
+                        crate::mp4::MAX_CHAPTERS
+                    )))
+                }
+            }
+            Some(Recording::Waiting { .. }) => Err(AvError::Encoder("the recording hasn't started yet".into())),
+            _ => Err(AvError::Encoder("chapter marks go in a recording".into())),
+        }
     }
 
     /// Whether the recording broke (a full disk): the stream goes on without it.

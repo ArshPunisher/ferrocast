@@ -3,7 +3,7 @@
 //! written, so a crash or a pulled plug loses at most the fragment being built (about the
 //! keyframe interval), and the file plays in every player as it is: no repair, no remux.
 
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 
 use crate::audio::{AAC_FRAME, AudioPacket};
 use crate::video::{VideoCodec, VideoPacket};
@@ -17,6 +17,21 @@ const KEY_FLAGS: u32 = 0x0200_0000;
 const DELTA_FLAGS: u32 = 0x0101_0000;
 /// Audio-only recordings cut a fragment this often (in audio frames, ~1 s at 48 kHz).
 const AUDIO_ONLY_FRAGMENT: usize = 47;
+/// Room kept after the header (a `free` box) for the chapter marks, written there at the end
+/// (about 300 marks with short names).
+pub(crate) const ROOM: usize = 16 * 1024;
+/// The most chapter marks a file takes (MP4's list counts them in a byte).
+pub const MAX_CHAPTERS: usize = 255;
+
+/// A chapter mark's name: "Chapter n" when it has none, at most `max` bytes (whole letters).
+pub(crate) fn chapter_name(name: &str, n: usize, max: usize) -> String {
+    let name = name.trim();
+    let mut s = if name.is_empty() { format!("Chapter {n}") } else { name.to_string() };
+    while s.len() > max {
+        s.pop();
+    }
+    s
+}
 
 /// The video track's shape.
 #[derive(Debug, Clone)]
@@ -68,6 +83,13 @@ pub struct Mp4Writer<W: Write> {
     v_last_dur: u32,
     /// Bytes written so far.
     written: u64,
+    /// The header as written (after `ftyp`), to write again with the chapter marks.
+    moov: Vec<u8>,
+    ftyp_len: u64,
+    /// Chapter marks: where (µs from the file's start) and their names.
+    chapters: Vec<(i64, String)>,
+    /// The latest time written (µs from the file's start): where a mark goes.
+    last_us: i64,
 }
 
 fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -121,8 +143,13 @@ impl<W: Write> Mp4Writer<W> {
         let tracks = audio.len();
         out.write_all(&ftyp)?;
         out.write_all(&moov)?;
+        let mut free = boxed(b"free", &[]);
+        free[..4].copy_from_slice(&(ROOM as u32).to_be_bytes());
+        free.resize(ROOM, 0);
+        out.write_all(&free)?;
         out.flush()?;
-        let written = (ftyp.len() + moov.len()) as u64;
+        let written = (ftyp.len() + moov.len() + ROOM) as u64;
+        let ftyp_len = ftyp.len() as u64;
         Ok(Self {
             out,
             video,
@@ -135,7 +162,22 @@ impl<W: Write> Mp4Writer<W> {
             sequence: 0,
             v_last_dur: 0,
             written,
+            moov,
+            ftyp_len,
+            chapters: Vec::new(),
+            last_us: 0,
         })
+    }
+
+    /// A chapter mark here (OBS's "Add Chapter Marker"), named, or "Chapter n" when not.
+    /// False when the file has `MAX_CHAPTERS` already.
+    pub fn chapter(&mut self, name: &str) -> bool {
+        if self.chapters.len() >= MAX_CHAPTERS {
+            return false;
+        }
+        let name = chapter_name(name, self.chapters.len() + 1, 255);
+        self.chapters.push((self.last_us, name));
+        true
     }
 
     /// A video frame. A keyframe first writes out what came before it.
@@ -151,6 +193,7 @@ impl<W: Write> Mp4Writer<W> {
             // Nothing decodes before the first keyframe.
             return Ok(());
         }
+        self.last_us = self.last_us.max(p.pts_us - start);
         let ticks = |us: i64| (us - start) * i64::from(VIDEO_SCALE) / 1_000_000;
         self.vq.push(Sample {
             dts: ticks(p.dts_us),
@@ -177,6 +220,7 @@ impl<W: Write> Mp4Writer<W> {
         if p.pts_us < start {
             return Ok(());
         }
+        self.last_us = self.last_us.max(p.pts_us - start);
         let ticks = (p.pts_us - start) * i64::from(a.sample_rate) / 1_000_000;
         self.aq[track].push(Sample { dts: ticks, cts: 0, key: true, data: p.data.clone() });
         if self.video.is_none() && self.aq[0].len() >= AUDIO_ONLY_FRAGMENT {
@@ -190,7 +234,8 @@ impl<W: Write> Mp4Writer<W> {
         self.written
     }
 
-    /// Writes out what's waiting and hands the output back.
+    /// Writes out what's waiting and hands the output back (chapter marks need
+    /// `finish_with_chapters`).
     pub fn finish(mut self) -> io::Result<W> {
         if !self.vq.is_empty() || self.aq.iter().any(|q| !q.is_empty()) {
             self.fragment()?;
@@ -267,6 +312,49 @@ impl<W: Write> Mp4Writer<W> {
         self.written += (moof.len() + payload.len() + 8) as u64;
         self.out.flush()
     }
+}
+
+impl<W: Write + Seek> Mp4Writer<W> {
+    /// As `finish`, with the chapter marks written into the room after the header (Nero's
+    /// `chpl`, as FFmpeg and players read it); marks that don't fit are left out.
+    pub fn finish_with_chapters(self) -> io::Result<W> {
+        let (moov, at, chapters) = (self.moov.clone(), self.ftyp_len, self.chapters.clone());
+        let mut out = self.finish()?;
+        if chapters.is_empty() {
+            return Ok(out);
+        }
+        let room = moov.len() + ROOM;
+        let mut n = chapters.len().min(MAX_CHAPTERS);
+        while n > 0 {
+            let marked = boxed(b"moov", &[&moov[8..], &boxed(b"udta", &chpl(&chapters[..n]))].concat());
+            let left = room.saturating_sub(marked.len());
+            if marked.len() <= room && (left == 0 || left >= 8) {
+                out.seek(SeekFrom::Start(at))?;
+                out.write_all(&marked)?;
+                if left > 0 {
+                    out.write_all(&(left as u32).to_be_bytes())?;
+                    out.write_all(b"free")?;
+                }
+                out.seek(SeekFrom::End(0))?;
+                out.flush()?;
+                break;
+            }
+            n -= 1;
+        }
+        Ok(out)
+    }
+}
+
+/// Nero's chapter list: each mark's start (100 ns units) and name.
+fn chpl(chapters: &[(i64, String)]) -> Vec<u8> {
+    let mut b = vec![0u8; 4];
+    b.push(chapters.len() as u8);
+    for (us, name) in chapters {
+        b.extend_from_slice(&(us.max(&0).unsigned_abs() * 10).to_be_bytes());
+        b.push(name.len() as u8);
+        b.extend_from_slice(name.as_bytes());
+    }
+    full(b"chpl", 1, 0, &b)
 }
 
 fn moov(video: Option<&VideoTrack>, audio: &[AudioTrack]) -> Vec<u8> {

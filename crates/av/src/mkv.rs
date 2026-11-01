@@ -5,7 +5,7 @@
 //! Times are milliseconds. H.264 and HEVC go in as the encoder's length-prefixed NAL units
 //! (V_MPEG4/ISO/AVC, V_MPEGH/ISO/HEVC) with its header as CodecPrivate; AAC as raw frames.
 
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 
 use crate::audio::AudioPacket;
 use crate::mp4::{AudioTrack, VideoTrack};
@@ -68,6 +68,47 @@ pub struct MkvWriter<W: Write> {
     written: u64,
     /// How many sound tracks.
     tracks: usize,
+    /// Where the room for chapter marks (a Void element) starts.
+    room_at: u64,
+    /// Chapter marks: where (µs from the file's start) and their names.
+    chapters: Vec<(i64, String)>,
+    /// The latest time written (µs from the file's start): where a mark goes.
+    last_us: i64,
+}
+
+/// A Void element exactly `len` bytes long (at least 2), or None.
+fn void(len: usize) -> Option<Vec<u8>> {
+    let mut v = vec![0xEC];
+    if (2..129).contains(&len) {
+        v.push(0x80 | (len - 2) as u8);
+    } else if len >= 9 {
+        v.push(0x01);
+        v.extend_from_slice(&((len - 9) as u64).to_be_bytes()[1..]);
+    } else {
+        return None;
+    }
+    v.resize(len, 0);
+    Some(v)
+}
+
+/// Matroska's Chapters: one edition, a mark per chapter (its start in ns, its name).
+fn chapters_element(chapters: &[(i64, String)]) -> Vec<u8> {
+    let atoms: Vec<u8> = chapters
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (us, name))| {
+            element(
+                0xB6,
+                &[
+                    uint(0x73C4, i as u64 + 1),
+                    uint(0x91, us.max(&0).unsigned_abs() * 1000),
+                    element(0x80, &[string(0x85, name), string(0x437C, "eng")].concat()),
+                ]
+                .concat(),
+            )
+        })
+        .collect();
+    element(0x1043_A770, &element(0x45B9, &atoms))
 }
 
 impl<W: Write> MkvWriter<W> {
@@ -137,6 +178,8 @@ impl<W: Write> MkvWriter<W> {
         head.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
         head.extend(info);
         head.extend(element(0x1654_AE6B, &tracks));
+        let room_at = head.len() as u64;
+        head.extend(void(crate::mp4::ROOM).unwrap_or_default());
         out.write_all(&head)?;
         out.flush()?;
         Ok(Self {
@@ -146,7 +189,21 @@ impl<W: Write> MkvWriter<W> {
             cluster: None,
             written: head.len() as u64,
             tracks: audio.len(),
+            room_at,
+            chapters: Vec::new(),
+            last_us: 0,
         })
+    }
+
+    /// A chapter mark here (OBS's "Add Chapter Marker"), named, or "Chapter n" when not.
+    /// False when the file has `MAX_CHAPTERS` already.
+    pub fn chapter(&mut self, name: &str) -> bool {
+        if self.chapters.len() >= crate::mp4::MAX_CHAPTERS {
+            return false;
+        }
+        let name = crate::mp4::chapter_name(name, self.chapters.len() + 1, 255);
+        self.chapters.push((self.last_us, name));
+        true
     }
 
     /// A video frame (shown at its presentation time). A keyframe starts a new cluster.
@@ -156,6 +213,7 @@ impl<W: Write> MkvWriter<W> {
             return Ok(());
         }
         let start = *self.start_us.get_or_insert(p.pts_us.min(p.dts_us));
+        self.last_us = self.last_us.max(p.pts_us - start);
         let ms = (p.pts_us - start) / 1000;
         self.block(VIDEO, ms, p.key, &p.data, p.key)
     }
@@ -179,6 +237,7 @@ impl<W: Write> MkvWriter<W> {
         if p.pts_us < start {
             return Ok(());
         }
+        self.last_us = self.last_us.max(p.pts_us - start);
         let ms = (p.pts_us - start) / 1000;
         let new = !self.has_video
             && track == 0
@@ -222,6 +281,29 @@ impl<W: Write> MkvWriter<W> {
         self.flush_cluster()?;
         self.out.flush()?;
         Ok(self.out)
+    }
+}
+
+impl<W: Write + Seek> MkvWriter<W> {
+    /// As `finish`, with the chapter marks written into the room after the tracks; marks that
+    /// don't fit are left out.
+    pub fn finish_with_chapters(self) -> io::Result<W> {
+        let (at, chapters) = (self.room_at, self.chapters.clone());
+        let mut out = self.finish()?;
+        for n in (1..=chapters.len()).rev() {
+            let c = chapters_element(&chapters[..n]);
+            let Some(rest) = crate::mp4::ROOM.checked_sub(c.len()) else { continue };
+            let rest = if rest == 0 { Some(Vec::new()) } else { void(rest) };
+            if let Some(rest) = rest {
+                out.seek(SeekFrom::Start(at))?;
+                out.write_all(&c)?;
+                out.write_all(&rest)?;
+                out.seek(SeekFrom::End(0))?;
+                out.flush()?;
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
