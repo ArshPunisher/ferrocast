@@ -322,6 +322,24 @@ impl LiveWatch {
                 format!("{name} is getting your stream again."),
             );
         }
+        // Gone from the sample (a camera removed, a destination stopped): not watched, so
+        // whatever it raised is cleared (BRB by itself comes back too).
+        let mut present = std::collections::BTreeSet::new();
+        for (n, _) in &s.mics {
+            present.insert(format!("mic:{n}"));
+        }
+        for (n, _, _) in &s.cameras {
+            present.insert(format!("camera:{n}:black"));
+            present.insert(format!("camera:{n}:frozen"));
+        }
+        for (n, _) in &s.destinations {
+            present.insert(format!("destination:{n}"));
+        }
+        let gone: Vec<String> = self.raised.iter().filter(|id| !present.contains(*id)).cloned().collect();
+        for id in gone {
+            self.raised.remove(&id);
+            out.push(LiveAlert { id, level: "warn", message: "That's no longer watched.".into(), cleared: true });
+        }
         out
     }
 }
@@ -1023,6 +1041,10 @@ mod watch_tests {
         let ids: Vec<&str> = said.iter().filter(|a| !a.cleared).map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&"mic:Mic") && ids.contains(&"destination:Twitch"), "{ids:?}");
         assert_eq!(w.raised(), ["destination:Twitch", "mic:Mic"]);
+        // A destination that stops running is no longer watched: its alert is cleared.
+        let gone = w.tick(&cfg, &WatchSample { at: at(300), mics: vec![("Mic".into(), -20.0)], ..Default::default() });
+        assert!(gone.iter().any(|a| a.id == "destination:Twitch" && a.cleared), "{gone:?}");
+        assert!(w.raised().is_empty());
         // Off: nothing said.
         let off = LiveWatchConfig { on: false, ..Default::default() };
         assert!(LiveWatch::default().tick(&off, &sample(0, -90.0, true, 0, false)).is_empty());
