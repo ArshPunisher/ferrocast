@@ -15,6 +15,7 @@ mod own;
 pub mod projector;
 pub mod stage;
 pub mod streamlabs;
+pub mod system;
 
 use std::ffi::c_int;
 use std::path::{Path, PathBuf};

@@ -38,6 +38,11 @@ pub fn available() -> bool {
     ffmpeg().is_some()
 }
 
+/// Where FFmpeg is (the app's, else the one on the PATH), for other jobs (remuxing).
+pub fn path() -> Option<PathBuf> {
+    ffmpeg()
+}
+
 /// The H.264 encoders tried, best first, on this system.
 fn candidates() -> &'static [&'static str] {
     if cfg!(windows) {

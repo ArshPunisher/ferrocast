@@ -1364,6 +1364,66 @@ impl Stage {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ the engine itself
+
+    /// The canvas everything is drawn at.
+    pub fn canvas(&self) -> Canvas {
+        self.canvas
+    }
+
+    /// A new canvas size or frame rate: our engine starts again at it (outputs and previews
+    /// must be made again; the app does). Refused while anything uses the engine.
+    pub fn set_canvas(&mut self, canvas: Canvas) -> Result<(), StudioError> {
+        if canvas.width == 0 || canvas.height == 0 || canvas.fps == 0 {
+            return Err(fail("The picture needs a size and a frame rate."));
+        }
+        if self.engine.borrow().as_ref().is_some_and(|e| Arc::strong_count(e) > 1) {
+            return Err(fail("The picture size can't change while streaming or recording. Stop first."));
+        }
+        *self.engine.borrow_mut() = None;
+        self.canvas = canvas;
+        Ok(())
+    }
+
+    /// How the engine is doing, as the Studio's stats show it.
+    pub fn stats(&self) -> crate::EngineStats {
+        let (cpu, memory_mb) = crate::system::usage();
+        let s = self.engine.borrow().as_ref().map(|e| e.engine.stats()).unwrap_or_default();
+        let total = (s.frames + s.skipped).max(1);
+        crate::EngineStats {
+            cpu,
+            fps: f64::from(self.canvas.fps) * s.frames as f64 / total as f64,
+            frame_ms: f64::from(s.frame_ms),
+            lagged: s.skipped.min(u64::from(u32::MAX)) as u32,
+            frames: s.frames.min(u64::from(u32::MAX)) as u32,
+            memory_mb,
+            skipped: 0,
+            encoded: s.frames.min(u64::from(u32::MAX)) as u32,
+        }
+    }
+
+    /// Where "Hear it" plays: the system's default, then every output device by name.
+    pub fn monitoring_devices(&self) -> Vec<(String, String)> {
+        let mut out = vec![("Default".to_string(), "default".to_string())];
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        out.extend(ferrocast_av::monitor::devices().into_iter().map(|n| (n.clone(), n)));
+        out
+    }
+
+    /// Plays monitored sound on device `id` (a name from `monitoring_devices`, or "default").
+    pub fn set_monitoring_device(&self, _name: &str, id: &str) -> Result<(), StudioError> {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let device = (id != "default" && !id.is_empty()).then_some(id);
+            self.engine()?.engine.set_monitoring(true, device).map_err(|e| fail(e.to_string()))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let _ = id;
+            Ok(())
+        }
+    }
+
     // ------------------------------------------------------------------ meters and channels
 
     /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.

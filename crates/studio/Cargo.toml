@@ -22,6 +22,8 @@ tracing.workspace = true
 png = "0.17"
 # Recording names from OBS's pattern (%CCYY-%MM-%DD…) in local time, with no libobs.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Free disk space and the app's own CPU and memory use, with no libobs.
+sysinfo = { version = "0.37", default-features = false, features = ["disk", "system"] }
 # Scene pictures as data URLs (the Scenes grid), on every platform.
 base64 = "0.23"
 # Remove background where Apple's Vision isn't: Robust Video Matting run by tract (pure Rust).
