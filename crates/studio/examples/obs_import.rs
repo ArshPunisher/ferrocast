@@ -164,6 +164,23 @@ fn main() -> Result<()> {
         c.set_transform("Graded", g.id, &t)?;
     }
 
+    // OBS's Scroll at rest: the ramp tiled wider than itself (wrapping), and cut short with a
+    // transparent edge (not looping). A moving scroll depends on frame timing, so isn't compared.
+    for (i, settings) in [
+        json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": true, "cx": 700, "limit_cy": true, "cy": 300, "loop": true }),
+        json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": true, "cx": 400, "limit_cy": true, "cy": 100, "loop": false }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Scrolled {i}");
+        let g = c.add_source("Graded", "image_source", &name, &json!({ "file": ramp.display().to_string() }), false)?;
+        c.add_filter(&name, "scroll_filter", "Scroll", &settings)?;
+        let mut t = c.transform("Graded", g.id)?;
+        (t.x, t.y) = (40.0 + 760.0 * i as f32, 460.0);
+        c.set_transform("Graded", g.id, &t)?;
+    }
+
     // A group of two pictures, moved and turned as one, in a fourth scene.
     c.add_scene("Grouped")?;
     c.add_source(
