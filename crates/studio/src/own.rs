@@ -127,12 +127,17 @@ struct Drawn {
     engine: Engine,
     output: u64,
     /// The collection as last opened, without the scene on air: when it differs, it's opened
-    /// again.
+    /// again (at most every few seconds, as that restarts its sources).
     shown: serde_json::Value,
+    opened: std::time::Instant,
     on_air: Option<String>,
     /// What couldn't come over.
     skipped: Vec<String>,
 }
+
+/// At most how often edits reopen the collection in a drawn stream (a reopen restarts its
+/// sources; edits in between go with the next one).
+const REOPEN_EVERY: Duration = Duration::from_secs(2);
 
 /// A collection without which scene is on air (what a reopen depends on).
 fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
@@ -369,7 +374,14 @@ impl OwnStream {
             stop_push,
             runtime,
             feed: None,
-            drawn: Some(Drawn { engine, output, shown: without_on_air(doc), on_air, skipped }),
+            drawn: Some(Drawn {
+                engine,
+                output,
+                shown: without_on_air(doc),
+                opened: std::time::Instant::now(),
+                on_air,
+                skipped,
+            }),
             hub: Some(hub),
         })
     }
@@ -380,9 +392,10 @@ impl OwnStream {
     pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
         let Some(d) = self.drawn.as_mut() else { return false };
         let bare = without_on_air(doc);
-        if bare != d.shown {
+        if bare != d.shown && d.opened.elapsed() >= REOPEN_EVERY {
             d.skipped = d.engine.load_obs(doc);
             d.shown = bare;
+            d.opened = std::time::Instant::now();
             d.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
             return true;
         }
@@ -397,6 +410,11 @@ impl OwnStream {
             d.on_air = now;
         }
         false
+    }
+
+    /// Whether our engine draws this (not libobs).
+    pub(crate) fn is_drawn(&self) -> bool {
+        self.drawn.is_some()
     }
 
     /// What our engine couldn't bring over (empty when libobs draws).

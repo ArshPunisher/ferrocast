@@ -2494,10 +2494,15 @@ impl RecordPlan {
 impl Recording {
     /// Keeps a recording our engine draws with the collection (see `Streaming::follow`).
     pub fn follow(&mut self, c: &Collection) -> bool {
-        match self.own.as_mut() {
+        match self.own.as_mut().filter(|o| o.is_drawn()) {
             Some(o) => o.follow(&c.save("Ferrocast")),
             None => false,
         }
+    }
+
+    /// Whether Ferrocast's own engine draws this recording.
+    pub fn drawn(&self) -> bool {
+        self.own.as_ref().is_some_and(|o| o.is_drawn())
     }
 
     /// What our engine couldn't bring over from the collection (empty when libobs draws).
@@ -2816,10 +2821,15 @@ impl Streaming {
     /// second or so. Returns whether the collection was opened again; nothing for a stream
     /// libobs draws.
     pub fn follow(&mut self, c: &Collection) -> bool {
-        match self.own.as_mut() {
+        match self.own.as_mut().filter(|o| o.is_drawn()) {
             Some(o) => o.follow(&c.save("Ferrocast")),
             None => false,
         }
+    }
+
+    /// Whether Ferrocast's own engine draws this stream.
+    pub fn drawn(&self) -> bool {
+        self.own.as_ref().is_some_and(|o| o.is_drawn())
     }
 
     /// What our engine couldn't bring over from the collection (empty when libobs draws).
