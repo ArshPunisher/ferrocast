@@ -59,6 +59,9 @@ pub struct Direct {
     pub url: String,
     pub key: String,
     pub retry: Retry,
+    /// WebRTC only: a lower layer to send beside the stream (simulcast), the Studio's lighter
+    /// stream; the receiver picks which its viewers get.
+    pub layer: Option<Arc<Hub>>,
 }
 
 impl std::fmt::Debug for Direct {
@@ -582,6 +585,7 @@ mod tests {
             url: "srt://a:1".into(),
             key: "s3cret".into(),
             retry: Retry::default(),
+            layer: None,
         };
         assert!(!format!("{d:?}").contains("s3cret"));
     }
@@ -612,6 +616,7 @@ mod tests {
             url: format!("srt://127.0.0.1:{port}"),
             key: String::new(),
             retry: Retry::default(),
+            layer: None,
         };
         let sender = tokio::spawn(run(d, hub.clone(), health, stop));
         let mut h2 = h.clone();
@@ -663,6 +668,7 @@ mod tests {
             url: url.into(),
             key: String::new(),
             retry: Retry::default(),
+            layer: None,
         };
         assert!(check(&srt("srt://:9000?mode=listener")).is_ok(), "a listener may leave the host out");
         assert!(check(&srt("srt://:9000")).is_err(), "a caller needs a host");
@@ -695,7 +701,8 @@ mod tests {
         let (health, h) =
             watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
-        let d = Direct { id: "t".into(), kind: Kind::Srt, url, key: String::new(), retry: Retry::default() };
+        let d =
+            Direct { id: "t".into(), kind: Kind::Srt, url, key: String::new(), retry: Retry::default(), layer: None };
         let sender = tokio::spawn(run(d, hub.clone(), health, stop));
         let mut h2 = h.clone();
         let _ = tokio::time::timeout(Duration::from_secs(8), h2.wait_for(|h| h.state == PushState::Live)).await;

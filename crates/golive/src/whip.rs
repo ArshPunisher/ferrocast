@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use str0m::change::SdpAnswer;
 use str0m::format::Codec;
-use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Pt};
+use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Pt, Rid, Rids, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
@@ -163,8 +163,15 @@ pub(crate) async fn session(
     let cand = Candidate::host(local, "udp").map_err(|e| DirectError::Refused(e.to_string()))?;
     rtc.add_local_candidate(cand);
     let mut api = rtc.sdp_api();
+    // With a lower layer, the picture is offered as simulcast: "h" the stream, "l" the layer.
+    let simulcast = d.layer.as_ref().map(|_| {
+        let mut s = Simulcast::new();
+        s.add_send_layer(SimulcastLayer::new(HIGH));
+        s.add_send_layer(SimulcastLayer::new(LOW));
+        s
+    });
     let vmid =
-        api.add_media(MediaKind::Video, Direction::SendOnly, Some("ferrocast".into()), Some("video".into()), None);
+        api.add_media(MediaKind::Video, Direction::SendOnly, Some("ferrocast".into()), Some("video".into()), simulcast);
     let amid =
         api.add_media(MediaKind::Audio, Direction::SendOnly, Some("ferrocast".into()), Some("audio".into()), None);
     let (offer, pending) =
@@ -180,7 +187,13 @@ pub(crate) async fn session(
 
     // However the session ends (stopped mid-stream too), it's deleted as the spec asks.
     let _end = session_url.map(|url| EndSession { client: client.clone(), url, key: d.key.trim().to_string() });
-    let out = stream_to(&mut rtc, &socket, local, hub, health, stream, vmid, amid, &name).await;
+    // The layer goes only where the server took simulcast; elsewhere the stream alone.
+    let took = rtc.media(vmid).is_some_and(|m| matches!(m.rids_tx(), Rids::Specific(r) if r.len() >= 2));
+    let layer = d.layer.as_deref().filter(|_| took);
+    if d.layer.is_some() && !took {
+        tracing::info!(dest = %d.id, "WHIP: the server doesn't take simulcast; the stream alone goes");
+    }
+    let out = stream_to(&mut rtc, &socket, local, hub, layer, health, stream, vmid, amid, &name).await;
     rtc.disconnect();
     out
 }
@@ -248,6 +261,18 @@ async fn post_offer(
     Ok((client, session_url, text))
 }
 
+/// Simulcast's layers: the stream, and the Studio's lighter one.
+const HIGH: &str = "h";
+const LOW: &str = "l";
+
+/// One simulcast layer's picture: its setup, waiting for a keyframe, and its first time.
+#[derive(Default)]
+struct Layer {
+    video: Option<VideoSetup>,
+    waiting_for_key: bool,
+    base: Option<u32>,
+}
+
 /// Deletes the WHIP session when dropped (a server that keeps it a while anyway lets it go).
 struct EndSession {
     client: reqwest::Client,
@@ -283,6 +308,7 @@ async fn stream_to(
     socket: &UdpSocket,
     local: SocketAddr,
     hub: &Hub,
+    layer: Option<&Hub>,
     health: &watch::Sender<Health>,
     stream: u64,
     vmid: Mid,
@@ -293,6 +319,14 @@ async fn stream_to(
     if !live.on || live.stream != stream {
         return Ok(Ended::StreamEnded);
     }
+    // Simulcast's lower layer: its own pictures (its sound isn't sent; the stream's is).
+    let mut low = Layer { waiting_for_key: true, ..Default::default() };
+    let mut low_rx = layer.map(|l| {
+        let s = l.subscribe();
+        low.video = s.headers.video.as_deref().and_then(video_setup);
+        s.rx
+    });
+    let rid_high: Option<Rid> = layer.map(|_| HIGH.into());
     let mut video: Option<VideoSetup> = None;
     let mut sound: Option<Sound> = None;
     // Opus at 128 kbps: transparent for speech and music.
@@ -393,6 +427,39 @@ async fn stream_to(
                     rtc.handle_input(input).map_err(|e| DirectError::Refused(e.to_string()))?;
                 }
             }
+            f = async {
+                match low_rx.as_mut() {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The lower layer's pictures (a lag or its end only stops the layer).
+                let Ok(Frame::Video { ts, data, .. }) = f else {
+                    if matches!(f, Err(broadcast::error::RecvError::Closed) | Ok(Frame::End)) {
+                        low_rx = None;
+                    } else {
+                        low.waiting_for_key = true;
+                    }
+                    continue;
+                };
+                if crate::flv::video_is_header(&data) {
+                    low.video = video_setup(&data);
+                    low.waiting_for_key = true;
+                    continue;
+                }
+                let Some(setup) = &low.video else { continue };
+                let (Ok(Some(pt)), true) = (pt_of(setup), connected) else { continue };
+                let Some((key, _, es)) = annex_b(setup, &data, false) else { continue };
+                if low.waiting_for_key && !key {
+                    continue;
+                }
+                low.waiting_for_key = false;
+                let b = *low.base.get_or_insert(ts);
+                let t = MediaTime::new(u64::from(ts.saturating_sub(b)) * 90, Frequency::NINETY_KHZ);
+                if let Some(w) = rtc.writer(vmid) {
+                    let _ = w.rid(LOW.into()).write(pt, Instant::now(), t, es);
+                }
+            }
             f = rx.recv() => {
                 let frame = match f {
                     Ok(f) => f,
@@ -428,7 +495,10 @@ async fn stream_to(
                         waiting_for_key = false;
                         let b = *base.get_or_insert(ts);
                         let t = MediaTime::new(u64::from(ts.saturating_sub(b)) * 90, Frequency::NINETY_KHZ);
-                        if let Some(w) = rtc.writer(vmid) {
+                        if let Some(mut w) = rtc.writer(vmid) {
+                            if let Some(r) = rid_high {
+                                w = w.rid(r);
+                            }
                             let _ = w.write(pt, Instant::now(), t, es);
                         }
                     }
@@ -481,6 +551,8 @@ mod tests {
     struct Got {
         video: AtomicU32,
         audio: AtomicU32,
+        /// Pictures on simulcast's lower layer.
+        low: AtomicU32,
         deleted: AtomicU32,
     }
 
@@ -558,8 +630,13 @@ mod tests {
                                     let _ = sock.send_to(&t.contents, t.destination).await;
                                 }
                                 Ok(Output::Event(Event::MediaData(m))) => {
-                                    let which =
-                                        if m.params.spec().codec == Codec::H264 { &got.video } else { &got.audio };
+                                    let which = if m.rid.as_deref() == Some(LOW) {
+                                        &got.low
+                                    } else if m.params.spec().codec == Codec::H264 {
+                                        &got.video
+                                    } else {
+                                        &got.audio
+                                    };
                                     which.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Ok(Output::Event(_)) => {}
@@ -587,8 +664,18 @@ mod tests {
     }
 
     async fn send(tags: Vec<(u8, u32, Vec<u8>)>, port: u16) -> watch::Receiver<Health> {
+        send_layered(tags, port, false).await
+    }
+
+    /// `send`, with the same pictures on a lower layer too when `layered` (simulcast).
+    async fn send_layered(tags: Vec<(u8, u32, Vec<u8>)>, port: u16, layered: bool) -> watch::Receiver<Health> {
         let hub = Hub::new();
         hub.start();
+        let low = layered.then(|| {
+            let l = Hub::new();
+            l.start();
+            l
+        });
         let (health, h) =
             watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
         let (stop_tx, stop) = watch::channel(false);
@@ -598,12 +685,16 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/whip"),
             key: "tok".into(),
             retry: Retry::default(),
+            layer: low.clone(),
         };
         let sender = tokio::spawn(run(d, hub.clone(), health, stop));
         // The headers first (the hub keeps them), then the connection, then 3 s of stream.
         let mut rest = Vec::new();
         for (kind, ms, body) in tags {
             let header = (kind == 9 && crate::flv::video_is_header(&body)) || (kind == 8 && body.get(1) == Some(&0));
+            if let (Some(l), 9, true) = (&low, kind, header) {
+                l.video(ms, body.clone().into());
+            }
             match (kind, header) {
                 (9, true) => hub.video(ms, body.into()),
                 (8, true) => hub.audio(ms, body.into()),
@@ -617,6 +708,9 @@ mod tests {
         )
         .await;
         for (kind, ms, body) in rest {
+            if let (Some(l), 9) = (&low, kind) {
+                l.video(ms, body.clone().into());
+            }
             match kind {
                 9 => hub.video(ms, body.into()),
                 8 => hub.audio(ms, body.into()),
@@ -647,6 +741,18 @@ mod tests {
         assert!(v >= 60, "pictures arrived: {v} (sound {a}, deleted {})", got.deleted.load(Ordering::Relaxed));
         assert!(a >= 100, "sound arrived as Opus: {a}");
         assert_eq!(got.deleted.load(Ordering::Relaxed), 1, "the session was deleted");
+    }
+
+    /// With a lower layer, the picture goes as simulcast: both layers reach a server that takes it.
+    #[tokio::test]
+    async fn simulcast_sends_both_layers() {
+        let Some(tags) = crate::ts::tests::sample_tags_with(0) else { return };
+        let got = Arc::new(Got::default());
+        let Some(port) = endpoint(got.clone()).await else { return };
+        let _ = send_layered(tags, port, true).await;
+        let (high, low) = (got.video.load(Ordering::Relaxed), got.low.load(Ordering::Relaxed));
+        assert!(high >= 60 && low >= 60, "both layers arrived: high {high}, low {low}");
+        assert!(got.audio.load(Ordering::Relaxed) >= 100, "and the sound");
     }
 
     /// B-frames can't go over WebRTC: refused, saying so.

@@ -40,7 +40,14 @@ fn ms(d: Duration) -> u32 {
 /// Tries `url` with `key` (the stream key, passphrase or token).
 pub async fn reach(url: &str, key: &str) -> Reach {
     let Some(kind) = Kind::of(url) else { return rtmp(url).await };
-    let d = Direct { id: "test".into(), kind, url: url.trim().into(), key: key.into(), retry: Retry::default() };
+    let d = Direct {
+        id: "test".into(),
+        kind,
+        url: url.trim().into(),
+        key: key.into(),
+        retry: Retry::default(),
+        layer: None,
+    };
     if let Err(e) = crate::direct::check(&d) {
         return Reach::failed(e.to_string());
     }

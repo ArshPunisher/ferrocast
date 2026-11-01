@@ -679,7 +679,14 @@ mod tests {
     }
 
     fn direct(url: &str, key: &str) -> Direct {
-        Direct { id: "r".into(), kind: Kind::Rist, url: url.into(), key: key.into(), retry: Retry::default() }
+        Direct {
+            id: "r".into(),
+            kind: Kind::Rist,
+            url: url.into(),
+            key: key.into(),
+            retry: Retry::default(),
+            layer: None,
+        }
     }
 
     #[test]
@@ -870,6 +877,7 @@ mod tests {
             url: format!("rist://127.0.0.1:{port}"),
             key: String::new(),
             retry: Retry::default(),
+            layer: None,
         };
         let sender = tokio::spawn(run(d, hub.clone(), health, stop));
         let mut h2 = h.clone();
