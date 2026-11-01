@@ -106,7 +106,8 @@ impl Lut {
             return Err(AvError::Source("the .cube LUT's domain is empty".into()));
         }
         let (size, one_d) = match (size_1d, size_3d) {
-            (s, _) if (2..=65_536).contains(&s) => (s, true),
+            // A 1D table is one row of a texture: 8,192 is as wide as every card goes.
+            (s, _) if (2..=8_192).contains(&s) => (s, true),
             (_, s) if (2..=256).contains(&s) => (s, false),
             _ => return Err(AvError::Source("the .cube LUT has no usable LUT_1D_SIZE or LUT_3D_SIZE".into())),
         };
