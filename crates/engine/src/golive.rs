@@ -1284,6 +1284,18 @@ impl Engine {
         }
     }
 
+    /// Each running destination (its name) and whether it's sending now, for the live watch.
+    pub(crate) fn golive_sending(&self) -> Vec<(String, bool)> {
+        let cfg = self.golive_config();
+        lock(&self.golive().running)
+            .iter()
+            .filter_map(|(id, r)| {
+                let d = cfg.destinations.iter().find(|d| &d.id == id)?;
+                Some((dest_name(d), r.health.borrow().state == PushState::Live))
+            })
+            .collect()
+    }
+
     /// This computer's network connections, for RIST's `via=` (two at once).
     pub fn golive_networks(&self) -> Vec<ferrocast_golive::links::Network> {
         ferrocast_golive::links::networks()

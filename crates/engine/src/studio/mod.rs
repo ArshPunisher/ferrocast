@@ -20,6 +20,7 @@ pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
 pub(crate) mod game_scenes;
+pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
 pub(crate) mod rig;
@@ -80,6 +81,10 @@ pub(crate) struct Studio {
     pub brb_from: Mutex<Option<String>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
+    /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
+    /// one loop.
+    pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
+    pub live_watching: std::sync::atomic::AtomicBool,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
     pub autoreplies: autoreplies::AutoReplies,
     /// Event rules running now (by their place in the list).

@@ -155,6 +155,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/show", get(show))
         .route("/show/config", get(show_config).put(save_show_config))
         .route("/show/preflight", get(preflight))
+        .route("/show/alerts", get(live_alerts))
         .route("/show/preflight/fix", post(preflight_fix))
         .route("/show/start", post(start_show))
         .route("/show/countdown/skip", post(skip_countdown))
@@ -1393,6 +1394,11 @@ pub async fn save_music(State(app): State<AppState>, Body(b): Body<Map<String, V
 
 async fn preflight(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.preflight().await))
+}
+
+/// The live watch's alerts raised now (`{ alerts: string[] }`, their ids).
+async fn live_alerts(State(app): State<AppState>) -> Json<Value> {
+    Json(json!({ "alerts": app.engine.live_alerts() }))
 }
 
 #[derive(Deserialize)]
