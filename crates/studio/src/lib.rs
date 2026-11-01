@@ -2785,8 +2785,9 @@ impl Streaming {
     /// while running, as its dynamic bitrate does): the stream doctor's lighter bitrate helps
     /// the stream that's struggling, not only the next one.
     pub fn set_video_kbps(&mut self, kbps: u32) {
-        if self.own.is_some() {
-            // Our encoder takes the new bitrate at the next start.
+        if let Some(o) = &self.own {
+            // Our Mac encoder takes it while running too (FFmpeg's from the next start).
+            o.set_video_kbps(kbps);
             self.settings.encode.video_kbps = kbps;
             return;
         }

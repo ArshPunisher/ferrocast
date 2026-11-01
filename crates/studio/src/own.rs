@@ -93,6 +93,8 @@ struct Counts {
     frames: AtomicU32,
     running: AtomicBool,
     error: Mutex<Option<String>>,
+    /// A new bitrate asked for while live (0: none), for the encoder thread to take.
+    new_kbps: AtomicU32,
 }
 
 /// Where a stream goes: the server, the key, and how it reconnects.
@@ -243,6 +245,12 @@ impl OwnStream {
                         }
                     };
                     while !stop.load(Ordering::Acquire) {
+                        let kbps = counts.new_kbps.swap(0, Ordering::AcqRel);
+                        if kbps > 0
+                            && let Err(e) = pipe.set_video_kbps(kbps)
+                        {
+                            tracing::warn!("Ferrocast's own encoder kept its bitrate: {e}");
+                        }
                         if let Ok(f) = frames.recv_timeout(Duration::from_millis(100)) {
                             let frame =
                                 Frame::Nv12 { y: &f.y, y_stride: f.y_stride, uv: &f.uv, uv_stride: f.uv_stride };
@@ -410,6 +418,18 @@ impl OwnStream {
             d.on_air = now;
         }
         false
+    }
+
+    /// A new video bitrate while live (the stream doctor's lighter one, a manual change).
+    pub(crate) fn set_video_kbps(&self, kbps: u32) {
+        match &self.drawn {
+            Some(d) => {
+                if let Err(e) = d.engine.set_output_kbps(d.output, kbps) {
+                    tracing::warn!("Ferrocast's own engine kept its bitrate: {e}");
+                }
+            }
+            None => self.counts.new_kbps.store(kbps, Ordering::Release),
+        }
     }
 
     /// Whether our engine draws this (not libobs).
