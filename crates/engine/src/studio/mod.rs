@@ -87,6 +87,8 @@ pub(crate) struct Studio {
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
+    /// The scene on air while the Studio streams (a change is a chapter marker).
+    pub scene_now: Mutex<Option<String>>,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
     pub autoreplies: autoreplies::AutoReplies,
     /// Event rules running now (by their place in the list).

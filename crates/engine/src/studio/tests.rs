@@ -894,6 +894,29 @@ async fn markers_export_as_csv_and_text() {
 }
 
 #[tokio::test]
+async fn a_scene_change_while_live_is_a_chapter() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Starting".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.scene_chapter_tick().await;
+    e.scene_chapter_tick().await;
+    *studio.current.lock().unwrap() = "Gameplay".into();
+    e.scene_chapter_tick().await;
+    let scenes: Vec<String> =
+        e.markers(None).await.unwrap().into_iter().filter(|m| m.kind == MomentKind::Scene).map(|m| m.label).collect();
+    assert_eq!(scenes, ["Starting", "Gameplay"], "one per change");
+    // Two scenes seconds apart make one chapter: YouTube wants three, and says so.
+    let err = e.export_markers("youtube", None).await.unwrap_err();
+    assert!(err.to_string().contains("at least 3"), "{err}");
+    // Markers off: no scene chapters.
+    e.patch_moments_config(json!({ "markers": false }).as_object().unwrap()).await.unwrap();
+    *studio.current.lock().unwrap() = "Chat".into();
+    e.scene_chapter_tick().await;
+    assert!(!e.markers(None).await.unwrap().iter().any(|m| m.label == "Chat"));
+}
+
+#[tokio::test]
 async fn a_chat_spike_while_live_is_marked() {
     let (e, _d) = engine().await;
     go_live(&e).await;

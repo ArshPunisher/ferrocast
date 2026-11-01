@@ -1597,7 +1597,7 @@ async fn delete_marker(State(app): State<AppState>, Path(id): Path<String>) -> A
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A download: `?format=csv|txt&since=<ms>`.
+/// A download: `?format=csv|txt|youtube&since=<ms>`.
 async fn export_markers(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> ApiResult<Response> {
     let format = q.get("format").map(String::as_str).unwrap_or("csv");
     let (ct, name, body) = app.engine.export_markers(format, since(&q)?).await?;

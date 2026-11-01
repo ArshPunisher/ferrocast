@@ -33,9 +33,11 @@ impl Engine {
                     // A new stream: everything starts fresh.
                     engine.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
                     engine.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                    *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     was_live = live;
                 }
                 if live {
+                    engine.scene_chapter_tick().await;
                     engine.live_watch_tick().await;
                 }
             }
@@ -46,6 +48,25 @@ impl Engine {
     async fn studio_streaming(&self) -> bool {
         let Ok(host) = self.studio_host() else { return false };
         host.stream_stats().await.ok().is_some_and(|v| v["active"].as_bool() == Some(true))
+    }
+
+    /// The scene on air, when it changed: a chapter marker (the first one starts the stream's).
+    pub(crate) async fn scene_chapter_tick(&self) {
+        if !self.moments_config().markers {
+            return;
+        }
+        let Ok(v) = self.studio_act(StudioAct::Scenes).await else { return };
+        let Some(scene) = v["current"].as_str().filter(|s| !s.is_empty()).map(String::from) else { return };
+        {
+            let mut now = self.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner());
+            if now.as_deref() == Some(scene.as_str()) {
+                return;
+            }
+            *now = Some(scene.clone());
+        }
+        if let Err(e) = self.add_marker_now(ferrocast_core::moments::MomentKind::Scene, &scene, None, false).await {
+            tracing::warn!(error = %e, "couldn't mark a scene change");
+        }
     }
 
     /// One look → the alerts it raises or clears, sent on.

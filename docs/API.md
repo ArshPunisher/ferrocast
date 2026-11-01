@@ -789,7 +789,7 @@ The show, its pre-flight and fixes, BRB, `!scene`, `!clip`, `/obs/replay/save` a
 
 `Health = { at, streaming, cpu, memory_mb, disk_gb, fps, render_skipped_pct, encoder_skipped_pct, dropped_pct, bitrate_kbps, warnings: { id: "dropped" | "encoder" | "render" | "cpu" | "disk" | "reconnecting", level: "warn" | "error", message, hint }[] }`, percentages over the last 5 s. Chat (mods, when `chat_enabled`): `!scene <name>` (allowed scenes only, unique prefixes work), `!brb`, `!back`; `!clip` (mods, every 20 s at most, when `clip_command`). With `brb_on_ads`, a Twitch ad break switches to BRB and back when it ends.
 
-**Moments.** `MomentsConfig = { big_tip /* main currency, major units */; big_gift_value /* bits/kicks */; big_sub_gift; raid_viewers; first_chatters; sound: "chime" | "coin" | "bell" | "none"; volume; markers; spike_factor /* 2–10 */; spike_min /* 5–500 per 30 s */; twitch_markers }`. `LaneItem = { id, kind, title, detail, platform, event_id, at }`; `Marker = { id, at, offset_ms /* into the stream */ | null, kind: "tip" | "superchat" | "bits" | "gift" | "raid" | "first_chatter" | "chat_spike" | "clip" | "manual", label, platform, clip }`.
+**Moments.** `MomentsConfig = { big_tip /* main currency, major units */; big_gift_value /* bits/kicks */; big_sub_gift; raid_viewers; first_chatters; sound: "chime" | "coin" | "bell" | "none"; volume; markers; spike_factor /* 2–10 */; spike_min /* 5–500 per 30 s */; twitch_markers; youtube_chapters /* after a YouTube stream ends (about 90 s later), its chapters go at the end of the video's description under "Chapters:", replacing ones put there before; a live_alert "chapters:youtube" says how it went */ }`. `LaneItem = { id, kind, title, detail, platform, event_id, at }`; `Marker = { id, at, offset_ms /* into the stream */ | null, kind: "tip" | "superchat" | "bits" | "gift" | "raid" | "first_chatter" | "chat_spike" | "clip" | "manual" | "scene" /* the Studio's scene on air changed (with markers on) */, label, platform, clip }`. Every marker is also a chapter in the Studio's recording while it records.
 
 | Method | Path | Body → Response |
 |---|---|---|
@@ -798,7 +798,7 @@ The show, its pre-flight and fixes, BRB, `!scene`, `!clip`, `/obs/replay/save` a
 | POST | `/api/v1/moments/lane/{id}/dismiss` · `/lane/dismiss-all` | → `LaneItem[]`. 404 `lane_item_not_found` |
 | GET / POST | `/api/v1/moments/markers?since=<ms>` | → `Marker[]` (default: this stream, else the last 24 h); POST `{ label? }` → 201 manual marker |
 | DELETE | `/api/v1/moments/markers/{id}` | → 204. 404 `marker_not_found` |
-| GET | `/api/v1/moments/markers/export?format=csv\|txt&since=` | a download: CSV `timecode,offset_seconds,kind,label,platform,clip,unix_ms` (formulas defused) or text lines `00:42:10  label` |
+| GET | `/api/v1/moments/markers/export?format=csv\|txt\|youtube&since=` | a download: CSV `timecode,offset_seconds,kind,label,platform,clip,unix_ms` (formulas defused), text lines `00:42:10  label`, or YouTube chapters (`0:00 Start`: scene changes and big moments, at least 10 s apart, from 0:00; 400 when there'd be fewer than 3) |
 
 Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */, added: LaneItem | null, sound, volume }` (play the sound for `added`, only in the dashboard), `marker Marker`, `counter { name, value }`, `show { show: ShowRun | null }`, `obs_health Health`, `brb { on, scene }`.
 
