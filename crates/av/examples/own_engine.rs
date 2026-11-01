@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitrate_kbps: 4000,
         rate: RateControl::Cbr,
         keyframe_secs: 2,
+        software: false,
     };
     let mut pipe =
         Pipeline::new(video, AudioConfig { sample_rate: RATE, channels: 2, bitrate_kbps: 160 }, Some(&recorded))?;

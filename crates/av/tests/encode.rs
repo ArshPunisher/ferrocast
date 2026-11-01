@@ -28,6 +28,7 @@ fn config(codec: VideoCodec, input: PixelFormat) -> VideoConfig {
         bitrate_kbps: 2500,
         rate: RateControl::Cbr,
         keyframe_secs: 1,
+        software: false,
     }
 }
 
@@ -333,4 +334,51 @@ fn constant_quality_follows_the_picture() {
     eprintln!("constant quality: {still} kbps still, {busy} kbps busy");
     // A CBR encoder would sit near 2500 for both.
     assert!(still < 1000 && busy > still * 5, "{still} kbps still, {busy} kbps busy");
+}
+
+/// x264 through FFmpeg (the software encoder, and Lossless recordings): rate factor 0 gives back
+/// exactly the pixels that went in.
+#[test]
+fn x264_lossless_gives_back_the_picture() {
+    if !ferrocast_av::ffenc::available() {
+        eprintln!("skipped: FFmpeg isn't here");
+        return;
+    }
+    let cfg = VideoConfig { rate: RateControl::Crf(0), software: true, ..config(VideoCodec::H264, PixelFormat::Nv12) };
+    let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(enc.name(), "libx264");
+    // A gradient in NV12 (already 4:2:0, so nothing is lost before the encoder).
+    let y: Vec<u8> = (0..640 * 360).map(|n: u32| ((n % 640) * 255 / 639) as u8).collect();
+    let uv: Vec<u8> = (0..640 * 180).map(|n: u32| if n.is_multiple_of(2) { 90 } else { 200 }).collect();
+    let mut packets = Vec::new();
+    for i in 0..10u32 {
+        packets.extend(
+            enc.encode(Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 }, i64::from(i) * 33_333, false)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+    }
+    packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
+    assert_eq!(packets.len(), 10, "one packet a frame");
+    let header = enc.header().unwrap_or_else(|| panic!("a codec header"));
+    let mut flv = FlvFile::new(false, true);
+    flv.tag(9, 0, &video_header(VideoCodec::H264, &header));
+    for p in &packets {
+        let (ms, body) = video_tag(VideoCodec::H264, p, 0);
+        flv.tag(9, ms, &body);
+    }
+    let dir = std::env::temp_dir();
+    let (file, raw) = (dir.join("ferrocast-av-lossless.flv"), dir.join("ferrocast-av-lossless.nv12"));
+    std::fs::write(&file, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(&file)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "nv12"])
+        .arg(&raw)
+        .status()
+        .unwrap_or_else(|e| panic!("ffmpeg to decode it: {e}"))
+        .success();
+    assert!(ok, "the lossless file decodes");
+    let back = std::fs::read(&raw).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(back.len(), y.len() + uv.len());
+    assert!(back[..y.len()] == y[..] && back[y.len()..] == uv[..], "lossless gives back every pixel");
 }

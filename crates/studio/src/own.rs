@@ -23,6 +23,10 @@ use ferrocast_golive::{Hub, Target};
 
 use crate::{EncodeSettings, ProgramFeed, RecordPlan, RecordStats, StreamSettings, StreamStats, Studio, StudioError};
 
+/// x264 (and Lossless) run through FFmpeg, which Ferrocast fetches the first time it's needed.
+const NO_FFMPEG: &str =
+    "x264 or Lossless before FFmpeg is downloaded (Go live › Vertical › Cut it from your stream fetches it)";
+
 /// Why this stream can't use our encoders (it then uses libobs's), or None when it can.
 pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'static str> {
     if !main_canvas {
@@ -33,10 +37,12 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("Twitch's VOD track")
     } else if s.encode.scale.is_some() {
         Some("a scaled stream")
-    } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") {
+    } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&s.encode.video_encoder) {
         Some("constant quality")
     } else if !s.encode.extra.is_empty() {
         Some("an encoder's own options")
+    } else if is_x264(&s.encode.video_encoder) && !ferrocast_av::ffenc::available() {
+        Some(NO_FFMPEG)
     } else if !own_codec_ok(&s.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
     } else {
@@ -55,12 +61,14 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("more than one sound track")
     } else if !plan.muxer.trim().is_empty() {
         Some("custom muxer settings")
-    } else if plan.encode.quality.is_some() && !cfg!(target_os = "macos") {
+    } else if plan.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&plan.encode.video_encoder) {
         Some("constant quality")
     } else if !plan.encode.extra.is_empty() {
         Some("an encoder's own options")
     } else if plan.encode.scale.is_some() {
         Some("a scaled recording")
+    } else if is_x264(&plan.encode.video_encoder) && !ferrocast_av::ffenc::available() {
+        Some(NO_FFMPEG)
     } else if !own_codec_ok(&plan.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
     } else {
@@ -68,10 +76,12 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
     }
 }
 
-/// The rate our encoder runs at. Constant quality (Mac only: FFmpeg's path keeps a bitrate)
-/// is libobs's 0 (lossless) … 51 scale turned into VideoToolbox's 0-1, as libobs does it.
+/// The rate our encoder runs at. Constant quality is libobs's 0 (lossless) … 51 scale: x264's
+/// rate factor as it is, or VideoToolbox's 0-1 as libobs turns it (Mac only: FFmpeg's hardware
+/// encoders keep a bitrate).
 fn rate_of(e: &EncodeSettings) -> RateControl {
     match e.quality {
+        Some(q) if is_x264(&e.video_encoder) => RateControl::Crf(q.min(51) as u8),
         Some(q) => RateControl::Quality((100 - q.min(51) * 100 / 51) as f32 / 100.0),
         None if e.vbr => RateControl::Average,
         None => RateControl::Cbr,
@@ -91,10 +101,16 @@ fn system_unsupported(encoder_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether the picked encoder is one ours stands in for: the Mac's hardware H.264 or HEVC.
+/// Whether the picked encoder is one ours stands in for: the Mac's hardware H.264 or HEVC, or
+/// x264 (through FFmpeg).
 fn own_codec_ok(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
-    !(id.contains("av1") || id.contains("aom") || id.contains("svt") || id.contains("x264") || id.contains("prores"))
+    !(id.contains("av1") || id.contains("aom") || id.contains("svt") || id.contains("prores"))
+}
+
+/// x264, OBS's software encoder (`obs_x264`): ours runs it through FFmpeg.
+fn is_x264(id: &str) -> bool {
+    id.to_ascii_lowercase().contains("x264")
 }
 
 #[derive(Debug, Default)]
@@ -216,6 +232,7 @@ impl OwnStream {
             bitrate_kbps: e.video_kbps.max(100),
             rate: rate_of(e),
             keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+            software: is_x264(&e.video_encoder),
         };
         let audio =
             AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
@@ -348,6 +365,7 @@ impl OwnStream {
             bitrate_kbps: e.video_kbps.max(100),
             rate: rate_of(e),
             keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+            software: is_x264(&e.video_encoder),
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let config = EngineConfig {
@@ -591,7 +609,8 @@ mod tests {
             assert_eq!(unsupported(&settings("com.apple.videotoolbox.videoencoder.ave.hevc"), true), None);
         }
         assert!(unsupported(&settings(hw), false).is_some(), "vertical");
-        assert!(unsupported(&settings("obs_x264"), true).is_some());
+        // x264 runs through FFmpeg, wherever FFmpeg is.
+        assert_eq!(unsupported(&settings("obs_x264"), true).is_none(), ferrocast_av::ffenc::available());
         assert!(unsupported(&settings("av1_texture_amf"), true).is_some());
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));
@@ -619,5 +638,9 @@ mod tests {
         assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
         cq.encode.quality = None;
         assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
+        // Lossless: x264 at rate factor 0.
+        cq.encode.video_encoder = "obs_x264".into();
+        cq.encode.quality = Some(0);
+        assert_eq!(rate_of(&cq.encode), RateControl::Crf(0));
     }
 }

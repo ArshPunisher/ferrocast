@@ -31,6 +31,8 @@ pub enum RateControl {
     Average,
     /// A steady quality, 0 to 1, the bitrate following the picture (recordings).
     Quality(f32),
+    /// x264's constant rate factor: 0 lossless … 51 worst (software only; recordings).
+    Crf(u8),
 }
 
 /// What an encoder is asked to make.
@@ -47,6 +49,9 @@ pub struct VideoConfig {
     pub rate: RateControl,
     /// Seconds between keyframes (platforms ask for 2).
     pub keyframe_secs: u32,
+    /// x264 (through FFmpeg) instead of the system's own encoder: sharper at low bitrates, and
+    /// lossless with `RateControl::Crf(0)`. H.264 only.
+    pub software: bool,
 }
 
 /// One frame's pixels, borrowed. Strides are bytes per row.
@@ -101,7 +106,7 @@ impl VideoEncoder {
     pub fn new(config: VideoConfig) -> Result<Self, AvError> {
         Self::check(&config)?;
         #[cfg(target_os = "macos")]
-        if !ffmpeg_asked() {
+        if !ffmpeg_asked() && !config.software {
             return Ok(Self { inner: Inner::Native(crate::apple::vt::Encoder::new(&config)?), config });
         }
         let _ = ffmpeg_asked();
@@ -127,6 +132,12 @@ impl VideoEncoder {
         }
         if config.fps_num == 0 || config.fps_den == 0 || config.bitrate_kbps == 0 {
             return Err(AvError::Encoder("the frame rate and bitrate must be above 0".into()));
+        }
+        if matches!(config.rate, RateControl::Crf(_)) && !config.software {
+            return Err(AvError::Encoder("a constant rate factor is x264's: ask for the software encoder".into()));
+        }
+        if config.software && config.codec != VideoCodec::H264 {
+            return Err(AvError::Encoder("x264 makes H.264 only".into()));
         }
         Ok(())
     }

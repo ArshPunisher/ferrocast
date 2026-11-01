@@ -197,7 +197,8 @@ fn set_rate(session: &Owned, kbps: u32, rate: RateControl) -> Result<(), AvError
                 limit();
             }
         }
-        RateControl::Average => {
+        // x264's rate factor never reaches here (VideoEncoder refuses it); an average if it did.
+        RateControl::Average | RateControl::Crf(_) => {
             let s = set(avg, bits.0);
             if s != 0 {
                 return Err(fail("set the bitrate", s));

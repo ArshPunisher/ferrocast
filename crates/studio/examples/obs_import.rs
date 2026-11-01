@@ -215,6 +215,7 @@ fn main() -> Result<()> {
         bitrate_kbps: 4000,
         rate: RateControl::Cbr,
         keyframe_secs: 2,
+        software: false,
     };
     let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
     let engine = Engine::new(EngineConfig { width: W, height: H, fps: 30, ..Default::default() }, video, audio)?;

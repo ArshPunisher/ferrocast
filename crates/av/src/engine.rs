@@ -1202,6 +1202,7 @@ mod tests {
             bitrate_kbps: 2000,
             rate: RateControl::Cbr,
             keyframe_secs: 1,
+            software: false,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()

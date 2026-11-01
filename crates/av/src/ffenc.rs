@@ -33,6 +33,11 @@ fn ffmpeg() -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| std::env::split_paths(&path).map(|d| d.join(exe)).find(|p| p.is_file()))
 }
 
+/// Whether FFmpeg is here (x264, and encoding off the Mac, need it).
+pub fn available() -> bool {
+    ffmpeg().is_some()
+}
+
 /// The H.264 encoders tried, best first, on this system.
 fn candidates() -> &'static [&'static str] {
     if cfg!(windows) {
@@ -208,8 +213,11 @@ impl Video {
         if cfg.codec != VideoCodec::H264 {
             return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
         }
-        let enc =
-            h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?;
+        let enc = if cfg.software {
+            "libx264".to_string()
+        } else {
+            h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
+        };
         let kbps = cfg.bitrate_kbps;
         let gop = (u64::from(cfg.keyframe_secs.max(1)) * u64::from(cfg.fps_num) / u64::from(cfg.fps_den.max(1))).max(1);
         let mut a: Vec<String> = vec![
@@ -252,7 +260,11 @@ impl Video {
             "bt709".into(),
         ]);
         let cbr = matches!(cfg.rate, RateControl::Cbr);
-        a.extend(["-b:v".into(), format!("{kbps}k")]);
+        match cfg.rate {
+            // A quality, not a bitrate: x264's rate factor (0 is lossless).
+            RateControl::Crf(q) => a.extend(["-crf".into(), q.min(51).to_string()]),
+            _ => a.extend(["-b:v".into(), format!("{kbps}k")]),
+        }
         // A rate cap for steady encoders; VideoToolbox's own CBR turns off when one is given.
         if cbr && enc != "h264_videotoolbox" {
             a.extend(["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{}k", kbps * 2)]);
@@ -261,6 +273,9 @@ impl Video {
             "libx264" if cbr => {
                 &["-preset", "veryfast", "-tune", "zerolatency", "-x264-params", "nal-hrd=cbr:force-cfr=1"]
             }
+            // Lossless as libobs's x264 does it: fast enough to keep up, big files.
+            "libx264" if cfg.rate == RateControl::Crf(0) => &["-preset", "ultrafast"],
+            "libx264" if matches!(cfg.rate, RateControl::Crf(_)) => &["-preset", "veryfast"],
             "libx264" => &["-preset", "veryfast", "-tune", "zerolatency"],
             "h264_nvenc" if cbr => &["-preset", "p4", "-tune", "ll", "-rc", "cbr", "-zerolatency", "1"],
             "h264_nvenc" => &["-preset", "p4", "-tune", "ll", "-zerolatency", "1"],

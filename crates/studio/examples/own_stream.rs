@@ -86,6 +86,7 @@ fn main() -> Result<()> {
         bitrate_kbps: kbps,
         rate: RateControl::Cbr,
         keyframe_secs: 2,
+        software: false,
     };
     let audio = AudioConfig { sample_rate: feed.sample_rate, channels: 2, bitrate_kbps: 160 };
     let recorded = out.join("recorded.mp4");
