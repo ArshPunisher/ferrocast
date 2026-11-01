@@ -304,6 +304,7 @@ pub(crate) fn features(st: &AppState) -> Value {
         "weekly_email": crate::mail::available(st),
         "tip_domain": crate::tips::domain_available(st),
         "smart": crate::smart::available(st),
+        "bond": crate::bond::available(st),
     })
 }
 
