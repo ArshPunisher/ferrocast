@@ -92,7 +92,7 @@ impl DestinationConfig {
 /// forwarder: "srt", "rist" or "whip".
 pub fn direct_kind(url: &str) -> Option<&'static str> {
     let u = url.trim().to_ascii_lowercase();
-    if u.starts_with("srt://") {
+    if u.starts_with("srt://") || u.starts_with("srtla://") {
         Some("srt")
     } else if u.starts_with("rist://") {
         Some("rist")
@@ -1194,7 +1194,7 @@ impl Engine {
                     || direct_host(u).is_none_or(|h| h.contains('@'))
                 {
                     return Err(EngineError::Invalid(
-                        "url: a whole address like srt://host:port, rist://host:port or https://host/whip, without a user name.".into(),
+                        "url: a whole address like srt://host:port, srtla://host:port, rist://host:port or https://host/whip, without a user name.".into(),
                     ));
                 }
                 if canvas != Canvas::Main {

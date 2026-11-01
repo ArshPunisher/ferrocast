@@ -22,7 +22,8 @@ const TS_CHUNK: usize = 7 * PACKET;
 /// Which way the stream goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// `srt://host:port?…`; the key, if any, is the stream id.
+    /// `srt://host:port?…`; the key, if any, is the stream id. `srtla://` is SRT over every
+    /// connection at once to an SRTLA receiver (`via=` names them; none: all).
     Srt,
     /// `rist://host:port?…`; the key, if any, is the passphrase.
     Rist,
@@ -34,7 +35,7 @@ impl Kind {
     /// The kind a server address asks for, or None for RTMP (and anything else).
     pub fn of(url: &str) -> Option<Kind> {
         let u = url.trim().to_ascii_lowercase();
-        if u.starts_with("srt://") {
+        if u.starts_with("srt://") || u.starts_with("srtla://") {
             Some(Kind::Srt)
         } else if u.starts_with("rist://") {
             Some(Kind::Rist)
@@ -159,8 +160,12 @@ pub fn check(d: &Direct) -> Result<(), DirectError> {
             {
                 return Err(DirectError::Address("An SRT passphrase is 10 to 79 letters long.".into()));
             }
-            if SrtMode::of(&a)? == SrtMode::Listener {
+            let mode = SrtMode::of(&a)?;
+            if mode == SrtMode::Listener {
                 listen_addr(&a)?;
+            }
+            if is_srtla(&d.url) && mode != SrtMode::Caller {
+                return Err(DirectError::Address("SRTLA calls the receiver: leave mode= out.".into()));
             }
             srt_bandwidth(&a)?;
             Ok(())
@@ -384,7 +389,7 @@ fn srt_bandwidth(a: &Address) -> Result<Option<LiveBandwidthMode>, DirectError> 
 async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stream: u64) -> Result<Ended, DirectError> {
     let a = Address::parse(&d.url)?;
     let name = a.name();
-    let mut sock = srt_connect(d, &a, None).await?;
+    let (mut sock, mut bond) = srt_connect(d, &a, None).await?;
     // A delay the streamer didn't set follows the network: SRT wants at least four round
     // trips to resend in time, so a far server gets a longer one (once, on connecting). Only as
     // the caller: a listener or rendezvous would drop the receiver that just connected.
@@ -394,7 +399,8 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
     {
         tracing::info!(dest = %d.id, latency_ms = want.as_millis() as u64, "SRT delay follows the network");
         let _ = sock.close().await;
-        sock = srt_connect(d, &a, Some(want)).await?;
+        drop(bond);
+        (sock, bond) = srt_connect(d, &a, Some(want)).await?;
     }
     let stats = sock.statistics().clone();
     let mut sink = SrtSink { sock, name };
@@ -403,7 +409,16 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
         () = srt_link(stats, health) => Ok(Ended::StreamEnded),
     };
     let _ = sink.sock.close().await;
+    if let Some(b) = &bond {
+        tracing::info!(dest = %d.id, links = ?b.stats(), "SRTLA: how the connections did");
+    }
+    drop(bond);
     out
+}
+
+/// Whether the address is SRTLA (SRT over every connection, to an SRTLA receiver).
+fn is_srtla(url: &str) -> bool {
+    url.trim().get(..8).is_some_and(|s| s.eq_ignore_ascii_case("srtla://"))
 }
 
 /// SRT's delay when the streamer didn't set one.
@@ -416,8 +431,13 @@ pub(crate) fn srt_latency_for(rtt: Duration) -> Option<Duration> {
     (Duration::from_millis(want) > SRT_LATENCY).then(|| Duration::from_millis(want.min(8_000)))
 }
 
-/// An SRT connection made as the address says (`latency` instead of its own, if given).
-async fn srt_connect(d: &Direct, a: &Address, latency: Option<Duration>) -> Result<srt_tokio::SrtSocket, DirectError> {
+/// An SRT connection made as the address says (`latency` instead of its own, if given), and
+/// for SRTLA the bond it goes through (held as long as the connection).
+async fn srt_connect(
+    d: &Direct,
+    a: &Address,
+    latency: Option<Duration>,
+) -> Result<(srt_tokio::SrtSocket, Option<crate::srtla::Bond>), DirectError> {
     let name = a.name();
     let mode = SrtMode::of(a)?;
     let stream_id = Some(d.key.trim()).filter(|k| !k.is_empty()).or_else(|| a.param("streamid"));
@@ -443,7 +463,11 @@ async fn srt_connect(d: &Direct, a: &Address, latency: Option<Duration>) -> Resu
         SrtMode::Listener => {
             let here = listen_addr(a)?;
             // No deadline: it waits for the receiver as long as the stream runs.
-            b.listen_on(here).await.map_err(|e| DirectError::Refused(format!("Couldn't listen on {name} ({e}).")))
+            let s = b
+                .listen_on(here)
+                .await
+                .map_err(|e| DirectError::Refused(format!("Couldn't listen on {name} ({e}).")))?;
+            Ok((s, None))
         }
         SrtMode::Caller | SrtMode::Rendezvous => {
             let addr = tokio::net::lookup_host((a.host.as_str(), a.port))
@@ -452,6 +476,19 @@ async fn srt_connect(d: &Direct, a: &Address, latency: Option<Duration>) -> Resu
                 .and_then(|mut it| it.next())
                 .ok_or_else(|| DirectError::Unreachable(name.clone()))?;
             let local = a.param("localport").and_then(|p| p.parse::<u16>().ok()).unwrap_or(a.port);
+            // SRTLA: SRT goes to the bond here, which spreads it over the connections.
+            let (addr, bond) = if is_srtla(&d.url) {
+                let via: Vec<String> = a
+                    .param("via")
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                    .unwrap_or_default();
+                let b = crate::srtla::bond(addr, &via)
+                    .await
+                    .map_err(|e| DirectError::Refused(format!("SRTLA couldn't start ({e}).")))?;
+                (b.local, Some(b))
+            } else {
+                (addr, None)
+            };
             let connect = async move {
                 if mode == SrtMode::Caller {
                     b.call(addr, stream_id).await
@@ -460,10 +497,11 @@ async fn srt_connect(d: &Direct, a: &Address, latency: Option<Duration>) -> Resu
                 }
             };
             let secret = a.param("passphrase").is_some_and(|p| !p.is_empty());
-            tokio::time::timeout(CONNECT_DEADLINE, connect)
+            let s = tokio::time::timeout(CONNECT_DEADLINE, connect)
                 .await
                 .map_err(|_| DirectError::Slow(name.clone()))?
-                .map_err(|e| srt_refusal(&name, &e.to_string(), secret))
+                .map_err(|e| srt_refusal(&name, &e.to_string(), secret))?;
+            Ok((s, bond))
         }
     }
 }
@@ -495,7 +533,7 @@ pub(crate) async fn srt_reach(d: &Direct) -> Result<(Duration, Option<Duration>)
             a.port
         )));
     }
-    let mut sock = srt_connect(d, &a, None).await?;
+    let (mut sock, _bond) = srt_connect(d, &a, None).await?;
     let rtt = sock.settings().rtt;
     let _ = sock.close().await;
     // A longer delay than the address sets (or SRT's own), when the network asks for it.
@@ -682,6 +720,9 @@ mod tests {
         assert!(check(&srt("srt://:9000")).is_err(), "a caller needs a host");
         assert!(check(&srt("srt://a:9000?mode=rendezvous&localport=9001")).is_ok());
         assert!(check(&srt("srt://a:9000?mode=sideways")).is_err());
+        assert_eq!(Kind::of("srtla://irl.example:5000?via=en0,en8"), Some(Kind::Srt));
+        assert!(check(&srt("srtla://irl.example:5000")).is_ok());
+        assert!(check(&srt("srtla://:5000?mode=listener")).is_err(), "SRTLA calls the receiver");
         assert!(check(&srt("srt://localhost:9000?mode=listener")).is_err(), "a listener's host is an IP");
         assert_eq!(
             listen_addr(&Address::parse("srt://[::1]:9000?mode=listener").unwrap()).unwrap().to_string(),
