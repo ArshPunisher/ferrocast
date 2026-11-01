@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::ffi::{self, Api, Level, cstr, text};
-use crate::{OptionInfo, RecordPlan, Recording, StreamSettings, Streaming, Studio, StudioError, check_name, own};
+use crate::{
+    OptionInfo, RecordPlan, Recording, ReplayBuffer, ReplayPlan, StreamSettings, Streaming, Studio, StudioError,
+    check_name, own,
+};
 
 mod follow;
 mod moves;
@@ -3558,6 +3561,7 @@ impl Collection {
             tracks: &[],
             delay_s: s.delay_s,
             vertical: false,
+            replay: None,
         };
         let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         Ok(Streaming::own(self.studio.clone(), s.clone(), own))
@@ -3576,6 +3580,7 @@ impl Collection {
             tracks: &plan.tracks,
             delay_s: 0,
             vertical: false,
+            replay: None,
         };
         let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         own.set_plan(plan);
@@ -3587,6 +3592,36 @@ impl Collection {
             path: path.to_path_buf(),
             view: std::ptr::null_mut(),
             own: Some(own),
+        })
+    }
+
+    /// OBS's replay buffer kept by Ferrocast's own engine: the last `plan.seconds` drawn from
+    /// this collection, saved to MP4 or MKV on request. Keep it with `ReplayBuffer::follow`.
+    pub fn replay_drawn(&self, plan: &ReplayPlan) -> Result<ReplayBuffer, StudioError> {
+        if !(5..=21_600).contains(&plan.seconds) {
+            return Err(StudioError::Failed("seconds: 5 to 21600.".into()));
+        }
+        if !matches!(plan.format.as_str(), "mkv" | "mp4") {
+            return Err(StudioError::Failed(
+                "Ferrocast's own engine saves replays as MKV or MP4: pick one of those in Settings › Recording.".into(),
+            ));
+        }
+        let how = own::Drawing {
+            send_to: None,
+            record: None,
+            encode: &plan.encode,
+            tracks: &plan.tracks,
+            delay_s: 0,
+            vertical: false,
+            replay: Some((plan.seconds, plan.mb)),
+        };
+        let stream = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        Ok(ReplayBuffer {
+            studio: self.studio.clone(),
+            out: std::ptr::null_mut(),
+            venc: std::ptr::null_mut(),
+            audio: Vec::new(),
+            own: Some(crate::OwnReplay { stream, plan: plan.clone(), saved: Default::default() }),
         })
     }
 

@@ -157,6 +157,13 @@ struct Drawn {
     vertical: Option<Option<String>>,
 }
 
+/// Where a replay buffer's saves stand: the last file written, or why the last save failed.
+#[derive(Debug, Default)]
+pub(crate) struct ReplaySaved {
+    pub last: Option<std::path::PathBuf>,
+    pub failed: Option<String>,
+}
+
 /// What a drawn output is: where it goes, how it's encoded, and which picture.
 pub(crate) struct Drawing<'a> {
     pub send_to: Option<Send<'a>>,
@@ -168,6 +175,8 @@ pub(crate) struct Drawing<'a> {
     pub delay_s: u32,
     /// The vertical picture (9:16, its own scenes) instead of the main one.
     pub vertical: bool,
+    /// A replay buffer instead: seconds kept, and at most this many megabytes (0: no limit).
+    pub replay: Option<(u32, u32)>,
 }
 
 /// The vertical picture's scene on air in a saved collection.
@@ -401,7 +410,7 @@ impl OwnStream {
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(studio: &Studio, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
-        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical } = how;
+        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay } = how;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -438,9 +447,10 @@ impl OwnStream {
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
         hub.start();
-        let kind = match record {
-            Some(p) => OutputKind::Record(p.to_path_buf()),
-            None => {
+        let kind = match (record, replay) {
+            (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
+            (Some(p), None) => OutputKind::Record(p.to_path_buf()),
+            (None, None) => {
                 let mut out = Delayed {
                     hub: hub.clone(),
                     counts: counts.clone(),
@@ -550,6 +560,29 @@ impl OwnStream {
 
     pub(crate) fn plan(&self) -> Option<&RecordPlan> {
         self.drawn.as_ref().and_then(|d| d.plan.as_ref()).map(|(p, _)| p)
+    }
+
+    /// Saves what a replay buffer holds to `path`, written on a thread of its own; `last`
+    /// is set to the file once it's there (or `failed` to why not).
+    pub(crate) fn save_replay(&self, path: &std::path::Path, done: Arc<Mutex<ReplaySaved>>) -> Result<(), StudioError> {
+        let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("The replay buffer couldn't save.".into()))?;
+        let clip = d.engine.replay_clip(d.output).map_err(|e| StudioError::Failed(e.to_string()))?;
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("ferrocast-replay-save".into())
+            .spawn(move || {
+                let result = clip.write(&path);
+                let mut d = done.lock().unwrap_or_else(|e| e.into_inner());
+                match result {
+                    Ok(()) => {
+                        tracing::info!(file = %path.display(), "a replay was saved");
+                        d.last = Some(path);
+                    }
+                    Err(e) => d.failed = Some(e.to_string()),
+                }
+            })
+            .map_err(|e| StudioError::Failed(format!("The replay couldn't be saved: {e}")))?;
+        Ok(())
     }
 
     /// Pauses or resumes the recording (no gap in the file).

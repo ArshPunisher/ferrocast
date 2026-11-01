@@ -1094,7 +1094,7 @@ impl Studio {
         let (oid, oname) = (cstr("replay_buffer"), cstr("ferrocast-replay"));
         let out = a.obs_output_create(oid.as_ptr(), oname.as_ptr(), settings, ptr::null_mut());
         a.obs_data_release(settings);
-        let rb = ReplayBuffer { studio: self.clone(), out, venc, audio };
+        let rb = ReplayBuffer { studio: self.clone(), out, venc, audio, own: None };
         if out.is_null() {
             return Err(StudioError::Failed("the replay buffer couldn't be made".into()));
         }
@@ -2277,16 +2277,52 @@ pub struct ReplayBuffer {
     out: *mut ffi::ObsOutput,
     venc: *mut ffi::ObsEncoder,
     audio: Vec<*mut ffi::ObsEncoder>,
+    /// Kept by Ferrocast's own engine instead (`out` and the encoders are null then): its
+    /// output, the plan naming saved files, and how the saves went.
+    own: Option<OwnReplay>,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnReplay {
+    pub stream: own::OwnStream,
+    pub plan: ReplayPlan,
+    pub saved: std::sync::Arc<std::sync::Mutex<own::ReplaySaved>>,
 }
 
 impl ReplayBuffer {
     pub fn active(&self) -> bool {
+        if let Some(o) = &self.own {
+            return o.stream.last_error().is_none();
+        }
         self.studio.inner.api.obs_output_active(self.out)
+    }
+
+    /// Keeps a replay buffer our engine draws with the collection (see `Streaming::follow`).
+    pub fn follow(&mut self, c: &Collection) -> bool {
+        match self.own.as_mut() {
+            Some(o) => o.stream.follow(&c.save("Ferrocast")),
+            None => false,
+        }
+    }
+
+    /// Whether Ferrocast's own engine keeps this replay buffer.
+    pub fn drawn(&self) -> bool {
+        self.own.is_some()
     }
 
     /// Saves what's kept so far to a file, written in the background ([`Self::last_replay`]
     /// names it once it's done).
     pub fn save(&self) -> Result<(), StudioError> {
+        if let Some(o) = &self.own {
+            let plan = RecordPlan {
+                folder: o.plan.folder.clone(),
+                name: o.plan.name.clone(),
+                format: o.plan.format.clone(),
+                spaces: o.plan.spaces,
+                ..RecordPlan::default()
+            };
+            return o.stream.save_replay(&self.studio.record_path(&plan), o.saved.clone());
+        }
         let a = &self.studio.inner.api;
         let ph = a.obs_output_get_proc_handler(self.out);
         let mut stack = [0u8; 64];
@@ -2300,6 +2336,9 @@ impl ReplayBuffer {
 
     /// The last replay saved, if any.
     pub fn last_replay(&self) -> Option<PathBuf> {
+        if let Some(o) = &self.own {
+            return o.saved.lock().unwrap_or_else(|e| e.into_inner()).last.clone();
+        }
         let a = &self.studio.inner.api;
         let ph = a.obs_output_get_proc_handler(self.out);
         if ph.is_null() {
@@ -2316,6 +2355,9 @@ impl ReplayBuffer {
     }
 
     pub fn last_error(&self) -> Option<String> {
+        if let Some(o) = &self.own {
+            return o.stream.last_error().or_else(|| o.saved.lock().unwrap_or_else(|e| e.into_inner()).failed.clone());
+        }
         let e = text(self.studio.inner.api.obs_output_get_last_error(self.out));
         (!e.is_empty()).then_some(e)
     }

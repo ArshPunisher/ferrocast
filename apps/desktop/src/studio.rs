@@ -1123,6 +1123,9 @@ impl DesktopStudio {
                     for s in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten().filter(|s| s.drawn()) {
                         s.follow(c);
                     }
+                    if let Some(r) = h.replay.as_mut().filter(|r| r.drawn()) {
+                        r.follow(c);
+                    }
                     if let Some((r, file, _)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
                         r.follow(c);
                         // A split by the plan's minutes or megabytes moves on to a new file.
@@ -1966,7 +1969,9 @@ impl StudioHost for DesktopStudio {
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(studio, &s),
             };
-            let rb = studio.replay_buffer(&plan).map_err(|e| e.to_string())?;
+            // Kept by Ferrocast's own engine (libobs no longer stands in).
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let rb = c.replay_drawn(&plan).map_err(|e| e.to_string())?;
             tracing::info!(seconds = s.replay_seconds, "the Studio's replay buffer is on");
             h.replay = Some(rb);
             Ok(json!({ "active": true }))
