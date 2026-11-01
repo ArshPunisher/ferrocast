@@ -1242,6 +1242,19 @@ impl Engine {
                 self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
             return Ok(ferrocast_golive::reach::reach(&url, &key).await);
         }
+        // YouTube's vertical stream is made when it's first needed, not for a test (it costs
+        // quota): its server is YouTube's own.
+        if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
+            if self.connector(Platform::Youtube).is_none() {
+                return Ok(ferrocast_golive::reach::Reach {
+                    ok: false,
+                    rtt_ms: None,
+                    message: "Connect YouTube in Settings, Accounts first.".into(),
+                    srt_latency_ms: None,
+                });
+            }
+            return Ok(ferrocast_golive::reach::reach(YOUTUBE_INGEST, "").await);
+        }
         match self.resolve(&d).await {
             Ok(dest) => {
                 let t = &dest.target;
