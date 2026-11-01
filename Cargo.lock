@@ -2191,6 +2191,7 @@ dependencies = [
  "cpal",
  "dispatch2",
  "ferrocast-golive",
+ "half",
  "image",
  "objc2",
  "objc2-av-foundation",

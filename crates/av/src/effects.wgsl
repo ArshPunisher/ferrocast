@@ -27,6 +27,8 @@ struct F {
 @group(0) @binding(2) var pick: sampler;
 // A second picture (Image Mask/Blend's).
 @group(0) @binding(3) var second: texture_2d<f32>;
+// A LUT's cube (Apply LUT's).
+@group(0) @binding(4) var cube: texture_3d<f32>;
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -372,4 +374,53 @@ fn fs_mask(i: Out) -> @location(0) vec4<f32> {
         rgba = vec4<f32>(saturate(rgba.rgb - t.rgb), rgba.a);
     }
     return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
+}
+
+fn srgb_nonlinear(u: f32) -> f32 {
+    if u <= 0.0031308 {
+        return 12.92 * u;
+    }
+    return 1.055 * pow(u, 1.0 / 2.4) - 0.055;
+}
+
+fn srgb_nonlinear3(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(srgb_nonlinear(v.r), srgb_nonlinear(v.g), srgb_nonlinear(v.b));
+}
+
+// color_grade_filter.effect: p0 which technique (0 Draw1D, 1 Draw3D, 2 DrawAlpha3D,
+// 3 DrawAmount3D, 4 DrawDomain3D), p1 the amount; q the scale, r the offset; m's first two
+// columns the domain's min and max. Each returns what OBS's does (Draw1D doesn't multiply the
+// alpha back in, and neither does Draw3D, which never took it out).
+@fragment
+fn fs_lut(i: Out) -> @location(0) vec4<f32> {
+    var c = textureSampleLevel(image, pick, i.uv, 0.0);
+    let k = u32(f.p0 + 0.5);
+    let amount = f.p1;
+    let lo = f.m[0].xyz;
+    let hi = f.m[1].xyz;
+    if k == 1u {
+        let at = srgb_nonlinear3(c.rgb) * f.q.xyz + f.r.xyz;
+        return vec4<f32>(textureSampleLevel(cube, pick, at, 0.0).rgb, c.a);
+    }
+    c = unpremultiplied(c);
+    let nl = srgb_nonlinear3(c.rgb);
+    if k == 0u {
+        for (var ch = 0u; ch < 3u; ch++) {
+            if nl[ch] >= lo[ch] && nl[ch] <= hi[ch] {
+                let u = nl[ch] * f.q[ch] + f.r[ch];
+                let v = textureSampleLevel(second, pick, vec2<f32>(u, 0.5), 0.0)[ch];
+                c[ch] = mix(c[ch], v, amount);
+            }
+        }
+        return c;
+    }
+    let looked = textureSampleLevel(cube, pick, nl * f.q.xyz + f.r.xyz, 0.0).rgb;
+    if k == 2u {
+        c = vec4<f32>(looked, c.a);
+    } else if k == 3u {
+        c = vec4<f32>(mix(c.rgb, looked, amount), c.a);
+    } else if all(nl >= lo) && all(nl <= hi) {
+        c = vec4<f32>(mix(c.rgb, looked, amount), c.a);
+    }
+    return vec4<f32>(c.rgb * c.a, c.a);
 }

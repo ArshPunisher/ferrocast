@@ -93,8 +93,11 @@ pub struct Compositor {
     /// Filters read the picture before them and, for Image Mask/Blend, a second one.
     effect_layout: wgpu::BindGroupLayout,
     effect_pipeline_layout: wgpu::PipelineLayout,
-    /// What the second picture is when a filter has none.
+    /// What the second picture and the cube are when a filter has none.
     blank: wgpu::Texture,
+    blank_cube: wgpu::Texture,
+    /// LUTs on the card, by the table they came from (dropped with it).
+    luts: Mutex<HashMap<usize, (std::sync::Weak<crate::lut::Lut>, wgpu::Texture)>>,
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
@@ -256,6 +259,15 @@ impl Compositor {
                 tex(1),
                 entry(2, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                 tex(3),
+                entry(
+                    4,
+                    wgpu::ShaderStages::FRAGMENT,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                ),
             ],
         });
         let effect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -272,6 +284,16 @@ impl Compositor {
             format: GAMMA,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[LINEAR],
+        });
+        let blank_cube = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("blank cube"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: GAMMA,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
         let effect_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("effects"),
@@ -312,6 +334,8 @@ impl Compositor {
             effect_layout,
             effect_pipeline_layout,
             blank,
+            blank_cube,
+            luts: Mutex::new(HashMap::new()),
             effect_pipelines: Mutex::new(HashMap::new()),
             transition_module,
             transition_layout,
@@ -794,6 +818,7 @@ impl Compositor {
             let lin = e.linear();
             let (mut q, mut r, mut m) = ([0f32; 4], [0f32; 4], [0f32; 16]);
             let mut second: Option<wgpu::Texture> = None;
+            let mut cube: Option<wgpu::Texture> = None;
             let (entry, p, color) = match e {
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
@@ -835,6 +860,31 @@ impl Compositor {
                 Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Crop { left, top, .. } => {
                     ("fs_crop", [*left as f32, *top as f32, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
+                Effect::Lut { lut, amount, passthrough_alpha } => {
+                    let t = self.lut_texture(lut);
+                    let tech = if lut.one_d {
+                        second = Some(t);
+                        0.0
+                    } else {
+                        cube = Some(t);
+                        if !lut.full_domain() {
+                            4.0
+                        } else if *amount < 1.0 {
+                            3.0
+                        } else if *passthrough_alpha {
+                            1.0
+                        } else {
+                            2.0
+                        }
+                    };
+                    let (scale, offset) = lut.scale_offset();
+                    q = [scale[0], scale[1], scale[2], 0.0];
+                    r = [offset[0], offset[1], offset[2], 0.0];
+                    let (lo, hi) = (lut.domain_min, lut.domain_max);
+                    m[..3].copy_from_slice(&lo);
+                    m[4..7].copy_from_slice(&hi);
+                    ("fs_lut", [tech, *amount, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
                 Effect::Mask { kind, image, rgba, stretch } => {
                     let t = self.uploaded(*image)?;
@@ -895,7 +945,20 @@ impl Compositor {
             .chain(m)
             .collect::<Vec<f32>>();
             let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
-            let second = view(second.as_ref().unwrap_or(&self.blank), if lin { LINEAR } else { GAMMA });
+            let second = match &second {
+                Some(t) => t.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(lut_view_format(t.format(), lin)),
+                    ..Default::default()
+                }),
+                None => view(&self.blank, if lin { LINEAR } else { GAMMA }),
+            };
+            let cube = match &cube {
+                Some(t) => t.create_view(&wgpu::TextureViewDescriptor {
+                    format: Some(lut_view_format(t.format(), true)),
+                    ..Default::default()
+                }),
+                None => self.blank_cube.create_view(&Default::default()),
+            };
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("effect"),
                 layout: &self.effect_layout,
@@ -907,6 +970,7 @@ impl Compositor {
                     },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&second) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&cube) },
                 ],
             });
             let pipeline = self.effect_pipeline(entry, lin);
@@ -989,6 +1053,54 @@ impl Compositor {
     /// Lets an uploaded picture go.
     pub fn forget(&self, id: u64) {
         self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    }
+
+    /// A LUT on the card: a 3D texture (a 1D one for a 1D table), made once per table.
+    fn lut_texture(&self, lut: &std::sync::Arc<crate::lut::Lut>) -> wgpu::Texture {
+        use crate::lut::LutData;
+        let key = std::sync::Arc::as_ptr(lut) as usize;
+        let mut luts = self.luts.lock().unwrap_or_else(|e| e.into_inner());
+        luts.retain(|_, (w, _)| w.strong_count() > 0);
+        if let Some((_, t)) = luts.get(&key) {
+            return t.clone();
+        }
+        let n = lut.size;
+        let (format, bytes, px): (_, Vec<u8>, u32) = match &lut.data {
+            LutData::Srgb8(d) => (GAMMA, d.clone(), 4),
+            LutData::Half(d) => (wgpu::TextureFormat::Rgba16Float, d.iter().flat_map(|h| h.to_le_bytes()).collect(), 8),
+        };
+        let (size, dimension) = if lut.one_d {
+            (wgpu::Extent3d { width: n, height: 1, depth_or_array_layers: 1 }, wgpu::TextureDimension::D2)
+        } else {
+            (wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n }, wgpu::TextureDimension::D3)
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lut"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: if format == GAMMA { &[LINEAR] } else { &[] },
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(n * px),
+                rows_per_image: Some(if lut.one_d { 1 } else { n }),
+            },
+            size,
+        );
+        luts.insert(key, (std::sync::Arc::downgrade(lut), texture.clone()));
+        texture
     }
 
     fn uploaded(&self, id: u64) -> Result<wgpu::Texture, AvError> {
@@ -1346,6 +1458,12 @@ fn check_size(w: u32, h: u32) -> Result<(), AvError> {
 /// A w×h rectangle's corners through `m`: top left, top right, bottom left, bottom right.
 fn corners(m: &Affine, w: f32, h: f32) -> [(f32, f32); 4] {
     [m.apply(0.0, 0.0), m.apply(w, 0.0), m.apply(0.0, h), m.apply(w, h)]
+}
+
+/// How a filter's second picture or LUT is read: an 8-bit one through its sRGB view when the
+/// filter works in linear light (libobs's gs_effect_set_texture_srgb), a float one as it is.
+fn lut_view_format(format: wgpu::TextureFormat, linear: bool) -> wgpu::TextureFormat {
+    if format == GAMMA && linear { LINEAR } else { format }
 }
 
 /// Where Image Mask/Blend reads its picture (mask-filter.c): a multiplier and an offset on the

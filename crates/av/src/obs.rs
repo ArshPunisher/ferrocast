@@ -115,6 +115,14 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             min_smooth: n("luma_min_smooth", 0.0),
         },
         "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        // Its table is read here; one that won't read leaves the filter out (listed as skipped).
+        "clut_filter" => Effect::Lut {
+            lut: std::sync::Arc::new(
+                crate::lut::Lut::open(std::path::Path::new(s.get("image_path").and_then(Value::as_str)?)).ok()?,
+            ),
+            amount: n("clut_amount", 1.0).clamp(0.0, 1.0),
+            passthrough_alpha: s.get("passthrough_alpha").and_then(Value::as_bool).unwrap_or(false),
+        },
         "crop_filter" => {
             let i = |k: &str| s.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(-16_384, 16_384) as i32;
             let relative = s.get("relative").and_then(Value::as_bool).unwrap_or(true);

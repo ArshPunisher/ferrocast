@@ -21,6 +21,7 @@ mod compose;
 pub mod engine;
 pub mod ffenc;
 pub mod flv;
+pub mod lut;
 pub mod mix;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod monitor;
@@ -237,6 +238,13 @@ pub enum Effect {
         rgba: [f32; 4],
         stretch: bool,
     },
+    /// OBS's Apply LUT: `amount` 0 to 1; `passthrough_alpha` reads colours as they are,
+    /// without undoing their alpha first.
+    Lut {
+        lut: std::sync::Arc<lut::Lut>,
+        amount: f32,
+        passthrough_alpha: bool,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
@@ -267,6 +275,7 @@ impl Effect {
                 | Self::Sharpen { .. }
                 | Self::Crop { .. }
                 | Self::Mask { .. }
+                | Self::Lut { .. }
         )
     }
 
