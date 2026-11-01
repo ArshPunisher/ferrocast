@@ -1458,7 +1458,7 @@ impl Studio {
             let param = &*state as *const ffi::DrawState as *mut std::ffi::c_void;
             self.inner.api.obs_display_add_draw_callback(display, ffi::draw_main, param);
             view.resize_with(&self.inner.api, display);
-            Ok(Preview { studio: self.clone(), display, state, view, scale })
+            Ok(Preview { studio: self.clone(), display, drawn: None, state, view, scale })
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
@@ -1484,7 +1484,7 @@ fn srgb_encoded(abgr: u32) -> u32 {
 /// much bigger than the page's box on every side, so the picture stays exactly on the box.
 const PREVIEW_EDGE: f64 = 10.0;
 
-fn with_edge(r: Rect) -> Rect {
+pub(crate) fn with_edge(r: Rect) -> Rect {
     Rect {
         x: r.x - PREVIEW_EDGE,
         y: r.y - PREVIEW_EDGE,
@@ -1510,7 +1510,11 @@ fn px(rect: Rect, scale: f64) -> (u32, u32) {
 #[derive(Debug)]
 pub struct Preview {
     studio: Studio,
+    /// libobs's display drawing it, or null when Ferrocast's own engine does (`drawn`).
     display: *mut ffi::ObsDisplay,
+    /// Ferrocast's own engine drawing it instead: the engine, the view's colour round the
+    /// canvas, and the scene shown instead of what's on air.
+    drawn: Option<DrawnPreview>,
     state: Box<ffi::DrawState>,
     #[cfg(target_os = "macos")]
     view: ffi::mac::ChildView,
@@ -1540,7 +1544,118 @@ pub struct PreviewInput {
     pub alt: bool,
 }
 
+/// What a preview our engine draws keeps.
+#[derive(Debug)]
+pub(crate) struct DrawnPreview {
+    pub shared: std::sync::Arc<own::Shared>,
+    pub background: std::sync::Mutex<[f32; 4]>,
+    pub scene: std::sync::Mutex<Option<String>>,
+}
+
 impl Preview {
+    /// A preview drawn by Ferrocast's own engine in `view` (`Collection::preview_drawn`).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn drawn(
+        studio: Studio,
+        shared: std::sync::Arc<own::Shared>,
+        view: ffi::mac::ChildView,
+        base: (u32, u32),
+        scale: f64,
+        rect: Rect,
+    ) -> Result<Preview, StudioError> {
+        let (cx, cy) = view.pixels().unwrap_or_else(|| px(rect, scale));
+        // SAFETY: the view lives as long as this preview, which stops the engine drawing in it
+        // before it goes (`Drop`).
+        #[allow(unsafe_code)]
+        let started = unsafe { shared.engine.start_preview(view.ptr(), cx, cy) };
+        if let Err(e) = started {
+            view.remove();
+            return Err(StudioError::Failed(format!("the preview couldn't be made: {e}")));
+        }
+        let state = Box::new(ffi::DrawState {
+            api: &studio.inner.api,
+            base,
+            selected: std::sync::Mutex::new(None),
+            scene: std::sync::Mutex::new(ptr::null_mut()),
+            edge: std::sync::atomic::AtomicU32::new(edge_px(scale)),
+            canvas: std::sync::Mutex::new(None),
+            frames: std::sync::Mutex::new(None),
+            shade: std::sync::atomic::AtomicU32::new(0),
+            on: ptr::null_mut(),
+        });
+        let drawn = DrawnPreview {
+            shared,
+            background: std::sync::Mutex::new([10.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0]),
+            scene: std::sync::Mutex::new(None),
+        };
+        let p = Preview { studio, display: ptr::null_mut(), drawn: Some(drawn), state, view, scale };
+        p.refresh();
+        Ok(p)
+    }
+
+    /// Keeps a drawn preview with the Studio: the engine follows the collection's edits and
+    /// scene changes, and the outlines follow what moved. Nothing for libobs's preview.
+    pub fn follow(&self, c: &Collection) {
+        if let Some(d) = &self.drawn {
+            d.shared.follow(&c.save("Ferrocast"));
+            self.refresh();
+        }
+    }
+
+    /// Sends a drawn preview's look to the engine: where the canvas sits, the outlines of what's
+    /// picked (and the frames of every source, when asked) from the scene's own boxes, the
+    /// colour round it and the shade. Called after every change, and often while things move
+    /// (a drag). Nothing for libobs's preview (it reads these as it draws).
+    pub fn refresh(&self) {
+        let Some(d) = &self.drawn else { return };
+        let api = &self.studio.inner.api;
+        let mut look = ferrocast_av::preview::PreviewLook {
+            background: *d.background.lock().unwrap_or_else(|e| e.into_inner()),
+            area: self.state.canvas.lock().ok().and_then(|g| *g),
+            margin: self.state.edge.load(std::sync::atomic::Ordering::Relaxed) as f32,
+            outlines: Vec::new(),
+            shade: self.state.shade.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0,
+        };
+        let corners = |m: &ffi::Matrix4| {
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .map(|(x, y): (f32, f32)| (x * m.x.x + y * m.y.x + m.t.x, x * m.x.y + y * m.y.y + m.t.y))
+        };
+        let color = |id: i64| {
+            let (r, g, b) = ffi::FRAME_COLORS[id.rem_euclid(8) as usize];
+            [r, g, b, 1.0]
+        };
+        let picked = self.state.selected.lock().ok().and_then(|g| g.clone());
+        if let Some(scene) = self.state.frames.lock().ok().and_then(|g| g.clone()) {
+            for (id, m) in ffi::all_boxes(api, ptr::null_mut(), &scene) {
+                if picked.as_ref().is_some_and(|(_, p)| p.contains(&id)) {
+                    continue;
+                }
+                look.outlines.push(ferrocast_av::preview::Outline {
+                    corners: corners(&m),
+                    color: color(id),
+                    width: 1.5,
+                    handles: false,
+                });
+            }
+        }
+        if let Some((scene, ids)) = &picked {
+            let nested = ffi::all_boxes(api, ptr::null_mut(), scene);
+            for id in ids {
+                let m = ffi::item_box(api, ptr::null_mut(), scene, *id)
+                    .or_else(|| nested.iter().find(|(i, _)| i == id).map(|(_, m)| *m));
+                if let Some(m) = m {
+                    look.outlines.push(ferrocast_av::preview::Outline {
+                        corners: corners(&m),
+                        color: color(*id),
+                        width: 2.0,
+                        handles: true,
+                    });
+                }
+            }
+        }
+        d.shared.engine.set_preview_look(look);
+    }
+
     /// The size it draws at: its view's own pixels (snapped round the box) where there's one.
     fn pixels(&self, rect: Rect, scale: f64) -> (u32, u32) {
         #[cfg(any(target_os = "macos", windows))]
@@ -1563,12 +1678,25 @@ impl Preview {
         #[cfg(windows)]
         self.view.set_frame(rect.x, rect.y, rect.w, rect.h);
         let (cx, cy) = self.pixels(rect, scale);
-        self.studio.inner.api.obs_display_resize(self.display, cx, cy);
+        self.resize(cx, cy);
+        self.refresh();
+    }
+
+    fn resize(&self, cx: u32, cy: u32) {
+        match &self.drawn {
+            Some(d) => d.shared.engine.resize_preview(cx, cy),
+            None => self.studio.inner.api.obs_display_resize(self.display, cx, cy),
+        }
     }
 
     /// Shows scene `name` instead of what's on air (Studio Mode's preview), or (None) what's on
     /// air again. Main thread.
     pub fn show_scene(&self, name: Option<&str>) {
+        if let Some(d) = &self.drawn {
+            d.shared.engine.set_preview_scene(name.map(String::from));
+            *d.scene.lock().unwrap_or_else(|e| e.into_inner()) = name.map(String::from);
+            return;
+        }
         let a = &self.studio.inner.api;
         let next = name.map_or(ptr::null_mut(), |n| {
             let src = a.obs_get_source_by_name(cstr(n).as_ptr());
@@ -1590,6 +1718,9 @@ impl Preview {
 
     /// The scene it shows instead of what's on air, if any.
     pub fn shown_scene(&self) -> Option<String> {
+        if let Some(d) = &self.drawn {
+            return d.scene.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        }
         let p = self.state.scene.lock().map(|g| *g).unwrap_or(ptr::null_mut());
         (!p.is_null()).then(|| text(self.studio.inner.api.obs_source_get_name(p)))
     }
@@ -1600,11 +1731,19 @@ impl Preview {
         if let Ok(mut sel) = self.state.selected.lock() {
             *sel = pick;
         }
+        self.refresh();
     }
 
     /// The colour round the canvas (0xAABBGGRR), to match the page's theme.
     pub fn background(&self, abgr: u32) {
-        self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr));
+        match &self.drawn {
+            Some(d) => {
+                let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
+                *d.background.lock().unwrap_or_else(|e| e.into_inner()) = [c(0), c(8), c(16), 1.0];
+                self.refresh();
+            }
+            None => self.studio.inner.api.obs_display_set_background_color(self.display, srgb_encoded(abgr)),
+        }
         // The view itself too: while the window grows, the strip not drawn yet shows the
         // stage's colour, not black.
         #[cfg(any(target_os = "macos", windows))]
@@ -1628,6 +1767,7 @@ impl Preview {
     pub fn set_shade(&self, shade: f64) {
         let v = (shade.clamp(0.0, 1.0) * 1000.0).round() as u32;
         self.state.shade.store(v, std::sync::atomic::Ordering::Relaxed);
+        self.refresh();
     }
 
     /// How much of the picture shows, 0 to 1 (dimmed under a dialog, hidden while the window
@@ -1662,6 +1802,7 @@ impl Preview {
         if let Ok(mut f) = self.state.frames.lock() {
             *f = scene.map(cstr);
         }
+        self.refresh();
     }
 
     /// Covers `area` (the page's whole stage) and draws the canvas at `canvas` inside it
@@ -1678,12 +1819,20 @@ impl Preview {
         if let Ok(mut g) = self.state.canvas.lock() {
             *g = Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
         }
-        self.studio.inner.api.obs_display_resize(self.display, cx, cy);
+        self.resize(cx, cy);
+        self.refresh();
     }
 }
 
 impl Drop for Preview {
     fn drop(&mut self) {
+        if let Some(d) = self.drawn.take() {
+            // The engine lets go of the view before it goes.
+            d.shared.engine.stop_preview();
+            #[cfg(any(target_os = "macos", windows))]
+            self.view.remove();
+            return;
+        }
         let a = &self.studio.inner.api;
         let param = &*self.state as *const ffi::DrawState as *mut std::ffi::c_void;
         a.obs_display_remove_draw_callback(self.display, ffi::draw_main, param);

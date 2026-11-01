@@ -1186,7 +1186,7 @@ unsafe extern "C" fn all_boxes_cb(_s: *mut ObsScene, item: *mut ObsSceneItem, pa
     true
 }
 
-fn all_boxes(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr) -> Vec<(i64, Matrix4)> {
+pub(crate) fn all_boxes(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr) -> Vec<(i64, Matrix4)> {
     let src = api.scene_named(on, scene);
     if src.is_null() {
         return Vec::new();
@@ -1224,7 +1224,7 @@ unsafe extern "C" fn find_box(_s: *mut ObsScene, item: *mut ObsSceneItem, param:
 }
 
 /// The box of item `id` in scene `scene` (canvas pixels), if it's there and showing.
-fn item_box(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
+pub(crate) fn item_box(api: &Api, on: *mut ObsCanvas, scene: &std::ffi::CStr, id: i64) -> Option<Matrix4> {
     let src = api.scene_named(on, scene);
     if src.is_null() {
         return None;

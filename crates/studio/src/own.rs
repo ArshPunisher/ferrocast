@@ -382,7 +382,7 @@ impl Drop for Delayed {
 
 /// At most how often edits reopen the collection in a drawn stream (edits in between go with
 /// the next one; sources that didn't change keep running).
-const REOPEN_EVERY: Duration = Duration::from_millis(500);
+const REOPEN_EVERY: Duration = Duration::from_millis(100);
 
 /// A collection without which scene is on air (what a reopen depends on).
 fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {

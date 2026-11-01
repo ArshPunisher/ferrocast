@@ -1047,9 +1047,18 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
 fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-    let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    let mut p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    // Drawn by Ferrocast's own engine on a Mac (libobs no longer draws it there).
+    #[cfg(target_os = "macos")]
+    let mut p = {
+        let c = h.collection.as_ref().ok_or(STOPPED)?;
+        c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut p = {
+        let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+        studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
+    };
     pass_input(&window, &p);
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
@@ -1112,16 +1121,21 @@ impl DesktopStudio {
         }
     }
 
-    /// Four times a second, a stream or recording our engine draws catches up with the Studio
-    /// (scene changes go on at once; edits within half a second).
+    /// Ten times a second, what Ferrocast's own engine draws (the preview, streams,
+    /// recordings, the replay buffer) catches up with the Studio: scene changes go on at once,
+    /// edits within a tenth of a second.
     async fn own_engine_loop(&self) {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // Ten times a second: the preview shows edits (a drag) through it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let _ = self
                 .on_main(|h| {
                     let Some(c) = h.collection.as_ref() else { return };
                     for s in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten().filter(|s| s.drawn()) {
                         s.follow(c);
+                    }
+                    if let Some(p) = h.preview.as_ref() {
+                        p.follow(c);
                     }
                     if let Some(r) = h.replay.as_mut().filter(|r| r.drawn()) {
                         r.follow(c);
@@ -1239,7 +1253,8 @@ impl DesktopStudio {
     /// stops or the item goes.
     async fn follow_loop(&self, run: u64) {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // Ten times a second: the preview shows edits (a drag) through it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let look = self
                 .on_main(move |h| {
                     if h.follow_run != run {
