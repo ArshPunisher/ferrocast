@@ -9,6 +9,7 @@
 mod collection;
 mod ffi;
 pub mod import;
+pub mod kinds;
 mod naming;
 mod own;
 pub mod projector;

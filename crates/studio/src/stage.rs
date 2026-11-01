@@ -389,7 +389,7 @@ impl Stage {
         }
         let s = self.source(source).unwrap_or(Value::Null);
         let set = s.get("settings").cloned().unwrap_or(Value::Null);
-        let n = |k: &str| set.get(k).and_then(Value::as_u64).map(|v| v as u32);
+        let n = |k: &str| set.get(k).and_then(Value::as_u64).filter(|v| *v > 0).map(|v| v as u32);
         match kind_of(&s) {
             k if k.starts_with("color_source") => {
                 (n("width").unwrap_or(self.canvas.width), n("height").unwrap_or(self.canvas.height))
@@ -505,9 +505,16 @@ impl Stage {
     ) -> Result<ItemInfo, StudioError> {
         self.scene_items(scene)?;
         self.name_free(name)?;
+        // The kind's defaults, under what was given.
+        let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
+        if let (Some(base), Some(given)) = (set.as_object_mut(), settings.as_object()) {
+            for (k, v) in given {
+                base.insert(k.clone(), v.clone());
+            }
+        }
         let source = json!({
             "id": kind, "versioned_id": kind, "name": name, "uuid": uuid(),
-            "settings": if settings.is_object() { settings.clone() } else { json!({}) },
+            "settings": set,
             "mixers": 255, "sync": 0, "flags": 0, "volume": 1.0, "balance": 0.5,
             "enabled": true, "muted": false, "monitoring_type": 0, "filters": [],
         });
@@ -789,6 +796,13 @@ impl Stage {
         Ok(self.source(name)?.get("settings").cloned().unwrap_or_else(|| json!({})))
     }
 
+    /// A source's settings form (its kind's, from our engine's kinds).
+    pub fn options(&self, name: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        let s = self.source(name)?;
+        crate::kinds::options(kind_of(&s))
+            .ok_or_else(|| fail(format!("Ferrocast's own engine can't show \"{name}\" yet.")))
+    }
+
     /// Changes some of a source's settings (the rest kept).
     pub fn update(&self, name: &str, settings: &Value) -> Result<(), StudioError> {
         let Some(new) = settings.as_object() else { return Err(fail("settings: an object.")) };
@@ -916,9 +930,15 @@ impl Stage {
         if self.filter_list(name)?.iter().any(|f| name_of(f) == filter) {
             return Err(fail(format!("\"{name}\" already has a filter called \"{filter}\".")));
         }
+        let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
+        if let (Some(base), Some(given)) = (set.as_object_mut(), settings.as_object()) {
+            for (k, v) in given {
+                base.insert(k.clone(), v.clone());
+            }
+        }
         let f = json!({
             "id": kind, "versioned_id": kind, "name": filter, "uuid": uuid(), "enabled": true,
-            "settings": if settings.is_object() { settings.clone() } else { json!({}) },
+            "settings": set,
         });
         self.with_filters(name, |l| l.push(f))
     }
@@ -942,6 +962,17 @@ impl Stage {
             .find(|f| name_of(f) == filter)
             .map(|f| f.get("settings").cloned().unwrap_or_else(|| json!({})))
             .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))
+    }
+
+    /// A filter's settings form.
+    pub fn filter_options(&self, name: &str, filter: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        let f = self
+            .filter_list(name)?
+            .into_iter()
+            .find(|f| name_of(f) == filter)
+            .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))?;
+        crate::kinds::options(kind_of(&f))
+            .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))
     }
 
     pub fn update_filter(&self, name: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
@@ -1866,5 +1897,17 @@ mod tests {
         s.restore_all(&before);
         assert_eq!(s.scenes().len(), 1);
         assert!(ok(s.items("Main")).is_empty());
+    }
+
+    #[test]
+    fn a_new_source_starts_from_its_kinds_defaults() {
+        let s = stage();
+        let c = ok(s.add_source("Main", "color_source_v3", "Back", &json!({ "color": 4278190080u32 }), false));
+        assert_eq!(c.frame[0..4], [1920.0, 0.0, 0.0, 1080.0], "no size given: the canvas's");
+        let set = ok(s.settings("Back"));
+        assert_eq!((set["color"].as_u64(), set["width"].as_u64()), (Some(4278190080), Some(0)), "given, then defaults");
+        assert!(ok(s.options("Back")).iter().any(|o| o.key == "color"));
+        ok(s.add_filter("Back", "chroma_key_filter_v2", "Key", &json!({})));
+        assert!(ok(s.filter_options("Back", "Key")).iter().any(|o| o.key == "similarity"));
     }
 }
