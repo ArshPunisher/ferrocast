@@ -1084,6 +1084,11 @@ struct FakeStudio {
     current: Mutex<String>,
     muted: Mutex<bool>,
     streaming: Mutex<bool>,
+    /// The camera shown in its scene.
+    cam_shown: Mutex<bool>,
+    /// What the mic hears (dBFS), and whether the camera's picture is black.
+    mic_db: Mutex<f32>,
+    cam_black: Mutex<bool>,
 }
 
 #[async_trait]
@@ -1130,7 +1135,15 @@ impl crate::studio_host::StudioHost for FakeStudio {
                 }
                 Value::Null
             }
-            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": false }]),
+            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": *self.cam_shown.lock().unwrap() }]),
+            A::Levels { .. } => {
+                let db = *self.mic_db.lock().unwrap();
+                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db] } })
+            }
+            A::Look { .. } => {
+                let black = *self.cam_black.lock().unwrap();
+                json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
+            }
             A::EditItem { scene, id, edit } => {
                 self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
                 Value::Null
@@ -1289,4 +1302,39 @@ async fn a_raid_puts_its_rules_scene_on_for_a_while_and_a_follow_shows_a_source(
     e.rules_saw(&follow).await;
     eventually(shown).await;
     eventually(|| !shown()).await;
+}
+
+/// The pre-flight checks what the Studio actually hears and shows: a mic that's on but silent,
+/// a camera that's shown but black.
+#[tokio::test]
+async fn the_preflight_hears_a_silent_mic_and_sees_a_black_camera() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        mic_db: Mutex::new(-90.0),
+        cam_black: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({ "live_scene": "Live", "mic_sources": ["Mic"], "cam_sources": ["Camera"] }).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    let pf = e.preflight().await;
+    let check = |pf: &crate::studio::show::Preflight, id: &str| pf.checks.iter().find(|c| c.id == id).cloned().unwrap();
+    let mic = check(&pf, "mic:Mic");
+    assert_eq!(mic.status, ferrocast_core::show::CheckStatus::Warn);
+    assert!(mic.detail.contains("no sound comes in"), "{mic:?}");
+    let cam = check(&pf, "cam:Camera");
+    assert_eq!(cam.status, ferrocast_core::show::CheckStatus::Fail);
+    assert!(cam.detail.contains("black"), "{cam:?}");
+    assert!(!pf.ready);
+    // Sound in, a picture on: both fine.
+    *studio.mic_db.lock().unwrap() = -18.0;
+    *studio.cam_black.lock().unwrap() = false;
+    let pf = e.preflight().await;
+    assert_eq!(check(&pf, "mic:Mic").status, ferrocast_core::show::CheckStatus::Ok);
+    assert_eq!(check(&pf, "cam:Camera").status, ferrocast_core::show::CheckStatus::Ok);
 }

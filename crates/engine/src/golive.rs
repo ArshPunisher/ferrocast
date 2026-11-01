@@ -503,6 +503,8 @@ pub(crate) struct GoLive {
     /// Quality per destination: the ones moved to the lighter stream because their own route
     /// couldn't keep up while the others could.
     quality: Mutex<ferrocast_golive::quality::Quality>,
+    /// Pre-flight's last Test connection per destination, and when.
+    tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
 }
 
 #[derive(Debug, Default)]
@@ -542,6 +544,7 @@ impl Default for GoLive {
             ffmpeg_fetch: Mutex::new(None),
             backup: Mutex::new(BackupState::default()),
             quality: Mutex::new(Default::default()),
+            tested: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1286,6 +1289,72 @@ impl Engine {
         ferrocast_golive::links::networks()
     }
 
+    /// Pre-flight's Go live checks: each ticked destination tried (as Test connection; the
+    /// answers kept a minute, so a pre-flight shown again doesn't reach every server again), and
+    /// the last upload check's verdict when it doesn't fit.
+    pub(crate) async fn golive_preflight(&self) -> Vec<ferrocast_core::show::Check> {
+        use ferrocast_core::show::{Check, CheckStatus, Fix};
+        use ferrocast_golive::reach::Reach;
+        let g = self.golive();
+        let cfg = self.golive_config();
+        // Ticked ones, and the backups that may send for them (ticked or not).
+        let ticked: Vec<DestinationConfig> = cfg
+            .destinations
+            .iter()
+            .filter(|d| d.enabled || backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+            .cloned()
+            .collect();
+        let mut checks = Vec::new();
+        let fresh = |at: &std::time::Instant| at.elapsed() < std::time::Duration::from_secs(60);
+        let stale: Vec<DestinationConfig> = {
+            let tested = lock(&g.tested);
+            ticked.iter().filter(|d| !tested.get(&d.id).is_some_and(|(at, _)| fresh(at))).cloned().collect()
+        };
+        let results = futures_util::future::join_all(stale.iter().map(|d| async move {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(8), self.golive_test(&d.id)).await;
+            (d.id.clone(), r)
+        }))
+        .await;
+        for (id, r) in results {
+            // A test that couldn't finish is said too, not left out (nor an older answer kept).
+            let reach = match r {
+                Ok(Ok(reach)) => reach,
+                Ok(Err(e)) => {
+                    Reach { ok: false, rtt_ms: None, message: format!("Couldn't test it: {e}"), srt_latency_ms: None }
+                }
+                Err(_) => Reach {
+                    ok: false,
+                    rtt_ms: None,
+                    message: "Its server took too long to answer.".into(),
+                    srt_latency_ms: None,
+                },
+            };
+            lock(&g.tested).insert(id, (std::time::Instant::now(), reach));
+        }
+        let tested = lock(&g.tested).clone();
+        for d in &ticked {
+            let name = dest_name(d);
+            let Some((_, r)) = tested.get(&d.id).filter(|(at, _)| fresh(at)) else { continue };
+            let (status, detail) =
+                if r.ok { (CheckStatus::Ok, r.message.clone()) } else { (CheckStatus::Fail, r.message.clone()) };
+            let fix = (!r.ok).then(|| Fix { label: "Go live".into(), href: "#/studio/golive".into() });
+            checks.push(Check::new(&format!("dest:{}", d.id), &name, status, detail, fix));
+        }
+        if let Some(u) = lock(&g.upload).clone()
+            && !u.verdict.fits
+            && !ticked.is_empty()
+        {
+            checks.push(Check::new(
+                "upload",
+                "Upload",
+                CheckStatus::Warn,
+                u.verdict.message.clone(),
+                Some(Fix { label: "Test upload".into(), href: "#/studio/golive".into() }),
+            ));
+        }
+        checks
+    }
+
     /// "Test connection" in the add dialog, before the server is saved.
     pub async fn golive_test_address(
         &self,
@@ -1327,6 +1396,8 @@ impl Engine {
     }
 
     async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
+        // A changed server (or any change) is tried again rather than trusting an old answer.
+        lock(&self.golive().tested).clear();
         save_setting(self, CONFIG_KEY, &cfg).await?;
         *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg;
         self.send_golive();

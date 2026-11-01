@@ -149,6 +149,9 @@ impl ShowConfig {
     }
 }
 
+/// Quieter than this (dBFS) over a second and a half: a mic that hears nothing.
+pub const SILENT_DB: f32 = -60.0;
+
 /// One pre-flight check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Check {

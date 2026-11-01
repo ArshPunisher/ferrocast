@@ -149,8 +149,19 @@ impl Engine {
                 }
                 Err(e) => checks.push(Check::new("scenes", "Scenes", CheckStatus::Warn, e.to_string(), None)),
             }
+            // What the mics actually hear, and what the cameras actually show (the Studio).
+            let loudest = self.rig_loudest(r, &cfg.mic_sources).await;
+            let looks = self.rig_look(r, &cfg.cam_sources).await;
             for m in &cfg.mic_sources {
+                let hears = loudest.as_ref().and_then(|l| l.get(m)).map(|db| *db > show::SILENT_DB);
                 checks.push(match self.rig_muted(r, m).await {
+                    Ok(false) if hears == Some(false) => Check::new(
+                        &format!("mic:{m}"),
+                        m,
+                        CheckStatus::Warn,
+                        "Not muted, but no sound comes in: is it plugged in, and the right one picked?",
+                        fix("Check the mic", "#/studio/engine"),
+                    ),
                     Ok(false) => Check::new(&format!("mic:{m}"), m, CheckStatus::Ok, "Not muted.", None),
                     Ok(true) => Check::new(
                         &format!("mic:{m}"),
@@ -171,7 +182,18 @@ impl Engine {
             let scene = cfg.live_scene.clone().or(cfg.starting_scene.clone());
             for cam in &cfg.cam_sources {
                 let Some(scene) = &scene else { break };
+                let black = looks.as_ref().is_some_and(|l| {
+                    let (luma, spread) = (l[cam]["luma"].as_u64(), l[cam]["spread"].as_u64());
+                    matches!((luma, spread), (Some(y), Some(s)) if y < 12 && s < 6)
+                });
                 checks.push(match self.rig_visible(r, scene, cam).await {
+                    Ok(Some(true)) if black => Check::new(
+                        &format!("cam:{cam}"),
+                        cam,
+                        CheckStatus::Fail,
+                        format!("Shown in \"{scene}\", but its picture is black: is the lens covered, or another app using the camera?"),
+                        fix("Check the camera", "#/studio/engine"),
+                    ),
                     Ok(Some(true)) => {
                         Check::new(&format!("cam:{cam}"), cam, CheckStatus::Ok, format!("Shown in \"{scene}\"."), None)
                     }
@@ -261,6 +283,7 @@ impl Engine {
                 ));
             }
         }
+        checks.extend(self.golive_preflight().await);
         let ready = show::ready(&checks);
         Preflight { checks, ready }
     }

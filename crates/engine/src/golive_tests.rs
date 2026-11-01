@@ -697,3 +697,21 @@ async fn simulcast_is_for_webrtc_servers_only() {
     let d = e.golive_config().destinations.into_iter().find(|d| d.id == whip.id).unwrap();
     assert!(e.simulcast(&d));
 }
+
+/// The pre-flight tries each ticked destination: one whose server isn't there fails, saying so.
+#[tokio::test]
+async fn the_preflight_tries_ticked_destinations() {
+    use crate::golive::Canvas;
+    let (e, _dir) = engine().await;
+    let (up, _got) = ferrocast_testkit::rtmp::platform("k").await;
+    let down = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let ok = e.add_golive_destination("Up", &format!("rtmp://127.0.0.1:{up}/app"), "k", Canvas::Main).await.unwrap();
+    let bad =
+        e.add_golive_destination("Down", &format!("rtmp://127.0.0.1:{down}/app"), "k", Canvas::Main).await.unwrap();
+    let checks = e.golive_preflight().await;
+    let of = |id: &str| checks.iter().find(|c| c.id == format!("dest:{id}")).cloned().unwrap();
+    assert_eq!(of(&ok.id).status, ferrocast_core::show::CheckStatus::Ok);
+    let b = of(&bad.id);
+    assert_eq!(b.status, ferrocast_core::show::CheckStatus::Fail);
+    assert!(b.detail.contains("Couldn't reach"), "{b:?}");
+}

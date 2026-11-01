@@ -1311,6 +1311,11 @@ pub enum StudioAct {
     Levels {
         names: Vec<String>,
     },
+    /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
+    /// frozen camera).
+    Look {
+        names: Vec<String>,
+    },
     Filters {
         name: String,
     },
@@ -1619,9 +1624,9 @@ impl StudioAct {
                 }
                 device.as_mut().map(new).transpose().map(|_| ())
             }
-            A::Levels { names } => {
+            A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
-                    return Err(EngineError::Invalid("names: up to 64 sounds at once.".into()));
+                    return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
                 }
                 names.iter().try_for_each(|n| check_source_name(n))
             }
@@ -1788,6 +1793,7 @@ impl StudioAct {
                 | A::Options { .. }
                 | A::Audio { .. }
                 | A::Levels { .. }
+                | A::Look { .. }
                 | A::Filters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
