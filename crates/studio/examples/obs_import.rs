@@ -111,6 +111,59 @@ fn main() -> Result<()> {
     let mut t = c.transform("Nest", p.id)?;
     (t.x, t.y) = (900.0, 400.0);
     c.set_transform("Nest", p.id, &t)?;
+    // A fifth: the ramp four times through OBS's Apply LUT: its own PNG and .cube tables, part
+    // strength, a 1D table and a 3D one over part of the range.
+    c.add_scene("Graded")?;
+    c.add_source(
+        "Graded",
+        "color_source_v3",
+        "Paper",
+        &json!({ "color": 0xFF_30_30_30u32, "width": 1280, "height": 720 }),
+        false,
+    )?;
+    let luts = Path::new(&dir).join("PlugIns/obs-filters.plugin/Contents/Resources/LUTs");
+    let one_d = out.join("curve.cube");
+    std::fs::write(
+        &one_d,
+        format!("LUT_1D_SIZE 4\n{}", ["0 0.1 0", "0.5 0.2 0.1", "0.7 0.6 0.9", "1 1 0.8"].join("\n")),
+    )?;
+    let part = out.join("part.cube");
+    let mut text = String::from("LUT_3D_SIZE 3\nDOMAIN_MIN 0.1 0.2 0\nDOMAIN_MAX 0.9 1 0.8\n");
+    for b in 0..3 {
+        for g in 0..3 {
+            for r in 0..3 {
+                text.push_str(&format!(
+                    "{} {} {}\n",
+                    f64::from(2 - r) / 2.0,
+                    f64::from(g) / 2.0,
+                    f64::from(b * g) / 4.0
+                ));
+            }
+        }
+    }
+    std::fs::write(&part, text)?;
+    for (i, (file, amount, passthrough)) in [
+        (luts.join("teal_lows_orange_highs.png"), 1.0, false),
+        (luts.join("grayscale.cube"), 0.6, false),
+        (one_d, 0.8, false),
+        (part, 1.0, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Graded {i}");
+        let g = c.add_source("Graded", "image_source", &name, &json!({ "file": ramp.display().to_string() }), false)?;
+        c.add_filter(
+            &name,
+            "clut_filter",
+            "LUT",
+            &json!({ "image_path": file.display().to_string(), "clut_amount": amount, "passthrough_alpha": passthrough }),
+        )?;
+        let mut t = c.transform("Graded", g.id)?;
+        (t.x, t.y) = (40.0 + 330.0 * i as f32, 200.0);
+        c.set_transform("Graded", g.id, &t)?;
+    }
+
     // A group of two pictures, moved and turned as one, in a fourth scene.
     c.add_scene("Grouped")?;
     c.add_source(
@@ -153,7 +206,7 @@ fn main() -> Result<()> {
     std::thread::sleep(Duration::from_millis(500));
     let total = (W * H) as usize;
     let mut failed = Vec::new();
-    for scene in ["Main", "Keyed", "Nest", "Grouped"] {
+    for scene in ["Main", "Keyed", "Nest", "Grouped", "Graded"] {
         let ours = engine.snapshot_scene(scene)?;
         let file = out.join(format!("{scene} obs.png"));
         c.screenshot(scene, &file)?;
