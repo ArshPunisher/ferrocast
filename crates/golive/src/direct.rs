@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::SinkExt;
+use srt_tokio::options::{DataRate, LiveBandwidthMode, Percent};
 use tokio::sync::{broadcast, watch};
 
 use crate::hub::{Frame, Hub, Live, Subscription};
@@ -100,10 +101,7 @@ impl Address {
             None => return Err(bad("needs a port (host:port)")),
         };
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        if host.is_empty() || port == 0 {
-            return Err(bad("needs a host and a port"));
-        }
-        let params = query
+        let params: Vec<(String, String)> = query
             .split('&')
             .filter(|kv| !kv.is_empty())
             .map(|kv| {
@@ -111,6 +109,11 @@ impl Address {
                 (k.to_ascii_lowercase(), percent_decode(v))
             })
             .collect();
+        // Only an SRT listener may leave the host out (`srt://:9000?mode=listener`: any address here).
+        let listener = params.iter().any(|(k, v)| k == "mode" && v.eq_ignore_ascii_case("listener"));
+        if (host.is_empty() && !listener) || port == 0 {
+            return Err(bad("needs a host and a port"));
+        }
         Ok(Self { host: host.to_string(), port, params })
     }
 
@@ -153,6 +156,10 @@ pub fn check(d: &Direct) -> Result<(), DirectError> {
             {
                 return Err(DirectError::Address("An SRT passphrase is 10 to 79 letters long.".into()));
             }
+            if SrtMode::of(&a)? == SrtMode::Listener {
+                listen_addr(&a)?;
+            }
+            srt_bandwidth(&a)?;
             Ok(())
         }
         Kind::Rist => crate::rist::check(d, &Address::parse(&d.url)?),
@@ -309,16 +316,77 @@ pub(crate) async fn feed_ts(
     }
 }
 
-/// SRT as a caller (as OBS's SRT output connects): the key, or `streamid=`, names the stream;
-/// `passphrase=` (10 to 79 letters) encrypts it, `pbkeylen=` 16, 24 or 32; `latency=` in
-/// microseconds, as libsrt's addresses write it (120 ms when not said).
+/// How an SRT connection is made, as libsrt's `mode=` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrtMode {
+    /// Connects to the server (the default, as OBS does).
+    Caller,
+    /// Waits here for the receiver to connect (`srt://:port?mode=listener`).
+    Listener,
+    /// Both sides connect to each other at once (`localport=` here, the port there by default).
+    Rendezvous,
+}
+
+impl SrtMode {
+    fn of(a: &Address) -> Result<Self, DirectError> {
+        match a.param("mode").map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("caller") => Ok(Self::Caller),
+            Some("listener") => Ok(Self::Listener),
+            Some("rendezvous") => Ok(Self::Rendezvous),
+            Some(_) => Err(DirectError::Address("An SRT mode is caller, listener or rendezvous.".into())),
+        }
+    }
+}
+
+/// Where an SRT listener waits: an IP address here (none: all of them), and the port.
+fn listen_addr(a: &Address) -> Result<std::net::SocketAddr, DirectError> {
+    let ip = if a.host.is_empty() {
+        std::net::IpAddr::from([0, 0, 0, 0])
+    } else {
+        a.host.parse().map_err(|_| DirectError::Address("An SRT listener's host is an IP address here.".into()))?
+    };
+    Ok(std::net::SocketAddr::new(ip, a.port))
+}
+
+/// SRT's sending limit, as libsrt's addresses write it (bytes per second): `maxbw=` a cap, or
+/// `inputbw=` with `oheadbw=` (percent, 5 to 100) on top; None leaves SRT's own (input plus 25%).
+fn srt_bandwidth(a: &Address) -> Result<Option<LiveBandwidthMode>, DirectError> {
+    let num = |k: &str| -> Result<Option<i64>, DirectError> {
+        a.param(k)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.parse::<i64>().map_err(|_| DirectError::Address(format!("SRT's {k} is a number."))))
+            .transpose()
+    };
+    let overhead = num("oheadbw")?.unwrap_or(25);
+    if !(5..=100).contains(&overhead) {
+        return Err(DirectError::Address("SRT's oheadbw is 5 to 100 percent.".into()));
+    }
+    Ok(match (num("maxbw")?, num("inputbw")?) {
+        // libsrt: -1 unlimited, 0 worked out from the input.
+        (Some(max), _) if max > 0 => Some(LiveBandwidthMode::Max(DataRate(max as u64))),
+        (Some(-1), _) => Some(LiveBandwidthMode::Unlimited),
+        (_, Some(input)) if input > 0 => {
+            Some(LiveBandwidthMode::Input { rate: DataRate(input as u64), overhead: Percent(overhead as u64) })
+        }
+        _ => None,
+    })
+}
+
+/// SRT as a caller (as OBS's SRT output connects), a listener or rendezvous (`mode=`): the key,
+/// or `streamid=`, names the stream; `passphrase=` (10 to 79 letters) encrypts it, `pbkeylen=`
+/// 16, 24 or 32; `latency=` in microseconds, as libsrt's addresses write it (120 ms when not
+/// said); `maxbw=`, `inputbw=` and `oheadbw=` cap the rate.
 async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stream: u64) -> Result<Ended, DirectError> {
     let a = Address::parse(&d.url)?;
     let name = a.name();
+    let mode = SrtMode::of(&a)?;
     let stream_id = Some(d.key.trim()).filter(|k| !k.is_empty()).or_else(|| a.param("streamid"));
     let mut b = srt_tokio::SrtSocket::builder();
     let latency_us = a.param("latency").and_then(|v| v.parse::<u64>().ok()).unwrap_or(120_000);
     b = b.latency(Duration::from_micros(latency_us.clamp(20_000, 8_000_000)));
+    if let Some(bw) = srt_bandwidth(&a)? {
+        b = b.bandwidth(bw);
+    }
     if let Some(pass) = a.param("passphrase").filter(|p| !p.is_empty()) {
         if !(10..=79).contains(&pass.chars().count()) {
             return Err(DirectError::Address("An SRT passphrase is 10 to 79 letters long.".into()));
@@ -327,15 +395,32 @@ async fn srt_session(d: &Direct, hub: &Hub, health: &watch::Sender<Health>, stre
             a.param("pbkeylen").and_then(|v| v.parse::<u16>().ok()).filter(|n| matches!(n, 16 | 24 | 32)).unwrap_or(16);
         b = b.encryption(size, pass);
     }
-    let addr = tokio::net::lookup_host((a.host.as_str(), a.port))
-        .await
-        .ok()
-        .and_then(|mut it| it.next())
-        .ok_or_else(|| DirectError::Unreachable(name.clone()))?;
-    let sock = tokio::time::timeout(CONNECT_DEADLINE, b.call(addr, stream_id))
-        .await
-        .map_err(|_| DirectError::Slow(name.clone()))?
-        .map_err(|e| DirectError::Refused(format!("{name} refused the SRT connection ({e}).")))?;
+    let sock = match mode {
+        SrtMode::Listener => {
+            let here = listen_addr(&a)?;
+            // No deadline: it waits for the receiver as long as the stream runs.
+            b.listen_on(here).await.map_err(|e| DirectError::Refused(format!("Couldn't listen on {name} ({e}).")))?
+        }
+        SrtMode::Caller | SrtMode::Rendezvous => {
+            let addr = tokio::net::lookup_host((a.host.as_str(), a.port))
+                .await
+                .ok()
+                .and_then(|mut it| it.next())
+                .ok_or_else(|| DirectError::Unreachable(name.clone()))?;
+            let local = a.param("localport").and_then(|p| p.parse::<u16>().ok()).unwrap_or(a.port);
+            let connect = async move {
+                if mode == SrtMode::Caller {
+                    b.call(addr, stream_id).await
+                } else {
+                    b.local_port(local).rendezvous(addr).await
+                }
+            };
+            tokio::time::timeout(CONNECT_DEADLINE, connect)
+                .await
+                .map_err(|_| DirectError::Slow(name.clone()))?
+                .map_err(|e| DirectError::Refused(format!("{name} refused the SRT connection ({e}).")))?
+        }
+    };
     let mut sink = SrtSink { sock, name };
     let out = feed_ts(hub, health, stream, &mut sink).await;
     let _ = sink.sock.close().await;
@@ -454,5 +539,126 @@ mod tests {
         if let Some(p) = crate::ts::tests::probe(&got) {
             assert!(p.starts_with("h264,") && p.contains("aac,"), "{p}");
         }
+    }
+
+    #[test]
+    fn srt_modes_and_limits_are_read() {
+        let srt = |url: &str| Direct {
+            id: "t".into(),
+            kind: Kind::Srt,
+            url: url.into(),
+            key: String::new(),
+            retry: Retry::default(),
+        };
+        assert!(check(&srt("srt://:9000?mode=listener")).is_ok(), "a listener may leave the host out");
+        assert!(check(&srt("srt://:9000")).is_err(), "a caller needs a host");
+        assert!(check(&srt("srt://a:9000?mode=rendezvous&localport=9001")).is_ok());
+        assert!(check(&srt("srt://a:9000?mode=sideways")).is_err());
+        assert!(check(&srt("srt://localhost:9000?mode=listener")).is_err(), "a listener's host is an IP");
+        assert_eq!(
+            listen_addr(&Address::parse("srt://[::1]:9000?mode=listener").unwrap()).unwrap().to_string(),
+            "[::1]:9000"
+        );
+        assert!(check(&srt("srt://a:9000?maxbw=lots")).is_err());
+        assert!(check(&srt("srt://a:9000?inputbw=500000&oheadbw=200")).is_err());
+        let bw = |url: &str| srt_bandwidth(&Address::parse(url).unwrap()).unwrap();
+        assert_eq!(bw("srt://a:1?maxbw=1000000"), Some(LiveBandwidthMode::Max(DataRate(1_000_000))));
+        assert_eq!(
+            bw("srt://a:1?inputbw=500000&oheadbw=50"),
+            Some(LiveBandwidthMode::Input { rate: DataRate(500_000), overhead: Percent(50) })
+        );
+        assert_eq!(bw("srt://a:1?maxbw=-1"), Some(LiveBandwidthMode::Unlimited));
+        assert_eq!(bw("srt://a:1?maxbw=-1&inputbw=500000"), Some(LiveBandwidthMode::Unlimited), "unlimited wins");
+        assert_eq!(bw("srt://a:1"), None);
+    }
+
+    /// Sends the sample stream through `url` while `receive` takes it on the other side → the
+    /// bytes it got.
+    async fn srt_through(url: String, receive: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>) -> Vec<u8> {
+        let Some(tags) = crate::ts::tests::sample_tags() else { return Vec::new() };
+        let hub = Hub::new();
+        hub.start();
+        let (health, h) =
+            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, since_ms: 0 });
+        let (stop_tx, stop) = watch::channel(false);
+        let d = Direct { id: "t".into(), kind: Kind::Srt, url, key: String::new(), retry: Retry::default() };
+        let sender = tokio::spawn(run(d, hub.clone(), health, stop));
+        let mut h2 = h.clone();
+        let _ = tokio::time::timeout(Duration::from_secs(8), h2.wait_for(|h| h.state == PushState::Live)).await;
+        for (kind, ms, body) in tags {
+            match kind {
+                9 => hub.video(ms, body.into()),
+                8 => hub.audio(ms, body.into()),
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        hub.end();
+        let got = tokio::time::timeout(Duration::from_secs(10), receive).await;
+        let _ = stop_tx.send(true);
+        let _ = sender.await;
+        match got {
+            Ok(Ok(Ok(g))) => g,
+            other => panic!("the receiver got nothing: {other:?}"),
+        }
+    }
+
+    async fn read_all(mut rx: srt_tokio::SrtSocket) -> std::io::Result<Vec<u8>> {
+        use futures::TryStreamExt;
+        let mut got = Vec::new();
+        while let Some((_, b)) = rx.try_next().await? {
+            got.extend_from_slice(&b);
+        }
+        Ok(got)
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| s.local_addr()).map(|a| a.port()).unwrap_or(24011)
+    }
+
+    /// As a listener, the stream waits here and goes to the receiver that connects.
+    #[tokio::test]
+    async fn srt_listens_for_a_receiver() {
+        if crate::ts::tests::sample_tags().is_none() {
+            return;
+        }
+        let port = free_udp_port();
+        let receive = tokio::spawn(async move {
+            // Calls until the listener is up.
+            for _ in 0..50 {
+                if let Ok(Ok(rx)) = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    srt_tokio::SrtSocket::builder().call(format!("127.0.0.1:{port}").as_str(), None),
+                )
+                .await
+                {
+                    return read_all(rx).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(std::io::Error::other("never connected"))
+        });
+        let got = srt_through(format!("srt://:{port}?mode=listener"), receive).await;
+        assert!(got.len() > 10 * PACKET && got.len() % PACKET == 0, "{} bytes", got.len());
+    }
+
+    /// In rendezvous, both sides connect to each other.
+    #[tokio::test]
+    async fn srt_meets_in_rendezvous() {
+        if crate::ts::tests::sample_tags().is_none() {
+            return;
+        }
+        let (ours, theirs) = (free_udp_port(), free_udp_port());
+        let receive = tokio::spawn(async move {
+            let rx = srt_tokio::SrtSocket::builder()
+                .local_port(theirs)
+                .rendezvous(format!("127.0.0.1:{ours}").as_str())
+                .await?;
+            read_all(rx).await
+        });
+        let got =
+            srt_through(format!("srt://127.0.0.1:{theirs}?mode=rendezvous&localport={ours}&maxbw=4000000"), receive)
+                .await;
+        assert!(got.len() > 10 * PACKET && got.len() % PACKET == 0, "{} bytes", got.len());
     }
 }
