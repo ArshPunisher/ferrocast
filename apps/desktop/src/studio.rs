@@ -113,6 +113,10 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     }
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
+    // Drawn by Ferrocast's own engine on a Mac.
+    #[cfg(target_os = "macos")]
+    let mut p = c.vertical_preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "macos"))]
     let mut p = c.vertical_preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     pass_input(&window, &p);
     let v = &h.vertical;
@@ -1028,9 +1032,18 @@ fn sync_views(h: &Held) {
 fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.program_at else { return Ok(()) };
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-    let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    let p = studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
+    // What's on air, drawn by Ferrocast's own engine on a Mac.
+    #[cfg(target_os = "macos")]
+    let p = {
+        let c = h.collection.as_ref().ok_or(STOPPED)?;
+        c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let p = {
+        let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+        studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
+    };
     pass_input(&window, &p);
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
@@ -1134,7 +1147,9 @@ impl DesktopStudio {
                     for s in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten().filter(|s| s.drawn()) {
                         s.follow(c);
                     }
-                    if let Some(p) = h.preview.as_ref() {
+                    for p in
+                        [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten()
+                    {
                         p.follow(c);
                     }
                     if let Some(r) = h.replay.as_mut().filter(|r| r.drawn()) {

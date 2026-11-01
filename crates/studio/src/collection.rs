@@ -3629,7 +3629,32 @@ impl Collection {
         let view = ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
             .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?;
         let c = self.studio.canvas();
-        crate::Preview::drawn(self.studio.clone(), shared, view, (c.width, c.height), scale, r)
+        crate::Preview::drawn(self.studio.clone(), shared, view, (c.width, c.height), scale, r, None)
+    }
+
+    /// The vertical picture's preview drawn by Ferrocast's own engine (its own scenes, 9:16),
+    /// as `preview_drawn` (macOS).
+    #[cfg(target_os = "macos")]
+    pub fn vertical_preview_drawn(
+        &self,
+        window: raw_window_handle::RawWindowHandle,
+        rect: crate::Rect,
+        scale: f64,
+    ) -> Result<crate::Preview, StudioError> {
+        let on = self.vertical().ok_or_else(|| StudioError::Failed("The vertical picture is off.".into()))?.current;
+        let raw_window_handle::RawWindowHandle::AppKit(h) = window else {
+            return Err(StudioError::Failed("that isn't a macOS window".into()));
+        };
+        let doc = self.save("Ferrocast");
+        let shared = self.own_engine(&doc)?;
+        let r = crate::with_edge(rect);
+        let view = ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
+            .ok_or_else(|| StudioError::Failed("the preview can only be made on the main thread".into()))?;
+        let mut p = crate::Preview::drawn(self.studio.clone(), shared, view, VERTICAL_SIZE, scale, r, Some(on))?;
+        // Its sources' boxes are looked up in the vertical picture's scenes.
+        p.state.on = self.vertical_canvas().unwrap_or(ptr::null_mut());
+        p.refresh();
+        Ok(p)
     }
 
     /// Records one scene or source on its own (OBS's Source Record) drawn by Ferrocast's own

@@ -1548,6 +1548,10 @@ pub struct PreviewInput {
 #[derive(Debug)]
 pub(crate) struct DrawnPreview {
     pub shared: std::sync::Arc<own::Shared>,
+    /// Its id in the engine.
+    pub id: u64,
+    /// Showing the vertical picture (it follows that picture's scene on air).
+    pub vertical: bool,
     pub background: std::sync::Mutex<[f32; 4]>,
     pub scene: std::sync::Mutex<Option<String>>,
 }
@@ -1562,16 +1566,21 @@ impl Preview {
         base: (u32, u32),
         scale: f64,
         rect: Rect,
+        vertical: Option<String>,
     ) -> Result<Preview, StudioError> {
         let (cx, cy) = view.pixels().unwrap_or_else(|| px(rect, scale));
+        let is_vertical = vertical.is_some();
         // SAFETY: the view lives as long as this preview, which stops the engine drawing in it
         // before it goes (`Drop`).
         #[allow(unsafe_code)]
-        let started = unsafe { shared.engine.start_preview(view.ptr(), cx, cy) };
-        if let Err(e) = started {
-            view.remove();
-            return Err(StudioError::Failed(format!("the preview couldn't be made: {e}")));
-        }
+        let started = unsafe { shared.engine.start_preview_of(view.ptr(), cx, cy, base, vertical) };
+        let id = match started {
+            Ok(id) => id,
+            Err(e) => {
+                view.remove();
+                return Err(StudioError::Failed(format!("the preview couldn't be made: {e}")));
+            }
+        };
         let state = Box::new(ffi::DrawState {
             api: &studio.inner.api,
             base,
@@ -1585,6 +1594,8 @@ impl Preview {
         });
         let drawn = DrawnPreview {
             shared,
+            id,
+            vertical: is_vertical,
             background: std::sync::Mutex::new([10.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0]),
             scene: std::sync::Mutex::new(None),
         };
@@ -1597,7 +1608,12 @@ impl Preview {
     /// scene changes, and the outlines follow what moved. Nothing for libobs's preview.
     pub fn follow(&self, c: &Collection) {
         if let Some(d) = &self.drawn {
-            d.shared.follow(&c.save("Ferrocast"));
+            let doc = c.save("Ferrocast");
+            d.shared.follow(&doc);
+            if d.vertical {
+                let on = doc.pointer("/ferrocast/vertical/current_scene").and_then(serde_json::Value::as_str);
+                d.shared.engine.set_preview_scene(d.id, on.filter(|s| !s.is_empty()).map(String::from));
+            }
             self.refresh();
         }
     }
@@ -1626,7 +1642,7 @@ impl Preview {
         };
         let picked = self.state.selected.lock().ok().and_then(|g| g.clone());
         if let Some(scene) = self.state.frames.lock().ok().and_then(|g| g.clone()) {
-            for (id, m) in ffi::all_boxes(api, ptr::null_mut(), &scene) {
+            for (id, m) in ffi::all_boxes(api, self.state.on, &scene) {
                 if picked.as_ref().is_some_and(|(_, p)| p.contains(&id)) {
                     continue;
                 }
@@ -1639,9 +1655,9 @@ impl Preview {
             }
         }
         if let Some((scene, ids)) = &picked {
-            let nested = ffi::all_boxes(api, ptr::null_mut(), scene);
+            let nested = ffi::all_boxes(api, self.state.on, scene);
             for id in ids {
-                let m = ffi::item_box(api, ptr::null_mut(), scene, *id)
+                let m = ffi::item_box(api, self.state.on, scene, *id)
                     .or_else(|| nested.iter().find(|(i, _)| i == id).map(|(_, m)| *m));
                 if let Some(m) = m {
                     look.outlines.push(ferrocast_av::preview::Outline {
@@ -1653,7 +1669,7 @@ impl Preview {
                 }
             }
         }
-        d.shared.engine.set_preview_look(look);
+        d.shared.engine.set_preview_look(d.id, look);
     }
 
     /// The size it draws at: its view's own pixels (snapped round the box) where there's one.
@@ -1684,7 +1700,7 @@ impl Preview {
 
     fn resize(&self, cx: u32, cy: u32) {
         match &self.drawn {
-            Some(d) => d.shared.engine.resize_preview(cx, cy),
+            Some(d) => d.shared.engine.resize_preview(d.id, cx, cy),
             None => self.studio.inner.api.obs_display_resize(self.display, cx, cy),
         }
     }
@@ -1693,7 +1709,7 @@ impl Preview {
     /// air again. Main thread.
     pub fn show_scene(&self, name: Option<&str>) {
         if let Some(d) = &self.drawn {
-            d.shared.engine.set_preview_scene(name.map(String::from));
+            d.shared.engine.set_preview_scene(d.id, name.map(String::from));
             *d.scene.lock().unwrap_or_else(|e| e.into_inner()) = name.map(String::from);
             return;
         }
@@ -1828,7 +1844,7 @@ impl Drop for Preview {
     fn drop(&mut self) {
         if let Some(d) = self.drawn.take() {
             // The engine lets go of the view before it goes.
-            d.shared.engine.stop_preview();
+            d.shared.engine.stop_preview(d.id);
             #[cfg(any(target_os = "macos", windows))]
             self.view.remove();
             return;
