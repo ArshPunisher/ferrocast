@@ -455,6 +455,10 @@ fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
         m.remove("current_scene");
         m.remove("current_program_scene");
     }
+    // Studio Mode's preview scene doesn't change what's drawn either.
+    if let Some(f) = d.get_mut("ferrocast").and_then(serde_json::Value::as_object_mut) {
+        f.remove("studio_mode");
+    }
     d
 }
 

@@ -394,12 +394,22 @@ impl Stage {
     /// Puts a scene on air, through the Studio's transition (the engine plays it).
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
         self.scene_index(name)?;
-        let t = self.transition();
-        self.doc.borrow_mut()["current_scene"] = json!(name);
-        self.doc.borrow_mut()["current_program_scene"] = json!(name);
-        if let Some(e) = self.engine.borrow().as_ref() {
-            e.follow(&self.doc.borrow());
-            let _ = t;
+        // The scene's own way in (its Transition Override), else the Studio's.
+        let t = self.scene_transition_of(name)?.unwrap_or_else(|| self.transition());
+        let was = self.current();
+        let studio_mode = self.preview_scene().is_some();
+        {
+            let mut d = self.doc.borrow_mut();
+            // Studio Mode's preview stays where it is (OBS saves it as current_scene).
+            if !studio_mode {
+                d["current_scene"] = json!(name);
+            }
+            d["current_program_scene"] = json!(name);
+        }
+        if was != name
+            && let Some(e) = self.engine.borrow().as_ref()
+        {
+            e.go_with(name, &t.kind, u64::from(t.ms))?;
         }
         Ok(())
     }
@@ -451,6 +461,27 @@ impl Stage {
             }
         });
         self.set_order(&order);
+        // The vertical picture's list and scene on air, and transition overrides, by name too.
+        self.edit(|d| {
+            if let Some(v) = d.pointer_mut("/ferrocast/vertical") {
+                if v.get("current_scene").and_then(Value::as_str) == Some(name) {
+                    v["current_scene"] = json!(new_name);
+                }
+                for o in v.get_mut("scene_order").and_then(Value::as_array_mut).into_iter().flatten() {
+                    if o.get("name").and_then(Value::as_str) == Some(name) {
+                        o["name"] = json!(new_name);
+                    }
+                }
+            }
+            if let Some(t) = d.pointer_mut("/ferrocast/scene_transitions").and_then(Value::as_object_mut)
+                && let Some(v) = t.remove(name)
+            {
+                t.insert(new_name.to_string(), v);
+            }
+            if d.pointer("/ferrocast/studio_mode").and_then(Value::as_str) == Some(name) {
+                d["ferrocast"]["studio_mode"] = json!(new_name);
+            }
+        });
         Ok(())
     }
 
@@ -2979,5 +3010,17 @@ mod tests {
         assert!(ok(s.transform("Tall", cam.id)).x > t.x);
         s.stop_follow(&f);
         assert_eq!(ok(s.transform("Tall", cam.id)).scale_x, 1.0, "back as it was");
+    }
+
+    #[test]
+    fn renaming_a_vertical_scene_keeps_it_vertical() {
+        let s = stage();
+        ok(s.start_vertical("Tall"));
+        ok(s.set_scene_transition("Main", Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        ok(s.rename("Tall", "Tall 2"));
+        assert_eq!(s.vertical().map(|v| v.current), Some("Tall 2".into()));
+        assert_eq!(s.scenes().len(), 1, "still not in the main list");
+        ok(s.rename("Main", "First"));
+        assert!(ok(s.scene_transition_of("First")).is_some(), "its override came along");
     }
 }

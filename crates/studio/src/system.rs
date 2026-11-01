@@ -8,6 +8,9 @@ use std::sync::Mutex;
 pub fn free_disk_mb(dir: &Path) -> u64 {
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Windows's full form (\\?\C:\…) doesn't match how disks are listed (C:\): plain it.
+    #[cfg(windows)]
+    let dir = std::path::PathBuf::from(dir.display().to_string().trim_start_matches(r"\\?\"));
     // The disk mounted deepest above the folder.
     disks
         .list()

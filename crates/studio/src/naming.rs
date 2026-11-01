@@ -51,7 +51,8 @@ pub(crate) fn file_name(
     let mut rest = pattern;
     while !rest.is_empty() {
         if let Some((spec, f)) = SPECS.iter().find(|(s, _)| rest.starts_with(s)) {
-            out.push_str(&now.format(f).to_string());
+            // What strftime writes can hold characters no file name may (%Z's "+01:00").
+            out.extend(now.format(f).to_string().chars().filter(|c| allowed(*c)));
             rest = &rest[spec.len()..];
             continue;
         }
@@ -70,7 +71,7 @@ pub(crate) fn file_name(
         let mut chars = rest.chars();
         let c = chars.next().unwrap_or_default();
         // An unknown %… loses its %, as in libobs.
-        if c != '%' && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control() {
+        if c != '%' && allowed(c) {
             out.push(c);
         }
         rest = chars.as_str();
@@ -84,6 +85,11 @@ pub(crate) fn file_name(
         name.push_str(extension);
     }
     name
+}
+
+/// A character any system's file names may hold.
+fn allowed(c: char) -> bool {
+    !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
 }
 
 #[cfg(test)]
@@ -102,5 +108,6 @@ mod tests {
             "Replay 261101 60 1920x1080 to 1280x720.mp4"
         );
         assert_eq!(file_name("a/b:c %Q 100%%", "mp4", true, v, at), "abc Q 100%.mp4");
+        assert!(!file_name("%z %Z", "mkv", true, v, at).contains(':'), "a time zone's colon is left out");
     }
 }
