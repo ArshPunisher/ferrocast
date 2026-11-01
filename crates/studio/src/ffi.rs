@@ -2318,7 +2318,7 @@ pub(crate) mod web {
         // Into our engine: as floats, stamped when the chunk began.
         if let Some(out) = shared.out.lock().ok().and_then(|o| o.clone()) {
             let samples: Vec<f32> =
-                pcm.chunks_exact(2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0).collect();
+                pcm.as_chunks::<2>().0.iter().map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0).collect();
             let span = u64::from(frames) * 1_000_000_000 / u64::from(rate);
             out.sound(samples, rate, ferrocast_av::engine::now_ns().saturating_sub(span));
             return;
