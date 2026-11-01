@@ -2534,6 +2534,19 @@ impl RecordPlan {
 }
 
 impl Recording {
+    /// A recording that only our engine runs (no libobs output under it).
+    pub(crate) fn own(studio: Studio, path: &Path, own: own::OwnStream) -> Self {
+        Self {
+            studio,
+            out: ptr::null_mut(),
+            venc: ptr::null_mut(),
+            audio: Vec::new(),
+            path: path.to_path_buf(),
+            view: ptr::null_mut(),
+            own: Some(own),
+        }
+    }
+
     /// Keeps a recording our engine draws with the collection (see `Streaming::follow`).
     pub fn follow(&mut self, c: &Collection) -> bool {
         // A new file when the plan's minutes or megabytes are reached.

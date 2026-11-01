@@ -242,6 +242,7 @@ impl Collection {
             delay_s: s.delay_s,
             vertical: true,
             replay: None,
+            solo: None,
         };
         let own = crate::own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         Ok(crate::Streaming::own(self.studio.clone(), s, own))

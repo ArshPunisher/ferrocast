@@ -1,5 +1,5 @@
-//! Recording a source on its own (OBS's "Source Record") beside what's on air, on a real engine
-//! (macOS: FERROCAST_OBS_DIR, else an installed OBS.app): the source's file is its own size,
+//! Recording a source on its own (OBS's "Source Record") beside what's on air, both drawn by
+//! Ferrocast's own engine from a real Studio (macOS: FERROCAST_OBS_DIR, else an installed OBS.app): the source's file is its own size,
 //! the program's the canvas's, both with sound. Checked with ffprobe.
 //!
 //!   cargo run -p ferrocast-studio --example source_record -- <out dir>
@@ -59,9 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..RecordPlan::default()
     };
     let (all, cam) = (plan("Program"), plan("Camera only"));
-    let program = studio.record_to(&studio.record_path(&all), &all)?;
-    let camera = studio.record_source_to("Camera", &studio.record_path(&cam), &cam)?;
-    assert!(studio.record_source_to("Nobody", &out.join("rec/x.mp4"), &cam).is_err(), "an unknown source is refused");
+    // Both drawn by Ferrocast's own engine, as the app records them.
+    let program = c.record_drawn(&studio.record_path(&all), &all)?;
+    let camera = c.record_source_drawn("Camera", &studio.record_path(&cam), &cam)?;
+    assert!(c.record_source_drawn("Nobody", &out.join("rec/x.mp4"), &cam).is_err(), "an unknown source is refused");
     std::thread::sleep(Duration::from_secs(3));
     drop(camera);
     drop(program);

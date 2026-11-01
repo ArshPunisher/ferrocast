@@ -155,6 +155,8 @@ struct Drawn {
     plan: Option<(RecordPlan, std::time::Instant)>,
     /// The vertical picture's scene on air, when this draws the vertical picture.
     vertical: Option<Option<String>>,
+    /// The scene or source shown on its own, when this is a Source Record.
+    solo: Option<String>,
 }
 
 /// Where a replay buffer's saves stand: the last file written, or why the last save failed.
@@ -177,6 +179,42 @@ pub(crate) struct Drawing<'a> {
     pub vertical: bool,
     /// A replay buffer instead: seconds kept, and at most this many megabytes (0: no limit).
     pub replay: Option<(u32, u32)>,
+    /// One scene or source on its own (OBS's Source Record) instead of what's on air.
+    pub solo: Option<&'a str>,
+}
+
+/// The scene a source shown alone is drawn from (no collection names a scene like it).
+const ALONE: &str = "\u{1}Ferrocast: on its own";
+
+/// Shows a scene, or a source alone, for a Source Record → the scene to draw and the size: a
+/// scene at `canvas`; a source at its own size (waited for up to 2 s while it starts; `canvas`
+/// if it has none by then), even-sided for the encoder.
+fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Result<(String, u32, u32), StudioError> {
+    if engine.scene_names().iter().any(|s| s == name) {
+        return Ok((name.to_string(), canvas.0, canvas.1));
+    }
+    let fail = || StudioError::Failed(format!("Ferrocast's own engine can't show \"{name}\" on its own yet."));
+    let started = std::time::Instant::now();
+    let (id, size) = loop {
+        let (id, size) = engine.source_named(name).ok_or_else(fail)?;
+        if size.is_some() || started.elapsed() >= Duration::from_secs(2) {
+            break (id, size);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let (w, h) = size.map_or(canvas, |(w, h)| ((w.max(2) & !1), (h.max(2) & !1)));
+    let (w, h) = if (w, h) == (0, 0) { canvas } else { (w, h) };
+    let item = ferrocast_av::engine::SceneItem::new(
+        id,
+        ferrocast_av::Placement {
+            bounds: ferrocast_av::Bounds::Fit,
+            bounds_width: w as f32,
+            bounds_height: h as f32,
+            ..Default::default()
+        },
+    );
+    engine.set_scene(ALONE, vec![item]);
+    Ok((ALONE.to_string(), w, h))
 }
 
 /// The vertical picture's scene on air in a saved collection.
@@ -410,7 +448,7 @@ impl OwnStream {
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(studio: &Studio, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
-        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay } = how;
+        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo } = how;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -472,6 +510,10 @@ impl OwnStream {
             (false, Some((w, h))) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
             (false, None) => AvCanvas::main(config),
         };
+        if let Some(name) = solo {
+            let (scene, w, h) = show_alone(&engine, name, (config.width, config.height))?;
+            (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w, h, None);
+        }
         // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
         let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
         if let Some(first) = picked.next() {
@@ -498,6 +540,7 @@ impl OwnStream {
                 skipped,
                 plan: None,
                 vertical: vertical.then(|| vertical_on_air(doc)),
+                solo: solo.map(String::from),
             }),
             hub: Some(hub),
         })
@@ -521,6 +564,12 @@ impl OwnStream {
         let bare = without_on_air(doc);
         if bare != d.shown && d.opened.elapsed() >= REOPEN_EVERY {
             d.skipped = d.engine.load_obs(doc);
+            // Opening again clears the scenes: a source shown alone gets its own scene back.
+            if let Some(name) = &d.solo
+                && let Err(e) = show_alone(&d.engine, name, (0, 0))
+            {
+                tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
+            }
             d.shown = bare;
             d.opened = std::time::Instant::now();
             d.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);

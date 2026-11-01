@@ -3562,6 +3562,7 @@ impl Collection {
             delay_s: s.delay_s,
             vertical: false,
             replay: None,
+            solo: None,
         };
         let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         Ok(Streaming::own(self.studio.clone(), s.clone(), own))
@@ -3581,18 +3582,37 @@ impl Collection {
             delay_s: 0,
             vertical: false,
             replay: None,
+            solo: None,
         };
         let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         own.set_plan(plan);
-        Ok(Recording {
-            studio: self.studio.clone(),
-            out: std::ptr::null_mut(),
-            venc: std::ptr::null_mut(),
-            audio: Vec::new(),
-            path: path.to_path_buf(),
-            view: std::ptr::null_mut(),
-            own: Some(own),
-        })
+        Ok(Recording::own(self.studio.clone(), path, own))
+    }
+
+    /// Records one scene or source on its own (OBS's Source Record) drawn by Ferrocast's own
+    /// engine: a source at its own size, a scene at the canvas's, with `plan`'s sound tracks.
+    pub fn record_source_drawn(
+        &self,
+        name: &str,
+        path: &std::path::Path,
+        plan: &RecordPlan,
+    ) -> Result<Recording, StudioError> {
+        if let Some(why) = own::unsupported_recording(plan) {
+            return Err(StudioError::Failed(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        let how = own::Drawing {
+            send_to: None,
+            record: Some(path),
+            encode: &plan.encode,
+            tracks: &plan.tracks,
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: Some(name),
+        };
+        let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        own.set_plan(plan);
+        Ok(Recording::own(self.studio.clone(), path, own))
     }
 
     /// OBS's replay buffer kept by Ferrocast's own engine: the last `plan.seconds` drawn from
@@ -3614,6 +3634,7 @@ impl Collection {
             delay_s: 0,
             vertical: false,
             replay: Some((plan.seconds, plan.mb)),
+            solo: None,
         };
         let stream = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
         Ok(ReplayBuffer {

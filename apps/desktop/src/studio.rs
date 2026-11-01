@@ -1126,6 +1126,12 @@ impl DesktopStudio {
                     if let Some(r) = h.replay.as_mut().filter(|r| r.drawn()) {
                         r.follow(c);
                     }
+                    for (_, r, file) in h.source_records.iter_mut().filter(|(_, r, _)| r.drawn()) {
+                        r.follow(c);
+                        if r.path() != file.as_path() {
+                            *file = r.path().to_path_buf();
+                        }
+                    }
                     if let Some((r, file, _)) = h.record.as_mut().filter(|(r, ..)| r.drawn()) {
                         r.follow(c);
                         // A split by the plan's minutes or megabytes moves on to a new file.
@@ -1931,11 +1937,11 @@ impl StudioHost for DesktopStudio {
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(studio, &s),
                 muxer: s.record_muxer.clone(),
-                // A source recorded on its own uses OBS's encoder (ours records what's on air).
                 own_encoder: false,
             };
             let file = studio.record_path(&plan);
-            let rec = studio.record_source_to(&name, &file, &plan).map_err(|e| e.to_string())?;
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let rec = c.record_source_drawn(&name, &file, &plan).map_err(|e| e.to_string())?;
             tracing::info!(source = %name, file = %file.display(), "the Studio is recording a source on its own");
             let v = json!({ "file": file.display().to_string() });
             h.source_records.push((name, rec, file));
