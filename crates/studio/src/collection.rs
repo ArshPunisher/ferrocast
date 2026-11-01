@@ -3430,7 +3430,7 @@ impl Collection {
                 48_000
             };
             match Listener::start(self.api(), src, rate, on_text) {
-                Ok(listener) => Ok(Captions { listener, _studio: self.studio.clone() }),
+                Ok(listener) => Ok(Captions { listener, _studio: Some(self.studio.clone()), pump: None }),
                 Err(Unavailable::NoAccess(Access::NotAsked)) => {
                     Err(StudioError::Failed("Allow speech recognition first.".into()))
                 }
@@ -4015,8 +4015,20 @@ pub(crate) struct Place {
 pub struct Captions {
     // Dropped first: the listener uses the Studio's libobs, kept alive by the field after it.
     #[cfg(target_os = "macos")]
-    listener: ffi::speech::Listener,
-    _studio: Studio,
+    pub(crate) listener: ffi::speech::Listener,
+    /// libobs's Studio when it feeds the listener; None when our engine's tap does.
+    pub(crate) _studio: Option<Studio>,
+    /// Our engine's tap handed to the listener: its thread and its stop.
+    pub(crate) pump: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>,
+}
+
+impl Drop for Captions {
+    fn drop(&mut self) {
+        if let Some((stop, t)) = self.pump.take() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = t.join();
+        }
+    }
 }
 
 impl Captions {
@@ -4044,26 +4056,42 @@ impl Collection {
         } else {
             48_000
         };
-        Ok(SoundTap { tap: ffi::tap::SoundTap::start(self.api(), src.ptr, rate), _studio: self.studio.clone() })
+        Ok(SoundTap {
+            tap: Tapped::Obs {
+                tap: ffi::tap::SoundTap::start(self.api(), src.ptr, rate),
+                _studio: self.studio.clone(),
+            },
+        })
     }
 }
 
 /// Listening to one sound; dropping it stops. Can move to another thread.
 #[derive(Debug)]
 pub struct SoundTap {
-    // Dropped first: it uses the Studio's libobs, kept alive by the field after it.
-    tap: ffi::tap::SoundTap,
-    _studio: Studio,
+    pub(crate) tap: Tapped,
+}
+
+/// Who listens: libobs (with the Studio it uses, kept alive after it), or our engine.
+#[derive(Debug)]
+pub(crate) enum Tapped {
+    Obs { tap: ffi::tap::SoundTap, _studio: Studio },
+    Own(ferrocast_av::mix::Tap),
 }
 
 impl SoundTap {
     pub fn rate(&self) -> u32 {
-        self.tap.rate()
+        match &self.tap {
+            Tapped::Obs { tap, .. } => tap.rate(),
+            Tapped::Own(_) => 48_000,
+        }
     }
 
     /// What it hears, for another thread: `take()` drains it.
     pub fn reader(&self) -> TapReader {
-        self.tap.reader()
+        match &self.tap {
+            Tapped::Obs { tap, .. } => tap.reader(),
+            Tapped::Own(t) => TapReader::own(t),
+        }
     }
 }
 

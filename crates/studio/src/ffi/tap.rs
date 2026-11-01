@@ -48,13 +48,20 @@ impl SoundTap {
 
     /// A handle to what's heard, for another thread.
     pub fn reader(&self) -> TapReader {
-        TapReader(self.buf.clone())
+        TapReader(Reader::Obs(self.buf.clone()))
     }
 }
 
-/// What a SoundTap hears, readable from any thread (empty once the tap is dropped).
+/// What a SoundTap hears, readable from any thread (empty once the tap is dropped): libobs's
+/// tap, or Ferrocast's own engine's.
 #[derive(Clone)]
-pub struct TapReader(Arc<Buf>);
+pub struct TapReader(Reader);
+
+#[derive(Clone)]
+enum Reader {
+    Obs(Arc<Buf>),
+    Own(ferrocast_av::mix::Tap),
+}
 
 impl std::fmt::Debug for TapReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,12 +72,23 @@ impl std::fmt::Debug for TapReader {
 impl TapReader {
     /// Everything heard since the last take (oldest first).
     pub fn take(&self) -> Vec<f32> {
-        self.0.samples.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
+        match &self.0 {
+            Reader::Obs(b) => b.samples.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default(),
+            Reader::Own(t) => t.take(),
+        }
     }
 
     /// Whether the tap is gone (nothing more will come).
     pub fn closed(&self) -> bool {
-        Arc::strong_count(&self.0) == 1
+        match &self.0 {
+            Reader::Obs(b) => Arc::strong_count(b) == 1,
+            Reader::Own(t) => Arc::strong_count(&t.0) == 1,
+        }
+    }
+
+    /// A reader of our engine's tap (its owner keeps the tap; dropping that closes this).
+    pub(crate) fn own(tap: &ferrocast_av::mix::Tap) -> Self {
+        Self(Reader::Own(tap.clone()))
     }
 }
 

@@ -75,9 +75,9 @@ struct Tap {
 
 /// A running caption recognizer for one source. Dropping it stops listening.
 pub struct Listener {
-    /// The Studio's libobs: its owner (`crate::Captions`) keeps the Studio alive longer.
-    api: *const Api,
-    source: *mut ObsSource,
+    /// The Studio's libobs and the source it listens to, when libobs feeds it (its owner,
+    /// `crate::Captions`, keeps the Studio alive longer); None when fed by `Feeder`.
+    from: Option<(*const Api, *mut ObsSource)>,
     tap: Arc<Tap>,
     /// Only ever used on the main thread (macOS calls the handlers there).
     turn: Rc<RefCell<Turn>>,
@@ -120,6 +120,17 @@ impl Listener {
         rate: u32,
         on_text: impl Fn(String, bool) + 'static,
     ) -> Result<Listener, Unavailable> {
+        let mut l = Self::start_fed(rate, on_text)?.0;
+        let param = Arc::as_ptr(&l.tap) as *mut c_void;
+        api.obs_source_add_audio_capture_callback(source, take_audio, param);
+        api.obs_source_get_ref(source);
+        l.from = Some((api as *const Api, source));
+        Ok(l)
+    }
+
+    /// Starts listening to mono sound at `rate` Hz handed to the returned `Feeder` (from any
+    /// thread): Ferrocast's own engine's tap. Called on the main thread.
+    pub fn start_fed(rate: u32, on_text: impl Fn(String, bool) + 'static) -> Result<(Listener, Feeder), Unavailable> {
         let a = access();
         if a != Access::Allowed {
             return Err(Unavailable::NoAccess(a));
@@ -149,10 +160,8 @@ impl Listener {
             gave_up: false,
         }));
         begin(&tap, &turn);
-        let param = Arc::as_ptr(&tap) as *mut c_void;
-        api.obs_source_add_audio_capture_callback(source, take_audio, param);
-        api.obs_source_get_ref(source);
-        Ok(Listener { api: api as *const Api, source, tap, turn })
+        let feeder = Feeder(tap.clone());
+        Ok((Listener { from: None, tap, turn }, feeder))
     }
 
     /// False once recognition kept failing and stopped.
@@ -163,11 +172,13 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // SAFETY: the owner keeps the Studio, and so this Api, alive until after this drop.
-        let api = unsafe { &*self.api };
-        let param = Arc::as_ptr(&self.tap) as *mut c_void;
-        api.obs_source_remove_audio_capture_callback(self.source, take_audio, param);
-        api.obs_source_release(self.source);
+        if let Some((api, source)) = self.from {
+            // SAFETY: the owner keeps the Studio, and so this Api, alive until after this drop.
+            let api = unsafe { &*api };
+            let param = Arc::as_ptr(&self.tap) as *mut c_void;
+            api.obs_source_remove_audio_capture_callback(source, take_audio, param);
+            api.obs_source_release(source);
+        }
         if let Ok(mut f) = self.tap.feed.lock()
             && let Some(r) = f.request.take()
         {
@@ -247,6 +258,48 @@ fn begin(tap: &Arc<Tap>, turn: &Rc<RefCell<Turn>>) {
     }
 }
 
+/// Hands mono sound to a `Listener` started with `start_fed`, from any thread.
+#[derive(Clone)]
+pub struct Feeder(Arc<Tap>);
+
+impl std::fmt::Debug for Feeder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Feeder").finish_non_exhaustive()
+    }
+}
+
+impl Feeder {
+    /// Appends `samples` (mono, the listener's rate) to what's being recognised.
+    pub fn feed(&self, samples: &[f32]) {
+        append(&self.0, samples);
+    }
+}
+
+/// Appends mono samples to the current request.
+fn append(tap: &Tap, samples: &[f32]) {
+    let Ok(n) = u32::try_from(samples.len()) else { return };
+    if n == 0 {
+        return;
+    }
+    let Ok(f) = tap.feed.lock() else { return };
+    let Some(request) = &f.request else { return };
+    // SAFETY: a new buffer the size of the chunk; its one channel is filled before it's
+    // appended, and the request copies it.
+    unsafe {
+        let Some(buf) = AVAudioPCMBuffer::initWithPCMFormat_frameCapacity(AVAudioPCMBuffer::alloc(), &f.format, n)
+        else {
+            return;
+        };
+        buf.setFrameLength(n);
+        let chans = buf.floatChannelData();
+        if chans.is_null() {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(samples.as_ptr(), (*chans).as_ptr(), samples.len());
+        request.appendAudioPCMBuffer(&buf);
+    }
+}
+
 /// libobs's audio capture callback: the first channel of each chunk (float planar, the
 /// Studio's rate) appended to the current request.
 unsafe extern "C" fn take_audio(param: *mut c_void, _src: *mut ObsSource, audio: *const AudioData, muted: bool) {
@@ -260,23 +313,7 @@ unsafe extern "C" fn take_audio(param: *mut c_void, _src: *mut ObsSource, audio:
     if plane.is_null() || audio.frames == 0 {
         return;
     }
-    let Ok(f) = tap.feed.lock() else { return };
-    let Some(request) = &f.request else { return };
-    // SAFETY: a new buffer the size of the chunk; its first channel is filled before it's
-    // appended, and the request copies it.
-    unsafe {
-        let Some(buf) =
-            AVAudioPCMBuffer::initWithPCMFormat_frameCapacity(AVAudioPCMBuffer::alloc(), &f.format, audio.frames)
-        else {
-            return;
-        };
-        buf.setFrameLength(audio.frames);
-        let chans = buf.floatChannelData();
-        if chans.is_null() {
-            return;
-        }
-        let dst = (*chans).as_ptr();
-        std::ptr::copy_nonoverlapping(plane as *const f32, dst, audio.frames as usize);
-        request.appendAudioPCMBuffer(&buf);
-    }
+    // SAFETY: plane 0 holds `frames` floats for the call.
+    let samples = unsafe { std::slice::from_raw_parts(plane as *const f32, audio.frames as usize) };
+    append(tap, samples);
 }

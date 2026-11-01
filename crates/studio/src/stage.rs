@@ -1637,6 +1637,63 @@ impl Stage {
         }
     }
 
+    // ------------------------------------------------------------------ listening
+
+    /// Listens to a source's sound (mono, 48 kHz) for anything that wants it: Whisper captions.
+    pub fn tap_sound(&self, source: &str) -> Result<crate::SoundTap, StudioError> {
+        let e = self.engine()?;
+        let (id, _) =
+            e.engine.source_named(source).ok_or_else(|| fail(format!("There's no source called \"{source}\".")))?;
+        Ok(crate::SoundTap { tap: crate::collection::Tapped::Own(e.engine.tap_sound(id)) })
+    }
+
+    /// Live captions on a source's sound, recognised on this Mac (Apple's Speech, on-device):
+    /// `on_text` gets the words so far, and true when a sentence is done. Main thread.
+    pub fn start_captions(
+        &self,
+        source: &str,
+        on_text: impl Fn(String, bool) + 'static,
+    ) -> Result<crate::Captions, StudioError> {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::ffi::speech::{Access, Listener, Unavailable};
+            let e = self.engine()?;
+            let (id, _) =
+                e.engine.source_named(source).ok_or_else(|| fail(format!("There's no source called \"{source}\".")))?;
+            let tap = e.engine.tap_sound(id);
+            let (listener, feeder) = Listener::start_fed(48_000, on_text).map_err(|e| match e {
+                Unavailable::NoAccess(Access::NotAsked) => fail("Allow speech recognition first."),
+                Unavailable::NoAccess(_) => fail(
+                    "Ferrocast isn't allowed to recognise speech: turn it on in System Settings, Privacy & Security, Speech Recognition.",
+                ),
+                Unavailable::NotOnDevice => fail(
+                    "This Mac can't recognise your language on the device yet: in System Settings, Keyboard, turn on Dictation to download it.",
+                ),
+                Unavailable::NoRecognizer => fail("Speech recognition isn't available on this Mac."),
+            })?;
+            // Our engine's sound to the recogniser, a few times a second.
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread = {
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name("ferrocast-captions".into())
+                    .spawn(move || {
+                        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            feeder.feed(&tap.take());
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    })
+                    .map_err(|e| fail(format!("Captions couldn't start: {e}")))?
+            };
+            Ok(crate::Captions { listener, _studio: None, pump: Some((stop, thread)) })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (source, on_text);
+            Err(fail("Live captions work on a Mac for now."))
+        }
+    }
+
     // ------------------------------------------------------------------ Studio Mode's extras
 
     /// Ferrocast's own settings kept in the collection (Studio Mode's options, quick
