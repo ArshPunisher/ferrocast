@@ -11,6 +11,7 @@ mod ffi;
 pub mod import;
 mod own;
 pub mod projector;
+pub mod stage;
 pub mod streamlabs;
 
 use std::ffi::c_int;

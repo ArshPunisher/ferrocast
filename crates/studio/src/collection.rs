@@ -3194,7 +3194,7 @@ impl Collection {
 }
 
 /// RGBA rows as a PNG data URL (a scene's tile).
-fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, StudioError> {
+pub(crate) fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, StudioError> {
     use base64::Engine as _;
     {
         let mut out = Vec::with_capacity(px.len() / 4);

@@ -325,7 +325,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
     })
 }
 
-fn placement_of(it: &Value) -> Placement {
+pub fn placement_of(it: &Value) -> Placement {
     let xy = |k: &str, d: f32| {
         let v = it.get(k);
         (v.map_or(d, |v| f(v, "x", f64::from(d))), v.map_or(d, |v| f(v, "y", f64::from(d))))

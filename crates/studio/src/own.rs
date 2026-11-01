@@ -181,7 +181,11 @@ struct Seen {
 impl Shared {
     /// Starts the engine at the Studio's canvas with the collection `doc` open.
     pub(crate) fn open(studio: &Studio, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
-        let canvas = studio.canvas();
+        Self::open_at(studio.canvas(), doc)
+    }
+
+    /// The same at `canvas`, with no libobs Studio (the scene store our engine keeps).
+    pub(crate) fn open_at(canvas: crate::Canvas, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
         let config = EngineConfig {
             width: canvas.width,
             height: canvas.height,
@@ -217,6 +221,21 @@ impl Shared {
 
     pub(crate) fn skipped(&self) -> Vec<String> {
         self.seen().skipped.clone()
+    }
+
+    /// Opens `doc` again now, whatever changed (the scene store calls it after each edit;
+    /// unchanged sources keep running).
+    pub(crate) fn reopen(&self, doc: &serde_json::Value) {
+        let mut seen = self.seen();
+        seen.skipped = self.engine.load_obs(doc);
+        for name in seen.alone.clone() {
+            if let Err(e) = show_alone(&self.engine, &name, (0, 0)) {
+                tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
+            }
+        }
+        seen.shown = without_on_air(doc);
+        seen.opened = std::time::Instant::now();
+        seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
     }
 
     /// Keeps the engine with the Studio: a new scene on air goes on through the Studio's
