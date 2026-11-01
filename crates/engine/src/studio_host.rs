@@ -912,7 +912,33 @@ impl Default for StudioSettings {
     }
 }
 
+/// x264, OBS's software encoder (`obs_x264`).
+fn is_x264(id: &str) -> bool {
+    id.to_ascii_lowercase().contains("x264")
+}
+
 impl StudioSettings {
+    /// Whether streaming uses x264 (the software encoder), which Ferrocast's own engine runs
+    /// through FFmpeg; with "record when streaming", the recording's encoder counts too.
+    pub fn stream_needs_ffmpeg(&self) -> bool {
+        let x264 = self.encoder == "software" || self.video_encoder.as_deref().is_some_and(is_x264);
+        x264 || (self.record_when_streaming && self.record_needs_ffmpeg())
+    }
+
+    /// Whether recording uses x264: Lossless, a custom x264, or the stream's encoder when that's x264.
+    pub fn record_needs_ffmpeg(&self) -> bool {
+        match (self.record_quality.as_str(), self.record_encoder.as_deref()) {
+            ("lossless", _) => true,
+            ("custom", Some(id)) => is_x264(id),
+            _ => self.encoder == "software" || self.video_encoder.as_deref().is_some_and(is_x264),
+        }
+    }
+
+    /// Whether any of it does (fetched as soon as such settings are saved).
+    pub fn needs_ffmpeg(&self) -> bool {
+        self.stream_needs_ffmpeg() || self.record_needs_ffmpeg()
+    }
+
     /// Refuses a value outside what OBS takes, naming the field and what's allowed.
     pub fn check(&self) -> Result<(), EngineError> {
         let bad = |m: &str| Err(EngineError::Invalid(m.into()));
@@ -1891,6 +1917,11 @@ impl Engine {
     /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
     pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
         s.check()?;
+        // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
+        // time Record or Go live is pressed.
+        if s.needs_ffmpeg() && self.ffmpeg_path().is_none() {
+            let _ = self.get_ffmpeg().await;
+        }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
         Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
@@ -1901,7 +1932,25 @@ impl Engine {
     }
 
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
-        self.studio_host()?.record(on).await.map_err(failed)
+        let host = self.studio_host()?;
+        if on {
+            let s = host.settings().await;
+            self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
+        }
+        host.record(on).await.map_err(failed)
+    }
+
+    /// Refuses (and starts fetching FFmpeg) when x264 is `needed` and FFmpeg isn't here yet.
+    async fn ffmpeg_first(&self, needed: bool) -> Result<(), EngineError> {
+        if !needed || self.ffmpeg_path().is_some() {
+            return Ok(());
+        }
+        self.get_ffmpeg().await?;
+        Err(crate::golive::refused_pub(
+            "ffmpeg_downloading",
+            "Ferrocast is downloading FFmpeg for the software encoder (x264) and Lossless (about 30 MB).",
+            "Try again in a minute, or pick the Mac's hardware encoder.",
+        ))
     }
 
     pub async fn studio_record_source(&self, name: &str, on: bool) -> Result<Value, EngineError> {
@@ -2044,6 +2093,9 @@ impl Engine {
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        if on {
+            self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
+        }
         if !on {
             host.stream_stop().await.map_err(failed)?;
             // The stream has ended either way; what didn't stop with it comes back in words.
@@ -2731,6 +2783,24 @@ mod tests {
         assert!(old.check().is_ok());
         let gl = StudioSettings { renderer: "opengl".into(), ..StudioSettings::default() };
         assert!(gl.check().is_ok());
+    }
+
+    #[test]
+    fn x264_and_lossless_need_ffmpeg() {
+        let s = StudioSettings::default();
+        assert!(!s.needs_ffmpeg(), "the hardware encoder doesn't");
+        assert!(StudioSettings { encoder: "software".into(), ..s.clone() }.needs_ffmpeg());
+        assert!(StudioSettings { record_quality: "lossless".into(), ..s.clone() }.needs_ffmpeg());
+        let custom =
+            StudioSettings { record_quality: "custom".into(), record_encoder: Some("obs_x264".into()), ..s.clone() };
+        assert!(custom.record_needs_ffmpeg() && !custom.stream_needs_ffmpeg());
+        // Lossless recordings don't hold up a hardware stream, unless it records too.
+        let lossless = StudioSettings { record_quality: "lossless".into(), ..s.clone() };
+        assert!(!lossless.stream_needs_ffmpeg());
+        assert!(StudioSettings { record_when_streaming: true, ..lossless }.stream_needs_ffmpeg());
+        // "Same as stream" recordings use the stream's x264.
+        let software = StudioSettings { encoder: "software".into(), ..s };
+        assert!(software.record_needs_ffmpeg() && software.stream_needs_ffmpeg());
     }
 
     #[test]
