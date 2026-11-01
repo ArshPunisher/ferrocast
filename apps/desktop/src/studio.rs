@@ -18,8 +18,7 @@ use ferrocast_studio::stage::StageOutput as Streaming;
 use ferrocast_studio::stage::StageOutput as Recording;
 use ferrocast_studio::stage::StageView as Preview;
 use ferrocast_studio::{
-    AudioSetup, Canvas, EncodeSettings, ItemEdit, Monitor, Paths, Projector, ProjectorOf, Rect, StreamSettings, Studio,
-    StudioOptions, TransitionInfo,
+    Canvas, EncodeSettings, ItemEdit, Monitor, Projector, Rect, StreamSettings, StudioOptions, TransitionInfo,
 };
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
@@ -34,10 +33,6 @@ use crate::studio_library::{self as library, Kind};
 /// it either). Stop takes the scenes and preview away; Start loads them back on the same engine.
 #[derive(Default)]
 struct Held {
-    studio: Option<Studio>,
-    paths: Option<Paths>,
-    /// The sound setup the engine started with (it can't change until Ferrocast restarts).
-    audio: Option<AudioSetup>,
     collection: Option<Collection>,
     preview: Option<Preview>,
     /// Where the preview is, to make it again when the canvas changes.
@@ -83,7 +78,6 @@ struct Held {
     program_at: Option<(Rect, f64)>,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
     projectors: Vec<(u64, Projector)>,
-    last_projector: u64,
     /// The vertical picture's preview, beside the main one.
     vertical: VerticalView,
     /// Live captions, and the sound they listen to.
@@ -140,23 +134,6 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
-/// A multiview follows the scenes after anything that changes them.
-/// How multiviews are laid out, from the settings.
-fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
-    use ferrocast_studio::MultiviewLayout as L;
-    ferrocast_studio::MultiviewLook {
-        layout: match s.multiview_layout.as_str() {
-            "bottom" => L::Bottom,
-            "left" => L::Left,
-            "right" => L::Right,
-            "scenes_only" => L::ScenesOnly,
-            _ => L::Top,
-        },
-        labels: s.multiview_labels,
-        safe_areas: s.multiview_safe_areas,
-    }
-}
-
 fn refresh_projectors(h: &Held) {
     if h.projectors.is_empty() {
         return;
@@ -174,49 +151,6 @@ thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
 }
 
-/// Where OBS's engine is (macOS): the one Ferrocast.app carries (deploy/obs-runtime-macos.sh),
-/// else an installed OBS.app (dev builds).
-fn obs_paths(metal: bool) -> Option<(Paths, &'static str)> {
-    #[cfg(target_os = "macos")]
-    {
-        // …/Ferrocast.app/Contents/MacOS/ferrocast-desktop → …/Contents
-        let own = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.parent()?.to_path_buf()));
-        let mut places: Vec<PathBuf> = own.into_iter().collect();
-        places.push(PathBuf::from("/Applications/OBS.app/Contents"));
-        if let Some(home) = dirs::home_dir() {
-            places.push(home.join("Applications/OBS.app/Contents"));
-        }
-        // Metal is the default from 29 Oct (OpenGL crashed in gl_update once while previews
-        // came and went); OpenGL stays in Settings. An OBS without Metal's renderer gets OpenGL.
-        places.into_iter().find(|p| p.join("Frameworks/libobs.framework").exists()).map(|c| {
-            let metal = metal && c.join("Frameworks/libobs-metal.dylib").exists();
-            (Paths::from_obs_app(&c, metal), if metal { "metal" } else { "opengl" })
-        })
-    }
-    #[cfg(windows)]
-    {
-        // The engine the installer puts beside Ferrocast (deploy/obs-runtime-windows.ps1),
-        // else an installed OBS (dev builds). D3D11 is OBS's renderer on Windows.
-        let _ = metal;
-        let own = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("obs")));
-        let mut places: Vec<PathBuf> = own.into_iter().collect();
-        for var in ["ProgramFiles", "ProgramW6432"] {
-            if let Some(p) = std::env::var_os(var) {
-                places.push(PathBuf::from(p).join("obs-studio"));
-            }
-        }
-        places
-            .into_iter()
-            .find(|p| p.join("bin/64bit/obs.dll").exists())
-            .map(|root| (Paths::from_obs_windows(&root), "d3d11"))
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let _ = metal;
-        None
-    }
-}
-
 /// Passes mouse actions over a picture on to the page (Windows: the picture's own window takes
 /// them, where on a Mac they go through to the page by themselves).
 fn pass_input(window: &tauri::WebviewWindow, p: &Preview) {
@@ -232,16 +166,10 @@ fn pass_input(window: &tauri::WebviewWindow, p: &Preview) {
 /// else x264. Go live sends it on as it comes, so this is what viewers get (Twitch takes up
 /// to 6000 kbps; Kick refuses over 8000, 25 Oct).
 /// How the settings ask to encode: the Mac's hardware H.264 (VideoToolbox) or x264.
-fn encode_of(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
-    // The Mac's VideoToolbox; on Windows the GPU's own (NVIDIA, AMD, then Intel), as OBS lists them.
-    const HARDWARE: [&str; 5] = [
-        "com.apple.videotoolbox.videoencoder.ave.avc",
-        "obs_nvenc_h264_tex",
-        "jim_nvenc",
-        "h264_texture_amf",
-        "obs_qsv11_v2",
-    ];
-    let kinds = studio.kinds();
+fn encode_of(s: &StudioSettings) -> EncodeSettings {
+    // The Mac's VideoToolbox; elsewhere the graphics card's through FFmpeg.
+    const HARDWARE: [&str; 2] = ["com.apple.videotoolbox.videoencoder.ave.avc", "ffmpeg_hardware"];
+    let kinds = ferrocast_studio::kinds::kinds();
     let hardware = (s.encoder == "hardware")
         .then(|| HARDWARE.into_iter().find(|id| kinds.encoders.iter().any(|e| e.id == *id)))
         .flatten();
@@ -267,9 +195,9 @@ fn encode_of(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
 
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
 /// viewers get (Twitch takes up to 6000 kbps; Kick refuses over 8000, 25 Oct).
-fn stream_settings(studio: &Studio, s: &StudioSettings) -> StreamSettings {
+fn stream_settings(s: &StudioSettings) -> StreamSettings {
     StreamSettings {
-        encode: encode_of(studio, s),
+        encode: encode_of(s),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
         delay_s: s.delay_s,
         vod_track: (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track),
@@ -279,8 +207,8 @@ fn stream_settings(studio: &Studio, s: &StudioSettings) -> StreamSettings {
 
 /// What a recording uses: the stream's settings, or constant quality (high: near-lossless
 /// with the same encoder; lossless: x264, much bigger files).
-fn record_encode(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
-    let mut e = encode_of(studio, s);
+fn record_encode(s: &StudioSettings) -> EncodeSettings {
+    let mut e = encode_of(s);
     match s.record_quality.as_str() {
         "high" => e.quality = Some(16),
         "lossless" => {
@@ -290,7 +218,7 @@ fn record_encode(studio: &Studio, s: &StudioSettings) -> EncodeSettings {
         }
         // Its own encoder and options, as OBS's Advanced recording settings.
         "custom" => {
-            let here = |id: &String| studio.kinds().encoders.iter().any(|k| &k.id == id);
+            let here = |id: &String| ferrocast_studio::kinds::kinds().encoders.iter().any(|k| &k.id == id);
             match &s.record_encoder {
                 Some(id) if here(id) => {
                     e.video_encoder = id.clone();
@@ -352,7 +280,7 @@ fn forget(data: &std::path::Path, kind: Kind, id: &str) {
 /// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
 /// set with one empty scene). If `to` won't load, the old ones come back.
 fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
-    let Some(studio) = h.studio.clone().filter(|_| h.collection.is_some()) else {
+    let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
         // Not running: the next Start loads it.
         return Ok(());
     };
@@ -380,13 +308,13 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     }
     // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
     let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
-        Some(Ok(d)) => Collection::load(studio.canvas(), &d, FIRST_SCENE),
+        Some(Ok(d)) => Collection::load(canvas, &d, FIRST_SCENE),
         Some(Err(e)) => {
             tracing::warn!(error = %e, file = %to.display(), "a scene collection didn't read; kept aside");
             let _ = std::fs::rename(to, to.with_extension("json.unreadable"));
-            Collection::new(studio.canvas(), FIRST_SCENE)
+            Collection::new(canvas, FIRST_SCENE)
         }
-        None => Collection::new(studio.canvas(), FIRST_SCENE),
+        None => Collection::new(canvas, FIRST_SCENE),
     };
     match made {
         Ok(c) => {
@@ -399,7 +327,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
         }
         Err(e) => {
             if let Some(old) = old {
-                h.collection = Collection::load(studio.canvas(), &old, FIRST_SCENE).ok();
+                h.collection = Collection::load(canvas, &old, FIRST_SCENE).ok();
             }
             sync_views(h);
             Err(format!("That scene collection didn't load: {e}"))
@@ -678,7 +606,9 @@ fn mp4_beside(from: &std::path::Path) -> PathBuf {
 
 /// Remuxes each file to an MP4 beside it, one after another on a thread of its own (a long
 /// file needn't hold the app up) → the first new file.
-fn remux_in_background(remuxer: ferrocast_studio::Remuxer, files: Vec<PathBuf>) -> Result<PathBuf, String> {
+fn remux_in_background(files: Vec<PathBuf>) -> Result<PathBuf, String> {
+    let ffmpeg = ferrocast_av::ffenc::path()
+        .ok_or("Remuxing to MP4 needs FFmpeg: pick x264 or Lossless once in Settings and Ferrocast fetches it.")?;
     if REMUX.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|v| v["done"] == false) {
         return Err("A remux is already running; wait for it to end.".into());
     }
@@ -691,13 +621,21 @@ fn remux_in_background(remuxer: ferrocast_studio::Remuxer, files: Vec<PathBuf>) 
         for (i, from) in files.into_iter().enumerate() {
             let to = mp4_beside(&from);
             let (f, t) = (from.display().to_string(), to.display().to_string());
-            let out = remuxer.remux(&from, &to, |pct| {
-                // Across all files: each is its share of the whole.
-                let whole = (i as f32 * 100.0 + pct) / count as f32;
-                set_remux(json!({ "from": f, "to": t, "percent": whole, "done": false, "error": null }));
-                true
-            });
-            let error = out.err().map(|e| e.to_string());
+            // Each file is its share of the whole; FFmpeg copies the packets as they are.
+            let whole = i as f32 * 100.0 / count as f32;
+            set_remux(json!({ "from": f, "to": t, "percent": whole, "done": false, "error": null }));
+            let out = std::process::Command::new(&ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(&from)
+                .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])
+                .arg(&to)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let error = match out {
+                Ok(o) if o.status.success() => None,
+                Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect::<String>()),
+                Err(e) => Some(e.to_string()),
+            };
             match &error {
                 Some(e) => tracing::warn!(file = %from.display(), error = %e, "a remux failed"),
                 None => tracing::info!(file = %to.display(), "remuxed to MP4"),
@@ -1094,8 +1032,6 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
-const NO_OBS: &str = "The Studio's engine is missing from this copy of Ferrocast. Reinstall Ferrocast from ferrocast.clearcraftlabs.com (or install OBS 32 from obsproject.com), then try again.";
-
 #[derive(Debug, Clone)]
 pub struct DesktopStudio {
     app: AppHandle,
@@ -1242,13 +1178,13 @@ impl DesktopStudio {
     }
 
     fn status_of(h: &Held) -> StudioStatus {
-        let found = obs_paths(true).is_some();
+        // Ferrocast's own engine is always here: nothing to install.
         StudioStatus {
-            available: found,
+            available: true,
             running: h.collection.is_some(),
-            version: h.collection.as_ref().and(h.studio.as_ref()).map(Studio::version),
+            version: h.collection.as_ref().map(|_| format!("Ferrocast engine {}", env!("CARGO_PKG_VERSION"))),
             renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
-            detail: (!found).then(|| NO_OBS.into()),
+            detail: None,
             recovered: None,
         }
     }
@@ -1340,49 +1276,29 @@ impl StudioHost for DesktopStudio {
             if h.collection.is_some() {
                 return Ok(Self::status_of(h));
             }
-            if h.studio.is_none() {
-                let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
-                // FERROCAST_RENDERER (opengl or metal) overrides it for a test run.
-                let want = std::env::var("FERROCAST_RENDERER")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| s.renderer.clone());
-                let (paths, renderer) = obs_paths(want != "opengl").ok_or(NO_OBS)?;
-                let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-                let layout = s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name);
-                let audio = AudioSetup {
-                    sample_rate: s.sample_rate,
-                    stereo: s.stereo,
-                    layout,
-                    low_latency: s.low_latency_audio,
-                };
-                let studio = Studio::start_with(&paths, canvas, audio, &config).map_err(|e| e.to_string())?;
-                tracing::info!(version = %studio.version(), renderer, "the Studio's engine loaded");
-                studio.set_multiview_look(multiview_look(&s));
-                if let Some((name, id)) = &s.monitoring
-                    && let Err(e) = studio.set_monitoring_device(name, id)
-                {
-                    tracing::warn!(error = %e, "the listening device is gone; using the system's");
-                }
-                h.renderer = renderer;
-                h.paths = Some(paths);
-                h.audio = Some(audio);
-                h.studio = Some(studio);
-            }
-            let studio = h.studio.as_ref().ok_or("The Studio's engine isn't loaded.")?;
+            // Ferrocast's own engine: no libobs to load.
+            let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+            let _ = &config;
+            h.renderer = "ferrocast";
+            let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
             // The saved scenes, or one empty scene the first time. A file that doesn't read is
             // kept aside (never overwritten) and the Studio starts fresh.
             let saved = std::fs::read(&file).ok().map(|b| serde_json::from_slice::<Value>(&b));
             let collection = match saved {
-                Some(Ok(doc)) => Collection::load(studio.canvas(), &doc, FIRST_SCENE),
+                Some(Ok(doc)) => Collection::load(canvas, &doc, FIRST_SCENE),
                 Some(Err(e)) => {
                     tracing::warn!(error = %e, "the Studio's scenes didn't read; starting with a new set");
                     let _ = std::fs::rename(&file, file.with_extension("json.unreadable"));
-                    Collection::new(studio.canvas(), FIRST_SCENE)
+                    Collection::new(canvas, FIRST_SCENE)
                 }
-                None => Collection::new(studio.canvas(), FIRST_SCENE),
+                None => Collection::new(canvas, FIRST_SCENE),
             }
             .map_err(|e| e.to_string())?;
+            if let Some((name, id)) = &s.monitoring
+                && let Err(e) = collection.set_monitoring_device(name, id)
+            {
+                tracing::warn!(error = %e, "the listening device is gone; using the system's");
+            }
             save(&collection, &file);
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             h.collection = Some(collection);
@@ -1668,45 +1584,38 @@ impl StudioHost for DesktopStudio {
         let note = self
             .on_main(move |h| {
                 let mut notes: Vec<String> = Vec::new();
-                if let Some(studio) = h.studio.as_ref() {
+                if let Some(c) = h.collection.as_mut() {
                     let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-                    if canvas != studio.canvas() {
-                        let renderer = h.paths.as_ref().map(|p| p.renderer.clone()).unwrap_or_default();
-                        // Refused while live or recording: nothing is saved then.
-                        studio.set_canvas(canvas, &renderer).map_err(|e| e.to_string())?;
-                        // The preview was made for the old size; projectors close.
-                        if h.preview.take().is_some() {
+                    if canvas != c.canvas() {
+                        // Refused while live or recording: nothing is saved then. The previews
+                        // let go of the old engine first.
+                        let (pv, pg, vv) = (h.preview.take(), h.program_view.take(), h.vertical.view.take());
+                        h.projectors.clear();
+                        let c = h.collection.as_mut().ok_or(STOPPED)?;
+                        if let Err(e) = c.set_canvas(canvas) {
+                            drop((pv, pg, vv));
+                            let _ = make_preview(&app, h);
+                            let _ = make_program_view(&app, h);
+                            let _ = make_vertical_view(&app, h);
+                            return Err(e.to_string());
+                        }
+                        // Made again at the new size.
+                        if pv.is_some() {
                             let _ = make_preview(&app, h);
                         }
-                        if h.program_view.take().is_some() {
+                        if pg.is_some() {
                             let _ = make_program_view(&app, h);
                         }
-                        // Its frame rate follows the main picture's.
-                        if h.vertical.view.take().is_some() {
+                        if vv.is_some() {
                             let _ = make_vertical_view(&app, h);
                         }
-                        h.projectors.clear();
                     }
-                    let studio = h.studio.as_ref().ok_or("The Studio's engine isn't loaded.")?;
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
-                    if studio.set_monitoring_device(&name, &id).is_err() {
+                    if c.set_monitoring_device(&name, &id).is_err() {
                         notes.push(format!("{name} can't play sound; the system's device is used."));
                     }
-                    if let Some(c) = &h.collection {
-                        c.set_true_peak(s.true_peak);
-                    }
-                    studio.set_multiview_look(multiview_look(&s));
-                    if h.audio.is_some_and(|a| {
-                        a.sample_rate != s.sample_rate
-                            || a.stereo != s.stereo
-                            || a.layout != s.speakers.as_deref().and_then(ferrocast_studio::Surround::from_name)
-                            || a.low_latency != s.low_latency_audio
-                    }) {
-                        notes.push("Sound changes apply after Ferrocast restarts.".into());
-                    }
-                    if h.studio.is_some() && cfg!(target_os = "macos") && h.renderer != s.renderer {
-                        notes.push("The new way of drawing applies after Ferrocast restarts.".into());
-                    }
+                    c.set_true_peak(s.true_peak);
                 }
                 // A new bitrate reaches the stream on air at once; the encoder, its size and the
                 // rest wait for the next start.
@@ -1738,7 +1647,7 @@ impl StudioHost for DesktopStudio {
     async fn stats(&self) -> Result<Value, String> {
         let data = self.data.clone();
         self.on_main(move |h| {
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().ok_or(STOPPED)?;
             // The page asks for stats every second, so scenes held for the grid's pictures
             // are let go soon after it closes.
             if let Some(c) = &h.collection {
@@ -1754,7 +1663,7 @@ impl StudioHost for DesktopStudio {
             let disk_free = {
                 let folder = record_folder(&h.settings.clone().unwrap_or_default());
                 let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
-                studio.free_disk_mb(&at)
+                ferrocast_studio::system::free_disk_mb(&at)
             };
             Ok(json!({
                 "engine": studio.stats(),
@@ -1794,7 +1703,7 @@ impl StudioHost for DesktopStudio {
                 // Waits for the file to be finished; MKV, FLV and TS then become MP4 too.
                 let ended = h.record.take();
                 let s = h.settings.clone().unwrap_or_default();
-                if let (Some((rec, file, started)), Some(studio)) = (ended, h.studio.as_ref()) {
+                if let Some((rec, file, started)) = ended {
                     drop(rec);
                     // By the file's own type (the setting may have changed while recording).
                     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -1802,7 +1711,7 @@ impl StudioHost for DesktopStudio {
                         // Every part, when it was split (a second's slack for the clock).
                         let since =
                             std::time::SystemTime::now() - started.elapsed() - std::time::Duration::from_secs(1);
-                        let _ = remux_in_background(studio.remuxer(), recording_parts(&file, since));
+                        let _ = remux_in_background(recording_parts(&file, since));
                     }
                 }
                 return Ok(Value::Null);
@@ -1811,7 +1720,7 @@ impl StudioHost for DesktopStudio {
                 return Ok(record_stats(r));
             }
             h.record = None;
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().ok_or(STOPPED)?;
             let s = h.settings.clone().unwrap_or_default();
             let folder = record_folder(&s);
             std::fs::create_dir_all(&folder)
@@ -1825,7 +1734,7 @@ impl StudioHost for DesktopStudio {
                 split_minutes: s.record_split_minutes,
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode(studio, &s),
+                encode: record_encode(&s),
                 muxer: s.record_muxer.clone(),
                 own_encoder: s.own_encoder,
             };
@@ -1941,7 +1850,7 @@ impl StudioHost for DesktopStudio {
                 // It stopped by itself (a full disk…): started again below.
                 h.source_records.remove(i);
             }
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().ok_or(STOPPED)?;
             let s = h.settings.clone().unwrap_or_default();
             let folder = record_folder(&s);
             std::fs::create_dir_all(&folder)
@@ -1961,7 +1870,7 @@ impl StudioHost for DesktopStudio {
                 split_minutes: s.record_split_minutes,
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode(studio, &s),
+                encode: record_encode(&s),
                 muxer: s.record_muxer.clone(),
                 own_encoder: false,
             };
@@ -1986,7 +1895,7 @@ impl StudioHost for DesktopStudio {
                 return Ok(json!({ "active": true }));
             }
             h.replay = None;
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            h.collection.as_ref().ok_or(STOPPED)?;
             let s = h.settings.clone().unwrap_or_default();
             let folder = record_folder(&s);
             std::fs::create_dir_all(&folder)
@@ -1999,7 +1908,7 @@ impl StudioHost for DesktopStudio {
                 seconds: s.replay_seconds,
                 mb: s.replay_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode(studio, &s),
+                encode: record_encode(&s),
             };
             // Kept by Ferrocast's own engine (libobs no longer stands in).
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -2027,21 +1936,12 @@ impl StudioHost for DesktopStudio {
             if !on {
                 return Ok(json!({ "active": false }));
             }
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
-            let shows = source.map_or(ferrocast_studio::CameraShows::Program, ferrocast_studio::CameraShows::Source);
-            let cam = studio.virtual_camera(&shows).map_err(|e| {
-                let e = e.to_string();
-                // macOS lets only OBS itself turn its camera on: say so plainly.
-                if cfg!(target_os = "macos") && e.contains("not installed") {
-                    "On a Mac the virtual camera works from OBS itself for now: macOS lets only OBS \
-                     turn its camera on. Start the virtual camera in OBS instead."
-                        .to_string()
-                } else {
-                    e
-                }
-            })?;
-            h.virtualcam = Some(cam);
-            Ok(json!({ "active": true }))
+            let _ = (h.collection.as_ref().ok_or(STOPPED)?, &source);
+            // On a Mac the camera is a system extension Apple has to sign.
+            Err::<Value, String>(
+                "The virtual camera isn't in Ferrocast's own engine yet: on a Mac it needs a camera extension signed by Apple."
+                    .into(),
+            )
         })
         .await?
     }
@@ -2214,7 +2114,7 @@ impl StudioHost for DesktopStudio {
 
     async fn remux(&self, file: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let studio = h.studio.as_ref().ok_or(STOPPED)?;
+            h.collection.as_ref().ok_or(STOPPED)?;
             let from = PathBuf::from(&file);
             // Any part of the recording under way (a split writes more beside the first).
             if h.record
@@ -2223,7 +2123,7 @@ impl StudioHost for DesktopStudio {
             {
                 return Err("Wait until the recording ends to remux files of it.".to_string());
             }
-            let to = remux_in_background(studio.remuxer(), vec![from])?;
+            let to = remux_in_background(vec![from])?;
             Ok(json!({ "to": to.display().to_string() }))
         })
         .await?
@@ -2250,9 +2150,10 @@ impl StudioHost for DesktopStudio {
 
     async fn encoder_options(&self, id: String, settings: serde_json::Map<String, Value>) -> Result<Value, String> {
         self.on_main(move |h| {
-            let studio = h.studio.as_ref().ok_or(STOPPED)?;
-            let (options, values) = studio.encoder_options(&id, &settings).map_err(|e| e.to_string())?;
-            Ok(json!({ "options": options, "values": values }))
+            // Our encoders take their settings from the Studio's own (bitrate, keyframes,
+            // profile): no options of their own to show.
+            let _ = (h.collection.as_ref().ok_or(STOPPED)?, &id);
+            Ok(json!({ "options": [], "values": settings }))
         })
         .await?
     }
@@ -2267,10 +2168,11 @@ impl StudioHost for DesktopStudio {
 
     async fn monitoring(&self) -> Result<Value, String> {
         self.on_main(|h| {
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().ok_or(STOPPED)?;
             let devices: Vec<Value> =
                 studio.monitoring_devices().into_iter().map(|(name, id)| json!({ "name": name, "id": id })).collect();
-            let (name, id) = studio.monitoring_device();
+            let (name, id) =
+                h.settings.as_ref().and_then(|s| s.monitoring.clone()).unwrap_or(("Default".into(), "default".into()));
             Ok(json!({ "devices": devices, "current": { "name": name, "id": id } }))
         })
         .await?
@@ -2422,8 +2324,12 @@ impl StudioHost for DesktopStudio {
                 // OBS's Browser sources become Web page sources here; note kinds this OBS lacks.
                 let known = self
                     .on_main(|h| {
-                        h.studio.as_ref().filter(|_| h.collection.is_some()).map(|s| {
-                            s.kinds().inputs.into_iter().map(|k| k.id).collect::<std::collections::BTreeSet<_>>()
+                        h.collection.as_ref().map(|_| {
+                            ferrocast_studio::kinds::kinds()
+                                .inputs
+                                .into_iter()
+                                .map(|k| k.id)
+                                .collect::<std::collections::BTreeSet<_>>()
                         })
                     })
                     .await?;
@@ -2552,61 +2458,9 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn projector(&self, p: ProjectorReq) -> Result<Value, String> {
-        self.on_main(move |h| {
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?.clone();
-            let scenes: Vec<String> =
-                h.collection.as_ref().map(|c| c.scenes().into_iter().map(|s| s.name).collect()).unwrap_or_default();
-            let of = match p.what.as_str() {
-                "program" => ProjectorOf::Program,
-                "multiview" => ProjectorOf::Multiview,
-                _ => ProjectorOf::Source(p.name.clone().unwrap_or_default()),
-            };
-            h.last_projector += 1;
-            let id = h.last_projector;
-            // Closed by its own button or Esc: out of the list (and dropped) after the borrow.
-            let on_close = Box::new(move || {
-                let gone = HELD.with(|h| {
-                    let mut h = h.try_borrow_mut().ok()?;
-                    let i = h.projectors.iter().position(|(pid, _)| *pid == id)?;
-                    Some(h.projectors.remove(i))
-                });
-                drop(gone);
-            });
-            // A click on a multiview scene puts it on air, through its transition; in Studio
-            // Mode it goes to the preview instead, as in OBS.
-            let on_pick = Box::new(|scene: String| {
-                HELD.with(|h| {
-                    let Ok(h) = h.try_borrow() else { return };
-                    if let Some(c) = &h.collection {
-                        let done =
-                            if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
-                        if c.moving() {
-                            glide();
-                        }
-                        if let Err(e) = done {
-                            tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
-                        }
-                        let names: Vec<String> = c.scenes().into_iter().map(|s| s.name).collect();
-                        let preview = c.preview_scene();
-                        for (_, p) in &h.projectors {
-                            p.update(&names, preview.as_deref());
-                        }
-                    }
-                });
-            });
-            let screen = p.screen.map(|s| s as usize);
-            let made = studio.projector(&of, &scenes, screen, on_close, on_pick).map_err(|e| e.to_string())?;
-            if p.on_top {
-                made.set_on_top(true);
-            }
-            // A multiview shows Studio Mode's preview as soon as it opens.
-            if let Some(c) = &h.collection {
-                made.update(&scenes, c.preview_scene().as_deref());
-            }
-            h.projectors.push((id, made));
-            Ok(json!({ "id": id }))
-        })
-        .await?
+        // Projector windows aren't drawn by Ferrocast's own engine yet.
+        let _ = p;
+        Err("Projectors aren't in Ferrocast's own engine yet.".into())
     }
 
     async fn close_projectors(&self) -> Result<(), String> {
@@ -2636,14 +2490,14 @@ impl StudioHost for DesktopStudio {
 
     async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
         self.on_main(move |h| {
-            let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
+            h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
                 return Ok(stats_of(s));
             }
             // A stopped or failed one goes first: one output at a time.
             h.stream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let settings = stream_settings(studio, &s);
+            let settings = stream_settings(&s);
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, "the Studio starts streaming into Go live");
             // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
             // the reason (libobs no longer stands in).
@@ -2667,13 +2521,13 @@ impl StudioHost for DesktopStudio {
 
     async fn light_stream_start(&self, server: String, key: String) -> Result<(), String> {
         self.on_main(move |h| {
-            let studio = h.studio.as_ref().filter(|_| h.collection.is_some()).ok_or(STOPPED)?;
+            let studio = h.collection.as_ref().ok_or(STOPPED)?;
             if h.lstream.as_ref().is_some_and(|s| s.stats().active) {
                 return Ok(());
             }
             h.lstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(studio, &s);
+            let mut settings = stream_settings(&s);
             // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
             let canvas = studio.canvas();
             settings.encode.scale = (canvas.height > 720).then(|| {
@@ -2707,7 +2561,6 @@ impl StudioHost for DesktopStudio {
     async fn vertical_stream_start(&self, server: String, key: String) -> Result<bool, String> {
         self.on_main(move |h| {
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            let studio = h.studio.as_ref().ok_or(STOPPED)?;
             if c.vertical().is_none() {
                 return Ok(false);
             }
@@ -2716,7 +2569,7 @@ impl StudioHost for DesktopStudio {
             }
             h.vstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let settings = stream_settings(studio, &s);
+            let settings = stream_settings(&s);
             tracing::info!(
                 kbps = settings.encode.video_kbps,
                 "the Studio's vertical picture starts streaming into Go live"
