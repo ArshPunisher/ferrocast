@@ -112,11 +112,8 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     }
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    // Drawn by Ferrocast's own engine on a Mac.
-    #[cfg(target_os = "macos")]
+    // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let mut p = c.vertical_preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
-    #[cfg(not(target_os = "macos"))]
-    let mut p = c.vertical_preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     pass_input(&window, &p);
     let v = &h.vertical;
     if let Some(area) = v.canvas {
@@ -976,17 +973,9 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.program_at else { return Ok(()) };
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    // What's on air, drawn by Ferrocast's own engine on a Mac.
-    #[cfg(target_os = "macos")]
-    let p = {
-        let c = h.collection.as_ref().ok_or(STOPPED)?;
-        c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
-    };
-    #[cfg(not(target_os = "macos"))]
-    let p = {
-        let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
-        studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
-    };
+    // What's on air, drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
+    let c = h.collection.as_ref().ok_or(STOPPED)?;
+    let p = c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     pass_input(&window, &p);
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
@@ -1004,17 +993,9 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
     let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
     let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
-    // Drawn by Ferrocast's own engine on a Mac (libobs no longer draws it there).
-    #[cfg(target_os = "macos")]
-    let mut p = {
-        let c = h.collection.as_ref().ok_or(STOPPED)?;
-        c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut p = {
-        let studio = h.collection.as_ref().and(h.studio.as_ref()).ok_or(STOPPED)?;
-        studio.preview(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?
-    };
+    // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
+    let c = h.collection.as_ref().ok_or(STOPPED)?;
+    let mut p = c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
     pass_input(&window, &p);
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
@@ -1711,7 +1692,12 @@ impl StudioHost for DesktopStudio {
                         // Every part, when it was split (a second's slack for the clock).
                         let since =
                             std::time::SystemTime::now() - started.elapsed() - std::time::Duration::from_secs(1);
-                        let _ = remux_in_background(recording_parts(&file, since));
+                        if let Err(e) = remux_in_background(recording_parts(&file, since)) {
+                            // Said in the stats (as a remux that ended with a problem) and the log.
+                            tracing::warn!(error = %e, "the recording wasn't remuxed to MP4");
+                            let f = file.display().to_string();
+                            set_remux(json!({ "from": f, "to": null, "percent": 0.0, "done": true, "error": e }));
+                        }
                     }
                 }
                 return Ok(Value::Null);
