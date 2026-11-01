@@ -30,6 +30,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/upload-check", post(upload_check))
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
+        .route("/golive/bond", put(bond_on))
         .route("/golive/vertical/obs/setup", post(point_vertical))
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
@@ -159,6 +160,16 @@ async fn resume(State(app): State<AppState>, Path(id): Path<String>) -> ApiResul
 #[serde(deny_unknown_fields)]
 struct AitumBody {
     ok: bool,
+}
+
+#[derive(Deserialize)]
+struct BondBody {
+    on: bool,
+}
+
+/// Ferrocast Bond (Pro) on or off, from the next stream.
+async fn bond_on(State(app): State<AppState>, Body(b): Body<BondBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_bond(b.on).await?)))
 }
 
 /// "I use Aitum Multistream on purpose" (A2.2): hides the setup note.

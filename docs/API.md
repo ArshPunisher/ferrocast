@@ -838,7 +838,7 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                            vertical: { points_here: boolean; streaming: boolean; before: string | null /* host */ } | null /* Aitum Vertical, when OBS has it */ };
                     live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
                     destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
-                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */;
+                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */; bond: boolean /* Ferrocast Bond (Pro) */;
                     advanced: Advanced;
                     cut: { source: "canvas" | "cut"; config: CutConfig; state: CutState | null /* null while not needed */; ffmpeg: FfmpegState } }
 type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number /* 2–30, 4 */; calm_s: number /* 5–120, 10 */;
@@ -886,6 +886,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | POST | `/api/v1/golive/ffmpeg` | Fetches ffmpeg (again, after a failure) → `FfmpegState`; progress in `GoLiveView.cut.ffmpeg` |
 | PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
+| PUT | `/api/v1/golive/bond` | `{ on: boolean }` → `GoLiveConfig`. Ferrocast Bond (Pro), from the next stream: the ticked RTMP platforms of the main picture are sent by the Bond service (`crates/bond`) instead of from here. Go live gets a token from the relay (`POST /v1/pro/bond/token`), makes a session there with those platforms' addresses and keys, and sends the stream once over SRTLA (every real connection); each platform's health line is read from the service every 2 s (Be right back on the channel shows as reconnecting, "Your stream didn't reach Ferrocast Bond…"). If anything fails (not Pro, Bond not running, its answer), that stream goes from this computer as usual and a `live_alert` `bond` says why. The view says `bond` and `bond_sending` |
 | POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
 
 **YouTube broadcasts (30 Oct).** No broadcast is ever made by hand. Going live, stream info and thumbnails all use one broadcast: the live one, else the next upcoming one, never Ferrocast's vertical one. When there's none, one is made (public, starting and ending with the stream, bound to the channel's stream). One that waits for "Go live" in YouTube Studio (auto-start off) is set to start with the stream when Go live starts. Stream info and thumbnails go to the vertical broadcast too, and a vertical broadcast made at go-live copies the normal one's title, privacy, description and thumbnail.
