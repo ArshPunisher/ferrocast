@@ -1676,6 +1676,9 @@ impl Stage {
         json!({
             "hide_notifications": p["hide_notifications"].as_bool() != Some(false),
             "hide_apps": p["hide_apps"].as_array().cloned().unwrap_or_default(),
+            // Leaving apps out of a capture is something only macOS does: elsewhere it isn't
+            // offered (a setting that did nothing would show what it promised to hide).
+            "supported": cfg!(target_os = "macos"),
         })
     }
 
@@ -2296,7 +2299,7 @@ impl Stage {
         name: &str,
         what: crate::collection::MediaAct,
     ) -> Result<crate::collection::MediaInfo, StudioError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             use crate::collection::MediaAct as A;
             use ferrocast_av::media::Control as C;
@@ -2317,7 +2320,7 @@ impl Stage {
             e.engine.media_control(id, c).map_err(|e| fail(e.to_string()))?;
             self.media_state(name)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = what;
             Err(fail(format!("\"{name}\": media files play on a Mac for now.")))
@@ -2325,7 +2328,7 @@ impl Stage {
     }
 
     pub fn media_state(&self, name: &str) -> Result<crate::collection::MediaInfo, StudioError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             use ferrocast_av::media::MediaState as S;
             let e = self.engine()?;
@@ -2343,7 +2346,7 @@ impl Stage {
                 duration_ms: (dur / 1_000_000) as i64,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(fail(format!("\"{name}\": media files play on a Mac for now.")))
         }
@@ -2351,7 +2354,7 @@ impl Stage {
 
     /// Jumps to `ms` into a video or sound file.
     pub fn media_seek(&self, name: &str, ms: i64) -> Result<crate::collection::MediaInfo, StudioError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let e = self.engine()?;
             let id = self.media_id(&e, name)?;
@@ -2359,14 +2362,14 @@ impl Stage {
             e.engine.media_control(id, ferrocast_av::media::Control::Seek(ns)).map_err(|e| fail(e.to_string()))?;
             self.media_state(name)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = ms;
             self.media_state(name)
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn media_id(&self, e: &own::Shared, name: &str) -> Result<u64, StudioError> {
         self.source(name)?;
         e.engine.source_named(name).map(|(id, _)| id).ok_or_else(|| fail(format!("\"{name}\" isn't playing yet.")))
@@ -3191,10 +3194,11 @@ mod tests {
     #[test]
     fn the_privacy_guard_is_kept_in_the_document_and_checked() {
         let s = stage();
-        assert_eq!(s.privacy(), json!({ "hide_notifications": true, "hide_apps": [] }));
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(s.privacy(), json!({ "hide_notifications": true, "hide_apps": [], "supported": mac }));
         s.set_privacy(&json!({ "hide_notifications": false, "hide_apps": ["Mail", " com.hnc.Discord ", "mail"] }))
             .unwrap();
-        let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord"] });
+        let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord"], "supported": mac });
         assert_eq!(s.privacy(), kept);
         assert_eq!(ferrocast_av::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord"]);
         let many: Vec<String> = (0..33).map(|i| format!("App {i}")).collect();

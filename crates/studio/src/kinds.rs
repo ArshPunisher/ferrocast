@@ -27,6 +27,16 @@ pub fn kinds() -> Kinds {
             kind("browser_source", "Browser"),
         ]);
     }
+    if cfg!(target_os = "windows") {
+        inputs.extend([
+            kind("ffmpeg_source", "Media Source"),
+            kind("monitor_capture", "Display Capture"),
+            kind("window_capture", "Window Capture"),
+            kind("dshow_input", "Video Capture Device"),
+            kind("wasapi_input_capture", "Audio Input Capture"),
+            kind("wasapi_output_capture", "Audio Output Capture"),
+        ]);
+    }
     Kinds {
         inputs,
         filters: vec![
@@ -222,6 +232,47 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         "sck_audio_capture" | "coreaudio_output_capture" => {
             vec![opt("type", "Method", "list").choices(&[("Desktop Audio Capture", json!(0))])]
         }
+        // Windows (OBS's own keys).
+        "monitor_capture" => {
+            #[allow(unused_mut)]
+            let mut d: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "windows")]
+            if let Ok((displays, _)) = ferrocast_av::screen::shareable() {
+                d.extend(
+                    displays.iter().map(|x| (format!("Display {} ({}x{})", x.id + 1, x.width, x.height), json!(x.id))),
+                );
+            }
+            vec![
+                opt("monitor", "Display", "list").choices(&as_refs(&d)),
+                opt("capture_cursor", "Capture Cursor", "bool"),
+            ]
+        }
+        "window_capture" => {
+            #[allow(unused_mut)]
+            let mut w: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "windows")]
+            if let Ok((_, windows)) = ferrocast_av::screen::shareable() {
+                w.extend(windows.iter().map(|x| (format!("[{}] {}", x.app, x.title), json!(x.id))));
+            }
+            vec![opt("window", "Window", "list").choices(&as_refs(&w)), opt("cursor", "Capture Cursor", "bool")]
+        }
+        "dshow_input" => {
+            #[allow(unused_mut)]
+            let mut list: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "windows")]
+            list.extend(ferrocast_av::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
+            vec![opt("video_device_id", "Device", "list").choices(&as_refs(&list))]
+        }
+        "wasapi_input_capture" => {
+            #[allow(unused_mut)]
+            let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
+            #[cfg(target_os = "windows")]
+            list.extend(ferrocast_av::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
+            vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
+        }
+        "wasapi_output_capture" => {
+            vec![opt("device_id", "Device", "list").choices(&[("Default", json!("default"))])]
+        }
         "browser_source" | "ferrocast_web" => vec![
             opt("is_local_file", "Local file", "bool"),
             opt("local_file", "Local file", "path").file("HTML Files (*.html *.htm);;All Files (*.*)"),
@@ -395,6 +446,10 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "av_capture_input" | "av_capture_input_v2" => json!({ "device": "" }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
         "sck_audio_capture" | "coreaudio_output_capture" => json!({ "type": 0 }),
+        "monitor_capture" => json!({ "monitor": 0, "capture_cursor": true }),
+        "window_capture" => json!({ "cursor": true }),
+        "dshow_input" => json!({ "video_device_id": "" }),
+        "wasapi_input_capture" | "wasapi_output_capture" => json!({ "device_id": "default" }),
         "browser_source" | "ferrocast_web" => json!({
             "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",
             "width": 800, "height": 600, "fps": 30,
