@@ -735,8 +735,14 @@ fn sender(
     // Every track goes on (Go live then gives Twitch's VOD track to Twitch only); a stream
     // without one has none to send.
     let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: true };
-    let (health_tx, h) =
-        tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+    let (health_tx, h) = tokio::sync::watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        since_ms: 0,
+    });
     let (sp, stop_rx) = tokio::sync::watch::channel(false);
     rt.spawn(push::run(dest, hub.clone(), health_tx, stop_rx));
     Ok((Some(rt), Some(h), Some(sp)))
