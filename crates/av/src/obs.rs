@@ -229,6 +229,16 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
             knee_db: n("knee_width", 10.0),
         },
         "basic_eq_filter" => AudioEffect::Eq3 { low_db: n("low", 0.0), mid_db: n("mid", 0.0), high_db: n("high", 0.0) },
+        // Strong noise removal, when the app has it (else listed as skipped).
+        "ferrocast_deepfilter" if crate::afx::denoiser_available() => AudioEffect::Denoise {
+            strength: s.get("strength").and_then(Value::as_u64).unwrap_or(100).clamp(1, 100) as u32,
+        },
+        // OBS's Noise Suppression (RNNoise or Speex) becomes it too: as deep as OBS's level
+        // (-30 dB by default), 0.6 dB a step.
+        "noise_suppress_filter" | "noise_suppress_filter_v2" if crate::afx::denoiser_available() => {
+            let level = s.get("suppress_level").and_then(Value::as_f64).unwrap_or(-30.0).abs();
+            AudioEffect::Denoise { strength: (level / 0.6).round().clamp(1.0, 100.0) as u32 }
+        }
         _ => return None,
     })
 }

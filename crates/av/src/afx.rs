@@ -11,6 +11,27 @@ pub fn mul_to_db(mul: f32) -> f32 {
     if mul == 0.0 { f32::NEG_INFINITY } else { 20.0 * mul.log10() }
 }
 
+/// A sound filter made outside the engine (DeepFilterNet's noise removal, which the app builds
+/// in): it cleans stereo blocks in place, keeping its own state.
+pub trait SoundPlugin: Send + std::fmt::Debug {
+    fn process(&mut self, ch: [&mut [f32]; 2]);
+}
+
+/// Makes the strong noise removal at a strength (1 to 100), when the app has one.
+pub type MakeDenoiser = fn(u32) -> Option<Box<dyn SoundPlugin>>;
+
+static DENOISER: std::sync::OnceLock<MakeDenoiser> = std::sync::OnceLock::new();
+
+/// The app's strong noise removal (set once; later calls change nothing).
+pub fn set_denoiser(make: MakeDenoiser) {
+    let _ = DENOISER.set(make);
+}
+
+/// Whether strong noise removal is here (the app built with it).
+pub fn denoiser_available() -> bool {
+    DENOISER.get().is_some()
+}
+
 /// A filter's kind and settings (OBS's keys and defaults in the comments).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AudioEffect {
@@ -67,6 +88,10 @@ pub enum AudioEffect {
         mid_db: f32,
         high_db: f32,
     },
+    /// Strong noise removal (DeepFilterNet, 48 kHz): "strength" 1 to 100 (100).
+    Denoise {
+        strength: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -77,7 +102,7 @@ struct EqState {
 }
 
 /// A filter running: its settings and what it remembers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AudioFilter {
     pub effect: AudioEffect,
     rate: f32,
@@ -91,6 +116,8 @@ pub struct AudioFilter {
     runave: [f32; 2],
     gain_db: [f32; 2],
     eq: [EqState; 2],
+    /// A filter made outside the engine (noise removal).
+    plugin: Option<Box<dyn SoundPlugin>>,
 }
 
 /// libobs's compressor `gain_coefficient`.
@@ -111,6 +138,13 @@ impl AudioFilter {
             runave: [0.0; 2],
             gain_db: [0.0; 2],
             eq: [EqState::default(); 2],
+            plugin: match effect {
+                // Its model works at 48 kHz only; elsewhere the sound passes as it is.
+                AudioEffect::Denoise { strength } if rate == 48_000 => {
+                    DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -119,6 +153,10 @@ impl AudioFilter {
         let [l, r] = ch;
         let n = l.len().min(r.len());
         let rate = self.rate;
+        if let Some(p) = self.plugin.as_mut() {
+            p.process([l, r]);
+            return;
+        }
         match self.effect {
             AudioEffect::Gain { db } => {
                 let m = db_to_mul(db);
@@ -209,6 +247,8 @@ impl AudioFilter {
                     }
                 }
             }
+            // Without the app's noise removal (or away from 48 kHz) the sound is as it was.
+            AudioEffect::Denoise { .. } => {}
         }
     }
 
