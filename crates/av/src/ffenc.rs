@@ -221,6 +221,16 @@ impl Video {
             format!("{}x{}", cfg.width, cfg.height),
             "-framerate".into(),
             format!("{}/{}", cfg.fps_num, cfg.fps_den.max(1)),
+        ];
+        // Our NV12 is BT.709, limited range: said so, or FFmpeg takes untagged frames for BT.601
+        // and turns every colour into BT.709 on the way to the encoder.
+        if cfg.input == PixelFormat::Nv12 {
+            a.extend(
+                ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+                    .map(String::from),
+            );
+        }
+        a.extend([
             "-i".into(),
             "pipe:0".into(),
             "-c:v".into(),
@@ -240,7 +250,7 @@ impl Video {
             "bt709".into(),
             "-color_trc".into(),
             "bt709".into(),
-        ];
+        ]);
         let cbr = matches!(cfg.rate, RateControl::Cbr);
         a.extend(["-b:v".into(), format!("{kbps}k")]);
         // A rate cap for steady encoders; VideoToolbox's own CBR turns off when one is given.
