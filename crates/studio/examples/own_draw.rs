@@ -98,6 +98,8 @@ fn main() -> Result<()> {
             let mut t = c.transform("Second", again.id)?;
             t.x = 700.0;
             c.set_transform("Second", again.id, &t)?;
+            // A lighter bitrate while live, as the stream doctor asks for.
+            stream.set_video_kbps(2_000);
             moved = Some(at);
         }
         if stream.follow(&c) {
@@ -154,6 +156,31 @@ fn main() -> Result<()> {
         if mean > 4.0 {
             failed.push(what);
         }
+    }
+    // The bitrate before and after the change (it lands within a second).
+    let packets = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,size", "-of", "csv=p=0"])
+        .arg(&got)
+        .output()?;
+    let (mut before, mut after) = (0f64, 0f64);
+    for line in String::from_utf8_lossy(&packets.stdout).lines() {
+        let mut it = line.split(',');
+        let (Some(t), Some(n)) =
+            (it.next().and_then(|t| t.parse::<f64>().ok()), it.next().and_then(|n| n.parse::<f64>().ok()))
+        else {
+            continue;
+        };
+        if t > 1.0 && t < mv {
+            before += n;
+        } else if t > mv + 1.0 {
+            after += n;
+        }
+    }
+    let kbps = |bytes: f64, secs: f64| bytes * 8.0 / secs.max(0.1) / 1000.0;
+    let (k1, k2) = (kbps(before, mv - 1.0), kbps(after, secs as f64 - mv - 1.0));
+    println!("own_draw bitrate: {k1:.0} kbps, then {k2:.0} kbps after asking for 2000");
+    if k2 > 2_600.0 {
+        failed.push("Bitrate");
     }
     let frames: u64 = text.split(',').nth(1).and_then(|n| n.trim().split(' ').next()?.parse().ok()).unwrap_or(0);
     if !text.contains("h264") || !text.contains("aac") || frames < (secs - 1) * 30 {
