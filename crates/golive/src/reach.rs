@@ -90,7 +90,7 @@ async fn rtmp(url: &str) -> Reach {
         Err(e) => return Reach::failed(e.to_string()),
     };
     let started = Instant::now();
-    let mut s = match crate::push::connect(&t).await {
+    let mut s = match crate::push::connect(&t, None).await {
         Ok(s) => s,
         Err(e) => return Reach::failed(e.to_string()),
     };

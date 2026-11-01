@@ -927,8 +927,15 @@ mod tests {
         });
         let hub = Hub::new();
         hub.start();
-        let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+        let (health, h) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
         let (stop_tx, stop) = watch::channel(false);
         let sender = tokio::spawn(run(direct(&url, "pass-word-1"), hub.clone(), health, stop));
         let mut h2 = h.clone();
@@ -1019,8 +1026,15 @@ mod tests {
         });
         let hub = Hub::new();
         hub.start();
-        let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+        let (health, h) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "r".into(),

@@ -198,6 +198,7 @@ pub async fn run(d: Direct, hub: Arc<Hub>, health: watch::Sender<Health>, mut st
         dropped: 0,
         sent: 0,
         link: None,
+        via: None,
         since_ms: crate::push::now_ms(),
     });
     let mut done = 0u64;
@@ -607,8 +608,15 @@ mod tests {
         });
         let hub = Hub::new();
         hub.start();
-        let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+        let (health, h) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
         let (stop_tx, stop) = watch::channel(false);
         let d = Direct {
             id: "t".into(),
@@ -698,8 +706,15 @@ mod tests {
         let Some(tags) = crate::ts::tests::sample_tags() else { return Vec::new() };
         let hub = Hub::new();
         hub.start();
-        let (health, h) =
-            watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, sent: 0, link: None, since_ms: 0 });
+        let (health, h) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
         let (stop_tx, stop) = watch::channel(false);
         let d =
             Direct { id: "t".into(), kind: Kind::Srt, url, key: String::new(), retry: Retry::default(), layer: None };

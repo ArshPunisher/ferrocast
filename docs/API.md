@@ -815,7 +815,10 @@ type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                  | { state: "paused"; until_ms: number /* earliest it comes back */; reason: string /* upload protection */ })
                  & { kbps: number; dropped: number; since_ms: number;
                      link?: { rtt_ms: number; lost_pct: number; resent_pct: number } /* SRT, RIST and WebRTC once connected: the
-                       round trip, and of the packets sent the share lost and the share sent again, over the last second */ }
+                       round trip, and of the packets sent the share lost and the share sent again, over the last second */;
+                     via?: string /* RTMP: after a network failure (not the server refusing) to a server that isn't on this network,
+                       the next try goes over the computer's next connection (Ethernet, Wi-Fi, a phone by USB or hotspot; not VPNs),
+                       then the default again; this names the one in use ("iPhone USB"). Back to the default when the stream ends */ }
 type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
 type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;

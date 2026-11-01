@@ -1814,6 +1814,7 @@ impl Engine {
                     dropped: 0,
                     sent: 0,
                     link: None,
+                    via: None,
                     since_ms: 0,
                 });
                 let (stop, stop_rx) = watch::channel(false);
@@ -1863,6 +1864,7 @@ impl Engine {
             dropped: 0,
             sent: 0,
             link: None,
+            via: None,
             since_ms: now_ms(),
         });
         let (stop, mut stop_rx) = watch::channel(false);
@@ -1969,6 +1971,7 @@ impl Engine {
             dropped: 0,
             sent: 0,
             link: None,
+            via: None,
             since_ms: now_ms,
         };
         lock(&g.paused).insert(id, health);

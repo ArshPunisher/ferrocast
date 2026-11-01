@@ -667,6 +667,7 @@ impl OwnStream {
             dropped: 0,
             sent: 0,
             link: None,
+            via: None,
             since_ms: 0,
         });
         let (stop, stop_rx) = tokio::sync::watch::channel(false);
@@ -754,6 +755,7 @@ fn sender(
         dropped: 0,
         sent: 0,
         link: None,
+        via: None,
         since_ms: 0,
     });
     let (sp, stop_rx) = tokio::sync::watch::channel(false);

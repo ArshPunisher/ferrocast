@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dropped: 0,
         sent: 0,
         link: None,
+        via: None,
         since_ms: 0,
     });
     let (stop_tx, stop) = tokio::sync::watch::channel(false);
