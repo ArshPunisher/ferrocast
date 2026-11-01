@@ -802,10 +802,15 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
             Content::Uploaded { id: it.source, width, height, premultiplied }
         }
     };
-    // Filters that move with time are told how long the scene has been on.
+    // Filters that move with time are told how long the scene has been on; a mask whose picture
+    // hasn't loaded (or won't) is left out rather than stopping the frame.
     let effects = it
         .effects
         .iter()
+        .filter(|e| match e {
+            Effect::Mask { image, .. } => st.sources.get(image).is_some_and(|s| s.size.is_some()),
+            _ => true,
+        })
         .map(|e| {
             let mut e = e.clone();
             if let Effect::Scroll { elapsed_ms, .. } = &mut e {
@@ -1089,6 +1094,19 @@ mod tests {
         // Studio Mode: A previewed while B is on air.
         assert_eq!(&e.snapshot_scene("A").unwrap_or_default()[0..4], &[255, 0, 0, 255]);
         assert!(e.snapshot_scene("Nope").is_err());
+    }
+
+    #[test]
+    fn a_mask_without_its_picture_is_left_out() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 255, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut it = SceneItem::new(1, Placement::default());
+        it.effects = vec![Effect::Mask { kind: crate::MaskKind::Alpha, image: 99, rgba: [1.0; 4], stretch: true }];
+        e.set_scene("A", vec![it]);
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        let px = e.snapshot().unwrap_or_else(|x| panic!("the frame still draws: {x}"));
+        assert_eq!(&px[0..4], &[0, 255, 0, 255]);
     }
 
     #[test]
