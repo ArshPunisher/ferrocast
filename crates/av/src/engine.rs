@@ -788,6 +788,23 @@ impl Engine {
         self.with_output(id, |pipe| pipe.set_video_kbps(kbps))
     }
 
+    /// Shows another scene on an output with a canvas of its own (None: what's on air), cut.
+    pub fn set_output_scene(&self, id: u64, scene: Option<String>) -> Result<(), AvError> {
+        let mut st = self.lock();
+        if let Some(name) = &scene
+            && !st.scenes.contains_key(name)
+        {
+            return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+        }
+        let (.., canvas) = st
+            .outputs
+            .iter_mut()
+            .find(|(i, ..)| *i == id)
+            .ok_or_else(|| AvError::Source(format!("there's no output {id}")))?;
+        canvas.scene = scene;
+        Ok(())
+    }
+
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
     pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
         self.with_output(id, |pipe| {
@@ -1792,5 +1809,40 @@ mod tests {
             // The long beep holds about 7 times the sound of the short one: about 8 dB more.
             assert!(two > one + 5.0, "{name}: track 1 {one} dB, track 2 {two} dB");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_output_switches_its_own_scene() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 360, height: 640, rgba: [255, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 360, height: 640, rgba: [0, 0, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Tall red", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Tall blue", vec![SceneItem::new(2, Placement::default())]);
+        let file = std::env::temp_dir().join("ferrocast-av-vertical.mp4");
+        let canvas = Canvas { width: 360, height: 640, scene: Some("Tall red".into()), ..Canvas::main(e.config()) };
+        let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(e.set_output_scene(id, Some("Nope".into())).is_err());
+        e.set_output_scene(id, Some("Tall blue".into())).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let frame = |at: &str| -> Option<Vec<u8>> {
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-ss", at, "-i"])
+                .arg(&file)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                .output()
+                .ok()?;
+            (out.stdout.len() == 360 * 640 * 3).then_some(out.stdout)
+        };
+        let (Some(a), Some(b)) = (frame("0.3"), frame("2.0")) else {
+            eprintln!("skipped the check: no ffmpeg");
+            return;
+        };
+        assert!(a[0] > 200 && a[2] < 60, "red first: {:?}", &a[..3]);
+        assert!(b[2] > 200 && b[0] < 60, "then blue: {:?}", &b[..3]);
     }
 }
