@@ -1791,20 +1791,10 @@ impl StudioHost for DesktopStudio {
                 own_encoder: s.own_encoder,
             };
             let file = studio.record_path(&plan);
-            let drawn = match h.collection.as_ref().filter(|_| s.own_drawing) {
-                Some(c) => match c.record_drawn(&file, &plan) {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        tracing::info!("libobs draws this recording: {e}");
-                        None
-                    }
-                },
-                None => None,
-            };
-            let rec = match drawn {
-                Some(r) => r,
-                None => studio.record_to(&file, &plan).map_err(|e| e.to_string())?,
-            };
+            // Ferrocast's own engine draws, mixes and encodes every recording; what it can't do
+            // yet is refused with the reason (libobs no longer stands in).
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let rec = c.record_drawn(&file, &plan).map_err(|e| e.to_string())?;
             tracing::info!(file = %file.display(), "the Studio is recording");
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
@@ -2611,22 +2601,10 @@ impl StudioHost for DesktopStudio {
             let s = h.settings.clone().unwrap_or_default();
             let settings = stream_settings(studio, &s);
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, "the Studio starts streaming into Go live");
-            // With the beta switch on, our engine draws what goes out; what it can't do yet (a
-            // stream delay, Twitch's VOD track…) goes out through libobs as before.
-            let drawn = match h.collection.as_ref().filter(|_| s.own_drawing) {
-                Some(c) => match c.stream_drawn(&server, &key, &settings) {
-                    Ok(st) => Some(st),
-                    Err(e) => {
-                        tracing::info!("libobs draws this stream: {e}");
-                        None
-                    }
-                },
-                None => None,
-            };
-            let stream = match drawn {
-                Some(st) => st,
-                None => studio.stream(&server, &key, &settings).map_err(|e| e.to_string())?,
-            };
+            // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
+            // the reason (libobs no longer stands in).
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let stream = c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?;
             let v = stats_of(&stream);
             h.stream = Some(stream);
             Ok(v)
