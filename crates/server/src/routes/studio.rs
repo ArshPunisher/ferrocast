@@ -124,6 +124,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
         .route("/studio/engine/levels", post(engine_levels))
         .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
+        .route("/studio/engine/privacy", get(privacy).put(set_privacy))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
@@ -1378,6 +1379,15 @@ async fn audio_care(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 async fn set_audio_care(State(app): State<AppState>, Body(care): Body<Value>) -> ApiResult<Json<Value>> {
     let _ = act(&app, StudioAct::SetAudioCare { care }).await?;
     act(&app, StudioAct::AudioCare).await
+}
+
+async fn privacy(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Privacy).await
+}
+
+async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetPrivacy { privacy }).await?;
+    act(&app, StudioAct::Privacy).await
 }
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
