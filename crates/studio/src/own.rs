@@ -178,6 +178,8 @@ struct Seen {
     alone: Vec<String>,
     /// Outputs showing the vertical picture: they follow its scene on air.
     vertical: Vec<u64>,
+    /// Faded to black (OBS's Fade to Black): black stays on air until it fades back.
+    black: bool,
 }
 
 impl Shared {
@@ -214,6 +216,7 @@ impl Shared {
                 skipped,
                 alone: Vec::new(),
                 vertical: Vec::new(),
+                black: false,
             }),
         }))
     }
@@ -243,6 +246,29 @@ impl Shared {
         for id in &seen.vertical {
             let _ = self.engine.set_output_scene(*id, on.clone());
         }
+        // Opening again cleared the black scene and put the scene on air back: black stays.
+        if seen.black {
+            self.engine.set_scene(BLACK, Vec::new());
+            let _ = self.engine.go(BLACK);
+        }
+    }
+
+    /// Fades to black over `ms` (on), or back to the scene on air.
+    pub(crate) fn fade_black(&self, on: bool, ms: u64) -> Result<(), StudioError> {
+        let mut seen = self.seen();
+        let to = if on {
+            self.engine.set_scene(BLACK, Vec::new());
+            BLACK.to_string()
+        } else {
+            seen.on_air.clone().ok_or_else(|| StudioError::Failed("Nothing's on air to fade back to.".into()))?
+        };
+        self.engine.go_with(&to, TransitionKind::Fade, ms).map_err(|e| StudioError::Failed(e.to_string()))?;
+        seen.black = on;
+        Ok(())
+    }
+
+    pub(crate) fn is_black(&self) -> bool {
+        self.seen().black
     }
 
     /// Puts `scene` on air now through a transition of its own (Studio Mode's quick
@@ -324,6 +350,9 @@ pub(crate) struct Drawing<'a> {
     /// One scene or source on its own (OBS's Source Record) instead of what's on air.
     pub solo: Option<&'a str>,
 }
+
+/// The empty scene Fade to Black shows (no collection names a scene like it).
+const BLACK: &str = "\u{1}Ferrocast: black";
 
 /// The scene a source shown alone is drawn from (no collection names a scene like it).
 fn alone_scene(name: &str) -> String {

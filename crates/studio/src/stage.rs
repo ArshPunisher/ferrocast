@@ -1548,6 +1548,274 @@ impl Stage {
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
     }
 
+    // ------------------------------------------------------------------ Studio Mode's extras
+
+    /// Ferrocast's own settings kept in the collection (Studio Mode's options, quick
+    /// transitions, transition overrides), under `key`.
+    fn extra(&self, key: &str) -> Value {
+        self.doc.borrow().pointer(&format!("/ferrocast/{key}")).cloned().unwrap_or(Value::Null)
+    }
+
+    fn set_extra(&self, key: &str, v: Value) {
+        self.edit(|d| {
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"][key] = v;
+        });
+    }
+
+    pub fn studio_options(&self) -> crate::collection::StudioOptions {
+        serde_json::from_value(self.extra("studio_options")).unwrap_or_default()
+    }
+
+    pub fn set_studio_options(&self, o: crate::collection::StudioOptions) -> Result<(), StudioError> {
+        self.set_extra("studio_options", json!(o));
+        Ok(())
+    }
+
+    /// Swaps what's on air and Studio Mode's preview, at once.
+    pub fn swap_scenes(&self) -> Result<(), StudioError> {
+        self.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }))
+    }
+
+    /// OBS's quick transitions (one click sends the preview on air through each).
+    pub fn quick_transitions(&self) -> Vec<TransitionInfo> {
+        serde_json::from_value(self.extra("quick")).unwrap_or_else(|_| {
+            vec![
+                TransitionInfo { kind: "cut_transition".into(), ms: 0 },
+                TransitionInfo { kind: "fade_transition".into(), ms: 300 },
+            ]
+        })
+    }
+
+    pub fn set_quick_transitions(&self, list: &[TransitionInfo]) -> Result<(), StudioError> {
+        if list.len() > 16 || list.iter().any(|t| t.ms > 20_000) {
+            return Err(fail("At most 16 quick transitions, each 0 to 20000 ms."));
+        }
+        self.set_extra("quick", json!(list));
+        Ok(())
+    }
+
+    /// A scene's own way in (OBS's Transition Override), or the Studio's (None).
+    pub fn scene_transition_of(&self, scene: &str) -> Result<Option<TransitionInfo>, StudioError> {
+        self.scene_index(scene)?;
+        Ok(serde_json::from_value(self.extra("scene_transitions").get(scene).cloned().unwrap_or(Value::Null)).ok())
+    }
+
+    pub fn set_scene_transition(&self, scene: &str, t: Option<&TransitionInfo>) -> Result<(), StudioError> {
+        self.scene_index(scene)?;
+        let mut all = self.extra("scene_transitions");
+        if !all.is_object() {
+            all = json!({});
+        }
+        match t {
+            Some(t) => all[scene] = json!(t),
+            None => {
+                all.as_object_mut().map(|m| m.remove(scene));
+            }
+        }
+        self.set_extra("scene_transitions", all);
+        Ok(())
+    }
+
+    /// How an item appears when shown (or goes when hidden): kept, drawn as a cut for now.
+    pub fn set_item_transition(
+        &self,
+        scene: &str,
+        id: i64,
+        show: bool,
+        t: Option<&TransitionInfo>,
+    ) -> Result<(), StudioError> {
+        let key = if show { "show_transition" } else { "hide_transition" };
+        let v = t.map_or(json!({}), |t| json!({ "id": t.kind, "duration": t.ms }));
+        self.with_item(scene, id, |i| i[key] = v)
+    }
+
+    /// Each transition kind's own settings.
+    pub fn transition_settings(&self, kind: &str) -> Value {
+        self.extra("transition_settings").get(kind).cloned().unwrap_or_else(|| json!({}))
+    }
+
+    pub fn set_transition_settings(&self, kind: &str, settings: &Value) -> Result<(), StudioError> {
+        let mut all = self.extra("transition_settings");
+        if !all.is_object() {
+            all = json!({});
+        }
+        all[kind] = settings.clone();
+        self.set_extra("transition_settings", all);
+        Ok(())
+    }
+
+    /// Fades what's on air to black over the Studio's transition time, or back → whether it's
+    /// black now.
+    pub fn fade_to_black(&self) -> Result<bool, StudioError> {
+        let e = self.engine()?;
+        let to = !e.is_black();
+        e.fade_black(to, u64::from(self.transition().ms.max(300)))?;
+        Ok(to)
+    }
+
+    pub fn is_black(&self) -> bool {
+        self.engine.borrow().as_ref().is_some_and(|e| e.is_black())
+    }
+
+    /// The T-bar: let go past halfway, the preview goes on air (dragged positions aren't drawn
+    /// part way yet).
+    pub fn tbar(&self, at: f32, release: bool) -> Result<crate::collection::TBarState, StudioError> {
+        if self.preview_scene().is_none() {
+            return Err(fail("Studio Mode is off."));
+        }
+        if release && at >= 0.5 {
+            self.transition_now(None)?;
+        }
+        Ok(crate::collection::TBarState { active: !release, at: if release { 0.0 } else { at.clamp(0.0, 1.0) } })
+    }
+
+    pub fn tbar_state(&self) -> crate::collection::TBarState {
+        crate::collection::TBarState { active: false, at: 0.0 }
+    }
+
+    // ------------------------------------------------------------------ more items
+
+    /// A copy of a source (its own settings and filters) placed in `scene` (OBS's Paste
+    /// (Duplicate)) → its item.
+    pub fn paste_copy(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
+        let mut src = self.source(name)?;
+        let mut n = 2;
+        let copy = loop {
+            let c = format!("{name} {n}");
+            if self.name_free(&c).is_ok() {
+                break c;
+            }
+            n += 1;
+        };
+        src["name"] = json!(copy);
+        src["uuid"] = json!(uuid());
+        self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(src.clone())));
+        self.place(scene, &src)
+    }
+
+    /// Moves an item into a group of the same scene (by the group's item id), or out of any.
+    pub fn set_group(&self, scene: &str, id: i64, group: Option<i64>) -> Result<(), StudioError> {
+        match group {
+            Some(g) => {
+                let gname = name_of(&self.item(scene, g)?).to_string();
+                let it = self.item(scene, id)?;
+                let gpos = (
+                    self.item(scene, g)?.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0),
+                    self.item(scene, g)?.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0),
+                );
+                self.with_items(scene, |l, _| l.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id)))?;
+                self.with_items(&gname, |l, set| {
+                    let mut c = it.clone();
+                    let x = c.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) - gpos.0;
+                    let y = c.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) - gpos.1;
+                    c["pos"] = json!({ "x": x, "y": y });
+                    let next = set.get("id_counter").and_then(Value::as_i64).unwrap_or(0) + 1;
+                    set.insert("id_counter".into(), json!(next));
+                    c["id"] = json!(next);
+                    l.push(c);
+                })
+            }
+            None => Err(fail("Ungroup the group to take its sources out.")),
+        }
+    }
+
+    /// A group item's name and its sources' names.
+    pub fn group_parts(&self, scene: &str, id: i64) -> Result<(String, Vec<String>), StudioError> {
+        let g = name_of(&self.item(scene, id)?).to_string();
+        let parts = self.scene_items(&g)?.iter().map(|i| name_of(i).to_string()).collect();
+        Ok((g, parts))
+    }
+
+    /// The item ids showing each of `names` in `scene`.
+    pub fn ids_named(&self, scene: &str, names: &[String]) -> Result<Vec<i64>, StudioError> {
+        Ok(self
+            .scene_items(scene)?
+            .iter()
+            .filter(|i| names.iter().any(|n| n == name_of(i)))
+            .filter_map(|i| i.get("id")?.as_i64())
+            .collect())
+    }
+
+    /// The sounds a scene makes (its sources with sound) and the global channels.
+    pub fn audio(&self, scene: &str) -> Result<Vec<AudioInfo>, StudioError> {
+        let mut out: Vec<AudioInfo> = Vec::new();
+        for it in self.scene_items(scene)?.iter().rev() {
+            let name = name_of(it);
+            if let Ok(src) = self.source(name)
+                && !is_scene(&src)
+                && self.info_of(it).audio
+                && !out.iter().any(|a| a.name == name)
+            {
+                out.push(self.audio_info(&src, None));
+            }
+        }
+        out.extend(self.channels());
+        Ok(out)
+    }
+
+    /// Deinterlacing: our engine's sources are never interlaced.
+    pub fn deinterlace_of(&self, _name: &str) -> Result<(String, bool), StudioError> {
+        Ok(("disable".into(), true))
+    }
+
+    pub fn set_deinterlace(&self, _name: &str, mode: &str, _top_field_first: bool) -> Result<(), StudioError> {
+        if mode == "disable" { Ok(()) } else { Err(fail("Ferrocast's own engine doesn't deinterlace yet.")) }
+    }
+
+    /// Media controls (play, pause, seek) aren't in our engine yet; files play and loop as set.
+    pub fn media(
+        &self,
+        name: &str,
+        _what: crate::collection::MediaAct,
+    ) -> Result<crate::collection::MediaInfo, StudioError> {
+        self.source(name)?;
+        Err(fail("Play and pause aren't in Ferrocast's own engine yet: the file plays as its settings say."))
+    }
+
+    pub fn media_state(&self, name: &str) -> Result<crate::collection::MediaInfo, StudioError> {
+        self.source(name)?;
+        Ok(crate::collection::MediaInfo { state: "playing", time_ms: 0, duration_ms: 0 })
+    }
+
+    pub fn media_seek(&self, name: &str, _ms: i64) -> Result<crate::collection::MediaInfo, StudioError> {
+        self.media(name, crate::collection::MediaAct::Play)
+    }
+
+    /// Web page sources aren't in our engine yet.
+    pub fn web(&self, name: &str, _what: crate::collection::WebAct) -> Result<(), StudioError> {
+        Err(fail(format!("\"{name}\": web pages aren't in Ferrocast's own engine yet.")))
+    }
+
+    // libobs's housekeeping, which our engine doesn't need: kept so the app calls the same.
+
+    pub fn set_true_peak(&self, _on: bool) {}
+
+    /// A Move transition under way: our engine plays it itself.
+    pub fn moving(&self) -> bool {
+        false
+    }
+
+    pub fn tick_moves(&self) -> bool {
+        false
+    }
+
+    pub fn finish_moves(&self) {}
+
+    pub fn settle_fits(&self) {}
+
+    pub fn follow_sizes(&self) -> bool {
+        false
+    }
+
+    pub fn let_thumbs_go(&self, _all: bool) {}
+
+    pub fn capture_problems(&self) -> Vec<crate::collection::CaptureProblem> {
+        Vec::new()
+    }
+
     // ------------------------------------------------------------------ transitions
 
     /// The Studio's transition: its kind and length.
@@ -2195,5 +2463,41 @@ mod tests {
         assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
         ok(s.set_channel(4, None));
         assert!(s.channels().is_empty());
+    }
+
+    #[test]
+    fn studio_extras_are_kept_in_the_collection() {
+        let s = stage();
+        ok(s.add_scene("Two"));
+        let quick = vec![TransitionInfo { kind: "fade_transition".into(), ms: 900 }];
+        ok(s.set_quick_transitions(&quick));
+        ok(s.set_scene_transition("Two", Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        ok(s.set_transition_settings("fade_to_color_transition", &json!({ "color": 4278190080u32 })));
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &s.save("x"), "Scene"));
+        assert_eq!(again.quick_transitions(), quick);
+        assert_eq!(ok(again.scene_transition_of("Two")).map(|t| t.kind), Some("cut_transition".into()));
+        assert_eq!(again.transition_settings("fade_to_color_transition")["color"], 4278190080u32);
+        assert_eq!(ok(again.scene_transition_of("Main")), None);
+    }
+
+    #[test]
+    fn fade_to_black_and_back() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "color": 4278190335u32 }), false));
+        ok(s.set_transition(&TransitionInfo { kind: "fade_transition".into(), ms: 300 }));
+        let px = || {
+            e.engine.snapshot().map(|p| p[(90 * 320 + 160) * 4..(90 * 320 + 160) * 4 + 3].to_vec()).unwrap_or_default()
+        };
+        assert_eq!(px(), [255, 0, 0]);
+        assert!(ok(s.fade_to_black()) && s.is_black());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(px(), [0, 0, 0], "black once the fade is over");
+        // An edit meanwhile doesn't bring the picture back.
+        ok(s.add_scene("Other"));
+        assert_eq!(px(), [0, 0, 0]);
+        assert!(!ok(s.fade_to_black()));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(px(), [255, 0, 0], "back");
     }
 }
