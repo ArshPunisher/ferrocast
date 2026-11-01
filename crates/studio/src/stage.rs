@@ -35,6 +35,9 @@ pub struct Stage {
     doc: RefCell<Value>,
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
+    /// Web page sources, each a page rendered for our engine, with the settings it opened with.
+    #[cfg(target_os = "macos")]
+    pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -110,7 +113,13 @@ impl Stage {
             "current_transition": "Fade",
             "transition_duration": 300,
         });
-        let s = Self { canvas, doc: RefCell::new(doc), engine: RefCell::new(None) };
+        let s = Self {
+            canvas,
+            doc: RefCell::new(doc),
+            engine: RefCell::new(None),
+            #[cfg(target_os = "macos")]
+            pages: RefCell::default(),
+        };
         s.add_scene(first_scene)?;
         Ok(s)
     }
@@ -121,7 +130,13 @@ impl Stage {
         if !doc.get("sources").is_some_and(Value::is_array) {
             doc["sources"] = json!([]);
         }
-        let s = Self { canvas, doc: RefCell::new(doc), engine: RefCell::new(None) };
+        let s = Self {
+            canvas,
+            doc: RefCell::new(doc),
+            engine: RefCell::new(None),
+            #[cfg(target_os = "macos")]
+            pages: RefCell::default(),
+        };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
         }
@@ -149,6 +164,7 @@ impl Stage {
         }
         let shared = own::Shared::open_at(self.canvas, &self.doc.borrow())?;
         *self.engine.borrow_mut() = Some(shared.clone());
+        self.sync_pages();
         Ok(shared)
     }
 
@@ -158,7 +174,53 @@ impl Stage {
         if let Some(e) = self.engine.borrow().as_ref() {
             e.reopen(&self.doc.borrow());
         }
+        self.sync_pages();
         out
+    }
+
+    /// Opens, updates or closes the web pages our engine shows, as the collection has them, and
+    /// hands each its source's feed (a new one after the collection is opened again). Main
+    /// thread (WebKit).
+    fn sync_pages(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(e) = self.engine.borrow().clone() else { return };
+            let web: Vec<(String, Value)> = self
+                .sources_list()
+                .iter()
+                .filter(|s| matches!(kind_of(s), "browser_source" | "ferrocast_web"))
+                .map(|s| (name_of(s).to_string(), s.get("settings").cloned().unwrap_or_default()))
+                .collect();
+            let mut pages = self.pages.borrow_mut();
+            pages.retain(|name, _| web.iter().any(|(n, _)| n == name));
+            for (name, set) in web {
+                let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
+                let n = |k: &str, d: u32| set.get(k).and_then(Value::as_u64).filter(|v| *v > 0).map_or(d, |v| v as u32);
+                let (w, h, fps) = (n("width", 800), n("height", 600), n("fps", 30));
+                let css = set.get("css").and_then(Value::as_str).unwrap_or_default().to_string();
+                let local = set.get("is_local_file").and_then(Value::as_bool) == Some(true);
+                let url = if local {
+                    let file = set.get("local_file").and_then(Value::as_str).unwrap_or_default();
+                    format!("file://{file}")
+                } else {
+                    set.get("url").and_then(Value::as_str).unwrap_or_default().to_string()
+                };
+                match pages.get_mut(&name) {
+                    Some((was, page)) => {
+                        if *was != set {
+                            page.update(&url, w, h, &css, fps);
+                            *was = set;
+                        }
+                        page.set_feed(feed);
+                    }
+                    None => {
+                        if let Some(page) = crate::ffi::web::FedPage::open(&url, w, h, &css, fps, feed) {
+                            pages.insert(name, (set, page));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn sources_list(&self) -> Vec<Value> {
@@ -2021,9 +2083,26 @@ impl Stage {
         self.media(name, crate::collection::MediaAct::Play)
     }
 
-    /// Web page sources aren't in our engine yet.
-    pub fn web(&self, name: &str, _what: crate::collection::WebAct) -> Result<(), StudioError> {
-        Err(fail(format!("\"{name}\": web pages aren't in Ferrocast's own engine yet.")))
+    /// Clicks into a web page source (in a window), stops, or reloads it.
+    pub fn web(&self, name: &str, what: crate::collection::WebAct) -> Result<(), StudioError> {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::collection::WebAct;
+            use crate::ffi::web::Do;
+            let pages = self.pages.borrow();
+            let (_, page) = pages.get(name).ok_or_else(|| fail(format!("\"{name}\" isn't a web page here.")))?;
+            page.act(match what {
+                WebAct::Interact => Do::Interact(format!("{name} (Interact)")),
+                WebAct::Stop => Do::Stop,
+                WebAct::Reload => Do::Reload,
+            });
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = what;
+            Err(fail(format!("\"{name}\": web pages work on a Mac for now.")))
+        }
     }
 
     // libobs's housekeeping, which our engine doesn't need: kept so the app calls the same.

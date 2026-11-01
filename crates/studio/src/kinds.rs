@@ -24,6 +24,7 @@ pub fn kinds() -> Kinds {
             kind("av_capture_input_v2", "Video Capture Device"),
             kind("coreaudio_input_capture", "Audio Input Capture"),
             kind("sck_audio_capture", "macOS Audio Capture"),
+            kind("browser_source", "Browser"),
         ]);
     }
     Kinds {
@@ -215,6 +216,15 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         "sck_audio_capture" | "coreaudio_output_capture" => {
             vec![opt("type", "Method", "list").choices(&[("Desktop Audio Capture", json!(0))])]
         }
+        "browser_source" | "ferrocast_web" => vec![
+            opt("is_local_file", "Local file", "bool"),
+            opt("local_file", "Local file", "path").file("HTML Files (*.html *.htm);;All Files (*.*)"),
+            opt("url", "URL", "text"),
+            opt("width", "Width", "int").range(1.0, 8192.0, 1.0),
+            opt("height", "Height", "int").range(1.0, 8192.0, 1.0),
+            opt("fps", "FPS", "int").range(1.0, 60.0, 1.0),
+            opt("css", "Custom CSS", "text").multiline(),
+        ],
         // Filters.
         "chroma_key_filter" | "chroma_key_filter_v2" => vec![
             opt("key_color_type", "Key Color Type", "list").choices(&[
@@ -373,6 +383,11 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "av_capture_input" | "av_capture_input_v2" => json!({ "device": "" }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
         "sck_audio_capture" | "coreaudio_output_capture" => json!({ "type": 0 }),
+        "browser_source" | "ferrocast_web" => json!({
+            "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",
+            "width": 800, "height": 600, "fps": 30,
+            "css": "body { background-color: rgba(0, 0, 0, 0); margin: 0px auto; overflow: hidden; }",
+        }),
         "chroma_key_filter" | "chroma_key_filter_v2" => {
             json!({ "key_color_type": "green", "similarity": 400, "smoothness": 80, "spill": 100, "opacity": 1.0, "contrast": 0.0, "brightness": 0.0, "gamma": 0.0 })
         }

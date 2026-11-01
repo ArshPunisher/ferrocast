@@ -2184,6 +2184,8 @@ pub(crate) mod web {
         fps: AtomicU32,
         /// The libobs source the page's sound goes out through; null once it's going.
         source: Mutex<SrcPtr>,
+        /// Ferrocast's own engine's source instead, when no libobs source holds the page.
+        out: Mutex<Option<ferrocast_av::engine::Feed>>,
     }
 
     struct SrcPtr(*mut ObsSource);
@@ -2303,7 +2305,6 @@ pub(crate) mod web {
 
     /// One chunk from the page ("48000:<base64 of 16-bit stereo>") into the source's sound.
     fn feed(shared: &Shared, msg: &str) {
-        let Some(a) = api() else { return };
         let Some((rate, b64)) = msg.split_once(':') else { return };
         let Ok(rate) = rate.parse::<u32>() else { return };
         if !(8_000..=192_000).contains(&rate) {
@@ -2314,6 +2315,15 @@ pub(crate) mod web {
         if frames == 0 {
             return;
         }
+        // Into our engine: as floats, stamped when the chunk began.
+        if let Some(out) = shared.out.lock().ok().and_then(|o| o.clone()) {
+            let samples: Vec<f32> =
+                pcm.chunks_exact(2).map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0).collect();
+            let span = u64::from(frames) * 1_000_000_000 / u64::from(rate);
+            out.sound(samples, rate, ferrocast_av::engine::now_ns().saturating_sub(span));
+            return;
+        }
+        let Some(a) = api() else { return };
         let Ok(src) = shared.source.lock() else { return };
         if src.0.is_null() {
             return;
@@ -2668,6 +2678,14 @@ pub(crate) mod web {
             }
             cg::CGColorSpaceRelease(cs);
         }
+        // Our engine takes it as it is: premultiplied, RGBA.
+        if let Some(out) = shared.out.lock().ok().and_then(|o| o.clone()) {
+            for px in buf.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
+            }
+            out.picture(ferrocast_av::Picture { width: w, height: h, rgba: buf, premultiplied: true });
+            return;
+        }
         for px in buf.as_chunks_mut::<4>().0 {
             let a = u32::from(px[3]);
             if a != 0 && a != 255 {
@@ -2725,6 +2743,114 @@ pub(crate) mod web {
         }
     }
 
+    /// A web page drawn for Ferrocast's own engine (no libobs source): its snapshots and sound
+    /// go to `feed`. The page closes when this is dropped. Main thread.
+    pub(crate) struct FedPage {
+        shared: Arc<Shared>,
+        page: PageSlot,
+    }
+
+    impl std::fmt::Debug for FedPage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FedPage").finish_non_exhaustive()
+        }
+    }
+
+    impl FedPage {
+        /// Opens `url` at `w`×`h` with `css`, snapshotted `fps` times a second into `feed`.
+        pub(crate) fn open(
+            url: &str,
+            w: u32,
+            h: u32,
+            css: &str,
+            fps: u32,
+            feed: ferrocast_av::engine::Feed,
+        ) -> Option<Self> {
+            let mtm = MainThreadMarker::new()?;
+            let shared = Arc::new(Shared {
+                frame: Mutex::new(Frame::default()),
+                // Always shown: our engine draws it only where it's on air or in a preview.
+                shown: AtomicBool::new(true),
+                alive: AtomicBool::new(true),
+                w: AtomicU32::new(w.max(1)),
+                h: AtomicU32::new(h.max(1)),
+                fps: AtomicU32::new(fps.clamp(1, 60)),
+                source: Mutex::new(SrcPtr(std::ptr::null_mut())),
+                out: Mutex::new(Some(feed)),
+            });
+            let page: PageSlot = Arc::new(Mutex::new(None));
+            let p = open(mtm, &page, &shared, url, w.max(1), h.max(1), css)?;
+            if let Ok(mut slot) = page.lock() {
+                *slot = Some(OnMain(p));
+            }
+            shoot(page.clone(), shared.clone());
+            Some(Self { shared, page })
+        }
+
+        /// Our engine's source changed (the collection was opened again): its new feed.
+        pub(crate) fn set_feed(&self, feed: ferrocast_av::engine::Feed) {
+            if let Ok(mut o) = self.shared.out.lock() {
+                *o = Some(feed);
+            }
+        }
+
+        /// A new address, size or CSS (the source's settings changed).
+        pub(crate) fn update(&self, url: &str, w: u32, h: u32, css: &str, fps: u32) {
+            self.shared.w.store(w.max(1), Ordering::Relaxed);
+            self.shared.h.store(h.max(1), Ordering::Relaxed);
+            self.shared.fps.store(fps.clamp(1, 60), Ordering::Relaxed);
+            if let Ok(mut p) = self.page.lock()
+                && let Some(OnMain(p)) = p.as_mut()
+            {
+                if p.size != (w, h) {
+                    resize(p, w.max(1), h.max(1));
+                }
+                if p.url != url || p.css != css {
+                    load(p, url, css);
+                }
+            }
+        }
+
+        /// Clicks, stops clicking or reloads the page.
+        pub(crate) fn act(&self, what: Do) {
+            let Ok(mut p) = self.page.lock() else { return };
+            let Some(OnMain(p)) = p.as_mut() else { return };
+            match what {
+                Do::Interact(title) => place(p, Some(title)),
+                Do::Stop => place(p, None),
+                Do::Reload => {
+                    // SAFETY: reload of the live view on the main thread.
+                    unsafe {
+                        let _ = p.view.reload();
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for FedPage {
+        fn drop(&mut self) {
+            self.shared.alive.store(false, Ordering::Release);
+            if let Ok(mut o) = self.shared.out.lock() {
+                *o = None;
+            }
+            if let Ok(mut p) = self.page.lock()
+                && let Some(OnMain(mut p)) = p.take()
+            {
+                // SAFETY: undoing what `open` registered, on the live objects, main thread.
+                unsafe {
+                    p.view
+                        .configuration()
+                        .userContentController()
+                        .removeScriptMessageHandlerForName(&NSString::from_str(AUDIO_HANDLER));
+                }
+                p.window.setDelegate(None);
+                p.closer = None;
+                p.window.close();
+            }
+        }
+    }
+
     unsafe extern "C" fn get_name(_t: *mut c_void) -> *const c_char {
         NAME.as_ptr()
     }
@@ -2739,6 +2865,7 @@ pub(crate) mod web {
             h: AtomicU32::new(h),
             fps: AtomicU32::new(fps),
             source: Mutex::new(SrcPtr(obs)),
+            out: Mutex::new(None),
         });
         let page: PageSlot = Arc::new(Mutex::new(None));
         let job = OnMain((page.clone(), shared.clone()));
