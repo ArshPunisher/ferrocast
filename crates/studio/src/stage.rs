@@ -2611,19 +2611,34 @@ impl StageOutput {
 /// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS): the
 /// same calls as `Preview`. Its outlines and handles come from the stage's own items, taken on
 /// each `follow` (the app's tick) and kept between. Removed when dropped.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 pub struct StageView {
     shared: Arc<own::Shared>,
     id: u64,
-    view: crate::ffi::mac::ChildView,
+    view: ChildView,
     look: RefCell<ViewLook>,
     /// Shows the vertical picture (it follows that picture's scene on air).
     vertical: bool,
 }
 
-/// What a view keeps to draw round and over the picture.
+/// The window the preview draws in: an NSView on a Mac, a child window on Windows.
 #[cfg(target_os = "macos")]
+type ChildView = crate::ffi::mac::ChildView;
+#[cfg(target_os = "windows")]
+type ChildView = crate::ffi::win::ChildView;
+
+/// Puts `view` at `r` (the page's box; a Mac also wants the page's height, its y runs up).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn place(view: &ChildView, r: &crate::Rect) {
+    #[cfg(target_os = "macos")]
+    view.set_frame(r.x, r.y, r.w, r.h, r.vh);
+    #[cfg(target_os = "windows")]
+    view.set_frame(r.x, r.y, r.w, r.h);
+}
+
+/// What a view keeps to draw round and over the picture.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Default)]
 struct ViewLook {
     background: [f32; 4],
@@ -2641,7 +2656,7 @@ struct ViewLook {
     outlines: Vec<ferrocast_av::preview::Outline>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Stage {
     /// A preview of the stage over `window`'s page at `rect` (points), `scale` its pixels per
     /// point: what's on air.
@@ -2674,13 +2689,20 @@ impl Stage {
         scale: f64,
         vertical: bool,
     ) -> Result<StageView, StudioError> {
-        let raw_window_handle::RawWindowHandle::AppKit(h) = window else {
-            return Err(fail("that isn't a macOS window"));
-        };
         let shared = self.engine()?;
         let r = crate::with_edge(rect);
-        let view = crate::ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
-            .ok_or_else(|| fail("the preview can only be made on the main thread"))?;
+        let made = match window {
+            #[cfg(target_os = "macos")]
+            raw_window_handle::RawWindowHandle::AppKit(h) => {
+                crate::ffi::mac::child_view(h.ns_view.as_ptr(), r.x, r.y, r.w, r.h, r.vh)
+            }
+            #[cfg(target_os = "windows")]
+            raw_window_handle::RawWindowHandle::Win32(h) => {
+                crate::ffi::win::child_view(h.hwnd.get() as *mut std::ffi::c_void, r.x, r.y, r.w, r.h)
+            }
+            _ => return Err(fail("that isn't this system's window")),
+        };
+        let view = made.ok_or_else(|| fail("the preview can only be made on the main thread"))?;
         let (cx, cy) = view.pixels().unwrap_or_else(|| crate::px(r, scale));
         let (size, scene) = if vertical {
             (crate::collection::VERTICAL_SIZE, self.vertical().map(|v| v.current))
@@ -2709,12 +2731,12 @@ impl Stage {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageView {
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
         let r = crate::with_edge(rect);
-        self.view.set_frame(r.x, r.y, r.w, r.h, r.vh);
+        place(&self.view, &r);
         {
             let mut l = self.look.borrow_mut();
             l.area = None;
@@ -2728,7 +2750,7 @@ impl StageView {
     /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
     /// from the area's top left). Main thread.
     pub fn set_area(&mut self, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
-        self.view.set_frame(area.x, area.y, area.w, area.h, area.vh);
+        place(&self.view, &area);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         self.look.borrow_mut().area =
             Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
@@ -2851,7 +2873,7 @@ impl StageView {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for StageView {
     fn drop(&mut self) {
         // The engine lets go of the view before it goes.
@@ -3086,13 +3108,13 @@ impl Drop for StageProjector {
     }
 }
 
-/// Off a Mac our engine draws no preview yet: the view can't be made (its calls are the same,
-/// so the app builds everywhere).
-#[cfg(not(target_os = "macos"))]
+/// Where our engine draws no preview yet (Linux): the view can't be made (its calls are the
+/// same, so the app builds everywhere).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub struct StageView(());
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::unused_self)]
 impl StageView {
     pub fn set_rect(&mut self, _rect: crate::Rect, _scale: f64) {}
@@ -3112,7 +3134,7 @@ impl StageView {
     pub fn follow(&self, _stage: &Stage) {}
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl Stage {
     pub fn preview_drawn(
         &self,
@@ -3120,7 +3142,7 @@ impl Stage {
         _rect: crate::Rect,
         _scale: f64,
     ) -> Result<StageView, StudioError> {
-        Err(fail("Ferrocast's own engine draws the preview on a Mac only so far."))
+        Err(fail("Ferrocast's own engine draws the preview on a Mac and on Windows so far."))
     }
 
     pub fn vertical_preview_drawn(
