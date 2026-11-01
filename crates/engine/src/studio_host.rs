@@ -1316,6 +1316,12 @@ pub enum StudioAct {
     Look {
         names: Vec<String>,
     },
+    /// The sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs }`.
+    AudioCare,
+    /// Sets it (as `AudioCare` gives it).
+    SetAudioCare {
+        care: Value,
+    },
     Filters {
         name: String,
     },
@@ -1548,7 +1554,14 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources | A::StopVertical => Ok(()),
+            A::Scenes | A::Sources | A::StopVertical | A::AudioCare => Ok(()),
+            // The Studio checks the names and numbers (it knows the sources); here only its size.
+            A::SetAudioCare { care } => {
+                if !care.is_object() || care.to_string().len() > 8_000 {
+                    return Err(EngineError::Invalid("care: { ducking, loudness_lufs }.".into()));
+                }
+                Ok(())
+            }
             A::AddScene { name, .. } | A::StartVertical { scene: name } => check_source_name(name),
             A::RemoveScene { scene }
             | A::MoveScene { scene, .. }
@@ -1794,6 +1807,7 @@ impl StudioAct {
                 | A::Audio { .. }
                 | A::Levels { .. }
                 | A::Look { .. }
+                | A::AudioCare
                 | A::Filters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram

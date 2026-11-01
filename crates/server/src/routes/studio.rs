@@ -123,6 +123,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/filters/{filter}/options", get(engine_filter_options))
         .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
         .route("/studio/engine/levels", post(engine_levels))
+        .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
@@ -1367,6 +1368,16 @@ async fn engine_record_pause(State(app): State<AppState>, Body(b): Body<OnBody>)
 
 async fn engine_monitoring(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_monitoring().await?))
+}
+
+/// The sound care: ducking and loudness (the Studio's document).
+async fn audio_care(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::AudioCare).await
+}
+
+async fn set_audio_care(State(app): State<AppState>, Body(care): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetAudioCare { care }).await?;
+    act(&app, StudioAct::AudioCare).await
 }
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
