@@ -283,8 +283,10 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
         }
         #[cfg(target_os = "macos")]
         "ffmpeg_source" => {
+            // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
+            // with FFmpeg and hands its pictures in, fitted into 1280x720.
             if s.get("is_local_file").and_then(Value::as_bool) == Some(false) {
-                return Err("Media from a network address".into());
+                return Ok((SourceKind::Fed { width: 1280, height: 720 }, true));
             }
             (
                 SourceKind::Media {
