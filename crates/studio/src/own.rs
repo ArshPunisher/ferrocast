@@ -629,7 +629,19 @@ impl OwnStream {
     }
 
     /// Sends the stream to an SRT, RIST or WHIP destination too (`id` replaces one before).
-    pub(crate) fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
+    /// The stream's hub (another stream's WebRTC simulcast layer), while it streams.
+    pub(crate) fn hub(&self) -> Option<Arc<Hub>> {
+        self.hub.clone()
+    }
+
+    /// `layer`: WebRTC only, a lower layer sent beside the stream (simulcast).
+    pub(crate) fn add_direct(
+        &mut self,
+        id: &str,
+        url: &str,
+        key: &str,
+        layer: Option<Arc<Hub>>,
+    ) -> Result<(), StudioError> {
         use ferrocast_golive::direct::{Direct, Kind};
         let kind = Kind::of(url)
             .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
@@ -646,6 +658,7 @@ impl OwnStream {
             url: url.trim().to_string(),
             key: key.to_string(),
             retry: Retry::default(),
+            layer: layer.filter(|_| kind == Kind::Whip),
         };
         ferrocast_golive::direct::check(&d).map_err(|e| StudioError::Failed(e.to_string()))?;
         let (health_tx, health) = tokio::sync::watch::channel(Health {

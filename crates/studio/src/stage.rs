@@ -2477,7 +2477,19 @@ impl StageOutput {
     /// is the stream id), `rist://` (simple profile) or an `https://` WHIP endpoint (the key is
     /// its bearer token).
     pub fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
-        self.own.add_direct(id, url, key)
+        self.own.add_direct(id, url, key, None)
+    }
+
+    /// `add_direct` for a WebRTC server with simulcast: `lower`'s stream (the lighter one) goes
+    /// beside this one as a second layer, where the server takes it.
+    pub fn add_direct_layered(
+        &mut self,
+        id: &str,
+        url: &str,
+        key: &str,
+        lower: &StageOutput,
+    ) -> Result<(), StudioError> {
+        self.own.add_direct(id, url, key, lower.own.hub())
     }
 
     pub fn remove_direct(&mut self, id: &str) {

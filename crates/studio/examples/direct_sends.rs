@@ -47,9 +47,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     enc.video_kbps = 2500;
     let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: None, own_encoder: true };
     let mut live = c.stream("rtmp://127.0.0.1:1935/main", "", &settings)?;
+    // FERROCAST_SIMULCAST=1: a lighter stream (360 high) goes beside it to WebRTC as a second layer.
+    let lighter = if std::env::var("FERROCAST_SIMULCAST").is_ok() {
+        let mut light = settings.clone();
+        light.encode.scale = Some((640, 360));
+        light.encode.video_kbps = 800;
+        Some(c.stream("rtmp://127.0.0.1:1935/light", "", &light)?)
+    } else {
+        None
+    };
     for (id, url) in sends {
         let Some(url) = url.filter(|u| !u.is_empty()) else { continue };
-        match live.add_direct(id, url, "") {
+        let added = match (&lighter, id) {
+            (Some(l), "whip") => live.add_direct_layered(id, url, "", l),
+            _ => live.add_direct(id, url, ""),
+        };
+        match added {
             Ok(()) => println!("{id}: added {url}"),
             Err(e) => println!("{id}: refused: {e}"),
         }
