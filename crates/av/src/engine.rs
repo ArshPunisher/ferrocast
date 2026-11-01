@@ -41,11 +41,13 @@ pub enum SourceKind {
         every_ms: u64,
         beep_ms: u64,
     },
-    /// A display (macOS); with `sound`, what the Mac plays too (Ferrocast's own left out).
+    /// A display (macOS); with `sound`, what the Mac plays too (Ferrocast's own left out). The
+    /// windows of the apps `hide` names (bundle ids or names) are left out: the privacy guard.
     #[cfg(target_os = "macos")]
     Screen {
         display: u32,
         sound: bool,
+        hide: Vec<String>,
     },
     /// One window (macOS), by its window number, as it looks wherever it is.
     #[cfg(target_os = "macos")]
@@ -567,7 +569,7 @@ impl Engine {
                 )
             }
             #[cfg(target_os = "macos")]
-            SourceKind::Screen { display, sound } => {
+            SourceKind::Screen { display, sound, hide } => {
                 let c = crate::screen::ScreenCapture::start_with(
                     crate::screen::Target::Display(display),
                     self.config.width,
@@ -575,6 +577,7 @@ impl Engine {
                     self.config.fps,
                     true,
                     sound,
+                    &hide,
                 )?;
                 if sound {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
@@ -590,6 +593,7 @@ impl Engine {
                     self.config.fps,
                     true,
                     false,
+                    &[],
                 )?;
                 (Live::Screen(c), None)
             }
@@ -608,6 +612,7 @@ impl Engine {
                     1,
                     false,
                     true,
+                    &[],
                 )?;
                 self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 (Live::Screen(c), None)

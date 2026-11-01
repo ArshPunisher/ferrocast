@@ -2,7 +2,7 @@
 //! window, at a size and frame rate, with or without the cursor. Frames arrive on a dispatch
 //! queue of ScreenCaptureKit's; the newest is kept (BGRA turned to RGBA) for the compositor.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,8 +19,8 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput,
-    SCStreamOutputType, SCWindow,
+    SCContentFilter, SCDisplay, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 use crate::{AvError, Picture};
@@ -39,6 +39,69 @@ pub struct Window {
     pub id: u32,
     pub title: String,
     pub app: String,
+}
+
+/// An app that's running, as a display capture can leave it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct App {
+    /// Its bundle id (com.hnc.Discord).
+    pub id: String,
+    pub name: String,
+}
+
+/// How often a display capture that leaves apps out looks for ones started since (an app's
+/// first window usually takes longer than this to show).
+const PRIVACY_EVERY: Duration = Duration::from_millis(500);
+
+/// Whether `hide` (bundle ids or app names, any case) names this app.
+fn hides(hide: &[String], bundle: &str, name: &str) -> bool {
+    hide.iter().any(|h| h.eq_ignore_ascii_case(bundle) || (!name.is_empty() && h.eq_ignore_ascii_case(name)))
+}
+
+/// The running apps `hide` names, and their process ids (to see when that changes).
+///
+/// # Safety
+/// `c` is a live content object.
+unsafe fn hidden_apps(c: &SCShareableContent, hide: &[String]) -> (Retained<NSArray<SCRunningApplication>>, Vec<i32>) {
+    // SAFETY: reading properties of the live content's apps.
+    unsafe {
+        let apps: Vec<Retained<SCRunningApplication>> = c
+            .applications()
+            .iter()
+            .filter(|a| hides(hide, &a.bundleIdentifier().to_string(), &a.applicationName().to_string()))
+            .collect();
+        let mut pids: Vec<i32> = apps.iter().map(|a| a.processID()).collect();
+        pids.sort_unstable();
+        (NSArray::from_retained_slice(&apps), pids)
+    }
+}
+
+/// A display's filter, leaving out the apps `hide` names.
+///
+/// # Safety
+/// `c` is a live content object.
+unsafe fn display_filter(
+    c: &SCShareableContent,
+    id: u32,
+    hide: &[String],
+) -> Result<(Retained<SCContentFilter>, Vec<i32>), AvError> {
+    // SAFETY: building a filter from the live content's display and apps.
+    unsafe {
+        let d: Retained<SCDisplay> = c
+            .displays()
+            .iter()
+            .find(|d| d.displayID() == id)
+            .ok_or_else(|| AvError::Source(format!("display {id} isn't connected")))?;
+        let none: Retained<NSArray<SCWindow>> = NSArray::new();
+        let (apps, pids) = hidden_apps(c, hide);
+        let filter = SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+            SCContentFilter::alloc(),
+            &d,
+            &apps,
+            &none,
+        );
+        Ok((filter, pids))
+    }
 }
 
 /// How long ScreenCaptureKit gets to answer.
@@ -95,6 +158,22 @@ pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     }
 }
 
+/// The running apps (with a bundle id), by name: what a display capture can leave out.
+pub fn apps() -> Result<Vec<App>, AvError> {
+    let c = content()?;
+    // SAFETY: reading properties of the live content's apps.
+    let mut apps: Vec<App> = unsafe {
+        c.applications()
+            .iter()
+            .map(|a| App { id: a.bundleIdentifier().to_string(), name: a.applicationName().to_string() })
+            .filter(|a| !a.id.is_empty())
+            .collect()
+    };
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
+    apps.dedup_by(|a, b| a.id == b.id);
+    Ok(apps)
+}
+
 /// What the stream's output keeps: the newest frame and how many came, and the sound
 /// (interleaved stereo float at 48 kHz, each piece with its host time) when it's captured.
 #[derive(Debug, Default)]
@@ -102,6 +181,8 @@ struct Shared {
     latest: Mutex<Option<Picture>>,
     frames: AtomicU64,
     sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
+    /// The picture holds (no new frame kept) while an app to leave out isn't left out yet.
+    hold: AtomicBool,
 }
 
 /// Sound pieces kept before they're taken (about 5 s).
@@ -131,6 +212,9 @@ define_class!(
                 return;
             }
             if kind != SCStreamOutputType::Screen {
+                return;
+            }
+            if self.ivars().hold.load(Ordering::Relaxed) {
                 return;
             }
             // SAFETY: the sample buffer is live for this call; an idle frame has no image.
@@ -219,7 +303,14 @@ pub struct ScreenCapture {
     output: Retained<Output>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     shared: Arc<Shared>,
+    /// Tells the thread that keeps apps out (when there is one) to stop.
+    privacy: Option<Arc<AtomicBool>>,
 }
+
+/// The stream, handed to the thread that keeps apps out.
+struct SendStream(Retained<SCStream>);
+// SAFETY: ScreenCaptureKit's stream may have its filter changed from any thread.
+unsafe impl Send for SendStream {}
 
 impl std::fmt::Debug for ScreenCapture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -241,11 +332,14 @@ pub enum Target {
 impl ScreenCapture {
     /// Starts capturing at `width`×`height` (scaled to fit), up to `fps` frames a second.
     pub fn start(target: Target, width: u32, height: u32, fps: u32, cursor: bool) -> Result<Self, AvError> {
-        Self::start_with(target, width, height, fps, cursor, false)
+        Self::start_with(target, width, height, fps, cursor, false, &[])
     }
 
     /// The same, and with `sound`, what the Mac plays too (all apps, or the window's app),
     /// leaving out Ferrocast's own: OBS's macOS desktop audio, with no driver to install.
+    /// A display leaves out the windows of the apps `hide` names (bundle ids or names): the
+    /// privacy guard, so a message or a notification never reaches the stream. Apps opened later
+    /// are left out too, within a couple of seconds' look.
     pub fn start_with(
         target: Target,
         width: u32,
@@ -253,20 +347,18 @@ impl ScreenCapture {
         fps: u32,
         cursor: bool,
         sound: bool,
+        hide: &[String],
     ) -> Result<Self, AvError> {
         let c = content()?;
         // SAFETY: building ScreenCaptureKit objects from the live content's displays and
         // windows, on this thread; each call gets live arguments.
         unsafe {
+            let mut hidden = Vec::new();
             let filter = match target {
                 Target::Display(id) => {
-                    let d: Retained<SCDisplay> = c
-                        .displays()
-                        .iter()
-                        .find(|d| d.displayID() == id)
-                        .ok_or_else(|| AvError::Source(format!("display {id} isn't connected")))?;
-                    let none: Retained<NSArray<SCWindow>> = NSArray::new();
-                    SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &d, &none)
+                    let (f, pids) = display_filter(&c, id, hide)?;
+                    hidden = pids;
+                    f
                 }
                 Target::Window(id) => {
                     let w: Retained<SCWindow> = c
@@ -332,7 +424,13 @@ impl ScreenCapture {
                 Ok(Err(m)) => return Err(AvError::Source(format!("the capture couldn't start ({m})"))),
                 Err(_) => return Err(AvError::Source("macOS didn't start the capture".into())),
             }
-            Ok(Self { stream, output, _queue: queue, shared })
+            let privacy = match target {
+                Target::Display(id) if !hide.is_empty() => {
+                    Some(keep_apps_out(SendStream(stream.clone()), shared.clone(), id, hide.to_vec(), hidden))
+                }
+                _ => None,
+            };
+            Ok(Self { stream, output, _queue: queue, shared, privacy })
         }
     }
 
@@ -352,8 +450,53 @@ impl ScreenCapture {
     }
 }
 
+/// Looks twice a second for apps `hide` names that started (or ended) since, and gives the
+/// stream a filter that leaves them out; the picture holds until macOS has taken it (and
+/// keeps holding, trying again, if it refuses). Stops when the flag is set.
+fn keep_apps_out(
+    stream: SendStream,
+    shared: Arc<Shared>,
+    display: u32,
+    hide: Vec<String>,
+    mut hidden: Vec<i32>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let _ = std::thread::Builder::new().name("ferrocast-privacy".into()).spawn(move || {
+        let stream = stream;
+        loop {
+            std::thread::sleep(PRIVACY_EVERY);
+            if stopped.load(Ordering::Relaxed) {
+                return;
+            }
+            let Ok(c) = content() else { continue };
+            // SAFETY: the content is live; the stream is live (this thread holds it).
+            unsafe {
+                let Ok((filter, pids)) = display_filter(&c, display, &hide) else { continue };
+                if pids == hidden || stopped.load(Ordering::Relaxed) {
+                    continue;
+                }
+                shared.hold.store(true, Ordering::Relaxed);
+                let (tx, rx) = mpsc::channel();
+                let done = RcBlock::new(move |e: *mut NSError| {
+                    let _ = tx.send(e.is_null());
+                });
+                stream.0.updateContentFilter_completionHandler(&filter, Some(&done));
+                if rx.recv_timeout(WAIT) == Ok(true) {
+                    hidden = pids;
+                    shared.hold.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+    stop
+}
+
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
+        if let Some(stop) = &self.privacy {
+            stop.store(true, Ordering::Relaxed);
+        }
         let (tx, rx) = mpsc::channel();
         let done = RcBlock::new(move |_e: *mut NSError| {
             let _ = tx.send(());
@@ -370,5 +513,19 @@ impl Drop for ScreenCapture {
                 .stream
                 .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), SCStreamOutputType::Audio);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apps_are_named_by_bundle_id_or_name_in_any_case() {
+        let hide = vec!["com.hnc.Discord".to_string(), "mail".to_string()];
+        assert!(hides(&hide, "com.hnc.discord", "Discord"));
+        assert!(hides(&hide, "com.apple.mail", "Mail"));
+        assert!(!hides(&hide, "com.tinyspeck.slackmacgap", "Slack"));
+        assert!(!hides(&["".into()], "com.apple.x", ""));
     }
 }

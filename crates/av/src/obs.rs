@@ -244,7 +244,30 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
 }
 
 /// A source kind the engine plays, from OBS's id and settings; Err with what it is otherwise.
-fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, bool), String> {
+/// macOS's notification banners (and Notification Center, and the desktop's widgets), by bundle id.
+pub const NOTIFICATIONS: &str = "com.apple.notificationcenterui";
+
+/// What a display capture leaves out, from the document's `ferrocast.privacy`: notifications
+/// (unless `hide_notifications` is false) and the apps in `hide_apps`.
+pub fn privacy_hide(doc: &Value) -> Vec<String> {
+    let p = &doc["ferrocast"]["privacy"];
+    let mut hide: Vec<String> = Vec::new();
+    if p["hide_notifications"].as_bool() != Some(false) {
+        hide.push(NOTIFICATIONS.into());
+    }
+    hide.extend(
+        p["hide_apps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|a| !a.is_empty())
+            .map(String::from),
+    );
+    hide
+}
+
+fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result<(SourceKind, bool), String> {
     let text_of = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(match id {
         "color_source" | "color_source_v2" | "color_source_v3" => (
@@ -317,7 +340,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32)) -> Result<(SourceKind, boo
                     // The display picked (by number), else the first (OBS keeps a display's UUID).
                     let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
                     let display = n("display").or_else(first).unwrap_or(0);
-                    (SourceKind::Screen { display, sound: false }, false)
+                    (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
                 }
                 _ => return Err("one app's windows (Application Capture)".into()),
             }
@@ -412,6 +435,7 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
         })
         .collect();
     let channels: Vec<Value> = CHANNELS.iter().filter_map(|k| doc.get(*k).cloned()).collect();
+    let hide = privacy_hide(doc);
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -476,7 +500,7 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                 out.skipped.push(format!("{name}: the filter {kind}"));
             }
         }
-        match kind_from(id, &settings, canvas) {
+        match kind_from(id, &settings, canvas, &hide) {
             Ok((kind, has_sound)) => {
                 let flags = s.get("flags").and_then(Value::as_u64).unwrap_or(0);
                 let sound = has_sound.then(|| SourceSettings {

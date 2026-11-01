@@ -5,10 +5,12 @@
 //!   cargo run -p ferrocast-av --example capture -- [seconds] [--sound] [--tiny]
 //!
 //! `--tiny` takes a 2×2 picture once a second, as the engine's desktop sound source does.
+//! `--private` leaves every running app out (the privacy guard) and says how much the
+//! picture changed against one with nothing left out (numbers only, no picture).
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use ferrocast_av::screen::{ScreenCapture, Target, shareable};
+    use ferrocast_av::screen::{ScreenCapture, Target, apps, shareable};
     let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let (displays, windows) = shareable()?;
     println!("{} displays, {} titled windows", displays.len(), windows.len());
@@ -19,7 +21,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--sound` also captures what the Mac plays (a short quiet tone is played to check).
     let sound = std::env::args().any(|a| a == "--sound");
     let (w, h, fps) = if std::env::args().any(|a| a == "--tiny") { (2, 2, 1) } else { (1280, 720, 30) };
-    let cap = ScreenCapture::start_with(Target::Display(main.id), w, h, fps, true, sound)?;
+    if std::env::args().any(|a| a == "--private") {
+        let apps = apps()?;
+        let notif = apps.iter().any(|a| a.id == ferrocast_av::obs::NOTIFICATIONS);
+        println!("{} running apps (notifications among them: {notif})", apps.len());
+        let first = |hide: &[String]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let cap = ScreenCapture::start_with(Target::Display(main.id), 320, 180, 10, false, false, hide)?;
+            let t = std::time::Instant::now();
+            while t.elapsed().as_secs() < 5 {
+                if let Some(p) = cap.take() {
+                    return Ok(p.rgba);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err("no frame".into())
+        };
+        let all = first(&[])?;
+        let none = first(&apps.iter().map(|a| a.id.clone()).collect::<Vec<_>>())?;
+        let diff = all.iter().zip(&none).filter(|(a, b)| a.abs_diff(**b) > 24).count() as f64 / all.len() as f64;
+        println!("with every app left out, {:.0}% of the picture changed", diff * 100.0);
+        return Ok(());
+    }
+    let cap = ScreenCapture::start_with(Target::Display(main.id), w, h, fps, true, sound, &[])?;
     let tone = if sound {
         let wav = std::env::temp_dir().join("ferrocast-tone.wav");
         write_tone(&wav)?;
