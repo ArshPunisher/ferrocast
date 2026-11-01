@@ -263,3 +263,29 @@ fn cbr_holds_the_rate_on_a_still_picture() {
         assert!(kbps >= 1500, "{kbps} kbps on a still picture");
     }
 }
+
+#[test]
+fn a_new_bitrate_takes_while_running() {
+    if !encodes() {
+        return;
+    }
+    let mut enc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
+    let mut sizes = [0usize; 2];
+    for i in 0..180u32 {
+        if i == 90 && !enc.set_kbps(500).unwrap_or_else(|e| panic!("{e}")) {
+            eprintln!("skipped: this encoder takes a new bitrate only at the next start");
+            return;
+        }
+        // A moving picture, so the encoder has something to spend bits on.
+        let px = bgra(i);
+        for p in enc
+            .encode(Frame::Bgra { data: &px, stride: 640 * 4 }, i64::from(i) * 33_333, false)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            sizes[usize::from(i >= 90)] += p.data.len();
+        }
+    }
+    let kbps = sizes.map(|b| b * 8 / 3 / 1000);
+    assert_eq!(enc.config().bitrate_kbps, 500);
+    assert!(kbps[1] * 2 < kbps[0], "2500 kbps then 500: {kbps:?}");
+}

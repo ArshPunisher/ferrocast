@@ -68,6 +68,11 @@ impl Pipeline {
         })
     }
 
+    /// A new video bitrate from now on; false when the encoder takes it only at the next start.
+    pub fn set_video_kbps(&mut self, kbps: u32) -> Result<bool, AvError> {
+        self.video.set_kbps(kbps)
+    }
+
     /// A frame at `ts_ns`. The first one is a keyframe and starts the clock.
     pub fn video(&mut self, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         let start = *self.start_ns.get_or_insert(ts_ns);

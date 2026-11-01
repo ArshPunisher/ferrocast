@@ -162,6 +162,60 @@ pub(crate) struct Encoder {
 // sessions may be used from any thread, and the sink is behind a mutex.
 unsafe impl Send for Encoder {}
 
+/// The bitrate, as OBS's own VideoToolbox encoder sets it; also on a running session (a new
+/// bitrate while live, as OBS's dynamic bitrate does).
+fn set_rate(session: &Owned, kbps: u32, rate: RateControl) -> Result<(), AvError> {
+    let none = || AvError::Encoder("out of memory setting the video bitrate".into());
+    let set = |key: CFStringRef, value: CFTypeRef| -> OSStatus {
+        // SAFETY: the session is live; key is a VideoToolbox constant, value a live CF object.
+        unsafe { VTSessionSetProperty(session.0, key, value) }
+    };
+    let bits = int(i32::try_from(u64::from(kbps) * 1000).unwrap_or(i32::MAX)).ok_or_else(none)?;
+    // SAFETY: VideoToolbox's constant keys.
+    let (cbr, avg, limits, quality) = unsafe {
+        (
+            kVTCompressionPropertyKey_ConstantBitRate,
+            kVTCompressionPropertyKey_AverageBitRate,
+            kVTCompressionPropertyKey_DataRateLimits,
+            kVTCompressionPropertyKey_Quality,
+        )
+    };
+    let limit = || -> OSStatus {
+        // At most a second's worth of bits in any second.
+        let (Some(bytes), Some(secs)) = (float(f64::from(kbps) * 125.0), float(1.0)) else { return -1 };
+        array(&[&bytes, &secs]).map_or(-1, |a| set(limits, a.0))
+    };
+    match rate {
+        RateControl::Cbr => {
+            // Apple silicon (macOS 13+) keeps a true constant rate; elsewhere the average,
+            // held under the rate each second.
+            if set(cbr, bits.0) != 0 {
+                let s = set(avg, bits.0);
+                if s != 0 {
+                    return Err(fail("set the bitrate", s));
+                }
+                limit();
+            }
+        }
+        RateControl::Average => {
+            let s = set(avg, bits.0);
+            if s != 0 {
+                return Err(fail("set the bitrate", s));
+            }
+        }
+        RateControl::Quality(q) => {
+            let q = float(f64::from(q.clamp(0.0, 1.0))).ok_or_else(none)?;
+            if set(quality, q.0) != 0 {
+                let s = set(avg, bits.0);
+                if s != 0 {
+                    return Err(fail("set the bitrate", s));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn fail(what: &str, status: OSStatus) -> AvError {
     AvError::Encoder(format!("the Mac's video encoder refused to {what} (error {status})"))
 }
@@ -209,7 +263,6 @@ impl Encoder {
             // SAFETY: the session is live; key is a VideoToolbox constant, value a live CF object.
             unsafe { VTSessionSetProperty(session.0, key, value) }
         };
-        let bits = int(i32::try_from(u64::from(cfg.bitrate_kbps) * 1000).unwrap_or(i32::MAX)).ok_or_else(none)?;
         let gop = float(f64::from(cfg.keyframe_secs.max(1))).ok_or_else(none)?;
         let rate = float(fps).ok_or_else(none)?;
         // SAFETY: reading VideoToolbox's and CoreVideo's constant CFStrings and CF booleans.
@@ -235,49 +288,7 @@ impl Encoder {
                 return Err(fail(what, s));
             }
         }
-        // The bitrate, as OBS's own VideoToolbox encoder sets it.
-        // SAFETY: VideoToolbox's constant keys.
-        let (cbr, avg, limits, quality) = unsafe {
-            (
-                kVTCompressionPropertyKey_ConstantBitRate,
-                kVTCompressionPropertyKey_AverageBitRate,
-                kVTCompressionPropertyKey_DataRateLimits,
-                kVTCompressionPropertyKey_Quality,
-            )
-        };
-        let limit = || -> OSStatus {
-            // At most a second's worth of bits in any second.
-            let (Some(bytes), Some(secs)) = (float(f64::from(cfg.bitrate_kbps) * 125.0), float(1.0)) else { return -1 };
-            array(&[&bytes, &secs]).map_or(-1, |a| set(limits, a.0))
-        };
-        match cfg.rate {
-            RateControl::Cbr => {
-                // Apple silicon (macOS 13+) keeps a true constant rate; elsewhere the average,
-                // held under the rate each second.
-                if set(cbr, bits.0) != 0 {
-                    let s = set(avg, bits.0);
-                    if s != 0 {
-                        return Err(fail("set the bitrate", s));
-                    }
-                    limit();
-                }
-            }
-            RateControl::Average => {
-                let s = set(avg, bits.0);
-                if s != 0 {
-                    return Err(fail("set the bitrate", s));
-                }
-            }
-            RateControl::Quality(q) => {
-                let q = float(f64::from(q.clamp(0.0, 1.0))).ok_or_else(none)?;
-                if set(quality, q.0) != 0 {
-                    let s = set(avg, bits.0);
-                    if s != 0 {
-                        return Err(fail("set the bitrate", s));
-                    }
-                }
-            }
-        }
+        set_rate(&session, cfg.bitrate_kbps, cfg.rate)?;
         // Hints and colour tags: the encoder may ignore them.
         // SAFETY: as above, constants only.
         unsafe {
@@ -298,6 +309,11 @@ impl Encoder {
             height: cfg.height as usize,
             frame_us: (1_000_000.0 / fps).round() as i64,
         })
+    }
+
+    /// A new bitrate for what's encoded from now on.
+    pub(crate) fn set_rate(&mut self, kbps: u32, rate: RateControl) -> Result<(), AvError> {
+        set_rate(&self.session, kbps, rate)
     }
 
     pub(crate) fn header(&self) -> Option<Vec<u8>> {

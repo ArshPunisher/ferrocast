@@ -183,6 +183,23 @@ impl VideoEncoder {
         }
     }
 
+    /// A new bitrate for what's encoded from now on. The Mac's encoder takes it while running;
+    /// FFmpeg's can't (false: it applies from the next start).
+    pub fn set_kbps(&mut self, kbps: u32) -> Result<bool, AvError> {
+        if kbps == 0 {
+            return Err(AvError::Encoder("the bitrate must be above 0".into()));
+        }
+        match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => {
+                e.set_rate(kbps, self.config.rate)?;
+                self.config.bitrate_kbps = kbps;
+                Ok(true)
+            }
+            Inner::Ffmpeg(_) => Ok(false),
+        }
+    }
+
     /// Everything still inside the encoder.
     pub fn flush(&mut self) -> Result<Vec<VideoPacket>, AvError> {
         match &mut self.inner {

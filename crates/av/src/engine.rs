@@ -702,6 +702,18 @@ impl Engine {
         Ok(id)
     }
 
+    /// A new video bitrate for an output from now on; false when its encoder takes it only at
+    /// the next start (FFmpeg's).
+    pub fn set_output_kbps(&self, id: u64, kbps: u32) -> Result<bool, AvError> {
+        let mut st = self.lock();
+        let (_, pipe, ..) = st
+            .outputs
+            .iter_mut()
+            .find(|(i, ..)| *i == id)
+            .ok_or_else(|| AvError::Source(format!("there's no output {id}")))?;
+        pipe.set_video_kbps(kbps)
+    }
+
     /// Stops an output: what's in its encoders is sent and a recording is closed.
     pub fn stop_output(&self, id: u64) -> Result<(), AvError> {
         let taken = {
