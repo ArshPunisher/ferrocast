@@ -1056,6 +1056,27 @@ impl Engine {
         self.gpu.render(&scaled(scene, size.0.max(1), size.1.max(1), Filter::Bicubic))
     }
 
+    /// One source's picture alone, scaled to `size`, RGBA (face follow looks at it). None until
+    /// it has a picture.
+    pub fn snapshot_source_at(&self, id: u64, size: (u32, u32)) -> Option<Vec<u8>> {
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let item = {
+            let st = self.lock();
+            let (sw, sh, premultiplied) = st.sources.get(&id)?.size?;
+            let mut it = Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default());
+            it.content = Content::Uploaded { id, width: sw, height: sh, premultiplied };
+            it.placement = Placement {
+                bounds: crate::Bounds::Stretch,
+                bounds_width: w as f32,
+                bounds_height: h as f32,
+                ..Default::default()
+            };
+            it.filter = Filter::Bilinear;
+            it
+        };
+        self.gpu.render(&Scene { width: w, height: h, items: vec![item] }).ok()
+    }
+
     /// The scene on air drawn now, RGBA (a preview or a screenshot).
     pub fn snapshot(&self) -> Result<Vec<u8>, AvError> {
         let frame = {
