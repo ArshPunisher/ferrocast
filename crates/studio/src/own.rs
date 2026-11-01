@@ -24,6 +24,23 @@ use ferrocast_golive::{Hub, Target};
 use crate::collection::VERTICAL_SIZE;
 use crate::{EncodeSettings, ProgramFeed, RecordPlan, RecordStats, StreamSettings, StreamStats, Studio, StudioError};
 
+/// Our encoder's settings for `e` at a picture of this size and rate.
+fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoConfig {
+    let codec = if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
+    VideoConfig {
+        codec,
+        input: PixelFormat::Nv12,
+        width,
+        height,
+        fps_num: fps.max(1),
+        fps_den: 1,
+        bitrate_kbps: e.video_kbps.max(100),
+        rate: rate_of(e),
+        keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+        software: is_x264(&e.video_encoder),
+    }
+}
+
 /// x264 (and Lossless) run through FFmpeg, which Ferrocast fetches the first time it's needed.
 const NO_FFMPEG: &str =
     "x264 or Lossless before FFmpeg is downloaded (Go live › Vertical › Cut it from your stream fetches it)";
@@ -139,11 +156,17 @@ pub(crate) struct OwnStream {
     hub: Option<Arc<Hub>>,
 }
 
-/// Our engine with the collection open, and what it last opened.
+/// The Studio's one engine, with the collection open: every drawn output (and the preview)
+/// shares it, so a camera or a microphone is opened once whatever runs.
 #[derive(Debug)]
-struct Drawn {
-    engine: Engine,
-    output: u64,
+pub(crate) struct Shared {
+    pub engine: Engine,
+    seen: Mutex<Seen>,
+}
+
+/// What the shared engine last opened.
+#[derive(Debug)]
+struct Seen {
     /// The collection as last opened, without the scene on air: when it differs, it's opened
     /// again (at most twice a second).
     shown: serde_json::Value,
@@ -151,6 +174,90 @@ struct Drawn {
     on_air: Option<String>,
     /// What couldn't come over.
     skipped: Vec<String>,
+    /// Sources shown on their own (Source Record): their scenes come back after a reopen.
+    alone: Vec<String>,
+}
+
+impl Shared {
+    /// Starts the engine at the Studio's canvas with the collection `doc` open.
+    pub(crate) fn open(studio: &Studio, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
+        let canvas = studio.canvas();
+        let config = EngineConfig {
+            width: canvas.width,
+            height: canvas.height,
+            fps: canvas.fps.max(1),
+            ..EngineConfig::default()
+        };
+        // Each output brings its own encoding; these only fill the gaps.
+        let video = video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps);
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
+        let engine = Engine::new(config, video, audio)
+            .map_err(|e| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}")))?;
+        let skipped = engine.load_obs(doc);
+        for s in &skipped {
+            tracing::info!("Ferrocast's own engine doesn't bring this over yet: {s}");
+        }
+        let on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        tracing::info!("Ferrocast's own engine opened the scenes");
+        Ok(Arc::new(Self {
+            engine,
+            seen: Mutex::new(Seen {
+                shown: without_on_air(doc),
+                opened: std::time::Instant::now(),
+                on_air,
+                skipped,
+                alone: Vec::new(),
+            }),
+        }))
+    }
+
+    fn seen(&self) -> std::sync::MutexGuard<'_, Seen> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn skipped(&self) -> Vec<String> {
+        self.seen().skipped.clone()
+    }
+
+    /// Keeps the engine with the Studio: a new scene on air goes on through the Studio's
+    /// transition; any other change opens the collection again (only changed sources restart).
+    /// Returns whether it was opened again. Many outputs may call it each tick: only the first
+    /// finds something to do.
+    pub(crate) fn follow(&self, doc: &serde_json::Value) -> bool {
+        let mut seen = self.seen();
+        let bare = without_on_air(doc);
+        if bare != seen.shown && seen.opened.elapsed() >= REOPEN_EVERY {
+            seen.skipped = self.engine.load_obs(doc);
+            // Opening again clears the scenes: sources shown alone get their scenes back.
+            for name in seen.alone.clone() {
+                if let Err(e) = show_alone(&self.engine, &name, (0, 0)) {
+                    tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
+                }
+            }
+            seen.shown = bare;
+            seen.opened = std::time::Instant::now();
+            seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+            return true;
+        }
+        let now = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        if now != seen.on_air
+            && let Some(name) = &now
+        {
+            let (kind, ms) = transition_of(doc);
+            if let Err(e) = self.engine.go_with(name, kind, ms) {
+                tracing::warn!("Ferrocast's own engine couldn't follow the scene change: {e}");
+            }
+            seen.on_air = now;
+        }
+        false
+    }
+}
+
+/// An output on the shared engine.
+#[derive(Debug)]
+struct Drawn {
+    shared: Arc<Shared>,
+    output: u64,
     /// A recording's plan (its names and when to split), and when the file now written began.
     plan: Option<(RecordPlan, std::time::Instant)>,
     /// The vertical picture's scene on air, when this draws the vertical picture.
@@ -184,7 +291,9 @@ pub(crate) struct Drawing<'a> {
 }
 
 /// The scene a source shown alone is drawn from (no collection names a scene like it).
-const ALONE: &str = "\u{1}Ferrocast: on its own";
+fn alone_scene(name: &str) -> String {
+    format!("\u{1}Ferrocast: {name} on its own")
+}
 
 /// Shows a scene, or a source alone, for a Source Record → the scene to draw and the size: a
 /// scene at `canvas`; a source at its own size (waited for up to 2 s while it starts; `canvas`
@@ -213,8 +322,9 @@ fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Result<(String
             ..Default::default()
         },
     );
-    engine.set_scene(ALONE, vec![item]);
-    Ok((ALONE.to_string(), w, h))
+    let scene = alone_scene(name);
+    engine.set_scene(&scene, vec![item]);
+    Ok((scene, w, h))
 }
 
 /// The vertical picture's scene on air in a saved collection.
@@ -447,40 +557,17 @@ impl OwnStream {
 
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
-    pub(crate) fn drawn(studio: &Studio, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
+    pub(crate) fn drawn(shared: Arc<Shared>, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
         let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo } = how;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
             None => None,
         };
-        let canvas = studio.canvas();
-        let codec =
-            if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
-        let video = VideoConfig {
-            codec,
-            input: PixelFormat::Nv12,
-            width: canvas.width,
-            height: canvas.height,
-            fps_num: canvas.fps.max(1),
-            fps_den: 1,
-            bitrate_kbps: e.video_kbps.max(100),
-            rate: rate_of(e),
-            keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
-            software: is_x264(&e.video_encoder),
-        };
+        let engine = &shared.engine;
+        let config = engine.config();
+        let video = video_config(e, config.width, config.height, config.fps);
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let config = EngineConfig {
-            width: canvas.width,
-            height: canvas.height,
-            fps: canvas.fps.max(1),
-            ..EngineConfig::default()
-        };
-        let engine = Engine::new(config, video, audio).map_err(|e| fail(e.to_string()))?;
-        let skipped = engine.load_obs(doc);
-        for s in &skipped {
-            tracing::info!("Ferrocast's own engine doesn't bring this over yet: {s}");
-        }
         let hub = Hub::new();
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
@@ -511,8 +598,12 @@ impl OwnStream {
             (false, None) => AvCanvas::main(config),
         };
         if let Some(name) = solo {
-            let (scene, w, h) = show_alone(&engine, name, (config.width, config.height))?;
+            let (scene, w, h) = show_alone(engine, name, (config.width, config.height))?;
             (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w, h, None);
+            let mut seen = shared.seen();
+            if !seen.alone.iter().any(|n| n == name) {
+                seen.alone.push(name.to_string());
+            }
         }
         // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
         let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
@@ -520,9 +611,8 @@ impl OwnStream {
             out.track = first;
             out.more_tracks = picked.collect();
         }
-        let output = engine.start_output_on(kind, out).map_err(|e| fail(e.to_string()))?;
-        tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
-        let on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+        let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
+        tracing::info!(codec = ?video.codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -532,12 +622,8 @@ impl OwnStream {
             runtime,
             feed: None,
             drawn: Some(Drawn {
-                engine,
+                shared,
                 output,
-                shown: without_on_air(doc),
-                opened: std::time::Instant::now(),
-                on_air,
-                skipped,
                 plan: None,
                 vertical: vertical.then(|| vertical_on_air(doc)),
                 solo: solo.map(String::from),
@@ -546,53 +632,29 @@ impl OwnStream {
         })
     }
 
-    /// Keeps a drawn stream with the Studio: a new scene on air goes on through the Studio's
-    /// transition; any other change opens the collection again (only changed sources restart). Returns
-    /// whether it was opened again. Nothing for a stream libobs draws.
+    /// Keeps a drawn output with the Studio (the shared engine follows the collection; the
+    /// vertical picture follows its own scene on air). Returns whether the collection was
+    /// opened again. Nothing for an output libobs draws.
     pub(crate) fn follow(&mut self, doc: &serde_json::Value) -> bool {
         let Some(d) = self.drawn.as_mut() else { return false };
         // The vertical picture follows its own scene on air (a cut).
         if let Some(shown) = d.vertical.as_mut() {
             let now = vertical_on_air(doc);
             if now != *shown {
-                if let Err(e) = d.engine.set_output_scene(d.output, now.clone()) {
+                if let Err(e) = d.shared.engine.set_output_scene(d.output, now.clone()) {
                     tracing::warn!("Ferrocast's own engine couldn't follow the vertical scene: {e}");
                 }
                 *shown = now;
             }
         }
-        let bare = without_on_air(doc);
-        if bare != d.shown && d.opened.elapsed() >= REOPEN_EVERY {
-            d.skipped = d.engine.load_obs(doc);
-            // Opening again clears the scenes: a source shown alone gets its own scene back.
-            if let Some(name) = &d.solo
-                && let Err(e) = show_alone(&d.engine, name, (0, 0))
-            {
-                tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
-            }
-            d.shown = bare;
-            d.opened = std::time::Instant::now();
-            d.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
-            return true;
-        }
-        let now = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
-        if now != d.on_air
-            && let Some(name) = &now
-        {
-            let (kind, ms) = transition_of(doc);
-            if let Err(e) = d.engine.go_with(name, kind, ms) {
-                tracing::warn!("Ferrocast's own engine couldn't follow the scene change: {e}");
-            }
-            d.on_air = now;
-        }
-        false
+        d.shared.follow(doc)
     }
 
     /// A new video bitrate while live (the stream doctor's lighter one, a manual change).
     pub(crate) fn set_video_kbps(&self, kbps: u32) {
         match &self.drawn {
             Some(d) => {
-                if let Err(e) = d.engine.set_output_kbps(d.output, kbps) {
+                if let Err(e) = d.shared.engine.set_output_kbps(d.output, kbps) {
                     tracing::warn!("Ferrocast's own engine kept its bitrate: {e}");
                 }
             }
@@ -615,7 +677,7 @@ impl OwnStream {
     /// is set to the file once it's there (or `failed` to why not).
     pub(crate) fn save_replay(&self, path: &std::path::Path, done: Arc<Mutex<ReplaySaved>>) -> Result<(), StudioError> {
         let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("The replay buffer couldn't save.".into()))?;
-        let clip = d.engine.replay_clip(d.output).map_err(|e| StudioError::Failed(e.to_string()))?;
+        let clip = d.shared.engine.replay_clip(d.output).map_err(|e| StudioError::Failed(e.to_string()))?;
         let path = path.to_path_buf();
         std::thread::Builder::new()
             .name("ferrocast-replay-save".into())
@@ -637,13 +699,13 @@ impl OwnStream {
     /// Pauses or resumes the recording (no gap in the file).
     pub(crate) fn pause(&self, on: bool) -> Result<(), StudioError> {
         let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("This recording can't pause.".into()))?;
-        d.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
+        d.shared.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
     }
 
     /// Goes on in a new file at `path` from the next frame.
     pub(crate) fn split(&mut self, path: &std::path::Path) -> Result<(), StudioError> {
         let d = self.drawn.as_mut().ok_or_else(|| StudioError::Failed("This recording can't be split.".into()))?;
-        d.engine.split_output(d.output, path).map_err(|e| StudioError::Failed(e.to_string()))?;
+        d.shared.engine.split_output(d.output, path).map_err(|e| StudioError::Failed(e.to_string()))?;
         if let Some((_, since)) = d.plan.as_mut() {
             *since = std::time::Instant::now();
         }
@@ -655,7 +717,7 @@ impl OwnStream {
     pub(crate) fn split_due(&self) -> bool {
         let Some(d) = &self.drawn else { return false };
         let Some((plan, since)) = &d.plan else { return false };
-        let Ok(state) = d.engine.output_record_state(d.output) else { return false };
+        let Ok(state) = d.shared.engine.output_record_state(d.output) else { return false };
         if state.splitting {
             return false;
         }
@@ -670,16 +732,16 @@ impl OwnStream {
     }
 
     /// What our engine couldn't bring over (empty when libobs draws).
-    pub(crate) fn skipped(&self) -> &[String] {
-        self.drawn.as_ref().map_or(&[], |d| &d.skipped)
+    pub(crate) fn skipped(&self) -> Vec<String> {
+        self.drawn.as_ref().map(|d| d.shared.skipped()).unwrap_or_default()
     }
 
     pub(crate) fn stats(&self) -> StreamStats {
         let state = self.health.as_ref().map(|h| h.borrow().state.clone());
         if let Some(d) = &self.drawn {
-            let s = d.engine.stats();
+            let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.engine.error().is_none(),
+                active: d.shared.engine.error().is_none(),
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.min(u64::from(u32::MAX)) as u32,
@@ -698,12 +760,12 @@ impl OwnStream {
     pub(crate) fn record_stats(&self) -> RecordStats {
         let s = self.stats();
         let paused =
-            self.drawn.as_ref().is_some_and(|d| d.engine.output_record_state(d.output).is_ok_and(|r| r.paused));
+            self.drawn.as_ref().is_some_and(|d| d.shared.engine.output_record_state(d.output).is_ok_and(|r| r.paused));
         RecordStats { active: s.active, paused, bytes: s.bytes, frames: s.frames }
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {
-        if let Some(e) = self.drawn.as_ref().and_then(|d| d.engine.error()) {
+        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.error()) {
             return Some(e);
         }
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {
@@ -758,8 +820,12 @@ impl Drop for OwnStream {
         // libobs stops handing frames over; our engine closes its output (encoders flushed).
         self.feed = None;
         if let Some(d) = self.drawn.take() {
-            if let Err(e) = d.engine.stop_output(d.output) {
+            if let Err(e) = d.shared.engine.stop_output(d.output) {
                 tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
+            }
+            // A source no longer recorded alone needn't come back after a reopen.
+            if let Some(name) = &d.solo {
+                d.shared.seen().alone.retain(|n| n != name);
             }
             if let Some(hub) = self.hub.take() {
                 hub.end();

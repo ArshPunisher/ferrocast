@@ -244,7 +244,8 @@ impl Collection {
             replay: None,
             solo: None,
         };
-        let own = crate::own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        let doc = self.save("Ferrocast");
+        let own = crate::own::OwnStream::drawn(self.own_engine(&doc)?, &doc, how)?;
         Ok(crate::Streaming::own(self.studio.clone(), s, own))
     }
 

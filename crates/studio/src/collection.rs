@@ -507,6 +507,9 @@ pub struct Collection {
     moves: RefCell<Option<moves::MoveRun>>,
     /// The last capture check and when it ran (`capture_problems`).
     captures_seen: RefCell<(Option<std::time::Instant>, Vec<CaptureProblem>)>,
+    /// Ferrocast's own engine with this collection open, while any output (or the preview)
+    /// uses it: they all share it, so each camera and microphone is opened once.
+    own_engine: RefCell<std::sync::Weak<own::Shared>>,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).
@@ -589,6 +592,7 @@ impl Collection {
             sizes_seen: RefCell::new(std::collections::HashMap::new()),
             captures_seen: RefCell::new((None, Vec::new())),
             moves: RefCell::new(None),
+            own_engine: RefCell::new(std::sync::Weak::new()),
         };
         c.make_transition("fade_transition")?;
         Ok(c)
@@ -3564,7 +3568,10 @@ impl Collection {
             replay: None,
             solo: None,
         };
-        let own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        let own = {
+            let doc = self.save("Ferrocast");
+            own::OwnStream::drawn(self.own_engine(&doc)?, &doc, how)?
+        };
         Ok(Streaming::own(self.studio.clone(), s.clone(), own))
     }
 
@@ -3584,9 +3591,24 @@ impl Collection {
             replay: None,
             solo: None,
         };
-        let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        let mut own = {
+            let doc = self.save("Ferrocast");
+            own::OwnStream::drawn(self.own_engine(&doc)?, &doc, how)?
+        };
         own.set_plan(plan);
         Ok(Recording::own(self.studio.clone(), path, own))
+    }
+
+    /// Ferrocast's own engine with this collection open (`doc`, as `save` gives it): the one
+    /// already running, brought up to date, or a new one.
+    pub(crate) fn own_engine(&self, doc: &Value) -> Result<std::sync::Arc<own::Shared>, StudioError> {
+        if let Some(shared) = self.own_engine.borrow().upgrade() {
+            shared.follow(doc);
+            return Ok(shared);
+        }
+        let shared = own::Shared::open(&self.studio, doc)?;
+        *self.own_engine.borrow_mut() = std::sync::Arc::downgrade(&shared);
+        Ok(shared)
     }
 
     /// Records one scene or source on its own (OBS's Source Record) drawn by Ferrocast's own
@@ -3610,7 +3632,10 @@ impl Collection {
             replay: None,
             solo: Some(name),
         };
-        let mut own = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        let mut own = {
+            let doc = self.save("Ferrocast");
+            own::OwnStream::drawn(self.own_engine(&doc)?, &doc, how)?
+        };
         own.set_plan(plan);
         Ok(Recording::own(self.studio.clone(), path, own))
     }
@@ -3636,7 +3661,10 @@ impl Collection {
             replay: Some((plan.seconds, plan.mb)),
             solo: None,
         };
-        let stream = own::OwnStream::drawn(&self.studio, &self.save("Ferrocast"), how)?;
+        let stream = {
+            let doc = self.save("Ferrocast");
+            own::OwnStream::drawn(self.own_engine(&doc)?, &doc, how)?
+        };
         Ok(ReplayBuffer {
             studio: self.studio.clone(),
             out: std::ptr::null_mut(),
