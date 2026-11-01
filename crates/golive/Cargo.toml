@@ -20,6 +20,9 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+# SRT sends (the Studio's direct destinations): pure Rust SRT, Apache-2.0.
+srt-tokio = "0.4.4"
+futures = "0.3"
 
 [lints]
 workspace = true

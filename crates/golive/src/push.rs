@@ -128,7 +128,7 @@ pub enum PushError {
 
 /// How a session ended without an error.
 #[derive(Debug, PartialEq, Eq)]
-enum Ended {
+pub(crate) enum Ended {
     /// OBS stopped streaming.
     StreamEnded,
     /// Asked to stop.
@@ -199,7 +199,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
     set_state(&health, PushState::Stopped);
 }
 
-fn set_state(health: &watch::Sender<Health>, state: PushState) {
+pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
     health.send_modify(|h| {
         if h.state != state {
             h.state = state;
@@ -217,7 +217,7 @@ pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
     base.mul_f64(jitter)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
