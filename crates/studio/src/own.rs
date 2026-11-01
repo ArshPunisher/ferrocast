@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use ferrocast_av::TransitionKind;
 use ferrocast_av::audio::AudioConfig;
-use ferrocast_av::engine::{Engine, EngineConfig, OutputKind};
+use ferrocast_av::engine::{Canvas as AvCanvas, Engine, EngineConfig, OutputKind};
 use ferrocast_av::pipeline::{Pipeline, Tag};
 use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
@@ -35,8 +35,6 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("a stream delay")
     } else if s.vod_track.is_some() {
         Some("Twitch's VOD track")
-    } else if s.encode.scale.is_some() {
-        Some("a scaled stream")
     } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&s.encode.video_encoder) {
         Some("constant quality")
     } else if !s.encode.extra.is_empty() {
@@ -63,8 +61,6 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("constant quality")
     } else if !plan.encode.extra.is_empty() {
         Some("an encoder's own options")
-    } else if plan.encode.scale.is_some() {
-        Some("a scaled recording")
     } else if is_x264(&plan.encode.video_encoder) && !ferrocast_av::ffenc::available() {
         Some(NO_FFMPEG)
     } else if !own_codec_ok(&plan.encode.video_encoder) {
@@ -399,7 +395,12 @@ impl OwnStream {
                 }))
             }
         };
-        let output = engine.start_output(kind).map_err(|e| fail(e.to_string()))?;
+        // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
+        let out = match e.scale {
+            Some((w, h)) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
+            None => AvCanvas::main(config),
+        };
+        let output = engine.start_output_on(kind, out).map_err(|e| fail(e.to_string()))?;
         tracing::info!(?codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         let on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
         Ok(Self {
