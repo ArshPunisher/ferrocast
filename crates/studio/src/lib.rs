@@ -9,6 +9,7 @@
 mod collection;
 mod ffi;
 pub mod import;
+mod naming;
 mod own;
 pub mod projector;
 pub mod stage;
