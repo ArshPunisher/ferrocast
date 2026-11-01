@@ -15,6 +15,6 @@ RUN apt-get update \
 COPY --from=build /src/target/release/ferrocast-bond /usr/local/bin/ferrocast-bond
 USER bond
 ENV BOND_HTTP=0.0.0.0:8795 BOND_SRTLA=0.0.0.0:5000 BOND_SRT=0.0.0.0:5001 BOND_LOG=info
-EXPOSE 8795 5000/udp 5001/udp
+EXPOSE 8795 5000/udp 5001/udp 40000-40099/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8795 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
 ENTRYPOINT ["/usr/local/bin/ferrocast-bond"]

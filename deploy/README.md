@@ -454,14 +454,18 @@ once), sends it on to their platforms, and holds it on a Be right back picture f
 minutes if their computer drops. It needs UDP, which the Cloudflare Tunnel can't carry, so
 starting it is the owner's call (it puts the server's address in the app):
 
-1. Oracle Cloud → the instance's subnet → Security List: allow UDP 5000-5001 in from anywhere.
-   On the server: `sudo iptables -I INPUT -p udp --dport 5000:5001 -j ACCEPT` (and save it).
+1. Oracle Cloud → the instance's subnet → Security List: allow UDP 5000-5001 and 40000-40099
+   (phones) in from anywhere. On the server: `sudo iptables -I INPUT -p udp --dport 5000:5001 -j ACCEPT`
+   and the same for `40000:40099` (and save them).
 2. A DNS record for the stream, *not* proxied (grey cloud: Cloudflare can't proxy UDP), e.g.
    `bond-udp.clearcraftlabs.com` → the server's public IP.
 3. Cloudflare → Tunnels → ferrocast-relay → Public hostname: `bond.clearcraftlabs.com` →
    `http://ferrocast-bond:8795` (the API, behind the tunnel like the relay).
 4. A secret for both: `openssl rand -hex 32`. In `/opt/ferrocast-relay/bond.env`:
-   `BOND_SECRET=<it>` (chmod 600). In `relay.env`: the same `BOND_SECRET`, plus
+   `BOND_SECRET=<it>`, `BOND_PUBLIC_URL=https://bond.clearcraftlabs.com`, `BOND_RTC_IP=<the
+   instance's private IP>` (WebRTC finds the public one itself) and `BOND_VAPID_KEY=<docker run
+   --rm ferrocast-bond vapid-key>` for phone alerts (chmod 600; keep the key: a new one drops
+   every phone's alerts). In `relay.env`: the same `BOND_SECRET`, plus
    `BOND_API_URL=https://bond.clearcraftlabs.com` and `BOND_SRTLA_HOST=bond-udp.clearcraftlabs.com`.
 5. Build and start it: `docker build -f deploy/bond.Dockerfile -t ferrocast-bond .` (or pull a
    built image), then `docker compose -f bond-compose.yml up -d`, and redeploy the relay so it

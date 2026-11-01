@@ -15,6 +15,8 @@ services:
     ports:
       - "5000:5000/udp"
       - "5001:5001/udp"
+      # Phones' WebRTC (Stream from your phone).
+      - "40000-40099:40000-40099/udp"
     networks: [relay]
     read_only: true
     tmpfs: [/tmp]
