@@ -1450,8 +1450,11 @@ async fn going_live_posts_to_discord_once_per_platform() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let posts = seen.lock().unwrap().clone();
     assert_eq!(posts.len(), 2, "Twitch once (the reconnect isn't news), Kick once");
-    assert_eq!(posts[0]["content"], "The stream is live on Twitch: Ranked");
-    assert_eq!(posts[0]["allowed_mentions"]["parse"], serde_json::json!(["everyone"]));
+    // The posts go out side by side, so they can land in either order.
+    let twitch = posts.iter().find(|p| p["content"].as_str().is_some_and(|c| c.contains("Twitch"))).unwrap();
+    assert_eq!(twitch["content"], "The stream is live on Twitch: Ranked");
+    assert_eq!(twitch["allowed_mentions"]["parse"], serde_json::json!(["everyone"]));
+    assert!(posts.iter().any(|p| p["content"] == "The stream is live on Kick:"));
     let view = e.discord().await.unwrap();
     assert!(view.has_webhook);
     assert!(!serde_json::to_string(&view).unwrap().contains("tok"), "the URL never comes back");
