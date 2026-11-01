@@ -222,14 +222,17 @@ Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps
 | Item opacity (a group fades as one); keyframes (position, size, rotation, opacity; eased, held, looping); the Move transition built in; stingers | `compose.rs`, `engine.rs` | unit tests in the engine |
 | Cameras and microphones run on real devices | `apple/camera.rs` | USB camera 1920×1080; iPhone mic 48 kHz |
 | OBS scene collections open in the engine: colour, image, text, media, screen, camera and microphone sources; every item setting (place, turn, scale, crop, bounds, blend, scale filter, shown); scenes inside scenes; picture and sound filters; volume, balance, mono, sync, tracks, monitoring. Whatever it can't run yet (a browser source, an unported filter) is listed by name | `obs.rs`, `Engine::load_obs` | `obs_import`: three scenes made in libobs, saved, opened by the engine: 0 pixels apart |
+| Groups in imported collections (OBS's backup copies of their items skipped) | `obs.rs`, `engine.rs` | `obs_import` Grouped: a turned, scaled group, 313 edge pixels of 921,600 apart |
+| More of OBS's filters: Crop/Pad, Image Mask/Blend (all five kinds), Apply LUT (PNG and .cube, 1D and 3D, amount, domain, alpha passed through), Scroll (wrapping, or scrolling away; its position from the scene's clock, so dropped frames don't make it drift) | `effects.wgsl`, `lut.rs`, `compose.rs` | `obs_import`: worst difference 1 (Scroll compared at rest) |
 
 CI: Linux's software OpenGL can't give a texture two views, so the compositor refuses it with
 a reason (tests skip there); macOS and Windows run every engine test.
 Still to do: Windows capture (WGC, WASAPI, Media Foundation cameras) and native encoders (FFmpeg
 covers encoding there for now); the engine drawing for the app (E7: it opens the app's
 collections now; next it takes over the preview and output); zero-copy (IOSurface and shared
-D3D textures from capture to encoder); more of libobs's filters (LUT, crop/pad, scroll, mask);
-groups in imported collections; web pages; game capture (E5); helper processes (E6).
+D3D textures from capture to encoder); the rest of libobs's filters (Scale/Aspect Ratio, render
+and video delay, HDR tone mapping); sound filters compared against libobs's output; web pages;
+game capture (E5); helper processes (E6).
 
 ### Honest sizes and risks
 
