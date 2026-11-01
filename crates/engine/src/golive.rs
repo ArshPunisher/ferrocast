@@ -881,7 +881,7 @@ impl Engine {
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
-                    lighter_for_route: !d.wants_light() && self.wants_light_now(d),
+                    lighter_for_route: !d.wants_light() && self.on_light(d),
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                 }
@@ -1932,6 +1932,15 @@ impl Engine {
         use ferrocast_golive::protect::Sample;
         use ferrocast_golive::quality::Move;
         let g = self.golive();
+        // Only the Ferrocast Studio makes a lighter stream (OBS sends one): with none to move
+        // to, nothing moves.
+        let studio = match self.studio_host() {
+            Ok(h) => h.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null()),
+            Err(_) => false,
+        };
+        if !studio {
+            return;
+        }
         let cfg = self.golive_config();
         let now_ms = u64::try_from(now().0).unwrap_or(0);
         let want_kbps = g.hub.stats().kbps;
