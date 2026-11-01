@@ -358,16 +358,18 @@ struct State {
     monitor: Option<crate::monitor::Feeder>,
     stats: Stats,
     error: Option<String>,
-    /// The Studio's preview, when a window shows one.
-    preview: Option<Preview>,
+    /// The previews windows show, by id.
+    previews: HashMap<u64, Preview>,
 }
 
-/// How the preview looks, and what it shows (its window is with its own thread).
-#[derive(Debug, Default)]
+/// How a preview looks, and what it shows (its window is with its own thread).
+#[derive(Debug)]
 struct Preview {
     look: crate::preview::PreviewLook,
-    /// A scene instead of what's on air (Studio Mode's preview).
+    /// A scene instead of what's on air (Studio Mode's preview, the vertical picture's).
     scene: Option<String>,
+    /// The canvas's size.
+    size: (u32, u32),
 }
 
 /// The preview's own thread and its window: a window that's slow to take a frame (hidden,
@@ -390,7 +392,8 @@ pub struct Engine {
     text: Mutex<TextRenderer>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    preview: Mutex<Option<PreviewThread>>,
+    preview: Mutex<HashMap<u64, PreviewThread>>,
+    next_preview: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Engine {
@@ -440,7 +443,7 @@ impl Engine {
             monitor: None,
             stats: Stats::default(),
             error: None,
-            preview: None,
+            previews: HashMap::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -460,7 +463,8 @@ impl Engine {
             text: Mutex::new(TextRenderer::new()),
             stop,
             thread: Some(thread),
-            preview: Mutex::new(None),
+            preview: Mutex::new(HashMap::new()),
+            next_preview: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -870,60 +874,88 @@ impl Engine {
         })
     }
 
-    /// Shows the preview in a Mac view (`NSView *`, `width`×`height` device pixels), drawn
-    /// each frame from now on; replaces one shown before.
+    /// Shows a preview in a Mac view (`NSView *`, `width`×`height` device pixels): what's on
+    /// air at the engine's size, drawn each frame from now on → its id. Several can show at
+    /// once (Studio Mode's two, the vertical picture's, projectors).
     ///
     /// # Safety
     /// `ns_view` must be a live `NSView` that outlives the preview (`stop_preview` first).
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
-    pub unsafe fn start_preview(&self, ns_view: *mut std::ffi::c_void, width: u32, height: u32) -> Result<(), AvError> {
+    pub unsafe fn start_preview(
+        &self,
+        ns_view: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, AvError> {
+        let size = (self.config.width, self.config.height);
+        // SAFETY: passed on from the caller's promise.
+        unsafe { self.start_preview_of(ns_view, width, height, size, None) }
+    }
+
+    /// As `start_preview`, of a canvas of `size` showing `scene` (the vertical picture's).
+    ///
+    /// # Safety
+    /// As `start_preview`.
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    pub unsafe fn start_preview_of(
+        &self,
+        ns_view: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+        size: (u32, u32),
+        scene: Option<String>,
+    ) -> Result<u64, AvError> {
         // SAFETY: passed on from the caller's promise.
         let surface = unsafe { self.gpu.preview_surface(ns_view, width, height) }?;
-        self.stop_preview();
-        self.lock().preview.get_or_insert_with(Preview::default);
+        let id = self.next_preview.fetch_add(1, Ordering::Relaxed);
+        self.lock().previews.insert(id, Preview { look: Default::default(), scene, size });
         let surface = Arc::new(Mutex::new(surface));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (state, gpu, surface, stop) = (self.state.clone(), self.gpu.clone(), surface.clone(), stop.clone());
-            let (size, every) =
-                ((self.config.width, self.config.height), Duration::from_secs(1) / self.config.fps.max(1));
+            let every = Duration::from_secs(1) / self.config.fps.max(1);
             std::thread::Builder::new()
                 .name("ferrocast-preview".into())
-                .spawn(move || preview_loop(&state, &gpu, &surface, &stop, size, every))
+                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, every))
                 .map_err(|e| AvError::Source(format!("the preview's thread didn't start ({e})")))?
         };
-        *self.preview.lock().unwrap_or_else(|e| e.into_inner()) = Some(PreviewThread { surface, stop, thread });
-        Ok(())
+        self.preview_threads().insert(id, PreviewThread { surface, stop, thread });
+        Ok(id)
     }
 
-    /// Stops drawing the preview; once it returns, its window may go.
-    pub fn stop_preview(&self) {
-        let running = self.preview.lock().unwrap_or_else(|e| e.into_inner()).take();
+    fn preview_threads(&self) -> std::sync::MutexGuard<'_, HashMap<u64, PreviewThread>> {
+        self.preview.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stops drawing a preview; once it returns, its window may go.
+    pub fn stop_preview(&self, id: u64) {
+        let running = self.preview_threads().remove(&id);
         if let Some(p) = running {
             p.stop.store(true, Ordering::Release);
             let _ = p.thread.join();
         }
-        self.lock().preview = None;
+        self.lock().previews.remove(&id);
     }
 
-    /// The preview's view changed size (device pixels).
-    pub fn resize_preview(&self, width: u32, height: u32) {
-        if let Some(p) = self.preview.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    /// A preview's view changed size (device pixels).
+    pub fn resize_preview(&self, id: u64, width: u32, height: u32) {
+        if let Some(p) = self.preview_threads().get(&id) {
             self.gpu.resize_preview(&mut p.surface.lock().unwrap_or_else(|e| e.into_inner()), width, height);
         }
     }
 
-    /// How the preview looks round and over the picture (outlines, where the canvas sits…).
-    pub fn set_preview_look(&self, look: crate::preview::PreviewLook) {
-        if let Some(p) = self.lock().preview.as_mut() {
+    /// How a preview looks round and over the picture (outlines, where the canvas sits…).
+    pub fn set_preview_look(&self, id: u64, look: crate::preview::PreviewLook) {
+        if let Some(p) = self.lock().previews.get_mut(&id) {
             p.look = look;
         }
     }
 
-    /// A scene the preview shows instead of what's on air (Studio Mode), or None.
-    pub fn set_preview_scene(&self, scene: Option<String>) {
-        if let Some(p) = self.lock().preview.as_mut() {
+    /// A scene a preview shows instead of what's on air (Studio Mode), or None.
+    pub fn set_preview_scene(&self, id: u64, scene: Option<String>) {
+        if let Some(p) = self.lock().previews.get_mut(&id) {
             p.scene = scene;
         }
     }
@@ -1011,7 +1043,10 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.stop_preview();
+        let ids: Vec<u64> = self.preview_threads().keys().copied().collect();
+        for id in ids {
+            self.stop_preview(id);
+        }
         self.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -1026,20 +1061,20 @@ impl Drop for Engine {
 /// The preview's thread: what's on air (or Studio Mode's scene) at the engine's rate, taken
 /// from the state in a moment and drawn into the window outside its lock.
 fn preview_loop(
+    id: u64,
     state: &Mutex<State>,
     gpu: &Compositor,
     surface: &Mutex<crate::preview::PreviewSurface>,
     stop: &AtomicBool,
-    size: (u32, u32),
     every: Duration,
 ) {
     while !stop.load(Ordering::Acquire) {
         let started = Instant::now();
         let next = {
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.preview
-                .as_ref()
-                .map(|p| (what_to_draw(&st, size.0, size.1, p.scene.as_deref(), now_ns()), p.look.clone()))
+            st.previews
+                .get(&id)
+                .map(|p| (what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()), p.look.clone()))
         };
         if let Some((draw, look)) = next {
             let shown = match &draw {
