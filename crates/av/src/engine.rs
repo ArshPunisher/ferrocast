@@ -302,6 +302,8 @@ struct State {
     started: std::collections::HashMap<String, u64>,
     /// Scenes that are OBS groups (shown inside scenes, not listed as scenes).
     groups: Vec<String>,
+    /// Sources heard whatever is on air (OBS's Desktop Audio and Mic/Aux channels).
+    globals: std::collections::HashSet<u64>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
     video: VideoConfig,
@@ -364,6 +366,7 @@ impl Engine {
             stinger: None,
             started: std::collections::HashMap::new(),
             groups: Vec::new(),
+            globals: std::collections::HashSet::new(),
             outputs: Vec::new(),
             next_output: 1,
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
@@ -472,7 +475,11 @@ impl Engine {
     }
 
     pub fn remove_source(&self, id: u64) {
-        self.lock().sources.remove(&id);
+        {
+            let mut st = self.lock();
+            st.sources.remove(&id);
+            st.globals.remove(&id);
+        }
         self.gpu.forget(id);
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
@@ -531,6 +538,7 @@ impl Engine {
             st.on_air = None;
             st.moving = None;
             st.groups = imported.groups;
+            st.globals.clear();
         }
         for s in imported.sources {
             match self.set_source(s.id, s.kind) {
@@ -551,6 +559,16 @@ impl Engine {
             let _ = self.go(&cur);
         }
         skipped
+    }
+
+    /// Makes a source heard whatever is on air (OBS's Desktop Audio and Mic/Aux), or not.
+    pub fn set_global(&self, id: u64, global: bool) {
+        let mut st = self.lock();
+        if global {
+            st.globals.insert(id);
+        } else {
+            st.globals.remove(&id);
+        }
     }
 
     /// The scenes there are (groups left out).
@@ -774,6 +792,37 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     }
 }
 
+/// The sources heard now: the global ones, and every source shown (scenes inside scenes and
+/// groups too) by the scene on air, the one a transition or stinger leaves, and each output's
+/// own scene; the stinger itself.
+fn heard(st: &State) -> std::collections::HashSet<u64> {
+    fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
+        let Some(items) = st.scenes.get(scene) else { return };
+        for it in items.iter().filter(|i| i.visible) {
+            match &it.scene {
+                Some(inner) if depth < MAX_NESTING => walk(st, inner, depth + 1, out),
+                Some(_) => {}
+                None => {
+                    out.insert(it.source);
+                }
+            }
+        }
+    }
+    let mut out = st.globals.clone();
+    let mut roots: Vec<&str> = Vec::new();
+    roots.extend(st.on_air.as_deref());
+    roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
+    #[cfg(target_os = "macos")]
+    roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
+    roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
+    for r in roots {
+        walk(st, r, 0, &mut out);
+    }
+    #[cfg(target_os = "macos")]
+    out.insert(STINGER);
+    out
+}
+
 /// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
 fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32)) -> Option<Item> {
     item_at(st, it, ms, 0, canvas)
@@ -907,6 +956,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.stats.skipped += behind;
         let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
+        // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
+        // rest still has its sound taken, so it doesn't pile up.
+        let heard = heard(&st);
         // Sources: new pictures to the GPU, new sound to the mixer.
         let mut uploads = Vec::new();
         for (id, src) in st.sources.iter_mut() {
@@ -930,7 +982,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                                 [v, v]
                             })
                             .collect();
-                        mx.push(*id, &pcm, 2, rate, at);
+                        if heard.contains(id) {
+                            mx.push(*id, &pcm, 2, rate, at);
+                        }
                         at += *every_ns;
                     }
                     *pushed_to = Some(at);
@@ -941,7 +995,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                         uploads.push((*id, p));
                     }
                     for (pcm, t) in cap.take_sound() {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+                        if heard.contains(id) {
+                            mx.push(*id, &pcm, 2, 48_000, t);
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -953,7 +1009,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                 #[cfg(target_os = "macos")]
                 Live::Microphone(cap) => {
                     for (pcm, t) in cap.take_sound() {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+                        if heard.contains(id) {
+                            mx.push(*id, &pcm, 2, 48_000, t);
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -962,7 +1020,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
                         uploads.push((*id, p));
                     }
                     for (pcm, t) in m.take_sound() {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+                        if heard.contains(id) {
+                            mx.push(*id, &pcm, 2, 48_000, t);
+                        }
                     }
                 }
             }
@@ -1107,6 +1167,34 @@ mod tests {
         e.go("A").unwrap_or_else(|x| panic!("{x}"));
         let px = e.snapshot().unwrap_or_else(|x| panic!("the frame still draws: {x}"));
         assert_eq!(&px[0..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn only_what_is_on_air_is_heard() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        // A steady tone, shown only in B (inside a nested scene, as OBS counts that too).
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 50, beep_ms: 50 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("A", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Inner", vec![SceneItem::new(2, Placement::default())]);
+        let mut nested = SceneItem::new(0, Placement::default());
+        nested.scene = Some("Inner".into());
+        e.set_scene("B", vec![SceneItem::new(1, Placement::default()), nested]);
+        // Its peak in dB (the tone is at -6).
+        let peak = |e: &Engine| e.levels(2).map_or(f32::NEG_INFINITY, |l| l.peak[0]);
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(peak(&e) < -60.0, "not on air, not heard: {}", peak(&e));
+        e.go("B").unwrap_or_else(|x| panic!("{x}"));
+        // The tone is scheduled half a second ahead.
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(peak(&e) > -12.0, "on air inside a nested scene: {}", peak(&e));
+        // Global sound is heard whatever is on air.
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(peak(&e) > -12.0, "global: {}", peak(&e));
     }
 
     #[test]
@@ -1282,6 +1370,7 @@ mod tests {
         // A quiet beep heard here only (left out of every output).
         e.set_source(1, SourceKind::Tone { hz: 660.0, every_ms: 400, beep_ms: 60 }).unwrap_or_else(|x| panic!("{x}"));
         e.set_sound(1, SourceSettings { volume: 0.1, monitoring: Monitoring::Only, ..Default::default() });
+        e.set_global(1, true);
         if e.set_monitoring(true, None).is_err() {
             return; // no speakers here (a CI machine)
         }
@@ -1299,6 +1388,7 @@ mod tests {
         e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
             .unwrap_or_else(|x| panic!("{x}"));
         e.set_source(2, SourceKind::Tone { hz: 1000.0, every_ms: 500, beep_ms: 50 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let file = std::env::temp_dir().join("ferrocast-av-engine.mp4");
