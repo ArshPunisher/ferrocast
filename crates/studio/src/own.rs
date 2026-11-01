@@ -33,7 +33,7 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("Twitch's VOD track")
     } else if s.encode.scale.is_some() {
         Some("a scaled stream")
-    } else if s.encode.quality.is_some() {
+    } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") {
         Some("constant quality")
     } else if !s.encode.extra.is_empty() {
         Some("an encoder's own options")
@@ -55,7 +55,7 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("more than one sound track")
     } else if !plan.muxer.trim().is_empty() {
         Some("custom muxer settings")
-    } else if plan.encode.quality.is_some() {
+    } else if plan.encode.quality.is_some() && !cfg!(target_os = "macos") {
         Some("constant quality")
     } else if !plan.encode.extra.is_empty() {
         Some("an encoder's own options")
@@ -65,6 +65,16 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
     } else {
         system_unsupported(&plan.encode.video_encoder)
+    }
+}
+
+/// The rate our encoder runs at. Constant quality (Mac only: FFmpeg's path keeps a bitrate)
+/// is libobs's 0 (lossless) … 51 scale turned into VideoToolbox's 0-1, as libobs does it.
+fn rate_of(e: &EncodeSettings) -> RateControl {
+    match e.quality {
+        Some(q) => RateControl::Quality((100 - q.min(51) * 100 / 51) as f32 / 100.0),
+        None if e.vbr => RateControl::Average,
+        None => RateControl::Cbr,
     }
 }
 
@@ -204,7 +214,7 @@ impl OwnStream {
             fps_num: feed.fps_num,
             fps_den: feed.fps_den.max(1),
             bitrate_kbps: e.video_kbps.max(100),
-            rate: if e.vbr { RateControl::Average } else { RateControl::Cbr },
+            rate: rate_of(e),
             keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
         };
         let audio =
@@ -336,7 +346,7 @@ impl OwnStream {
             fps_num: canvas.fps.max(1),
             fps_den: 1,
             bitrate_kbps: e.video_kbps.max(100),
-            rate: if e.vbr { RateControl::Average } else { RateControl::Cbr },
+            rate: rate_of(e),
             keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
@@ -602,5 +612,12 @@ mod tests {
         assert!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }).is_some());
         assert!(unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_some());
         assert!(unsupported_recording(&RecordPlan { tracks: vec![1, 2], ..plan.clone() }).is_some());
+        // Recordings default to constant quality: ours does it on the Mac.
+        let mut cq = plan.clone();
+        cq.encode.quality = Some(16);
+        assert_eq!(unsupported_recording(&cq).is_none(), cfg!(target_os = "macos"));
+        assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
+        cq.encode.quality = None;
+        assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
     }
 }

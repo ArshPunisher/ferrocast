@@ -289,3 +289,48 @@ fn a_new_bitrate_takes_while_running() {
     assert_eq!(enc.config().bitrate_kbps, 500);
     assert!(kbps[1] * 2 < kbps[0], "2500 kbps then 500: {kbps:?}");
 }
+
+/// Constant quality (recordings, Mac only): the bitrate follows the picture, little for a still
+/// one and much more for a busy one, and every frame decodes.
+#[test]
+fn constant_quality_follows_the_picture() {
+    if !cfg!(target_os = "macos") || std::env::var("FERROCAST_AV_ENCODER").as_deref() == Ok("ffmpeg") {
+        return;
+    }
+    let size = |busy: bool| {
+        let cfg = VideoConfig { rate: RateControl::Quality(0.69), ..config(VideoCodec::H264, PixelFormat::Bgra) };
+        let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
+        let mut packets = Vec::new();
+        let black = vec![0u8; 640 * 360 * 4];
+        for i in 0..60u32 {
+            // Noise for the busy picture: nothing an encoder can predict.
+            let px: Vec<u8> = if busy {
+                (0..640 * 360 * 4)
+                    .map(|n: u32| (n.wrapping_mul(2_654_435_761).wrapping_add(i * 7919) >> 13) as u8)
+                    .collect()
+            } else {
+                black.clone()
+            };
+            packets.extend(
+                enc.encode(Frame::Bgra { data: &px, stride: 640 * 4 }, i64::from(i) * 33_333, false)
+                    .unwrap_or_else(|e| panic!("{e}")),
+            );
+        }
+        packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
+        let header = enc.header().unwrap_or_else(|| panic!("a codec header"));
+        let mut flv = FlvFile::new(false, true);
+        flv.tag(9, 0, &video_header(VideoCodec::H264, &header));
+        for p in &packets {
+            let (ms, body) = video_tag(VideoCodec::H264, p, 0);
+            flv.tag(9, ms, &body);
+        }
+        if let Some(p) = probe(&flv.bytes, &format!("ferrocast-av-cq-{busy}.flv")) {
+            assert_eq!(p, "h264,640,360,60", "every frame decodes");
+        }
+        packets.iter().map(|p| p.data.len()).sum::<usize>() * 8 / 2 / 1000
+    };
+    let (still, busy) = (size(false), size(true));
+    eprintln!("constant quality: {still} kbps still, {busy} kbps busy");
+    // A CBR encoder would sit near 2500 for both.
+    assert!(still < 1000 && busy > still * 5, "{still} kbps still, {busy} kbps busy");
+}
