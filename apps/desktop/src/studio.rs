@@ -137,9 +137,35 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
-/// Projectors drawn by our engine follow the scenes by themselves (the multiview, which needed
-/// telling, isn't drawn by our engine yet).
-fn refresh_projectors(_h: &Held) {}
+/// How multiviews are laid out, from the settings.
+fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
+    use ferrocast_studio::MultiviewLayout as L;
+    ferrocast_studio::MultiviewLook {
+        layout: match s.multiview_layout.as_str() {
+            "bottom" => L::Bottom,
+            "left" => L::Left,
+            "right" => L::Right,
+            "scenes_only" => L::ScenesOnly,
+            _ => L::Top,
+        },
+        labels: s.multiview_labels,
+        safe_areas: s.multiview_safe_areas,
+    }
+}
+
+/// Multiviews follow the scenes, Studio Mode's preview and their settings (other projectors
+/// follow by themselves).
+fn refresh_projectors(h: &Held) {
+    #[cfg(target_os = "macos")]
+    if let Some(c) = &h.collection {
+        let look = multiview_look(&h.settings.clone().unwrap_or_default());
+        for (_, p) in &h.projectors {
+            p.update(c, look);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = h;
+}
 
 thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
@@ -963,6 +989,8 @@ fn sync_views(h: &Held) {
     {
         p.show_scene(want.as_deref());
     }
+    // A multiview's preview box and scene list too.
+    refresh_projectors(h);
 }
 
 /// Makes Studio Mode's picture of what's on air at its last place (main thread).
@@ -2461,7 +2489,27 @@ impl StudioHost for DesktopStudio {
                     });
                     drop(gone);
                 });
-                let made = c.projector(&of, p.screen.map(|s| s as usize), on_close).map_err(|e| e.to_string())?;
+                // A click on a multiview scene puts it on air, through its transition; in Studio
+                // Mode it goes to the preview instead, as in OBS.
+                let on_pick = Box::new(|scene: String| {
+                    HELD.with(|h| {
+                        let Ok(h) = h.try_borrow() else { return };
+                        let Some(c) = &h.collection else { return };
+                        let done =
+                            if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
+                        if c.moving() {
+                            glide();
+                        }
+                        if let Err(e) = done {
+                            tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
+                        }
+                        sync_views(&h);
+                    });
+                });
+                let look = multiview_look(&h.settings.clone().unwrap_or_default());
+                let made = c
+                    .projector(&of, p.screen.map(|s| s as usize), look, on_close, on_pick)
+                    .map_err(|e| e.to_string())?;
                 if p.on_top {
                     made.set_on_top(true);
                 }

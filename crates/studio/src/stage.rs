@@ -2688,24 +2688,126 @@ pub struct StageProjector {
     shared: Arc<own::Shared>,
     id: u64,
     win: crate::ffi::projector_window::Win,
+    /// A multiview's layout (shared with its window's clicks and resizes).
+    multiview: Option<std::rc::Rc<RefCell<MultiviewState>>>,
+}
+
+/// What a multiview shows and where: the scenes, Studio Mode's preview, the look, the canvas
+/// and the window's size in pixels.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq)]
+struct MultiviewState {
+    names: Vec<String>,
+    preview: Option<String>,
+    look: crate::MultiviewLook,
+    canvas: (u32, u32),
+    view: (u32, u32),
+}
+
+#[cfg(target_os = "macos")]
+impl MultiviewState {
+    /// Drawn at the window's shape, at most 1920 wide (each box is far smaller than a scene).
+    fn size(&self) -> (u32, u32) {
+        let (vw, vh) = (self.view.0.max(1) as f32, self.view.1.max(1) as f32);
+        let k = (1920.0 / vw).min(1.0);
+        (((vw * k).round() as u32).max(1), ((vh * k).round() as u32).max(1))
+    }
+
+    fn aspect(&self) -> f32 {
+        self.canvas.0.max(1) as f32 / self.canvas.1.max(1) as f32
+    }
+
+    fn laid_out(&self) -> (Vec<crate::projector::Area>, Vec<crate::projector::Area>) {
+        let (w, h) = self.size();
+        let preview = self.preview.is_some() && self.look.layout != crate::MultiviewLayout::ScenesOnly;
+        crate::projector::multiview_in(self.look.layout, preview, self.names.len(), w as f32, h as f32, self.aspect())
+    }
+
+    /// Studio Mode's preview first (green), then what's on air (red), then each scene (red
+    /// while on air, green while previewed); names under them, safe areas in the big ones.
+    fn boxes(&self) -> Vec<ferrocast_av::engine::MultiviewBox> {
+        use ferrocast_av::engine::MultiviewBox;
+        const RED: [u8; 4] = [214, 40, 40, 255];
+        const GREEN: [u8; 4] = [40, 180, 80, 255];
+        const GREY: [u8; 4] = [70, 70, 70, 255];
+        let a = |r: &crate::projector::Area| (r.x, r.y, r.w, r.h);
+        let label = |s: &str| self.look.labels.then(|| s.to_string());
+        let marks = |r: &crate::projector::Area| {
+            if self.look.safe_areas { crate::projector::safe_areas(*r).iter().map(a).collect() } else { Vec::new() }
+        };
+        let (bigs, cells) = self.laid_out();
+        let mut out = Vec::new();
+        let mut bigs = bigs.iter();
+        if self.preview.is_some()
+            && self.look.layout != crate::MultiviewLayout::ScenesOnly
+            && let Some(r) = bigs.next()
+        {
+            out.push(MultiviewBox {
+                scene: self.preview.clone(),
+                area: a(r),
+                frame: GREEN,
+                live: None,
+                marks: marks(r),
+                label: label("Preview"),
+            });
+        }
+        if let Some(r) = bigs.next() {
+            out.push(MultiviewBox {
+                scene: None,
+                area: a(r),
+                frame: RED,
+                live: None,
+                marks: marks(r),
+                label: label("Program"),
+            });
+        }
+        for (name, r) in self.names.iter().zip(&cells) {
+            let frame = if self.preview.as_deref() == Some(name) { GREEN } else { GREY };
+            out.push(MultiviewBox {
+                scene: Some(name.clone()),
+                area: a(r),
+                frame,
+                live: Some(RED),
+                marks: Vec::new(),
+                label: label(name),
+            });
+        }
+        out
+    }
+
+    /// The scene a click at (`x`, `y`) in a `w`×`h` view lands on.
+    fn hit(&self, x: f64, y: f64, w: f64, h: f64) -> Option<String> {
+        let (mw, mh) = self.size();
+        let (x, y) = ((x / w.max(1.0)) as f32 * mw as f32, (y / h.max(1.0)) as f32 * mh as f32);
+        self.laid_out().1.iter().position(|r| r.contains(x, y)).and_then(|i| self.names.get(i).cloned())
+    }
+
+    fn apply(&self, shared: &own::Shared, id: u64) {
+        shared.engine.set_preview_multiview(id, self.size(), self.canvas, self.boxes());
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Stage {
     /// Opens a projector of `of` on `screen` (full screen) or in a window; `on_close` runs when
-    /// it's closed there (Esc, the window's button). Main thread. The multiview isn't drawn by
-    /// our engine yet.
+    /// it's closed there (Esc, the window's button), `on_pick` with a scene clicked in a
+    /// multiview, laid out as `look`. Main thread.
     pub fn projector(
         &self,
         of: &crate::ProjectorOf,
         screen: Option<usize>,
+        look: crate::MultiviewLook,
         on_close: Box<dyn Fn()>,
+        on_pick: Box<dyn Fn(String)>,
     ) -> Result<StageProjector, StudioError> {
         use crate::ProjectorOf as P;
         let shared = self.engine()?;
+        let canvas = (self.canvas.width, self.canvas.height);
         let (title, scene, size) = match of {
-            P::Program => ("Projector: what's on air".to_string(), None, (self.canvas.width, self.canvas.height)),
-            P::Multiview => return Err(fail("The multiview isn't in Ferrocast's own engine yet.")),
+            P::Program | P::Multiview => {
+                let title = if *of == P::Multiview { "Multiview" } else { "Projector: what's on air" };
+                (title.to_string(), None, canvas)
+            }
             P::Source(name) => {
                 let canvas = self.canvas_of(name);
                 let (scene, w, h) = own::show_alone(&shared.engine, name, canvas)?;
@@ -2714,17 +2816,42 @@ impl Stage {
             }
         };
         let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
-        // Resizes reach the engine once the preview is there.
+        let multiview = (*of == P::Multiview).then(|| {
+            std::rc::Rc::new(RefCell::new(MultiviewState {
+                names: self.scenes().into_iter().map(|s| s.name).collect(),
+                preview: self.preview_scene(),
+                look,
+                canvas,
+                view: canvas,
+            }))
+        });
+        // Resizes reach the engine once the preview is there (a multiview is laid out again).
         let id_cell = std::rc::Rc::new(std::cell::Cell::new(None::<u64>));
         let resize = {
-            let (shared, id_cell) = (shared.clone(), id_cell.clone());
+            let (shared, id_cell, mv) = (shared.clone(), id_cell.clone(), multiview.clone());
             Box::new(move |w: u32, h: u32| {
                 if let Some(id) = id_cell.get() {
                     shared.engine.resize_preview(id, w, h);
+                    if let Some(mv) = &mv {
+                        mv.borrow_mut().view = (w, h);
+                        mv.borrow().apply(&shared, id);
+                    }
                 }
             })
         };
-        let hooks = crate::ffi::projector_window::Hooks { click: Box::new(|_, _, _, _| {}), close: on_close, resize };
+        let click: Box<dyn Fn(f64, f64, f64, f64)> = match &multiview {
+            Some(mv) => {
+                let mv = mv.clone();
+                Box::new(move |x, y, w, h| {
+                    let hit = mv.borrow().hit(x, y, w, h);
+                    if let Some(scene) = hit {
+                        on_pick(scene);
+                    }
+                })
+            }
+            None => Box::new(|_, _, _, _| {}),
+        };
+        let hooks = crate::ffi::projector_window::Hooks { click, close: on_close, resize };
         let win = crate::ffi::projector_window::open(&title, aspect, screen, hooks)
             .ok_or_else(|| fail("The projector's window couldn't be made."))?;
         let (pw, ph) = win.pixels();
@@ -2738,7 +2865,11 @@ impl Stage {
             id,
             ferrocast_av::preview::PreviewLook { background: [0.0, 0.0, 0.0, 1.0], ..Default::default() },
         );
-        Ok(StageProjector { shared, id, win })
+        if let Some(mv) = &multiview {
+            mv.borrow_mut().view = (pw, ph);
+            mv.borrow().apply(&shared, id);
+        }
+        Ok(StageProjector { shared, id, win, multiview })
     }
 }
 
@@ -2752,6 +2883,18 @@ impl StageProjector {
     /// Keeps the window above the others, or not.
     pub fn set_on_top(&self, on: bool) {
         self.win.set_on_top(on);
+    }
+
+    /// A multiview follows the scenes, Studio Mode's preview and its look (nothing to do when
+    /// they're as they were, or for other projectors).
+    pub fn update(&self, stage: &Stage, look: crate::MultiviewLook) {
+        let Some(mv) = &self.multiview else { return };
+        let names: Vec<String> = stage.scenes().into_iter().map(|s| s.name).collect();
+        let next = MultiviewState { names, preview: stage.preview_scene(), look, ..mv.borrow().clone() };
+        if *mv.borrow() != next {
+            next.apply(&self.shared, self.id);
+            *mv.borrow_mut() = next;
+        }
     }
 }
 
@@ -3016,6 +3159,40 @@ mod tests {
             assert!(std::fs::metadata(f).is_ok_and(|m| m.len() > 1000), "{} was written", f.display());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_multiview_boxes_each_scene_and_answers_clicks() {
+        let mut mv = MultiviewState {
+            names: vec!["A".into(), "B".into()],
+            preview: None,
+            look: crate::MultiviewLook::default(),
+            canvas: (1920, 1080),
+            view: (3840, 2160),
+        };
+        assert_eq!(mv.size(), (1920, 1080), "drawn at most 1920 wide");
+        let b = mv.boxes();
+        assert_eq!(b.len(), 3, "what's on air, then each scene");
+        assert_eq!((b[0].scene.as_deref(), b[0].label.as_deref()), (None, Some("Program")));
+        assert_eq!(b[2].scene.as_deref(), Some("B"));
+        assert!(b[1].live.is_some(), "a scene box turns red while on air");
+        // A click in the middle of B's box (in a view half the size) picks B.
+        let (x, y, w, h) = b[2].area;
+        let hit = mv.hit(f64::from((x + w / 2.0) / 2.0), f64::from((y + h / 2.0) / 2.0), 960.0, 540.0);
+        assert_eq!(hit.as_deref(), Some("B"));
+        assert_eq!(mv.hit(1.0, 1.0, 960.0, 540.0), None, "the program box isn't a scene to pick");
+        // Studio Mode: its preview first, framed green, safe areas when asked, no names.
+        mv.preview = Some("B".into());
+        mv.look = crate::MultiviewLook { labels: false, safe_areas: true, ..mv.look };
+        let b = mv.boxes();
+        assert_eq!(b.len(), 4);
+        assert_eq!((b[0].scene.as_deref(), b[0].marks.len()), (Some("B"), 3));
+        assert!(b.iter().all(|x| x.label.is_none()));
+        assert_eq!(b[3].frame, b[0].frame, "the previewed scene's box is green too");
+        // Scenes only: no big boxes.
+        mv.look.layout = crate::MultiviewLayout::ScenesOnly;
+        assert_eq!(mv.boxes().len(), 2);
     }
 
     #[test]
