@@ -238,6 +238,25 @@ draws it); edits applied in place instead of reopening the scenes; the rest of l
 and video delay, HDR tone mapping); sound filters compared against libobs's output; web pages;
 game capture (E5); helper processes (E6).
 
+**1 Nov 2026 (afternoon): our engine only, branch `own-engine-only`.** The owner chose to
+remove libobs with no fallback. Done on the branch (each checked as noted in its commit):
+
+| What | Notes |
+|---|---|
+| Every stream and recording through our engine, no fallback | what it can't do is refused with the reason |
+| Constant quality; x264 and Lossless through FFmpeg (fetched by itself when picked) | lossless round trip gives back every pixel |
+| Pause, split (by hand, minutes, megabytes), MKV, up to six sound tracks | real files checked with ffprobe |
+| Output size (scaled), stream delay, the vertical stream, the replay buffer, Source Record | |
+| One engine shared by every output and preview | cameras and microphones open once |
+| The preview, Studio Mode's on-air view, the vertical preview, the Scenes grid's tiles (Mac) | checked in a real window: edits within 0.4 s, outlines and handles |
+| Fixed on the way (also on main): FFmpeg recoloured our frames (BT.601 taken for BT.709); the mixer dropped queued sound at a gap | |
+
+Left, in order: projectors and the multiview; **the scene store without libobs** (step 3:
+the collection as an OBS-format document edited in Rust and handed to the engine, about 115
+functions the app calls, plus each source kind's settings form); web page sources; Windows
+capture; SRT, RIST and WHIP sends; chapters and Twitch's VOD track; the virtual camera (needs
+Apple signing); then libobs, its bundled files and its CI jobs deleted.
+
 ### Honest sizes and risks
 
 - **OBS is about 12 years and ~600,000 lines of C/C++.** We don't need all of it: the parity list
