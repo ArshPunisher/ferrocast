@@ -418,6 +418,9 @@ pub struct ScenesConfig {
     /// The BRB scene (`!brb` / the BRB button, and during Twitch ads when `brb_on_ads`).
     pub brb_scene: Option<String>,
     pub brb_on_ads: bool,
+    /// While live, BRB by itself when a watched camera (Show's `cam_sources`) has been black for
+    /// the live watch's `camera_black_s`, and back when its picture returns.
+    pub brb_when_black: bool,
     /// Mute these inputs while on BRB.
     pub brb_mute: Vec<String>,
     /// Mods may type `!clip` to save the replay buffer.
@@ -511,6 +514,7 @@ impl Default for ScenesConfig {
             hotkeys: Vec::new(),
             brb_scene: None,
             brb_on_ads: false,
+            brb_when_black: false,
             brb_mute: Vec::new(),
             clip_command: true,
             clip_on_big_moments: false,
@@ -585,6 +589,9 @@ impl ScenesConfig {
         }
         if self.brb_on_ads && self.brb_scene.is_none() {
             return Err("brb_scene: pick the BRB scene to switch to during ads.".into());
+        }
+        if self.brb_when_black && self.brb_scene.is_none() {
+            return Err("brb_scene: pick the BRB scene to switch to when a camera goes black.".into());
         }
         Ok(())
     }

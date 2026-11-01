@@ -1,6 +1,7 @@
 //! The live watch: every two seconds while the Ferrocast Studio streams, a look at what goes out
 //! (the show's mics and cameras, Go live's destinations), fed to `ferrocast_core::show::LiveWatch`;
-//! what it raises or clears goes to the dashboard (`live_alert`) and the log.
+//! what it raises or clears goes to the dashboard (`live_alert`) and the log, and a black camera
+//! can put the show on BRB by itself (`ScenesConfig::brb_when_black`).
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -31,6 +32,7 @@ impl Engine {
                 if live != was_live {
                     // A new stream: everything starts fresh.
                     engine.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
+                    engine.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     was_live = live;
                 }
                 if live {
@@ -83,7 +85,33 @@ impl Engine {
             tracing::info!(id = %a.id, cleared = a.cleared, "live watch: {}", a.message);
             self.studio_frame("live_alert", a);
         }
+        self.brb_when_black(&alerts).await;
         alerts
+    }
+
+    /// BRB by itself while a watched camera is black (when asked), back once none is.
+    pub(crate) async fn brb_when_black(&self, alerts: &[LiveAlert]) {
+        if !self.scenes_config().brb_when_black {
+            return;
+        }
+        let (was, now) = {
+            let mut black = self.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner());
+            let was = !black.is_empty();
+            for a in alerts.iter().filter(|a| a.id.ends_with(":black")) {
+                if a.cleared {
+                    black.remove(&a.id);
+                } else {
+                    black.insert(a.id.clone());
+                }
+            }
+            (was, !black.is_empty())
+        };
+        if was != now {
+            tracing::info!(on = now, "live watch: BRB by itself (a camera went black, or came back)");
+            if let Err(e) = self.set_brb(now).await {
+                tracing::warn!(error = %e, "live watch: couldn't switch BRB");
+            }
+        }
     }
 
     /// The live watch's alerts raised now (their ids).

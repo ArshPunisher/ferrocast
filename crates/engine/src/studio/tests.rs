@@ -1338,3 +1338,24 @@ async fn the_preflight_hears_a_silent_mic_and_sees_a_black_camera() {
     assert_eq!(check(&pf, "mic:Mic").status, ferrocast_core::show::CheckStatus::Ok);
     assert_eq!(check(&pf, "cam:Camera").status, ferrocast_core::show::CheckStatus::Ok);
 }
+
+/// A watched camera black long enough puts the show on BRB by itself, and its picture coming
+/// back returns it to where it was.
+#[tokio::test]
+async fn a_black_camera_puts_the_show_on_brb_and_back() {
+    use ferrocast_core::show::LiveAlert;
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+    let alert = |cleared| LiveAlert { id: "camera:Cam:black".into(), level: "error", message: String::new(), cleared };
+    e.brb_when_black(&[alert(false)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    // Another alert while black changes nothing; the picture back returns.
+    e.brb_when_black(&[]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    e.brb_when_black(&[alert(true)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+    // Asked for without a BRB scene: refused.
+    assert!(e.patch_scenes_config(json!({ "brb_scene": null }).as_object().unwrap()).await.is_err());
+}
