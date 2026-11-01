@@ -15,7 +15,7 @@ use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAssetReader, AVAssetReaderOutput, AVAssetReaderTrackOutput, AVMediaTypeAudio, AVMediaTypeVideo, AVURLAsset,
 };
-use objc2_core_media::CMSampleBuffer;
+use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeRange};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
 use super::host_ns;
@@ -29,10 +29,39 @@ const MAX_SOUND: usize = 400;
 
 #[derive(Debug, Default)]
 struct Shared {
-    frames: Mutex<VecDeque<(Picture, u64)>>,
+    /// Frames waiting: the picture, the host time it shows at, and its place in the file (ns).
+    frames: Mutex<VecDeque<(Picture, u64, u64)>>,
     sound: Mutex<VecDeque<(Vec<f32>, u64)>>,
     ended: AtomicBool,
     error: Mutex<Option<String>>,
+    /// What the controls asked for, in order, for the reader to do.
+    command: Mutex<VecDeque<Control>>,
+    /// Where it is in the file (ns): the last frame shown, or the paused place.
+    position: std::sync::atomic::AtomicU64,
+    paused: AtomicBool,
+    stopped: AtomicBool,
+}
+
+/// OBS's media controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Play,
+    Pause,
+    /// From the start, playing.
+    Restart,
+    /// Back to the start, showing nothing until played.
+    Stop,
+    /// To this place in the file (ns); playing or paused as it was.
+    Seek(u64),
+}
+
+/// Where a file's playing stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaState {
+    Playing,
+    Paused,
+    Stopped,
+    Ended,
 }
 
 /// A playing file; dropping it stops.
@@ -60,7 +89,7 @@ struct Pass {
     audio: Option<Retained<AVAssetReaderTrackOutput>>,
 }
 
-fn open_pass(asset: &AVURLAsset) -> Result<Pass, String> {
+fn open_pass(asset: &AVURLAsset, from_ns: u64) -> Result<Pass, String> {
     // SAFETY: AVFoundation objects made and used on this (the reader's) thread; the settings
     // dictionaries hold NSNumbers under AVFoundation's documented keys.
     unsafe {
@@ -117,6 +146,12 @@ fn open_pass(asset: &AVURLAsset) -> Result<Pass, String> {
         };
         if video.is_none() && audio.is_none() {
             return Err("it has no picture or sound this Mac can play".into());
+        }
+        // From a place in the file (play after a pause, a seek): the rest of it.
+        if from_ns > 0 {
+            let start = CMTime::new(i64::try_from(from_ns / 1000).unwrap_or(i64::MAX), 1_000_000);
+            let rest = CMTime::new(i64::MAX / 2, 1_000_000);
+            reader.setTimeRange(CMTimeRange { start, duration: rest });
         }
         if !reader.startReading() {
             return Err(reader
@@ -201,10 +236,49 @@ impl Media {
     pub fn frame_at(&self, now_ns: u64) -> Option<Picture> {
         let mut q = self.shared.frames.lock().ok()?;
         let mut chosen = None;
-        while q.front().is_some_and(|(_, t)| *t <= now_ns) {
-            chosen = q.pop_front().map(|(p, _)| p);
+        while q.front().is_some_and(|(_, t, _)| *t <= now_ns) {
+            chosen = q.pop_front().map(|(p, _, pts)| {
+                self.shared.position.store(pts, Ordering::Relaxed);
+                p
+            });
         }
         chosen
+    }
+
+    /// Plays, pauses, restarts, stops or seeks (it happens on the reader's next turn).
+    pub fn control(&self, c: Control) {
+        if let Ok(mut cmd) = self.shared.command.lock() {
+            cmd.push_back(c);
+        }
+        // Said at once, so a second press reads the new state.
+        match c {
+            Control::Play | Control::Restart => {
+                self.shared.paused.store(false, Ordering::Relaxed);
+                self.shared.stopped.store(false, Ordering::Relaxed);
+                self.shared.ended.store(false, Ordering::Relaxed);
+            }
+            Control::Pause => self.shared.paused.store(true, Ordering::Relaxed),
+            Control::Stop => {
+                self.shared.paused.store(true, Ordering::Relaxed);
+                self.shared.stopped.store(true, Ordering::Relaxed);
+            }
+            Control::Seek(ns) => self.shared.position.store(ns.min(self.duration_ns), Ordering::Relaxed),
+        }
+    }
+
+    /// Where it stands, and where it is in the file (ns).
+    pub fn state(&self) -> (MediaState, u64) {
+        let s = &self.shared;
+        let state = if s.ended.load(Ordering::Relaxed) {
+            MediaState::Ended
+        } else if s.stopped.load(Ordering::Relaxed) {
+            MediaState::Stopped
+        } else if s.paused.load(Ordering::Relaxed) {
+            MediaState::Paused
+        } else {
+            MediaState::Playing
+        };
+        (state, s.position.load(Ordering::Relaxed))
     }
 
     /// Sound decoded since the last call, each piece with the host time it plays at.
@@ -231,14 +305,48 @@ impl Drop for Media {
     }
 }
 
-/// The reader thread: one pass after another (looping), each stamped from its start time.
+/// The reader thread: one pass after another (looping), each stamped from its start time;
+/// the controls stop a pass and start another from the place asked for.
 fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: &AtomicBool) {
     // SAFETY: AVFoundation objects made and used on this thread only.
     let asset =
         unsafe { AVURLAsset::URLAssetWithURL_options(&NSURL::fileURLWithPath(&NSString::from_str(url_text)), None) };
-    let mut start = host_ns() + 100_000_000;
-    loop {
-        let pass = match open_pass(&asset) {
+    let clear = || {
+        if let Ok(mut q) = shared.frames.lock() {
+            q.clear();
+        }
+        if let Ok(mut q) = shared.sound.lock() {
+            q.clear();
+        }
+    };
+    let take = || shared.command.lock().ok().and_then(|mut c| c.pop_front());
+    // Where the next pass starts in the file, and the host time its 0 plays at when it follows
+    // the last pass on (a seamless loop).
+    let (mut from, mut follows): (u64, Option<u64>) = (0, None);
+    'passes: loop {
+        // Paused, stopped or ended: wait for a control.
+        while shared.paused.load(Ordering::Relaxed) || shared.ended.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            match take() {
+                Some(Control::Play) => {
+                    if shared.stopped.swap(false, Ordering::Relaxed) || shared.ended.swap(false, Ordering::Relaxed) {
+                        from = 0;
+                    }
+                    shared.paused.store(false, Ordering::Relaxed);
+                }
+                Some(Control::Restart) => {
+                    from = 0;
+                    shared.paused.store(false, Ordering::Relaxed);
+                    shared.ended.store(false, Ordering::Relaxed);
+                }
+                Some(Control::Seek(n)) => from = n.min(duration_ns),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+            follows = None;
+        }
+        let pass = match open_pass(&asset, from) {
             Ok(p) => p,
             Err(e) => {
                 if let Ok(mut err) = shared.error.lock() {
@@ -247,10 +355,36 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
                 return;
             }
         };
+        let start = follows.unwrap_or_else(|| (host_ns() + 100_000_000).saturating_sub(from));
         let (mut v_next, mut a_next) =
             (pass.video.as_ref().and_then(|o| next(o)), pass.audio.as_ref().and_then(|o| next(o)));
         let mut last_end = 0u64;
         while (v_next.is_some() || a_next.is_some()) && !stop.load(Ordering::Acquire) {
+            if let Some(c) = take() {
+                let now_at = shared.position.load(Ordering::Relaxed);
+                match c {
+                    Control::Play => {}
+                    Control::Pause => {
+                        from = now_at;
+                        shared.paused.store(true, Ordering::Relaxed);
+                    }
+                    Control::Seek(n) => from = n.min(duration_ns),
+                    Control::Restart => from = 0,
+                    Control::Stop => {
+                        from = 0;
+                        shared.position.store(0, Ordering::Relaxed);
+                        shared.paused.store(true, Ordering::Relaxed);
+                        shared.stopped.store(true, Ordering::Relaxed);
+                    }
+                }
+                if c != Control::Play {
+                    clear();
+                    // SAFETY: the reader belongs to this thread.
+                    unsafe { pass.reader.cancelReading() };
+                    follows = None;
+                    continue 'passes;
+                }
+            }
             let horizon = host_ns() + AHEAD_NS;
             let mut moved = false;
             if let Some(s) = &v_next {
@@ -262,7 +396,7 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
                         && let Some(p) = super::screen::copy_bgra(&img)
                         && let Ok(mut q) = shared.frames.lock()
                     {
-                        q.push_back((Picture { premultiplied: false, ..p }, at));
+                        q.push_back((Picture { premultiplied: false, ..p }, at, pts_ns(s)));
                     }
                     last_end = last_end.max(pts_ns(s));
                     v_next = pass.video.as_ref().and_then(|o| next(o));
@@ -277,6 +411,10 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
                         && let Ok(mut q) = shared.sound.lock()
                     {
                         last_end = last_end.max(pts_ns(s) + (pcm.len() / 2) as u64 * 1_000_000_000 / 48_000);
+                        // A file with no picture keeps its place by its sound.
+                        if pass.video.is_none() {
+                            shared.position.store(pts_ns(s), Ordering::Relaxed);
+                        }
                         q.push_back((pcm, at));
                     }
                     a_next = pass.audio.as_ref().and_then(|o| next(o));
@@ -294,9 +432,62 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
         }
         if !looping {
             shared.ended.store(true, Ordering::Relaxed);
-            return;
+            continue;
         }
         // The next pass starts where this one's length ends, exactly.
-        start += if duration_ns > 0 { duration_ns } else { last_end };
+        from = 0;
+        follows = Some(start + if duration_ns > 0 { duration_ns } else { last_end });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 4 s test video (a counter on screen, a tone), made by FFmpeg; None without it.
+    fn clip() -> Option<std::path::PathBuf> {
+        let f = std::env::temp_dir().join("ferrocast-av-media-controls.mp4");
+        if f.exists() {
+            return Some(f);
+        }
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30:duration=4"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then_some(f)
+    }
+
+    #[test]
+    fn pause_seek_and_restart() {
+        let Some(f) = clip() else { return };
+        let m = Media::open(&f, false).unwrap_or_else(|e| panic!("{e}"));
+        let show = |ms: u64| {
+            let end = std::time::Instant::now() + Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                let _ = m.frame_at(host_ns());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        show(700);
+        assert_eq!(m.state().0, MediaState::Playing);
+        m.control(Control::Pause);
+        show(150);
+        let at = m.state().1;
+        assert!((300_000_000..900_000_000).contains(&at), "paused about half a second in: {at}");
+        show(500);
+        assert_eq!(m.state(), (MediaState::Paused, at), "still there");
+        m.control(Control::Seek(2_500_000_000));
+        m.control(Control::Play);
+        show(500);
+        let (state, after) = m.state();
+        assert!(state == MediaState::Playing && after >= 2_500_000_000, "on from 2.5 s: {after}");
+        m.control(Control::Restart);
+        show(400);
+        assert!(m.state().1 < 1_000_000_000, "from the start again: {}", m.state().1);
+        m.control(Control::Stop);
+        show(100);
+        assert_eq!(m.state(), (MediaState::Stopped, 0));
     }
 }

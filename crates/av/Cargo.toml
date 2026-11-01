@@ -35,7 +35,7 @@ block2 = "0.6"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics", "SCShareableContent", "SCStream", "SCError"] }
-objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMBase", "CMTime", "CMFormatDescription", "CMBlockBuffer", "objc2-core-video", "objc2-core-audio-types"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMBase", "CMTime", "CMTimeRange", "CMFormatDescription", "CMBlockBuffer", "objc2-core-video", "objc2-core-audio-types"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "AVCaptureSession", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureVideoDataOutput", "AVCaptureAudioDataOutput", "AVMediaFormat", "AVCaptureSessionPreset", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVTime"] }
 

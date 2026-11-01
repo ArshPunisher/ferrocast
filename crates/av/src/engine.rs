@@ -654,6 +654,30 @@ impl Engine {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_effects(id, effects);
     }
 
+    /// Plays, pauses, restarts, stops or seeks a media source (OBS's media controls).
+    #[cfg(target_os = "macos")]
+    pub fn media_control(&self, id: u64, c: crate::media::Control) -> Result<(), AvError> {
+        match self.lock().sources.get(&id).map(|s| &s.live) {
+            Some(Live::Media(m)) => {
+                m.control(c);
+                Ok(())
+            }
+            _ => Err(AvError::Source(format!("source {id} isn't a media file"))),
+        }
+    }
+
+    /// A media source's state, where it is and how long it lasts (ns).
+    #[cfg(target_os = "macos")]
+    pub fn media_state(&self, id: u64) -> Option<(crate::media::MediaState, u64, u64)> {
+        match self.lock().sources.get(&id).map(|s| &s.live) {
+            Some(Live::Media(m)) => {
+                let (state, at) = m.state();
+                Some((state, at, m.duration_ns))
+            }
+            _ => None,
+        }
+    }
+
     /// Where an outside source (`SourceKind::Fed`) is handed its pictures and sound.
     pub fn fed(&self, id: u64) -> Option<Feed> {
         match self.lock().sources.get(&id).map(|s| &s.live) {
