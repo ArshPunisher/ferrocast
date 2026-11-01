@@ -55,6 +55,8 @@ pub fn kinds() -> Kinds {
             kind("invert_polarity_filter", "Invert Polarity"),
         ]
         .into_iter()
+        // Remove background: Apple's Vision finds the person (a Mac for now).
+        .chain(cfg!(target_os = "macos").then(|| kind("ferrocast_remove_background", "Remove Background")))
         // Strong noise removal (DeepFilterNet), in builds that have it.
         .chain(cfg!(feature = "deepfilter").then(|| kind("ferrocast_deepfilter", "Strong Noise Removal")))
         .collect(),
@@ -349,6 +351,11 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("high", "High", "float").range(-20.0, 20.0, 0.1).slider().unit(" dB"),
         ],
         "invert_polarity_filter" => Vec::new(),
+        "ferrocast_remove_background" => vec![
+            opt("mode", "Background", "list").choices(&[("Remove it", json!(0)), ("Blur it", json!(1))]),
+            opt("soft", "Soft edge", "int").range(0.0, 40.0, 1.0).slider().unit("%"),
+            opt("blur", "Blur", "int").range(2.0, 100.0, 1.0).slider().unit(" px"),
+        ],
         "ferrocast_deepfilter" => vec![opt("strength", "Strength", "int").range(1.0, 100.0, 1.0).slider()],
         "ferrocast_rounded_corners" => {
             vec![opt("radius", "Radius", "int").range(0.0, 1000.0, 1.0).slider().unit(" px")]
@@ -416,6 +423,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         }
         "gain_filter" => json!({ "db": 0.0 }),
         "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),
         "noise_gate_filter" => {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
         }

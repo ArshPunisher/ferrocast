@@ -16,7 +16,13 @@ mod naming;
 #[cfg(target_os = "macos")]
 mod netmedia;
 mod own;
+// Vision through objc2 (the same unsafe calls as ffi's).
+#[cfg(target_os = "macos")]
+mod cutout;
 pub mod projector;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod segment;
 pub mod stage;
 pub mod streamlabs;
 pub mod system;

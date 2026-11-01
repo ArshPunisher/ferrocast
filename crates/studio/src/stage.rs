@@ -41,6 +41,9 @@ pub struct Stage {
     /// Media from network addresses (guests' cameras, streams), each read by FFmpeg.
     #[cfg(target_os = "macos")]
     nets: RefCell<std::collections::HashMap<String, (Value, crate::netmedia::NetMedia)>>,
+    /// Remove background filters at work, by their mask picture's name.
+    #[cfg(target_os = "macos")]
+    cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -124,6 +127,8 @@ impl Stage {
             pages: RefCell::default(),
             #[cfg(target_os = "macos")]
             nets: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            cutouts: RefCell::default(),
         };
         s.add_scene(first_scene)?;
         Ok(s)
@@ -143,6 +148,8 @@ impl Stage {
             pages: RefCell::default(),
             #[cfg(target_os = "macos")]
             nets: RefCell::default(),
+            #[cfg(target_os = "macos")]
+            cutouts: RefCell::default(),
         };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
@@ -183,6 +190,41 @@ impl Stage {
         }
         self.sync_pages();
         out
+    }
+
+    /// Starts or stops finding the person for each Remove background filter that's on.
+    #[cfg(target_os = "macos")]
+    fn sync_cutouts(&self, e: &Arc<own::Shared>) {
+        let want: Vec<(String, String)> = self
+            .sources_list()
+            .iter()
+            .flat_map(|s| {
+                let source = name_of(s).to_string();
+                s.get("filters")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|f| {
+                        f.get("versioned_id").or_else(|| f.get("id")).and_then(Value::as_str)
+                            == Some("ferrocast_remove_background")
+                            && f.get("enabled").and_then(Value::as_bool) != Some(false)
+                    })
+                    .map(move |f| {
+                        let fname = f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background");
+                        // The engine names the mask picture so (ferrocast_av::obs).
+                        (format!("{source}: {fname}"), source.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut cutouts = self.cutouts.borrow_mut();
+        // Gone, or working for an engine that's gone (a new canvas): stopped.
+        cutouts.retain(|mask, c| c.serves(e) && want.iter().any(|(m, _)| m == mask));
+        for (mask, source) in want {
+            cutouts
+                .entry(mask.clone())
+                .or_insert_with(|| crate::cutout::Cutout::start(Arc::downgrade(e), source, mask));
+        }
     }
 
     /// Starts, restarts or stops reading the network media sources (a guest's camera…), and
@@ -226,6 +268,7 @@ impl Stage {
                 .map(|s| (name_of(s).to_string(), s.get("settings").cloned().unwrap_or_default()))
                 .collect();
             self.sync_nets(&e);
+            self.sync_cutouts(&e);
             let mut pages = self.pages.borrow_mut();
             pages.retain(|name, _| web.iter().any(|(n, _)| n == name));
             for (name, set) in web {
@@ -1507,7 +1550,12 @@ impl Stage {
         if canvas.width == 0 || canvas.height == 0 || canvas.fps == 0 {
             return Err(fail("The picture needs a size and a frame rate."));
         }
+        // Remove background's workers hold the engine for a moment each round: stopped first, so
+        // only outputs count (and started again if the size can't change).
+        #[cfg(target_os = "macos")]
+        self.cutouts.borrow_mut().clear();
         if self.engine.borrow().as_ref().is_some_and(|e| Arc::strong_count(e) > 1) {
+            self.sync_pages();
             return Err(fail("The picture size can't change while streaming or recording. Stop first."));
         }
         *self.engine.borrow_mut() = None;
@@ -3115,6 +3163,42 @@ mod tests {
         assert_eq!(px(300, 10), [255, 0, 0]);
         ok(s.edit_item("Main", red.id, ItemEdit::Hide));
         assert_eq!(px(300, 10), [0, 0, 0], "hidden");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn remove_background_takes_out_what_isnt_a_person() {
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        // Green, with no one in it: once Vision has looked, it's all background.
+        ok(s.add_source("Main", "color_source_v3", "Card", &json!({ "color": 4278255360u32 }), false));
+        ok(s.add_filter("Card", "ferrocast_remove_background", "Cut", &json!({})));
+        assert_eq!(s.cutouts.borrow().len(), 1, "a worker for the filter");
+        let path = std::env::temp_dir().join(format!("ferrocast-cutout-{}.png", std::process::id()));
+        let mut gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            ok(s.screenshot_program(&path));
+            let img = image_px(&path);
+            if img.get(1).is_some_and(|g| *g < 10) {
+                gone = true;
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(gone, "the background went");
+        ok(s.remove_filter("Card", "Cut"));
+        assert!(s.cutouts.borrow().is_empty(), "its worker stops with it");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_px(path: &Path) -> Vec<u8> {
+        let Ok(f) = std::fs::File::open(path) else { return Vec::new() };
+        let Ok(mut r) = png::Decoder::new(std::io::BufReader::new(f)).read_info() else { return Vec::new() };
+        let mut px = vec![0; r.output_buffer_size()];
+        r.next_frame(&mut px).map(|_| px).unwrap_or_default()
     }
 
     #[test]
