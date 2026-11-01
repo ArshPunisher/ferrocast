@@ -251,11 +251,18 @@ remove libobs with no fallback. Done on the branch (each checked as noted in its
 | The preview, Studio Mode's on-air view, the vertical preview, the Scenes grid's tiles (Mac) | checked in a real window: edits within 0.4 s, outlines and handles |
 | Fixed on the way (also on main): FFmpeg recoloured our frames (BT.601 taken for BT.709); the mixer dropped queued sound at a gap | |
 
-Left, in order: projectors and the multiview; **the scene store without libobs** (step 3:
-the collection as an OBS-format document edited in Rust and handed to the engine, about 115
-functions the app calls, plus each source kind's settings form); web page sources; Windows
-capture; SRT, RIST and WHIP sends; chapters and Twitch's VOD track; the virtual camera (needs
-Apple signing); then libobs, its bundled files and its CI jobs deleted.
+**The scene store without libobs (step 3): done.** `crates/studio/src/stage.rs` keeps the
+collection as an OBS-format document edited in Rust and hands it to the engine after each edit
+(unchanged sources keep running); it answers every call the app makes on a collection, and its
+outputs and views answer as the app's streams, recordings and previews. Kinds and their forms
+are our engine's own (`kinds.rs`), recording names follow OBS's patterns (`naming.rs`), stats
+come from the system (`system.rs`), undo keeps whole snapshots, and recordings are remuxed by
+FFmpeg. **The app's Studio starts with no libobs**: run from a folder with no OBS files, it
+records H.264 and AAC at 1080p with no libobs loaded.
+
+Left: Windows capture and preview; web page sources; projectors and the multiview; media
+play/pause; guests; SRT, RIST and WHIP sends; chapters and Twitch's VOD track; the virtual
+camera (needs Apple signing); then libobs's code, its bundled files and its CI jobs deleted.
 
 ### Honest sizes and risks
 
