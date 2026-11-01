@@ -449,7 +449,13 @@ async fn stream_to(
                 }
                 let Some(setup) = &low.video else { continue };
                 let (Ok(Some(pt)), true) = (pt_of(setup), connected) else { continue };
-                let Some((key, _, es)) = annex_b(setup, &data, false) else { continue };
+                let Some((key, cts, es)) = annex_b(setup, &data, false) else { continue };
+                // WebRTC can't carry B-frames: that layer stops, the stream goes on.
+                if cts != 0 {
+                    tracing::info!("WHIP: the lower layer has B-frames; the stream alone goes");
+                    low_rx = None;
+                    continue;
+                }
                 if low.waiting_for_key && !key {
                     continue;
                 }
