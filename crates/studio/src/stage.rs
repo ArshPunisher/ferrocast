@@ -2413,9 +2413,10 @@ impl StageOutput {
         self.save_replay()
     }
 
-    /// Chapter marks aren't in our engine's files yet.
-    pub fn chapter(&self, _name: &str) -> Result<(), StudioError> {
-        Err(fail("Chapter marks aren't in Ferrocast's own engine yet."))
+    /// A chapter mark in the recording here (OBS's "Add Chapter Marker"): named, or
+    /// "Chapter n" when the name is empty. In MP4 and MKV files alike.
+    pub fn chapter(&self, name: &str) -> Result<(), StudioError> {
+        self.own.chapter(name)
     }
 
     /// SRT, RIST and WebRTC sends aren't in our engine yet.

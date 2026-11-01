@@ -786,6 +786,15 @@ impl OwnStream {
         d.shared.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
     }
 
+    /// A chapter mark in the recording here (named, or "Chapter n").
+    pub(crate) fn chapter(&self, name: &str) -> Result<(), StudioError> {
+        let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("Chapter marks go in a recording.".into()))?;
+        d.shared
+            .engine
+            .chapter_output(d.output, name)
+            .map_err(|e| StudioError::Failed(format!("The chapter mark couldn't be added: {e}.")))
+    }
+
     /// Goes on in a new file at `path` from the next frame.
     pub(crate) fn split(&mut self, path: &std::path::Path) -> Result<(), StudioError> {
         let d = self.drawn.as_mut().ok_or_else(|| StudioError::Failed("This recording can't be split.".into()))?;
