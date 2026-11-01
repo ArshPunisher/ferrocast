@@ -4,15 +4,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ffi;
 use crate::StudioError;
+use crate::ffi;
 
 pub(crate) mod follow;
 mod vertical;
 
+pub use ffi::tap::TapReader;
 pub use follow::{Face, FaceFollow, FollowLook, find_busy, find_faces};
 pub use vertical::{VERTICAL_SIZE, VerticalInfo};
-pub use ffi::tap::TapReader;
 
 /// OBS's keys for the six global sound channels (1 and 2: desktop audio, 3 to 6: mics).
 pub const CHANNEL_KEYS: [(u32, &str); 6] = [

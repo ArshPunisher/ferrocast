@@ -24,7 +24,6 @@ use objc2_web_kit::{
     WKWebViewConfiguration,
 };
 
-
 /// What every thread may touch.
 struct Shared {
     /// The source is visible somewhere (preview or program): snapshots only then.

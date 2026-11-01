@@ -151,6 +151,9 @@ pub(crate) struct OwnStream {
     /// Our engine drawing the collection (instead of libobs's frames).
     drawn: Option<Drawn>,
     hub: Option<Arc<Hub>>,
+    /// SRT, RIST and WHIP destinations beside the stream, by id: their stop and health.
+    directs:
+        std::collections::HashMap<String, (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<Health>)>,
 }
 
 /// The Studio's one engine, with the collection open: every drawn output (and the preview)
@@ -282,7 +285,6 @@ impl Shared {
         self.seen().on_air = Some(scene.to_string());
         Ok(())
     }
-
 }
 
 /// An output on the shared engine.
@@ -505,13 +507,9 @@ impl OwnStream {
             health,
             stop_push,
             runtime,
-            drawn: Some(Drawn {
-                shared,
-                output,
-                plan: None,
-                solo: solo.map(String::from),
-            }),
+            drawn: Some(Drawn { shared, output, plan: None, solo: solo.map(String::from) }),
             hub: Some(hub),
+            directs: Default::default(),
         })
     }
 
@@ -624,6 +622,53 @@ impl OwnStream {
             frames: self.counts.frames.load(Ordering::Relaxed),
             dropped: 0,
         }
+    }
+
+    /// Sends the stream to an SRT, RIST or WHIP destination too (`id` replaces one before).
+    pub(crate) fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
+        use ferrocast_golive::direct::{Direct, Kind};
+        let kind = Kind::of(url)
+            .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
+        if self.runtime.is_none() || self.hub.is_none() {
+            return Err(StudioError::Failed(
+                "SRT, RIST and WebRTC go out with a stream: start streaming first.".into(),
+            ));
+        }
+        self.remove_direct(id);
+        let (Some(rt), Some(hub)) = (self.runtime.as_ref(), self.hub.as_ref()) else { return Ok(()) };
+        let d = Direct {
+            id: id.to_string(),
+            kind,
+            url: url.trim().to_string(),
+            key: key.to_string(),
+            retry: Retry::default(),
+        };
+        ferrocast_golive::direct::check(&d).map_err(|e| StudioError::Failed(e.to_string()))?;
+        let (health_tx, health) =
+            tokio::sync::watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        rt.spawn(ferrocast_golive::direct::run(d, hub.clone(), health_tx, stop_rx));
+        self.directs.insert(id.to_string(), (stop, health));
+        Ok(())
+    }
+
+    pub(crate) fn remove_direct(&mut self, id: &str) {
+        if let Some((stop, _)) = self.directs.remove(id) {
+            let _ = stop.send(true);
+        }
+    }
+
+    /// A direct destination's stats: live or trying again, and what it lost.
+    pub(crate) fn direct_stats(&self, id: &str) -> Option<StreamStats> {
+        let (_, h) = self.directs.get(id)?;
+        let h = h.borrow();
+        Some(StreamStats {
+            active: h.state == PushState::Live,
+            reconnecting: matches!(h.state, PushState::Reconnecting { .. } | PushState::Connecting),
+            bytes: 0,
+            frames: 0,
+            dropped: h.dropped.min(u64::from(u32::MAX)) as u32,
+        })
     }
 
     pub(crate) fn record_stats(&self) -> RecordStats {

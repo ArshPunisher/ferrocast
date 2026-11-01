@@ -19,7 +19,6 @@ use objc2_speech::{
     SFSpeechRecognitionTaskHint, SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
 };
 
-
 /// How long one recognition runs before the next takes over.
 const TURN_SECS: u64 = 50;
 

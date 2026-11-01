@@ -2398,8 +2398,9 @@ impl StageOutput {
     }
 
     /// Stats of a direct send (none: those aren't in our engine yet).
-    pub fn direct_stats(&self, _id: &str) -> Option<StreamStats> {
-        None
+    /// An SRT, RIST or WHIP destination's stats (None when there's no such one).
+    pub fn direct_stats(&self, id: &str) -> Option<StreamStats> {
+        self.own.direct_stats(id)
     }
 
     pub fn pause(&self, on: bool) -> Result<(), StudioError> {
@@ -2472,13 +2473,16 @@ impl StageOutput {
     }
 
     /// SRT, RIST and WebRTC sends aren't in our engine yet.
-    pub fn add_direct(&mut self, _id: &str, _url: &str, _key: &str) -> Result<(), StudioError> {
-        Err(fail(
-            "SRT, RIST and WebRTC aren't in Ferrocast's own engine yet: those destinations go through Go live's RTMP.",
-        ))
+    /// Sends this stream to an SRT, RIST or WebRTC (WHIP) destination too: `srt://` (the key
+    /// is the stream id), `rist://` (simple profile) or an `https://` WHIP endpoint (the key is
+    /// its bearer token).
+    pub fn add_direct(&mut self, id: &str, url: &str, key: &str) -> Result<(), StudioError> {
+        self.own.add_direct(id, url, key)
     }
 
-    pub fn remove_direct(&mut self, _id: &str) {}
+    pub fn remove_direct(&mut self, id: &str) {
+        self.own.remove_direct(id);
+    }
 }
 
 /// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS): the
