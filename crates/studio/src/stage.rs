@@ -197,7 +197,7 @@ impl Stage {
     }
 
     /// Starts or stops finding the person for each Remove background filter that's on.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sync_cutouts(&self, e: &Arc<own::Shared>) {
         let want: Vec<(String, String)> = self
             .sources_list()
@@ -2913,7 +2913,7 @@ struct MultiviewState {
     view: (u32, u32),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl MultiviewState {
     /// Drawn at the window's shape, at most 1920 wide (each box is far smaller than a scene).
     fn size(&self) -> (u32, u32) {

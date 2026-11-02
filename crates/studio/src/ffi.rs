@@ -28,10 +28,10 @@ pub(crate) mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod vision;
 
-/// Robust Video Matting through tract: the person mask where Vision isn't. Kept for Remove
-/// background on Windows, which waits for our engine's Windows capture (ENGINE.md step 6).
-#[cfg(any(not(target_os = "macos"), feature = "onnx-matte"))]
-#[allow(dead_code)]
+/// Robust Video Matting through tract: the person mask where Vision isn't (Remove background on
+/// Windows).
+#[cfg(any(windows, feature = "onnx-matte"))]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod matte;
 
 /// The Studio's picture in the app's window on Windows (the macOS one is `mac::ChildView`).

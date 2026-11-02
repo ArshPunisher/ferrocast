@@ -1308,6 +1308,8 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn start(&self) -> Result<StudioStatus, String> {
+        #[cfg(windows)]
+        fetch_matte(self.data.clone());
         let config = self.data.join("studio");
         let data = self.data.clone();
         self.on_main(move |h| {

@@ -516,9 +516,9 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                     }
                     None => out.skipped.push(format!("{name}: the filter {kind} (no picture chosen)")),
                 }
-            } else if kind == "ferrocast_remove_background" && !cfg!(target_os = "macos") {
+            } else if kind == "ferrocast_remove_background" && !cfg!(any(target_os = "macos", target_os = "windows")) {
                 // Nothing finds the person here yet: left out, not a picture cut away.
-                out.skipped.push(format!("{name}: the filter {kind} (on a Mac only so far)"));
+                out.skipped.push(format!("{name}: the filter {kind} (on a Mac and Windows only so far)"));
             } else if kind == "ferrocast_remove_background" {
                 // The person mask comes in as a picture of its own (the app finds the person
                 // and hands it in), shown in no scene.

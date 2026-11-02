@@ -1,7 +1,8 @@
 //! The person in a picture, found on the CPU by Robust Video Matting (RVM, MobileNetV3, GPL-3.0,
 //! github.com/PeterL1n/RobustVideoMatting) through tract, pure Rust: Remove background where
-//! Apple's Vision isn't (Windows). The model is a file the installer puts beside OBS's engine
-//! (deploy/obs-runtime-windows.ps1); without it the filter isn't offered.
+//! Apple's Vision isn't (Windows). The model is fetched the first time the Studio starts
+//! (`ferrocast_engine::speech_model::MATTE`, checked against its SHA-256); until it's here the
+//! picture shows as it is.
 //!
 //! RVM is made for video: it carries what it saw in the last frames (its recurrent state), so the
 //! mask stays steady from frame to frame. A frame of another size starts afresh.
@@ -12,8 +13,6 @@ use std::sync::OnceLock;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::internal::bail;
 
-/// The model's file name, under the engine's `data/ferrocast/`.
-pub(crate) const MODEL: &str = "rvm_mobilenetv3_fp32.onnx";
 
 /// Frames are given to RVM this wide (the height follows the picture's shape): about 20 ms a
 /// frame on one core.
@@ -24,16 +23,16 @@ const RATIO: f32 = 0.5;
 
 static PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Where the model is (FERROCAST_MATTE_MODEL first, else under the engine's data), set once at
-/// start → whether there is one.
-pub(crate) fn find(obs_data: &str) -> bool {
-    let from_env = std::env::var_os("FERROCAST_MATTE_MODEL").map(PathBuf::from);
-    // `obs_data` is libobs's own data (`…/data/libobs/`): ours sits beside it.
-    let beside = Path::new(obs_data).parent().map(|d| d.join("ferrocast").join(MODEL));
-    match from_env.into_iter().chain(beside).find(|p| p.is_file()) {
-        Some(p) => PATH.get_or_init(|| p).is_file(),
-        None => false,
-    }
+/// Uses the model at `path` (FERROCAST_MATTE_MODEL wins) from now on → whether there is one.
+/// Set once.
+pub(crate) fn set_model(path: &Path) -> bool {
+    let p = std::env::var_os("FERROCAST_MATTE_MODEL").map_or_else(|| path.to_path_buf(), PathBuf::from);
+    p.is_file() && PATH.get_or_init(|| p).is_file()
+}
+
+/// Whether a model is here to use.
+pub(crate) fn ready() -> bool {
+    PATH.get().is_some()
 }
 
 type Plan = std::sync::Arc<TypedRunnableModel>;
@@ -140,5 +139,36 @@ mod tests {
         assert_eq!(height_for(1080, 1920), 680);
         assert_eq!(height_for(4000, 100), 64, "never too thin");
         assert_eq!(height_for(0, 0), 64);
+    }
+
+    /// With FERROCAST_MATTE_MODEL (the model) and FERROCAST_MATTE_TEST_PNG (a picture with a
+    /// person at its middle): the middle is the person, the bottom-left corner isn't.
+    #[test]
+    fn finds_the_person_in_a_picture() {
+        let (Some(model), Some(png)) =
+            (std::env::var_os("FERROCAST_MATTE_MODEL"), std::env::var_os("FERROCAST_MATTE_TEST_PNG"))
+        else {
+            return;
+        };
+        assert!(set_model(Path::new(&model)) && ready());
+        let file = std::fs::File::open(png).unwrap_or_else(|e| panic!("{e}"));
+        let mut r = png::Decoder::new(std::io::BufReader::new(file)).read_info().unwrap_or_else(|e| panic!("{e}"));
+        let mut buf = vec![0; r.output_buffer_size()];
+        let info = r.next_frame(&mut buf).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(info.color_type, png::ColorType::Rgba, "an RGBA picture");
+        // Cut to a multiple of 8 each way.
+        let (w, h) = (info.width / 8 * 8, info.height / 8 * 8);
+        let rgba: Vec<u8> = (0..h as usize)
+            .flat_map(|y| buf[y * info.line_size..y * info.line_size + w as usize * 4].to_vec())
+            .collect();
+        let mut m = Matte::new();
+        let mut px = Vec::new();
+        // A few frames: RVM settles as it sees more of them.
+        for _ in 0..4 {
+            px = m.mask(&rgba, w, h).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let at = |x: u32, y: u32| px[(y * w + x) as usize];
+        assert!(at(w / 2, h / 2) > 200, "the person: {}", at(w / 2, h / 2));
+        assert!(at(8, h - 8) < 50, "not the person: {}", at(8, h - 8));
     }
 }
