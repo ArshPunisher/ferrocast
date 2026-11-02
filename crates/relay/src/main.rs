@@ -142,7 +142,6 @@ async fn main() {
         .with_vault(vault)
         .with_blobs(blobs)
         .with_tts(tts, tts_cap)
-        .with_bond(ferrocast_relay::bond::Runtime::from_env())
         .with_smart(smart, smart_cap)
         .with_smart_backup(smart_backup, smart_backup_cap)
         .with_admin(admin);

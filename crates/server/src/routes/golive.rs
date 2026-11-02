@@ -30,8 +30,6 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/upload-check", post(upload_check))
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
-        .route("/golive/bond", put(bond_on))
-        .route("/golive/irl", get(irl).post(irl_start).delete(irl_end))
         .route("/golive/vertical/obs/setup", post(point_vertical))
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
@@ -161,32 +159,6 @@ async fn resume(State(app): State<AppState>, Path(id): Path<String>) -> ApiResul
 #[serde(deny_unknown_fields)]
 struct AitumBody {
     ok: bool,
-}
-
-#[derive(Deserialize)]
-struct BondBody {
-    on: bool,
-}
-
-/// "Stream from your phone" (Bond, Pro): the link for the phone.
-async fn irl_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.golive_irl_start().await?))
-}
-
-/// The phone stream: its link, and how it and the platforms are doing.
-async fn irl(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.golive_irl().await))
-}
-
-/// Ends the phone stream.
-async fn irl_end(State(app): State<AppState>) -> ApiResult<axum::http::StatusCode> {
-    app.engine.golive_irl_end().await;
-    Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
-/// Ferrocast Bond (Pro) on or off, from the next stream.
-async fn bond_on(State(app): State<AppState>, Body(b): Body<BondBody>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.set_golive_bond(b.on).await?)))
 }
 
 /// "I use Aitum Multistream on purpose" (A2.2): hides the setup note.

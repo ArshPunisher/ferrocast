@@ -17,7 +17,6 @@ mod admin_pro;
 pub mod backups;
 pub mod billing;
 pub mod blob;
-pub mod bond;
 pub mod bot;
 pub mod cloud;
 pub mod db;
@@ -134,8 +133,6 @@ pub struct AppState {
     pub(crate) cloud: Arc<cloud::Runtime>,
     /// Guest cameras: the PCs' link sockets and the guests waiting for an answer.
     pub(crate) guests: Arc<guests::Runtime>,
-    /// Ferrocast Bond: where it is and its tokens' secret (off without `BOND_*`).
-    pub(crate) bond: Arc<bond::Runtime>,
     /// Wakes an install's link socket when something is queued for it.
     wakers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     /// Install registrations per IP per minute.
@@ -166,7 +163,6 @@ impl AppState {
             accounts: Arc::default(),
             cloud: Arc::default(),
             guests: Arc::default(),
-            bond: Arc::default(),
             wakers: Arc::default(),
             signups: Arc::default(),
             signups_hour: Arc::default(),
@@ -189,12 +185,6 @@ impl AppState {
     /// Where Pro keeps files (`blob::FsBlobStore` in production).
     pub fn with_blobs(mut self, blobs: Option<Arc<dyn blob::BlobStore>>) -> AppState {
         self.blobs = blobs;
-        self
-    }
-
-    /// Ferrocast Bond (`bond::Runtime::from_env()` in production).
-    pub fn with_bond(mut self, bond: bond::Runtime) -> AppState {
-        self.bond = Arc::new(bond);
         self
     }
 
@@ -394,7 +384,6 @@ pub fn router(state: AppState) -> Router {
         .merge(accounts::routes())
         .merge(cloud::routes())
         .merge(guests::routes())
-        .merge(bond::routes())
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         // A streamer's own tip address (`Host` is theirs) gets only their tip pages.
         .layer(axum::middleware::from_fn_with_state(state.clone(), tips::domains::route_custom_hosts))
