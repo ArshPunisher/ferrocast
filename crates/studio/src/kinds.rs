@@ -17,6 +17,7 @@ pub fn kinds() -> Kinds {
         kind("image_source", "Image"),
         kind("text_ft2_source_v2", "Text"),
         kind("slideshow", "Image Slide Show"),
+        kind("ndi_source", "NDI Source"),
     ];
     if cfg!(target_os = "macos") {
         inputs.extend([
@@ -208,6 +209,12 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("width", "Width", "int").range(0.0, 16384.0, 1.0),
             opt("height", "Height", "int").range(0.0, 16384.0, 1.0),
         ],
+        "ndi_source" => {
+            // The sources on the network now (a moment's look), when NDI is installed.
+            let found: Vec<(String, Value)> =
+                crate::ffi::ndi::sources(1500).unwrap_or_default().into_iter().map(|n| (n.clone(), json!(n))).collect();
+            vec![opt("ndi_source_name", "Source name", "list").choices(&as_refs(&found))]
+        }
         "ferrocast_shader" => vec![
             opt("shader_file", "Shader File", "path").file("WGSL Shaders (*.wgsl);;All Files (*.*)"),
             opt("shader_text", "Or Write One Here", "text").multiline().mono(),
@@ -566,6 +573,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "color": 0xFFD1_D1D1u32, "width": 0, "height": 0 })
         }
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
+        "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_shader" => json!({
             "shader_file": "",
             "shader_text": "// Each point of the picture: pic(uv) reads it; time(), size() and params() help.\nfn effect(uv: vec2<f32>) -> vec4<f32> {\n    let c = pic(uv);\n    let gray = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));\n    return vec4<f32>(mix(c.rgb, vec3<f32>(gray), params().x), c.a);\n}\n",

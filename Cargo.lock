@@ -2507,6 +2507,7 @@ dependencies = [
  "ferrocast-golive",
  "ferrocast-guest",
  "ferrocore",
+ "libloading 0.8.9",
  "ndarray 0.15.6",
  "objc2",
  "objc2-app-kit",

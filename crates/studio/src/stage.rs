@@ -44,6 +44,10 @@ pub struct Stage {
     pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
     /// Media from network addresses (guests' cameras, streams), each read by FFmpeg.
     nets: RefCell<std::collections::HashMap<String, (Value, crate::netmedia::NetMedia)>>,
+    /// NDI sources, each read from the network.
+    ndis: RefCell<std::collections::HashMap<String, (String, crate::ndi_io::NdiIn)>>,
+    /// NDI sources that didn't start, with why (said once, tried again at each edit).
+    ndi_failed: RefCell<std::collections::HashMap<String, String>>,
     /// Remove background filters at work, by their mask picture's name.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
@@ -129,6 +133,8 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
             nets: RefCell::default(),
+            ndis: RefCell::default(),
+            ndi_failed: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
         };
@@ -149,6 +155,8 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
             nets: RefCell::default(),
+            ndis: RefCell::default(),
+            ndi_failed: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
         };
@@ -230,6 +238,45 @@ impl Stage {
 
     /// Starts, restarts or stops reading the network media sources (a guest's camera…), and
     /// hands each its source's feed.
+    fn sync_ndis(&self, e: &own::Shared) {
+        let want: Vec<(String, String)> = self
+            .sources_list()
+            .iter()
+            .filter(|s| kind_of(s) == "ndi_source")
+            .map(|s| {
+                let n = s.pointer("/settings/ndi_source_name").and_then(Value::as_str).unwrap_or_default();
+                (name_of(s).to_string(), n.to_string())
+            })
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
+        let mut ndis = self.ndis.borrow_mut();
+        ndis.retain(|name, (was, _)| want.iter().any(|(n, src)| n == name && src == was));
+        for (name, src) in want {
+            let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
+            match ndis.get(&name) {
+                Some((_, r)) => r.set_feed(feed),
+                None => match crate::ndi_io::NdiIn::start(&src, feed) {
+                    Ok(r) => {
+                        self.ndi_failed.borrow_mut().remove(&name);
+                        ndis.insert(name, (src, r));
+                    }
+                    Err(e) => {
+                        if self.ndi_failed.borrow_mut().insert(name.clone(), e.clone()).as_ref() != Some(&e) {
+                            tracing::warn!(source = %name, "an NDI source didn't start: {e}");
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// Sends what's on air out on the network as the NDI source `name`.
+    pub fn ndi_output(&self, name: &str) -> Result<crate::NdiOut, StudioError> {
+        let e = self.engine()?;
+        let size = (self.canvas.width, self.canvas.height);
+        crate::ndi_io::NdiOut::start(Arc::downgrade(&e), name, size, self.canvas.fps).map_err(fail)
+    }
+
     fn sync_nets(&self, e: &own::Shared) {
         let net: Vec<(String, Value)> = self
             .sources_list()
@@ -258,6 +305,9 @@ impl Stage {
     /// hands each its source's feed (a new one after the collection is opened again). Main
     /// thread (WebKit on a Mac).
     fn sync_pages(&self) {
+        if let Some(e) = self.engine.borrow().clone() {
+            self.sync_ndis(&e);
+        }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         if let Some(e) = self.engine.borrow().clone() {
             self.sync_nets(&e);

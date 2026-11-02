@@ -21,6 +21,9 @@ pub const FRAME_COLORS: [(f32, f32, f32); 8] = [
 #[cfg(target_os = "macos")]
 pub(crate) mod speech;
 
+/// NDI in and out, through NDI's own library when it's installed.
+pub(crate) mod ndi;
+
 /// A sound's audio for any listener (Whisper captions).
 pub(crate) mod tap;
 

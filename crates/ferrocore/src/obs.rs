@@ -537,6 +537,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             let dev = text_of("device_id");
             (SourceKind::Microphone(if dev.is_empty() { "default".into() } else { dev }), true)
         }
+        // An NDI source (DistroAV's kind): the app reads it from the network and hands it in.
+        "ndi_source" => (SourceKind::Fed { width: 1920, height: 1080 }, true),
         // A web page (OBS's Browser source, or Ferrocast's own): the app renders it and hands
         // its pictures in. OBS's own size keys; 800x600 when it says none.
         "browser_source" | "ferrocast_web" => {
