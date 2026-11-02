@@ -2891,7 +2891,7 @@ impl Drop for StageView {
 
 /// A projector: a window of its own (or a display, full screen) showing what's on air, a scene,
 /// or a source alone, drawn by our engine. Closed when dropped.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug)]
 pub struct StageProjector {
     shared: Arc<own::Shared>,
@@ -2903,7 +2903,7 @@ pub struct StageProjector {
 
 /// What a multiview shows and where: the scenes, Studio Mode's preview, the look, the canvas
 /// and the window's size in pixels.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq)]
 struct MultiviewState {
     names: Vec<String>,
@@ -2996,7 +2996,7 @@ impl MultiviewState {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Stage {
     /// Opens a projector of `of` on `screen` (full screen) or in a window; `on_close` runs when
     /// it's closed there (Esc, the window's button), `on_pick` with a scene clicked in a
@@ -3082,7 +3082,7 @@ impl Stage {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageProjector {
     /// Its window's number (to screenshot it in checks).
     pub fn window_number(&self) -> isize {
@@ -3107,7 +3107,7 @@ impl StageProjector {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for StageProjector {
     fn drop(&mut self) {
         self.shared.engine.stop_preview(self.id);

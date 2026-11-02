@@ -566,7 +566,7 @@ pub mod projector {
                 }
                 TRUE as LRESULT
             }
-            // libobs draws all of it.
+            // Ferrocore draws all of it.
             WM_ERASEBKGND => 1,
             WM_NCDESTROY => {
                 // SAFETY: clears the pointer before Win drops the State it points to.

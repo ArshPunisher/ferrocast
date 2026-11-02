@@ -17,10 +17,10 @@ use ferrocast_studio::stage::Stage as Collection;
 use ferrocast_studio::stage::StageOutput as Streaming;
 use ferrocast_studio::stage::StageOutput as Recording;
 use ferrocast_studio::stage::StageView as Preview;
-/// A projector window (our engine draws them on a Mac; none elsewhere yet).
-#[cfg(target_os = "macos")]
+/// A projector window (Ferrocore draws them on a Mac and on Windows; none elsewhere yet).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 type ProjectorWin = ferrocast_studio::stage::StageProjector;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 type ProjectorWin = ();
 use ferrocast_studio::{
     Canvas, EncodeSettings, ItemEdit, Monitor, Rect, StreamSettings, StudioOptions, TransitionInfo,
@@ -156,15 +156,44 @@ fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
 /// Multiviews follow the scenes, Studio Mode's preview and their settings (other projectors
 /// follow by themselves).
 fn refresh_projectors(h: &Held) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(c) = &h.collection {
         let look = multiview_look(&h.settings.clone().unwrap_or_default());
         for (_, p) in &h.projectors {
             p.update(c, look);
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = h;
+}
+
+/// Remove background's model on Windows (Robust Video Matting, 15 MB): used when it's here,
+/// fetched when not (once per run, again after a failure), checked against its SHA-256.
+#[cfg(windows)]
+fn fetch_matte(data: std::path::PathBuf) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferrocast_engine::speech_model::{MATTE, download_model, model_path};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if ASKED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let path = model_path(&data, &MATTE);
+    tauri::async_runtime::spawn(async move {
+        // A model of one's own (FERROCAST_MATTE_MODEL) needs no download.
+        let own = std::env::var_os("FERROCAST_MATTE_MODEL").is_some();
+        if !own && !path.is_file() {
+            if let Err(e) = download_model(&MATTE, &path, |_| {}).await {
+                tracing::warn!(error = %e, "Remove background's model didn't download");
+                ASKED.store(false, Ordering::Release);
+                return;
+            }
+            tracing::info!("Remove background's model downloaded");
+        }
+        if !ferrocast_studio::use_matte_model(&path) {
+            tracing::warn!("Remove background's model isn't usable");
+        }
+    });
 }
 
 thread_local! {
@@ -2499,7 +2528,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn projector(&self, p: ProjectorReq) -> Result<Value, String> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             self.on_main(move |h| {
                 let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -2548,10 +2577,10 @@ impl StudioHost for DesktopStudio {
             })
             .await?
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = p;
-            Err("Projectors are drawn by Ferrocast's own engine on a Mac only so far.".into())
+            Err("Projectors are drawn on a Mac and on Windows so far.".into())
         }
     }
 

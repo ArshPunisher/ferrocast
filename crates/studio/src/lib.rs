@@ -178,6 +178,13 @@ pub struct PreviewInput {
     pub alt: bool,
 }
 
+/// Remove background's model on Windows (Robust Video Matting), once it's here → whether it's
+/// used (a missing file isn't).
+#[cfg(windows)]
+pub fn use_matte_model(path: &Path) -> bool {
+    ffi::matte::set_model(path)
+}
+
 /// The displays a full-screen projector can go on (macOS and Windows; none elsewhere yet). Main
 /// thread.
 pub fn screens() -> Vec<Screen> {
