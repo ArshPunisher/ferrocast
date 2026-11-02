@@ -1262,7 +1262,8 @@ impl Engine {
 
     /// What stopped the loop or an output, if anything did.
     pub fn error(&self) -> Option<String> {
-        self.lock().error.clone()
+        let own = self.lock().error.clone();
+        own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     /// Any scene drawn now at the engine's size, RGBA: Studio Mode's preview, the Scenes grid.
@@ -1735,6 +1736,11 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
 
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             frame(&config, state, gpu, mixer, ts, behind, started);
+            // Pictures uploaded this frame are sent even when nothing drew (no preview, no
+            // output), and what the card finished with is let go: without this, Direct3D and
+            // Vulkan keep it all and run out of memory in minutes.
+            gpu.queue.submit(std::iter::empty());
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
         }));
         if let Err(p) = ok {
             // A fault in a frame is that frame lost, not the engine: the next one is drawn.

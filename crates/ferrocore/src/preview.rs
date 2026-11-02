@@ -195,6 +195,8 @@ impl Compositor {
         self.paint(&mut enc, &view, s.config.format, (s.config.width, s.config.height), &canvas, look);
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
+        // What finished drawing is let go now (Direct3D and Vulkan hold it until asked).
+        let _ = self.device.poll(wgpu::PollType::Poll);
         Ok(())
     }
 

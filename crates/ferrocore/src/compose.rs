@@ -73,6 +73,9 @@ fn blend_state(b: Blend, metal: bool) -> wgpu::BlendState {
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
 pub struct Compositor {
+    /// The last error the graphics card reported on its own (out of memory, a device lost), in
+    /// words: kept so the engine says so instead of only logging it.
+    pub(crate) gpu_error: std::sync::Arc<Mutex<Option<String>>>,
     /// Kept for window surfaces (the preview): they must come from the device's own instance.
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) instance: wgpu::Instance,
@@ -168,6 +171,26 @@ impl Compositor {
             .request_device(&wgpu::DeviceDescriptor { label: Some("ferrocore"), ..Default::default() })
             .await
             .map_err(|e| AvError::NoGpu(e.to_string()))?;
+        // A graphics card error is logged, never the end of the app: the frame it hit is lost,
+        // the engine draws the next (wgpu would otherwise panic on the thread it happened on).
+        let gpu_error = std::sync::Arc::new(Mutex::new(None::<String>));
+        {
+            let gpu_error = gpu_error.clone();
+            device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::error!(times = n, "the graphics card refused something: {e}");
+                }
+                // Out of memory (or worse) is said where the Studio shows the engine's errors.
+                if let wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. } = e {
+                    *gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!(
+                        "The graphics card had a problem ({e}). Stop and start the Studio; if it keeps happening, \
+                         use fewer or smaller sources."
+                    ));
+                }
+            }));
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("draw"),
             source: wgpu::ShaderSource::Wgsl(include_str!("draw.wgsl").into()),
@@ -336,6 +359,7 @@ impl Compositor {
         };
         let nv12 = (conv("fs_y", wgpu::TextureFormat::R8Unorm), conv("fs_uv", wgpu::TextureFormat::Rg8Unorm));
         Ok(Self {
+            gpu_error,
             instance,
             adapter,
             preview_pipelines: Mutex::new(HashMap::new()),
