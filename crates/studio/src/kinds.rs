@@ -37,6 +37,15 @@ pub fn kinds() -> Kinds {
             kind("wasapi_output_capture", "Audio Output Capture"),
         ]);
     }
+    if cfg!(target_os = "linux") {
+        inputs.extend([
+            kind("ffmpeg_source", "Media Source"),
+            kind("xshm_input", "Screen Capture (XSHM)"),
+            kind("v4l2_input", "Video Capture Device (V4L2)"),
+            kind("pulse_input_capture", "Audio Input Capture (PulseAudio)"),
+            kind("pulse_output_capture", "Audio Output Capture (PulseAudio)"),
+        ]);
+    }
     Kinds {
         inputs,
         filters: vec![
@@ -272,6 +281,33 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
             vec![opt("video_device_id", "Device", "list").choices(&as_refs(&list))]
         }
+        // Linux (OBS's own keys).
+        "xshm_input" => {
+            #[allow(unused_mut)]
+            let mut d: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "linux")]
+            if let Ok((displays, _)) = ferrocore::screen::shareable() {
+                d.extend(
+                    displays.iter().map(|x| (format!("Display {} ({}x{})", x.id + 1, x.width, x.height), json!(x.id))),
+                );
+            }
+            vec![opt("screen", "Screen", "list").choices(&as_refs(&d)), opt("show_cursor", "Capture Cursor", "bool")]
+        }
+        "v4l2_input" => {
+            #[allow(unused_mut)]
+            let mut list: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "linux")]
+            list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
+            vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
+        }
+        "pulse_input_capture" => {
+            #[allow(unused_mut)]
+            let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
+            #[cfg(target_os = "linux")]
+            list.extend(ferrocore::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
+            vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
+        }
+        "pulse_output_capture" => vec![opt("device_id", "Device", "list").choices(&[("Default", json!("default"))])],
         "wasapi_input_capture" => {
             #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
@@ -490,6 +526,9 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "window_capture" => json!({ "cursor": true }),
         "dshow_input" => json!({ "video_device_id": "" }),
         "wasapi_input_capture" | "wasapi_output_capture" => json!({ "device_id": "default" }),
+        "xshm_input" => json!({ "screen": 0, "show_cursor": true }),
+        "v4l2_input" => json!({ "device_id": "" }),
+        "pulse_input_capture" | "pulse_output_capture" => json!({ "device_id": "default" }),
         "browser_source" | "ferrocast_web" => json!({
             "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",
             "width": 800, "height": 600, "fps": 30,
