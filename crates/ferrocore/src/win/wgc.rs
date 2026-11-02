@@ -297,19 +297,42 @@ impl Reader {
         let mut rgba = vec![0u8; ow as usize * oh as usize * 4];
         let pitch = mapped.RowPitch as usize;
         let base = mapped.pData as *const u8;
+        // Which source column each output column reads, worked out once a frame (not per pixel).
+        let cols: Vec<usize> = (0..ow as usize).map(|x| x * w as usize / ow as usize * 4).collect();
         for y in 0..oh as usize {
             let sy = y * h as usize / oh as usize;
             // SAFETY: row `sy` < the texture's height, inside the mapped data (RowPitch apart).
             let row = unsafe { std::slice::from_raw_parts(base.add(sy * pitch), w as usize * 4) };
             let out = &mut rgba[y * ow as usize * 4..(y + 1) * ow as usize * 4];
-            for x in 0..ow as usize {
-                let sx = x * w as usize / ow as usize * 4;
-                // BGRA in, RGBA out; Windows' desktop is opaque.
-                out[x * 4..x * 4 + 4].copy_from_slice(&[row[sx + 2], row[sx + 1], row[sx], 255]);
+            if ow == w {
+                // Same size: a straight swap of blue and red, which the compiler vectorises.
+                bgra_to_rgba(row, out);
+            } else {
+                for (o, &sx) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+                    // BGRA in, RGBA out; Windows' desktop is opaque.
+                    *o = [row[sx + 2], row[sx + 1], row[sx], 255];
+                }
             }
         }
         // SAFETY: the map made above.
         unsafe { self.context.Unmap(staging, 0) };
         Ok(Some(Picture { width: ow, height: oh, rgba, premultiplied: false }))
+    }
+}
+
+/// One row of BGRA as opaque RGBA.
+fn bgra_to_rgba(src: &[u8], out: &mut [u8]) {
+    for (o, i) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+        *o = [i[2], i[1], i[0], 255];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_row_turns_from_bgra_to_opaque_rgba() {
+        let mut out = [0u8; 8];
+        super::bgra_to_rgba(&[1, 2, 3, 0, 10, 20, 30, 7], &mut out);
+        assert_eq!(out, [3, 2, 1, 255, 30, 20, 10, 255]);
     }
 }
