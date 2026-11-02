@@ -314,7 +314,6 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             };
             (SourceKind::Text { text: text_of("text"), style }, false)
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
         "ffmpeg_source" => {
             // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
             // with FFmpeg and hands its pictures in, fitted into 1280x720.
@@ -414,6 +413,21 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             let dev = text_of("device_id");
             let dev = if dev.is_empty() || dev.starts_with('{') { "default".to_string() } else { dev };
             (SourceKind::Microphone(dev), true)
+        }
+        // Linux: OBS's own source kinds (X11 screen, Video4Linux, PulseAudio).
+        #[cfg(target_os = "linux")]
+        "xshm_input" | "xshm_input_v2" => {
+            let display = s.get("screen").and_then(Value::as_u64).unwrap_or(0) as u32;
+            (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
+        }
+        #[cfg(target_os = "linux")]
+        "v4l2_input" => (SourceKind::Camera(text_of("device_id")), false),
+        #[cfg(target_os = "linux")]
+        "pulse_output_capture" => (SourceKind::DesktopSound, true),
+        #[cfg(target_os = "linux")]
+        "pulse_input_capture" => {
+            let dev = text_of("device_id");
+            (SourceKind::Microphone(if dev.is_empty() { "default".into() } else { dev }), true)
         }
         // A web page (OBS's Browser source, or Ferrocast's own): the app renders it and hands
         // its pictures in. OBS's own size keys; 800x600 when it says none.

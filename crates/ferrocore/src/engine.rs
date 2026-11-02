@@ -43,26 +43,26 @@ pub enum SourceKind {
     },
     /// A display (macOS); with `sound`, what the Mac plays too (Ferrocast's own left out). The
     /// windows of the apps `hide` names (bundle ids or names) are left out: the privacy guard.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Screen {
         display: u32,
         sound: bool,
         hide: Vec<String>,
     },
     /// One window (macOS), by its window number, as it looks wherever it is.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Window(u32),
     /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     DesktopSound,
     /// A camera (macOS), by its id.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Camera(String),
     /// A microphone (macOS), by its id.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(String),
     /// A video or sound file (macOS), looping or once.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Media {
         path: PathBuf,
         looping: bool,
@@ -356,13 +356,13 @@ enum Live {
         beep_ns: u64,
         pushed_to: Option<u64>,
     },
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Screen(crate::screen::ScreenCapture),
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Camera(crate::camera::Capture),
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(crate::camera::Capture),
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Media(crate::media::Media),
     Fed(Feed),
 }
@@ -411,7 +411,7 @@ struct State {
     moving: Option<(String, TransitionKind, u64, u64)>,
     /// A stinger under way: the scene it came from, when it started, when the scene changes
     /// underneath, and when it ends (ns).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     stinger: Option<(String, u64, u64, u64)>,
     /// When each scene last went on air (its keyframes' time 0).
     started: std::collections::HashMap<String, u64>,
@@ -529,7 +529,7 @@ impl Engine {
             scenes: BTreeMap::new(),
             on_air: None,
             moving: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             stinger: None,
             started: std::collections::HashMap::new(),
             groups: Vec::new(),
@@ -612,7 +612,7 @@ impl Engine {
                     None,
                 )
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Screen { .. }
             | SourceKind::Window(_)
             | SourceKind::DesktopSound
@@ -630,7 +630,7 @@ impl Engine {
                 }
                 (live, None)
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Media { path, looping } => {
                 let m = crate::media::Media::open(&path, looping)?;
                 if m.has_audio {
@@ -702,7 +702,7 @@ impl Engine {
     }
 
     /// Plays, pauses, restarts, stops or seeks a media source (OBS's media controls).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_control(&self, id: u64, c: crate::media::Control) -> Result<(), AvError> {
         match self.lock().sources.get(&id).map(|s| &s.live) {
             Some(Live::Media(m)) => {
@@ -714,7 +714,7 @@ impl Engine {
     }
 
     /// A media source's state, where it is and how long it lasts (ns).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_state(&self, id: u64) -> Option<(crate::media::MediaState, u64, u64)> {
         match self.lock().sources.get(&id).map(|s| &s.live) {
             Some(Live::Media(m)) => {
@@ -904,7 +904,7 @@ impl Engine {
 
     /// Puts a scene on air behind a stinger: `video` plays over everything, and the scene
     /// changes underneath `cut_ms` in. Its sound plays too.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn go_stinger(&self, name: &str, video: &std::path::Path, cut_ms: u64) -> Result<(), AvError> {
         if !self.lock().scenes.contains_key(name) {
             return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
@@ -932,7 +932,7 @@ impl Engine {
     /// Whether a transition (or stinger) is under way.
     pub fn transitioning(&self) -> bool {
         let st = self.lock();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         if st.stinger.is_some() {
             return true;
         }
@@ -1345,7 +1345,7 @@ enum Draw {
 }
 
 /// The stinger's own source id (it plays as a source while it runs).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 const STINGER: u64 = u64::MAX - 1;
 
 /// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps).
@@ -1353,7 +1353,7 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     if let Some(name) = scene {
         return Draw::Scene(build(st, width, height, Some(name), ts));
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if let Some((from, _, cut, _)) = &st.stinger {
         let under = if ts < *cut { Some(from.as_str()) } else { st.on_air.as_deref() };
         let mut s = build(st, width, height, under, ts);
@@ -1484,13 +1484,13 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
     let mut roots: Vec<&str> = Vec::new();
     roots.extend(st.on_air.as_deref());
     roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
     roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
     for r in roots {
         walk(st, r, 0, &mut out);
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     out.insert(STINGER);
     out
 }
@@ -1519,7 +1519,7 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
     let mut roots: Vec<&str> = Vec::new();
     roots.extend(st.on_air.as_deref());
     roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
     roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
     for p in st.previews.values() {
@@ -1531,7 +1531,7 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
     for r in roots {
         walk(st, r, 0, &mut out);
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     out.insert(STINGER);
     out
 }
@@ -1697,7 +1697,7 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
 
 /// Sources the watchdog can start again: captures (a file or a picture doesn't stop by itself).
 fn is_capture(kind: &SourceKind) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if matches!(
         kind,
         SourceKind::Screen { .. }
@@ -1713,7 +1713,7 @@ fn is_capture(kind: &SourceKind) -> bool {
 }
 
 /// Starts a capture (None: `kind` isn't one).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
     use crate::screen::{ScreenCapture, Target};
     Some(match kind {
@@ -1737,7 +1737,13 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             &[],
         )
         .map(Live::Screen),
+        // Linux reads the speakers' monitor on its own, no display needed.
+        #[cfg(target_os = "linux")]
+        SourceKind::DesktopSound => {
+            ScreenCapture::start_with(Target::Display(0), 2, 2, 1, false, true, &[]).map(Live::Screen)
+        }
         // ScreenCaptureKit gives the sound with a display's picture: the smallest, slowest one.
+        #[cfg(not(target_os = "linux"))]
         SourceKind::DesktopSound => crate::screen::shareable()
             .and_then(|s| {
                 s.0.first()
@@ -1752,7 +1758,7 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
     })
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn open_capture(_: &EngineConfig, _: &SourceKind) -> Option<Result<Live, AvError>> {
     None
 }
@@ -1761,9 +1767,9 @@ fn open_capture(_: &EngineConfig, _: &SourceKind) -> Option<Result<Live, AvError
 /// microphone does; a screen only sends when something changes), and why it ended if it did.
 fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
     match live {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         Live::Screen(c) => Some((c.frames(), false, c.ended())),
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
         _ => None,
     }
@@ -1908,7 +1914,7 @@ fn frame(
                 }
                 *pushed_to = Some(at);
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Screen(cap) => {
                 if let Some(p) = cap.take() {
                     uploads.push((*id, p));
@@ -1919,13 +1925,13 @@ fn frame(
                     }
                 }
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Camera(cap) => {
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, p));
                 }
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Microphone(cap) => {
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
@@ -1933,7 +1939,7 @@ fn frame(
                     }
                 }
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Media(m) => {
                 if let Some(p) = m.frame_at(ts) {
                     uploads.push((*id, p));
@@ -1984,7 +1990,7 @@ fn frame(
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if st.stinger.as_ref().is_some_and(|(.., end)| ts >= *end) {
         st.stinger = None;
         st.sources.remove(&STINGER);

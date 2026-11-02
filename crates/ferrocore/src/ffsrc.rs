@@ -260,6 +260,32 @@ impl Reader {
     }
 }
 
+/// Live sound alone from an input (a microphone, what the computer plays).
+#[derive(Debug)]
+pub struct LiveSound(Reader);
+
+impl LiveSound {
+    /// Starts reading `input` (FFmpeg's input arguments) as 48 kHz stereo.
+    pub fn start(input: &[String]) -> Result<Self, AvError> {
+        let ff = ffmpeg()?;
+        Ok(LiveSound(Reader::start(&ff, input, Out::Sound, 30, Arc::new(Shared::default()))?))
+    }
+
+    /// Sound since the last call, oldest first.
+    pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
+        self.0.shared.sound.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// FFmpeg stopped (the device went), and its last words.
+    pub fn ended(&self) -> Option<String> {
+        self.0
+            .shared
+            .ended
+            .load(Ordering::Acquire)
+            .then(|| self.0.shared.error.lock().ok().and_then(|e| e.clone()).unwrap_or_default())
+    }
+}
+
 /// Live pictures (and sound, when asked) from an input: a screen, a camera.
 #[derive(Debug)]
 pub struct Live {

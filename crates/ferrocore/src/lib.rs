@@ -26,6 +26,19 @@ pub use win::media;
 /// Screen and window capture (Windows: Desktop Duplication or GDI through FFmpeg).
 #[cfg(target_os = "windows")]
 pub use win::screen;
+// Built for its tests elsewhere too (its parsers are plain text).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod linux;
+/// Cameras and microphones (Linux: Video4Linux and PulseAudio through FFmpeg).
+#[cfg(target_os = "linux")]
+pub use linux::camera;
+/// Video and sound files (Linux: through FFmpeg).
+#[cfg(target_os = "linux")]
+pub use linux::media;
+/// Screen capture (Linux: X11 through FFmpeg).
+#[cfg(target_os = "linux")]
+pub use linux::screen;
 pub mod afx;
 pub mod audio;
 mod compose;
