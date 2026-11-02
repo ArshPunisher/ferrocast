@@ -19,8 +19,12 @@ pub mod projector;
 #[allow(unsafe_code)]
 mod segment;
 pub mod stage;
+// The virtual camera on Linux (v4l2loopback); built for its tests elsewhere too.
 pub mod streamlabs;
 pub mod system;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod virtualcam;
 
 use std::path::{Path, PathBuf};
 
@@ -306,13 +310,19 @@ pub enum CameraShows {
     Source(String),
 }
 
-/// The virtual camera (it needs a signed camera extension, which Ferrocast doesn't have yet):
-/// never made, so turning it on says why.
+/// The virtual camera: on Linux what's on air sent to a v4l2loopback camera; a Mac and Windows
+/// need a signed camera of their own, not here yet, so turning it on there says why.
 #[derive(Debug)]
-pub struct VirtualCamera(());
+pub struct VirtualCamera {
+    #[cfg(target_os = "linux")]
+    pub(crate) cam: virtualcam::Loopback,
+}
 
 impl VirtualCamera {
     pub fn active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.cam.active();
+        #[cfg(not(target_os = "linux"))]
         false
     }
 }

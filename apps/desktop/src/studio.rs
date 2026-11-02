@@ -1983,12 +1983,21 @@ impl StudioHost for DesktopStudio {
             if !on {
                 return Ok(json!({ "active": false }));
             }
-            let _ = (h.collection.as_ref().ok_or(STOPPED)?, &source);
-            // On a Mac the camera is a system extension Apple has to sign.
-            Err::<Value, String>(
-                "The virtual camera isn't in Ferrocast's own engine yet: on a Mac it needs a camera extension signed by Apple."
-                    .into(),
-            )
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            #[cfg(target_os = "linux")]
+            {
+                h.virtualcam = Some(c.virtual_camera(source.as_deref()).map_err(|e| e.to_string())?);
+                Ok(json!({ "active": true }))
+            }
+            // A Mac and Windows need a camera of their own, signed, which Ferrocast doesn't have yet.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (c, &source);
+                Err::<Value, String>(
+                    "The virtual camera works on Linux so far: on a Mac and Windows it needs a signed camera of Ferrocast's own, which comes later."
+                        .into(),
+                )
+            }
         })
         .await?
     }

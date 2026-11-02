@@ -2023,6 +2023,23 @@ impl Stage {
 
     // ------------------------------------------------------------------ listening
 
+    /// Starts the virtual camera (Linux: a v4l2loopback camera) showing what's on air, or
+    /// `source` alone, at the canvas's size and frame rate.
+    #[cfg(target_os = "linux")]
+    pub fn virtual_camera(&self, source: Option<&str>) -> Result<crate::VirtualCamera, StudioError> {
+        let e = self.engine()?;
+        if let Some(name) = source
+            && e.engine.source_named(name).is_none()
+        {
+            return Err(fail(format!("There's no source called \"{name}\".")));
+        }
+        let size = (self.canvas.width, self.canvas.height);
+        let cam =
+            crate::virtualcam::Loopback::start(Arc::downgrade(&e), source.map(String::from), size, self.canvas.fps)
+                .map_err(fail)?;
+        Ok(crate::VirtualCamera { cam })
+    }
+
     /// Listens to a source's sound (mono, 48 kHz) for anything that wants it: Whisper captions.
     pub fn tap_sound(&self, source: &str) -> Result<crate::SoundTap, StudioError> {
         let e = self.engine()?;
