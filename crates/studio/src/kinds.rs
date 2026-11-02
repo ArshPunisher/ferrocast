@@ -16,10 +16,12 @@ pub fn kinds() -> Kinds {
         kind("color_source_v3", "Color Source"),
         kind("image_source", "Image"),
         kind("text_ft2_source_v2", "Text"),
+        kind("slideshow", "Image Slide Show"),
     ];
     if cfg!(target_os = "macos") {
         inputs.extend([
             kind("ffmpeg_source", "Media Source"),
+            kind("vlc_source", "VLC Video Source"),
             kind("screen_capture", "macOS Screen Capture"),
             kind("av_capture_input_v2", "Video Capture Device"),
             kind("coreaudio_input_capture", "Audio Input Capture"),
@@ -30,6 +32,7 @@ pub fn kinds() -> Kinds {
     if cfg!(target_os = "windows") {
         inputs.extend([
             kind("ffmpeg_source", "Media Source"),
+            kind("vlc_source", "VLC Video Source"),
             kind("monitor_capture", "Display Capture"),
             kind("window_capture", "Window Capture"),
             kind("dshow_input", "Video Capture Device"),
@@ -40,6 +43,7 @@ pub fn kinds() -> Kinds {
     if cfg!(target_os = "linux") {
         inputs.extend([
             kind("ffmpeg_source", "Media Source"),
+            kind("vlc_source", "VLC Video Source"),
             kind("xshm_input", "Screen Capture (XSHM)"),
             kind("v4l2_input", "Video Capture Device (V4L2)"),
             kind("pulse_input_capture", "Audio Input Capture (PulseAudio)"),
@@ -160,6 +164,13 @@ impl OptionInfo {
         self
     }
 
+    /// A list of files (OBS's editable list of files).
+    fn files(mut self, filter: &str) -> Self {
+        self.path = "files";
+        self.filter = filter.into();
+        self
+    }
+
     fn multiline(mut self) -> Self {
         self.text_type = "multiline";
         self
@@ -172,6 +183,7 @@ fn as_refs(l: &[(String, Value)]) -> Vec<(&str, Value)> {
     l.iter().map(|(a, b)| (a.as_str(), b.clone())).collect()
 }
 
+const MEDIA_FILES: &str = "Media Files (*.mp4 *.m4v *.mov *.mkv *.webm *.flv *.ts *.avi *.mp3 *.m4a *.aac *.wav *.ogg *.opus *.flac);;All Files (*.*)";
 const IMAGES: &str = "Image Files (*.bmp *.tga *.png *.jpeg *.jpg *.jxr *.gif *.psd *.webp);;All Files (*.*)";
 const MEDIA: &str =
     "Media Files (*.mp4 *.m4v *.mov *.mkv *.ts *.webm *.mp3 *.aac *.wav *.m4a *.flac *.ogg);;All Files (*.*)";
@@ -183,6 +195,19 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("color", "Color", "color_alpha"),
             opt("width", "Width", "int").range(0.0, 16384.0, 1.0),
             opt("height", "Height", "int").range(0.0, 16384.0, 1.0),
+        ],
+        "slideshow" | "slideshow_v2" | "image_slide_show" => vec![
+            opt("files", "Image Files", "editable_list").files(IMAGES),
+            opt("slide_time", "Time Between Slides", "int").range(50.0, 3_600_000.0, 50.0).unit(" ms"),
+            opt("transition", "Transition", "list").choices(&[("Fade", json!("fade")), ("Cut", json!("cut"))]),
+            opt("transition_speed", "Transition Speed", "int").range(0.0, 3600000.0, 50.0).unit(" ms"),
+            opt("loop", "Loop", "bool"),
+            opt("randomize", "Randomize Playback", "bool"),
+        ],
+        "vlc_source" => vec![
+            opt("playlist", "Playlist", "editable_list").files(MEDIA_FILES),
+            opt("loop", "Loop Playlist", "bool"),
+            opt("shuffle", "Shuffle playlist", "bool"),
         ],
         "image_source" => vec![
             opt("file", "Image File", "path").file(IMAGES),
@@ -510,6 +535,10 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "color": 0xFFD1_D1D1u32, "width": 0, "height": 0 })
         }
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
+        "slideshow" | "slideshow_v2" | "image_slide_show" => json!({
+            "files": [], "slide_time": 8000, "transition": "fade", "transition_speed": 700, "loop": true, "randomize": false,
+        }),
+        "vlc_source" => json!({ "playlist": [], "loop": true, "shuffle": false }),
         "text_ft2_source" | "text_ft2_source_v2" => json!({
             "font": { "face": "Helvetica", "size": 256, "style": "Regular", "flags": 0 },
             "text": "", "color1": 0xFFFF_FFFFu32, "color2": 0xFFFF_FFFFu32, "outline": false,
