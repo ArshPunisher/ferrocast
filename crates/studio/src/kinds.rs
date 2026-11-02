@@ -583,10 +583,10 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ffmpeg_source" => {
             json!({ "is_local_file": true, "local_file": "", "looping": false, "restart_on_activate": true, "close_when_inactive": false, "speed_percent": 100 })
         }
-        "screen_capture" => json!({ "type": 0, "show_cursor": true }),
+        "screen_capture" => json!({ "type": 0, "show_cursor": true, "application": "" }),
         "av_capture_input" | "av_capture_input_v2" => json!({ "device": "" }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
-        "sck_audio_capture" | "coreaudio_output_capture" => json!({ "type": 0 }),
+        "sck_audio_capture" | "coreaudio_output_capture" => json!({ "type": 0, "application": "" }),
         "monitor_capture" => json!({ "monitor": 0, "capture_cursor": true }),
         "window_capture" => json!({ "cursor": true }),
         "dshow_input" => json!({ "video_device_id": "" }),
