@@ -74,6 +74,7 @@ fn blend_state(b: Blend, metal: bool) -> wgpu::BlendState {
 #[derive(Debug)]
 pub struct Compositor {
     /// Kept for window surfaces (the preview): they must come from the device's own instance.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) instance: wgpu::Instance,
     pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,

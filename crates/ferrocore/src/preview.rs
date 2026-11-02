@@ -133,6 +133,7 @@ impl Compositor {
         self.surface_from(surface, width, height)
     }
 
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn surface_from(
         &self,
         surface: wgpu::Surface<'static>,

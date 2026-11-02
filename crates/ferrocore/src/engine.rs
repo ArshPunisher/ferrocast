@@ -468,6 +468,7 @@ struct Preview {
     /// A scene instead of what's on air (Studio Mode's preview, the vertical picture's).
     scene: Option<String>,
     /// The canvas's size.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     size: (u32, u32),
     /// Every scene in boxes instead (a multiview projector).
     multiview: Option<Multiview>,
@@ -492,6 +493,7 @@ pub struct MultiviewBox {
 /// with their names drawn once.
 #[derive(Debug)]
 struct Multiview {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     size: (u32, u32),
     canvas: (u32, u32),
     boxes: Vec<(MultiviewBox, Option<Picture>)>,
@@ -519,6 +521,7 @@ pub struct Engine {
     thread: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     next_preview: std::sync::atomic::AtomicU64,
 }
 
@@ -1351,6 +1354,7 @@ impl Drop for Engine {
 
 /// The preview's thread: what's on air (or Studio Mode's scene) at the engine's rate, taken
 /// from the state in a moment and drawn into the window outside its lock.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn preview_loop(
     id: u64,
     state: &Mutex<State>,
@@ -1438,6 +1442,7 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
 
 /// A multiview's frame: each box's scene stretched into it (what's on air for the program box,
 /// past any transition), its frame round it and its name along its bottom.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn multiview_scene(st: &State, mv: &Multiview, ts: u64) -> Scene {
     let at = |content: Content, (x, y, w, h): (f32, f32, f32, f32)| Item {
         content,
