@@ -85,6 +85,7 @@ struct Held {
     program_at: Option<(Rect, f64)>,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
     projectors: Vec<(u64, ProjectorWin)>,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     last_projector: u64,
     /// The vertical picture's preview, beside the main one.
     vertical: VerticalView,
@@ -140,6 +141,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
 }
 
 /// How multiviews are laid out, from the settings.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
     use ferrocast_studio::MultiviewLayout as L;
     ferrocast_studio::MultiviewLook {
@@ -1644,6 +1646,8 @@ impl StudioHost for DesktopStudio {
                         h.virtualcam = None;
                         let c = h.collection.as_mut().ok_or(STOPPED)?;
                         if let Err(e) = c.set_canvas(canvas) {
+                            // The old views go before new ones are made (on Linux they hold nothing).
+                            #[allow(clippy::drop_non_drop)]
                             drop((pv, pg, vv));
                             let _ = make_preview(&app, h);
                             let _ = make_program_view(&app, h);
