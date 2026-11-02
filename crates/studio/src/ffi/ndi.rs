@@ -488,6 +488,8 @@ mod tests {
         }
         let p = got.unwrap_or_else(|| panic!("nothing came back"));
         assert_eq!((p.width, p.height), (64, 36));
-        assert_eq!(&p.rgba[..4], &[255, 0, 0, 255]);
+        // NDI compresses (a few steps off is its codec, not a wrong colour).
+        let px = &p.rgba[..4];
+        assert!(px[0] > 240 && px[1] < 15 && px[2] < 15 && px[3] == 255, "red came back as {px:?}");
     }
 }
