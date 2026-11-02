@@ -67,6 +67,21 @@ pub use compose::Compositor;
 pub use compose::bt709_limited;
 pub use transform::{Affine, BOTTOM, Bounds, LEFT, Placement, RIGHT, TOP, cropped, draw_transform, output_scale};
 
+/// Reads a file a collection names, safely: a plain file only (never a device or a pipe, which
+/// could be read forever) and at most `max` bytes (more is an error saying so).
+pub fn read_file(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other("it isn't a file"));
+    }
+    let mut out = Vec::new();
+    std::fs::File::open(path)?.take(max + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > max {
+        return Err(std::io::Error::other(format!("it's bigger than {} MB", max / 1_000_000)));
+    }
+    Ok(out)
+}
+
 /// Why drawing or encoding failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AvError {

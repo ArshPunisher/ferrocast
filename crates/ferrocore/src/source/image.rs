@@ -27,8 +27,9 @@ pub struct ImageSource {
 impl ImageSource {
     /// Loads a file. Errors say what's wrong: missing, unreadable, too big, not an image.
     pub fn open(path: &Path) -> Result<Self, AvError> {
-        let bytes =
-            std::fs::read(path).map_err(|e| AvError::Source(format!("{} can't be read ({e})", path.display())))?;
+        // A picture file is never this big (a 16K PNG is far smaller).
+        let bytes = crate::read_file(path, 512_000_000)
+            .map_err(|e| AvError::Source(format!("{} can't be read ({e})", path.display())))?;
         Self::from_bytes(&bytes).map_err(|e| match e {
             AvError::Source(m) => AvError::Source(format!("{}: {m}", path.display())),
             other => other,

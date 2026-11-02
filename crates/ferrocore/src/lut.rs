@@ -37,11 +37,13 @@ impl Lut {
     pub fn open(path: &Path) -> Result<Self, AvError> {
         let cube = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cube"));
         if cube {
-            let text = std::fs::read_to_string(path)
+            let bytes = crate::read_file(path, 64_000_000)
                 .map_err(|e| AvError::Source(format!("couldn't read the LUT {}: {e}", path.display())))?;
-            Self::from_cube(&text)
+            Self::from_cube(&String::from_utf8_lossy(&bytes))
         } else {
-            let img = image::open(path)
+            let bytes = crate::read_file(path, 64_000_000)
+                .map_err(|e| AvError::Source(format!("couldn't read the LUT {}: {e}", path.display())))?;
+            let img = image::load_from_memory(&bytes)
                 .map_err(|e| AvError::Source(format!("couldn't read the LUT {}: {e}", path.display())))?
                 .to_rgba8();
             Self::from_png(img.width(), img.height(), img.as_raw())
