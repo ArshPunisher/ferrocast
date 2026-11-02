@@ -85,6 +85,21 @@ unsafe fn display_filter(
     id: u32,
     hide: &[String],
 ) -> Result<(Retained<SCContentFilter>, Vec<i32>), AvError> {
+    // SAFETY: passed on from the caller's promise.
+    unsafe { apps_filter(c, id, hide, false) }
+}
+
+/// A display's filter showing only the apps `names` names (OBS's Application Capture), or (not
+/// `only`) everything but them.
+///
+/// # Safety
+/// `c` is a live content object.
+unsafe fn apps_filter(
+    c: &SCShareableContent,
+    id: u32,
+    names: &[String],
+    only: bool,
+) -> Result<(Retained<SCContentFilter>, Vec<i32>), AvError> {
     // SAFETY: building a filter from the live content's display and apps.
     unsafe {
         let d: Retained<SCDisplay> = c
@@ -93,13 +108,22 @@ unsafe fn display_filter(
             .find(|d| d.displayID() == id)
             .ok_or_else(|| AvError::Source(format!("display {id} isn't connected")))?;
         let none: Retained<NSArray<SCWindow>> = NSArray::new();
-        let (apps, pids) = hidden_apps(c, hide);
-        let filter = SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
-            SCContentFilter::alloc(),
-            &d,
-            &apps,
-            &none,
-        );
+        let (apps, pids) = hidden_apps(c, names);
+        let filter = if only {
+            SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                SCContentFilter::alloc(),
+                &d,
+                &apps,
+                &none,
+            )
+        } else {
+            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                SCContentFilter::alloc(),
+                &d,
+                &apps,
+                &none,
+            )
+        };
         Ok((filter, pids))
     }
 }
@@ -349,12 +373,50 @@ impl ScreenCapture {
         sound: bool,
         hide: &[String],
     ) -> Result<Self, AvError> {
+        Self::open(target, None, width, height, fps, cursor, sound, hide)
+    }
+
+    /// Only the windows of the app `app` names (its bundle id or name) on `display`, wherever
+    /// they move on it (OBS's Application Capture); with `sound`, that app's sound. Followed
+    /// when the app quits and starts again.
+    pub fn start_app(
+        display: u32,
+        app: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        cursor: bool,
+        sound: bool,
+    ) -> Result<Self, AvError> {
+        if app.trim().is_empty() {
+            return Err(AvError::Source("no app picked to capture".into()));
+        }
+        Self::open(Target::Display(display), Some(app.trim()), width, height, fps, cursor, sound, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        target: Target,
+        only: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        cursor: bool,
+        sound: bool,
+        hide: &[String],
+    ) -> Result<Self, AvError> {
+        let only: Option<Vec<String>> = only.map(|a| vec![a.to_string()]);
         let c = content()?;
         // SAFETY: building ScreenCaptureKit objects from the live content's displays and
         // windows, on this thread; each call gets live arguments.
         unsafe {
             let mut hidden = Vec::new();
             let filter = match target {
+                Target::Display(id) if let Some(only) = &only => {
+                    let (f, pids) = apps_filter(&c, id, only, true)?;
+                    hidden = pids;
+                    f
+                }
                 Target::Display(id) => {
                     let (f, pids) = display_filter(&c, id, hide)?;
                     hidden = pids;
@@ -424,9 +486,12 @@ impl ScreenCapture {
                 Ok(Err(m)) => return Err(AvError::Source(format!("the capture couldn't start ({m})"))),
                 Err(_) => return Err(AvError::Source("macOS didn't start the capture".into())),
             }
-            let privacy = match target {
-                Target::Display(id) if !hide.is_empty() => {
-                    Some(keep_apps_out(SendStream(stream.clone()), shared.clone(), id, hide.to_vec(), hidden))
+            let privacy = match (target, only) {
+                (Target::Display(id), Some(only)) => {
+                    Some(follow_apps(SendStream(stream.clone()), shared.clone(), id, only, true, hidden))
+                }
+                (Target::Display(id), None) if !hide.is_empty() => {
+                    Some(follow_apps(SendStream(stream.clone()), shared.clone(), id, hide.to_vec(), false, hidden))
                 }
                 _ => None,
             };
@@ -455,14 +520,16 @@ impl ScreenCapture {
     }
 }
 
-/// Looks twice a second for apps `hide` names that started (or ended) since, and gives the
-/// stream a filter that leaves them out; the picture holds until macOS has taken it (and
-/// keeps holding, trying again, if it refuses). Stops when the flag is set.
-fn keep_apps_out(
+/// Looks twice a second for apps `names` names that started (or ended) since, and gives the
+/// stream a filter that leaves them out (or, `only`, shows only them); the picture holds until
+/// macOS has taken it (and keeps holding, trying again, if it refuses). Stops when the flag is
+/// set.
+fn follow_apps(
     stream: SendStream,
     shared: Arc<Shared>,
     display: u32,
-    hide: Vec<String>,
+    names: Vec<String>,
+    only: bool,
     mut hidden: Vec<i32>,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -477,7 +544,7 @@ fn keep_apps_out(
             let Ok(c) = content() else { continue };
             // SAFETY: the content is live; the stream is live (this thread holds it).
             unsafe {
-                let Ok((filter, pids)) = display_filter(&c, display, &hide) else { continue };
+                let Ok((filter, pids)) = apps_filter(&c, display, &names, only) else { continue };
                 if pids == hidden || stopped.load(Ordering::Relaxed) {
                     continue;
                 }

@@ -52,6 +52,17 @@ pub enum SourceKind {
     /// One window (macOS), by its window number, as it looks wherever it is.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Window(u32),
+    /// One app's windows on a display (macOS, OBS's Application Capture), by bundle id or
+    /// name; with `sound`, its sound too.
+    #[cfg(target_os = "macos")]
+    App {
+        display: u32,
+        app: String,
+        sound: bool,
+    },
+    /// One app's sound alone (macOS, OBS's Application Audio Capture).
+    #[cfg(target_os = "macos")]
+    AppSound(String),
     /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     DesktopSound,
@@ -626,6 +637,15 @@ impl Engine {
                     },
                     None,
                 )
+            }
+            #[cfg(target_os = "macos")]
+            SourceKind::App { .. } | SourceKind::AppSound(_) => {
+                let live = open_capture(&self.config, &kind)
+                    .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
+                if matches!(kind, SourceKind::App { sound: true, .. } | SourceKind::AppSound(_)) {
+                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                }
+                (live, None)
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Screen { .. }
@@ -1735,6 +1755,10 @@ fn is_capture(kind: &SourceKind) -> bool {
     ) {
         return true;
     }
+    #[cfg(target_os = "macos")]
+    if matches!(kind, SourceKind::App { .. } | SourceKind::AppSound(_)) {
+        return true;
+    }
     let _ = kind;
     false
 }
@@ -1778,6 +1802,20 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
                     .ok_or_else(|| AvError::Source("there's no display to take the computer's sound with".into()))
             })
             .and_then(|d| ScreenCapture::start_with(Target::Display(d), 2, 2, 1, false, true, &[]))
+            .map(Live::Screen),
+        #[cfg(target_os = "macos")]
+        SourceKind::App { display, app, sound } => {
+            ScreenCapture::start_app(*display, app, config.width, config.height, config.fps, true, *sound)
+                .map(Live::Screen)
+        }
+        #[cfg(target_os = "macos")]
+        SourceKind::AppSound(app) => crate::screen::shareable()
+            .and_then(|s| {
+                s.0.first()
+                    .map(|d| d.id)
+                    .ok_or_else(|| AvError::Source("there's no display to take the app's sound with".into()))
+            })
+            .and_then(|d| ScreenCapture::start_app(d, app, 2, 2, 1, false, true))
             .map(Live::Screen),
         SourceKind::Camera(dev) => crate::camera::Capture::camera(dev).map(Live::Camera),
         SourceKind::Microphone(dev) => crate::camera::Capture::microphone(dev).map(Live::Microphone),

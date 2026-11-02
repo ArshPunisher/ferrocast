@@ -406,7 +406,17 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                     let display = n("display").or_else(first).unwrap_or(0);
                     (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
                 }
-                _ => return Err("one app's windows (Application Capture)".into()),
+                // Application Capture: one app's windows (its bundle id) on a display.
+                (2, _) => {
+                    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
+                    let display = n("display").or_else(first).unwrap_or(0);
+                    let app = text_of("application");
+                    if app.is_empty() {
+                        return Err("an Application Capture with no app picked".into());
+                    }
+                    (SourceKind::App { display, app, sound: false }, false)
+                }
+                _ => return Err("an unknown screen capture method".into()),
             }
         }
         #[cfg(target_os = "macos")]
@@ -416,10 +426,18 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         // What the Mac plays: all of it (an app's own sound isn't separated yet).
         #[cfg(target_os = "macos")]
         "sck_audio_capture" | "coreaudio_output_capture" => {
-            if s.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
-                return Err("one app's sound (Application Audio Capture)".into());
+            match s.get("type").and_then(Value::as_i64).unwrap_or(0) {
+                0 => (SourceKind::DesktopSound, true),
+                // Application Audio Capture: one app's sound (its bundle id).
+                1 => {
+                    let app = text_of("application");
+                    if app.is_empty() {
+                        return Err("an Application Audio Capture with no app picked".into());
+                    }
+                    (SourceKind::AppSound(app), true)
+                }
+                _ => return Err("an unknown audio capture method".into()),
             }
-            (SourceKind::DesktopSound, true)
         }
         #[cfg(target_os = "macos")]
         "coreaudio_input_capture" => {
