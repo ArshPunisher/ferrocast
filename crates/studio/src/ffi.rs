@@ -44,6 +44,12 @@ pub(crate) use win::projector as projector_window;
 #[cfg(target_os = "macos")]
 pub(crate) mod web;
 
+/// Web pages as sources where WebKit isn't (Windows): a hidden Edge or Chrome.
+#[cfg(any(windows, test))]
+pub(crate) mod headless;
+#[cfg(windows)]
+pub(crate) use headless as web;
+
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {
     use std::ffi::c_void;

@@ -40,7 +40,7 @@ pub struct Stage {
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
     /// Web page sources, each a page rendered for our engine, with the settings it opened with.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
     /// Media from network addresses (guests' cameras, streams), each read by FFmpeg.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -127,7 +127,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             engine: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             nets: RefCell::default(),
@@ -148,7 +148,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             engine: RefCell::new(None),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             nets: RefCell::default(),
@@ -260,14 +260,9 @@ impl Stage {
 
     /// Opens, updates or closes the web pages our engine shows, as the collection has them, and
     /// hands each its source's feed (a new one after the collection is opened again). Main
-    /// thread (WebKit).
+    /// thread (WebKit on a Mac).
     fn sync_pages(&self) {
-        #[cfg(target_os = "windows")]
-        if let Some(e) = self.engine.borrow().clone() {
-            self.sync_nets(&e);
-            self.sync_cutouts(&e);
-        }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let Some(e) = self.engine.borrow().clone() else { return };
             let web: Vec<(String, Value)> = self
@@ -1561,7 +1556,7 @@ impl Stage {
         }
         // Remove background's workers hold the engine for a moment each round: stopped first, so
         // only outputs count (and started again if the size can't change).
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.cutouts.borrow_mut().clear();
         if self.engine.borrow().as_ref().is_some_and(|e| Arc::strong_count(e) > 1) {
             self.sync_pages();
@@ -2397,10 +2392,23 @@ impl Stage {
             });
             Ok(())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use crate::collection::WebAct;
+            use crate::ffi::web::Do;
+            let pages = self.pages.borrow();
+            let (_, page) = pages.get(name).ok_or_else(|| fail(format!("\"{name}\" isn't a web page here.")))?;
+            page.act(match what {
+                WebAct::Interact => Do::Interact(String::new()),
+                WebAct::Stop => Do::Stop,
+                WebAct::Reload => Do::Reload,
+            })
+            .map_err(fail)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = what;
-            Err(fail(format!("\"{name}\": web pages work on a Mac for now.")))
+            Err(fail(format!("\"{name}\": web pages work on a Mac and Windows for now.")))
         }
     }
 
@@ -3236,10 +3244,7 @@ mod tests {
         }
         assert_eq!(s.privacy(), kept);
         s.set_privacy(&json!({})).unwrap();
-        assert_eq!(
-            ferrocore::obs::privacy_hide(&s.doc.borrow()),
-            vec![ferrocore::obs::NOTIFICATIONS.to_string()]
-        );
+        assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec![ferrocore::obs::NOTIFICATIONS.to_string()]);
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {
