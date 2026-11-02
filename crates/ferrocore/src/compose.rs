@@ -102,6 +102,8 @@ pub struct Compositor {
     /// LUTs on the card, by the table they came from (dropped with it).
     luts: Mutex<HashMap<usize, (std::sync::Weak<crate::lut::Lut>, wgpu::Texture)>>,
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
+    /// Shader effects of one's own, by their code's key: None when the card refused it.
+    custom_pipelines: Mutex<HashMap<u64, Option<wgpu::RenderPipeline>>>,
     /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
     /// NV12 out: the Y and UV pipelines.
@@ -345,6 +347,7 @@ impl Compositor {
             blank_cube,
             luts: Mutex::new(HashMap::new()),
             effect_pipelines: Mutex::new(HashMap::new()),
+            custom_pipelines: Mutex::new(HashMap::new()),
             transition_module,
             transition_layout,
             transition_pipeline_layout,
@@ -823,6 +826,14 @@ impl Compositor {
             Content::Group { items, .. } => self.draw_items(enc, &cur, items, &Affine::IDENTITY)?,
         }
         for e in &item.effects {
+            // A shader effect of one's own that can't run is left out (the picture as it was).
+            let custom = match e {
+                Effect::Custom { code, .. } => match self.custom_pipeline(code) {
+                    Some(p) => Some(p),
+                    None => continue,
+                },
+                _ => None,
+            };
             let pad = e.pad();
             let (ow, oh) = e.out_size(cur.width, cur.height);
             check_size(ow, oh)?;
@@ -833,6 +844,10 @@ impl Compositor {
             let mut second: Option<wgpu::Texture> = None;
             let mut cube: Option<wgpu::Texture> = None;
             let (entry, p, color) = match e {
+                Effect::Custom { params, elapsed_ms, .. } => {
+                    q = *params;
+                    ("fx_fs", [*elapsed_ms as f32 / 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                }
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
                 Effect::Shadow { rgba, blur, x, y } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], *rgba),
@@ -996,7 +1011,10 @@ impl Compositor {
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&cube) },
                 ],
             });
-            let pipeline = self.effect_pipeline(entry, lin);
+            let pipeline = match custom {
+                Some(p) => p,
+                None => self.effect_pipeline(entry, lin),
+            };
             {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("effect"),
@@ -1015,6 +1033,61 @@ impl Compositor {
             cur = next;
         }
         Ok(cur)
+    }
+
+    /// A shader effect's pipeline, made once per code; None when it doesn't pass `shaderfx::check`
+    /// or the card refuses it (caught, never a crash), and not tried again.
+    fn custom_pipeline(&self, code: &str) -> Option<wgpu::RenderPipeline> {
+        let mut cache = self.custom_pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(crate::shaderfx::key(code))
+            .or_insert_with(|| {
+                if let Err(e) = crate::shaderfx::check(code) {
+                    tracing::warn!(error = %e, "a shader effect was left out");
+                    return None;
+                }
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("shader effect"),
+                    source: wgpu::ShaderSource::Wgsl(crate::shaderfx::source(code).into()),
+                });
+                let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("shader effect"),
+                    layout: Some(&self.effect_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("fx_vs"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fx_fs"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: GAMMA,
+                            blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                match pollster::block_on(scope.pop()) {
+                    None => Some(pipeline),
+                    Some(e) => {
+                        tracing::warn!(error = %e, "the graphics card refused a shader effect: left out");
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 
     fn effect_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {

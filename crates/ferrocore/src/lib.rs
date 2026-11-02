@@ -56,6 +56,7 @@ pub mod mp4;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+pub mod shaderfx;
 /// Sound in through cpal: microphones, and the computer's own sound (Windows).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod sound_in;
@@ -300,6 +301,13 @@ pub enum Effect {
         width: Option<u32>,
         height: Option<u32>,
         looping: bool,
+        elapsed_ms: u64,
+    },
+    /// A shader effect of one's own (`shaderfx`): its WGSL, its four sliders, and how long the
+    /// scene has been on (the engine sets it each frame).
+    Custom {
+        code: std::sync::Arc<str>,
+        params: [f32; 4],
         elapsed_ms: u64,
     },
     /// OBS's Sharpen (0 to 1).

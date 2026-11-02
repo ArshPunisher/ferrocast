@@ -199,3 +199,26 @@ fn opacity_fades_an_item_and_a_group_as_one() {
     let px = c.render(&Scene { width: 10, height: 10, items: vec![black, group] }).unwrap_or_default();
     assert_eq!(at(&px, 10, 5, 2)[0], at(&px, 10, 1, 2)[0], "the overlap fades with the rest");
 }
+
+#[test]
+fn a_shader_effect_of_ones_own_runs_and_a_broken_one_is_left_out() {
+    use ferrocore::Effect;
+    let Some(c) = gpu() else { return };
+    let fx = |code: &str, params: [f32; 4]| Effect::Custom { code: code.into(), params, elapsed_ms: 0 };
+    let invert = "fn effect(uv: vec2<f32>) -> vec4<f32> { let c = pic(uv); return vec4<f32>(1.0 - c.rgb, c.a); }";
+    let mut red = item(Picture::solid(20, 20, [255, 0, 0, 255]), Placement::default());
+    red.effects = vec![fx(invert, [0.0; 4])];
+    let px = c.render(&Scene { width: 20, height: 20, items: vec![red.clone()] }).unwrap_or_default();
+    assert_eq!(at(&px, 20, 10, 10), [0, 255, 255, 255], "red inverted is cyan");
+    // A slider reaches the shader: its first value is the green.
+    let slider = "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0, params().x, 0.0, 1.0); }";
+    red.effects = vec![fx(slider, [1.0, 0.0, 0.0, 0.0])];
+    let px = c.render(&Scene { width: 20, height: 20, items: vec![red.clone()] }).unwrap_or_default();
+    assert_eq!(at(&px, 20, 10, 10), [0, 255, 0, 255]);
+    // A shader that doesn't compile: the picture as it was, and the next frame still draws.
+    red.effects = vec![fx("fn effect(uv: vec2<f32>) -> vec4<f32> { return oops; }", [0.0; 4])];
+    for _ in 0..2 {
+        let px = c.render(&Scene { width: 20, height: 20, items: vec![red.clone()] }).unwrap_or_default();
+        assert_eq!(at(&px, 20, 10, 10), [255, 0, 0, 255]);
+    }
+}

@@ -187,6 +187,31 @@ fn mask_from(kind: &str, s: &Value, image: u64) -> Option<(Effect, std::path::Pa
 }
 
 /// A source's sound filter, from OBS's id and settings.
+/// A shader effect of one's own from its filter's settings: the WGSL in `shader_file` (a file)
+/// or else `shader_text`, and four sliders `param1`…`param4` (0 to 1). Err says why it can't run.
+pub fn shader_from(s: &Value) -> Result<Effect, String> {
+    let file = s.get("shader_file").and_then(Value::as_str).unwrap_or_default().trim();
+    let code = if file.is_empty() {
+        s.get("shader_text").and_then(Value::as_str).unwrap_or_default().to_string()
+    } else {
+        let bytes = crate::read_file(std::path::Path::new(file), crate::shaderfx::MAX_LEN as u64).map_err(|e| {
+            if e.to_string().contains("bigger") {
+                format!("{file} is longer than {} KB", crate::shaderfx::MAX_LEN / 1024)
+            } else {
+                format!("{file} can't be read ({e})")
+            }
+        })?;
+        String::from_utf8(bytes).map_err(|_| format!("{file} isn't text"))?
+    };
+    crate::shaderfx::check(&code)?;
+    let n = |k: &str| f(s, k, 0.5).clamp(-1000.0, 1000.0);
+    Ok(Effect::Custom {
+        code: code.into(),
+        params: [n("param1"), n("param2"), n("param3"), n("param4")],
+        elapsed_ms: 0,
+    })
+}
+
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
@@ -637,6 +662,12 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                     soft: int("soft", 10, 0, 40) as f32 / 100.0,
                 });
                 next_id += 1;
+            } else if kind == "ferrocast_shader" {
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                match shader_from(&fs) {
+                    Ok(e) => effects.push(e),
+                    Err(why) => out.skipped.push(format!("{name}: the shader effect \"{fname}\" ({why})")),
+                }
             } else if let Some(e) = effect_from(kind, &fs) {
                 effects.push(e);
             } else if let Some(e) = audio_effect_from(kind, &fs) {
@@ -719,6 +750,24 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shader_file_is_read_safely() {
+        let fx = |set: Value| shader_from(&set);
+        assert!(
+            fx(json!({ "shader_file": "/dev/zero" })).unwrap_err().contains("isn't a file"),
+            "a device is never read"
+        );
+        assert!(fx(json!({ "shader_file": "/nowhere.wgsl" })).unwrap_err().contains("can't be read"));
+        let big = std::env::temp_dir().join(format!("ferrocore-big-{}.wgsl", std::process::id()));
+        let _ = std::fs::write(&big, "x".repeat(crate::shaderfx::MAX_LEN + 10));
+        let e = fx(json!({ "shader_file": big })).unwrap_err();
+        let _ = std::fs::remove_file(&big);
+        assert!(e.contains("longer"), "{e}");
+        let ok =
+            fx(json!({ "shader_text": "fn effect(uv: vec2<f32>) -> vec4<f32> { return pic(uv); }", "param2": 0.25 }));
+        assert!(matches!(ok, Ok(Effect::Custom { params: [0.5, 0.25, 0.5, 0.5], .. })), "{ok:?}");
+    }
 
     #[test]
     fn a_slideshow_reads_obs_settings() {

@@ -1637,7 +1637,7 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
         })
         .map(|e| {
             let mut e = e.clone();
-            if let Effect::Scroll { elapsed_ms, .. } = &mut e {
+            if let Effect::Scroll { elapsed_ms, .. } | Effect::Custom { elapsed_ms, .. } = &mut e {
                 *elapsed_ms = ms;
             }
             e

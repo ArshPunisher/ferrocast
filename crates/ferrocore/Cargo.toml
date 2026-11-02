@@ -18,6 +18,8 @@ thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 half = "2"
+# Checks shader effects of one's own before they're used (the naga wgpu itself uses).
+naga = { version = "30", features = ["wgsl-in"] }
 
 
 [dev-dependencies]
