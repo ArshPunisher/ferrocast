@@ -2,4 +2,5 @@
 //! compositor draws.
 
 pub mod image;
+pub mod series;
 pub mod text;

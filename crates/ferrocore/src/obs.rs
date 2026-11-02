@@ -267,6 +267,40 @@ pub fn privacy_hide(doc: &Value) -> Vec<String> {
     hide
 }
 
+/// The files in an OBS file list (`[{ value, hidden }]`), a folder's files with one of `exts`
+/// in its place (sorted by name), hidden ones left out.
+fn files_of(list: Option<&Value>, exts: &[&str]) -> Vec<std::path::PathBuf> {
+    let has_ext = |p: &std::path::Path| {
+        p.extension().and_then(|e| e.to_str()).is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    };
+    let mut out = Vec::new();
+    for e in list.and_then(Value::as_array).into_iter().flatten() {
+        if e.get("hidden").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(v) = e.get("value").and_then(Value::as_str).filter(|v| !v.is_empty()) else { continue };
+        let p = std::path::PathBuf::from(v);
+        if p.is_dir() {
+            let mut inside: Vec<_> = std::fs::read_dir(&p)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|f| f.path())
+                .filter(|f| f.is_file() && has_ext(f))
+                .collect();
+            inside.sort();
+            out.extend(inside);
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+const PICTURES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+const MEDIA: &[&str] =
+    &["mp4", "m4v", "mov", "mkv", "webm", "flv", "ts", "avi", "mp3", "m4a", "aac", "wav", "ogg", "opus", "flac"];
+
 fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result<(SourceKind, bool), String> {
     let text_of = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(match id {
@@ -280,6 +314,37 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             false,
         ),
         "image_source" => (SourceKind::Image(text_of("file").into()), false),
+        // OBS's Image Slide Show: its files (a folder's pictures), slide time and fade.
+        "slideshow" | "slideshow_v2" | "image_slide_show" => {
+            let files = files_of(s.get("files"), PICTURES);
+            if files.is_empty() {
+                return Err("a slideshow with no pictures".into());
+            }
+            let n = |k: &str, d: u64| s.get(k).and_then(Value::as_u64).unwrap_or(d);
+            let cut = s.get("transition").and_then(Value::as_str) == Some("cut");
+            let slides = crate::source::series::Slides {
+                files,
+                every_ms: n("slide_time", 8000).clamp(50, 3_600_000),
+                fade_ms: if cut { 0 } else { n("transition_speed", 700).min(10_000) },
+                looping: s.get("loop").and_then(Value::as_bool).unwrap_or(true),
+                random: s.get("randomize").and_then(Value::as_bool).unwrap_or(false),
+            };
+            (SourceKind::Slides(slides), false)
+        }
+        // OBS's VLC Video Source: its playlist, one file after another.
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        "vlc_source" => {
+            let files = files_of(s.get("playlist"), MEDIA);
+            if files.is_empty() {
+                return Err("a playlist with no files".into());
+            }
+            let p = crate::source::series::Playlist {
+                files,
+                looping: s.get("loop").and_then(Value::as_bool).unwrap_or(true),
+                random: s.get("shuffle").and_then(Value::as_bool).unwrap_or(false),
+            };
+            (SourceKind::Playlist(p), true)
+        }
         "text_ft2_source" | "text_ft2_source_v2" | "text_gdiplus" | "text_gdiplus_v2" | "text_gdiplus_v3" => {
             let font = s.get("font").cloned().unwrap_or(Value::Null);
             let flags = font.get("flags").and_then(Value::as_u64).unwrap_or(0);
@@ -636,6 +701,34 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slideshow_reads_obs_settings() {
+        let dir = std::env::temp_dir().join(format!("ferrocore-obs-slides-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        for f in ["b.png", "a.jpg", "notes.txt"] {
+            let _ = std::fs::write(dir.join(f), b"x");
+        }
+        let set = json!({
+            "files": [
+                { "value": dir.join("..").join("one.png"), "hidden": false },
+                { "value": dir, "hidden": false },
+                { "value": "/gone.png", "hidden": true },
+            ],
+            "slide_time": 3000, "transition": "cut", "randomize": true,
+        });
+        let got = kind_from("slideshow_v2", &set, (1920, 1080), &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok((SourceKind::Slides(s), false)) = got else { panic!("{got:?}") };
+        let names: Vec<String> = s
+            .files
+            .iter()
+            .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["one.png", "a.jpg", "b.png"], "a folder's pictures by name, hidden ones out");
+        assert_eq!((s.every_ms, s.fade_ms, s.looping, s.random), (3000, 0, true, true));
+        assert!(kind_from("slideshow", &json!({ "files": [] }), (1920, 1080), &[]).is_err(), "no pictures");
+    }
     use serde_json::json;
 
     #[test]

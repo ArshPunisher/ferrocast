@@ -67,6 +67,11 @@ pub enum SourceKind {
         path: PathBuf,
         looping: bool,
     },
+    /// Pictures one after another (OBS's Image Slide Show).
+    Slides(crate::source::series::Slides),
+    /// Video or sound files one after another (OBS's VLC Video Source).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    Playlist(crate::source::series::Playlist),
     /// Pictures and sound handed in from outside (a web page rendered by the app), through
     /// `Engine::fed`; `width`×`height` until the first picture says otherwise.
     Fed {
@@ -87,6 +92,11 @@ struct FeedSlot {
 }
 
 impl Feed {
+    /// The newest picture handed in, taken.
+    pub fn take_picture(&self) -> Option<Picture> {
+        self.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
     pub fn picture(&self, p: Picture) {
         *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
@@ -365,6 +375,11 @@ enum Live {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Media(crate::media::Media),
     Fed(Feed),
+    /// Files one after another, on a worker that hands them in as a fed source would.
+    Series {
+        feed: Feed,
+        _worker: crate::source::series::Worker,
+    },
 }
 
 struct Src {
@@ -637,6 +652,18 @@ impl Engine {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 }
                 (Live::Media(m), None)
+            }
+            SourceKind::Slides(s) => {
+                let feed = Feed::default();
+                let worker = crate::source::series::slideshow(s, feed.clone());
+                (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            SourceKind::Playlist(p) => {
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                let feed = Feed::default();
+                let worker = crate::source::series::playlist(p, feed.clone());
+                (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
             }
             SourceKind::Fed { width, height } => {
                 self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
@@ -1950,7 +1977,7 @@ fn frame(
                     }
                 }
             }
-            Live::Fed(feed) => {
+            Live::Fed(feed) | Live::Series { feed, .. } => {
                 if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, p));
                 }
