@@ -177,6 +177,12 @@ impl OptionInfo {
     }
 }
 
+/// The running apps with a window or sound to capture, by name (their bundle ids kept).
+#[cfg(target_os = "macos")]
+fn app_choices() -> Vec<(String, Value)> {
+    ferrocore::screen::apps().map(|l| l.into_iter().map(|a| (a.name, json!(a.id))).collect()).unwrap_or_default()
+}
+
 /// Owned choices as the borrowed pairs `choices` takes.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn as_refs(l: &[(String, Value)]) -> Vec<(&str, Value)> {
@@ -236,9 +242,11 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("speed_percent", "Speed", "int").range(1.0, 200.0, 1.0).slider().unit("%"),
         ],
         "screen_capture" => {
-            let mut v = vec![
-                opt("type", "Method", "list").choices(&[("Display Capture", json!(0)), ("Window Capture", json!(1))]),
-            ];
+            let mut v = vec![opt("type", "Method", "list").choices(&[
+                ("Display Capture", json!(0)),
+                ("Window Capture", json!(1)),
+                ("Application Capture", json!(2)),
+            ])];
             #[cfg(target_os = "macos")]
             if let Ok((displays, windows)) = ferrocore::screen::shareable() {
                 let d: Vec<(String, Value)> = displays
@@ -254,6 +262,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 v.push(opt("display", "Display", "list").choices(&as_refs(&d)));
                 v.push(opt("window", "Window", "list").choices(&as_refs(&w)));
             }
+            #[cfg(target_os = "macos")]
+            v.push(opt("application", "Application", "list").choices(&as_refs(&app_choices())));
             v.push(opt("show_cursor", "Show Cursor", "bool"));
             v
         }
@@ -273,7 +283,14 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             vec![opt("device_id", "Device", "list").choices(&l)]
         }
         "sck_audio_capture" | "coreaudio_output_capture" => {
-            vec![opt("type", "Method", "list").choices(&[("Desktop Audio Capture", json!(0))])]
+            #[allow(unused_mut)]
+            let mut v = vec![
+                opt("type", "Method", "list")
+                    .choices(&[("Desktop Audio Capture", json!(0)), ("Application Audio Capture", json!(1))]),
+            ];
+            #[cfg(target_os = "macos")]
+            v.push(opt("application", "Application", "list").choices(&as_refs(&app_choices())));
+            v
         }
         // Windows (OBS's own keys).
         "monitor_capture" => {
