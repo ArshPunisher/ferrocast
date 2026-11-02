@@ -950,7 +950,10 @@ mod tests {
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));
         assert!(unsupported(&extra, true).is_some());
-        assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_none());
+        // The VOD track on a track that exists goes through ours (the Mac's encoder: it's only there).
+        if cfg!(target_os = "macos") {
+            assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_none());
+        }
         assert!(unsupported(&StreamSettings { vod_track: Some(7), ..settings(hw) }, true).is_some());
     }
 

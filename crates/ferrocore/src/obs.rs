@@ -756,6 +756,8 @@ mod tests {
     #[test]
     fn a_shader_file_is_read_safely() {
         let fx = |set: Value| shader_from(&set);
+        // A device (Mac and Linux have /dev/zero) is never read.
+        #[cfg(unix)]
         assert!(
             fx(json!({ "shader_file": "/dev/zero" })).unwrap_err().contains("isn't a file"),
             "a device is never read"
