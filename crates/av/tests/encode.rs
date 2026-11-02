@@ -459,3 +459,66 @@ fn x264_lossless_gives_back_the_picture() {
     assert_eq!(back.len(), y.len() + uv.len());
     assert!(back[..y.len()] == y[..] && back[y.len()..] == uv[..], "lossless gives back every pixel");
 }
+
+/// A bitrate change while encoding through FFmpeg: another encoder takes over at a keyframe,
+/// and the stream plays straight through, every frame there once, in order.
+#[test]
+fn ffmpegs_bitrate_changes_on_the_run() {
+    if !ferrocast_av::ffenc::available() {
+        eprintln!("skipped: FFmpeg isn't here");
+        return;
+    }
+    let cfg = VideoConfig { rate: RateControl::Cbr, software: true, ..config(VideoCodec::H264, PixelFormat::Nv12) };
+    let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
+    let mut packets = Vec::new();
+    for i in 0..90u32 {
+        if i == 30 {
+            assert!(enc.set_kbps(1200).unwrap_or_else(|e| panic!("{e}")), "taken on the run");
+        }
+        if i == 60 {
+            assert!(enc.set_kbps(4000).unwrap_or_else(|e| panic!("{e}")));
+        }
+        // A moving bar, so frames differ.
+        let y: Vec<u8> = (0..640 * 360).map(|n: u32| if (n % 640 + i * 7) % 640 < 60 { 235 } else { 40 }).collect();
+        let uv = vec![128u8; 640 * 180];
+        packets.extend(
+            enc.encode(Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 }, i64::from(i) * 33_333, false)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+    }
+    packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
+    assert_eq!(packets.len(), 90, "every frame once");
+    assert!(packets.windows(2).all(|w| w[0].pts_us < w[1].pts_us), "in order");
+    assert!(packets[30].key && packets[60].key, "each new encoder starts on a keyframe");
+    let header = enc.header().unwrap_or_else(|| panic!("a codec header"));
+    let mut flv = FlvFile::new(false, true);
+    flv.tag(9, 0, &video_header(VideoCodec::H264, &header));
+    for p in &packets {
+        let (ms, body) = video_tag(VideoCodec::H264, p, 0);
+        flv.tag(9, ms, &body);
+    }
+    let file = std::env::temp_dir().join("ferrocast-av-rate-change.flv");
+    std::fs::write(&file, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&file)
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "90",
+        "it decodes whole: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty(), "no decoding errors: {}", String::from_utf8_lossy(&out.stderr));
+}

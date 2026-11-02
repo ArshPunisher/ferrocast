@@ -77,7 +77,7 @@ enum Inner {
     #[cfg(target_os = "macos")]
     Native(crate::apple::vt::Encoder),
     /// FFmpeg, with the best H.264 encoder it has here.
-    Ffmpeg(crate::ffenc::Video),
+    Ffmpeg(Box<crate::ffenc::Video>),
 }
 
 impl std::fmt::Debug for Inner {
@@ -116,7 +116,7 @@ impl VideoEncoder {
     /// Through FFmpeg, whatever the system.
     pub fn ffmpeg(config: VideoConfig) -> Result<Self, AvError> {
         Self::check(&config)?;
-        Ok(Self { inner: Inner::Ffmpeg(crate::ffenc::Video::new(&config)?), config })
+        Ok(Self { inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new(&config)?)), config })
     }
 
     fn check(config: &VideoConfig) -> Result<(), AvError> {
@@ -194,8 +194,8 @@ impl VideoEncoder {
         }
     }
 
-    /// A new bitrate for what's encoded from now on. The Mac's encoder takes it while running;
-    /// FFmpeg's can't (false: it applies from the next start).
+    /// A new bitrate for what's encoded from now on, on the stream as it runs: the Mac's
+    /// encoder takes it; FFmpeg's hands over to another at the new rate at the next frame.
     pub fn set_kbps(&mut self, kbps: u32) -> Result<bool, AvError> {
         if kbps == 0 {
             return Err(AvError::Encoder("the bitrate must be above 0".into()));
@@ -207,7 +207,14 @@ impl VideoEncoder {
                 self.config.bitrate_kbps = kbps;
                 Ok(true)
             }
-            Inner::Ffmpeg(_) => Ok(false),
+            // Another encoder takes over at the next frame (a keyframe), seamlessly.
+            // (CRF has no bitrate to change.)
+            Inner::Ffmpeg(_) if matches!(self.config.rate, RateControl::Crf(_)) => Ok(false),
+            Inner::Ffmpeg(e) => {
+                e.set_kbps(kbps)?;
+                self.config.bitrate_kbps = kbps;
+                Ok(true)
+            }
         }
     }
 

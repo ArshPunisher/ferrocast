@@ -210,6 +210,12 @@ pub(crate) struct Video {
     height: u32,
     input: PixelFormat,
     pub(crate) name: String,
+    /// What it was made with (a new bitrate starts another like it).
+    cfg: VideoConfig,
+    /// An encoder at a new bitrate, started and waiting to take over at the next frame.
+    next: Option<Proc>,
+    /// The parameter sets to put in front of the next keyframe (the header changed).
+    inline: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Video {
@@ -228,6 +234,39 @@ impl Video {
         } else {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
+        Ok(Self {
+            proc: Proc::spawn(&args(cfg, &enc))?,
+            times: VecDeque::new(),
+            header: None,
+            width: cfg.width,
+            height: cfg.height,
+            input: cfg.input,
+            name: enc,
+            cfg: *cfg,
+            next: None,
+            inline: None,
+        })
+    }
+
+    /// A new bitrate from the next frame: another encoder starts now (its warming up overlaps
+    /// this one's work), and takes over at the next frame, which it makes a keyframe; this one
+    /// finishes what it was given first. Nothing's lost or doubled.
+    pub(crate) fn set_kbps(&mut self, kbps: u32) -> Result<(), AvError> {
+        if matches!(self.cfg.rate, RateControl::Crf(_)) || kbps == self.cfg.bitrate_kbps {
+            return Ok(());
+        }
+        let mut cfg = self.cfg;
+        cfg.bitrate_kbps = kbps;
+        self.next = Some(Proc::spawn(&args(&cfg, &self.name))?);
+        self.cfg = cfg;
+        Ok(())
+    }
+}
+
+/// FFmpeg's arguments for encoder `enc` as `cfg` says.
+fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
+    {
+        let enc = enc.to_string();
         let kbps = cfg.bitrate_kbps;
         let gop = (u64::from(cfg.keyframe_secs.max(1)) * u64::from(cfg.fps_num) / u64::from(cfg.fps_den.max(1))).max(1);
         let mut a: Vec<String> = vec![
@@ -300,17 +339,31 @@ impl Video {
         };
         a.extend(extra.iter().chain(must_have(&enc)).map(|s| s.to_string()));
         a.extend(["-f".into(), "flv".into(), "pipe:1".into()]);
-        Ok(Self {
-            proc: Proc::spawn(&a)?,
-            times: VecDeque::new(),
-            header: None,
-            width: cfg.width,
-            height: cfg.height,
-            input: cfg.input,
-            name: enc,
-        })
+        a
     }
+}
 
+/// An avcC record's parameter sets (SPS, PPS) as length-prefixed NAL units, as they'd sit in
+/// front of a frame (4-byte lengths, as FFmpeg's FLV writes).
+fn inline_params(avcc: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = 5;
+    for _ in 0..2 {
+        // SPS count (low 5 bits), then PPS count.
+        let n = usize::from(*avcc.get(at)? & if out.is_empty() { 0x1f } else { 0xff });
+        at += 1;
+        for _ in 0..n {
+            let len = usize::from(u16::from_be_bytes([*avcc.get(at)?, *avcc.get(at + 1)?]));
+            let nal = avcc.get(at + 2..at + 2 + len)?;
+            out.extend_from_slice(&(len as u32).to_be_bytes());
+            out.extend_from_slice(nal);
+            at += 2 + len;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+impl Video {
     pub(crate) fn header(&self) -> Option<Vec<u8>> {
         self.header.clone()
     }
@@ -333,9 +386,23 @@ impl Video {
                 }
             }
         }
+        let mut out = Vec::new();
+        if let Some(next) = self.next.take() {
+            // The old one finishes what it has; the new one goes on from this frame.
+            let rest = self.proc.finish();
+            out.extend(self.take(rest));
+            let old_header = self.header.take();
+            self.proc = next;
+            out.extend(self.take(self.proc.tags.try_iter().collect()));
+            if self.header.is_none() {
+                self.header = old_header.clone();
+            }
+            self.inline = old_header;
+        }
         self.times.push_back(pts_us);
         self.proc.write(&raw)?;
-        Ok(self.take(self.proc.tags.try_iter().collect()))
+        out.extend(self.take(self.proc.tags.try_iter().collect()));
+        Ok(out)
     }
 
     pub(crate) fn flush(&mut self) -> Result<Vec<VideoPacket>, AvError> {
@@ -351,15 +418,23 @@ impl Video {
                 continue;
             }
             match body[1] {
-                0 => self.header = Some(body[5..].to_vec()),
+                0 => {
+                    let new = body[5..].to_vec();
+                    // After a hand-over: the old header is in `inline` until the new one is
+                    // known; a different one goes in front of the next keyframe.
+                    if let Some(old) = self.inline.take() {
+                        self.inline = (old != new).then(|| inline_params(&new)).flatten();
+                    }
+                    self.header = Some(new);
+                }
                 1 => {
                     let Some(pts) = self.times.pop_front() else { continue };
-                    out.push(VideoPacket {
-                        pts_us: pts,
-                        dts_us: pts,
-                        key: body[0] >> 4 == 1,
-                        data: body[5..].to_vec(),
-                    });
+                    let key = body[0] >> 4 == 1;
+                    let mut data = body[5..].to_vec();
+                    if key && let Some(params) = self.inline.take() {
+                        data.splice(0..0, params);
+                    }
+                    out.push(VideoPacket { pts_us: pts, dts_us: pts, key, data });
                 }
                 _ => {}
             }
