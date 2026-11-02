@@ -65,6 +65,11 @@ fn args(set: &Value, fifo: &std::path::Path, parts: Parts) -> Option<Vec<String>
             a.extend([format!("-{k}"), v.to_string()]);
         }
     }
+    // Pictures decoded on the GPU when it can (FFmpeg falls back to the CPU by itself), unless
+    // the options already say how.
+    if parts.picture && ferrocast_av::ffsrc::hw_decode_allowed() && !opts.contains("hwaccel") {
+        a.extend(["-hwaccel".into(), "auto".into()]);
+    }
     a.extend(["-i".into(), input.into()]);
     let (w, h) = SIZE;
     let fit = format!(
@@ -250,7 +255,7 @@ mod tests {
         let s = a.join(" ");
         assert!(
             s.contains(
-                "-f sdp -analyzeduration 1000000 -protocol_whitelist file,udp,rtp -fflags nobuffer -i /tmp/guest.sdp"
+                "-f sdp -analyzeduration 1000000 -protocol_whitelist file,udp,rtp -fflags nobuffer -hwaccel auto -i /tmp/guest.sdp"
             ),
             "{s}"
         );
@@ -264,6 +269,10 @@ mod tests {
         let picture = Parts { picture: true, sound: false };
         let only = args(&set, std::path::Path::new("/tmp/s.pcm"), picture).unwrap_or_default().join(" ");
         assert!(only.ends_with("pipe:1") && !only.contains("0:a:0"), "{only}");
+        // Sound alone isn't decoded on the GPU.
+        let sound = Parts { picture: false, sound: true };
+        let only = args(&set, std::path::Path::new("/tmp/s.pcm"), sound).unwrap_or_default().join(" ");
+        assert!(!only.contains("hwaccel"), "{only}");
     }
 
     #[test]

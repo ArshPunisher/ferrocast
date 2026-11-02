@@ -78,6 +78,43 @@ pub fn probe(ffmpeg: &Path, input: &[String], wait: Duration) -> Option<Probe> {
     parse_probe(&text)
 }
 
+/// Whether pictures may be decoded on the GPU (`-hwaccel auto`: D3D11/DXVA on Windows,
+/// VideoToolbox on a Mac). FFmpeg falls back to the CPU by itself when the GPU can't; setting
+/// `FERROCAST_CPU_DECODE` keeps everything on the CPU.
+pub fn hw_decode_allowed() -> bool {
+    std::env::var_os("FERROCAST_CPU_DECODE").is_none_or(|v| v.is_empty() || v == "0")
+}
+
+/// One picture of `input` decoded with `-hwaccel auto`, to be sure the GPU path works for this
+/// file before playing it that way.
+fn hw_decodes(ffmpeg: &Path, input: &[String]) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-hwaccel", "auto"])
+        .args(input)
+        .args(["-an", "-frames:v", "1", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let Ok(mut child) = cmd.spawn() else { return false };
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// The probe's facts from FFmpeg's text (the first video and audio stream).
 pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut p = Probe::default();
@@ -305,6 +342,8 @@ pub struct Media {
     path: PathBuf,
     looping: bool,
     max: (u32, u32),
+    /// Its pictures are decoded on the GPU.
+    pub hw: bool,
     run: Mutex<Option<Run>>,
     state: Mutex<(MediaState, u64)>,
     pub has_video: bool,
@@ -326,10 +365,16 @@ impl Media {
         let ff = ffmpeg()?;
         let p = probe(&ff, &["-i".into(), path.display().to_string()], Duration::from_secs(10))
             .ok_or_else(|| AvError::Source(format!("{} couldn't be opened", path.display())))?;
+        let file = ["-i".to_string(), path.display().to_string()];
+        let hw = p.size.is_some() && hw_decode_allowed() && hw_decodes(&ff, &file);
+        if p.size.is_some() && !hw {
+            tracing::info!(file = %path.display(), "the video is decoded on the CPU");
+        }
         let m = Media {
             path: path.to_path_buf(),
             looping,
             max: p.size.map_or(max, |s| fit(s, max)),
+            hw,
             run: Mutex::new(None),
             state: Mutex::new((MediaState::Playing, 0)),
             has_video: p.size.is_some(),
@@ -342,6 +387,9 @@ impl Media {
 
     fn input(&self, from_ns: u64) -> Vec<String> {
         let mut a: Vec<String> = vec!["-re".into()];
+        if self.hw {
+            a.extend(["-hwaccel".into(), "auto".into()]);
+        }
         if self.looping {
             a.extend(["-stream_loop".into(), "-1".into()]);
         }
@@ -546,6 +594,9 @@ mod tests {
         assert!(ok.success());
         let m = Media::open(&file, false).unwrap();
         assert!(m.has_video && m.has_audio && (1_900_000_000..2_200_000_000).contains(&m.duration_ns));
+        // The GPU decodes it where it can; a file it can't read never goes that way.
+        eprintln!("decoded on the GPU: {}", m.hw);
+        assert!(!hw_decodes(&ffmpeg().unwrap(), &["-i".into(), dir.join("missing.mp4").display().to_string()]));
         std::thread::sleep(Duration::from_millis(600));
         assert!(m.frame_at(0).is_some(), "pictures come");
         assert!(!m.take_sound().is_empty(), "sound comes");
