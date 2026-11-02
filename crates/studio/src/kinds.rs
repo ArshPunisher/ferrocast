@@ -68,6 +68,7 @@ pub fn kinds() -> Kinds {
             kind("ferrocast_shape", "Shape"),
             kind("ferrocast_blur_area", "Blur or Pixelate"),
             kind("ferrocast_look", "Look"),
+            kind("ferrocast_shader", "Shader Effect"),
             kind("gain_filter", "Gain"),
             kind("noise_gate_filter", "Noise Gate"),
             kind("compressor_filter", "Compressor"),
@@ -171,6 +172,11 @@ impl OptionInfo {
         self
     }
 
+    fn mono(mut self) -> Self {
+        self.monospace = true;
+        self
+    }
+
     fn multiline(mut self) -> Self {
         self.text_type = "multiline";
         self
@@ -201,6 +207,14 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("color", "Color", "color_alpha"),
             opt("width", "Width", "int").range(0.0, 16384.0, 1.0),
             opt("height", "Height", "int").range(0.0, 16384.0, 1.0),
+        ],
+        "ferrocast_shader" => vec![
+            opt("shader_file", "Shader File", "path").file("WGSL Shaders (*.wgsl);;All Files (*.*)"),
+            opt("shader_text", "Or Write One Here", "text").multiline().mono(),
+            opt("param1", "Slider 1", "float").range(0.0, 1.0, 0.01).slider(),
+            opt("param2", "Slider 2", "float").range(0.0, 1.0, 0.01).slider(),
+            opt("param3", "Slider 3", "float").range(0.0, 1.0, 0.01).slider(),
+            opt("param4", "Slider 4", "float").range(0.0, 1.0, 0.01).slider(),
         ],
         "slideshow" | "slideshow_v2" | "image_slide_show" => vec![
             opt("files", "Image Files", "editable_list").files(IMAGES),
@@ -552,6 +566,11 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "color": 0xFFD1_D1D1u32, "width": 0, "height": 0 })
         }
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
+        "ferrocast_shader" => json!({
+            "shader_file": "",
+            "shader_text": "// Each point of the picture: pic(uv) reads it; time(), size() and params() help.\nfn effect(uv: vec2<f32>) -> vec4<f32> {\n    let c = pic(uv);\n    let gray = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));\n    return vec4<f32>(mix(c.rgb, vec3<f32>(gray), params().x), c.a);\n}\n",
+            "param1": 0.5, "param2": 0.5, "param3": 0.5, "param4": 0.5,
+        }),
         "slideshow" | "slideshow_v2" | "image_slide_show" => json!({
             "files": [], "slide_time": 8000, "transition": "fade", "transition_speed": 700, "loop": true, "randomize": false,
         }),

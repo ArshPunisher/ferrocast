@@ -239,7 +239,12 @@ impl Shared {
     /// unchanged sources keep running).
     pub(crate) fn reopen(&self, doc: &serde_json::Value) {
         let mut seen = self.seen();
-        seen.skipped = self.engine.load_obs(doc);
+        let skipped = self.engine.load_obs(doc);
+        // What an edit just left out says why (a shader effect that doesn't compile…).
+        for s in skipped.iter().filter(|s| !seen.skipped.contains(s)) {
+            tracing::warn!("Ferrocast's own engine left this out: {s}");
+        }
+        seen.skipped = skipped;
         for name in seen.alone.clone() {
             if let Err(e) = show_alone(&self.engine, &name, (0, 0)) {
                 tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
