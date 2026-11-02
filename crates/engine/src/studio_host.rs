@@ -233,6 +233,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
         Err(NOT_HERE.into())
     }
+    /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
+    /// set, from now on; what's saved doesn't change.
+    async fn set_live_quality(&self, _pct: u8) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
     /// Marks a chapter in the recording (MP4 and MOV), named or numbered.
     async fn record_chapter(&self, _name: String) -> Result<(), String> {
         Err(NOT_HERE.into())

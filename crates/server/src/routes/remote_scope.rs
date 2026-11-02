@@ -269,6 +269,7 @@ mod tests {
             ("POST", "/golive/destinations/c_1/test"),
             ("PUT", "/golive/protection"),
             ("PUT", "/golive/aitum"),
+            ("PUT", "/golive/auto-quality"),
             ("GET", "/settings"),
             ("PUT", "/settings"),
             ("POST", "/chat/send"),

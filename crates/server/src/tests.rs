@@ -1632,6 +1632,10 @@ async fn go_live_routes_refuse_what_is_wrong() {
     let ok: Value = r.put("/api/v1/golive/aitum", json!({ "ok": true })).await.json().await.unwrap();
     assert_eq!(ok["aitum_ok"], true);
     assert_eq!(error_code(r.put("/api/v1/golive/aitum", json!({ "ok": 1 })).await).await.0, StatusCode::BAD_REQUEST);
+    // Auto quality: on unless turned off.
+    assert_eq!(v["auto_quality"], true);
+    let off: Value = r.put("/api/v1/golive/auto-quality", json!({ "on": false })).await.json().await.unwrap();
+    assert_eq!(off["auto_quality"], false);
     assert_eq!(
         error_code(r.post("/api/v1/golive/resume/kick", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "golive_not_paused".into())

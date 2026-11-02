@@ -34,10 +34,12 @@ impl Engine {
                     engine.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
                     engine.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     was_live = live;
                 }
                 if live {
                     engine.scene_chapter_tick().await;
+                    engine.auto_quality_tick().await;
                     engine.live_watch_tick().await;
                 }
             }
@@ -67,6 +69,60 @@ impl Engine {
         if let Err(e) = self.add_marker_now(ferrocast_core::moments::MomentKind::Scene, &scene, None, false).await {
             tracing::warn!(error = %e, "couldn't mark a scene change");
         }
+    }
+
+    /// Auto quality: trouble getting the stream out lowers its bitrate a step, calm raises it
+    /// back (when Go live's switch is on).
+    pub(crate) async fn auto_quality_tick(&self) {
+        if !self.golive_config().auto_quality {
+            return;
+        }
+        let Ok(host) = self.studio_host() else { return };
+        let enc = host.stream_stats().await.ok().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
+        let (net, paused) = self.golive_trouble();
+        let s = ferrocast_core::auto_quality::Signals { net_dropped: net, enc_dropped: enc, paused };
+        let changed = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).tick(now().0, s);
+        let Some(pct) = changed else { return };
+        if let Err(e) = host.set_live_quality(pct).await {
+            tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
+            return;
+        }
+        let (message, cleared) = if pct >= 100 {
+            ("Your stream is back to full quality.".to_string(), true)
+        } else {
+            (
+                format!(
+                    "Your upload struggled: the stream's quality is at {pct}% to stay smooth. It goes back up by itself."
+                ),
+                false,
+            )
+        };
+        self.studio_frame("live_alert", &LiveAlert { id: "auto_quality".into(), level: "warn", message, cleared });
+    }
+
+    /// Auto quality turned off: a lowered stream goes back to full quality.
+    pub(crate) async fn auto_quality_off(&self) {
+        let lowered = {
+            let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *aq).pct() < 100
+        };
+        if !lowered {
+            return;
+        }
+        if let Ok(host) = self.studio_host()
+            && let Err(e) = host.set_live_quality(100).await
+        {
+            tracing::warn!(error = %e, "auto quality couldn't put the bitrate back");
+        }
+        self.studio_frame(
+            "live_alert",
+            &LiveAlert {
+                id: "auto_quality".into(),
+                level: "warn",
+                message: "Your stream is back to full quality.".into(),
+                cleared: true,
+            },
+        );
     }
 
     /// One look → the alerts it raises or clears, sent on.

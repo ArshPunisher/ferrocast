@@ -143,6 +143,10 @@ pub struct GoLiveConfig {
     /// Advanced mode's settings (A2.5): defaults that work for most people.
     #[serde(default)]
     pub advanced: Advanced,
+    /// Auto quality: the Studio's stream lowers its bitrate when it can't get out, and goes
+    /// back up when it can. On unless the streamer turns it off.
+    #[serde(default = "on")]
+    pub auto_quality: bool,
 }
 
 /// Go live's Advanced settings (board items 2B and 3).
@@ -312,6 +316,7 @@ impl Default for GoLiveConfig {
             vertical_source: VerticalSource::Canvas,
             cut: CutConfig::default(),
             advanced: Advanced::default(),
+            auto_quality: true,
         }
     }
 }
@@ -359,6 +364,8 @@ pub struct GoLiveView {
     pub cut: CutView,
     /// Advanced mode's settings (A2.5).
     pub advanced: Advanced,
+    /// Auto quality is on.
+    pub auto_quality: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -916,6 +923,7 @@ impl Engine {
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
             advanced: cfg.advanced.clone(),
+            auto_quality: cfg.auto_quality,
             cut: CutView {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
@@ -1078,6 +1086,26 @@ impl Engine {
                 .map(|(name, live)| AitumOutput { platform: aitum_platform(host(&name).as_deref(), &name), name, live })
                 .collect(),
         )
+    }
+
+    /// Auto quality on or off.
+    pub async fn set_golive_auto_quality(&self, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        cfg.auto_quality = on;
+        self.save_golive(cfg.clone()).await?;
+        if !on {
+            self.auto_quality_off().await;
+        }
+        Ok(cfg)
+    }
+
+    /// Trouble getting the stream out: packets the platforms' senders skipped (all told) and
+    /// whether upload protection has one paused.
+    pub(crate) fn golive_trouble(&self) -> (u64, bool) {
+        let g = self.golive();
+        let dropped = lock(&g.running).values().map(|r| r.health.borrow().dropped).sum();
+        (dropped, !lock(&g.paused).is_empty())
     }
 
     /// "I use it on purpose": hides the Aitum Multistream setup note.

@@ -838,7 +838,7 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                            vertical: { points_here: boolean; streaming: boolean; before: string | null /* host */ } | null /* Aitum Vertical, when OBS has it */ };
                     live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
                     destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
-                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */;
+                    protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */; auto_quality: boolean /* auto quality, on by default */;
                     advanced: Advanced;
                     cut: { source: "canvas" | "cut"; config: CutConfig; state: CutState | null /* null while not needed */; ffmpeg: FfmpegState } }
 type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number /* 2–30, 4 */; calm_s: number /* 5–120, 10 */;
@@ -886,6 +886,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | POST | `/api/v1/golive/ffmpeg` | Fetches ffmpeg (again, after a failure) → `FfmpegState`; progress in `GoLiveView.cut.ffmpeg` |
 | PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
+| PUT | `/api/v1/golive/auto-quality` | `{ on: boolean }` → `GoLiveConfig`. Auto quality: while the Studio streams, upload trouble lowers its bitrate a step at a time (never below 40%); after 30 calm seconds it goes back up. On by default; turned off, a lowered stream goes back to full quality |
 | POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
 
 **YouTube broadcasts (30 Oct).** No broadcast is ever made by hand. Going live, stream info and thumbnails all use one broadcast: the live one, else the next upcoming one, never Ferrocast's vertical one. When there's none, one is made (public, starting and ending with the stream, bound to the channel's stream). One that waits for "Go live" in YouTube Studio (auto-start off) is set to start with the stream when Go live starts. Stream info and thumbnails go to the vertical broadcast too, and a vertical broadcast made at go-live copies the normal one's title, privacy, description and thumbnail.

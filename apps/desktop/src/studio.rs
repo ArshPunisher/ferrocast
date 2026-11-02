@@ -2129,6 +2129,22 @@ impl StudioHost for DesktopStudio {
         .map_err(|e| e.to_string())
     }
 
+    async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
+        self.on_main(move |h| {
+            let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
+            let kbps = (set * u32::from(pct.clamp(10, 100)) / 100).max(300);
+            for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
+                st.set_video_kbps(kbps);
+            }
+            // The lighter stream (3,000 kbps at most) comes down with it.
+            if let Some(l) = h.lstream.as_mut() {
+                l.set_video_kbps((set.min(3000) * u32::from(pct.clamp(10, 100)) / 100).max(300));
+            }
+            tracing::info!(pct, kbps, "auto quality: the stream's bitrate now");
+        })
+        .await
+    }
+
     async fn record_chapter(&self, name: String) -> Result<(), String> {
         self.on_main(move |h| {
             let r = h.record.as_ref().ok_or("Nothing is recording.")?;
