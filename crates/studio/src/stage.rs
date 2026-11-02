@@ -2888,11 +2888,22 @@ impl StageView {
         self.view.set_opacity(opacity);
     }
 
-    /// Mouse actions over it go to `cb` (Windows only; on a Mac the page gets them itself).
-    pub fn set_input(&self, _cb: Box<dyn Fn(crate::PreviewInput)>) {}
+    /// Mouse actions over it go to `cb` (Windows: the picture's own window takes them; on a
+    /// Mac the page gets them itself).
+    pub fn set_input(&self, cb: Box<dyn Fn(crate::PreviewInput)>) {
+        #[cfg(target_os = "windows")]
+        self.view.set_input(cb);
+        #[cfg(not(target_os = "windows"))]
+        let _ = cb;
+    }
 
-    /// The cursor over it (Windows only).
-    pub fn set_cursor(&self, _css: &str) {}
+    /// The cursor over it (Windows only), by its CSS name.
+    pub fn set_cursor(&self, css: &str) {
+        #[cfg(target_os = "windows")]
+        self.view.set_cursor(css);
+        #[cfg(not(target_os = "windows"))]
+        let _ = css;
+    }
 
     /// Keeps it with the stage (the app's tick): the vertical picture's scene on air, and the
     /// outlines taken from the items as they are now.
