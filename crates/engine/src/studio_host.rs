@@ -1915,6 +1915,11 @@ impl Engine {
     }
 
     pub async fn studio_start(&self) -> Result<StudioStatus, EngineError> {
+        // Off a Mac, cameras, video files and some screen capture go through FFmpeg: fetched
+        // now, in the background, so a new streamer never installs anything or waits later.
+        if !cfg!(target_os = "macos") && self.ffmpeg_path().is_none() {
+            let _ = self.get_ffmpeg().await;
+        }
         let mut status = self.studio_host()?.start().await.map_err(failed)?;
         // After a crash: the replay buffer and the recording come back on as they were (a new
         // file); the stream waits for the streamer.
