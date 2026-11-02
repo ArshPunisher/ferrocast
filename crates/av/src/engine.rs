@@ -374,11 +374,13 @@ struct Src {
     /// What it was started as, when the watchdog can start it again (captures).
     kind: Option<SourceKind>,
     watch: Watch,
+    /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
+    pending: Option<Picture>,
 }
 
 impl Src {
     fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
-        Src { live, size, kind, watch: Watch { since: now_ns(), ..Watch::default() } }
+        Src { live, size, kind, watch: Watch { since: now_ns(), ..Watch::default() }, pending: None }
     }
 }
 
@@ -1216,10 +1218,11 @@ impl Engine {
     /// Any scene drawn now at the engine's size, RGBA: Studio Mode's preview, the Scenes grid.
     pub fn snapshot_scene(&self, name: &str) -> Result<Vec<u8>, AvError> {
         let scene = {
-            let st = self.lock();
+            let mut st = self.lock();
             if !st.scenes.contains_key(name) {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
+            send_pending(&mut st, &self.gpu);
             build(&st, self.config.width, self.config.height, Some(name), now_ns())
         };
         self.gpu.render(&scene)
@@ -1229,10 +1232,11 @@ impl Engine {
     /// RGBA: the Scenes grid's tiles, a vertical scene's at its own shape.
     pub fn snapshot_scene_at(&self, name: &str, canvas: (u32, u32), size: (u32, u32)) -> Result<Vec<u8>, AvError> {
         let scene = {
-            let st = self.lock();
+            let mut st = self.lock();
             if !st.scenes.contains_key(name) {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
+            send_pending(&mut st, &self.gpu);
             build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns())
         };
         self.gpu.render(&scaled(scene, size.0.max(1), size.1.max(1), Filter::Bicubic))
@@ -1243,7 +1247,13 @@ impl Engine {
     pub fn snapshot_source_at(&self, id: u64, size: (u32, u32)) -> Option<Vec<u8>> {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let item = {
-            let st = self.lock();
+            let mut st = self.lock();
+            if let Some(src) = st.sources.get_mut(&id)
+                && let Some(p) = src.pending.take()
+                && self.gpu.upload(id, &p).is_ok()
+            {
+                src.size = Some((p.width, p.height, p.premultiplied));
+            }
             let (sw, sh, premultiplied) = st.sources.get(&id)?.size?;
             let mut it = Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default());
             it.content = Content::Uploaded { id, width: sw, height: sh, premultiplied };
@@ -1483,6 +1493,59 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     out.insert(STINGER);
     out
+}
+
+/// Sources something drawn shows now: on air, a transition's or stinger's, an output's own
+/// scene, a preview's or a multiview's, with the scenes inside them and the masks they use.
+fn seen(st: &State) -> std::collections::HashSet<u64> {
+    fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
+        let Some(items) = st.scenes.get(scene) else { return };
+        for it in items.iter().filter(|i| i.visible) {
+            for e in &it.effects {
+                if let Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } = e {
+                    out.insert(*image);
+                }
+            }
+            match &it.scene {
+                Some(inner) if depth < MAX_NESTING => walk(st, inner, depth + 1, out),
+                Some(_) => {}
+                None => {
+                    out.insert(it.source);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    let mut roots: Vec<&str> = Vec::new();
+    roots.extend(st.on_air.as_deref());
+    roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
+    roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
+    for p in st.previews.values() {
+        roots.extend(p.scene.as_deref());
+        if let Some(mv) = &p.multiview {
+            roots.extend(mv.boxes.iter().filter_map(|(b, _)| b.scene.as_deref()));
+        }
+    }
+    for r in roots {
+        walk(st, r, 0, &mut out);
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    out.insert(STINGER);
+    out
+}
+
+/// Pictures kept back while unseen, sent to the GPU now (something is about to draw them
+/// another way: a thumbnail, a snapshot).
+fn send_pending(st: &mut State, gpu: &Compositor) {
+    for (id, src) in st.sources.iter_mut() {
+        if let Some(p) = src.pending.take()
+            && gpu.upload(*id, &p).is_ok()
+        {
+            src.size = Some((p.width, p.height, p.premultiplied));
+        }
+    }
 }
 
 /// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
@@ -1804,8 +1867,18 @@ fn frame(
     // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
     // rest still has its sound taken, so it doesn't pile up.
     let heard = heard(&st);
+    // Pictures go to the GPU only for sources something drawn shows (and a source's first,
+    // for its size); the rest keep their newest until they're shown.
+    let seen = seen(&st);
     // Sources: new pictures to the GPU, new sound to the mixer.
     let mut uploads = Vec::new();
+    for (id, src) in st.sources.iter_mut() {
+        if seen.contains(id)
+            && let Some(p) = src.pending.take()
+        {
+            uploads.push((*id, p));
+        }
+    }
     let mut st_recovered = 0;
     for (id, src) in st.sources.iter_mut() {
         let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut src.live {
@@ -1893,9 +1966,12 @@ fn frame(
     }
     st.stats.recovered += st_recovered;
     for (id, p) in uploads {
-        if gpu.upload(id, &p).is_ok()
-            && let Some(s) = st.sources.get_mut(&id)
-        {
+        let Some(s) = st.sources.get_mut(&id) else { continue };
+        if !seen.contains(&id) && s.size.is_some() {
+            s.pending = Some(p);
+            continue;
+        }
+        if gpu.upload(id, &p).is_ok() {
             s.size = Some((p.width, p.height, p.premultiplied));
         }
     }
@@ -2694,5 +2770,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[255, 0, 0, 255], "the picture handed in");
         assert!(e.fed(2).is_none());
+    }
+
+    #[test]
+    fn a_hidden_source_waits_off_the_gpu_until_shown() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        }
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Other", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let feed = e.fed(2).unwrap_or_else(|| panic!("a fed source"));
+        feed.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        // Off air: kept back, not sent.
+        assert!(e.lock().sources[&2].pending.is_some(), "kept, not uploaded");
+        // A thumbnail of its scene sends it first.
+        assert_eq!(&e.snapshot_scene("Other").unwrap_or_default()[0..4], &[0, 0, 255, 255]);
+        assert!(e.lock().sources[&2].pending.is_none());
+        // Another picture while hidden, then its scene goes on air: shown at once.
+        feed.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[0, 255, 0, 255], "the newest, on air");
     }
 }
