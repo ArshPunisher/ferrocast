@@ -73,6 +73,11 @@ pub fn kinds() -> Kinds {
         transitions: vec![
             kind("cut_transition", "Cut"),
             kind("fade_transition", "Fade"),
+            kind("swipe_transition", "Swipe"),
+            kind("slide_transition", "Slide"),
+            kind("fade_to_color_transition", "Fade to Color"),
+            kind("wipe_transition", "Luma Wipe"),
+            kind("obs_stinger_transition", "Stinger"),
             kind("ferrocast_move", "Move"),
         ],
         encoders: if cfg!(target_os = "macos") {
@@ -282,6 +287,34 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("fps", "FPS", "int").range(1.0, 60.0, 1.0),
             opt("css", "Custom CSS", "text").multiline(),
         ],
+        // Transitions.
+        "swipe_transition" | "slide_transition" => {
+            let mut v = vec![opt("direction", "Direction", "list").choices(&[
+                ("Left", json!("left")),
+                ("Right", json!("right")),
+                ("Up", json!("up")),
+                ("Down", json!("down")),
+            ])];
+            if kind == "swipe_transition" {
+                v.push(opt("swipe_in", "Swipe In", "bool"));
+            }
+            v
+        }
+        "fade_to_color_transition" => vec![
+            opt("color", "Color", "color"),
+            opt("switch_point", "Peak Color Point", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
+        ],
+        "wipe_transition" => vec![
+            opt("luma_image", "Image", "path").file("Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*.*)"),
+            opt("luma_softness", "Softness", "float").range(0.0, 1.0, 0.01).slider(),
+            opt("luma_invert", "Invert", "bool"),
+        ],
+        "obs_stinger_transition" => vec![
+            opt("path", "Video File", "path").file("Video Files (*.mp4 *.mov *.webm *.mkv);;All Files (*.*)"),
+            opt("transition_point_type", "Transition Point Type", "list")
+                .choices(&[("Time (milliseconds)", json!(0)), ("Frame", json!(1))]),
+            opt("transition_point", "Transition Point", "int").range(0.0, 60_000.0, 1.0),
+        ],
         // Filters.
         "chroma_key_filter" | "chroma_key_filter_v2" => vec![
             opt("key_color_type", "Key Color Type", "list").choices(&[
@@ -469,6 +502,11 @@ pub fn defaults(kind: &str) -> Option<Value> {
         }
         "sharpness_filter" | "sharpness_filter_v2" => json!({ "sharpness": 0.08 }),
         "crop_filter" => json!({ "relative": true, "left": 0, "top": 0, "right": 0, "bottom": 0, "cx": 0, "cy": 0 }),
+        "swipe_transition" => json!({ "direction": "left", "swipe_in": false }),
+        "slide_transition" => json!({ "direction": "left" }),
+        "fade_to_color_transition" => json!({ "color": 0xFF00_0000u32, "switch_point": 50 }),
+        "wipe_transition" => json!({ "luma_image": "", "luma_softness": 0.03, "luma_invert": false }),
+        "obs_stinger_transition" => json!({ "path": "", "transition_point_type": 0, "transition_point": 500 }),
         "mask_filter" | "mask_filter_v2" => {
             json!({ "type": "mask_color_filter.effect", "image_path": "", "color": 0x00FF_FFFFu32, "opacity": 1.0, "stretch": false })
         }

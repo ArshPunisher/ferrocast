@@ -277,11 +277,39 @@ impl Shared {
         self.seen().black
     }
 
-    /// Puts `scene` on air now through a transition of its own (Studio Mode's quick
-    /// transitions), whatever the collection's transition is.
-    pub(crate) fn go_with(&self, scene: &str, id: &str, ms: u64) -> Result<(), StudioError> {
-        let (kind, ms) = transition_kind(id, ms);
-        self.engine.go_with(scene, kind, ms).map_err(|e| StudioError::Failed(e.to_string()))?;
+    /// Puts `scene` on air now through transition `id` lasting `ms`, with its `settings`
+    /// (OBS's keys: a direction, a colour, a wipe's picture, a stinger's video).
+    pub(crate) fn go_with(
+        &self,
+        scene: &str,
+        id: &str,
+        ms: u64,
+        settings: &serde_json::Value,
+    ) -> Result<(), StudioError> {
+        let fail = |e: ferrocast_av::AvError| StudioError::Failed(e.to_string());
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if id == "obs_stinger_transition" {
+            let path = settings.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+            // OBS keeps the cut in ms (type 0) or frames (type 1, at 60 a second here).
+            let point = settings.get("transition_point").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let cut_ms = if settings.get("transition_point_type").and_then(serde_json::Value::as_u64) == Some(1) {
+                point * 1000 / 60
+            } else {
+                point
+            };
+            if !path.is_empty() {
+                match self.engine.go_stinger(scene, std::path::Path::new(path), cut_ms) {
+                    Ok(()) => {
+                        self.seen().on_air = Some(scene.to_string());
+                        return Ok(());
+                    }
+                    // A video that's gone or broken mustn't stop the switch: it fades instead.
+                    Err(e) => tracing::warn!(error = %e, "the stinger couldn't play: fading instead"),
+                }
+            }
+        }
+        let (kind, ms) = transition_of(id, ms, settings);
+        self.engine.go_with(scene, kind, ms).map_err(fail)?;
         self.seen().on_air = Some(scene.to_string());
         Ok(())
     }
@@ -429,13 +457,51 @@ fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
     d
 }
 
-/// The engine's transition for one of OBS's transition ids (the rest fade for now).
-pub(crate) fn transition_kind(id: &str, ms: u64) -> (TransitionKind, u64) {
-    match id {
-        "cut_transition" => (TransitionKind::Cut, 0),
-        "ferrocast_move" | "move_transition" => (TransitionKind::Move, ms),
-        _ => (TransitionKind::Fade, ms),
-    }
+/// The engine's transition for one of OBS's ids with its settings (OBS's keys). A wipe whose
+/// picture can't be read, and anything else, fades.
+pub(crate) fn transition_of(id: &str, ms: u64, s: &serde_json::Value) -> (TransitionKind, u64) {
+    use ferrocast_av::Direction;
+    let direction = || match s.get("direction").and_then(serde_json::Value::as_str) {
+        Some("right") => Direction::Right,
+        Some("up") => Direction::Up,
+        Some("down") => Direction::Down,
+        _ => Direction::Left,
+    };
+    let kind = match id {
+        "cut_transition" => return (TransitionKind::Cut, 0),
+        "ferrocast_move" | "move_transition" => TransitionKind::Move,
+        "slide_transition" => TransitionKind::Slide(direction()),
+        "swipe_transition" => TransitionKind::Swipe {
+            direction: direction(),
+            swipe_in: s.get("swipe_in").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        },
+        "fade_to_color_transition" => {
+            // OBS's colour is 0xAABBGGRR; the switch point a percentage.
+            let c = s.get("color").and_then(serde_json::Value::as_u64).unwrap_or(0xFF00_0000) as u32;
+            TransitionKind::FadeToColor {
+                rgb: [(c & 0xFF) as u8, (c >> 8 & 0xFF) as u8, (c >> 16 & 0xFF) as u8],
+                switch_point: s
+                    .get("switch_point")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(50.0)
+                    .clamp(0.0, 100.0) as f32
+                    / 100.0,
+            }
+        }
+        "wipe_transition" => {
+            let path = s.get("luma_image").and_then(serde_json::Value::as_str).unwrap_or("");
+            match ferrocast_av::source::image::ImageSource::open(std::path::Path::new(path)) {
+                Ok(img) => TransitionKind::LumaWipe {
+                    luma: img.frame_at(std::time::Duration::ZERO).clone(),
+                    invert: s.get("luma_invert").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                    softness: s.get("luma_softness").and_then(serde_json::Value::as_f64).unwrap_or(0.03) as f32,
+                },
+                Err(_) => TransitionKind::Fade,
+            }
+        }
+        _ => TransitionKind::Fade,
+    };
+    (kind, ms)
 }
 
 impl OwnStream {
@@ -811,9 +877,34 @@ mod tests {
 
     #[test]
     fn transitions_map_and_scene_changes_dont_reopen() {
-        assert_eq!(transition_kind("cut_transition", 700), (TransitionKind::Cut, 0));
-        assert_eq!(transition_kind("fade_transition", 500), (TransitionKind::Fade, 500));
-        assert_eq!(transition_kind("ferrocast_move", 400), (TransitionKind::Move, 400));
+        assert_eq!(transition_of("cut_transition", 700, &serde_json::Value::Null), (TransitionKind::Cut, 0));
+        assert_eq!(transition_of("fade_transition", 500, &serde_json::Value::Null), (TransitionKind::Fade, 500));
+        assert_eq!(transition_of("ferrocast_move", 400, &serde_json::Value::Null), (TransitionKind::Move, 400));
+        use ferrocast_av::Direction;
+        let j = |v: serde_json::Value| v;
+        assert_eq!(
+            transition_of("slide_transition", 300, &j(serde_json::json!({ "direction": "up" }))).0,
+            TransitionKind::Slide(Direction::Up)
+        );
+        assert_eq!(
+            transition_of("swipe_transition", 300, &j(serde_json::json!({ "direction": "right", "swipe_in": true }))).0,
+            TransitionKind::Swipe { direction: Direction::Right, swipe_in: true }
+        );
+        // OBS's 0xAABBGGRR: a red one, the switch at a quarter.
+        assert_eq!(
+            transition_of(
+                "fade_to_color_transition",
+                900,
+                &j(serde_json::json!({ "color": 0xFF00_00FFu32, "switch_point": 25 }))
+            )
+            .0,
+            TransitionKind::FadeToColor { rgb: [255, 0, 0], switch_point: 0.25 }
+        );
+        // A wipe whose picture isn't there fades.
+        assert_eq!(
+            transition_of("wipe_transition", 500, &j(serde_json::json!({ "luma_image": "/nope.png" }))).0,
+            TransitionKind::Fade
+        );
         // Only which scene is on air changed: not a reopen.
         let a = serde_json::json!({ "current_program_scene": "A", "current_scene": "A", "sources": [1] });
         let b = serde_json::json!({ "current_program_scene": "B", "current_scene": "B", "sources": [1] });

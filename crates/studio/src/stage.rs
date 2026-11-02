@@ -491,7 +491,7 @@ impl Stage {
         if was != name
             && let Some(e) = self.engine.borrow().as_ref()
         {
-            e.go_with(name, &t.kind, u64::from(t.ms))?;
+            e.go_with(name, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
         }
         Ok(())
     }
@@ -1410,7 +1410,7 @@ impl Stage {
                 }
                 self.doc.borrow_mut()["current_program_scene"] = json!(pre);
                 if let Some(e) = self.engine.borrow().as_ref() {
-                    e.go_with(&pre, &t.kind, u64::from(t.ms))?;
+                    e.go_with(&pre, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
                 }
             }
             None => self.set_current(&pre)?,
