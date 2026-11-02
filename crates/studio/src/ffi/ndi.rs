@@ -178,7 +178,7 @@ fn load() -> Result<Lib, String> {
     let path = candidates()
         .into_iter()
         .find(|p| p.is_file())
-        .ok_or("NDI isn't installed: install NDI Tools (or on a Mac `brew install --cask libndi`) and try again.")?;
+        .ok_or("NDI isn't installed: install NDI Tools from ndi.video (on a Mac, brew install --cask libndi also works), then try again.")?;
     // SAFETY: loading NDI's own library, whose calls are declared above as its SDK has them
     // (Processing.NDI.*.h, v5 and v6 alike); each symbol is looked up by name and its type
     // matches the header's.
