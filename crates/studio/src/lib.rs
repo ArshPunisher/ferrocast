@@ -1,4 +1,4 @@
-//! The Studio (2.1, LIVE-STUDIO.md Track B), on Ferrocast's own engine (`ferrocast-av`): the
+//! The Studio (2.1, LIVE-STUDIO.md Track B), on Ferrocast's own engine (`ferrocore`): the
 //! scene collection is an OBS-format document edited here (`stage::Stage`) and drawn, mixed,
 //! encoded and sent by our engine, so collections move between OBS and Ferrocast unchanged.
 
@@ -431,7 +431,7 @@ pub struct StreamSettings {
     /// while viewers hear track 1. None: one track.
     #[serde(default)]
     pub vod_track: Option<u8>,
-    /// Kept from when OBS's engine was there too (settings files still carry it); our engine
+    /// Kept from when OBS's engine was there too (settings files still carry it); Ferrocore
     /// always encodes now.
     #[serde(default)]
     pub own_encoder: bool,

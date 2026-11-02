@@ -1,4 +1,7 @@
-# Ferrocast's own engine: plan
+# Ferrocore: Ferrocast's own engine
+
+The engine is named **Ferrocore** (2 Nov 2026); its code is `crates/ferrocore`. The plan below was written
+while it was still called "our own engine".
 
 Written 31 Oct 2026 at the owner's request. Nothing here is built yet; it's the plan to pick from.
 
@@ -89,7 +92,7 @@ ships months before an own engine and keeps working after it (the new engine reu
 A Rust engine that does **everything people use OBS for, plus what OBS can't**, smaller and
 crash-proof, built so that **users never lose a feature** while it replaces libobs piece by piece.
 
-Working name: **Ferrocast Engine** (crate `crates/av`; name to pick).
+Working name: **Ferrocast Engine** (crate `crates/ferrocore`; name to pick).
 
 ### The rule that makes it safe: replace piece by piece
 
@@ -181,7 +184,7 @@ At every step the Studio looks and works the same, and every step ships on its o
 ### Status
 
 **1 Nov 2026 (one night's run): E0 done; E1 built; E2's compositor matches libobs; E3 and E4
-started; the engine core runs with no libobs at all.** All in `crates/av` (`ferrocast-av`), not
+started; the engine core runs with no libobs at all.** All in `crates/ferrocore` (`ferrocore`), not
 used by the app yet.
 
 Checked against libobs by `cargo run -p ferrocast-studio --example engine_match -- <dir>
@@ -208,7 +211,7 @@ Checked against libobs by `cargo run -p ferrocast-studio --example engine_match 
 
 Speed: a 1080p frame (background, game, camera uploaded each frame with rounded corners and
 border, a turned bicubic logo, a lower third) drawn and read back as NV12 in **2.7 ms** on this
-Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps frame.
+Mac (`cargo run --release -p ferrocore --example bench`), a sixth of a 60 fps frame.
 
 **1 Nov 2026 (day): in the app, and further.**
 

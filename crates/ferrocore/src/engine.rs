@@ -1010,8 +1010,8 @@ impl Engine {
         Ok(id)
     }
 
-    /// A new video bitrate for an output from now on; false when its encoder takes it only at
-    /// the next start (FFmpeg's).
+    /// A new video bitrate for an output from now on; false when its encoder has none to change
+    /// (constant quality).
     pub fn set_output_kbps(&self, id: u64, kbps: u32) -> Result<bool, AvError> {
         self.with_output(id, |pipe| pipe.set_video_kbps(kbps))
     }
@@ -2367,7 +2367,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn stingers_cover_the_cut_then_go() {
         let Some(e) = engine() else { return };
-        let clip = std::env::temp_dir().join("ferrocast-av-stinger.mp4");
+        let clip = std::env::temp_dir().join("ferrocore-stinger.mp4");
         let made = std::process::Command::new("ffmpeg")
             .args([
                 "-v",
@@ -2437,7 +2437,7 @@ mod tests {
         e.set_scene("Tall", vec![SceneItem::new(2, Placement::default())]);
         e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
         let (wide, tall) =
-            (std::env::temp_dir().join("ferrocast-av-wide.mp4"), std::env::temp_dir().join("ferrocast-av-tall.mp4"));
+            (std::env::temp_dir().join("ferrocore-wide.mp4"), std::env::temp_dir().join("ferrocore-tall.mp4"));
         let a = e.start_output(OutputKind::Record(wide.clone())).unwrap_or_else(|x| panic!("{x}"));
         let b = e
             .start_output_on(
@@ -2506,7 +2506,7 @@ mod tests {
         e.set_global(2, true);
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
-        let file = std::env::temp_dir().join("ferrocast-av-engine.mp4");
+        let file = std::env::temp_dir().join("ferrocore-engine.mp4");
         let id = e.start_output(OutputKind::Record(file.clone())).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_secs(3));
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
@@ -2549,7 +2549,7 @@ mod tests {
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let dir = std::env::temp_dir();
-        let (one, two) = (dir.join("ferrocast-av-split-1.mp4"), dir.join("ferrocast-av-split-2.mp4"));
+        let (one, two) = (dir.join("ferrocore-split-1.mp4"), dir.join("ferrocore-split-2.mp4"));
         let id = e.start_output(OutputKind::Record(one.clone())).unwrap_or_else(|x| panic!("{x}"));
         let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
         // 2 s, 2 s paused, 1 s, then a new file for 2 s.
@@ -2563,7 +2563,7 @@ mod tests {
         assert!(written > 10_000, "the first file grows: {written} bytes");
         e.split_output(id, &two).unwrap_or_else(|x| panic!("{x}"));
         // One split at a time: another waits until this one has its first frame.
-        assert!(e.split_output(id, &dir.join("ferrocast-av-split-3.mp4")).is_err());
+        assert!(e.split_output(id, &dir.join("ferrocore-split-3.mp4")).is_err());
         sleep(2000);
         assert_eq!(e.output_record_state(id).map(|s| s.splitting).ok(), Some(false));
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
@@ -2589,7 +2589,7 @@ mod tests {
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let dir = std::env::temp_dir();
-        let (one, two) = (dir.join("ferrocast-av-rec-1.mkv"), dir.join("ferrocast-av-rec-2.mkv"));
+        let (one, two) = (dir.join("ferrocore-rec-1.mkv"), dir.join("ferrocore-rec-2.mkv"));
         let id = e.start_output(OutputKind::Record(one.clone())).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(2500));
         e.split_output(id, &two).unwrap_or_else(|x| panic!("{x}"));
@@ -2630,7 +2630,7 @@ mod tests {
             ],
         );
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
-        let file = std::env::temp_dir().join("ferrocast-av-scaled.mp4");
+        let file = std::env::temp_dir().join("ferrocore-scaled.mp4");
         let canvas = Canvas::scaled(e.config(), 320, 180);
         let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(1500));
@@ -2681,7 +2681,7 @@ mod tests {
         }
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
-        for name in ["ferrocast-av-tracks.mp4", "ferrocast-av-tracks.mkv"] {
+        for name in ["ferrocore-tracks.mp4", "ferrocore-tracks.mkv"] {
             let file = std::env::temp_dir().join(name);
             let canvas = Canvas { more_tracks: vec![1], ..Canvas::main(e.config()) };
             let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
@@ -2707,7 +2707,7 @@ mod tests {
             .unwrap_or_else(|x| panic!("{x}"));
         e.set_scene("Tall red", vec![SceneItem::new(1, Placement::default())]);
         e.set_scene("Tall blue", vec![SceneItem::new(2, Placement::default())]);
-        let file = std::env::temp_dir().join("ferrocast-av-vertical.mp4");
+        let file = std::env::temp_dir().join("ferrocore-vertical.mp4");
         let canvas = Canvas { width: 360, height: 640, scene: Some("Tall red".into()), ..Canvas::main(e.config()) };
         let id = e.start_output_on(OutputKind::Record(file.clone()), canvas).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(1200));
@@ -2747,7 +2747,7 @@ mod tests {
         let clip = e.replay_clip(id).unwrap_or_else(|x| panic!("{x}"));
         // From a keyframe (one a second here): 2 s, up to a second more.
         assert!((1.9..3.1).contains(&clip.seconds()), "{} s kept", clip.seconds());
-        let file = std::env::temp_dir().join("ferrocast-av-replay.mkv");
+        let file = std::env::temp_dir().join("ferrocore-replay.mkv");
         clip.write(&file).unwrap_or_else(|x| panic!("{x}"));
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
         let Some((secs, av)) = probed(&file) else {
