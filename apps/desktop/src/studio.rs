@@ -627,7 +627,7 @@ fn mp4_beside(from: &std::path::Path) -> PathBuf {
 /// Remuxes each file to an MP4 beside it, one after another on a thread of its own (a long
 /// file needn't hold the app up) → the first new file.
 fn remux_in_background(files: Vec<PathBuf>) -> Result<PathBuf, String> {
-    let ffmpeg = ferrocast_av::ffenc::path()
+    let ffmpeg = ferrocore::ffenc::path()
         .ok_or("Remuxing to MP4 needs FFmpeg: pick x264 or Lossless once in Settings and Ferrocast fetches it.")?;
     if REMUX.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|v| v["done"] == false) {
         return Err("A remux is already running; wait for it to end.".into());
@@ -1193,7 +1193,7 @@ impl DesktopStudio {
         StudioStatus {
             available: true,
             running: h.collection.is_some(),
-            version: h.collection.as_ref().map(|_| format!("Ferrocast engine {}", env!("CARGO_PKG_VERSION"))),
+            version: h.collection.as_ref().map(|_| format!("Ferrocore {}", env!("CARGO_PKG_VERSION"))),
             renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
             detail: None,
             recovered: None,

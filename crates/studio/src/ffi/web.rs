@@ -34,7 +34,7 @@ struct Shared {
     h: AtomicU32,
     fps: AtomicU32,
     /// Our engine's source the page's picture and sound go to.
-    out: Mutex<Option<ferrocast_av::engine::Feed>>,
+    out: Mutex<Option<ferrocore::engine::Feed>>,
 }
 
 /// The off-screen window and its web view. Main thread only.
@@ -151,7 +151,7 @@ fn feed(shared: &Shared, msg: &str) {
     let samples: Vec<f32> =
         pcm.as_chunks::<2>().0.iter().map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0).collect();
     let span = u64::from(frames) * 1_000_000_000 / u64::from(rate);
-    out.sound(samples, rate, ferrocast_av::engine::now_ns().saturating_sub(span));
+    out.sound(samples, rate, ferrocore::engine::now_ns().saturating_sub(span));
 }
 
 define_class!(
@@ -445,7 +445,7 @@ fn copy(img: &NSImage, shared: &Shared) {
         for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
-        out.picture(ferrocast_av::Picture { width: w, height: h, rgba: buf, premultiplied: true });
+        out.picture(ferrocore::Picture { width: w, height: h, rgba: buf, premultiplied: true });
     }
 }
 
@@ -514,7 +514,7 @@ impl FedPage {
         h: u32,
         css: &str,
         fps: u32,
-        feed: ferrocast_av::engine::Feed,
+        feed: ferrocore::engine::Feed,
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let shared = Arc::new(Shared {
@@ -536,7 +536,7 @@ impl FedPage {
     }
 
     /// Our engine's source changed (the collection was opened again): its new feed.
-    pub(crate) fn set_feed(&self, feed: ferrocast_av::engine::Feed) {
+    pub(crate) fn set_feed(&self, feed: ferrocore::engine::Feed) {
         if let Ok(mut o) = self.shared.out.lock() {
             *o = Some(feed);
         }

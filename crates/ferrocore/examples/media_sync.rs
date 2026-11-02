@@ -2,7 +2,7 @@
 //! every second) through our Media source and records it; then checks that every beep meets its
 //! flash. The clip loops, so each loop's join is checked too.
 //!
-//!   cargo run --release -p ferrocast-av --example media_sync -- <out dir> [seconds]
+//!   cargo run --release -p ferrocore --example media_sync -- <out dir> [seconds]
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,10 +10,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
     use std::time::Duration;
 
-    use ferrocast_av::audio::AudioConfig;
-    use ferrocast_av::engine::{Engine, EngineConfig, OutputKind, SceneItem, SourceKind};
-    use ferrocast_av::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
-    use ferrocast_av::{Bounds, Placement};
+    use ferrocore::audio::AudioConfig;
+    use ferrocore::engine::{Engine, EngineConfig, OutputKind, SceneItem, SourceKind};
+    use ferrocore::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
+    use ferrocore::{Bounds, Placement};
 
     let mut args = std::env::args().skip(1);
     let out = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));

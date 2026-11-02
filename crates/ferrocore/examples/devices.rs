@@ -1,11 +1,11 @@
 //! Lists cameras and microphones; with `--try`, runs the first of each for 3 seconds and says
 //! how many frames and sound pieces came, and the sound's loudest level (nothing is saved).
 //!
-//!   cargo run -p ferrocast-av --example devices -- [--try]
+//!   cargo run -p ferrocore --example devices -- [--try]
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use ferrocast_av::camera::{Capture, cameras, microphones};
+    use ferrocore::camera::{Capture, cameras, microphones};
     let cams = cameras();
     let mics = microphones();
     for c in &cams {

@@ -446,7 +446,7 @@ mod tests {
 
     /// A 4 s test video (a counter on screen, a tone), made by FFmpeg; None without it.
     fn clip() -> Option<std::path::PathBuf> {
-        let f = std::env::temp_dir().join("ferrocast-av-media-controls.mp4");
+        let f = std::env::temp_dir().join("ferrocore-media-controls.mp4");
         if f.exists() {
             return Some(f);
         }

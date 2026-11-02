@@ -263,7 +263,7 @@ mod tests {
         assert!(p.width > 150 && p.height >= 48, "{}x{}", p.width, p.height);
         assert!(lit(&p) > 500);
         // Longer text is wider.
-        let q = r.render("Ferrocast engine", &TextStyle::default());
+        let q = r.render("Ferrocore", &TextStyle::default());
         assert!(q.width > p.width);
     }
 

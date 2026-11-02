@@ -94,7 +94,7 @@ fn main() -> Result<()> {
     let ffmpeg = std::env::var_os("PATH")
         .and_then(|p| std::env::split_paths(&p).map(|d| d.join("ffmpeg")).find(|f| f.is_file()))
         .ok_or("FFmpeg isn't on PATH")?;
-    ferrocast_av::ffenc::set_ffmpeg(&ffmpeg);
+    ferrocore::ffenc::set_ffmpeg(&ffmpeg);
     let c = Stage::new(Canvas { width: 1280, height: 720, fps: 30 }, "Main")?;
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;

@@ -5,7 +5,7 @@
 //! FFmpeg server here and recorded to MP4. Both results are checked for length, frames and
 //! picture-to-sound sync, then deleted (they hold what was on screen).
 //!
-//!   cargo run --release -p ferrocast-av --example own_engine -- <out dir> [seconds]
+//!   cargo run --release -p ferrocore --example own_engine -- <out dir> [seconds]
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,13 +13,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use ferrocast_av::audio::AudioConfig;
-    use ferrocast_av::mix::{Mixer, SourceSettings};
-    use ferrocast_av::pipeline::{Pipeline, Tag};
-    use ferrocast_av::screen::{ScreenCapture, Target, shareable};
-    use ferrocast_av::source::text::{TextRenderer, TextStyle};
-    use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
-    use ferrocast_av::{Bounds, Compositor, Content, Effect, Item, Picture, Placement, Scene};
+    use ferrocore::audio::AudioConfig;
+    use ferrocore::mix::{Mixer, SourceSettings};
+    use ferrocore::pipeline::{Pipeline, Tag};
+    use ferrocore::screen::{ScreenCapture, Target, shareable};
+    use ferrocore::source::text::{TextRenderer, TextStyle};
+    use ferrocore::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
+    use ferrocore::{Bounds, Compositor, Content, Effect, Item, Picture, Placement, Scene};
     use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
     use ferrocast_golive::{Hub, Target as Url};
 

@@ -1,11 +1,11 @@
 //! Streaming and recording with Ferrocast's own encoders (ENGINE.md E1, behind the "own
 //! encoder" switch): libobs still draws and mixes, but its finished frames and sound go through
-//! ferrocast-av's encoders, out over RTMP by Go live's own sender to the same server libobs
+//! ferrocore's encoders, out over RTMP by Go live's own sender to the same server libobs
 //! would send to (Go live's ingest on this computer), or into a crash-safe MP4. Everything after
 //! looks the same to the rest of the app.
 //!
 //! With the engine drawing too (E7, `OwnStream::drawn`), libobs isn't in the picture at all:
-//! the collection is opened in ferrocast-av's engine, which draws, mixes and encodes it, and
+//! the collection is opened in ferrocore's engine, which draws, mixes and encodes it, and
 //! follows the Studio's scene changes and edits (`OwnStream::follow`).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ferrocast_av::TransitionKind;
-use ferrocast_av::audio::AudioConfig;
-use ferrocast_av::engine::{Canvas as AvCanvas, Engine, EngineConfig, OutputKind};
-use ferrocast_av::pipeline::Tag;
-use ferrocast_av::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
+use ferrocore::TransitionKind;
+use ferrocore::audio::AudioConfig;
+use ferrocore::engine::{Canvas as AvCanvas, Engine, EngineConfig, OutputKind};
+use ferrocore::pipeline::Tag;
+use ferrocore::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
 use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
 use ferrocast_golive::{Hub, Target};
 
@@ -55,7 +55,7 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("constant quality")
     } else if !s.encode.extra.is_empty() {
         Some("an encoder's own options")
-    } else if is_x264(&s.encode.video_encoder) && !ferrocast_av::ffenc::available() {
+    } else if is_x264(&s.encode.video_encoder) && !ferrocore::ffenc::available() {
         Some(NO_FFMPEG)
     } else if !own_codec_ok(&s.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
@@ -74,7 +74,7 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("constant quality")
     } else if !plan.encode.extra.is_empty() {
         Some("an encoder's own options")
-    } else if is_x264(&plan.encode.video_encoder) && !ferrocast_av::ffenc::available() {
+    } else if is_x264(&plan.encode.video_encoder) && !ferrocore::ffenc::available() {
         Some(NO_FFMPEG)
     } else if !own_codec_ok(&plan.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
@@ -101,7 +101,7 @@ fn system_unsupported(encoder_id: &str) -> Option<&'static str> {
         None
     } else if encoder_id.to_ascii_lowercase().contains("hevc") {
         Some("HEVC on this system (ours does H.264 here so far)")
-    } else if ferrocast_av::ffenc::h264_encoder().is_none() {
+    } else if ferrocore::ffenc::h264_encoder().is_none() {
         Some("this system without a working FFmpeg H.264 encoder")
     } else {
         None
@@ -286,7 +286,7 @@ impl Shared {
         ms: u64,
         settings: &serde_json::Value,
     ) -> Result<(), StudioError> {
-        let fail = |e: ferrocast_av::AvError| StudioError::Failed(e.to_string());
+        let fail = |e: ferrocore::AvError| StudioError::Failed(e.to_string());
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if id == "obs_stinger_transition" {
             let path = settings.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -376,10 +376,10 @@ pub(crate) fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Res
     };
     let (w, h) = size.map_or(canvas, |(w, h)| ((w.max(2) & !1), (h.max(2) & !1)));
     let (w, h) = if (w, h) == (0, 0) { canvas } else { (w, h) };
-    let item = ferrocast_av::engine::SceneItem::new(
+    let item = ferrocore::engine::SceneItem::new(
         id,
-        ferrocast_av::Placement {
-            bounds: ferrocast_av::Bounds::Fit,
+        ferrocore::Placement {
+            bounds: ferrocore::Bounds::Fit,
             bounds_width: w as f32,
             bounds_height: h as f32,
             ..Default::default()
@@ -460,7 +460,7 @@ fn without_on_air(doc: &serde_json::Value) -> serde_json::Value {
 /// The engine's transition for one of OBS's ids with its settings (OBS's keys). A wipe whose
 /// picture can't be read, and anything else, fades.
 pub(crate) fn transition_of(id: &str, ms: u64, s: &serde_json::Value) -> (TransitionKind, u64) {
-    use ferrocast_av::Direction;
+    use ferrocore::Direction;
     let direction = || match s.get("direction").and_then(serde_json::Value::as_str) {
         Some("right") => Direction::Right,
         Some("up") => Direction::Up,
@@ -490,7 +490,7 @@ pub(crate) fn transition_of(id: &str, ms: u64, s: &serde_json::Value) -> (Transi
         }
         "wipe_transition" => {
             let path = s.get("luma_image").and_then(serde_json::Value::as_str).unwrap_or("");
-            match ferrocast_av::source::image::ImageSource::open(std::path::Path::new(path)) {
+            match ferrocore::source::image::ImageSource::open(std::path::Path::new(path)) {
                 Ok(img) => TransitionKind::LumaWipe {
                     luma: img.frame_at(std::time::Duration::ZERO).clone(),
                     invert: s.get("luma_invert").and_then(serde_json::Value::as_bool).unwrap_or(false),
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(transition_of("cut_transition", 700, &serde_json::Value::Null), (TransitionKind::Cut, 0));
         assert_eq!(transition_of("fade_transition", 500, &serde_json::Value::Null), (TransitionKind::Fade, 500));
         assert_eq!(transition_of("ferrocast_move", 400, &serde_json::Value::Null), (TransitionKind::Move, 400));
-        use ferrocast_av::Direction;
+        use ferrocore::Direction;
         let j = |v: serde_json::Value| v;
         assert_eq!(
             transition_of("slide_transition", 300, &j(serde_json::json!({ "direction": "up" }))).0,
@@ -939,7 +939,7 @@ mod tests {
         }
         assert!(unsupported(&settings(hw), false).is_some(), "vertical");
         // x264 runs through FFmpeg, wherever FFmpeg is.
-        assert_eq!(unsupported(&settings("obs_x264"), true).is_none(), ferrocast_av::ffenc::available());
+        assert_eq!(unsupported(&settings("obs_x264"), true).is_none(), ferrocore::ffenc::available());
         assert!(unsupported(&settings("av1_texture_amf"), true).is_some());
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));

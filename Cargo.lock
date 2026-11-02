@@ -2214,33 +2214,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrocast-av"
-version = "2.3.0"
-dependencies = [
- "block2",
- "cosmic-text",
- "cpal",
- "dispatch2",
- "ferrocast-golive",
- "half",
- "image",
- "objc2",
- "objc2-av-foundation",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
- "objc2-screen-capture-kit",
- "pollster",
- "rubato",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "wgpu",
- "windows 0.61.3",
-]
-
-[[package]]
 name = "ferrocast-connector"
 version = "2.3.0"
 dependencies = [
@@ -2271,12 +2244,12 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
- "ferrocast-av",
  "ferrocast-core",
  "ferrocast-engine",
  "ferrocast-guest",
  "ferrocast-server",
  "ferrocast-studio",
+ "ferrocore",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -2306,7 +2279,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "fastrand",
- "ferrocast-av",
  "ferrocast-connector",
  "ferrocast-core",
  "ferrocast-golive",
@@ -2318,6 +2290,7 @@ dependencies = [
  "ferrocast-testkit",
  "ferrocast-twitch",
  "ferrocast-youtube",
+ "ferrocore",
  "flate2",
  "futures-util",
  "getrandom 0.4.3",
@@ -2531,9 +2504,9 @@ dependencies = [
  "chrono",
  "deep_filter",
  "dispatch2",
- "ferrocast-av",
  "ferrocast-golive",
  "ferrocast-guest",
+ "ferrocore",
  "ndarray 0.15.6",
  "objc2",
  "objc2-app-kit",
@@ -2618,6 +2591,33 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "ferrocore"
+version = "2.3.0"
+dependencies = [
+ "block2",
+ "cosmic-text",
+ "cpal",
+ "dispatch2",
+ "ferrocast-golive",
+ "half",
+ "image",
+ "objc2",
+ "objc2-av-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-screen-capture-kit",
+ "pollster",
+ "rubato",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "wgpu",
+ "windows 0.61.3",
 ]
 
 [[package]]

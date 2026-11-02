@@ -1,6 +1,6 @@
 [package]
-name = "ferrocast-av"
-description = "Ferrocast's own engine: a GPU compositor (wgpu) that draws scenes as libobs does, to replace it piece by piece."
+name = "ferrocore"
+description = "Ferrocore: Ferrocast's own video and sound engine (GPU compositor on wgpu, capture, encoders, mixer)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

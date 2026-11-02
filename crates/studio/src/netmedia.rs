@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ferrocast_av::engine::{Feed, now_ns};
+use ferrocore::engine::{Feed, now_ns};
 use serde_json::Value;
 
 /// The size pictures are fitted into (their shape kept, the rest clear).
@@ -67,7 +67,7 @@ fn args(set: &Value, fifo: &std::path::Path, parts: Parts) -> Option<Vec<String>
     }
     // Pictures decoded on the GPU when it can (FFmpeg falls back to the CPU by itself), unless
     // the options already say how.
-    if parts.picture && ferrocast_av::ffsrc::hw_decode_allowed() && !opts.contains("hwaccel") {
+    if parts.picture && ferrocore::ffsrc::hw_decode_allowed() && !opts.contains("hwaccel") {
         a.extend(["-hwaccel".into(), "auto".into()]);
     }
     a.extend(["-i".into(), input.into()]);
@@ -104,7 +104,7 @@ impl NetMedia {
     /// Starts reading the source with these settings into `feed`. Err when FFmpeg isn't here or
     /// the settings name nothing to read.
     pub(crate) fn start(name: &str, set: &Value, feed: Feed) -> Result<Self, String> {
-        let ffmpeg = ferrocast_av::ffenc::path()
+        let ffmpeg = ferrocore::ffenc::path()
             .ok_or("Media from a network address needs FFmpeg: pick x264 once in Settings and Ferrocast fetches it.")?;
         let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
         // Unique per start: two sources (or two collections) can share a name.
@@ -211,7 +211,7 @@ fn run(
             let mut frame = vec![0u8; (w * h * 4) as usize];
             while !stop.load(Ordering::Acquire) && out.read_exact(&mut frame).is_ok() {
                 let f = feed.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                f.picture(ferrocast_av::Picture { width: w, height: h, rgba: frame.clone(), premultiplied: false });
+                f.picture(ferrocore::Picture { width: w, height: h, rgba: frame.clone(), premultiplied: false });
             }
         }
         if let Some(mut c) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -286,7 +286,7 @@ mod tests {
     }
 
     fn reaches_the_engine(with_sound: bool) {
-        use ferrocast_av::engine::{Engine, EngineConfig, SceneItem, SourceKind};
+        use ferrocore::engine::{Engine, EngineConfig, SceneItem, SourceKind};
         let Ok(ff) = which("ffmpeg") else { return };
         let port =
             std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| s.local_addr()).map(|a| a.port()).unwrap_or(23999);
@@ -300,20 +300,20 @@ mod tests {
             .stdin(Stdio::null())
             .spawn()
             .unwrap_or_else(|e| panic!("{e}"));
-        ferrocast_av::ffenc::set_ffmpeg(&ff);
-        let video = ferrocast_av::video::VideoConfig {
-            codec: ferrocast_av::video::VideoCodec::H264,
-            input: ferrocast_av::video::PixelFormat::Nv12,
+        ferrocore::ffenc::set_ffmpeg(&ff);
+        let video = ferrocore::video::VideoConfig {
+            codec: ferrocore::video::VideoCodec::H264,
+            input: ferrocore::video::PixelFormat::Nv12,
             width: 1280,
             height: 720,
             fps_num: 30,
             fps_den: 1,
             bitrate_kbps: 2000,
-            rate: ferrocast_av::video::RateControl::Cbr,
+            rate: ferrocore::video::RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
         };
-        let audio = ferrocast_av::audio::AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let audio = ferrocore::audio::AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let Ok(e) = Engine::new(EngineConfig { width: 1280, height: 720, fps: 30, ..Default::default() }, video, audio)
         else {
             let _ = sender.kill();
@@ -321,7 +321,7 @@ mod tests {
             return;
         };
         e.set_source(1, SourceKind::Fed { width: 1280, height: 720 }).unwrap_or_else(|x| panic!("{x}"));
-        e.set_scene("Main", vec![SceneItem::new(1, ferrocast_av::Placement::default())]);
+        e.set_scene("Main", vec![SceneItem::new(1, ferrocore::Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let feed = e.fed(1).unwrap_or_else(|| panic!("fed"));
         let m = NetMedia::start("Remote", &json!({ "input": format!("udp://127.0.0.1:{port}") }), feed)

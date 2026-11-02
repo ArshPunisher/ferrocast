@@ -162,7 +162,7 @@ impl Compositor {
             )));
         }
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("ferrocast-av"), ..Default::default() })
+            .request_device(&wgpu::DeviceDescriptor { label: Some("ferrocore"), ..Default::default() })
             .await
             .map_err(|e| AvError::NoGpu(e.to_string()))?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {

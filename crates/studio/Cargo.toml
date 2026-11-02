@@ -10,7 +10,7 @@ publish.workspace = true
 
 [dependencies]
 # Ferrocast's own engine: drawing, mixing, encoding and sending.
-ferrocast-av.workspace = true
+ferrocore.workspace = true
 ferrocast-golive.workspace = true
 tokio.workspace = true
 raw-window-handle = "0.6"

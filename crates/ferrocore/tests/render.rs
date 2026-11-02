@@ -1,7 +1,7 @@
 //! Draws small scenes on this computer's graphics card. Without one (some CI machines) the
 //! tests say so and pass: libobs's own check (`engine_match`) needs a GPU anyway.
 
-use ferrocast_av::{Blend, Bounds, Compositor, Item, Picture, Placement, Scene};
+use ferrocore::{Blend, Bounds, Compositor, Item, Picture, Placement, Scene};
 
 fn gpu() -> Option<Compositor> {
     match Compositor::new() {
@@ -111,7 +111,7 @@ fn blend_modes_mix_as_libobs_does() {
 
 #[test]
 fn groups_place_their_items_inside_their_box() {
-    use ferrocast_av::Content;
+    use ferrocore::Content;
     let Some(c) = gpu() else { return };
     let dot = item(Picture::solid(2, 2, [255, 0, 0, 255]), Placement { x: 3.0, y: 4.0, ..Default::default() });
     let group = Item {
@@ -141,7 +141,7 @@ fn bad_pictures_are_refused() {
 
 #[test]
 fn uploaded_pictures_draw_and_update_in_place() {
-    use ferrocast_av::Content;
+    use ferrocore::Content;
     let Some(c) = gpu() else { return };
     c.upload(7, &Picture::solid(4, 4, [255, 0, 0, 255])).unwrap_or_else(|e| panic!("{e}"));
     let it = Item {
@@ -175,7 +175,7 @@ fn nv12_is_bt709_limited() {
 
 #[test]
 fn transitions_refuse_bad_sizes_instead_of_crashing() {
-    use ferrocast_av::{Transition, TransitionKind};
+    use ferrocore::{Transition, TransitionKind};
     let Some(c) = gpu() else { return };
     let empty = Scene { width: 0, height: 10, items: vec![] };
     let tr = Transition { kind: TransitionKind::Fade, t: 0.5, from: empty.clone(), to: empty };
@@ -185,7 +185,7 @@ fn transitions_refuse_bad_sizes_instead_of_crashing() {
 
 #[test]
 fn opacity_fades_an_item_and_a_group_as_one() {
-    use ferrocast_av::Content;
+    use ferrocore::Content;
     let Some(c) = gpu() else { return };
     let black = item(Picture::solid(10, 10, [0, 0, 0, 255]), Placement::default());
     let white = Item { opacity: 0.5, ..item(Picture::solid(10, 10, [255, 255, 255, 255]), Placement::default()) };

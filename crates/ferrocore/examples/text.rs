@@ -1,15 +1,15 @@
 //! Draws a few text styles onto a dark canvas and saves it, to look at.
 //!
-//!   cargo run -p ferrocast-av --example text -- <out.png>
+//!   cargo run -p ferrocore --example text -- <out.png>
 
-use ferrocast_av::source::text::{TextAlign, TextRenderer, TextStyle};
-use ferrocast_av::{Compositor, Item, Picture, Placement, Scene};
+use ferrocore::source::text::{TextAlign, TextRenderer, TextStyle};
+use ferrocore::{Compositor, Item, Picture, Placement, Scene};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args().nth(1).unwrap_or_else(|| "text.png".into());
     let mut r = TextRenderer::new();
     let styles = [
-        ("Ferrocast engine — any font", TextStyle { size: 64.0, bold: true, ..Default::default() }),
+        ("Ferrocore — any font", TextStyle { size: 64.0, bold: true, ..Default::default() }),
         (
             "Outline, shadow, gradient",
             TextStyle {

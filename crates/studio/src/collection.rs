@@ -367,7 +367,7 @@ pub struct SoundTap {
 /// Who listens: our engine's mixer.
 #[derive(Debug)]
 pub(crate) enum Tapped {
-    Own(ferrocast_av::mix::Tap),
+    Own(ferrocore::mix::Tap),
 }
 
 impl SoundTap {

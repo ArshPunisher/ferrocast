@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// What a sound tap hears, readable from any thread (empty once the tap is dropped).
 #[derive(Clone)]
-pub struct TapReader(ferrocast_av::mix::Tap);
+pub struct TapReader(ferrocore::mix::Tap);
 
 impl std::fmt::Debug for TapReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,7 +26,7 @@ impl TapReader {
     }
 
     /// A reader of our engine's tap (its owner keeps the tap; dropping that closes this).
-    pub(crate) fn own(tap: &ferrocast_av::mix::Tap) -> Self {
+    pub(crate) fn own(tap: &ferrocore::mix::Tap) -> Self {
         Self(tap.clone())
     }
 }

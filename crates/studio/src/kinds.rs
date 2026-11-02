@@ -203,7 +203,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 opt("type", "Method", "list").choices(&[("Display Capture", json!(0)), ("Window Capture", json!(1))]),
             ];
             #[cfg(target_os = "macos")]
-            if let Ok((displays, windows)) = ferrocast_av::screen::shareable() {
+            if let Ok((displays, windows)) = ferrocore::screen::shareable() {
                 let d: Vec<(String, Value)> = displays
                     .iter()
                     .enumerate()
@@ -224,14 +224,14 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "macos")]
-            list.extend(ferrocast_av::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
+            list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
             let l: Vec<(&str, Value)> = list.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
             vec![opt("device", "Device", "list").choices(&l)]
         }
         "coreaudio_input_capture" => {
             let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
             #[cfg(target_os = "macos")]
-            list.extend(ferrocast_av::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
+            list.extend(ferrocore::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
             let l: Vec<(&str, Value)> = list.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
             vec![opt("device_id", "Device", "list").choices(&l)]
         }
@@ -243,7 +243,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             #[allow(unused_mut)]
             let mut d: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "windows")]
-            if let Ok((displays, _)) = ferrocast_av::screen::shareable() {
+            if let Ok((displays, _)) = ferrocore::screen::shareable() {
                 d.extend(
                     displays.iter().map(|x| (format!("Display {} ({}x{})", x.id + 1, x.width, x.height), json!(x.id))),
                 );
@@ -257,7 +257,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             #[allow(unused_mut)]
             let mut w: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "windows")]
-            if let Ok((_, windows)) = ferrocast_av::screen::shareable() {
+            if let Ok((_, windows)) = ferrocore::screen::shareable() {
                 w.extend(windows.iter().map(|x| (format!("[{}] {}", x.app, x.title), json!(x.id))));
             }
             vec![opt("window", "Window", "list").choices(&as_refs(&w)), opt("cursor", "Capture Cursor", "bool")]
@@ -266,14 +266,14 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "windows")]
-            list.extend(ferrocast_av::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
+            list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
             vec![opt("video_device_id", "Device", "list").choices(&as_refs(&list))]
         }
         "wasapi_input_capture" => {
             #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
             #[cfg(target_os = "windows")]
-            list.extend(ferrocast_av::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
+            list.extend(ferrocore::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));
             vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
         }
         "wasapi_output_capture" => {
@@ -574,7 +574,7 @@ mod tests {
         let sources = vec![
             json!({ "id": "color_source_v3", "name": "C", "settings": defaults("color_source_v3"), "filters": filters }),
         ];
-        let got = ferrocast_av::obs::import(&json!({ "sources": sources }), (1920, 1080));
+        let got = ferrocore::obs::import(&json!({ "sources": sources }), (1920, 1080));
         let effects: Vec<String> = got.skipped.clone();
         assert!(
             // A mask and a LUT need their picture first.

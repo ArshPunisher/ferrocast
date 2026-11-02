@@ -215,7 +215,7 @@ impl Stage {
                     })
                     .map(move |f| {
                         let fname = f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background");
-                        // The engine names the mask picture so (ferrocast_av::obs).
+                        // The engine names the mask picture so (ferrocore::obs).
                         (format!("{source}: {fname}"), source.clone())
                     })
                     .collect::<Vec<_>>()
@@ -593,9 +593,9 @@ impl Stage {
         let name = name_of(it).to_string();
         let src = self.source(&name).unwrap_or(Value::Null);
         let (w, h) = self.size_of(&name);
-        let p = ferrocast_av::obs::placement_of(it);
-        let a = ferrocast_av::draw_transform(&p, w, h);
-        let (cw, ch) = ferrocast_av::cropped(w, h, p.crop);
+        let p = ferrocore::obs::placement_of(it);
+        let a = ferrocore::draw_transform(&p, w, h);
+        let (cw, ch) = ferrocore::cropped(w, h, p.crop);
         let (cw, ch) = (cw as f32, ch as f32);
         let kind = kind_of(&src).to_string();
         let media = matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2");
@@ -727,7 +727,7 @@ impl Stage {
 
     pub fn transform(&self, scene: &str, id: i64) -> Result<Transform, StudioError> {
         let it = self.item(scene, id)?;
-        let p = ferrocast_av::obs::placement_of(&it);
+        let p = ferrocore::obs::placement_of(&it);
         let (w, h) = self.size_of(name_of(&it));
         Ok(Transform {
             x: p.x,
@@ -777,7 +777,7 @@ impl Stage {
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
         let mut t = self.transform(scene, id)?;
-        let (cw, ch) = ferrocast_av::cropped(
+        let (cw, ch) = ferrocore::cropped(
             t.width,
             t.height,
             [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom].map(|c| c.max(0) as u32),
@@ -1496,9 +1496,9 @@ impl Stage {
         if kind_of(&src) != "group" {
             return Err(fail(format!("\"{name}\" isn't a group.")));
         }
-        let p = ferrocast_av::obs::placement_of(&g);
+        let p = ferrocore::obs::placement_of(&g);
         let (gw, gh) = self.size_of(&name);
-        let to_canvas = ferrocast_av::draw_transform(&p, gw, gh);
+        let to_canvas = ferrocore::draw_transform(&p, gw, gh);
         let (scale, turn) =
             ((p.scale_x * p.scale_x + p.scale_y * p.scale_y).sqrt() / std::f32::consts::SQRT_2, p.rotation);
         let children: Vec<Value> =
@@ -1590,7 +1590,7 @@ impl Stage {
     pub fn monitoring_devices(&self) -> Vec<(String, String)> {
         let mut out = vec![("Default".to_string(), "default".to_string())];
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        out.extend(ferrocast_av::monitor::devices().into_iter().map(|n| (n.clone(), n)));
+        out.extend(ferrocore::monitor::devices().into_iter().map(|n| (n.clone(), n)));
         out
     }
 
@@ -2304,14 +2304,14 @@ impl Stage {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             use crate::collection::MediaAct as A;
-            use ferrocast_av::media::Control as C;
+            use ferrocore::media::Control as C;
             let e = self.engine()?;
             let id = self.media_id(&e, name)?;
             let c = match what {
                 A::Play => C::Play,
                 A::Pause => C::Pause,
                 A::PlayPause => match e.engine.media_state(id).map(|s| s.0) {
-                    Some(ferrocast_av::media::MediaState::Playing) => C::Pause,
+                    Some(ferrocore::media::MediaState::Playing) => C::Pause,
                     _ => C::Play,
                 },
                 A::Restart => C::Restart,
@@ -2332,7 +2332,7 @@ impl Stage {
     pub fn media_state(&self, name: &str) -> Result<crate::collection::MediaInfo, StudioError> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            use ferrocast_av::media::MediaState as S;
+            use ferrocore::media::MediaState as S;
             let e = self.engine()?;
             let id = self.media_id(&e, name)?;
             let (state, at, dur) =
@@ -2361,7 +2361,7 @@ impl Stage {
             let e = self.engine()?;
             let id = self.media_id(&e, name)?;
             let ns = u64::try_from(ms.max(0)).unwrap_or(0) * 1_000_000;
-            e.engine.media_control(id, ferrocast_av::media::Control::Seek(ns)).map_err(|e| fail(e.to_string()))?;
+            e.engine.media_control(id, ferrocore::media::Control::Seek(ns)).map_err(|e| fail(e.to_string()))?;
             self.media_state(name)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2655,7 +2655,7 @@ struct ViewLook {
     /// The scene shown instead of what's on air (Studio Mode).
     scene: Option<String>,
     /// The outlines as last taken from the stage.
-    outlines: Vec<ferrocast_av::preview::Outline>,
+    outlines: Vec<ferrocore::preview::Outline>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2836,7 +2836,7 @@ impl StageView {
                     if l.picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&it.id)) {
                         continue;
                     }
-                    outlines.push(ferrocast_av::preview::Outline {
+                    outlines.push(ferrocore::preview::Outline {
                         corners: corners(&it.frame),
                         color: color(it.id),
                         width: 1.5,
@@ -2846,7 +2846,7 @@ impl StageView {
             }
             if let Some((scene, ids)) = &l.picked {
                 for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| ids.contains(&i.id)) {
-                    outlines.push(ferrocast_av::preview::Outline {
+                    outlines.push(ferrocore::preview::Outline {
                         corners: corners(&it.frame),
                         color: color(it.id),
                         width: 2.0,
@@ -2864,7 +2864,7 @@ impl StageView {
         let l = self.look.borrow();
         self.shared.engine.set_preview_look(
             self.id,
-            ferrocast_av::preview::PreviewLook {
+            ferrocore::preview::PreviewLook {
                 background: l.background,
                 area: l.area,
                 margin: l.margin,
@@ -2929,8 +2929,8 @@ impl MultiviewState {
 
     /// Studio Mode's preview first (green), then what's on air (red), then each scene (red
     /// while on air, green while previewed); names under them, safe areas in the big ones.
-    fn boxes(&self) -> Vec<ferrocast_av::engine::MultiviewBox> {
-        use ferrocast_av::engine::MultiviewBox;
+    fn boxes(&self) -> Vec<ferrocore::engine::MultiviewBox> {
+        use ferrocore::engine::MultiviewBox;
         const RED: [u8; 4] = [214, 40, 40, 255];
         const GREEN: [u8; 4] = [40, 180, 80, 255];
         const GREY: [u8; 4] = [70, 70, 70, 255];
@@ -3067,7 +3067,7 @@ impl Stage {
         id_cell.set(Some(id));
         shared.engine.set_preview_look(
             id,
-            ferrocast_av::preview::PreviewLook { background: [0.0, 0.0, 0.0, 1.0], ..Default::default() },
+            ferrocore::preview::PreviewLook { background: [0.0, 0.0, 0.0, 1.0], ..Default::default() },
         );
         if let Some(mv) = &multiview {
             mv.borrow_mut().view = (pw, ph);
@@ -3224,7 +3224,7 @@ mod tests {
             .unwrap();
         let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord"], "supported": mac });
         assert_eq!(s.privacy(), kept);
-        assert_eq!(ferrocast_av::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord"]);
+        assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord"]);
         let many: Vec<String> = (0..33).map(|i| format!("App {i}")).collect();
         for b in [json!({ "hide_apps": [""] }), json!({ "hide_apps": [1] }), json!({ "hide_apps": many })] {
             assert!(s.set_privacy(&b).is_err(), "{b}");
@@ -3232,8 +3232,8 @@ mod tests {
         assert_eq!(s.privacy(), kept);
         s.set_privacy(&json!({})).unwrap();
         assert_eq!(
-            ferrocast_av::obs::privacy_hide(&s.doc.borrow()),
-            vec![ferrocast_av::obs::NOTIFICATIONS.to_string()]
+            ferrocore::obs::privacy_hide(&s.doc.borrow()),
+            vec![ferrocore::obs::NOTIFICATIONS.to_string()]
         );
     }
 
@@ -3327,7 +3327,7 @@ mod tests {
         ok(s.set_transition(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }));
         let doc = s.save("Mine");
         assert_eq!(s.transition().kind, "cut_transition");
-        let got = ferrocast_av::obs::import(&doc, (1920, 1080));
+        let got = ferrocore::obs::import(&doc, (1920, 1080));
         assert!(got.skipped.is_empty(), "nothing left out: {:?}", got.skipped);
         assert_eq!(got.current.as_deref(), Some("Main"));
         let main = got.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default();
@@ -3510,7 +3510,7 @@ mod tests {
         assert_eq!(g.frame, [250.0, 0.0, 0.0, 100.0, 100.0, 100.0], "the box round both");
         assert_eq!(ok(s.items("Main")).len(), 1);
         // Our engine reads the group with both inside, each where it was.
-        let got = ferrocast_av::obs::import(&s.save("x"), (1920, 1080));
+        let got = ferrocore::obs::import(&s.save("x"), (1920, 1080));
         assert!(got.groups.iter().any(|n| n == "Pair") && got.skipped.is_empty());
         ok(s.ungroup("Main", g.id));
         let back: Vec<[f32; 6]> = ok(s.items("Main")).iter().map(|i| i.frame).collect();

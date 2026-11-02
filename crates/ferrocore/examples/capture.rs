@@ -2,7 +2,7 @@
 //! seconds, and says how many frames came and how big they were. No picture is saved (what's
 //! on screen is private).
 //!
-//!   cargo run -p ferrocast-av --example capture -- [seconds] [--sound] [--tiny]
+//!   cargo run -p ferrocore --example capture -- [seconds] [--sound] [--tiny]
 //!
 //! `--tiny` takes a 2×2 picture once a second, as the engine's desktop sound source does.
 //! `--private` leaves every running app out (the privacy guard) and says how much the
@@ -10,7 +10,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use ferrocast_av::screen::{ScreenCapture, Target, apps, shareable};
+    use ferrocore::screen::{ScreenCapture, Target, apps, shareable};
     let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let (displays, windows) = shareable()?;
     println!("{} displays, {} titled windows", displays.len(), windows.len());
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (w, h, fps) = if std::env::args().any(|a| a == "--tiny") { (2, 2, 1) } else { (1280, 720, 30) };
     if std::env::args().any(|a| a == "--private") {
         let apps = apps()?;
-        let notif = apps.iter().any(|a| a.id == ferrocast_av::obs::NOTIFICATIONS);
+        let notif = apps.iter().any(|a| a.id == ferrocore::obs::NOTIFICATIONS);
         println!("{} running apps (notifications among them: {notif})", apps.len());
         let first = |hide: &[String]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             let cap = ScreenCapture::start_with(Target::Display(main.id), 320, 180, 10, false, false, hide)?;

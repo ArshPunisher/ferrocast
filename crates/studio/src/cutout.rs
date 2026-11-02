@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ferrocast_av::Picture;
+use ferrocore::Picture;
 
 use crate::own::Shared;
 

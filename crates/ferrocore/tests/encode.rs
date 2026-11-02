@@ -3,14 +3,14 @@
 
 use std::process::Command;
 
-use ferrocast_av::flv::{FlvFile, video_header, video_tag};
-use ferrocast_av::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder};
+use ferrocore::flv::{FlvFile, video_header, video_tag};
+use ferrocore::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder};
 
 /// Whether this computer encodes: the Mac always; elsewhere only with FFmpeg and a working H.264
 /// encoder (the shared CI machines have none, the engine's Windows job brings FFmpeg).
 fn encodes() -> bool {
     let native = cfg!(target_os = "macos") && std::env::var("FERROCAST_AV_ENCODER").as_deref() != Ok("ffmpeg");
-    let ok = native || ferrocast_av::ffenc::h264_encoder().is_some();
+    let ok = native || ferrocore::ffenc::h264_encoder().is_some();
     if !ok {
         eprintln!("skipped: no encoder here (FFmpeg isn't installed)");
     }
@@ -89,7 +89,7 @@ fn h264_from_bgra() {
     assert_eq!(keys.len(), 60, "one packet a frame");
     assert!(keys[0], "starts on a keyframe");
     assert!(keys.iter().filter(|k| **k).count() >= 2, "a keyframe every second");
-    if let Some(p) = probe(&flv, "ferrocast-av-h264.flv") {
+    if let Some(p) = probe(&flv, "ferrocore-h264.flv") {
         assert_eq!(p, "h264,640,360,60");
     }
 }
@@ -104,7 +104,7 @@ fn hevc_from_nv12() {
     }
     let (flv, keys) = run(VideoCodec::Hevc, PixelFormat::Nv12);
     assert!(keys[0]);
-    if let Some(p) = probe(&flv, "ferrocast-av-hevc.flv") {
+    if let Some(p) = probe(&flv, "ferrocore-hevc.flv") {
         assert_eq!(p, "hevc,640,360,60");
     }
 }
@@ -124,8 +124,8 @@ fn aac_from_a_tone() {
     if !encodes() {
         return;
     }
-    use ferrocast_av::audio::{AudioConfig, AudioEncoder};
-    use ferrocast_av::flv::{audio_header, audio_tag};
+    use ferrocore::audio::{AudioConfig, AudioEncoder};
+    use ferrocore::flv::{audio_header, audio_tag};
     let mut enc = AudioEncoder::new(AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 160 })
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(enc.header(), vec![0x11, 0x90]);
@@ -147,7 +147,7 @@ fn aac_from_a_tone() {
     for p in &packets {
         flv.tag(8, (p.pts_us / 1000) as u32, &audio_tag(&p.data));
     }
-    let path = std::env::temp_dir().join("ferrocast-av-aac.flv");
+    let path = std::env::temp_dir().join("ferrocore-aac.flv");
     std::fs::write(&path, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
     if let Ok(out) = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "stream=codec_name,profile,sample_rate,channels", "-of", "csv=p=0"])
@@ -162,13 +162,13 @@ fn aac_from_a_tone() {
 fn encoded(
     frames: u32,
 ) -> (
-    ferrocast_av::mp4::VideoTrack,
-    ferrocast_av::mp4::AudioTrack,
-    Vec<ferrocast_av::video::VideoPacket>,
-    Vec<ferrocast_av::audio::AudioPacket>,
+    ferrocore::mp4::VideoTrack,
+    ferrocore::mp4::AudioTrack,
+    Vec<ferrocore::video::VideoPacket>,
+    Vec<ferrocore::audio::AudioPacket>,
 ) {
-    use ferrocast_av::audio::{AudioConfig, AudioEncoder};
-    use ferrocast_av::mp4::{AudioTrack, VideoTrack};
+    use ferrocore::audio::{AudioConfig, AudioEncoder};
+    use ferrocore::mp4::{AudioTrack, VideoTrack};
     let mut venc = VideoEncoder::new(config(VideoCodec::H264, PixelFormat::Bgra)).unwrap_or_else(|e| panic!("{e}"));
     let acfg = AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 };
     let mut aenc = AudioEncoder::new(acfg).unwrap_or_else(|e| panic!("{e}"));
@@ -203,7 +203,7 @@ fn mp4_recording_survives_a_crash() {
     if !encodes() {
         return;
     }
-    use ferrocast_av::mp4::Mp4Writer;
+    use ferrocore::mp4::Mp4Writer;
     let (video, audio, vpk, apk) = encoded(150);
     let mut w = Mp4Writer::new(Vec::new(), Some(video), Some(audio)).unwrap_or_else(|e| panic!("{e}"));
     // Interleaved by time, as they'd arrive live.
@@ -236,12 +236,12 @@ fn mp4_recording_survives_a_crash() {
             .ok()?;
         Some(String::from_utf8_lossy(&out.stdout).trim().replace('\n', " "))
     };
-    if let Some(p) = probe("ferrocast-av.mp4", &bytes) {
+    if let Some(p) = probe("ferrocore.mp4", &bytes) {
         let n = apk.len();
         assert_eq!(p, format!("h264,150 aac,{n}"));
     }
     // Cut 3 KB before the end: the last fragment is broken; the rest still reads.
-    if let Some(p) = probe("ferrocast-av-cut.mp4", &bytes[..bytes.len() - 3000]) {
+    if let Some(p) = probe("ferrocore-cut.mp4", &bytes[..bytes.len() - 3000]) {
         let frames: u32 =
             p.split(' ').next().and_then(|v| v.split(',').nth(1)).and_then(|n| n.parse().ok()).unwrap_or(0);
         assert!(frames >= 120, "plays up to the last whole fragment: {p}");
@@ -255,8 +255,8 @@ fn chapter_marks_are_in_the_file() {
     if !encodes() {
         return;
     }
-    use ferrocast_av::mkv::MkvWriter;
-    use ferrocast_av::mp4::Mp4Writer;
+    use ferrocore::mkv::MkvWriter;
+    use ferrocore::mp4::Mp4Writer;
     use std::io::Cursor;
     let (video, audio, vpk, apk) = encoded(90);
     let chapters = |name: &str, data: &[u8]| -> Option<String> {
@@ -402,7 +402,7 @@ fn constant_quality_follows_the_picture() {
             let (ms, body) = video_tag(VideoCodec::H264, p, 0);
             flv.tag(9, ms, &body);
         }
-        if let Some(p) = probe(&flv.bytes, &format!("ferrocast-av-cq-{busy}.flv")) {
+        if let Some(p) = probe(&flv.bytes, &format!("ferrocore-cq-{busy}.flv")) {
             assert_eq!(p, "h264,640,360,60", "every frame decodes");
         }
         packets.iter().map(|p| p.data.len()).sum::<usize>() * 8 / 2 / 1000
@@ -417,7 +417,7 @@ fn constant_quality_follows_the_picture() {
 /// exactly the pixels that went in.
 #[test]
 fn x264_lossless_gives_back_the_picture() {
-    if !ferrocast_av::ffenc::available() {
+    if !ferrocore::ffenc::available() {
         eprintln!("skipped: FFmpeg isn't here");
         return;
     }
@@ -444,7 +444,7 @@ fn x264_lossless_gives_back_the_picture() {
         flv.tag(9, ms, &body);
     }
     let dir = std::env::temp_dir();
-    let (file, raw) = (dir.join("ferrocast-av-lossless.flv"), dir.join("ferrocast-av-lossless.nv12"));
+    let (file, raw) = (dir.join("ferrocore-lossless.flv"), dir.join("ferrocore-lossless.nv12"));
     std::fs::write(&file, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
     let ok = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
@@ -464,7 +464,7 @@ fn x264_lossless_gives_back_the_picture() {
 /// and the stream plays straight through, every frame there once, in order.
 #[test]
 fn ffmpegs_bitrate_changes_on_the_run() {
-    if !ferrocast_av::ffenc::available() {
+    if !ferrocore::ffenc::available() {
         eprintln!("skipped: FFmpeg isn't here");
         return;
     }
@@ -497,7 +497,7 @@ fn ffmpegs_bitrate_changes_on_the_run() {
         let (ms, body) = video_tag(VideoCodec::H264, p, 0);
         flv.tag(9, ms, &body);
     }
-    let file = std::env::temp_dir().join("ferrocast-av-rate-change.flv");
+    let file = std::env::temp_dir().join("ferrocore-rate-change.flv");
     std::fs::write(&file, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
     let out = Command::new("ffprobe")
         .args([

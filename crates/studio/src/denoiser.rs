@@ -143,7 +143,7 @@ impl Plugin {
     }
 }
 
-impl ferrocast_av::afx::SoundPlugin for Plugin {
+impl ferrocore::afx::SoundPlugin for Plugin {
     fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
         let [l, r] = ch;
         // Its thread gone: the light noise removal instead.
@@ -166,7 +166,7 @@ impl ferrocast_av::afx::SoundPlugin for Plugin {
 
 /// Gives our engine the strong noise removal (once is enough).
 pub(crate) fn install() {
-    ferrocast_av::afx::set_denoiser(|strength| match Plugin::start(strength) {
+    ferrocore::afx::set_denoiser(|strength| match Plugin::start(strength) {
         Ok(p) => Some(Box::new(p)),
         Err(e) => {
             tracing::warn!(error = %e, "the strong noise removal couldn't start");
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(atten_db(0), 0.6);
     }
 
-    use ferrocast_av::afx::{AudioEffect, AudioFilter};
+    use ferrocore::afx::{AudioEffect, AudioFilter};
 
     #[test]
     fn our_engine_takes_the_noise_out() {

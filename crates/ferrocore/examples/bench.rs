@@ -3,11 +3,11 @@
 //! cropped logo with bicubic scaling, a half-clear lower third), drawn and read back as NV12
 //! for the encoder, `frames` times.
 //!
-//!   cargo run --release -p ferrocast-av --example bench -- [frames]
+//!   cargo run --release -p ferrocore --example bench -- [frames]
 
 use std::time::Instant;
 
-use ferrocast_av::{Blend, Bounds, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene};
+use ferrocore::{Blend, Bounds, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frames: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
