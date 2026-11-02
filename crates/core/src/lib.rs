@@ -19,6 +19,7 @@ pub mod event;
 pub mod filter;
 pub mod giveaway;
 pub mod goal;
+pub mod health;
 pub mod layer;
 pub mod loyalty;
 pub mod moderation;
