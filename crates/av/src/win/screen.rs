@@ -1,6 +1,6 @@
-//! Screen and window capture on Windows: a display through Desktop Duplication (FFmpeg's
-//! `ddagrab`; GDI's `gdigrab` where that isn't there), one window through GDI, and what the
-//! computer plays through WASAPI's loopback.
+//! Screen and window capture on Windows: Windows' own capture first (games in full screen too),
+//! else a display through Desktop Duplication (FFmpeg's `ddagrab`; GDI's `gdigrab` where that
+//! isn't there) and a window through GDI; and what the computer plays through WASAPI's loopback.
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
@@ -46,18 +46,24 @@ pub enum Target {
 
 /// The displays with where each sits on the desktop: (x, y, width, height).
 fn monitors() -> Vec<(i32, i32, u32, u32)> {
+    monitor_handles().into_iter().map(|(_, m)| m).collect()
+}
+
+/// The displays' handles, with where each sits.
+fn monitor_handles() -> Vec<(HMONITOR, (i32, i32, u32, u32))> {
+    type List = Vec<(HMONITOR, (i32, i32, u32, u32))>;
     unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         // SAFETY: `data` is the Vec this call was given below, alive for EnumDisplayMonitors.
-        let list = unsafe { &mut *(data.0 as *mut Vec<(i32, i32, u32, u32)>) };
+        let list = unsafe { &mut *(data.0 as *mut List) };
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         // SAFETY: a monitor handle Windows just gave, and an info struct with its size set.
         if unsafe { GetMonitorInfoW(m, &mut info) }.as_bool() {
             let r = info.rcMonitor;
-            list.push((r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32));
+            list.push((m, (r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)));
         }
         true.into()
     }
-    let mut list: Vec<(i32, i32, u32, u32)> = Vec::new();
+    let mut list: List = Vec::new();
     // SAFETY: the callback reads `list` only during this call.
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut list as *mut _ as isize));
@@ -128,10 +134,17 @@ pub fn apps() -> Result<Vec<App>, AvError> {
     Ok(names.into_iter().map(|n| App { id: n.clone(), name: n }).collect())
 }
 
+/// Where the pictures come from.
+#[derive(Debug)]
+enum Pictures {
+    Native(super::wgc::Wgc),
+    Ffmpeg(Live),
+}
+
 /// A running capture; dropping it stops.
 #[derive(Debug)]
 pub struct ScreenCapture {
-    live: Option<Live>,
+    live: Option<Pictures>,
     sound: Option<SoundIn>,
 }
 
@@ -165,6 +178,18 @@ impl ScreenCapture {
         }
         let (fps, mouse) = (fps.clamp(1, 120), if cursor { "1" } else { "0" });
         let max = (width.max(16), height.max(16));
+        // Windows' own capture first; FFmpeg's where it can't.
+        let native = match target {
+            Target::Display(i) => monitor_handles()
+                .get(i as usize)
+                .ok_or_else(|| AvError::Source(format!("display {} isn't connected", i + 1)))
+                .and_then(|(m, _)| super::wgc::Wgc::display(*m, max, fps, cursor)),
+            Target::Window(id) => super::wgc::Wgc::window(HWND(id as usize as *mut _), max, fps, cursor),
+        };
+        match native {
+            Ok(w) => return Ok(ScreenCapture { live: Some(Pictures::Native(w)), sound }),
+            Err(e) => tracing::info!(error = %e, "Windows' own capture can't: FFmpeg captures instead"),
+        }
         let live = match target {
             Target::Display(i) => {
                 // Desktop Duplication first (the GPU's copy, fast), else GDI.
@@ -220,12 +245,15 @@ impl ScreenCapture {
                 Live::start(&gdi, max, fps, None)?
             }
         };
-        Ok(ScreenCapture { live: Some(live), sound })
+        Ok(ScreenCapture { live: Some(Pictures::Ffmpeg(live)), sound })
     }
 
     /// The newest frame (taken).
     pub fn take(&self) -> Option<Picture> {
-        self.live.as_ref()?.take().map(|(p, _)| p)
+        match self.live.as_ref()? {
+            Pictures::Native(w) => w.take(),
+            Pictures::Ffmpeg(l) => l.take().map(|(p, _)| p),
+        }
     }
 
     /// The computer's sound since the last call (when started with sound).
@@ -234,11 +262,18 @@ impl ScreenCapture {
     }
 
     pub fn frames(&self) -> u64 {
-        self.live.as_ref().map_or(0, Live::frames)
+        match &self.live {
+            Some(Pictures::Native(w)) => w.frames(),
+            Some(Pictures::Ffmpeg(l)) => l.frames(),
+            None => 0,
+        }
     }
 
-    /// Why FFmpeg's capture ended, if it did.
+    /// Why the capture ended, if it did.
     pub fn ended(&self) -> Option<String> {
-        self.live.as_ref()?.ended()
+        match self.live.as_ref()? {
+            Pictures::Native(w) => w.ended(),
+            Pictures::Ffmpeg(l) => l.ended(),
+        }
     }
 }
