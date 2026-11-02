@@ -286,9 +286,8 @@ mod tests {
             "{s}"
         );
         assert!(!s.contains("bad;key"), "only plain option names pass");
-        let own =
-            args(&json!({ "input": "x", "ffmpeg_options": "analyzeduration=5" }), "tcp://127.0.0.1:9", BOTH)
-                .unwrap_or_default();
+        let own = args(&json!({ "input": "x", "ffmpeg_options": "analyzeduration=5" }), "tcp://127.0.0.1:9", BOTH)
+            .unwrap_or_default();
         assert_eq!(own.iter().filter(|a| *a == "-analyzeduration").count(), 1, "the source's own probe time wins");
         assert!(s.ends_with("tcp://127.0.0.1:9"));
         assert!(args(&json!({}), "tcp://127.0.0.1:9", BOTH).is_none(), "no address, nothing to read");

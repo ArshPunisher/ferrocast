@@ -13,7 +13,6 @@ use std::sync::OnceLock;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::internal::bail;
 
-
 /// Frames are given to RVM this wide (the height follows the picture's shape): about 20 ms a
 /// frame on one core.
 pub(crate) const WIDTH: u32 = 384;

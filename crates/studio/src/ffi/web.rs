@@ -508,14 +508,7 @@ impl std::fmt::Debug for FedPage {
 
 impl FedPage {
     /// Opens `url` at `w`×`h` with `css`, snapshotted `fps` times a second into `feed`.
-    pub(crate) fn open(
-        url: &str,
-        w: u32,
-        h: u32,
-        css: &str,
-        fps: u32,
-        feed: ferrocore::engine::Feed,
-    ) -> Option<Self> {
+    pub(crate) fn open(url: &str, w: u32, h: u32, css: &str, fps: u32, feed: ferrocore::engine::Feed) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let shared = Arc::new(Shared {
             // Always shown: our engine draws it only where it's on air or in a preview.

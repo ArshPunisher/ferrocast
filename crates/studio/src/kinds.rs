@@ -67,7 +67,10 @@ pub fn kinds() -> Kinds {
         ]
         .into_iter()
         // Remove background: Apple's Vision finds the person (a Mac for now).
-        .chain(cfg!(any(target_os = "macos", target_os = "windows")).then(|| kind("ferrocast_remove_background", "Remove Background")))
+        .chain(
+            cfg!(any(target_os = "macos", target_os = "windows"))
+                .then(|| kind("ferrocast_remove_background", "Remove Background")),
+        )
         // Strong noise removal (DeepFilterNet), in builds that have it.
         .chain(cfg!(feature = "deepfilter").then(|| kind("ferrocast_deepfilter", "Strong Noise Removal")))
         .collect(),

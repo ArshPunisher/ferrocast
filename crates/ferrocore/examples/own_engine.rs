@@ -13,6 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
+    use ferrocast_golive::{Hub, Target as Url};
     use ferrocore::audio::AudioConfig;
     use ferrocore::mix::{Mixer, SourceSettings};
     use ferrocore::pipeline::{Pipeline, Tag};
@@ -20,8 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ferrocore::source::text::{TextRenderer, TextStyle};
     use ferrocore::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig};
     use ferrocore::{Bounds, Compositor, Content, Effect, Item, Picture, Placement, Scene};
-    use ferrocast_golive::push::{self, Destination, Health, PushState, Retry};
-    use ferrocast_golive::{Hub, Target as Url};
 
     let mut args = std::env::args().skip(1);
     let out = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
