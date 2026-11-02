@@ -319,10 +319,6 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
             // with FFmpeg and hands its pictures in, fitted into 1280x720.
             if s.get("is_local_file").and_then(Value::as_bool) == Some(false) {
-                // Nothing reads network addresses into a Windows Studio yet: said, not blank.
-                #[cfg(target_os = "windows")]
-                return Err("a network address in a Media Source (not on Windows yet)".into());
-                #[cfg(not(target_os = "windows"))]
                 return Ok((SourceKind::Fed { width: 1280, height: 720 }, true));
             }
             (

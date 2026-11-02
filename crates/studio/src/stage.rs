@@ -43,10 +43,10 @@ pub struct Stage {
     #[cfg(target_os = "macos")]
     pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
     /// Media from network addresses (guests' cameras, streams), each read by FFmpeg.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     nets: RefCell<std::collections::HashMap<String, (Value, crate::netmedia::NetMedia)>>,
     /// Remove background filters at work, by their mask picture's name.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
 }
 
@@ -129,9 +129,9 @@ impl Stage {
             engine: RefCell::new(None),
             #[cfg(target_os = "macos")]
             pages: RefCell::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             nets: RefCell::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
         };
         s.add_scene(first_scene)?;
@@ -150,9 +150,9 @@ impl Stage {
             engine: RefCell::new(None),
             #[cfg(target_os = "macos")]
             pages: RefCell::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             nets: RefCell::default(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
         };
         if s.scenes().is_empty() {
@@ -233,7 +233,7 @@ impl Stage {
 
     /// Starts, restarts or stops reading the network media sources (a guest's camera…), and
     /// hands each its source's feed.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sync_nets(&self, e: &own::Shared) {
         let net: Vec<(String, Value)> = self
             .sources_list()
@@ -248,7 +248,7 @@ impl Stage {
             let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
             match nets.get(&name) {
                 Some((_, m)) => m.set_feed(feed),
-                None => match crate::netmedia::NetMedia::start(&name, &set, feed) {
+                None => match crate::netmedia::NetMedia::start(&set, feed) {
                     Ok(m) => {
                         nets.insert(name, (set, m));
                     }
@@ -262,6 +262,11 @@ impl Stage {
     /// hands each its source's feed (a new one after the collection is opened again). Main
     /// thread (WebKit).
     fn sync_pages(&self) {
+        #[cfg(target_os = "windows")]
+        if let Some(e) = self.engine.borrow().clone() {
+            self.sync_nets(&e);
+            self.sync_cutouts(&e);
+        }
         #[cfg(target_os = "macos")]
         {
             let Some(e) = self.engine.borrow().clone() else { return };

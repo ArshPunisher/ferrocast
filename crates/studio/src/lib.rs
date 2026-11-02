@@ -9,11 +9,11 @@ mod ffi;
 pub mod import;
 pub mod kinds;
 mod naming;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod netmedia;
 mod own;
-// Vision through objc2 (the same unsafe calls as ffi's).
-#[cfg(target_os = "macos")]
+// Remove background: Vision through objc2 on a Mac (the same unsafe calls as ffi's), RVM on Windows.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod cutout;
 pub mod projector;
 #[cfg(target_os = "macos")]

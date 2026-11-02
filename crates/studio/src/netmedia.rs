@@ -4,7 +4,7 @@
 //! When the stream drops, FFmpeg is started again after the source's reconnect delay.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,8 +44,9 @@ struct Parts {
 const BOTH: Parts = Parts { picture: true, sound: true };
 
 /// The FFmpeg arguments for a Media source's network settings (OBS's keys: `input`,
-/// `input_format`, `ffmpeg_options`), its picture to stdout and its sound to `fifo`.
-fn args(set: &Value, fifo: &std::path::Path, parts: Parts) -> Option<Vec<String>> {
+/// `input_format`, `ffmpeg_options`), its picture to stdout and its sound to `sound_to` (an
+/// FFmpeg output address).
+fn args(set: &Value, sound_to: &str, parts: Parts) -> Option<Vec<String>> {
     let input = set.get("input").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
     if let Some(f) = set.get("input_format").and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -80,7 +81,7 @@ fn args(set: &Value, fifo: &std::path::Path, parts: Parts) -> Option<Vec<String>
     }
     if parts.sound {
         a.extend(["-map", "0:a:0?", "-f", "f32le", "-ar", "48000", "-ac", "2", "-y"].map(String::from));
-        a.push(fifo.display().to_string());
+        a.push(sound_to.to_string());
     }
     Some(a)
 }
@@ -103,15 +104,10 @@ fn parts_after(parts: Parts, errors: &str) -> Parts {
 impl NetMedia {
     /// Starts reading the source with these settings into `feed`. Err when FFmpeg isn't here or
     /// the settings name nothing to read.
-    pub(crate) fn start(name: &str, set: &Value, feed: Feed) -> Result<Self, String> {
+    pub(crate) fn start(set: &Value, feed: Feed) -> Result<Self, String> {
         let ffmpeg = ferrocore::ffenc::path()
             .ok_or("Media from a network address needs FFmpeg: pick x264 once in Settings and Ferrocast fetches it.")?;
-        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-        // Unique per start: two sources (or two collections) can share a name.
-        static STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = STARTS.fetch_add(1, Ordering::Relaxed);
-        let fifo = std::env::temp_dir().join(format!("ferrocast-net-{}-{n}-{slug}.pcm", std::process::id()));
-        args(set, &fifo, BOTH).ok_or("The media source has no address to read.")?;
+        args(set, "", BOTH).ok_or("The media source has no address to read.")?;
         let set = set.clone();
         let delay = set.get("reconnect_delay_sec").and_then(Value::as_u64).unwrap_or(1).clamp(1, 60);
         let feed = Arc::new(Mutex::new(feed));
@@ -121,7 +117,7 @@ impl NetMedia {
             let (feed, stop, child) = (feed.clone(), stop.clone(), child.clone());
             std::thread::Builder::new()
                 .name("ferrocast-net-media".into())
-                .spawn(move || run(&ffmpeg, &set, &fifo, &feed, &stop, &child, Duration::from_secs(delay)))
+                .spawn(move || run(&ffmpeg, &set, &feed, &stop, &child, Duration::from_secs(delay)))
                 .map_err(|e| format!("The media source couldn't start: {e}"))?
         };
         Ok(Self { feed, stop, child, thread: Some(thread) })
@@ -150,7 +146,6 @@ impl Drop for NetMedia {
 fn run(
     ffmpeg: &std::path::Path,
     set: &Value,
-    fifo: &PathBuf,
     feed: &Arc<Mutex<Feed>>,
     stop: &AtomicBool,
     child: &Mutex<Option<Child>>,
@@ -158,14 +153,24 @@ fn run(
 ) {
     let mut parts = BOTH;
     while !stop.load(Ordering::Acquire) {
-        let Some(args) = args(set, fifo, parts) else { return };
-        let _ = std::fs::remove_file(fifo);
-        // The sound comes through a named pipe, the picture through stdout.
-        let made = !parts.sound || Command::new("mkfifo").arg(fifo).status().is_ok_and(|s| s.success());
-        if !made {
-            tracing::warn!("a network media source couldn't make its sound pipe");
-            return;
-        }
+        // The picture comes through stdout, the sound through a connection FFmpeg makes to
+        // this computer (every system has those; named pipes differ).
+        let listener = match parts.sound.then(|| TcpListener::bind(("127.0.0.1", 0))).transpose() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("a network media source couldn't open its sound connection: {e}");
+                return;
+            }
+        };
+        let sound_to = match listener.as_ref().map(TcpListener::local_addr).transpose() {
+            Ok(Some(a)) => format!("tcp://{a}"),
+            Ok(None) => String::new(),
+            Err(e) => {
+                tracing::warn!("a network media source couldn't open its sound connection: {e}");
+                return;
+            }
+        };
+        let Some(args) = args(set, &sound_to, parts) else { return };
         let spawned =
             Command::new(ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         let Ok(mut c) = spawned else {
@@ -187,23 +192,20 @@ fn run(
             if stop.load(Ordering::Acquire) {
                 let _ = c.kill();
                 let _ = c.wait();
-                let _ = std::fs::remove_file(fifo);
                 return;
             }
             *slot = Some(c);
         }
-        // Sound on its own thread (opening the pipe waits for FFmpeg to open it too).
-        let sound = parts.sound.then(|| {
-            let (fifo, feed) = (fifo.clone(), feed.clone());
+        // Sound on its own thread (it waits for FFmpeg to connect).
+        let done = Arc::new(AtomicBool::new(false));
+        let sound = listener.map(|l| {
+            let (feed, done) = (feed.clone(), done.clone());
             std::thread::spawn(move || {
-                let Ok(mut f) = std::fs::File::open(&fifo) else { return };
-                let mut buf = vec![0u8; CHUNK * 2 * 4];
-                while f.read_exact(&mut buf).is_ok() {
-                    let pcm: Vec<f32> = buf.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+                read_sound(&l, &done, |pcm| {
                     let span = CHUNK as u64 * 1_000_000_000 / 48_000;
                     let f = feed.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     f.sound(pcm, 48_000, now_ns().saturating_sub(span));
-                }
+                });
             })
         });
         if let Some(mut out) = out {
@@ -218,15 +220,11 @@ fn run(
             let _ = c.kill();
             let _ = c.wait();
         }
-        // A reader still waiting for a writer that never came: open the pipe once to let it
-        // go (only then: with no reader left, opening for writing would wait forever).
+        // FFmpeg has ended: a sound reader still waiting for it to connect stops waiting.
+        done.store(true, Ordering::Release);
         if let Some(sound) = sound {
-            if !sound.is_finished() {
-                let _ = std::fs::OpenOptions::new().write(true).open(fifo);
-            }
             let _ = sound.join();
         }
-        let _ = std::fs::remove_file(fifo);
         if let Some(text) = errors.and_then(|t| t.join().ok()) {
             let next = parts_after(parts, &text);
             if next != parts {
@@ -243,6 +241,34 @@ fn run(
     }
 }
 
+/// The sound FFmpeg sends (48 kHz stereo f32), a chunk at a time to `chunk`, once it connects
+/// to `l`. Gives up waiting when `done` is set (FFmpeg ended without connecting); only the first
+/// connection is read.
+fn read_sound(l: &TcpListener, done: &AtomicBool, mut chunk: impl FnMut(Vec<f32>)) {
+    if l.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut conn = loop {
+        match l.accept() {
+            Ok((c, _)) => break c,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
+    };
+    if conn.set_nonblocking(false).is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; CHUNK * 2 * 4];
+    while conn.read_exact(&mut buf).is_ok() {
+        chunk(buf.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,7 +277,7 @@ mod tests {
     #[test]
     fn obs_network_settings_become_ffmpeg_arguments() {
         let set = json!({ "input": "/tmp/guest.sdp", "input_format": "sdp", "ffmpeg_options": "protocol_whitelist=file,udp,rtp fflags=nobuffer bad;key=x" });
-        let a = args(&set, std::path::Path::new("/tmp/s.pcm"), BOTH).unwrap_or_default();
+        let a = args(&set, "tcp://127.0.0.1:9", BOTH).unwrap_or_default();
         let s = a.join(" ");
         assert!(
             s.contains(
@@ -261,17 +287,17 @@ mod tests {
         );
         assert!(!s.contains("bad;key"), "only plain option names pass");
         let own =
-            args(&json!({ "input": "x", "ffmpeg_options": "analyzeduration=5" }), std::path::Path::new("/tmp/s"), BOTH)
+            args(&json!({ "input": "x", "ffmpeg_options": "analyzeduration=5" }), "tcp://127.0.0.1:9", BOTH)
                 .unwrap_or_default();
         assert_eq!(own.iter().filter(|a| *a == "-analyzeduration").count(), 1, "the source's own probe time wins");
-        assert!(s.ends_with("/tmp/s.pcm"));
-        assert!(args(&json!({}), std::path::Path::new("/tmp/s"), BOTH).is_none(), "no address, nothing to read");
+        assert!(s.ends_with("tcp://127.0.0.1:9"));
+        assert!(args(&json!({}), "tcp://127.0.0.1:9", BOTH).is_none(), "no address, nothing to read");
         let picture = Parts { picture: true, sound: false };
-        let only = args(&set, std::path::Path::new("/tmp/s.pcm"), picture).unwrap_or_default().join(" ");
+        let only = args(&set, "tcp://127.0.0.1:9", picture).unwrap_or_default().join(" ");
         assert!(only.ends_with("pipe:1") && !only.contains("0:a:0"), "{only}");
         // Sound alone isn't decoded on the GPU.
         let sound = Parts { picture: false, sound: true };
-        let only = args(&set, std::path::Path::new("/tmp/s.pcm"), sound).unwrap_or_default().join(" ");
+        let only = args(&set, "tcp://127.0.0.1:9", sound).unwrap_or_default().join(" ");
         assert!(!only.contains("hwaccel"), "{only}");
     }
 
@@ -324,7 +350,7 @@ mod tests {
         e.set_scene("Main", vec![SceneItem::new(1, ferrocore::Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let feed = e.fed(1).unwrap_or_else(|| panic!("fed"));
-        let m = NetMedia::start("Remote", &json!({ "input": format!("udp://127.0.0.1:{port}") }), feed)
+        let m = NetMedia::start(&json!({ "input": format!("udp://127.0.0.1:{port}") }), feed)
             .unwrap_or_else(|x| panic!("{x}"));
         let mid = (360 * 1280 + 640) * 4;
         let mut px = Vec::new();
@@ -339,6 +365,32 @@ mod tests {
         let _ = sender.kill();
         let _ = sender.wait();
         assert!(green(&px, mid), "the stream's green, in the middle: {:?}", px.get(mid..mid + 3));
+    }
+
+    #[test]
+    fn sound_comes_through_a_local_connection() {
+        let Ok(ff) = which("ffmpeg") else { return };
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|e| panic!("{e}"));
+        let to = format!("tcp://{}", l.local_addr().unwrap_or_else(|e| panic!("{e}")));
+        let mut sender = Command::new(&ff)
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-f", "f32le", "-ar", "48000"])
+            .args(["-ac", "2", &to])
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let done = AtomicBool::new(false);
+        let mut got = 0usize;
+        let mut loud = 0f32;
+        read_sound(&l, &done, |pcm| {
+            got += pcm.len();
+            loud = pcm.iter().fold(loud, |m, v| m.max(v.abs()));
+        });
+        let _ = sender.wait();
+        // A second's tone, less the part that doesn't fill a whole chunk.
+        assert!(got >= 46 * CHUNK * 2 && loud > 0.05, "{got} samples, peak {loud}");
+        // FFmpeg gone without connecting: the reader doesn't wait forever.
+        done.store(true, Ordering::Release);
+        read_sound(&l, &done, |_| panic!("nothing connected"));
     }
 
     #[test]
