@@ -12,9 +12,11 @@ pub fn mul_to_db(mul: f32) -> f32 {
 }
 
 /// A sound filter made outside the engine (DeepFilterNet's noise removal, which the app builds
-/// in): it cleans stereo blocks in place, keeping its own state.
+/// in): it cleans stereo blocks in place, keeping its own state. False: it couldn't (gone, or
+/// too slow for this computer); the block is left as it was and the engine's light noise
+/// removal takes over.
 pub trait SoundPlugin: Send + std::fmt::Debug {
-    fn process(&mut self, ch: [&mut [f32]; 2]);
+    fn process(&mut self, ch: [&mut [f32]; 2]) -> bool;
 }
 
 /// Makes the strong noise removal at a strength (1 to 100), when the app has one.
@@ -118,6 +120,9 @@ pub struct AudioFilter {
     eq: [EqState; 2],
     /// A filter made outside the engine (noise removal).
     plugin: Option<Box<dyn SoundPlugin>>,
+    // Light noise removal: the noise floor it hears (RMS) and the gain now.
+    floor: f32,
+    nr_gain: f32,
 }
 
 /// libobs's compressor `gain_coefficient`.
@@ -145,6 +150,8 @@ impl AudioFilter {
                 }
                 _ => None,
             },
+            floor: 0.0,
+            nr_gain: 1.0,
         }
     }
 
@@ -154,8 +161,11 @@ impl AudioFilter {
         let n = l.len().min(r.len());
         let rate = self.rate;
         if let Some(p) = self.plugin.as_mut() {
-            p.process([l, r]);
-            return;
+            if p.process([&mut *l, &mut *r]) {
+                return;
+            }
+            tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
+            self.plugin = None;
         }
         match self.effect {
             AudioEffect::Gain { db } => {
@@ -247,8 +257,36 @@ impl AudioFilter {
                     }
                 }
             }
-            // Without the app's noise removal (or away from 48 kHz) the sound is as it was.
-            AudioEffect::Denoise { .. } => {}
+            // Without the app's strong noise removal (not in this build, it didn't start, or this
+            // computer is too slow for it): the light one.
+            AudioEffect::Denoise { strength } => self.light_denoise(&mut l[..n], &mut r[..n], strength),
+        }
+    }
+
+    /// Light noise removal, for any computer: it follows the noise floor (the quietest the sound
+    /// gets, rising slowly) and turns down what stays near it (hiss, hum, a fan between words)
+    /// by up to 24 dB at strength 100; a voice above it passes untouched.
+    fn light_denoise(&mut self, l: &mut [f32], r: &mut [f32], strength: u32) {
+        let n = l.len();
+        if n == 0 {
+            return;
+        }
+        let rms = (l.iter().chain(r.iter()).map(|v| v * v).sum::<f32>() / (2 * n) as f32).sqrt();
+        let secs = n as f32 / self.rate;
+        // Down at once to anything quieter; up 3 dB a second (a louder room is learnt).
+        self.floor = if self.floor <= 0.0 || rms < self.floor { rms } else { self.floor * db_to_mul(3.0 * secs) };
+        let depth = 24.0 * strength.clamp(1, 100) as f32 / 100.0;
+        // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly.
+        let over = mul_to_db(rms.max(1e-9) / self.floor.max(1e-9));
+        let target = db_to_mul(-depth * (1.0 - ((over - 6.0) / 6.0).clamp(0.0, 1.0)));
+        // Opens in 5 ms (a word's start isn't clipped), closes in 120 ms.
+        let open = 1.0 - coefficient(self.rate, 0.005);
+        let close = 1.0 - coefficient(self.rate, 0.120);
+        for i in 0..n {
+            let k = if target > self.nr_gain { open } else { close };
+            self.nr_gain += (target - self.nr_gain) * k;
+            l[i] *= self.nr_gain;
+            r[i] *= self.nr_gain;
         }
     }
 
@@ -366,6 +404,45 @@ mod tests {
             f.process([a, b]);
         }
         l
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+    }
+
+    /// A slow plugin that gives up, as the strong noise removal does on a slow computer.
+    #[derive(Debug)]
+    struct GivesUp;
+    impl SoundPlugin for GivesUp {
+        fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn light_noise_removal_quiets_the_room_not_the_voice() {
+        // A fan's hiss (-50 dBFS), then a voice over it (-12 dBFS), then the fan alone again.
+        let hiss: Vec<f32> = (0..RATE as usize).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.0055).collect();
+        let voice: Vec<f32> = sine(220.0, 0.35, 1.0).iter().zip(&hiss).map(|(v, h)| v + h).collect();
+        let input: Vec<f32> = hiss.iter().chain(&voice).chain(&hiss).copied().collect();
+        let out = run(AudioEffect::Denoise { strength: 100 }, &input);
+        let r = RATE as usize;
+        // The fan between words: about 24 dB quieter once the floor is learnt.
+        let fan = mul_to_db(rms(&out[2 * r + r / 2..3 * r]) / rms(&input[2 * r + r / 2..3 * r]));
+        assert!(fan < -18.0, "{fan} dB");
+        // The voice: as it was (after its first 50 ms).
+        let said = mul_to_db(rms(&out[r + r / 20..2 * r]) / rms(&input[r + r / 20..2 * r]));
+        assert!(said > -1.0, "{said} dB");
+    }
+
+    #[test]
+    fn a_plugin_that_gives_up_hands_over_to_the_light_one() {
+        let mut f = AudioFilter::new(AudioEffect::Denoise { strength: 100 }, RATE);
+        f.plugin = Some(Box::new(GivesUp));
+        let (mut l, mut r) = (vec![0.01; 1024], vec![0.01; 1024]);
+        f.process([&mut l, &mut r]);
+        assert!(f.plugin.is_none(), "it's dropped");
+        assert!(f.floor > 0.0, "and the light one ran on the same block");
     }
 
     fn sine(hz: f32, amp: f32, secs: f32) -> Vec<f32> {

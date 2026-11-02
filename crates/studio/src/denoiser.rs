@@ -144,15 +144,22 @@ impl Plugin {
 }
 
 impl ferrocast_av::afx::SoundPlugin for Plugin {
-    fn process(&mut self, ch: [&mut [f32]; 2]) {
+    fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
         let [l, r] = ch;
-        // Its thread gone: the sound as it is.
+        // Its thread gone: the light noise removal instead.
         if self.to.send((l.to_vec(), r.to_vec())).is_err() {
-            return;
+            return false;
         }
-        if let Ok((cl, cr)) = self.from.recv() {
-            l.copy_from_slice(&cl[..l.len()]);
-            r.copy_from_slice(&cr[..r.len()]);
+        // A block back within four of its own length (at least 100 ms), or this computer is too
+        // slow for the model and the mixer mustn't wait on it.
+        let limit = std::time::Duration::from_secs_f64((l.len() as f64 / 48_000.0 * 4.0).max(0.1));
+        match self.from.recv_timeout(limit) {
+            Ok((cl, cr)) if cl.len() >= l.len() && cr.len() >= r.len() => {
+                l.copy_from_slice(&cl[..l.len()]);
+                r.copy_from_slice(&cr[..r.len()]);
+                true
+            }
+            _ => false,
         }
     }
 }

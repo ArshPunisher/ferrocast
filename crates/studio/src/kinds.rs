@@ -62,6 +62,7 @@ pub fn kinds() -> Kinds {
             kind("expander_filter", "Expander"),
             kind("upward_compressor_filter", "Upward Compressor"),
             kind("basic_eq_filter", "3-Band Equalizer"),
+            kind("noise_suppress_filter_v2", "Noise Suppression"),
             kind("invert_polarity_filter", "Invert Polarity"),
         ]
         .into_iter()
@@ -441,6 +442,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("blur", "Blur", "int").range(2.0, 100.0, 1.0).slider().unit(" px"),
         ],
         "ferrocast_deepfilter" => vec![opt("strength", "Strength", "int").range(1.0, 100.0, 1.0).slider()],
+        "noise_suppress_filter" | "noise_suppress_filter_v2" => {
+            vec![opt("suppress_level", "Suppression Level", "int").range(-60.0, 0.0, 1.0).slider().unit(" dB")]
+        }
         "ferrocast_rounded_corners" => {
             vec![opt("radius", "Radius", "int").range(0.0, 1000.0, 1.0).slider().unit(" px")]
         }
@@ -516,6 +520,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         }
         "gain_filter" => json!({ "db": 0.0 }),
         "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -30 }),
         "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),
         "noise_gate_filter" => {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
