@@ -453,6 +453,9 @@ pub struct EngineStats {
     /// given to them.
     pub skipped: u32,
     pub encoded: u32,
+    /// Faults the engine caught and carried on from, and sources its watchdog started again.
+    pub recovered: u32,
+    pub restarts: u32,
 }
 
 /// How a source's picture looks now (`Stage::look`): for catching a black or frozen camera.

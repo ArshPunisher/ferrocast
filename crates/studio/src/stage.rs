@@ -1581,6 +1581,8 @@ impl Stage {
             memory_mb,
             skipped: 0,
             encoded: s.frames.min(u64::from(u32::MAX)) as u32,
+            recovered: s.recovered.min(u64::from(u32::MAX)) as u32,
+            restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
         }
     }
 
