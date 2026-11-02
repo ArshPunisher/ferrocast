@@ -23,7 +23,8 @@ use tungstenite::{Message, WebSocket};
 
 /// What a page is asked to do (as `ffi::web::Do`).
 pub(crate) enum Do {
-    Interact(String),
+    /// Its window's title on a Mac; clicking in isn't here yet.
+    Interact(#[allow(dead_code)] String),
     Stop,
     Reload,
 }

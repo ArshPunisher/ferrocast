@@ -6,6 +6,7 @@
 
 /// The colours of sources' outlines, picked by item id (`id % 8`); the page's list shows the
 /// same: orange, sky, lime, pink, amber, violet, teal, blue.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub const FRAME_COLORS: [(f32, f32, f32); 8] = [
     (1.0, 0.353, 0.122),
     (0.2, 0.831, 1.0),

@@ -224,6 +224,7 @@ impl Shared {
     }
 
     /// Keeps a source shown alone (a projector of it) through reopens.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub(crate) fn keep_alone(&self, name: &str) {
         let mut seen = self.seen();
         if !seen.alone.iter().any(|n| n == name) {

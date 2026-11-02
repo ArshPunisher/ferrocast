@@ -297,6 +297,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             vec![opt("device", "Device", "list").choices(&l)]
         }
         "coreaudio_input_capture" => {
+            #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
             #[cfg(target_os = "macos")]
             list.extend(ferrocore::camera::microphones().into_iter().map(|d| (d.name, json!(d.id))));

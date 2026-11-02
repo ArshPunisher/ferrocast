@@ -1638,6 +1638,7 @@ impl Stage {
 
     /// Where "Hear it" plays: the system's default, then every output device by name.
     pub fn monitoring_devices(&self) -> Vec<(String, String)> {
+        #[allow(unused_mut)]
         let mut out = vec![("Default".to_string(), "default".to_string())];
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         out.extend(ferrocore::monitor::devices().into_iter().map(|n| (n.clone(), n)));
