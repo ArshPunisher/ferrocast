@@ -87,6 +87,8 @@ pub(crate) struct Studio {
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
+    /// The stream's health now (None while it isn't live) and its memory.
+    pub live_health: Mutex<(ferrocast_core::health::HealthMeter, Option<ferrocast_core::health::Health>)>,
     /// Auto quality's state for the stream now.
     pub auto_quality: Mutex<ferrocast_core::auto_quality::AutoQuality>,
     /// The scene on air while the Studio streams (a change is a chapter marker).

@@ -919,6 +919,25 @@ async fn a_clip_is_looked_at_in_batches_to_fill_the_frame() {
 }
 
 #[tokio::test]
+async fn the_streams_health_is_scored_while_live() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    // Not live yet: no score.
+    assert!(e.studio_stats().await.unwrap().get("health").is_none());
+    e.health_tick().await;
+    e.health_tick().await;
+    let h = e.studio_stats().await.unwrap()["health"].clone();
+    assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(100), Some("great")));
+    // 18 frames drawn late out of the 360 since the first look: 5% costs 20.
+    *studio.lagged.lock().unwrap() = 18;
+    e.health_tick().await;
+    let h = e.studio_stats().await.unwrap()["health"].clone();
+    assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(80), Some("good")));
+    assert!(h["reason"].as_str().unwrap().contains("late"));
+}
+
+#[tokio::test]
 async fn a_scene_change_while_live_is_a_chapter() {
     let (e, _d) = engine().await;
     go_live(&e).await;
@@ -1139,6 +1158,9 @@ struct FakeStudio {
     cam_black: Mutex<bool>,
     /// How many pictures each `focus` call got.
     focus_batches: Mutex<Vec<usize>>,
+    /// The engine's frames so far (each stats call is two seconds more), and those drawn late.
+    frames: Mutex<u64>,
+    lagged: Mutex<u64>,
 }
 
 #[async_trait]
@@ -1214,7 +1236,18 @@ impl crate::studio_host::StudioHost for FakeStudio {
         Ok(None)
     }
     async fn stats(&self) -> Result<Value, String> {
-        Ok(json!({ "disk_free_mb": 500_000.0, "replay": null }))
+        let frames = {
+            let mut f = self.frames.lock().unwrap();
+            *f += 120;
+            *f
+        };
+        let lagged = *self.lagged.lock().unwrap();
+        Ok(json!({
+            "disk_free_mb": 500_000.0,
+            "replay": null,
+            "engine": { "frames": frames, "lagged": lagged, "encoded": frames, "skipped": 0, "cpu": 20.0 },
+            "stream": { "frames": frames, "dropped": 0, "reconnecting": false },
+        }))
     }
     async fn record(&self, on: bool) -> Result<Value, String> {
         self.acts.lock().unwrap().push(format!("record {on}"));

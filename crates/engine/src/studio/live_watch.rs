@@ -35,11 +35,13 @@ impl Engine {
                     engine.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     was_live = live;
                 }
                 if live {
                     engine.scene_chapter_tick().await;
                     engine.auto_quality_tick().await;
+                    engine.health_tick().await;
                     engine.live_watch_tick().await;
                 }
             }
@@ -98,6 +100,31 @@ impl Engine {
             )
         };
         self.studio_frame("live_alert", &LiveAlert { id: "auto_quality".into(), level: "warn", message, cleared });
+    }
+
+    /// The stream's health: the engine's and the network's counters into the score.
+    pub(crate) async fn health_tick(&self) {
+        let Ok(host) = self.studio_host() else { return };
+        let Ok(v) = host.stats().await else { return };
+        let (e, s) = (&v["engine"], &v["stream"]);
+        let n = |x: &Value| x.as_u64().unwrap_or(0);
+        let (net_dropped, paused) = self.golive_trouble();
+        let sample = ferrocast_core::health::Sample {
+            frames: n(&e["frames"]),
+            lagged: n(&e["lagged"]),
+            encoded: n(&e["encoded"]),
+            skipped: n(&e["skipped"]),
+            sent: n(&s["frames"]),
+            dropped: n(&s["dropped"]),
+            net_dropped,
+            reconnecting: s["reconnecting"].as_bool() == Some(true),
+            paused,
+            quality_pct: self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct(),
+            cpu: e["cpu"].as_f64().unwrap_or(0.0),
+        };
+        let mut h = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner());
+        let now = h.0.push(sample);
+        h.1 = Some(now);
     }
 
     /// Auto quality turned off: a lowered stream goes back to full quality.
