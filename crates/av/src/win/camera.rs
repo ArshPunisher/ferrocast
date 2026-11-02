@@ -83,6 +83,16 @@ impl Capture {
     pub fn received(&self) -> u64 {
         self.live.as_ref().map_or(0, Live::frames)
     }
+
+    /// A camera sends all the time (a microphone here has no count to watch).
+    pub fn steady(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Why FFmpeg's camera ended, if it did.
+    pub fn ended(&self) -> Option<String> {
+        self.live.as_ref()?.ended()
+    }
 }
 
 #[cfg(test)]

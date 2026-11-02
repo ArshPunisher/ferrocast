@@ -320,6 +320,10 @@ pub struct Stats {
     /// How long the last frame took to make, and the longest so far, in ms.
     pub frame_ms: f32,
     pub worst_ms: f32,
+    /// Faults the loop caught and carried on from (a source's or a whole frame's).
+    pub recovered: u64,
+    /// Sources the watchdog started again (a camera that stopped sending, a capture that died).
+    pub restarts: u64,
 }
 
 /// Settings fixed for the engine's life.
@@ -367,6 +371,34 @@ struct Src {
     live: Live,
     /// The picture's size once there is one, and whether it's premultiplied.
     size: Option<(u32, u32, bool)>,
+    /// What it was started as, when the watchdog can start it again (captures).
+    kind: Option<SourceKind>,
+    watch: Watch,
+}
+
+impl Src {
+    fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
+        Src { live, size, kind, watch: Watch { since: now_ns(), ..Watch::default() } }
+    }
+}
+
+/// The watchdog's look at a capture: what it had received last, since when, and its tries.
+#[derive(Debug, Default)]
+struct Watch {
+    count: u64,
+    since: u64,
+    tries: u32,
+    next_try: u64,
+    /// It panicked in the loop (and was stopped there).
+    faulted: bool,
+}
+
+/// A camera or microphone with nothing new for this long has stopped.
+const STALL_NS: u64 = 5_000_000_000;
+
+/// The wait before try `n` at starting a source again: 2 s, doubling, a minute at most.
+fn backoff_ns(n: u32) -> u64 {
+    (2_000_000_000u64 << n.min(5)).min(60_000_000_000)
 }
 
 struct State {
@@ -457,6 +489,7 @@ pub struct Engine {
     text: Mutex<TextRenderer>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    watchdog: Option<JoinHandle<()>>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
     next_preview: std::sync::atomic::AtomicU64,
 }
@@ -518,6 +551,13 @@ impl Engine {
                 .spawn(move || run(config, &state, &gpu, &mixer, &stop))
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
+        let watchdog = {
+            let (state, stop) = (state.clone(), stop.clone());
+            std::thread::Builder::new()
+                .name("ferrocast-watchdog".into())
+                .spawn(move || watchdog(config, &state, &stop))
+                .ok()
+        };
         Ok(Self {
             config,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -528,6 +568,7 @@ impl Engine {
             text: Mutex::new(TextRenderer::new()),
             stop,
             thread: Some(thread),
+            watchdog,
             preview: Mutex::new(HashMap::new()),
             next_preview: std::sync::atomic::AtomicU64::new(1),
         })
@@ -543,6 +584,7 @@ impl Engine {
 
     /// Adds (or replaces) a source. Errors say what's wrong (a missing file, a camera in use).
     pub fn set_source(&self, id: u64, kind: SourceKind) -> Result<(), AvError> {
+        let restart = is_capture(&kind).then(|| kind.clone());
         let (live, picture) = match kind {
             SourceKind::Color { width, height, rgba } => {
                 (Live::Still, Some(Picture::solid(width.max(1), height.max(1), rgba)))
@@ -569,60 +611,22 @@ impl Engine {
                 )
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SourceKind::Screen { display, sound, hide } => {
-                let c = crate::screen::ScreenCapture::start_with(
-                    crate::screen::Target::Display(display),
-                    self.config.width,
-                    self.config.height,
-                    self.config.fps,
-                    true,
-                    sound,
-                    &hide,
-                )?;
-                if sound {
+            SourceKind::Screen { .. }
+            | SourceKind::Window(_)
+            | SourceKind::DesktopSound
+            | SourceKind::Camera(_)
+            | SourceKind::Microphone(_) => {
+                let live = open_capture(&self.config, &kind)
+                    .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
+                let heard = match &kind {
+                    SourceKind::Screen { sound, .. } => *sound,
+                    SourceKind::DesktopSound | SourceKind::Microphone(_) => true,
+                    _ => false,
+                };
+                if heard {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 }
-                (Live::Screen(c), None)
-            }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SourceKind::Window(window) => {
-                let c = crate::screen::ScreenCapture::start_with(
-                    crate::screen::Target::Window(window),
-                    self.config.width,
-                    self.config.height,
-                    self.config.fps,
-                    true,
-                    false,
-                    &[],
-                )?;
-                (Live::Screen(c), None)
-            }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SourceKind::DesktopSound => {
-                // ScreenCaptureKit gives the sound with a display's picture: the smallest, slowest one.
-                let display = crate::screen::shareable()?
-                    .0
-                    .first()
-                    .map(|d| d.id)
-                    .ok_or_else(|| AvError::Source("there's no display to take the Mac's sound with".into()))?;
-                let c = crate::screen::ScreenCapture::start_with(
-                    crate::screen::Target::Display(display),
-                    2,
-                    2,
-                    1,
-                    false,
-                    true,
-                    &[],
-                )?;
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
-                (Live::Screen(c), None)
-            }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SourceKind::Camera(dev) => (Live::Camera(crate::camera::Capture::camera(&dev)?), None),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SourceKind::Microphone(dev) => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
-                (Live::Microphone(crate::camera::Capture::microphone(&dev)?), None)
+                (live, None)
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             SourceKind::Media { path, looping } => {
@@ -645,7 +649,7 @@ impl Engine {
             }
             None => None,
         };
-        self.lock().sources.insert(id, Src { live, size });
+        self.lock().sources.insert(id, Src::new(live, size, restart));
         Ok(())
     }
 
@@ -913,7 +917,7 @@ impl Engine {
         }
         let now = now_ns();
         let mut st = self.lock();
-        st.sources.insert(STINGER, Src { live: Live::Media(m), size: None });
+        st.sources.insert(STINGER, Src::new(Live::Media(m), None, None));
         let from = st.on_air.replace(name.to_string()).unwrap_or_default();
         st.started.insert(name.to_string(), now + cut_ms * 1_000_000);
         st.moving = None;
@@ -1278,6 +1282,9 @@ impl Drop for Engine {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        if let Some(t) = self.watchdog.take() {
+            let _ = t.join();
+        }
         let ids: Vec<u64> = self.lock().outputs.iter().map(|(i, ..)| *i).collect();
         for id in ids {
             let _ = self.stop_output(id);
@@ -1598,7 +1605,7 @@ fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: 
 fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
     let frame_ns = 1_000_000_000 / u64::from(config.fps);
     let mut next = now_ns();
-    let rate = config.sample_rate;
+    let mut faults = 0u64;
     while !stop.load(Ordering::Acquire) {
         let now = now_ns();
         if now < next {
@@ -1611,184 +1618,372 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
         next = ts + frame_ns;
         let started = Instant::now();
 
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.stats.skipped += behind;
-        let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
-        // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
-        // rest still has its sound taken, so it doesn't pile up.
-        let heard = heard(&st);
-        // Sources: new pictures to the GPU, new sound to the mixer.
-        let mut uploads = Vec::new();
-        for (id, src) in st.sources.iter_mut() {
-            match &mut src.live {
-                Live::Still => {}
-                Live::Image { src: img, since, last } => {
-                    if img.animated() {
-                        let p = img.frame_at(since.elapsed());
-                        uploads.push((*id, p.clone()));
-                        *last = None;
-                    }
-                }
-                Live::Tone { hz, every_ns, beep_ns, pushed_to } => {
-                    // Beeps scheduled up to half a second ahead, on the frame clock.
-                    let mut at = pushed_to.unwrap_or(ts - ts % *every_ns);
-                    while at < ts + 500_000_000 {
-                        let n = (u128::from(*beep_ns) * u128::from(rate) / 1_000_000_000) as usize;
-                        let pcm: Vec<f32> = (0..n)
-                            .flat_map(|i| {
-                                let v = (i as f32 * *hz * std::f32::consts::TAU / rate as f32).sin() * 0.5;
-                                [v, v]
-                            })
-                            .collect();
-                        if heard.contains(id) {
-                            mx.push(*id, &pcm, 2, rate, at);
-                        }
-                        at += *every_ns;
-                    }
-                    *pushed_to = Some(at);
-                }
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                Live::Screen(cap) => {
-                    if let Some(p) = cap.take() {
-                        uploads.push((*id, p));
-                    }
-                    for (pcm, t) in cap.take_sound() {
-                        if heard.contains(id) {
-                            mx.push(*id, &pcm, 2, 48_000, t);
-                        }
-                    }
-                }
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                Live::Camera(cap) => {
-                    if let Some((p, _)) = cap.take_frame() {
-                        uploads.push((*id, p));
-                    }
-                }
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                Live::Microphone(cap) => {
-                    for (pcm, t) in cap.take_sound() {
-                        if heard.contains(id) {
-                            mx.push(*id, &pcm, 2, 48_000, t);
-                        }
-                    }
-                }
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                Live::Media(m) => {
-                    if let Some(p) = m.frame_at(ts) {
-                        uploads.push((*id, p));
-                    }
-                    for (pcm, t) in m.take_sound() {
-                        if heard.contains(id) {
-                            mx.push(*id, &pcm, 2, 48_000, t);
-                        }
-                    }
-                }
-                Live::Fed(feed) => {
-                    if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                        uploads.push((*id, p));
-                    }
-                    let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
-                    if heard.contains(id) {
-                        for (pcm, rate, t) in sound {
-                            mx.push(*id, &pcm, 2, rate, t);
-                        }
-                    }
-                }
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame(&config, state, gpu, mixer, ts, behind, started);
+        }));
+        if let Err(p) = ok {
+            // A fault in a frame is that frame lost, not the engine: the next one is drawn.
+            faults += 1;
+            if faults.is_power_of_two() {
+                tracing::error!(why = panic_text(&*p), faults, "the engine caught a fault in a frame and carried on");
             }
+            state.lock().unwrap_or_else(|e| e.into_inner()).stats.recovered += 1;
         }
-        for (id, p) in uploads {
-            if gpu.upload(id, &p).is_ok()
-                && let Some(s) = st.sources.get_mut(&id)
-            {
-                s.size = Some((p.width, p.height, p.premultiplied));
-            }
-        }
-        let blocks = mx.mix_until(now_ns());
-        drop(mx);
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Some(f) = &st.monitor {
-            for b in &blocks {
-                f.push(&b.monitor);
-            }
-        }
+    }
+}
 
+/// Sources the watchdog can start again: captures (a file or a picture doesn't stop by itself).
+fn is_capture(kind: &SourceKind) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if matches!(
+        kind,
+        SourceKind::Screen { .. }
+            | SourceKind::Window(_)
+            | SourceKind::DesktopSound
+            | SourceKind::Camera(_)
+            | SourceKind::Microphone(_)
+    ) {
+        return true;
+    }
+    let _ = kind;
+    false
+}
+
+/// Starts a capture (None: `kind` isn't one).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
+    use crate::screen::{ScreenCapture, Target};
+    Some(match kind {
+        SourceKind::Screen { display, sound, hide } => ScreenCapture::start_with(
+            Target::Display(*display),
+            config.width,
+            config.height,
+            config.fps,
+            true,
+            *sound,
+            hide,
+        )
+        .map(Live::Screen),
+        SourceKind::Window(window) => ScreenCapture::start_with(
+            Target::Window(*window),
+            config.width,
+            config.height,
+            config.fps,
+            true,
+            false,
+            &[],
+        )
+        .map(Live::Screen),
+        // ScreenCaptureKit gives the sound with a display's picture: the smallest, slowest one.
+        SourceKind::DesktopSound => crate::screen::shareable()
+            .and_then(|s| {
+                s.0.first()
+                    .map(|d| d.id)
+                    .ok_or_else(|| AvError::Source("there's no display to take the computer's sound with".into()))
+            })
+            .and_then(|d| ScreenCapture::start_with(Target::Display(d), 2, 2, 1, false, true, &[]))
+            .map(Live::Screen),
+        SourceKind::Camera(dev) => crate::camera::Capture::camera(dev).map(Live::Camera),
+        SourceKind::Microphone(dev) => crate::camera::Capture::microphone(dev).map(Live::Microphone),
+        _ => return None,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_capture(_: &EngineConfig, _: &SourceKind) -> Option<Result<Live, AvError>> {
+    None
+}
+
+/// What a capture has received so far, whether it should keep receiving (a camera or a
+/// microphone does; a screen only sends when something changes), and why it ended if it did.
+fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
+    match live {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if st.stinger.as_ref().is_some_and(|(.., end)| ts >= *end) {
-            st.stinger = None;
-            st.sources.remove(&STINGER);
-            gpu.forget(STINGER);
-            mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(STINGER);
-        }
-        if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
-            st.moving = None;
-        }
-        if !st.outputs.is_empty() {
-            // Each distinct canvas drawn once this frame (if it takes this one), then every output
-            // on it encodes the same pixels.
-            let index = st.stats.frames;
-            let mut drawn: Vec<(Canvas, Result<Nv12, String>)> = Vec::new();
-            for (.., canvas) in &st.outputs {
-                if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
-                    continue;
-                }
-                let (w, h) = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
-                let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts), canvas.scaled_from) {
-                    (d, None) => d,
-                    (Draw::Scene(s), Some((.., f))) => Draw::Scene(scaled(s, canvas.width, canvas.height, f)),
-                    (Draw::Moving(mut t), Some((.., f))) => {
-                        t.from = scaled(t.from, canvas.width, canvas.height, f);
-                        t.to = scaled(t.to, canvas.width, canvas.height, f);
-                        Draw::Moving(t)
-                    }
-                };
-                let frame = match draw {
-                    Draw::Scene(s) => gpu.render_nv12(&s),
-                    Draw::Moving(t) => gpu.render_transition_nv12(&t),
-                };
-                drawn.push((canvas.clone(), frame.map_err(|e| e.to_string())));
+        Live::Screen(c) => Some((c.frames(), false, c.ended())),
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
+        _ => None,
+    }
+}
+
+/// Why a capture should be started again now, if it should: it faulted, isn't running (a
+/// restart that failed), ended, or (one that sends all the time) has been quiet too long.
+fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>, now: u64) -> Option<String> {
+    if w.faulted {
+        return Some("it faulted".into());
+    }
+    if !running {
+        return Some("it didn't start again last time".into());
+    }
+    let (count, steady, ended) = signs?;
+    if count != w.count {
+        w.count = count;
+        w.since = now;
+        w.tries = 0;
+    }
+    ended.or_else(|| {
+        (steady && (count > 0 || w.tries > 0) && now.saturating_sub(w.since) > STALL_NS)
+            .then(|| "it stopped sending".into())
+    })
+}
+
+/// The watchdog: once a second it looks at every capture, and one that faulted, ended or
+/// went quiet is started again (waiting longer after each try that didn't hold).
+fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        for _ in 0..10 {
+            if stop.load(Ordering::Acquire) {
+                return;
             }
-            let mut failed = None;
-            for (_, pipe, kind, canvas) in st.outputs.iter_mut() {
-                let mut tags = Vec::new();
-                if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
-                    match frame {
-                        Ok(f) => {
-                            let w = canvas.width as usize;
-                            match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
-                                Ok(t) => tags = t,
-                                Err(e) => failed = Some(e.to_string()),
-                            }
-                        }
-                        Err(e) => failed = Some(e.clone()),
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let now = now_ns();
+        let mut todo = Vec::new();
+        {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            for (id, src) in st.sources.iter_mut() {
+                let Some(kind) = &src.kind else { continue };
+                let running = !matches!(src.live, Live::Still);
+                let w = &mut src.watch;
+                let why = look(w, running, signs(&src.live), now);
+                if let Some(why) = why
+                    && now >= w.next_try
+                {
+                    w.next_try = now + backoff_ns(w.tries);
+                    w.tries += 1;
+                    w.faulted = false;
+                    w.since = now;
+                    // Taken out now (a camera is let go before it's opened again), dropped
+                    // outside the lock.
+                    let old = std::mem::replace(&mut src.live, Live::Still);
+                    todo.push((*id, kind.clone(), why, old));
+                }
+            }
+        }
+        for (id, kind, why, old) in todo {
+            drop(old);
+            tracing::warn!(source = id, %why, "the watchdog starts a source again");
+            match open_capture(&config, &kind) {
+                Some(Ok(live)) => {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(src) = st.sources.get_mut(&id).filter(|s| s.kind.as_ref() == Some(&kind)) {
+                        src.live = live;
+                        src.watch.count = 0;
+                        src.watch.since = now_ns();
+                        st.stats.restarts += 1;
                     }
                 }
-                for b in &blocks {
-                    match pipe.audio(&b.tracks[canvas.track], b.ts_ns) {
-                        Ok(t) => tags.extend(t),
-                        Err(e) => failed = Some(e.to_string()),
+                Some(Err(e)) => {
+                    tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later")
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// What a panic said.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str)).unwrap_or("a fault")
+}
+
+/// One frame: sources taken in, sound mixed, each canvas drawn and its outputs fed.
+fn frame(
+    config: &EngineConfig,
+    state: &Mutex<State>,
+    gpu: &Compositor,
+    mixer: &Mutex<Mixer>,
+    ts: u64,
+    behind: u64,
+    started: Instant,
+) {
+    let rate = config.sample_rate;
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    st.stats.skipped += behind;
+    let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
+    // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
+    // rest still has its sound taken, so it doesn't pile up.
+    let heard = heard(&st);
+    // Sources: new pictures to the GPU, new sound to the mixer.
+    let mut uploads = Vec::new();
+    let mut st_recovered = 0;
+    for (id, src) in st.sources.iter_mut() {
+        let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut src.live {
+            Live::Still => {}
+            Live::Image { src: img, since, last } => {
+                if img.animated() {
+                    let p = img.frame_at(since.elapsed());
+                    uploads.push((*id, p.clone()));
+                    *last = None;
+                }
+            }
+            Live::Tone { hz, every_ns, beep_ns, pushed_to } => {
+                // Beeps scheduled up to half a second ahead, on the frame clock.
+                let mut at = pushed_to.unwrap_or(ts - ts % *every_ns);
+                while at < ts + 500_000_000 {
+                    let n = (u128::from(*beep_ns) * u128::from(rate) / 1_000_000_000) as usize;
+                    let pcm: Vec<f32> = (0..n)
+                        .flat_map(|i| {
+                            let v = (i as f32 * *hz * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                            [v, v]
+                        })
+                        .collect();
+                    if heard.contains(id) {
+                        mx.push(*id, &pcm, 2, rate, at);
                     }
-                    for (i, t) in canvas.more_tracks.iter().enumerate() {
-                        match pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
-                            Ok(t) => tags.extend(t),
+                    at += *every_ns;
+                }
+                *pushed_to = Some(at);
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Live::Screen(cap) => {
+                if let Some(p) = cap.take() {
+                    uploads.push((*id, p));
+                }
+                for (pcm, t) in cap.take_sound() {
+                    if heard.contains(id) {
+                        mx.push(*id, &pcm, 2, 48_000, t);
+                    }
+                }
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Live::Camera(cap) => {
+                if let Some((p, _)) = cap.take_frame() {
+                    uploads.push((*id, p));
+                }
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Live::Microphone(cap) => {
+                for (pcm, t) in cap.take_sound() {
+                    if heard.contains(id) {
+                        mx.push(*id, &pcm, 2, 48_000, t);
+                    }
+                }
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Live::Media(m) => {
+                if let Some(p) = m.frame_at(ts) {
+                    uploads.push((*id, p));
+                }
+                for (pcm, t) in m.take_sound() {
+                    if heard.contains(id) {
+                        mx.push(*id, &pcm, 2, 48_000, t);
+                    }
+                }
+            }
+            Live::Fed(feed) => {
+                if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    uploads.push((*id, p));
+                }
+                let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
+                if heard.contains(id) {
+                    for (pcm, rate, t) in sound {
+                        mx.push(*id, &pcm, 2, rate, t);
+                    }
+                }
+            }
+        }));
+        if let Err(p) = took {
+            // This source alone stops (its last picture stays); the watchdog starts a capture again.
+            tracing::error!(source = id, why = panic_text(&*p), "a source faulted: stopped");
+            src.live = Live::Still;
+            src.watch.faulted = true;
+            st_recovered += 1;
+        }
+    }
+    st.stats.recovered += st_recovered;
+    for (id, p) in uploads {
+        if gpu.upload(id, &p).is_ok()
+            && let Some(s) = st.sources.get_mut(&id)
+        {
+            s.size = Some((p.width, p.height, p.premultiplied));
+        }
+    }
+    let blocks = mx.mix_until(now_ns());
+    drop(mx);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(f) = &st.monitor {
+        for b in &blocks {
+            f.push(&b.monitor);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if st.stinger.as_ref().is_some_and(|(.., end)| ts >= *end) {
+        st.stinger = None;
+        st.sources.remove(&STINGER);
+        gpu.forget(STINGER);
+        mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(STINGER);
+    }
+    if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
+        st.moving = None;
+    }
+    if !st.outputs.is_empty() {
+        // Each distinct canvas drawn once this frame (if it takes this one), then every output
+        // on it encodes the same pixels.
+        let index = st.stats.frames;
+        let mut drawn: Vec<(Canvas, Result<Nv12, String>)> = Vec::new();
+        for (.., canvas) in &st.outputs {
+            if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
+                continue;
+            }
+            let (w, h) = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
+            let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts), canvas.scaled_from) {
+                (d, None) => d,
+                (Draw::Scene(s), Some((.., f))) => Draw::Scene(scaled(s, canvas.width, canvas.height, f)),
+                (Draw::Moving(mut t), Some((.., f))) => {
+                    t.from = scaled(t.from, canvas.width, canvas.height, f);
+                    t.to = scaled(t.to, canvas.width, canvas.height, f);
+                    Draw::Moving(t)
+                }
+            };
+            let frame = match draw {
+                Draw::Scene(s) => gpu.render_nv12(&s),
+                Draw::Moving(t) => gpu.render_transition_nv12(&t),
+            };
+            drawn.push((canvas.clone(), frame.map_err(|e| e.to_string())));
+        }
+        let mut failed = None;
+        for (_, pipe, kind, canvas) in st.outputs.iter_mut() {
+            let mut tags = Vec::new();
+            if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
+                match frame {
+                    Ok(f) => {
+                        let w = canvas.width as usize;
+                        match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
+                            Ok(t) => tags = t,
                             Err(e) => failed = Some(e.to_string()),
                         }
                     }
+                    Err(e) => failed = Some(e.clone()),
                 }
-                if let OutputKind::Stream(send) = kind {
-                    for t in tags {
-                        send(t);
+            }
+            for b in &blocks {
+                match pipe.audio(&b.tracks[canvas.track], b.ts_ns) {
+                    Ok(t) => tags.extend(t),
+                    Err(e) => failed = Some(e.to_string()),
+                }
+                for (i, t) in canvas.more_tracks.iter().enumerate() {
+                    match pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
+                        Ok(t) => tags.extend(t),
+                        Err(e) => failed = Some(e.to_string()),
                     }
                 }
             }
-            if failed.is_some() {
-                st.error = failed;
+            if let OutputKind::Stream(send) = kind {
+                for t in tags {
+                    send(t);
+                }
             }
         }
-        let ms = started.elapsed().as_secs_f32() * 1000.0;
-        st.stats.frames += 1;
-        st.stats.frame_ms = ms;
-        st.stats.worst_ms = st.stats.worst_ms.max(ms);
+        if failed.is_some() {
+            st.error = failed;
+        }
     }
+    let ms = started.elapsed().as_secs_f32() * 1000.0;
+    st.stats.frames += 1;
+    st.stats.frame_ms = ms;
+    st.stats.worst_ms = st.stats.worst_ms.max(ms);
 }
 
 #[cfg(test)]
@@ -1812,6 +2007,41 @@ mod tests {
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
+    }
+
+    #[test]
+    fn the_watchdog_starts_stuck_captures_again() {
+        let s = 1_000_000_000;
+        let mut w = Watch { since: 0, ..Watch::default() };
+        // A camera sending: nothing to do; quiet 5 s: started again.
+        assert_eq!(look(&mut w, true, Some((30, true, None)), s), None);
+        assert_eq!(look(&mut w, true, Some((30, true, None)), 5 * s), None);
+        assert!(look(&mut w, true, Some((30, true, None)), 7 * s).is_some());
+        // A screen sends only on change: quiet isn't stuck; ended is.
+        let mut w = Watch::default();
+        assert_eq!(look(&mut w, true, Some((3, false, None)), 60 * s), None);
+        assert!(look(&mut w, true, Some((3, false, Some("closed".into()))), 61 * s).is_some());
+        // Faulted, or a restart that didn't take: at once.
+        assert!(look(&mut Watch { faulted: true, ..Watch::default() }, true, None, 0).is_some());
+        assert!(look(&mut Watch::default(), false, None, 0).is_some());
+        // A camera that never sent isn't stuck (it may be warming up)…
+        let mut w = Watch::default();
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 60 * s), None);
+        // …unless it's one the watchdog restarted; sending again resets the tries.
+        w.tries = 2;
+        assert!(look(&mut w, true, Some((0, true, None)), 60 * s).is_some());
+        assert_eq!(look(&mut w, true, Some((5, true, None)), 61 * s), None);
+        assert_eq!(w.tries, 0);
+        // Tries wait 2, 4, 8… seconds, a minute at most.
+        assert_eq!((backoff_ns(0), backoff_ns(2), backoff_ns(9)), (2 * s, 8 * s, 60 * s));
+    }
+
+    #[test]
+    fn a_fault_is_named() {
+        let p = std::panic::catch_unwind(|| panic!("boom {}", 1)).unwrap_err();
+        assert_eq!(panic_text(&*p), "boom 1");
+        let p = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
+        assert_eq!(panic_text(&*p), "a fault");
     }
 
     #[test]

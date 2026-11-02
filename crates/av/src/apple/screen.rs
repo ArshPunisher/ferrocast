@@ -448,6 +448,11 @@ impl ScreenCapture {
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
+
+    /// Why it ended, if it did (ScreenCaptureKit's stream doesn't end by itself here).
+    pub fn ended(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Looks twice a second for apps `hide` names that started (or ended) since, and gives the

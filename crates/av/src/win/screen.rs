@@ -236,4 +236,9 @@ impl ScreenCapture {
     pub fn frames(&self) -> u64 {
         self.live.as_ref().map_or(0, Live::frames)
     }
+
+    /// Why FFmpeg's capture ended, if it did.
+    pub fn ended(&self) -> Option<String> {
+        self.live.as_ref()?.ended()
+    }
 }

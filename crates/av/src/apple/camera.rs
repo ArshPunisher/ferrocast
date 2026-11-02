@@ -248,6 +248,16 @@ impl Capture {
     pub fn received(&self) -> u64 {
         self.shared.count.load(Ordering::Relaxed)
     }
+
+    /// A camera or microphone sends all the time: quiet for long means it stopped.
+    pub fn steady(&self) -> bool {
+        true
+    }
+
+    /// Why it ended, if it did (AVFoundation's session keeps running; a stall shows instead).
+    pub fn ended(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Drop for Capture {
