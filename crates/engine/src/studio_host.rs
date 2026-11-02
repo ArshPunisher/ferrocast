@@ -224,6 +224,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Sends what's on air out as the NDI source `name`, or stops → `{ active, name }`.
+    async fn ndi_output(&self, _on: bool, _name: Option<String>) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Starts a new file of the recording now (OBS's Split recording).
     async fn record_split(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -2023,6 +2027,14 @@ impl Engine {
             check_source_name(s)?;
         }
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
+    }
+
+    /// NDI output: what's on air sent on the network as `name` (default "Ferrocast"), or stopped.
+    pub async fn studio_ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, EngineError> {
+        if let Some(n) = &name {
+            check_source_name(n)?;
+        }
+        self.studio_host()?.ndi_output(on, name).await.map_err(failed)
     }
 
     /// Searches a folder for the missing files (by file name).

@@ -54,6 +54,8 @@ struct Held {
     guests: Vec<(String, String, ferrocast_guest::Guest)>,
     replay: Option<ferrocast_studio::stage::StageOutput>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
+    /// What's on air sent out as NDI.
+    ndi: Option<ferrocast_studio::NdiOut>,
     settings: Option<StudioSettings>,
     renderer: &'static str,
     /// The item outlined in the preview (scene, id), kept when the preview is made again.
@@ -339,6 +341,9 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     h.vertical.view = None;
     h.vstream = None;
     h.captions = None;
+    // NDI and the virtual camera send the old collection's picture: they stop with it.
+    h.ndi = None;
+    h.virtualcam = None;
     // Put the following item back first, so neither collection is saved slid sideways.
     if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
         c.stop_follow(&f);
@@ -1365,6 +1370,7 @@ impl StudioHost for DesktopStudio {
             h.source_records.clear();
             h.replay = None;
             h.virtualcam = None;
+            h.ndi = None;
             h.preview = None;
             h.preview_at = None;
             h.program_view = None;
@@ -1633,6 +1639,9 @@ impl StudioHost for DesktopStudio {
                         // let go of the old engine first.
                         let (pv, pg, vv) = (h.preview.take(), h.program_view.take(), h.vertical.view.take());
                         h.projectors.clear();
+                        // They send the old engine's picture: stopped (turned on again by hand).
+                        h.ndi = None;
+                        h.virtualcam = None;
                         let c = h.collection.as_mut().ok_or(STOPPED)?;
                         if let Err(e) = c.set_canvas(canvas) {
                             drop((pv, pg, vv));
@@ -1730,6 +1739,7 @@ impl StudioHost for DesktopStudio {
                     "error": r.last_error(),
                 })),
                 "virtualcam": h.virtualcam.as_ref().map(|c| json!({ "active": c.active() })),
+                "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "name": n.name() })),
                 // Captures on air that show nothing (the black screen fixer).
                 "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
@@ -1998,6 +2008,21 @@ impl StudioHost for DesktopStudio {
                         .into(),
                 )
             }
+        })
+        .await?
+    }
+
+    async fn ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, String> {
+        self.on_main(move |h| {
+            h.ndi = None;
+            if !on {
+                return Ok(json!({ "active": false, "name": null }));
+            }
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let name = name.unwrap_or_else(|| "Ferrocast".into());
+            let out = c.ndi_output(&name).map_err(|e| e.to_string())?;
+            h.ndi = Some(out);
+            Ok(json!({ "active": true, "name": name }))
         })
         .await?
     }

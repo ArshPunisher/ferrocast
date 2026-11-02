@@ -136,6 +136,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
+        .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
@@ -1317,6 +1318,20 @@ struct CameraBody {
 /// `POST /studio/engine/virtualcam` `{ on, source? }` → `{ active }`.
 async fn engine_virtual_camera(State(app): State<AppState>, Body(b): Body<CameraBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_virtual_camera(b.on, b.source).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NdiBody {
+    on: bool,
+    /// The name it's sent under (default "Ferrocast").
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /studio/engine/ndi` `{ on, name? }` → `{ active, name }`.
+async fn engine_ndi_output(State(app): State<AppState>, Body(b): Body<NdiBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_ndi_output(b.on, b.name).await?))
 }
 
 /// `POST /studio/engine/record/split`: the recording goes on in a new file.
