@@ -31,7 +31,7 @@ use crate::{AvError, Picture};
 /// What the frames leave for the engine.
 #[derive(Debug, Default)]
 struct Shared {
-    latest: Mutex<Option<Picture>>,
+    latest: Mutex<Option<Surface>>,
     frames: AtomicU64,
     /// The window closed (or the display went).
     closed: AtomicBool,
@@ -46,6 +46,8 @@ struct Reader {
     max: (u32, u32),
     every: Duration,
     last: Option<Instant>,
+    /// Pixel buffers handed back by the engine, used again (no 8 MB of fresh memory a frame).
+    spare: Spare,
 }
 
 /// The WinRT device the pool is recreated with on its own thread.
@@ -190,6 +192,7 @@ impl Wgc {
             max: (max.0.max(16), max.1.max(16)),
             every: Duration::from_secs_f64(1.0 / f64::from(fps.clamp(1, 240))),
             last: None,
+            spare: Spare::default(),
         });
         let pool_size = Mutex::new(size);
         let (s, dev) = (shared.clone(), PoolDevice(device.clone()));
@@ -236,8 +239,13 @@ impl Wgc {
         Ok(Wgc { session, pool, token, shared })
     }
 
-    /// The newest picture (taken).
+    /// The newest picture (taken), as RGBA: a copy (the engine uses `take_surface`).
     pub fn take(&self) -> Option<Picture> {
+        self.take_surface().map(|s| s.to_picture())
+    }
+
+    /// The newest frame as BGRA, for sending to the card as it is (taken).
+    pub fn take_surface(&self) -> Option<Surface> {
         self.shared.latest.lock().ok()?.take()
     }
 
@@ -267,9 +275,10 @@ fn texture_height(t: &ID3D11Texture2D) -> u32 {
 }
 
 impl Reader {
-    /// The texture's top-left `w`×`h` as a picture, fitted into `max` (nearest pixel when it's
-    /// bigger: only what's kept is read).
-    fn read(&mut self, texture: &ID3D11Texture2D, w: u32, h: u32) -> windows::core::Result<Option<Picture>> {
+    /// The texture's top-left `w`×`h` as BGRA, fitted into `max` (nearest pixel when it's
+    /// bigger: only what's kept is read). Opaque: a window's empty corners would otherwise show
+    /// through (Windows leaves their alpha 0).
+    fn read(&mut self, texture: &ID3D11Texture2D, w: u32, h: u32) -> windows::core::Result<Option<Surface>> {
         let full = desc(texture);
         if self.staging.as_ref().is_none_or(|(_, sw, sh)| (*sw, *sh) != (full.Width, full.Height)) {
             let d = D3D11_TEXTURE2D_DESC {
@@ -294,29 +303,101 @@ impl Reader {
             self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         }
         let (ow, oh) = crate::ffsrc::fit((w, h), self.max);
-        let mut rgba = vec![0u8; ow as usize * oh as usize * 4];
+        let mut bgra = self.spare.get(ow as usize * oh as usize * 4);
         let pitch = mapped.RowPitch as usize;
         let base = mapped.pData as *const u8;
+        let out_row = ow as usize * 4;
         // Which source column each output column reads, worked out once a frame (not per pixel).
-        let cols: Vec<usize> = (0..ow as usize).map(|x| x * w as usize / ow as usize * 4).collect();
+        let cols: Vec<usize> =
+            if ow == w { Vec::new() } else { (0..ow as usize).map(|x| x * w as usize / ow as usize * 4).collect() };
         for y in 0..oh as usize {
             let sy = y * h as usize / oh as usize;
             // SAFETY: row `sy` < the texture's height, inside the mapped data (RowPitch apart).
             let row = unsafe { std::slice::from_raw_parts(base.add(sy * pitch), w as usize * 4) };
-            let out = &mut rgba[y * ow as usize * 4..(y + 1) * ow as usize * 4];
+            let out = &mut bgra[y * out_row..(y + 1) * out_row];
             if ow == w {
-                // Same size: a straight swap of blue and red, which the compiler vectorises.
-                bgra_to_rgba(row, out);
+                out.copy_from_slice(row);
             } else {
                 for (o, &sx) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
-                    // BGRA in, RGBA out; Windows' desktop is opaque.
-                    *o = [row[sx + 2], row[sx + 1], row[sx], 255];
+                    o.copy_from_slice(&row[sx..sx + 4]);
                 }
             }
+            opaque(out);
         }
         // SAFETY: the map made above.
         unsafe { self.context.Unmap(staging, 0) };
-        Ok(Some(Picture { width: ow, height: oh, rgba, premultiplied: false }))
+        Ok(Some(Surface { bytes: bgra, width: ow, height: oh, spare: self.spare.clone() }))
+    }
+}
+
+/// Buffers going round between the capture and the engine.
+#[derive(Debug, Default, Clone)]
+struct Spare(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl Spare {
+    /// A buffer of `len` bytes (its old contents are all written over).
+    fn get(&self, len: usize) -> Vec<u8> {
+        let mut free = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match free.iter().position(|b| b.len() == len) {
+            Some(i) => free.swap_remove(i),
+            None => {
+                // Another size (the window was resized): the old ones are let go.
+                free.clear();
+                vec![0; len]
+            }
+        }
+    }
+
+    fn give(&self, b: Vec<u8>) {
+        let mut free = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if free.len() < 3 {
+            free.push(b);
+        }
+    }
+}
+
+/// A frame of the screen as BGRA rows (opaque), handed back for reuse when dropped.
+pub struct Surface {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    spare: Spare,
+}
+
+impl std::fmt::Debug for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Surface({}x{})", self.width, self.height)
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        self.spare.give(std::mem::take(&mut self.bytes));
+    }
+}
+
+impl Surface {
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Its bytes (BGRA, `stride` bytes a row), as the Mac's surface gives them.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        Some(f(&self.bytes, self.width as usize * 4))
+    }
+
+    /// As an RGBA picture (a copy).
+    pub fn to_picture(&self) -> Picture {
+        let mut rgba = vec![0u8; self.bytes.len()];
+        bgra_to_rgba(&self.bytes, &mut rgba);
+        Picture { width: self.width, height: self.height, rgba, premultiplied: false }
+    }
+}
+
+/// Every pixel's alpha set full (BGRA rows).
+fn opaque(row: &mut [u8]) {
+    for px in row.as_chunks_mut::<4>().0 {
+        px[3] = 255;
     }
 }
 
@@ -329,6 +410,19 @@ fn bgra_to_rgba(src: &[u8], out: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rows_become_opaque_and_buffers_go_round() {
+        let mut row = [1, 2, 3, 0, 10, 20, 30, 7];
+        super::opaque(&mut row);
+        assert_eq!(row, [1, 2, 3, 255, 10, 20, 30, 255]);
+        let spare = super::Spare::default();
+        let b = spare.get(16);
+        let p = b.as_ptr();
+        spare.give(b);
+        assert_eq!(spare.get(16).as_ptr(), p, "the same buffer again");
+        assert_eq!(spare.get(8).len(), 8, "another size: a new one");
+    }
+
     #[test]
     fn a_row_turns_from_bgra_to_opaque_rgba() {
         let mut out = [0u8; 8];

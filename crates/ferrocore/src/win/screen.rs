@@ -14,6 +14,9 @@ use crate::ffsrc::Live;
 use crate::sound_in::{SoundIn, Which};
 use crate::{AvError, Picture};
 
+/// A frame of the screen as BGRA, sent to the card without a colour swap.
+pub use super::wgc::Surface;
+
 /// A display that can be captured (`id`: its place in Windows' list).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Display {
@@ -276,6 +279,14 @@ impl ScreenCapture {
         match self.live.as_ref()? {
             Pictures::Native(w) => w.take(),
             Pictures::Ffmpeg(l) => l.take().map(|(p, _)| p),
+        }
+    }
+
+    /// The newest frame of Windows' own capture as BGRA (taken); None from FFmpeg's (`take`).
+    pub fn take_surface(&self) -> Option<Surface> {
+        match self.live.as_ref()? {
+            Pictures::Native(w) => w.take_surface(),
+            Pictures::Ffmpeg(_) => None,
         }
     }
 

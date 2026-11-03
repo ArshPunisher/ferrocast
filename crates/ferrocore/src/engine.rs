@@ -412,7 +412,7 @@ struct Src {
 /// system holds it, which goes up without a copy of ours.
 enum Fresh {
     Pic(Picture),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Screen(crate::screen::Surface),
 }
 
@@ -421,7 +421,7 @@ impl Fresh {
     fn info(&self) -> (u32, u32, bool) {
         match self {
             Fresh::Pic(p) => (p.width, p.height, p.premultiplied),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Fresh::Screen(s) => (s.size().0, s.size().1, true),
         }
     }
@@ -430,7 +430,7 @@ impl Fresh {
     fn send(&self, gpu: &Compositor, id: u64) -> bool {
         match self {
             Fresh::Pic(p) => gpu.upload(id, p).is_ok(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Fresh::Screen(s) => gpu.upload_surface(id, s).is_ok(),
         }
     }
@@ -2108,7 +2108,14 @@ fn frame(
                 if let Some(s) = cap.take_surface() {
                     uploads.push((*id, Fresh::Screen(s)));
                 }
-                #[cfg(not(target_os = "macos"))]
+                // Windows' own capture hands BGRA over as it is; FFmpeg's gives pictures.
+                #[cfg(target_os = "windows")]
+                if let Some(s) = cap.take_surface() {
+                    uploads.push((*id, Fresh::Screen(s)));
+                } else if let Some(p) = cap.take() {
+                    uploads.push((*id, Fresh::Pic(p)));
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 if let Some(p) = cap.take() {
                     uploads.push((*id, Fresh::Pic(p)));
                 }

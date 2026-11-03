@@ -1224,7 +1224,7 @@ impl Compositor {
     /// A frame of the screen as the system holds it (BGRA, colours multiplied by alpha), sent to
     /// the card with one copy, into a buffer kept between frames: no RGBA copy of ours, no colour
     /// swap on the CPU (the card reads BGRA as RGBA).
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn upload_surface(&self, id: u64, s: &crate::screen::Surface) -> Result<(), AvError> {
         let (w, h) = s.size();
         check_size(w, h)?;
