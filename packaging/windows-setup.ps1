@@ -15,7 +15,12 @@ function Run($exe, [string[]]$argv) {
   $p = Start-Process -FilePath $exe -ArgumentList $argv -Wait -PassThru -NoNewWindow
   return $p.ExitCode
 }
-function Fail($msg) { Write-Host "::error::$msg"; exit 1 }
+function Fail($msg) {
+  Write-Host '--- %TEMP%\ferrocast-setup.log ---'
+  Get-Content "$env:TEMP\ferrocast-setup.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+  Write-Host "::error::$msg"
+  exit 1
+}
 
 $nsis = Get-ChildItem "$Bundle/nsis/*-setup.exe" | Select-Object -First 1
 if (-not $nsis) { Fail "no NSIS installer in $Bundle/nsis" }

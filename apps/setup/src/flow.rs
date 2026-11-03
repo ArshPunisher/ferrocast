@@ -107,16 +107,15 @@ pub fn ours_or_empty(dir: &Path, main: &str) -> bool {
     }
 }
 
-/// Renames, trying again for a moment: antivirus scanners often hold a fresh file briefly.
+/// Renames, trying again for up to 15 seconds: antivirus scanners (Defender) hold a freshly
+/// written program while they scan it, which blocks moving its folder.
 fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    let mut tries = 0;
+    let until = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
-            Err(e) if tries < 20 && e.kind() != io::ErrorKind::NotFound => {
-                tries += 1;
-                std::thread::sleep(Duration::from_millis(150));
-                let _ = e;
+            Err(e) if e.kind() != io::ErrorKind::NotFound && std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(250));
             }
             Err(e) => return Err(e),
         }
