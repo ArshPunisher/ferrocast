@@ -60,8 +60,9 @@ pub enum SourceKind {
         app: String,
         sound: bool,
     },
-    /// One app's sound alone (macOS, OBS's Application Audio Capture).
-    #[cfg(target_os = "macos")]
+    /// One app's sound alone (OBS's Application Audio Capture): its bundle id on a Mac, its
+    /// program's name ("chrome") on Windows.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     AppSound(String),
     /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -679,6 +680,13 @@ impl Engine {
                 if matches!(kind, SourceKind::App { sound: true, .. } | SourceKind::AppSound(_)) {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 }
+                (live, None)
+            }
+            #[cfg(target_os = "windows")]
+            SourceKind::AppSound(_) => {
+                let live = open_capture(&self.config, &kind)
+                    .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 (live, None)
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -1866,6 +1874,10 @@ fn is_capture(kind: &SourceKind) -> bool {
     if matches!(kind, SourceKind::App { .. } | SourceKind::AppSound(_)) {
         return true;
     }
+    #[cfg(target_os = "windows")]
+    if matches!(kind, SourceKind::AppSound(_)) {
+        return true;
+    }
     let _ = kind;
     false
 }
@@ -1885,15 +1897,15 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             hide,
         )
         .map(Live::Screen),
-        // On a Mac the window's app's sound comes with it (ScreenCaptureKit filters it to the
-        // window); elsewhere a capture's sound is the whole computer's, so none.
+        // The window's app's sound comes with it (ScreenCaptureKit filters it to the window on
+        // a Mac, WASAPI's process loopback hears its app on Windows); none on Linux.
         SourceKind::Window(window) => ScreenCapture::start_with(
             Target::Window(*window),
             config.width,
             config.height,
             config.fps,
             true,
-            cfg!(target_os = "macos"),
+            cfg!(any(target_os = "macos", target_os = "windows")),
             &[],
         )
         .map(Live::Screen),
@@ -1926,6 +1938,8 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             })
             .and_then(|d| ScreenCapture::start_app(d, app, 2, 2, 1, false, true))
             .map(Live::Screen),
+        #[cfg(target_os = "windows")]
+        SourceKind::AppSound(app) => ScreenCapture::start_app_sound(app).map(Live::Screen),
         SourceKind::Camera(dev) => crate::camera::Capture::camera(dev).map(Live::Camera),
         SourceKind::Microphone(dev) => crate::camera::Capture::microphone(dev).map(Live::Microphone),
         _ => return None,

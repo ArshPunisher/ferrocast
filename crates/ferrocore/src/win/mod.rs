@@ -5,6 +5,7 @@
 
 #![allow(unsafe_code)]
 
+pub mod app_sound;
 pub mod camera;
 pub mod screen;
 pub mod wgc;

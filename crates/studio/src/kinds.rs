@@ -39,6 +39,7 @@ pub fn kinds() -> Kinds {
             kind("dshow_input", "Video Capture Device"),
             kind("wasapi_input_capture", "Audio Input Capture"),
             kind("wasapi_output_capture", "Audio Output Capture"),
+            kind("wasapi_process_output_capture", "Application Audio Capture"),
         ]);
     }
     if cfg!(target_os = "linux") {
@@ -370,6 +371,19 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
         }
         "pulse_output_capture" => vec![opt("device_id", "Device", "list").choices(&[("Default", json!("default"))])],
+        "wasapi_process_output_capture" => {
+            // OBS's value: "title:class:program.exe" (only the program is read here).
+            #[allow(unused_mut)]
+            let mut w: Vec<(String, Value)> = Vec::new();
+            #[cfg(target_os = "windows")]
+            if let Ok((_, windows)) = ferrocore::screen::shareable() {
+                w.extend(windows.iter().filter(|x| !x.app.is_empty()).map(|x| {
+                    let value = format!("{}::{}.exe", x.title.replace(':', "#3A"), x.app);
+                    (format!("[{}.exe]: {}", x.app, x.title), json!(value))
+                }));
+            }
+            vec![opt("window", "Window", "list").choices(&as_refs(&w))]
+        }
         "wasapi_input_capture" => {
             #[allow(unused_mut)]
             let mut list: Vec<(String, Value)> = vec![("Default".into(), json!("default"))];
@@ -598,6 +612,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "window_capture" => json!({ "cursor": true }),
         "dshow_input" => json!({ "video_device_id": "" }),
         "wasapi_input_capture" | "wasapi_output_capture" => json!({ "device_id": "default" }),
+        "wasapi_process_output_capture" => json!({ "window": "" }),
         "xshm_input" => json!({ "screen": 0, "show_cursor": true }),
         "v4l2_input" => json!({ "device_id": "" }),
         "pulse_input_capture" | "pulse_output_capture" => json!({ "device_id": "default" }),

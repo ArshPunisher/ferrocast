@@ -27,6 +27,9 @@ pub enum Which {
     Input(Option<String>),
     /// What the computer plays (Windows: the default speakers, as WASAPI loopback).
     Loopback,
+    /// One app's sound, by its process id (its child processes too).
+    #[cfg(target_os = "windows")]
+    Process(u32),
 }
 
 /// Microphones and other inputs connected now, by name.
@@ -111,6 +114,17 @@ impl SoundIn {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (s, st) = (sound.clone(), stop.clone());
+        #[cfg(target_os = "windows")]
+        if let Which::Process(pid) = which {
+            let thread = std::thread::Builder::new()
+                .name("ferrocast-app-sound".into())
+                .spawn(move || {
+                    let mut conv = Convert::new(2, RATE);
+                    crate::win::app_sound::run(pid, st, ready_tx, |data| keep(&s, conv.push(data)));
+                })
+                .map_err(|e| AvError::Source(e.to_string()))?;
+            return Self::started(sound, stop, thread, ready_rx);
+        }
         let thread = std::thread::Builder::new()
             .name("ferrocast-sound-in".into())
             .spawn(move || {
@@ -132,7 +146,17 @@ impl SoundIn {
                 drop(stream);
             })
             .map_err(|e| AvError::Source(e.to_string()))?;
-        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Self::started(sound, stop, thread, ready_rx)
+    }
+
+    /// Waits for the thread to say whether its sound opened.
+    fn started(
+        sound: Pieces,
+        stop: Arc<AtomicBool>,
+        thread: JoinHandle<()>,
+        ready_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    ) -> Result<Self, AvError> {
+        match ready_rx.recv_timeout(Duration::from_secs(8)) {
             Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread) }),
             Ok(Err(e)) => Err(AvError::Source(e)),
             Err(_) => {
@@ -146,6 +170,22 @@ impl SoundIn {
     /// Sound since the last call, oldest first: 48 kHz stereo.
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
         self.sound.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+    }
+}
+
+/// Finished pieces into `sound`, stamped now (the oldest let go past about 5 s).
+fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
+    if pieces.is_empty() {
+        return;
+    }
+    let now = now_ns();
+    if let Ok(mut q) = sound.lock() {
+        for p in pieces {
+            q.push_back((p, now));
+        }
+        while q.len() > MAX_PIECES {
+            q.pop_front();
+        }
     }
 }
 
@@ -163,28 +203,16 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
             .ok()
             .and_then(|mut ds| ds.find(|d| d.description().is_ok_and(|x| x.to_string() == *name)))
             .ok_or_else(|| format!("the microphone \"{name}\" isn't connected"))?,
+        #[cfg(target_os = "windows")]
+        Which::Process(_) => return Err("one app's sound doesn't come through cpal".into()),
     };
     let cfg = match which {
         Which::Loopback => dev.default_output_config(),
-        Which::Input(_) => dev.default_input_config(),
+        _ => dev.default_input_config(),
     }
     .map_err(|e| format!("its format couldn't be read ({e})"))?;
     let mut conv = Convert::new(usize::from(cfg.channels()), cfg.sample_rate());
-    let mut keep = move |data: &[f32]| {
-        let now = now_ns();
-        let pieces = conv.push(data);
-        if pieces.is_empty() {
-            return;
-        }
-        if let Ok(mut q) = sound.lock() {
-            for p in pieces {
-                q.push_back((p, now));
-            }
-            while q.len() > MAX_PIECES {
-                q.pop_front();
-            }
-        }
-    };
+    let mut keep = move |data: &[f32]| keep(&sound, conv.push(data));
     let err = |e: cpal::Error| tracing::warn!(%e, "a sound input stopped");
     let config = cfg.config();
     match cfg.sample_format() {

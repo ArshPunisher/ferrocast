@@ -172,7 +172,19 @@ impl ScreenCapture {
         if !hide.is_empty() {
             tracing::info!("the privacy guard leaves apps out on a Mac only: on Windows the whole screen shows");
         }
-        let sound = if sound { Some(SoundIn::start(Which::Loopback)?) } else { None };
+        // A window's sound is its app's own (OBS's "Capture Audio"); a display's is everything.
+        // An app's sound that can't be had (older Windows) leaves the picture without it.
+        let sound = match (sound, target) {
+            (false, _) => None,
+            (true, Target::Window(id)) => match SoundIn::start(Which::Process(super::app_sound::process_of(id))) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the window's sound can't be heard");
+                    None
+                }
+            },
+            (true, Target::Display(_)) => Some(SoundIn::start(Which::Loopback)?),
+        };
         if width <= 2 && height <= 2 {
             return Ok(ScreenCapture { live: None, sound });
         }
@@ -246,6 +258,17 @@ impl ScreenCapture {
             }
         };
         Ok(ScreenCapture { live: Some(Pictures::Ffmpeg(live)), sound })
+    }
+
+    /// One app's sound only (OBS's Application Audio Capture), by its program's name ("chrome"):
+    /// the first open window's process of that program, with its child processes.
+    pub fn start_app_sound(app: &str) -> Result<Self, AvError> {
+        let w = windows()
+            .into_iter()
+            .find(|w| w.app.eq_ignore_ascii_case(app))
+            .ok_or_else(|| AvError::Source(format!("{app} has no window open")))?;
+        let sound = SoundIn::start(Which::Process(super::app_sound::process_of(w.id)))?;
+        Ok(ScreenCapture { live: None, sound: Some(sound) })
     }
 
     /// The newest frame (taken).

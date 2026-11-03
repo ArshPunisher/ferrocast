@@ -503,7 +503,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 _ => None,
             };
             match w {
-                Some(w) => (SourceKind::Window(w), false),
+                // With its app's sound, as on a Mac (muted or turned down in the mixer).
+                Some(w) => (SourceKind::Window(w), true),
                 None => return Err("a window capture whose window isn't open".into()),
             }
         }
@@ -512,7 +513,15 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         #[cfg(target_os = "windows")]
         "wasapi_output_capture" | "wasapi_process_output_capture" => {
             if id == "wasapi_process_output_capture" {
-                return Err("one app's sound (Application Audio Capture)".into());
+                // OBS keeps the window as "title:class:program.exe" (colons written #3A): the
+                // program is what's heard (its first open window's process).
+                let w = text_of("window");
+                let app = w.rsplit(':').next().unwrap_or("").replace("#3A", ":");
+                let app = app.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
+                if app.is_empty() {
+                    return Err("an Application Audio Capture with no app picked".into());
+                }
+                return Ok((SourceKind::AppSound(app), true));
             }
             (SourceKind::DesktopSound, true)
         }
