@@ -270,11 +270,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             ])];
             #[cfg(target_os = "macos")]
             if let Ok((displays, windows)) = ferrocore::screen::shareable() {
-                let d: Vec<(String, Value)> = displays
-                    .iter()
-                    .enumerate()
-                    .map(|(i, d)| (format!("Display {} ({}x{})", i + 1, d.width, d.height), json!(d.id)))
-                    .collect();
+                let names = crate::ffi::projector_window::screen_names();
+                let d: Vec<(String, Value)> =
+                    displays.iter().enumerate().map(|(i, d)| (display_label(i, d, &names), json!(d.id))).collect();
                 let w: Vec<(String, Value)> = windows
                     .iter()
                     .filter(|w| !w.title.is_empty())
@@ -659,6 +657,16 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ferrocast_shape" | "ferrocast_blur_area" | "ferrocast_look" => json!({}),
         _ => return None,
     })
+}
+
+/// A display as OBS names it ("VG271U M3: 2560x1440 @ 0,0"), or "Display 2 (2560x1440)" when
+/// macOS gives no name.
+#[cfg(target_os = "macos")]
+fn display_label(i: usize, d: &ferrocore::screen::Display, names: &std::collections::HashMap<u32, String>) -> String {
+    match names.get(&d.id).filter(|n| !n.trim().is_empty()) {
+        Some(n) => format!("{n}: {}x{} @ {},{}", d.width, d.height, d.x, d.y),
+        None => format!("Display {} ({}x{})", i + 1, d.width, d.height),
+    }
 }
 
 #[cfg(test)]

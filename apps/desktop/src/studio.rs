@@ -1399,7 +1399,11 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn options(&self, kind: String) -> Result<Value, String> {
-        let opts = ferrocast_studio::kinds::options(&kind)
+        // On the main thread: a display's name ("VG271U M3") comes from AppKit, read there only.
+        let k = kind.clone();
+        let opts = self
+            .on_main(move |_| ferrocast_studio::kinds::options(&k))
+            .await?
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))?;
         serde_json::to_value(opts).map_err(|e| e.to_string())
     }
@@ -1638,31 +1642,31 @@ impl StudioHost for DesktopStudio {
                     let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                     if canvas != c.canvas() {
                         // Refused while live or recording: nothing is saved then. The previews
-                        // let go of the old engine first.
-                        let (pv, pg, vv) = (h.preview.take(), h.program_view.take(), h.vertical.view.take());
+                        // must let go of the old engine first: each holds it, so with one still
+                        // alive the change was refused as "streaming or recording" when nothing
+                        // was. They're dropped here, and made again below either way.
+                        let had = (h.preview.is_some(), h.program_view.is_some(), h.vertical.view.is_some());
+                        h.preview = None;
+                        h.program_view = None;
+                        h.vertical.view = None;
                         h.projectors.clear();
                         // They send the old engine's picture: stopped (turned on again by hand).
                         h.ndi = None;
                         h.virtualcam = None;
                         let c = h.collection.as_mut().ok_or(STOPPED)?;
-                        if let Err(e) = c.set_canvas(canvas) {
-                            // The old views go before new ones are made (on Linux they hold nothing).
-                            #[allow(clippy::drop_non_drop)]
-                            drop((pv, pg, vv));
+                        let changed = c.set_canvas(canvas);
+                        // Made again (at the new size when it changed).
+                        if had.0 {
                             let _ = make_preview(&app, h);
+                        }
+                        if had.1 {
                             let _ = make_program_view(&app, h);
+                        }
+                        if had.2 {
                             let _ = make_vertical_view(&app, h);
+                        }
+                        if let Err(e) = changed {
                             return Err(e.to_string());
-                        }
-                        // Made again at the new size.
-                        if pv.is_some() {
-                            let _ = make_preview(&app, h);
-                        }
-                        if pg.is_some() {
-                            let _ = make_program_view(&app, h);
-                        }
-                        if vv.is_some() {
-                            let _ = make_vertical_view(&app, h);
                         }
                     }
                     let c = h.collection.as_ref().ok_or(STOPPED)?;

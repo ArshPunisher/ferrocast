@@ -37,6 +37,11 @@ pub struct Stage {
     canvas: Canvas,
     /// The collection, as OBS saves one.
     doc: RefCell<Value>,
+    /// Set while an edit's engine update is done by the caller itself (a moved source goes
+    /// straight to the engine's item, not through opening the whole collection again).
+    quiet: std::cell::Cell<bool>,
+    /// Where monitored sound plays (a device's name; None: the system's), kept for each engine.
+    monitor_device: RefCell<Option<String>>,
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
     /// Web page sources, each a page rendered for our engine, with the settings it opened with.
@@ -129,6 +134,8 @@ impl Stage {
         let s = Self {
             canvas,
             doc: RefCell::new(doc),
+            quiet: std::cell::Cell::new(false),
+            monitor_device: RefCell::new(None),
             engine: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
@@ -151,6 +158,8 @@ impl Stage {
         let s = Self {
             canvas,
             doc: RefCell::new(doc),
+            quiet: std::cell::Cell::new(false),
+            monitor_device: RefCell::new(None),
             engine: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
@@ -186,6 +195,13 @@ impl Stage {
             return Ok(e.clone());
         }
         let shared = own::Shared::open_at(self.canvas, &self.doc.borrow())?;
+        // Monitoring plays from the start, as libobs keeps its device open: opened only when
+        // Settings were saved, every new engine (each start, a new picture size) had none, and
+        // a source set to be heard here ("Monitor only", "Monitor and output") played nowhere.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Err(e) = shared.engine.set_monitoring(true, self.monitor_device.borrow().as_deref()) {
+            tracing::warn!("monitoring couldn't start: {e}");
+        }
         *self.engine.borrow_mut() = Some(shared.clone());
         self.sync_pages();
         Ok(shared)
@@ -194,6 +210,9 @@ impl Stage {
     /// Changes the document, then the engine shows it.
     fn edit<T>(&self, f: impl FnOnce(&mut Value) -> T) -> T {
         let out = f(&mut self.doc.borrow_mut());
+        if self.quiet.get() {
+            return out;
+        }
         if let Some(e) = self.engine.borrow().as_ref() {
             e.reopen(&self.doc.borrow());
         }
@@ -802,6 +821,10 @@ impl Stage {
     pub fn set_transform(&self, scene: &str, id: i64, t: &Transform) -> Result<ItemInfo, StudioError> {
         let bounds =
             BOUNDS.iter().position(|b| *b == t.bounds).ok_or_else(|| fail(format!("bounds: one of {BOUNDS:?}.")))?;
+        // A drag sends many of these a second: the moved item goes straight to the engine (the
+        // picture and its outline move in the same frame), instead of the whole collection
+        // being opened again for each step. Anything it can't find takes the long way.
+        self.quiet.set(true);
         let it = self.with_item(scene, id, |i| {
             i["pos"] = json!({ "x": t.x, "y": t.y });
             i["rot"] = json!(t.rotation);
@@ -819,7 +842,20 @@ impl Stage {
                 i[k] = json!(v.max(0));
             }
             i.clone()
-        })?;
+        });
+        self.quiet.set(false);
+        let it = it?;
+        let moved = self
+            .engine
+            .borrow()
+            .as_ref()
+            .is_some_and(|e| e.engine.set_item_placement(scene, id, ferrocore::obs::placement_of(&it)));
+        if !moved {
+            if let Some(e) = self.engine.borrow().as_ref() {
+                e.reopen(&self.doc.borrow());
+            }
+            self.sync_pages();
+        }
         Ok(self.info_of(&it))
     }
 
@@ -1650,6 +1686,7 @@ impl Stage {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let device = (id != "default" && !id.is_empty()).then_some(id);
+            *self.monitor_device.borrow_mut() = device.map(String::from);
             self.engine()?.engine.set_monitoring(true, device).map_err(|e| fail(e.to_string()))
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1669,7 +1706,10 @@ impl Stage {
             .filter_map(|n| {
                 let (id, _) = e.engine.source_named(n)?;
                 let l = e.engine.levels(id)?;
-                Some((n.clone(), crate::collection::LevelInfo { peak: l.peak, magnitude: l.rms }))
+                // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
+                // the page read as 0 dB, a full red meter the moment the sound stopped.
+                let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
+                Some((n.clone(), crate::collection::LevelInfo { peak: floor(l.peak), magnitude: floor(l.rms) }))
             })
             .collect()
     }
@@ -2727,6 +2767,8 @@ struct ViewLook {
     background: [f32; 4],
     /// Where the canvas is in the view (device pixels), when the page says.
     area: Option<(f32, f32, f32, f32)>,
+    /// The view's size (device pixels) the page's `area` was for.
+    area_for: Option<(u32, u32)>,
     margin: f32,
     /// The scene and items picked (outlined with handles).
     picked: Option<(String, Vec<i64>)>,
@@ -2735,8 +2777,6 @@ struct ViewLook {
     shade: f32,
     /// The scene shown instead of what's on air (Studio Mode).
     scene: Option<String>,
-    /// The outlines as last taken from the stage.
-    outlines: Vec<ferrocore::preview::Outline>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2808,6 +2848,13 @@ impl Stage {
             margin: crate::edge_px(scale) as f32,
             ..Default::default()
         };
+        // The engine draws at the view's size the moment it changes (AppKit following the
+        // window included), not when the page next says.
+        #[cfg(target_os = "macos")]
+        {
+            let (engine, pid) = (shared.clone(), id);
+            view.on_resize(Box::new(move |w, h| engine.engine.resize_preview(pid, w, h)));
+        }
         let v = StageView { shared, id, view, look: RefCell::new(look), vertical };
         v.follow(self);
         Ok(v)
@@ -2818,6 +2865,9 @@ impl Stage {
 impl StageView {
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
+        // A box of the page's own (Studio Mode's halves): placed by the page only.
+        #[cfg(target_os = "macos")]
+        self.view.follow_window(false);
         let r = crate::with_edge(rect);
         place(&self.view, &r);
         {
@@ -2833,11 +2883,16 @@ impl StageView {
     /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
     /// from the area's top left). Main thread.
     pub fn set_area(&mut self, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+        // The whole stage, between panels of fixed size: it follows the window itself. Not
+        // the vertical picture's, which shares the stage's width with it.
+        #[cfg(target_os = "macos")]
+        self.view.follow_window(!self.vertical);
         place(&self.view, &area);
         let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         self.look.borrow_mut().area =
             Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
         let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(area, scale));
+        self.look.borrow_mut().area_for = Some(crate::px(area, scale));
         self.shared.engine.resize_preview(self.id, cx, cy);
         self.push();
     }
@@ -2855,11 +2910,13 @@ impl StageView {
     /// Outlines `ids` of `scene` with handles, or nothing (from the next tick).
     pub fn select(&self, pick: Option<(&str, &[i64])>) {
         self.look.borrow_mut().picked = pick.map(|(s, i)| (s.to_string(), i.to_vec()));
+        self.push();
     }
 
     /// Outlines every source of `scene` in its own colour, or none (from the next tick).
     pub fn frames(&self, scene: Option<&str>) {
         self.look.borrow_mut().frames = scene.map(String::from);
+        self.push();
     }
 
     /// The colour round the canvas (0xAABBGGRR).
@@ -2912,42 +2969,6 @@ impl StageView {
         if self.vertical {
             self.shared.engine.set_preview_scene(self.id, stage.vertical().map(|v| v.current));
         }
-        let corners = |f: &[f32; 6]| {
-            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-                .map(|(u, v): (f32, f32)| (f[4] + u * f[0] + v * f[2], f[5] + u * f[1] + v * f[3]))
-        };
-        let color = |id: i64| {
-            let (r, g, b) = crate::ffi::FRAME_COLORS[id.rem_euclid(8) as usize];
-            [r, g, b, 1.0]
-        };
-        let mut outlines = Vec::new();
-        {
-            let l = self.look.borrow();
-            if let Some(scene) = &l.frames {
-                for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| i.visible) {
-                    if l.picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&it.id)) {
-                        continue;
-                    }
-                    outlines.push(ferrocore::preview::Outline {
-                        corners: corners(&it.frame),
-                        color: color(it.id),
-                        width: 1.5,
-                        handles: false,
-                    });
-                }
-            }
-            if let Some((scene, ids)) = &l.picked {
-                for it in stage.items(scene).unwrap_or_default().into_iter().filter(|i| ids.contains(&i.id)) {
-                    outlines.push(ferrocore::preview::Outline {
-                        corners: corners(&it.frame),
-                        color: color(it.id),
-                        width: 2.0,
-                        handles: true,
-                    });
-                }
-            }
-        }
-        self.look.borrow_mut().outlines = outlines;
         self.push();
     }
 
@@ -2959,8 +2980,15 @@ impl StageView {
             ferrocore::preview::PreviewLook {
                 background: l.background,
                 area: l.area,
+                area_for: l.area_for,
                 margin: l.margin,
-                outlines: l.outlines.clone(),
+                outlines: Vec::new(),
+                // The engine outlines them from its own items, with the picture's frame.
+                marks: Some(ferrocore::preview::Marks {
+                    scene: l.frames.clone(),
+                    picked: l.picked.clone(),
+                    colors: crate::ffi::FRAME_COLORS.iter().map(|&(r, g, b)| [r, g, b, 1.0]).collect(),
+                }),
                 shade: l.shade,
             },
         );
@@ -3282,6 +3310,27 @@ mod tests {
 
     fn stage() -> Stage {
         Stage::new(Canvas { width: 1920, height: 1080, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Monitored sound plays from the moment the engine opens (not only after Settings are
+    /// saved), on the device last picked, through each new engine.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn monitoring_plays_from_the_engine_start() {
+        let mut s = stage();
+        // No graphics card or no sound device here (some CI machines): nothing to check.
+        let Ok(e) = s.engine() else { return };
+        if ferrocore::monitor::devices().is_empty() {
+            return;
+        }
+        assert!(e.engine.monitoring_stats().is_some(), "monitoring is on from the start");
+        drop(e);
+        // A new picture size makes a new engine: it monitors too.
+        if s.set_canvas(Canvas { width: 1280, height: 720, fps: 30 }).is_ok()
+            && let Ok(e) = s.engine()
+        {
+            assert!(e.engine.monitoring_stats().is_some(), "and after a new engine");
+        }
     }
 
     #[test]

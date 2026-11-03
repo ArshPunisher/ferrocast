@@ -61,7 +61,7 @@ pub(crate) mod mac {
     use objc2::encode::{Encoding, RefEncode};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::{NSAutoresizingMaskOptions, NSResponder, NSView};
     use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 
@@ -119,9 +119,23 @@ pub(crate) mod mac {
         fn CGColorRelease(color: *mut CGColor);
     }
 
-    /// The view's own state (none: the picture is drawn by our engine's preview thread).
-    #[derive(Debug, Default)]
-    pub struct PassIvars;
+    /// What a view tells of its new size (device pixels).
+    pub type Resized = Box<dyn Fn(u32, u32)>;
+
+    /// The view's own state (the picture itself is drawn by our engine's preview thread).
+    #[derive(Default)]
+    pub struct PassIvars {
+        /// Told the view's new size in device pixels whenever it changes (the engine draws at it).
+        resized: std::cell::RefCell<Option<Resized>>,
+        /// It follows the window's size itself (fixed distances to the window's edges).
+        follows: std::cell::Cell<bool>,
+    }
+
+    impl std::fmt::Debug for PassIvars {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PassIvars").field("follows", &self.follows.get()).finish_non_exhaustive()
+        }
+    }
 
     define_class!(
         // SAFETY: NSView allows subclassing; PassView's ivars are plain Cells (no Drop needed).
@@ -144,12 +158,28 @@ pub(crate) mod mac {
             fn resize_with_old(&self, old: NSSize) {
                 // SAFETY: NSView's own resizeWithOldSuperviewSize: with AppKit's argument.
                 let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
+                // Following the window, it already is where the page will be: nothing to hide.
+                if self.ivars().follows.get() {
+                    return;
+                }
                 // SAFETY: on the main thread (AppKit calls this there); only reads the tree.
                 if let Some(p) = unsafe { self.superview() } {
                     let now = p.bounds().size;
                     if (now.width - old.width).abs() > 60.0 || (now.height - old.height).abs() > 60.0 {
                         self.setAlphaValue(0.0);
                     }
+                }
+            }
+
+            /// A new size from anywhere (AppKit following the window, or the page): the engine
+            /// draws at it from its next frame, so the picture never lags its view.
+            #[unsafe(method(setFrameSize:))]
+            fn set_frame_size(&self, size: NSSize) {
+                // SAFETY: NSView's own setFrameSize: on this view, with the size given.
+                let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+                let px = self.convertSizeToBacking(size);
+                if let Some(f) = self.ivars().resized.borrow().as_ref() {
+                    f(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
                 }
             }
 
@@ -165,6 +195,7 @@ pub(crate) mod mac {
     /// A child view of the window's content, in top-left coordinates like the web page.
     pub struct ChildView {
         view: Retained<NSView>,
+        pass: Retained<PassView>,
     }
 
     impl std::fmt::Debug for ChildView {
@@ -219,11 +250,11 @@ pub(crate) mod mac {
         // SAFETY: `parent` is the live NSView from the window toolkit's raw handle (Tauri/tao),
         // used on the main thread while that window exists.
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
-        let pass = PassView::alloc(mtm).set_ivars(PassIvars);
+        let pass = PassView::alloc(mtm).set_ivars(PassIvars::default());
         // SAFETY: NSView's designated initialiser on a freshly allocated PassView.
-        let view: Retained<PassView> =
+        let pass: Retained<PassView> =
             unsafe { msg_send![super(pass), initWithFrame: frame(parent, None, x, y, w, h, vh)] };
-        let view: Retained<NSView> = Retained::into_super(view);
+        let view: Retained<NSView> = Retained::into_super(pass.clone());
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
         // AppKit would keep it from the bottom and slide it over the page above (2.1 test).
@@ -231,7 +262,7 @@ pub(crate) mod mac {
             view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
         }
         parent.addSubview(&view);
-        Some(ChildView { view })
+        Some(ChildView { view, pass })
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -268,9 +299,49 @@ pub(crate) mod mac {
             Some((px(f.size.width), px(f.size.height)))
         }
 
+        /// Follows the window's size itself, as a native widget in the window's own layout does
+        /// (OBS's preview is one): its distances to the window's edges stay as they are, so
+        /// while the window is resized it is resized with it in the same step, not a beat later
+        /// when the page has laid out. For a view whose page box keeps those distances (the
+        /// stage between fixed panels). Main thread only.
+        pub fn follow_window(&self, on: bool) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            self.pass.ivars().follows.set(on);
+            let fixed_top = NSAutoresizingMaskOptions::ViewMinYMargin;
+            // SAFETY: on the main thread (checked above); only reads the tree.
+            let flipped = unsafe { self.view.superview() }.is_some_and(|p| p.isFlipped());
+            self.view.setAutoresizingMask(if on {
+                NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
+            } else if flipped {
+                NSAutoresizingMaskOptions::empty()
+            } else {
+                fixed_top
+            });
+        }
+
+        /// `f` is told the view's size in device pixels each time it changes. Main thread only.
+        pub fn on_resize(&self, f: Box<dyn Fn(u32, u32)>) {
+            if MainThreadMarker::new().is_some() {
+                *self.pass.ivars().resized.borrow_mut() = Some(f);
+            }
+        }
+
+        /// The window is being resized by hand now (its live resize).
+        pub fn window_resizing(&self) -> bool {
+            MainThreadMarker::new().is_some() && self.view.window().is_some_and(|w| w.inLiveResize())
+        }
+
         /// Moves and resizes it (the page's box moved). Main thread only; ignored elsewhere.
+        /// While a view that follows the window is resized with it, the page's boxes are left
+        /// out: they're a beat behind the window, and moving to them made the picture lag and
+        /// jump. The page places it exactly again once the resize settles.
         pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64, vh: f64) {
             if MainThreadMarker::new().is_none() {
+                return;
+            }
+            if self.pass.ivars().follows.get() && self.window_resizing() {
                 return;
             }
             // SAFETY: on the main thread (checked above); `superview` only reads the view tree.
@@ -529,6 +600,21 @@ pub(crate) mod projector_window {
         window: Retained<ProjectorWin>,
         view: Retained<ProjectorView>,
         _closer: Retained<Closer>,
+    }
+
+    /// Each display's name as macOS shows it ("VG271U M3"), by its display id. Empty off the
+    /// main thread (AppKit's screens are read there only).
+    pub fn screen_names() -> std::collections::HashMap<u32, String> {
+        use objc2_foundation::{NSNumber, NSString};
+        let Some(mtm) = MainThreadMarker::new() else { return Default::default() };
+        let key = NSString::from_str("NSScreenNumber");
+        NSScreen::screens(mtm)
+            .iter()
+            .filter_map(|s| {
+                let id = s.deviceDescription().objectForKey(&key)?.downcast::<NSNumber>().ok()?.unsignedIntValue();
+                Some((id, s.localizedName().to_string()))
+            })
+            .collect()
     }
 
     /// The displays, the main one first as macOS lists them: (name, width, height in points).

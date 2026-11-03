@@ -20,14 +20,18 @@ pub fn free_disk_mb(dir: &Path) -> u64 {
         .map_or(0, |d| d.available_space() / (1024 * 1024))
 }
 
-/// Ferrocast's CPU use (% of one core, since the last ask) and its memory (MB).
+/// Ferrocast's CPU use (since the last ask) as a share of the whole computer, as libobs's meter
+/// (and OBS's status bar) gives it: one core busy on a 10-core Mac is 10%. Measured per core it
+/// read ten times OBS's figure for the same work, and the 85%/90% warnings meant the machine.
+/// And its memory (MB).
 pub fn usage() -> (f64, u64) {
     static SYS: Mutex<Option<sysinfo::System>> = Mutex::new(None);
     let Ok(pid) = sysinfo::get_current_pid() else { return (0.0, 0) };
     let mut guard = SYS.lock().unwrap_or_else(|e| e.into_inner());
     let sys = guard.get_or_insert_with(sysinfo::System::new);
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid).map_or((0.0, 0), |p| (f64::from(p.cpu_usage()), p.memory() / (1024 * 1024)))
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f64;
+    sys.process(pid).map_or((0.0, 0), |p| (f64::from(p.cpu_usage()) / cores, p.memory() / (1024 * 1024)))
 }
 
 #[cfg(test)]
