@@ -28,17 +28,44 @@ pub struct PreviewLook {
     /// Where the canvas sits in the view (view pixels: x, y, w, h) when the page says; its
     /// shape is kept inside that box. None fits it inside `margin`.
     pub area: Option<(f32, f32, f32, f32)>,
+    /// The view's size (view pixels) `area` was given for. While the view is another size (the
+    /// window being resized: the view follows it at once, the page says where things are a
+    /// beat later) the canvas is fitted to the view as it is now, as OBS's preview does,
+    /// instead of drawn where it was.
+    pub area_for: Option<(u32, u32)>,
     /// Room left round a fitted canvas (view pixels), for handles at its edge.
     pub margin: f32,
     pub outlines: Vec<Outline>,
+    /// What to outline, worked out by the engine from its own items each frame (it then
+    /// replaces `outlines`): the picture and its boxes from the same moment.
+    pub marks: Option<Marks>,
     /// A dark layer over everything, 0 (none) to 1, as a dialog's backdrop dims the page.
     pub shade: f32,
 }
 
 impl Default for PreviewLook {
     fn default() -> Self {
-        Self { background: [0.0, 0.0, 0.0, 1.0], area: None, margin: 0.0, outlines: Vec::new(), shade: 0.0 }
+        Self {
+            background: [0.0, 0.0, 0.0, 1.0],
+            area: None,
+            area_for: None,
+            margin: 0.0,
+            outlines: Vec::new(),
+            marks: None,
+            shade: 0.0,
+        }
     }
+}
+
+/// Which sources a preview outlines, by their ids in the scene collection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Marks {
+    /// A scene whose shown sources all get an outline in their colour.
+    pub scene: Option<String>,
+    /// The scene and items picked: outlined with handles.
+    pub picked: Option<(String, Vec<i64>)>,
+    /// The outline colours, an item's by its id (straight alpha, the view's gamma).
+    pub colors: Vec<[f32; 4]>,
 }
 
 /// What the preview shows: a scene, or two mid-transition.
@@ -335,7 +362,16 @@ impl Compositor {
 /// Where the canvas goes in a view of `size` (view pixels: x, y, w, h), as libobs places it.
 pub fn canvas_area(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> (f32, f32, f32, f32) {
     let (bw, bh) = (canvas.0.max(1) as f32, canvas.1.max(1) as f32);
-    match look.area {
+    let area = match (look.area, look.area_for) {
+        // A pixel or two is the page's rounding, not a resize.
+        (Some(a), Some(was))
+            if was.0 > 0 && was.1 > 0 && (was.0.abs_diff(size.0) > 2 || was.1.abs_diff(size.1) > 2) =>
+        {
+            Some(refit(a, was, size))
+        }
+        (a, _) => a,
+    };
+    match area {
         // Where the page put it, its shape kept.
         Some((x, y, w, h)) if w >= 1.0 && h >= 1.0 => {
             let scale = (w / bw).min(h / bh);
@@ -350,6 +386,26 @@ pub fn canvas_area(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> 
             (((cx - w) / 2.0).trunc(), ((cy - h) / 2.0).trunc(), w, h)
         }
     }
+}
+
+/// The page's box for the canvas (`area`, in a view of size `was`) moved into a view of `now`
+/// as the page will lay it out once it catches up: a fitted canvas (it nearly fills the view on
+/// one side) is fitted again with the same room round it; a zoomed one (75%, 50%, bigger than
+/// the view) keeps its size. Either way it keeps where it sat from the view's middle.
+fn refit(area: (f32, f32, f32, f32), was: (u32, u32), now: (u32, u32)) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = area;
+    let (w0, h0) = (was.0 as f32, was.1 as f32);
+    let (w1, h1) = (now.0 as f32, now.1 as f32);
+    let room = (w0 - w).min(h0 - h);
+    let fitted = w <= w0 && h <= h0 && room <= 0.12 * w0.min(h0) + 2.0;
+    let (nw, nh) = if fitted {
+        let s = ((w1 - room).max(1.0) / w).min((h1 - room).max(1.0) / h);
+        (w * s, h * s)
+    } else {
+        (w, h)
+    };
+    let (ox, oy) = (x + w / 2.0 - w0 / 2.0, y + h / 2.0 - h0 / 2.0);
+    (w1 / 2.0 + ox - nw / 2.0, h1 / 2.0 + oy - nh / 2.0, nw, nh)
 }
 
 /// Every triangle the preview draws: the canvas, the outlines and handles, the shade.
@@ -428,6 +484,22 @@ mod tests {
 
     #[test]
     fn the_canvas_fits_inside_the_margin_or_where_the_page_says() {
+        // The window grew before the page said where things went: a fitted canvas is fitted to
+        // the view as it is now, from the middle; a zoomed one keeps its size.
+        let page =
+            PreviewLook { area: Some((16.0, 16.0, 768.0, 432.0)), area_for: Some((800, 464)), ..Default::default() };
+        assert_eq!(canvas_area((800, 464), (1920, 1080), &page), (16.0, 16.0, 768.0, 432.0));
+        let (x, y, w, h) = canvas_area((1000, 600), (1920, 1080), &page);
+        // The same 32 pixels of room round it as the page left (1000 - 32 wide).
+        assert_eq!((w, h), (968.0, 545.0), "fitted: {w}x{h}");
+        assert!(w <= 1000.0 && h <= 600.0 && (x + w / 2.0 - 500.0).abs() <= 1.0 && (y + h / 2.0 - 300.0).abs() <= 1.0);
+        let zoomed = PreviewLook {
+            area: Some((-100.0, -50.0, 1000.0, 563.0)),
+            area_for: Some((800, 464)),
+            ..Default::default()
+        };
+        let (_, _, w, h) = canvas_area((1000, 600), (1920, 1080), &zoomed);
+        assert_eq!((w, h), (1000.0, 563.0), "a zoomed canvas keeps its size");
         let fitted = PreviewLook { margin: 10.0, ..Default::default() };
         // 400x300 view, 16:9 canvas: 380 wide inside the margin, centred top to bottom.
         assert_eq!(canvas_area((400, 300), (1920, 1080), &fitted), (10.0, 43.0, 380.0, 214.0));

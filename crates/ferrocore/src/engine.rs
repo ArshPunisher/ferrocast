@@ -140,6 +140,8 @@ pub struct SceneItem {
     pub scene: Option<String>,
     /// With `scene`: that scene is a group, its items placed in a box of this size.
     pub group: Option<(u32, u32)>,
+    /// The item's id in the scene collection (OBS's), for outlining it in the preview; 0 none.
+    pub item_id: i64,
 }
 
 impl SceneItem {
@@ -155,6 +157,7 @@ impl SceneItem {
             animation: Vec::new(),
             scene: None,
             group: None,
+            item_id: 0,
         }
     }
 }
@@ -401,7 +404,35 @@ struct Src {
     kind: Option<SourceKind>,
     watch: Watch,
     /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
-    pending: Option<Picture>,
+    pending: Option<Fresh>,
+}
+
+/// A new picture for the card: pixels of ours, or (on a Mac) a frame of the screen as the
+/// system holds it, which goes up without a copy of ours.
+enum Fresh {
+    Pic(Picture),
+    #[cfg(target_os = "macos")]
+    Screen(crate::screen::Surface),
+}
+
+impl Fresh {
+    /// Width, height, and whether the colours are already multiplied by alpha.
+    fn info(&self) -> (u32, u32, bool) {
+        match self {
+            Fresh::Pic(p) => (p.width, p.height, p.premultiplied),
+            #[cfg(target_os = "macos")]
+            Fresh::Screen(s) => (s.size().0, s.size().1, true),
+        }
+    }
+
+    /// Sends it to the card as source `id`'s picture.
+    fn send(&self, gpu: &Compositor, id: u64) -> bool {
+        match self {
+            Fresh::Pic(p) => gpu.upload(id, p).is_ok(),
+            #[cfg(target_os = "macos")]
+            Fresh::Screen(s) => gpu.upload_surface(id, s).is_ok(),
+        }
+    }
 }
 
 impl Src {
@@ -924,6 +955,22 @@ impl Engine {
         Some((*id, st.sources.get(id).and_then(|s| s.size).map(|(w, h, _)| (w, h))))
     }
 
+    /// Places item `item_id` (its id in the scene collection) of `scene` at `p` from the next
+    /// frame. False when there's no such item (the caller then opens the collection again).
+    pub fn set_item_placement(&self, scene: &str, item_id: i64, p: Placement) -> bool {
+        if item_id == 0 {
+            return false;
+        }
+        let mut st = self.lock();
+        match st.scenes.get_mut(scene).and_then(|items| items.iter_mut().find(|i| i.item_id == item_id)) {
+            Some(it) => {
+                it.placement = p;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn scene_names(&self) -> Vec<String> {
         let st = self.lock();
         st.scenes.keys().filter(|n| !st.groups.contains(n)).cloned().collect()
@@ -1300,10 +1347,10 @@ impl Engine {
         let item = {
             let mut st = self.lock();
             if let Some(src) = st.sources.get_mut(&id)
-                && let Some(p) = src.pending.take()
-                && self.gpu.upload(id, &p).is_ok()
+                && let Some(f) = src.pending.take()
+                && f.send(&self.gpu, id)
             {
-                src.size = Some((p.width, p.height, p.premultiplied));
+                src.size = Some(f.info());
             }
             let (sw, sh, premultiplied) = st.sources.get(&id)?.size?;
             let mut it = Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default());
@@ -1373,7 +1420,14 @@ fn preview_loop(
                     Some(mv) => Draw::Scene(multiview_scene(&st, mv, now_ns())),
                     None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()),
                 };
-                (draw, p.look.clone())
+                // The outlines from the same items, at the same moment, as the picture: drawn
+                // together they can't drift apart while a source is dragged (as OBS draws its
+                // selection boxes in the frame it draws the scene).
+                let mut look = p.look.clone();
+                if let Some(m) = &look.marks {
+                    look.outlines = outlines(&st, m, p.size, now_ns());
+                }
+                (draw, look)
             })
         };
         if let Some((draw, look)) = next {
@@ -1388,6 +1442,48 @@ fn preview_loop(
         }
         std::thread::sleep(every.saturating_sub(started.elapsed()));
     }
+}
+
+/// The preview's outlines (canvas pixels) for `m`, from the engine's own items at `ts`: every
+/// shown source of `m.scene` in its colour, then the picked ones with handles on top.
+fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) -> Vec<crate::preview::Outline> {
+    let corners = |scene: &str, it: &SceneItem| -> Option<[(f32, f32); 4]> {
+        let (placement, _) = animated(it, scene_ms(st, scene, ts));
+        let (w, h) = match (&it.scene, it.group) {
+            (Some(_), Some(size)) => size,
+            (Some(_), None) => canvas,
+            (None, _) => st.sources.get(&it.source)?.size.map(|(w, h, _)| (w, h))?,
+        };
+        let a = crate::transform::draw_transform(&placement, w, h);
+        let (cw, ch) = crate::transform::cropped(w, h, placement.crop);
+        let (cw, ch) = (cw as f32, ch as f32);
+        Some([a.apply(0.0, 0.0), a.apply(cw, 0.0), a.apply(cw, ch), a.apply(0.0, ch)])
+    };
+    let color = |id: i64| {
+        let n = m.colors.len().max(1) as i64;
+        m.colors.get(id.rem_euclid(n) as usize).copied().unwrap_or([1.0, 1.0, 1.0, 1.0])
+    };
+    let picked = |scene: &str, id: i64| m.picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&id));
+    let mut out = Vec::new();
+    if let Some(scene) = &m.scene
+        && let Some(items) = st.scenes.get(scene)
+    {
+        for it in items.iter().filter(|i| i.visible && i.item_id != 0 && !picked(scene, i.item_id)) {
+            if let Some(c) = corners(scene, it) {
+                out.push(crate::preview::Outline { corners: c, color: color(it.item_id), width: 1.5, handles: false });
+            }
+        }
+    }
+    if let Some((scene, ids)) = &m.picked
+        && let Some(items) = st.scenes.get(scene)
+    {
+        for it in items.iter().filter(|i| i.item_id != 0 && ids.contains(&i.item_id)) {
+            if let Some(c) = corners(scene, it) {
+                out.push(crate::preview::Outline { corners: c, color: color(it.item_id), width: 2.0, handles: true });
+            }
+        }
+    }
+    out
 }
 
 /// What a frame shows: the scene on air, or two scenes mid-transition.
@@ -1593,10 +1689,10 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
 /// another way: a thumbnail, a snapshot).
 fn send_pending(st: &mut State, gpu: &Compositor) {
     for (id, src) in st.sources.iter_mut() {
-        if let Some(p) = src.pending.take()
-            && gpu.upload(*id, &p).is_ok()
+        if let Some(f) = src.pending.take()
+            && f.send(gpu, *id)
         {
-            src.size = Some((p.width, p.height, p.premultiplied));
+            src.size = Some(f.info());
         }
     }
 }
@@ -1789,13 +1885,15 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             hide,
         )
         .map(Live::Screen),
+        // On a Mac the window's app's sound comes with it (ScreenCaptureKit filters it to the
+        // window); elsewhere a capture's sound is the whole computer's, so none.
         SourceKind::Window(window) => ScreenCapture::start_with(
             Target::Window(*window),
             config.width,
             config.height,
             config.fps,
             true,
-            false,
+            cfg!(target_os = "macos"),
             &[],
         )
         .map(Live::Screen),
@@ -1956,9 +2054,9 @@ fn frame(
     let mut uploads = Vec::new();
     for (id, src) in st.sources.iter_mut() {
         if seen.contains(id)
-            && let Some(p) = src.pending.take()
+            && let Some(f) = src.pending.take()
         {
-            uploads.push((*id, p));
+            uploads.push((*id, f));
         }
     }
     let mut st_recovered = 0;
@@ -1968,7 +2066,7 @@ fn frame(
             Live::Image { src: img, since, last } => {
                 if img.animated() {
                     let p = img.frame_at(since.elapsed());
-                    uploads.push((*id, p.clone()));
+                    uploads.push((*id, Fresh::Pic(p.clone())));
                     *last = None;
                 }
             }
@@ -1992,8 +2090,13 @@ fn frame(
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Screen(cap) => {
+                #[cfg(target_os = "macos")]
+                if let Some(s) = cap.take_surface() {
+                    uploads.push((*id, Fresh::Screen(s)));
+                }
+                #[cfg(not(target_os = "macos"))]
                 if let Some(p) = cap.take() {
-                    uploads.push((*id, p));
+                    uploads.push((*id, Fresh::Pic(p)));
                 }
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
@@ -2004,7 +2107,7 @@ fn frame(
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Camera(cap) => {
                 if let Some((p, _)) = cap.take_frame() {
-                    uploads.push((*id, p));
+                    uploads.push((*id, Fresh::Pic(p)));
                 }
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2018,7 +2121,7 @@ fn frame(
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Media(m) => {
                 if let Some(p) = m.frame_at(ts) {
-                    uploads.push((*id, p));
+                    uploads.push((*id, Fresh::Pic(p)));
                 }
                 for (pcm, t) in m.take_sound() {
                     if heard.contains(id) {
@@ -2028,7 +2131,7 @@ fn frame(
             }
             Live::Fed(feed) | Live::Series { feed, .. } => {
                 if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    uploads.push((*id, p));
+                    uploads.push((*id, Fresh::Pic(p)));
                 }
                 let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                 if heard.contains(id) {
@@ -2047,14 +2150,14 @@ fn frame(
         }
     }
     st.stats.recovered += st_recovered;
-    for (id, p) in uploads {
+    for (id, f) in uploads {
         let Some(s) = st.sources.get_mut(&id) else { continue };
         if !seen.contains(&id) && s.size.is_some() {
-            s.pending = Some(p);
+            s.pending = Some(f);
             continue;
         }
-        if gpu.upload(id, &p).is_ok() {
-            s.size = Some((p.width, p.height, p.premultiplied));
+        if f.send(gpu, id) {
+            s.size = Some(f.info());
         }
     }
     let blocks = mx.mix_until(now_ns());
@@ -2576,6 +2679,37 @@ mod tests {
         e.set_monitoring(false, None).unwrap_or_else(|x| panic!("{x}"));
         assert!(played > 40_000, "about a second played: {played}");
         assert!(short < 10, "the device seldom ran short: {short}");
+    }
+
+    /// A dragged source moves in the engine's own item, and the preview's outline is worked out
+    /// from that same item: picture and box can't drift apart.
+    #[test]
+    fn a_moved_item_and_its_outline_move_together() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 100, height: 50, rgba: [200, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut it = SceneItem::new(1, Placement { x: 10.0, y: 20.0, ..Default::default() });
+        it.item_id = 7;
+        e.set_scene("Main", vec![it]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let marks = crate::preview::Marks {
+            scene: None,
+            picked: Some(("Main".into(), vec![7])),
+            colors: vec![[1.0, 0.0, 0.0, 1.0]],
+        };
+        let corners = |e: &Engine| {
+            let st = e.lock();
+            let o = outlines(&st, &marks, (640, 360), now_ns());
+            assert_eq!(o.len(), 1);
+            assert!(o[0].handles);
+            o[0].corners
+        };
+        assert_eq!(corners(&e), [(10.0, 20.0), (110.0, 20.0), (110.0, 70.0), (10.0, 70.0)]);
+        let to = Placement { x: 300.0, y: 100.0, scale_x: 2.0, scale_y: 2.0, ..Default::default() };
+        assert!(e.set_item_placement("Main", 7, to));
+        assert_eq!(corners(&e), [(300.0, 100.0), (500.0, 100.0), (500.0, 200.0), (300.0, 200.0)]);
+        assert!(!e.set_item_placement("Main", 8, Placement::default()), "no such item: the long way");
+        assert!(!e.set_item_placement("Other", 7, Placement::default()));
     }
 
     #[test]

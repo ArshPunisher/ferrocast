@@ -422,8 +422,9 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         "screen_capture" | "display_capture" => {
             let n = |k: &str| s.get(k).and_then(Value::as_u64).map(|v| v as u32);
             match (s.get("type").and_then(Value::as_u64).unwrap_or(0), n("window")) {
-                // Window Capture, by its window number (as OBS keeps it).
-                (1, Some(w)) => (SourceKind::Window(w), false),
+                // Window Capture, by its window number (as OBS keeps it), with its app's sound
+                // (a browser's video heard as it's shown; muted or turned down in the mixer).
+                (1, Some(w)) => (SourceKind::Window(w), true),
                 (1, None) => return Err("a window capture with no window picked".into()),
                 (0, _) => {
                     // The display picked (by number), else the first (OBS keeps a display's UUID).
@@ -732,6 +733,7 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                 continue;
             };
             si.visible = it.get("visible").and_then(Value::as_bool).unwrap_or(true);
+            si.item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
             si.filter = Filter::from_name(it.get("scale_filter").and_then(Value::as_str).unwrap_or("disable"));
             si.blend = Blend::from_name(it.get("blend_type").and_then(Value::as_str).unwrap_or("normal"));
             items.push(si);

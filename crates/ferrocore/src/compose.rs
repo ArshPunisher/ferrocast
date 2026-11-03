@@ -7,7 +7,8 @@
 //! same, so both engines' pictures match pixel for pixel.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::transform::{Affine, cropped, draw_transform, output_scale};
 use crate::{
@@ -20,6 +21,10 @@ use crate::{
 /// through `GAMMA` views, as stored (libobs's way for sources that aren't sRGB-aware).
 const GAMMA: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The screen arrives as BGRA: kept so on the card (it reads the colours in the right order),
+/// with the same two views (raw, and sRGB-aware) as the RGBA ones.
+const BGRA: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+const BGRA_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 const MAX: u32 = 16_384;
 /// libobs's `EPSILON` for "scaled at all".
 const EPSILON: f32 = 0.0001;
@@ -70,6 +75,36 @@ fn blend_state(b: Blend, metal: bool) -> wgpu::BlendState {
     }
 }
 
+/// Buffers an upload goes through, each with whether it is mapped again and free.
+#[derive(Debug)]
+struct Staging {
+    width: u32,
+    height: u32,
+    bufs: Vec<(wgpu::Buffer, Arc<AtomicBool>)>,
+}
+
+/// What one NV12 frame needs on the card, kept between frames: the canvas drawn into, the two
+/// planes it is converted to, their readback buffers and the conversion's constants. Making
+/// and freeing these through the driver each frame (35 MB of memory to allocate, zero and give
+/// back, 30 or 60 times a second) was most of the engine's system time.
+struct Rig {
+    canvas: Target,
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    ubuf: wgpu::Buffer,
+    /// The Y and UV readbacks, with the padded bytes a row takes in each.
+    read: [(wgpu::Buffer, u32); 2],
+}
+
+impl std::fmt::Debug for Rig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rig({}x{})", self.canvas.width, self.canvas.height)
+    }
+}
+
+/// Rigs kept at most (each size an output draws at has its own).
+const RIGS: usize = 6;
+
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
 pub struct Compositor {
@@ -110,6 +145,10 @@ pub struct Compositor {
     custom_pipelines: Mutex<HashMap<u64, Option<wgpu::RenderPipeline>>>,
     /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
     uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
+    /// Buffers kept between frames to send each upload through (see `write_staged`).
+    staging: Mutex<HashMap<u64, Staging>>,
+    /// NV12 frames' resources, kept between frames (see `Rig`).
+    rigs: Mutex<Vec<Rig>>,
     /// NV12 out: the Y and UV pipelines.
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     /// The preview's painter, by the window surface's format.
@@ -364,6 +403,8 @@ impl Compositor {
             adapter,
             preview_pipelines: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            staging: Mutex::new(HashMap::new()),
+            rigs: Mutex::new(Vec::new()),
             nv12,
             effect_module,
             effect_layout,
@@ -471,9 +512,10 @@ impl Compositor {
             return Err(AvError::BadSize(w, h));
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
-        let canvas = self.target(w, h, wgpu::TextureUsages::empty());
-        self.transition_into(&mut enc, &canvas, tr)?;
-        self.nv12_out(enc, &canvas)
+        let rig = self.rig(w, h);
+        self.clear(&mut enc, &rig.canvas);
+        self.transition_into(&mut enc, &rig.canvas, tr)?;
+        self.nv12_out(enc, rig)
     }
 
     pub(crate) fn transition_into(
@@ -1162,7 +1204,15 @@ impl Compositor {
         }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         match ups.get(&id) {
-            Some((tex, w, h)) if *w == p.width && *h == p.height => self.write(tex, p),
+            Some((tex, w, h)) if *w == p.width && *h == p.height && tex.format() == GAMMA => {
+                let sent = self.write_staged(id, tex, (p.width, p.height), |dst| {
+                    dst.copy_from_slice(&p.rgba);
+                    true
+                });
+                if !sent {
+                    self.write(tex, p);
+                }
+            }
             _ => {
                 let tex = self.new_picture(p);
                 ups.insert(id, (tex, p.width, p.height));
@@ -1171,9 +1221,60 @@ impl Compositor {
         Ok(())
     }
 
+    /// A frame of the screen as the system holds it (BGRA, colours multiplied by alpha), sent to
+    /// the card with one copy, into a buffer kept between frames: no RGBA copy of ours, no colour
+    /// swap on the CPU (the card reads BGRA as RGBA).
+    #[cfg(target_os = "macos")]
+    pub fn upload_surface(&self, id: u64, s: &crate::screen::Surface) -> Result<(), AvError> {
+        let (w, h) = s.size();
+        check_size(w, h)?;
+        let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(ups.get(&id), Some((t, tw, th)) if (*tw, *th) == (w, h) && t.format() == BGRA) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("screen"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: BGRA,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[BGRA_SRGB],
+            });
+            ups.insert(id, (texture, w, h));
+        }
+        let Some((texture, ..)) = ups.get(&id) else { return Err(AvError::NotUploaded(id)) };
+        let row = w as usize * 4;
+        let staged = self.write_staged(id, texture, (w, h), |dst| {
+            s.with_bytes(|src, stride| {
+                if stride == row {
+                    dst.copy_from_slice(&src[..row * h as usize]);
+                } else {
+                    for y in 0..h as usize {
+                        dst.slice(y * row..(y + 1) * row).copy_from_slice(&src[y * stride..y * stride + row]);
+                    }
+                }
+            })
+            .is_some()
+        });
+        if staged {
+            return Ok(());
+        }
+        // No buffer free yet (or rows that don't line up): straight from the system's memory.
+        let sent = s.with_bytes(|src, stride| {
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                src,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        });
+        sent.ok_or_else(|| AvError::Source("a frame of the screen couldn't be read".into()))
+    }
+
     /// Lets an uploaded picture go.
     pub fn forget(&self, id: u64) {
         self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
 
     /// A LUT on the card: a 3D texture (a 1D one for a 1D table), made once per table.
@@ -1238,15 +1339,20 @@ impl Compositor {
         }
         self.validate(&scene.items)?;
         let mut enc = self.device.create_command_encoder(&Default::default());
-        let canvas = self.target(w, h, wgpu::TextureUsages::empty());
-        self.clear(&mut enc, &canvas);
-        self.draw_items(&mut enc, &canvas, &scene.items, &Affine::IDENTITY)?;
-        self.nv12_out(enc, &canvas)
+        let rig = self.rig(w, h);
+        self.clear(&mut enc, &rig.canvas);
+        self.draw_items(&mut enc, &rig.canvas, &scene.items, &Affine::IDENTITY)?;
+        self.nv12_out(enc, rig)
     }
 
-    /// Converts a drawn canvas to NV12 and reads it back.
-    fn nv12_out(&self, mut enc: wgpu::CommandEncoder, canvas: &Target) -> Result<Nv12, AvError> {
-        let (w, h) = (canvas.width, canvas.height);
+    /// A rig for `w`×`h` frames: one kept from before, or a new one.
+    fn rig(&self, w: u32, h: u32) -> Rig {
+        {
+            let mut rigs = self.rigs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = rigs.iter().position(|r| (r.canvas.width, r.canvas.height) == (w, h)) {
+                return rigs.remove(i);
+            }
+        }
         let plane = |format, pw, ph| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("nv12"),
@@ -1259,24 +1365,45 @@ impl Compositor {
                 view_formats: &[],
             })
         };
-        let y = plane(wgpu::TextureFormat::R8Unorm, w, h);
-        let uv = plane(wgpu::TextureFormat::Rg8Unorm, w / 2, h / 2);
         let mut u = Vec::with_capacity(16);
         for row in bt709_limited() {
             u.extend_from_slice(&row);
         }
         u.extend_from_slice(&[1.0 / w as f32, 0.0, (w / 2) as f32, (h / 2) as f32]);
-        let ubuf = self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM);
+        let readback = |bytes_per_row: u32, rows: u32| {
+            let padded =
+                bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: u64::from(padded) * u64::from(rows),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            (buf, padded)
+        };
+        Rig {
+            canvas: self.target(w, h, wgpu::TextureUsages::empty()),
+            y: plane(wgpu::TextureFormat::R8Unorm, w, h),
+            uv: plane(wgpu::TextureFormat::Rg8Unorm, w / 2, h / 2),
+            ubuf: self.buffer(&floats(&u), wgpu::BufferUsages::UNIFORM),
+            read: [readback(w, h), readback(w, h / 2)],
+        }
+    }
+
+    /// Converts a drawn canvas (the rig's) to NV12 and reads it back; the rig is kept for the
+    /// next frame unless the readback failed.
+    fn nv12_out(&self, mut enc: wgpu::CommandEncoder, rig: Rig) -> Result<Nv12, AvError> {
+        let (w, h) = (rig.canvas.width, rig.canvas.height);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("nv12"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&canvas.gamma) },
+                wgpu::BindGroupEntry { binding: 0, resource: rig.ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&rig.canvas.gamma) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
             ],
         });
-        for (tex, pipeline) in [(&y, &self.nv12.0), (&uv, &self.nv12.1)] {
+        for (tex, pipeline) in [(&rig.y, &self.nv12.0), (&rig.uv, &self.nv12.1)] {
             let v = tex.create_view(&Default::default());
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nv12"),
@@ -1295,10 +1422,93 @@ impl Compositor {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let mut planes = self.read_planes(enc, &[(&y, w, h, 1), (&uv, w / 2, h / 2, 2)])?;
+        let mut planes = self.read_planes(
+            enc,
+            &[(&rig.y, w, h, 1, Some(&rig.read[0].0)), (&rig.uv, w / 2, h / 2, 2, Some(&rig.read[1].0))],
+        )?;
         let uv = planes.pop().unwrap_or_default();
         let y = planes.pop().unwrap_or_default();
+        let mut rigs = self.rigs.lock().unwrap_or_else(|e| e.into_inner());
+        // The oldest goes when full: sizes no longer drawn mustn't keep the one in use out.
+        if rigs.len() >= RIGS {
+            rigs.remove(0);
+        }
+        rigs.push(rig);
         Ok(Nv12 { width: w, height: h, y, uv })
+    }
+
+    /// Sends a picture to its texture through a buffer of ours that stays mapped between frames.
+    /// `Queue::write_texture` makes a fresh staging buffer of the picture's size every call: for
+    /// a 1080p display that is 8 MB of new memory, page-faulted and copied, 30 times a second a
+    /// display, and was the biggest CPU cost of a recording. Here a few buffers per picture go
+    /// round: written while mapped, copied to the texture on the card, mapped again once the card
+    /// is done (`poll` runs that). False when no buffer is free yet or the rows don't line up:
+    /// the caller then uses `write_texture`.
+    fn write_staged(
+        &self,
+        id: u64,
+        texture: &wgpu::Texture,
+        (width, height): (u32, u32),
+        fill: impl FnOnce(&mut wgpu::BufferViewMut) -> bool,
+    ) -> bool {
+        const BUFFERS: usize = 3;
+        let row = width * 4;
+        if !row.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) {
+            return false;
+        }
+        let mut all = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+        let st = all.entry(id).or_insert_with(|| Staging { width, height, bufs: Vec::new() });
+        if (st.width, st.height) != (width, height) {
+            *st = Staging { width, height, bufs: Vec::new() };
+        }
+        let free = st.bufs.iter().position(|(_, ready)| ready.load(Ordering::Acquire));
+        let i = match free {
+            Some(i) => i,
+            None if st.bufs.len() < BUFFERS => {
+                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("upload"),
+                    size: u64::from(row) * u64::from(height),
+                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                st.bufs.push((buf, Arc::new(AtomicBool::new(true))));
+                st.bufs.len() - 1
+            }
+            None => return false,
+        };
+        let (buf, ready) = &st.bufs[i];
+        let Ok(mut view) = buf.slice(..).get_mapped_range_mut() else {
+            // Not in the state the flag said: this buffer is let go and the plain way used.
+            st.bufs.remove(i);
+            return false;
+        };
+        if !fill(&mut view) {
+            return false;
+        }
+        drop(view);
+        ready.store(false, Ordering::Release);
+        buf.unmap();
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            texture.as_image_copy(),
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+        let ready = ready.clone();
+        buf.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+            if r.is_ok() {
+                ready.store(true, Ordering::Release);
+            }
+        });
+        true
     }
 
     fn write(&self, texture: &wgpu::Texture, p: &Picture) {
@@ -1393,7 +1603,7 @@ impl Compositor {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>, AvError> {
-        Ok(self.read_planes(enc, &[(target, w, h, 4)])?.pop().unwrap_or_default())
+        Ok(self.read_planes(enc, &[(target, w, h, 4, None)])?.pop().unwrap_or_default())
     }
 
     /// Copies textures (each with its size and bytes per pixel) into memory, rows packed (the
@@ -1401,18 +1611,21 @@ impl Compositor {
     fn read_planes(
         &self,
         mut enc: wgpu::CommandEncoder,
-        planes: &[(&wgpu::Texture, u32, u32, u32)],
+        planes: &[(&wgpu::Texture, u32, u32, u32, Option<&wgpu::Buffer>)],
     ) -> Result<Vec<Vec<u8>>, AvError> {
         let mut bufs = Vec::new();
-        for (target, w, h, bpp) in planes {
+        for (target, w, h, bpp, kept) in planes {
             let (w, h) = (*w, *h);
             let row = w * bpp;
             let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let out = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback"),
-                size: u64::from(padded) * u64::from(h),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
+            // A buffer kept from the last frame (see `Rig`) or a new one.
+            let out = kept.cloned().unwrap_or_else(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size: u64::from(padded) * u64::from(h),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
             });
             enc.copy_texture_to_buffer(
                 target.as_image_copy(),
@@ -1624,6 +1837,12 @@ fn mask_mapping(source: (u32, u32), mask: (u32, u32), stretch: bool) -> [f32; 4]
 }
 
 fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {
+    // A BGRA texture is read through its own pair of views, whichever of ours was asked for.
+    let format = match (texture.format(), format) {
+        (BGRA, LINEAR) => BGRA_SRGB,
+        (BGRA, GAMMA) => BGRA,
+        _ => format,
+    };
     texture.create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() })
 }
 

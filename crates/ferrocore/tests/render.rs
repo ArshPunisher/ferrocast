@@ -157,6 +157,81 @@ fn uploaded_pictures_draw_and_update_in_place() {
     assert!(c.render(&scene).is_err(), "forgotten pictures are refused, not drawn as garbage");
 }
 
+/// Uploads whose rows are a multiple of 256 bytes go through buffers kept between frames: a
+/// run of them with no frame drawn between (all buffers busy, the plain way used after the
+/// first few) must still end on the newest picture, and each picture must show whole.
+#[test]
+fn uploads_through_kept_buffers_always_show_the_newest_picture() {
+    use ferrocore::Content;
+    let Some(c) = gpu() else { return };
+    let (w, h) = (64u32, 6u32);
+    let scene = |id: u64| Scene {
+        width: w,
+        height: h,
+        items: vec![Item {
+            content: Content::Uploaded { id, width: w, height: h, premultiplied: false },
+            ..item(Picture::solid(1, 1, [0; 4]), Placement::default())
+        }],
+    };
+    let colour = |k: u8| [k * 20, 255 - k * 20, k, 255];
+    for k in 0..12 {
+        c.upload(9, &Picture::solid(w, h, colour(k))).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let px = c.render(&scene(9)).unwrap_or_default();
+    for (x, y) in [(0, 0), (63, 5), (31, 3)] {
+        assert_eq!(at(&px, w, x, y), colour(11), "the newest of twelve uploads in a row, at {x},{y}");
+    }
+    // A frame drawn after each: every picture comes out as sent, for far more than the
+    // buffers kept (each is mapped again once the card is done with it).
+    for k in 0..40 {
+        c.upload(9, &Picture::solid(w, h, colour(k % 12))).unwrap_or_else(|e| panic!("{e}"));
+        let px = c.render(&scene(9)).unwrap_or_default();
+        assert_eq!(at(&px, w, 17, 2), colour(k % 12), "upload {k}");
+    }
+    // A picture of another size takes its own texture and buffers.
+    c.upload(9, &Picture::solid(128, 2, [1, 2, 3, 255])).unwrap_or_else(|e| panic!("{e}"));
+    let s2 = Scene {
+        width: 128,
+        height: 2,
+        items: vec![Item {
+            content: Content::Uploaded { id: 9, width: 128, height: 2, premultiplied: false },
+            ..item(Picture::solid(1, 1, [0; 4]), Placement::default())
+        }],
+    };
+    assert_eq!(at(&c.render(&s2).unwrap_or_default(), 128, 100, 1), [1, 2, 3, 255]);
+}
+
+/// NV12 frames reuse the canvas, planes and readback buffers of the frame before: what one
+/// frame drew must never show in the next, whatever it drew or didn't.
+#[test]
+fn frames_that_reuse_their_resources_carry_nothing_over() {
+    let Some(c) = gpu() else { return };
+    let solid = |rgba: [u8; 4], size: u32| Scene {
+        width: 16,
+        height: 16,
+        items: vec![item(Picture::solid(size, size, rgba), Placement::default())],
+    };
+    let draw = |s: &Scene| c.render_nv12(s).unwrap_or_else(|e| panic!("{e}"));
+    let white = draw(&solid([255, 255, 255, 255], 16));
+    let corner = draw(&solid([255, 0, 0, 255], 4));
+    let empty = draw(&Scene { width: 16, height: 16, items: Vec::new() });
+    let white_again = draw(&solid([255, 255, 255, 255], 16));
+    assert_eq!(white, white_again, "the same scene draws the same after others");
+    assert_eq!((corner.y[0], corner.y[15 * 16 + 15]), (63, 16), "red in the corner, black elsewhere");
+    assert!(empty.y.iter().all(|y| *y == 16), "an empty frame is black, not what came before");
+    assert!(empty.uv.iter().all(|v| *v == 128));
+    // Another size alongside (an output at its own size) keeps its own.
+    let small = c
+        .render_nv12(&Scene {
+            width: 8,
+            height: 8,
+            items: vec![item(Picture::solid(8, 8, [0, 0, 0, 255]), Placement::default())],
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((small.y.len(), small.uv.len()), (64, 32));
+    assert_eq!(draw(&solid([255, 255, 255, 255], 16)), white);
+}
+
 #[test]
 fn nv12_is_bt709_limited() {
     let Some(c) = gpu() else { return };

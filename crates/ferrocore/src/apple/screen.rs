@@ -12,10 +12,11 @@ use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
+use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetWidth,
-    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
+    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
@@ -31,6 +32,9 @@ pub struct Display {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+    /// Its top left on the desktop, in points (the main display's is 0,0), as OBS names it.
+    pub x: i32,
+    pub y: i32,
 }
 
 /// A window that can be captured.
@@ -156,7 +160,7 @@ fn content() -> Result<Retained<SCShareableContent>, AvError> {
     }
 }
 
-/// What can be captured now: displays, and windows that are on screen and have a title.
+/// What can be captured now: displays, and apps' own windows that are on screen and have a title.
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     let c = content()?;
     // SAFETY: reading properties of the live content object.
@@ -164,20 +168,38 @@ pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
         let displays = c
             .displays()
             .iter()
-            .map(|d| Display { id: d.displayID(), width: d.width() as u32, height: d.height() as u32 })
+            .map(|d| {
+                let o = d.frame().origin;
+                Display {
+                    id: d.displayID(),
+                    width: d.width() as u32,
+                    height: d.height() as u32,
+                    x: o.x.round() as i32,
+                    y: o.y.round() as i32,
+                }
+            })
             .collect();
-        let windows = c
+        // Only apps' own windows on screen, as OBS lists them: the system's layers (the menu bar,
+        // the wallpaper, status icons, the Dock) and windows of no app are left out, and so
+        // is Ferrocast itself; sorted by app, then title.
+        let me = i32::try_from(std::process::id()).unwrap_or(-1);
+        let mut windows: Vec<Window> = c
             .windows()
             .iter()
+            .filter(|w| w.windowLayer() == 0 && w.isOnScreen())
             .filter_map(|w| {
                 let title = w.title()?.to_string();
-                if title.is_empty() {
+                let owner = w.owningApplication()?;
+                let app = owner.applicationName().to_string();
+                if title.trim().is_empty() || app.trim().is_empty() || owner.processID() == me {
                     return None;
                 }
-                let app = w.owningApplication().map(|a| a.applicationName().to_string()).unwrap_or_default();
                 Some(Window { id: w.windowID(), title, app })
             })
             .collect();
+        windows.sort_by(|a, b| {
+            (a.app.to_lowercase(), a.title.to_lowercase()).cmp(&(b.app.to_lowercase(), b.title.to_lowercase()))
+        });
         Ok((displays, windows))
     }
 }
@@ -202,11 +224,82 @@ pub fn apps() -> Result<Vec<App>, AvError> {
 /// (interleaved stereo float at 48 kHz, each piece with its host time) when it's captured.
 #[derive(Debug, Default)]
 struct Shared {
-    latest: Mutex<Option<Picture>>,
+    latest: Mutex<Option<Surface>>,
     frames: AtomicU64,
     sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
     /// The picture holds (no new frame kept) while an app to leave out isn't left out yet.
     hold: AtomicBool,
+    /// A window capture: its stream, kept at the window's own size as it is resized.
+    fit: Mutex<Option<WindowFit>>,
+}
+
+/// What a window capture needs to follow the window's size, as OBS's ScreenCaptureKit capture
+/// does: each frame says how big the window is now, and a new size is asked for when it
+/// changed. Asked for once, at the start, a resized window was drawn small inside the old
+/// size with black round it, and its box on the canvas no longer matched it.
+struct WindowFit {
+    stream: SendStream,
+    config: SendConfig,
+    /// The most a side may be (the canvas), and the size asked for now.
+    max: (u32, u32),
+    size: (u32, u32),
+}
+
+impl std::fmt::Debug for WindowFit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowFit").field("max", &self.max).field("size", &self.size).finish_non_exhaustive()
+    }
+}
+
+/// A stream's settings, changed from ScreenCaptureKit's queue.
+struct SendConfig(Retained<SCStreamConfiguration>);
+// SAFETY: a configuration object, only changed on the one serial queue its stream's frames
+// come on, then handed to the stream (which copies it).
+unsafe impl Send for SendConfig {}
+
+impl Shared {
+    /// After a window frame: the window's size now, and a new stream size when it changed.
+    fn follow_window(&self, sample: &CMSampleBuffer) {
+        let Ok(mut fit) = self.fit.lock() else { return };
+        let Some(fit) = fit.as_mut() else { return };
+        let Some(px) = window_pixels(sample) else { return };
+        let want = window_size(px, fit.max);
+        if want.0.abs_diff(fit.size.0) <= 2 && want.1.abs_diff(fit.size.1) <= 2 {
+            return;
+        }
+        fit.size = want;
+        // SAFETY: the stream and its configuration are live; the new size is in range.
+        unsafe {
+            fit.config.0.setWidth(want.0.clamp(16, 8192) as usize);
+            fit.config.0.setHeight(want.1.clamp(16, 8192) as usize);
+            fit.stream.0.updateConfiguration_completionHandler(&fit.config.0, None);
+        }
+    }
+}
+
+/// A window frame's window size in pixels: its content rectangle (points), times points to
+/// pixels, over how much it was scaled to fit the frame (ScreenCaptureKit's frame info).
+fn window_pixels(sample: &CMSampleBuffer) -> Option<(f64, f64)> {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSNumber, NSString};
+    use objc2_screen_capture_kit::{
+        SCStreamFrameInfoContentRect, SCStreamFrameInfoContentScale, SCStreamFrameInfoScaleFactor,
+    };
+    // SAFETY: the sample buffer is live for this call; its attachments array is a CFArray of
+    // CFDictionary, toll-free bridged to NSArray / NSDictionary.
+    unsafe {
+        let arr = sample.sample_attachments_array(false)?;
+        let arr: &NSArray<NSDictionary<NSString, AnyObject>> = &*(CFRetained::as_ptr(&arr).as_ptr().cast());
+        let info = arr.firstObject()?;
+        let number = |k: &NSString| info.objectForKey(k)?.downcast::<NSNumber>().ok().map(|n| n.doubleValue());
+        let rect = info.objectForKey(SCStreamFrameInfoContentRect)?.downcast::<NSDictionary>().ok()?;
+        let side =
+            |k: &str| rect.objectForKey(&NSString::from_str(k))?.downcast::<NSNumber>().ok().map(|n| n.doubleValue());
+        let (w, h) = (side("Width")?, side("Height")?);
+        let scale = number(SCStreamFrameInfoScaleFactor).filter(|s| *s > 0.0).unwrap_or(1.0);
+        let shrunk = number(SCStreamFrameInfoContentScale).filter(|s| *s > 0.0).unwrap_or(1.0);
+        Some((w * scale / shrunk, h * scale / shrunk))
+    }
 }
 
 /// Sound pieces kept before they're taken (about 5 s).
@@ -241,12 +334,17 @@ define_class!(
             if self.ivars().hold.load(Ordering::Relaxed) {
                 return;
             }
+            self.ivars().follow_window(sample);
             // SAFETY: the sample buffer is live for this call; an idle frame has no image.
             let Some(image) = (unsafe { sample.image_buffer() }) else { return };
-            if let Some(p) = copy_bgra(&image) {
-                if let Ok(mut l) = self.ivars().latest.lock() {
-                    *l = Some(p);
-                }
+            // Kept as the system holds it, not copied here: the engine copies it once, straight to
+            // the card, when it draws (a copy and a colour swap of every frame on this queue was
+            // the biggest CPU cost of a 1080p recording).
+            // One that can't be taken (not BGRA, no size) leaves the last good one, uncounted.
+            if let Some(surface) = Surface::of(image)
+                && let Ok(mut l) = self.ivars().latest.lock()
+            {
+                *l = Some(surface);
                 self.ivars().frames.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -295,6 +393,77 @@ fn sound_of(sample: &CMSampleBuffer) -> Option<(Vec<f32>, u64)> {
     }
 }
 
+/// A window's capture size: its pixels, made smaller (never larger) to fit in `max` with its
+/// shape kept, both sides even (the encoders' NV12 needs it).
+fn window_size((w, h): (f64, f64), max: (u32, u32)) -> (u32, u32) {
+    if !(w >= 1.0 && h >= 1.0) {
+        return max;
+    }
+    let f = (f64::from(max.0) / w).min(f64::from(max.1) / h).min(1.0);
+    let even = |v: f64| ((v * f / 2.0).round() as u32).max(8) * 2;
+    (even(w), even(h))
+}
+
+/// A frame of a display as the system holds it: BGRA, colours multiplied by alpha, not copied.
+/// It is kept (so ScreenCaptureKit can't reuse its memory) until it has been sent to the card.
+pub struct Surface {
+    image: CFRetained<objc2_core_video::CVImageBuffer>,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: a CoreVideo buffer is reference counted and the system itself passes it between its
+// queues; it is only read, under CoreVideo's own lock, and let go from any thread.
+unsafe impl Send for Surface {}
+
+impl std::fmt::Debug for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Surface({}x{})", self.width, self.height)
+    }
+}
+
+impl Surface {
+    /// None for a buffer that isn't 32-bit BGRA or has no size.
+    fn of(image: CFRetained<objc2_core_video::CVImageBuffer>) -> Option<Self> {
+        let (w, h) = (CVPixelBufferGetWidth(&image), CVPixelBufferGetHeight(&image));
+        if w == 0 || h == 0 || CVPixelBufferGetPixelFormatType(&image) != BGRA {
+            return None;
+        }
+        Some(Self { image, width: u32::try_from(w).ok()?, height: u32::try_from(h).ok()? })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Reads the pixels where they are: `f` gets them (BGRA, `stride` bytes a row), or None when
+    /// the system won't let them be read.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
+        // SAFETY: locking a live pixel buffer read-only; unlocked below with the same flag.
+        if unsafe { CVPixelBufferLockBaseAddress(&self.image, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+            return None;
+        }
+        let stride = CVPixelBufferGetBytesPerRow(&self.image);
+        let base = CVPixelBufferGetBaseAddress(&self.image).cast::<u8>();
+        let h = self.height as usize;
+        let out = if base.is_null() || stride < self.width as usize * 4 {
+            None
+        } else {
+            // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`, and nothing
+            // writes to it while it is locked for reading.
+            Some(f(unsafe { std::slice::from_raw_parts(base, stride * h) }, stride))
+        };
+        // SAFETY: locked above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&self.image, CVPixelBufferLockFlags::ReadOnly) };
+        out
+    }
+
+    /// The frame as an RGBA picture (a copy, for the ways that need one).
+    pub fn to_picture(&self) -> Option<Picture> {
+        copy_bgra(&self.image)
+    }
+}
+
 /// A BGRA pixel buffer's pixels as RGBA rows (premultiplied, as ScreenCaptureKit gives them).
 pub(crate) fn copy_bgra(image: &objc2_core_video::CVPixelBuffer) -> Option<Picture> {
     // SAFETY: locking a live pixel buffer read-only; unlocked below with the same flag.
@@ -306,12 +475,16 @@ pub(crate) fn copy_bgra(image: &objc2_core_video::CVPixelBuffer) -> Option<Pictu
     let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
     let mut out = None;
     if !base.is_null() && w > 0 && h > 0 && stride >= w * 4 {
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for y in 0..h {
+        // Each pixel is turned as one 32-bit word (blue and red swapped) so the loop compiles to
+        // wide vector moves; a byte-by-byte `extend_from_slice` per pixel was the biggest CPU
+        // cost in a 1080p recording.
+        let mut rgba = vec![0u8; w * h * 4];
+        for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
             // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`.
             let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
-            for px in row.as_chunks::<4>().0 {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
+                let v = u32::from_le_bytes(*s);
+                *d = ((v & 0xFF00_FF00) | (v << 16 & 0x00FF_0000) | (v >> 16 & 0x0000_00FF)).to_le_bytes();
             }
         }
         out = Some(Picture { width: w as u32, height: h as u32, rgba, premultiplied: true });
@@ -431,9 +604,22 @@ impl ScreenCapture {
                     SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w)
                 }
             };
+            let (max_w, max_h) = (width, height);
+            // A window is captured at its own shape: asked for the canvas's 16:9, ScreenCaptureKit
+            // drew a window of another shape into a corner of a black picture, and the source's
+            // box fitted that black picture, the window small inside it.
+            let (width, height) = match target {
+                Target::Window(_) => {
+                    let r = filter.contentRect();
+                    let s = f64::from(filter.pointPixelScale()).max(1.0);
+                    window_size((r.size.width * s, r.size.height * s), (width, height))
+                }
+                Target::Display(_) => (width, height),
+            };
             let config = SCStreamConfiguration::new();
             config.setWidth(width.clamp(16, 8192) as usize);
             config.setHeight(height.clamp(16, 8192) as usize);
+            config.setScalesToFit(true);
             config.setPixelFormat(BGRA);
             config.setMinimumFrameInterval(CMTime {
                 value: 1,
@@ -451,6 +637,16 @@ impl ScreenCapture {
             }
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
             let shared = Arc::new(Shared::default());
+            if let Target::Window(_) = target
+                && let Ok(mut fit) = shared.fit.lock()
+            {
+                *fit = Some(WindowFit {
+                    stream: SendStream(stream.clone()),
+                    config: SendConfig(config.clone()),
+                    max: (max_w, max_h),
+                    size: (width, height),
+                });
+            }
             let output = Output::new(shared.clone());
             let queue = DispatchQueue::new("ferrocast.screen", DispatchQueueAttr::SERIAL);
             stream
@@ -499,8 +695,14 @@ impl ScreenCapture {
         }
     }
 
-    /// The newest frame (taken: the next call gives the one after, or None until it comes).
+    /// The newest frame as an RGBA picture (taken: the next call gives the one after, or None
+    /// until it comes). A copy: the engine uses `take_surface`.
     pub fn take(&self) -> Option<Picture> {
+        self.take_surface().and_then(|s| s.to_picture())
+    }
+
+    /// The newest frame as the system holds it, for sending to the card without a copy of ours.
+    pub fn take_surface(&self) -> Option<Surface> {
         self.shared.latest.lock().ok().and_then(|mut l| l.take())
     }
 
@@ -599,5 +801,76 @@ mod tests {
         assert!(hides(&hide, "com.apple.mail", "Mail"));
         assert!(!hides(&hide, "com.tinyspeck.slackmacgap", "Slack"));
         assert!(!hides(&["".into()], "com.apple.x", ""));
+    }
+
+    #[test]
+    fn a_window_keeps_its_shape_and_fits_the_canvas() {
+        // A tall 2x window: its shape kept, made to fit 1920x1080, sides even.
+        assert_eq!(window_size((2200.0, 2800.0), (1920, 1080)), (848, 1080));
+        // A small window keeps its own pixels (never blown up).
+        assert_eq!(window_size((801.0, 601.0), (1920, 1080)), (802, 602));
+        // A wide one fits by its width.
+        assert_eq!(window_size((5120.0, 1440.0), (1920, 1080)), (1920, 540));
+        // No size known: the canvas.
+        assert_eq!(window_size((0.0, 0.0), (1920, 1080)), (1920, 1080));
+    }
+
+    /// A BGRA pixel buffer with `rows` rows of `width` pixels, each pixel `bgra`, and a stride
+    /// wider than the row (the system pads them).
+    fn bgra_buffer(width: usize, rows: usize, bgra: [u8; 4]) -> Option<CFRetained<objc2_core_video::CVImageBuffer>> {
+        use std::ptr::NonNull;
+        let mut out: *mut objc2_core_video::CVPixelBuffer = std::ptr::null_mut();
+        // SAFETY: a new buffer asked for with no attributes; `out` is a valid pointer to fill.
+        let r = unsafe {
+            objc2_core_video::CVPixelBufferCreate(None, width, rows, BGRA, None, NonNull::new(&raw mut out)?)
+        };
+        if r != 0 {
+            return None;
+        }
+        // SAFETY: `out` is a new +1 retained buffer on success; the CFRetained now owns it.
+        let buf = unsafe { CFRetained::from_raw(NonNull::new(out)?) };
+        // SAFETY: locked for writing (flags 0) around the writes below, then unlocked.
+        unsafe { CVPixelBufferLockBaseAddress(&buf, CVPixelBufferLockFlags::empty()) };
+        let (stride, base) = (CVPixelBufferGetBytesPerRow(&buf), CVPixelBufferGetBaseAddress(&buf).cast::<u8>());
+        for y in 0..rows {
+            for x in 0..width {
+                // SAFETY: inside the locked buffer's `rows` rows of `stride` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(bgra.as_ptr(), base.add(y * stride + x * 4), 4) };
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&buf, CVPixelBufferLockFlags::empty()) };
+        Some(buf)
+    }
+
+    /// A frame of the screen goes to the card as it is and comes out in the right colours:
+    /// ScreenCaptureKit's BGRA is read as red, green, blue, with no swap of ours.
+    #[test]
+    fn a_screen_frame_reaches_the_card_in_the_right_colours() {
+        use crate::{Content, Item, Placement, Scene};
+        let Ok(gpu) = crate::Compositor::new() else { return };
+        // Blue 10, green 120, red 250, opaque: width 70 (stride padded past 280 bytes).
+        let Some(buf) = bgra_buffer(70, 5, [10, 120, 250, 255]) else { return };
+        let surface = Surface::of(buf).unwrap_or_else(|| panic!("a BGRA buffer is taken"));
+        assert_eq!(surface.size(), (70, 5));
+        let scene = Scene {
+            width: 70,
+            height: 5,
+            items: vec![Item {
+                content: Content::Uploaded { id: 3, width: 70, height: 5, premultiplied: true },
+                ..Item::picture(Picture::solid(1, 1, [0; 4]), Placement::default())
+            }],
+        };
+        // Twice, and a third time after a frame is drawn (kept buffers, then the plain way).
+        for _ in 0..3 {
+            gpu.upload_surface(3, &surface).unwrap_or_else(|e| panic!("{e}"));
+            let px = gpu.render(&scene).unwrap_or_default();
+            let at = |x: usize, y: usize| px[(y * 70 + x) * 4..(y * 70 + x) * 4 + 4].to_vec();
+            assert_eq!(at(0, 0), vec![250, 120, 10, 255]);
+            assert_eq!(at(69, 4), vec![250, 120, 10, 255]);
+        }
+        // The same frame as an RGBA picture (the other way to take it) agrees.
+        let p = surface.to_picture().unwrap_or_else(|| panic!("a picture"));
+        assert_eq!(&p.rgba[..4], &[250, 120, 10, 255]);
     }
 }
