@@ -209,6 +209,10 @@ pub fn show(start: Start) -> ExitCode {
                 let _ = webview.evaluate_script(&js);
             }
             TaoEvent::UserEvent(Ui::Exit(code)) => {
+                // Gone at once: WebView2 takes a few seconds to shut down, and the window sat
+                // there not answering meanwhile (Finish seemed stuck while Ferrocast opened).
+                window.set_visible(false);
+                EXIT.store(i32::from(code), Ordering::Relaxed);
                 *flow = ControlFlow::ExitWithCode(i32::from(code));
             }
             TaoEvent::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -216,8 +220,16 @@ pub fn show(start: Start) -> ExitCode {
                 if busy.load(Ordering::Relaxed) {
                     let _ = webview.evaluate_script("window.setup && window.setup.closeAsked()");
                 } else {
+                    window.set_visible(false);
+                    EXIT.store(1, Ordering::Relaxed);
                     *flow = ControlFlow::ExitWithCode(1);
                 }
+            }
+            // Out of the loop: the process ends now, without waiting on WebView2's own shutdown
+            // (its helper processes close by themselves when setup has gone).
+            TaoEvent::LoopDestroyed => {
+                log("setup closed");
+                std::process::exit(EXIT.load(Ordering::Relaxed));
             }
             _ => {}
         }
@@ -325,6 +337,9 @@ fn send_space(s: &Session, proxy: &EventLoopProxy<Ui>, dir: &std::path::Path) {
     let need = pkg.manifest.total + pkg.manifest.total / 10;
     send(proxy, "space", &space_info(dir, need, &pkg.manifest.main));
 }
+
+/// The code setup ends with (set when the loop is told to end).
+static EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 enum WindowAsk {
     Minimize,
