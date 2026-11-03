@@ -129,10 +129,10 @@ pub fn pack(dir: &Path, version: &str, main: &str, out: &mut impl Write) -> io::
     out.write_all(&u32::try_from(json.len()).map_err(io::Error::other)?.to_le_bytes())?;
     out.write_all(&json)?;
 
-    // Strongest LZMA2 with the x86 filter (smaller programs), in 32 MB blocks so every core helps.
+    // Strongest LZMA2, in 32 MB blocks so every core helps. No x86 (BCJ) pre-filter:
+    // lzma-rust2 0.25's damaged real programs with it (the first runner test caught it).
     let mut opts = lzma_rust2::XzOptions::with_preset(9);
     opts.set_block_size(NonZeroU64::new(32 << 20));
-    opts.prepend_pre_filter(lzma_rust2::filter::FilterType::BcjX86, 0);
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).min(16) as u32;
     let mut xz = lzma_rust2::XzWriterMt::new(out, opts, workers)?;
     for (_, path) in &files {
@@ -423,5 +423,22 @@ mod tests {
         payload.extend_from_slice(&(json.len() as u32).to_le_bytes());
         payload.extend_from_slice(&json);
         assert!(matches!(read_head(&payload), Err(UnpackError::Damaged(_))));
+    }
+}
+
+#[cfg(test)]
+mod real {
+    /// A real build of the app, packed and unpacked (slow, so by hand):
+    /// `FC_PACK_DIR=<folder with ferrocast.exe> cargo test --release -p ferrocast-setup real -- --ignored`
+    #[test]
+    #[ignore]
+    fn a_real_app_round_trips() {
+        let dir = std::path::PathBuf::from(std::env::var("FC_PACK_DIR").unwrap());
+        let mut out = Vec::new();
+        let m = super::pack(&dir, "1", "ferrocast.exe", &mut out).unwrap();
+        let (m2, body) = super::read_head(&out).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        super::unpack(body, &m2, dest.path(), &mut |_| true).unwrap();
+        assert_eq!(m, m2);
     }
 }
