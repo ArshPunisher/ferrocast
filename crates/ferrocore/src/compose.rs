@@ -193,12 +193,31 @@ impl Compositor {
         pollster::block_on(Self::open())
     }
 
-    async fn open() -> Result<Self, AvError> {
+    /// The graphics card. On Windows Direct3D 12 first: it's what Windows presents a window's
+    /// picture with (the preview, a child window over the web page), where Vulkan's swap chains
+    /// over another app's window (WebView2) are left to each driver; any other backend after.
+    async fn card() -> Result<(wgpu::Instance, wgpu::Adapter), AvError> {
+        #[cfg(target_os = "windows")]
+        {
+            let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
+            d.backends = wgpu::Backends::DX12;
+            let instance = wgpu::Instance::new(d);
+            // Windows' first card, the one its displays are on (as OBS picks by default).
+            match instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await {
+                Ok(a) => return Ok((instance, a)),
+                Err(e) => tracing::info!(error = %e, "no Direct3D 12 card: trying the others"),
+            }
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .map_err(|e| AvError::NoGpu(e.to_string()))?;
+        Ok((instance, adapter))
+    }
+
+    async fn open() -> Result<Self, AvError> {
+        let (instance, adapter) = Self::card().await?;
         // Every texture is seen two ways (linear and as stored), which basic OpenGL can't do.
         if !adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::VIEW_FORMATS) {
             return Err(AvError::NoGpu(format!(
