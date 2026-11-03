@@ -46,6 +46,12 @@ impl Denoiser {
         })
     }
 
+    /// How late the cleaned sound comes out, in samples: the block of silence it starts with,
+    /// the rest of the model's window, and the frames it looks ahead (40 ms with its model).
+    pub(crate) fn latency(&self) -> usize {
+        self.df.fft_size + self.df.lookahead * self.hop
+    }
+
     pub(crate) fn channels(&self) -> usize {
         self.inp.len()
     }
@@ -100,8 +106,11 @@ impl std::fmt::Debug for Denoiser {
     }
 }
 
-/// A stereo block, there and back.
-type Block = (Vec<f32>, Vec<f32>);
+/// A stereo block, there and back, with its number.
+type Block = (u64, Vec<f32>, Vec<f32>);
+
+/// Slow blocks in a row before the strong noise removal gives way to the light one.
+const MISSES: u32 = 3;
 
 /// Our engine's sound filter: a stereo Denoiser on a thread of its own (the model can't move
 /// between threads, the mixer's filters do); each block goes there and comes back cleaned.
@@ -109,19 +118,23 @@ type Block = (Vec<f32>, Vec<f32>);
 struct Plugin {
     to: std::sync::mpsc::Sender<Block>,
     from: std::sync::mpsc::Receiver<Block>,
+    /// The next block's number, slow blocks in a row now, and the model's delay (samples).
+    seq: u64,
+    missed: u32,
+    latency: usize,
 }
 
 impl Plugin {
     fn start(strength: u32) -> Result<Self, String> {
         let (to, inbox) = std::sync::mpsc::channel::<Block>();
         let (outbox, from) = std::sync::mpsc::channel::<Block>();
-        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (ready_tx, ready) = std::sync::mpsc::channel::<Result<usize, String>>();
         std::thread::Builder::new()
             .name("ferrocast-denoise".into())
             .spawn(move || {
                 let mut d = match Denoiser::new(2, strength) {
                     Ok(d) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(d.latency()));
                         d
                     }
                     Err(e) => {
@@ -130,37 +143,60 @@ impl Plugin {
                     }
                 };
                 // Until the filter goes (its sender with it).
-                for (mut l, mut r) in inbox {
+                for (n, mut l, mut r) in inbox {
                     d.run(&mut [&mut l, &mut r]);
-                    if outbox.send((l, r)).is_err() {
+                    if outbox.send((n, l, r)).is_err() {
                         return;
                     }
                 }
             })
             .map_err(|e| e.to_string())?;
-        ready.recv().map_err(|e| e.to_string())??;
-        Ok(Self { to, from })
+        let latency = ready.recv().map_err(|e| e.to_string())??;
+        Ok(Self { to, from, seq: 0, missed: 0, latency })
     }
 }
 
 impl ferrocore::afx::SoundPlugin for Plugin {
     fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
         let [l, r] = ch;
+        let n = self.seq;
+        self.seq += 1;
         // Its thread gone: the light noise removal instead.
-        if self.to.send((l.to_vec(), r.to_vec())).is_err() {
+        if self.to.send((n, l.to_vec(), r.to_vec())).is_err() {
             return false;
         }
-        // A block back within four of its own length (at least 100 ms), or this computer is too
-        // slow for the model and the mixer mustn't wait on it.
+        // A block back within four of its own length (at least 100 ms), or the mixer mustn't
+        // wait on it. Answers to blocks it gave up on before are let go as they come.
         let limit = std::time::Duration::from_secs_f64((l.len() as f64 / 48_000.0 * 4.0).max(0.1));
-        match self.from.recv_timeout(limit) {
-            Ok((cl, cr)) if cl.len() >= l.len() && cr.len() >= r.len() => {
-                l.copy_from_slice(&cl[..l.len()]);
-                r.copy_from_slice(&cr[..r.len()]);
-                true
+        let until = std::time::Instant::now() + limit;
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            match self.from.recv_timeout(left) {
+                Ok((got, cl, cr)) if got == n && cl.len() >= l.len() && cr.len() >= r.len() => {
+                    l.copy_from_slice(&cl[..l.len()]);
+                    r.copy_from_slice(&cr[..r.len()]);
+                    self.missed = 0;
+                    return true;
+                }
+                Ok((got, ..)) if got < n => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // One slow block (the computer busy for a moment) is a moment of quiet, in
+                    // step with the rest; a few in a row and this computer is too slow for it.
+                    self.missed += 1;
+                    if self.missed >= MISSES {
+                        return false;
+                    }
+                    l.fill(0.0);
+                    r.fill(0.0);
+                    return true;
+                }
+                _ => return false,
             }
-            _ => false,
         }
+    }
+
+    fn latency_frames(&self) -> usize {
+        self.latency
     }
 }
 
@@ -191,6 +227,43 @@ mod tests {
 
     fn rms(s: &[f32]) -> f32 {
         (s.iter().map(|x| x * x).sum::<f32>() / s.len().max(1) as f32).sqrt()
+    }
+
+    /// How late the cleaned sound comes out (in samples), found by matching it to what went in.
+    fn delay_of(d: &mut Denoiser) -> usize {
+        let mut seed = 3;
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for _ in 0..94 {
+            // A rich, voice-like buzz (harmonics of 140 Hz) the lightest touch leaves alone.
+            let base = before.len();
+            let mut l: Vec<f32> = (0..1024)
+                .map(|i| {
+                    let t = (base + i) as f32 / 48_000.0;
+                    (1..12).map(|k| (std::f32::consts::TAU * 140.0 * k as f32 * t).sin() / k as f32).sum::<f32>() * 0.1
+                        + hiss(1, &mut seed)[0] * 0.05
+                })
+                .collect();
+            let mut r = l.clone();
+            before.extend_from_slice(&l);
+            d.run(&mut [&mut l, &mut r]);
+            after.extend_from_slice(&l);
+        }
+        let (a, b) = (&after[48_000..90_000], &before[..]);
+        (0..4_800)
+            .max_by(|x, y| {
+                let c = |lag: usize| a.iter().enumerate().map(|(i, v)| v * b[48_000 + i - lag]).sum::<f32>();
+                c(*x).total_cmp(&c(*y))
+            })
+            .unwrap_or(0)
+    }
+
+    /// The delay it says it has is the one it has (the mixer makes up for exactly that).
+    #[test]
+    fn its_delay_is_what_it_says() {
+        let mut d = Denoiser::new(2, 1).expect("the built-in model starts");
+        let said = d.latency();
+        assert_eq!(delay_of(&mut d), said, "measured against reported, in samples");
+        assert_eq!(said, 1920, "40 ms with the built-in model");
     }
 
     #[test]

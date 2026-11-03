@@ -21,6 +21,10 @@ pub const TRACKS: usize = 6;
 const SMOOTHING_NS: u64 = 70_000_000;
 /// The longest gap ahead filled with silence; beyond it, the queue starts again.
 const MAX_GAP_NS: u64 = 2_000_000_000;
+/// The most the mixer waits for late sound (libobs's own limit is near a second).
+const MAX_LATENCY_NS: u64 = 1_000_000_000;
+/// Room added over the lateness seen when the mixer waits longer.
+const LATENCY_ROOM_NS: u64 = 20_000_000;
 /// A source never holds more than this much sound waiting (a stalled mixer can't grow memory).
 const MAX_QUEUE_SECS: usize = 5;
 /// Input frames the resampler takes at a time.
@@ -190,6 +194,11 @@ impl Mixer {
         self.rate
     }
 
+    /// How far behind the clock blocks are made now (it grows when sound comes late).
+    pub fn latency_ns(&self) -> u64 {
+        self.latency_ns
+    }
+
     /// Starts listening to source `id`'s sound (see [`Tap`]).
     pub fn tap(&mut self, id: u64) -> Tap {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -258,11 +267,36 @@ impl Mixer {
     /// `rate`, its first frame at `ts_ns`. Unknown sources are ignored.
     pub fn push(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) {
         let out_rate = self.rate;
-        let Some(src) = self.sources.get_mut(&id) else { return };
         if channels == 0 || rate == 0 || pcm.is_empty() {
             return;
         }
-        let ts = (ts_ns as i64 + src.settings.sync_offset_ns).max(0) as u64;
+        // Its sync offset, less what its filters hold it back by (the strong noise removal
+        // gives a voice back 40 ms late): filed that much earlier, it comes out on time.
+        let Some(offset) = self.sources.get(&id).map(|s| {
+            let held: usize = s.filters.iter().map(AudioFilter::latency_frames).sum();
+            s.settings.sync_offset_ns - (held as u64 * 1_000_000_000 / u64::from(out_rate)) as i64
+        }) else {
+            return;
+        };
+        let ts = (ts_ns as i64 + offset).max(0) as u64;
+        // Sound for a time already mixed came too late: its start would be cut off, and with a
+        // source that's always this late (ScreenCaptureKit hands sound over 20-40 ms after it
+        // plays, and the engine takes it once a frame) every piece lost its start, a break
+        // several times a second. As libobs does, the mixer waits that much longer from now on
+        // (never less again; at most a second).
+        if let Some(next) = self.next_ns
+            && ts < next
+            && self.latency_ns < MAX_LATENCY_NS
+        {
+            let was = self.latency_ns;
+            self.latency_ns = (was + (next - ts) + LATENCY_ROOM_NS).min(MAX_LATENCY_NS);
+            tracing::info!(
+                from_ms = was / 1_000_000,
+                to_ms = self.latency_ns / 1_000_000,
+                "sound came late: the mixer waits longer for it"
+            );
+        }
+        let Some(src) = self.sources.get_mut(&id) else { return };
         // Where this sound would continue what's queued: jitter is smoothed over; a gap ahead
         // (a source that went quiet, beeps scheduled apart) is filled with silence, as libobs
         // does, so nothing queued is lost; a jump back or a long jump (a seek) restarts the queue.
@@ -480,6 +514,97 @@ impl Mixer {
 
 #[cfg(test)]
 mod tests {
+    /// A filter that holds sound back (as the strong noise removal does, 40 ms) is made up
+    /// for: a click filed at a moment comes out at that moment, not the filter's delay later.
+    #[test]
+    fn a_filters_delay_is_made_up_for() {
+        #[derive(Debug)]
+        struct Late([std::collections::VecDeque<f32>; 2]);
+        impl crate::afx::SoundPlugin for Late {
+            fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+                for (c, q) in ch.into_iter().zip(self.0.iter_mut()) {
+                    for v in c.iter_mut() {
+                        q.push_back(*v);
+                        *v = q.pop_front().unwrap_or(0.0);
+                    }
+                }
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                480
+            }
+        }
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 200_000_000);
+        m.set(1, SourceSettings::default());
+        // 480 frames (10 ms) of delay on each side.
+        let late = Late([std::iter::repeat_n(0.0, 480).collect(), std::iter::repeat_n(0.0, 480).collect()]);
+        if let Some(s) = m.sources.get_mut(&1) {
+            s.filters = vec![AudioFilter::with_plugin(Box::new(late), rate)];
+        }
+        let t0 = 5_000_000_000u64;
+        let click_at = t0 + 500_000_000;
+        let mut pcm = vec![0f32; 48_000 * 2];
+        pcm[24_000 * 2] = 1.0;
+        pcm[24_000 * 2 + 1] = 1.0;
+        let _ = m.mix_until(t0 + 200_000_000);
+        m.push(1, &pcm, 2, rate, t0);
+        let mut heard = None;
+        for b in m.mix_until(t0 + 1_400_000_000) {
+            if let Some(i) = b.tracks[0].as_chunks::<2>().0.iter().position(|f| f[0] > 0.5) {
+                heard = Some(b.ts_ns + i as u64 * 1_000_000_000 / u64::from(rate));
+            }
+        }
+        let heard = heard.unwrap_or_else(|| panic!("the click came out"));
+        assert!(heard.abs_diff(click_at) < 100_000, "the click {} µs off", (heard as i64 - click_at as i64) / 1000);
+    }
+
+    /// A 440 Hz tone captured as ScreenCaptureKit hands it over (20 ms pieces, each 20 to 45 ms
+    /// after it played, taken once a video frame at 30 fps) comes out whole: no break in it.
+    #[test]
+    fn late_pieces_of_sound_come_out_whole() {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let piece = 960usize;
+        let mut made = 0usize; // frames of the tone handed to the mixer
+        let mut out: Vec<f32> = Vec::new();
+        let frame_ns = 1_000_000_000 / 30;
+        let mut now = t0;
+        while now < t0 + 6_000_000_000 {
+            now += frame_ns;
+            // Every piece that has arrived by now (its end, plus 20 to 45 ms).
+            loop {
+                let start_ns = t0 + made as u64 * 1_000_000_000 / u64::from(rate);
+                let end_ns = start_ns + piece as u64 * 1_000_000_000 / u64::from(rate);
+                let late = 20_000_000 + (made / piece % 6) as u64 * 5_000_000;
+                if end_ns + late > now {
+                    break;
+                }
+                let pcm: Vec<f32> = (made..made + piece)
+                    .flat_map(|i| {
+                        let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                        [v, v]
+                    })
+                    .collect();
+                m.push(1, &pcm, 2, rate, start_ns);
+                made += piece;
+            }
+            for b in m.mix_until(now) {
+                out.extend(b.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        // From where the tone starts, skip the first second (the mixer settles), then no
+        // sample may jump more than the tone itself can.
+        let first = out.iter().position(|v| v.abs() > 0.01).unwrap_or(0) + rate as usize;
+        let tone = &out[first..out.len() - 4096];
+        let lim = 0.5 * std::f32::consts::TAU * 440.0 / rate as f32 * 1.5;
+        let breaks = tone.windows(2).filter(|w| (w[1] - w[0]).abs() > lim).count();
+        assert!(tone.len() > rate as usize * 3, "{} frames out", tone.len());
+        assert_eq!(breaks, 0, "breaks in the tone; latency now {} ms", m.latency_ns() / 1_000_000);
+    }
+
     use super::*;
 
     const RATE: u32 = 48_000;

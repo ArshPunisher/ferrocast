@@ -17,6 +17,12 @@ pub fn mul_to_db(mul: f32) -> f32 {
 /// removal takes over.
 pub trait SoundPlugin: Send + std::fmt::Debug {
     fn process(&mut self, ch: [&mut [f32]; 2]) -> bool;
+
+    /// How late its sound comes out (frames at the mixer's rate): the mixer files the source's
+    /// sound that much earlier, so a voice cleaned by it stays in step with the picture.
+    fn latency_frames(&self) -> usize {
+        0
+    }
 }
 
 /// Makes the strong noise removal at a strength (1 to 100), when the app has one.
@@ -153,6 +159,19 @@ impl AudioFilter {
             floor: 0.0,
             nr_gain: 1.0,
         }
+    }
+
+    /// A filter that is just `plugin` (tests: a plugin of their own, not the app's).
+    #[cfg(test)]
+    pub(crate) fn with_plugin(plugin: Box<dyn SoundPlugin>, rate: u32) -> Self {
+        let mut f = Self::new(AudioEffect::Gain { db: 0.0 }, rate);
+        f.plugin = Some(plugin);
+        f
+    }
+
+    /// How late this filter's sound comes out, in frames (a plugin's; the engine's own add none).
+    pub fn latency_frames(&self) -> usize {
+        self.plugin.as_ref().map_or(0, |p| p.latency_frames())
     }
 
     /// Filters a block in place (both sides the same length).
