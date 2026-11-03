@@ -176,8 +176,11 @@ jobs:
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
           cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
+      # Off until the Windows builds are code-signed: Smart App Control (on in fresh Windows 11)
+      # blocks an unsigned setup Microsoft hasn't seen before, and ours carries the app packed
+      # in one file. NSIS's installer, unsigned too, is let through (3 Nov 2026 test).
       - name: Ferrocast's own Windows setup in place of NSIS's (built, then installed, updated, uninstalled here)
-        if: matrix.name == 'Windows'
+        if: false && matrix.name == 'Windows'
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
