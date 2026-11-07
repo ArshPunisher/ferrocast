@@ -153,6 +153,8 @@ pub struct Compositor {
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     /// The preview's painter, by the window surface's format.
     pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
+    /// Held to submit and to configure a window surface (see `configure`).
+    submitting: Mutex<()>,
 }
 
 /// What an item draws: a picture, a texture made on the GPU (filtered), or other items.
@@ -188,6 +190,22 @@ struct Quad<'a> {
 }
 
 impl Compositor {
+    /// Sends work to the card. Every submit goes through here, so none lands while a window
+    /// surface is being configured (see `configure`).
+    pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(&self, work: I) {
+        let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.queue.submit(work);
+    }
+
+    /// Configures a window surface (the preview's). wgpu waits for the card to be idle first
+    /// and refuses if another thread submitted meanwhile ("Failed to wait for GPU to come idle
+    /// before reconfiguring the Surface", logged on Windows while resizing: the engine's frame
+    /// loop draws the outputs as the main thread resizes the preview). Submits wait for it.
+    pub(crate) fn configure(&self, surface: &wgpu::Surface<'_>, config: &wgpu::SurfaceConfiguration) {
+        let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        surface.configure(&self.device, config);
+    }
+
     /// Opens the system's graphics card, headless (no window needed).
     pub fn new() -> Result<Self, AvError> {
         pollster::block_on(Self::open())
@@ -430,6 +448,7 @@ impl Compositor {
             instance,
             adapter,
             preview_pipelines: Mutex::new(HashMap::new()),
+            submitting: Mutex::new(()),
             uploads: Mutex::new(HashMap::new()),
             staging: Mutex::new(HashMap::new()),
             rigs: Mutex::new(Vec::new()),
@@ -1529,7 +1548,7 @@ impl Compositor {
             texture.as_image_copy(),
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
-        self.queue.submit([enc.finish()]);
+        self.submit([enc.finish()]);
         let ready = ready.clone();
         buf.slice(..).map_async(wgpu::MapMode::Write, move |r| {
             if r.is_ok() {
@@ -1669,7 +1688,7 @@ impl Compositor {
             );
             bufs.push((out, row, padded, h));
         }
-        self.queue.submit([enc.finish()]);
+        self.submit([enc.finish()]);
         let (tx, rx) = mpsc::channel();
         for (out, ..) in &bufs {
             let tx = tx.clone();

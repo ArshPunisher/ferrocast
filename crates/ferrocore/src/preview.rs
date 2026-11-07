@@ -188,7 +188,7 @@ impl Compositor {
             view_formats: Vec::new(),
             color_space: Default::default(),
         };
-        surface.configure(&self.device, &config);
+        self.configure(&surface, &config);
         Ok(PreviewSurface { surface, config })
     }
 
@@ -197,7 +197,7 @@ impl Compositor {
         let (w, h) = (width.max(1), height.max(1));
         if (s.config.width, s.config.height) != (w, h) {
             (s.config.width, s.config.height) = (w, h);
-            s.surface.configure(&self.device, &s.config);
+            self.configure(&s.surface, &s.config);
         }
     }
 
@@ -207,11 +207,11 @@ impl Compositor {
         let frame = match s.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                s.surface.configure(&self.device, &s.config);
+                self.configure(&s.surface, &s.config);
                 f
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                s.surface.configure(&self.device, &s.config);
+                self.configure(&s.surface, &s.config);
                 return Ok(());
             }
             _ => return Ok(()),
@@ -220,7 +220,7 @@ impl Compositor {
         let mut enc = self.device.create_command_encoder(&Default::default());
         let canvas = self.canvas_of(&mut enc, shown)?;
         self.paint(&mut enc, &view, s.config.format, (s.config.width, s.config.height), &canvas, look);
-        self.queue.submit([enc.finish()]);
+        self.submit([enc.finish()]);
         self.queue.present(frame);
         // What finished drawing is let go now (Direct3D and Vulkan hold it until asked).
         let _ = self.device.poll(wgpu::PollType::Poll);

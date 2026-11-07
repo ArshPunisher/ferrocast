@@ -1843,7 +1843,7 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
             // Pictures uploaded this frame are sent even when nothing drew (no preview, no
             // output), and what the card finished with is let go: without this, Direct3D and
             // Vulkan keep it all and run out of memory in minutes.
-            gpu.queue.submit(std::iter::empty());
+            gpu.submit(std::iter::empty());
             let _ = gpu.device.poll(wgpu::PollType::Poll);
         }));
         if let Err(p) = ok {
