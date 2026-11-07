@@ -1,0 +1,157 @@
+# Windows: plan for the next session (written 4 Nov 2026)
+
+## Start here (Claude running on the owner's Windows PC)
+
+You are on the owner's own Windows 11 PC, which is the machine the bugs below happen on. That
+solves this plan's biggest problem: until now nobody could **run** the Windows engine, it was
+only compiled on GitHub. Run everything here and look at it before calling anything fixed.
+
+**Repo and branch.** `ferrocast` repo, branch `own-engine-only` (Ferrocast's own engine,
+Ferrocore, in `crates/ferrocore`; no OBS/libobs: the owner chose that on 1 Nov 2026). The web
+dashboard is a separate repo, `ferrocast-web`, same branch name `own-engine-only`: build it
+with `pnpm install --frozen-lockfile && pnpm build` and point `FERROCAST_WEB_DIST` at its
+`dist` folder when building the app (see `.github/workflows/release.yml`, "Build the app").
+
+**Tools this PC needs:** Rust (rustup, MSVC toolchain + Visual Studio Build Tools "Desktop
+development with C++"), Node 22 + pnpm, `cargo install tauri-cli --version "^2" --locked`,
+WebView2 (already in Windows 11), Git.
+
+**Running a dev build and driving it.**
+- `cargo build -p ferrocast-desktop`, then start `target\debug\ferrocast.exe` with
+  `FERROCAST_HOME` set to an empty test folder (keeps the owner's real data out of tests) and
+  `FERROCAST_DEBUG_TOKEN_FILE=<file>`: a dev build writes "<base url> <token>" there.
+- Drive the Studio through the local API with that token:
+  `<base>/api/v1/studio/engine/...` with `Authorization: Bearer <token>`.
+- The app is single-instance: close the installed Ferrocast first.
+- Logs: `%APPDATA%\Ferrocast\logs` (installed app) or under `FERROCAST_HOME`.
+- Engine CPU test: `cargo run --release -p ferrocore --example cpu_soak -- <secs> <fps>`.
+
+**Owner's rules (from their own setup, follow them):**
+- Commit only when the owner says "commit"/"commit and push". Small focused commits,
+  conventional messages with a scope (`fix(ferrocore): ...`), body says why. The commit-msg
+  hook (`tools/check-commit-msg.sh`) rejects subjects over 72 characters after the colon.
+- Author is the owner only: never add `Co-Authored-By`, "Generated with Claude Code" or any
+  AI attribution. Never commit secrets or `.env`, never force-push, push only this branch.
+- Before committing, run CodeRabbit (`coderabbit review --agent --uncommitted`, free plan,
+  3 an hour, never `--use-credits`); if it can't run, do your own review at the same bar.
+- Don't spawn subagents or run several agents without asking the owner first.
+- Write to the owner in plain, short English; they say "do all" often, but ask before big
+  choices that are theirs (like bringing libobs back).
+
+**What's already in this branch for Windows (all untested on a real PC):** WGC capture
+(`win/wgc.rs`, now BGRA surfaces), per-app sound through WASAPI process loopback
+(`win/app_sound.rs`, the first crash suspect), Direct3D 12 first in `compose.rs`, preview as a
+child HWND (`crates/studio/src/ffi/win.rs`), our own setup program `apps/setup` (switched off
+in the release workflow until Windows code signing exists; builds ship NSIS).
+
+---
+
+Owner's test of the 4 Nov build (run 41691853753, NSIS, commits up to c690c60) on a real
+Windows 11 PC:
+
+1. The exe still shows the default NSIS "disc" icon, and the installer is the plain default
+   NSIS UI (expected: no branding was done yet; the icon fix `installerIcon` didn't show).
+2. Adding a Chrome **window** source closes the app with no message (silent crash).
+3. The app lags badly on Windows.
+
+Owner: "too buggy on Windows, use a different, better approach. Plan only, do it next session."
+
+## Root problem
+
+None of the Windows engine code has ever been **run** by us. Everything was only compiled on
+CI. Every fix so far was a guess from reading code. So step 0 is getting a Windows machine we
+can drive and watch, and only then fixing.
+
+## Step 0: a Windows machine we can run and see (do first)
+
+Now: this PC (see "Start here"). Reproduce each bug here first, with the log and a crash
+dump. Later, so it never breaks unseen again, also add:
+
+- **A. GitHub's Windows runner as a test bench.** It has a desktop session, a GPU-less WARP
+  device and can run WGC/WASAPI (verify). Add a CI job `windows-smoke` that:
+  starts the built app with `FERROCAST_DEBUG_TOKEN_FILE`, drives the local API
+  (`/api/v1/studio/engine/...`) to add a display source, a window source (start Notepad or
+  Edge with a page first), a microphone and Desktop Audio; records 20 s; checks the app is
+  still alive, CPU (Get-Process), the MP4 (ffprobe: video + sound present), and uploads
+  screenshots, the log and any crash dump as artifacts. Free; repeatable on every push.
+- **B. A Windows 11 VM on this Mac** (UTM or Parallels, Windows 11 ARM running the x64 build
+  under emulation, or an aarch64-pc-windows-msvc build). Lets me watch the preview by eye.
+- **C. Remote access to the owner's PC** for a final check only.
+
+Also ship **crash reports** in Windows builds: a minidump on any native crash (crate
+`minidumper` + `crash-handler`, written to `%APPDATA%\Ferrocast\crashes`) and a panic hook that
+logs the backtrace. A silent close must leave a file we can read.
+
+## Step 1: the Chrome window crash
+
+Suspects, in order (check with the crash dump / smoke test):
+
+1. New per-app sound (`crates/ferrocore/src/win/app_sound.rs`, commit c5c7ce9): COM
+   `ActivateAudioInterfaceAsync` + our `#[implement]` handler, `PROPVARIANT` blob, the
+   capture thread. A native fault there kills the process (catch_unwind can't catch it).
+   Quick test: start the window source with sound off (`FERROCAST_NO_APP_SOUND=1` switch).
+2. WGC window capture of Chrome (`win/wgc.rs`): Chrome's window is GPU-composited; the pool's
+   `Recreate` on resize, `ContentSize` vs texture size, the new BGRA `Surface` path
+   (commit 31e2640): a row read past the mapped texture would crash.
+3. Window id truncation: `hwnd.0 as usize as u32` (screen.rs) — a 64-bit HWND cut to 32 bits
+   is usually fine but not guaranteed; keep the full value (u64) end to end.
+
+Fix the cause, keep a test in the smoke job that adds a Chrome/Edge window and plays sound.
+
+## Step 2: the lag — move the Windows path to the GPU end to end (OBS's way)
+
+Today each Windows frame goes GPU → CPU (staging map) → CPU copy → GPU (wgpu upload), on two
+separate GPU devices (WGC on D3D11, wgpu on D3D12). OBS never brings frames to the CPU.
+
+Better approach:
+
+- **Zero-copy capture:** make WGC's D3D11 device and wgpu's D3D12 device the same adapter,
+  copy each frame into a **shared texture** (D3D11 `CreateTexture2D` with
+  `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, opened in D3D12 with `OpenSharedHandle`) and wrap it
+  in wgpu with `wgpu::hal::dx12` `texture_from_raw` / `Device::create_texture_from_hal`.
+  The compositor samples it directly: no map, no CPU copy, no upload. Keep the current CPU
+  path as the fallback (WARP, odd adapters).
+- **Encoders:** check which encoder runs on Windows; use the GPU one (NVENC / AMF / QSV via
+  FFmpeg, or Media Foundation) by default, x264 only as fallback. Feed it NV12 straight from
+  the GPU where FFmpeg allows (d3d11va frames), otherwise one readback per output frame.
+- **Measure:** the smoke job prints CPU % and dropped frames for display/window at 1080p30 and
+  1080p60; target close to 2.3.0 (libobs) on the same machine.
+
+## Step 3: the preview window (canvas empty / lag on resize)
+
+The preview is a child HWND over WebView2 with a wgpu swap chain (`studio/src/ffi/win.rs`,
+`ferrocore/src/preview.rs`). Options:
+
+- **Keep the child window, do it right:** follow the parent's size in the same step (subclass
+  the main window, resize the child on `WM_SIZE`/`WM_WINDOWPOSCHANGED` like the Mac's
+  `follow_window`), present with a flip-model swap chain sized to the child, `WS_CLIPCHILDREN`
+  on the parent so WebView2 doesn't paint over it.
+- **Or DirectComposition:** wgpu can make a surface from a DComp visual
+  (`SurfaceTargetUnsafe::CompositionVisual`). Put the preview visual in the same window's
+  DComp tree above the webview: no extra HWND, no z-order fights, moves with the window.
+  Try this if the child window keeps misbehaving.
+
+## Step 4: the installer
+
+- **Icon:** confirm on CI whether `bundle.windows.nsis.installerIcon` is really in the exe
+  (PowerShell `[System.Drawing.Icon]::ExtractAssociatedIcon`, save as PNG artifact). The
+  owner's Explorer may also show a cached icon for the same file name: test with a renamed
+  copy. If Tauri ignores the setting, use a custom NSIS template
+  (`bundle.windows.nsis.template`) with `!define MUI_ICON`.
+- **Look:** branded NSIS now (no extra plugins, so Smart App Control still trusts it):
+  `sidebarImage` 164×314 (Welcome/Finish: logo, dark, step list), `headerImage` 150×57,
+  our wording, fewer pages; the Finish "Run Ferrocast" launch without the wait.
+- **Our own setup (apps/setup, Style C UI)** comes back only with **Windows code signing**
+  (Azure Trusted Signing, ~$10/month, owner's Azure account + identity check). It's switched
+  off in `.github/workflows/release.yml` (`if: false && ...`) since 3e5e77c.
+
+## Option to raise with the owner (decision is theirs)
+
+On 1 Nov the owner chose "own engine only, no OBS/libobs". 2.3.0 with libobs was smooth on
+Windows. If Steps 0-3 can't reach that quickly, one choice is libobs on Windows only while
+Ferrocore's Windows path matures. Ask; don't do it unasked.
+
+## Order
+
+0 (test bench + crash dumps) → 1 (crash) → 2 (GPU path, CPU) → 3 (preview) → 4 (installer).
+Every step: run on the Windows bench, numbers before/after, then a build for the owner.
