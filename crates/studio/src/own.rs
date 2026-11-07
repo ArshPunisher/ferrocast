@@ -330,6 +330,10 @@ struct Drawn {
     plan: Option<(RecordPlan, std::time::Instant)>,
     /// The scene or source shown on its own, when this is a Source Record.
     solo: Option<String>,
+    /// The engine's frames made and skipped when this output began: its stats count from
+    /// there (the engine's own count from when the Studio started, so a recording started
+    /// later showed every frame skipped before it as its own).
+    from: (u64, u64),
 }
 
 /// Where a replay buffer's saves stand: the last file written, or why the last save failed.
@@ -571,6 +575,8 @@ impl OwnStream {
         if vertical {
             shared.seen().vertical.push(output);
         }
+        let begun = engine.stats();
+        let from = (begun.frames, begun.skipped);
         tracing::info!(codec = ?video.codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
@@ -579,7 +585,7 @@ impl OwnStream {
             health,
             stop_push,
             runtime,
-            drawn: Some(Drawn { shared, output, plan: None, solo: solo.map(String::from) }),
+            drawn: Some(Drawn { shared, output, plan: None, solo: solo.map(String::from), from }),
             hub: Some(hub),
             directs: Default::default(),
         })
@@ -683,8 +689,8 @@ impl OwnStream {
                 active: d.shared.engine.error().is_none(),
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
-                frames: s.frames.min(u64::from(u32::MAX)) as u32,
-                dropped: s.skipped.min(u64::from(u32::MAX)) as u32,
+                frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
+                dropped: s.skipped.saturating_sub(d.from.1).min(u64::from(u32::MAX)) as u32,
                 link: None,
                 reason: None,
             };
