@@ -202,9 +202,18 @@ impl Compositor {
             let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
             d.backends = wgpu::Backends::DX12;
             let instance = wgpu::Instance::new(d);
-            // Windows' first card, the one its displays are on (as OBS picks by default).
-            match instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await {
-                Ok(a) => return Ok((instance, a)),
+            // The fast card when there are two: Windows' first is often a laptop's built-in Intel
+            // one, which drew and read back each 1080p60 frame in 22-34 ms against 4.6 ms on its
+            // GTX 1650 Ti (recordings fell to 24-38 fps).
+            let fast = wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            };
+            match instance.request_adapter(&fast).await {
+                Ok(a) => {
+                    tracing::info!(card = %a.get_info().name, "Ferrocore draws on this card");
+                    return Ok((instance, a));
+                }
                 Err(e) => tracing::info!(error = %e, "no Direct3D 12 card: trying the others"),
             }
         }
