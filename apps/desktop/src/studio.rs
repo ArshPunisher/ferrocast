@@ -680,7 +680,7 @@ fn remux_in_background(files: Vec<PathBuf>) -> Result<PathBuf, String> {
             // Each file is its share of the whole; FFmpeg copies the packets as they are.
             let whole = i as f32 * 100.0 / count as f32;
             set_remux(json!({ "from": f, "to": t, "percent": whole, "done": false, "error": null }));
-            let out = std::process::Command::new(&ffmpeg)
+            let out = ferrocore::ffenc::hidden(std::process::Command::new(&ffmpeg))
                 .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
                 .arg(&from)
                 .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])

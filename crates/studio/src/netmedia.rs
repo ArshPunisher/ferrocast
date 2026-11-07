@@ -171,8 +171,12 @@ fn run(
             }
         };
         let Some(args) = args(set, &sound_to, parts) else { return };
-        let spawned =
-            Command::new(ffmpeg).args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let spawned = ferrocore::ffenc::hidden(Command::new(ffmpeg))
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
         let Ok(mut c) = spawned else {
             tracing::warn!("FFmpeg couldn't start for a network media source");
             return;

@@ -44,6 +44,21 @@ pub fn available() -> bool {
     ffmpeg().is_some()
 }
 
+/// `cmd` without a console window of its own. Windows gives every console program a window
+/// when the app that starts it has none (an installed Ferrocast): recording opened two empty
+/// terminals, and closing one ended FFmpeg and the recording with it. Elsewhere: as it is.
+pub fn hidden(cmd: Command) -> Command {
+    #[cfg(windows)]
+    let cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
+        // CREATE_NO_WINDOW
+        cmd.creation_flags(0x0800_0000);
+        cmd
+    };
+    cmd
+}
+
 /// Where FFmpeg is (the app's, else the one on the PATH), for other jobs (remuxing).
 pub fn path() -> Option<PathBuf> {
     ffmpeg()
@@ -83,7 +98,7 @@ pub fn h264_encoder() -> Option<String> {
             candidates()
                 .iter()
                 .find(|e| {
-                    Command::new(&ff)
+                    hidden(Command::new(&ff))
                         .args([
                             "-hide_banner",
                             "-loglevel",
@@ -135,7 +150,7 @@ impl Proc {
     fn spawn(args: &[String], chunk: usize) -> Result<Self, AvError> {
         let ff =
             ffmpeg().ok_or_else(|| AvError::Encoder("FFmpeg isn't here, so this system can't encode yet".into()))?;
-        let mut child = Command::new(ff)
+        let mut child = hidden(Command::new(ff))
             .args(["-hide_banner", "-loglevel", "error"])
             .args(args)
             .stdin(Stdio::piped())

@@ -13,6 +13,11 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+/// FFmpeg with no console window of its own on Windows (`ferrocore::ffenc::hidden`).
+fn hidden(ffmpeg: &Path) -> Command {
+    Command::from(ferrocore::ffenc::hidden(std::process::Command::new(ffmpeg)))
+}
+
 use crate::Engine;
 use crate::studio_host::{Said, Transcribe};
 
@@ -278,7 +283,7 @@ impl Engine {
         static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
         let host = self.studio_host().ok()?;
         let _turn = ONE.acquire().await.ok()?;
-        let mut child = Command::new(ffmpeg)
+        let mut child = hidden(ffmpeg)
             .args(look_args(clip))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -334,7 +339,7 @@ impl Engine {
             tracing::info!("no clip subtitles: no speech model is downloaded");
             return None;
         };
-        let run = Command::new(ffmpeg).args(audio_args(clip)).kill_on_drop(true).output();
+        let run = hidden(ffmpeg).args(audio_args(clip)).kill_on_drop(true).output();
         let sound = match tokio::time::timeout(AUDIO_LIMIT, run).await {
             Ok(Ok(o)) if o.status.success() => o.stdout,
             other => {
@@ -391,7 +396,7 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Op
         _ => false,
     };
     let args = vertical_args(clip, &part, burn.then_some("subs.srt"), fill);
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = hidden(ffmpeg);
     cmd.args(args).kill_on_drop(true);
     if burn {
         cmd.current_dir(&work);
