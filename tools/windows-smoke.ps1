@@ -15,7 +15,10 @@ param(
   [int]$Seconds = 20,
   [int]$Fps = 30,
   # A minidump on a native crash (Sysinternals ProcDump, downloaded when missing).
-  [string]$ProcDump = ''
+  [string]$ProcDump = '',
+  # Instead: the app faults on purpose (FERROCAST_TEST_CRASH) and its own crash report must
+  # appear in <home>\crashes. No ProcDump then: Windows skips the app's handler under a debugger.
+  [switch]$Crash
 )
 $ErrorActionPreference = 'Stop'
 $Out = (New-Item -ItemType Directory -Force $Out).FullName
@@ -39,6 +42,32 @@ function Shot($name) {
     [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
     $bmp.Save((Join-Path $Out "$name.png"))
   } catch { Note "no screenshot ${name}: $($_.Exception.Message)" }
+}
+
+if ($Crash) {
+  $env:FERROCAST_HOME = $home_
+  $env:FERROCAST_DEBUG_TOKEN_FILE = $tokenFile
+  $env:FERROCAST_TEST_CRASH = '1'
+  $app = Start-Process (Resolve-Path $Exe) -PassThru
+  $gone = $app.WaitForExit(90000)
+  Remove-Item Env:FERROCAST_TEST_CRASH
+  Check 'app faults on purpose' $gone $(if ($gone) { 'exit code 0x{0:X8}' -f $app.ExitCode } else { 'still running after 90 s' })
+  if (-not $gone) { Stop-Process -Id $app.Id -Force }
+  $dmp = Get-ChildItem (Join-Path $home_ 'crashes') -Filter *.dmp -ErrorAction SilentlyContinue
+  Check 'crash report written' ([bool]$dmp) $(if ($dmp) { "$($dmp.Name), $([math]::Round($dmp.Length / 1MB, 1)) MB" } else { 'none in crashes' })
+  # The next start says so in the log.
+  Remove-Item $tokenFile -ErrorAction SilentlyContinue
+  $app = Start-Process (Resolve-Path $Exe) -PassThru
+  for ($i = 0; $i -lt 60 -and -not (Test-Path $tokenFile); $i++) { Start-Sleep 1 }
+  Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+  $said = Select-String -Path (Join-Path $home_ 'logs\ferrocast.log') -Pattern 'a crash report was saved' -ErrorAction SilentlyContinue
+  Check 'next start logs it' ([bool]$said) $(if ($said) { $said[-1].Line.Trim() } else { 'not in the log' })
+  Copy-Item (Join-Path $home_ 'logs\*'), (Join-Path $home_ 'crashes\*') $Out -ErrorAction SilentlyContinue
+  $result.ok = -not ($result.checks.Values | Where-Object { -not $_.ok })
+  $result | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out 'results.json')
+  Write-Host $(if ($result.ok) { 'CRASH TEST PASSED' } else { 'CRASH TEST FAILED' })
+  if (-not $result.ok) { exit 1 }
+  exit 0
 }
 
 # A page that plays a 440 Hz tone, in its own Edge window (the window source, with its sound).

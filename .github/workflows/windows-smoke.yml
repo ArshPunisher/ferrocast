@@ -71,7 +71,11 @@ jobs:
           --config 'profile.release.package.ferrocast-desktop.debug-assertions=true'
       - name: Smoke test
         shell: pwsh
-        run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke -Seconds 20 -Fps 30
+        run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke/run -Seconds 20 -Fps 30
+      - name: Crash report test (the app faults on purpose; its minidump must be written)
+        if: always()
+        shell: pwsh
+        run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke/crash -Crash
       - name: Keep what it saw
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
