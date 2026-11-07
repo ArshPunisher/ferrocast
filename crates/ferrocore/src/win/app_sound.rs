@@ -61,7 +61,10 @@ fn client_for(pid: u32) -> Result<IAudioClient, String> {
             },
         },
     };
-    let prop = PROPVARIANT {
+    // Never dropped: PROPVARIANT's Drop is PropVariantClear, which frees a VT_BLOB's data with
+    // CoTaskMemFree. Ours points at `params` on this stack, so freeing it corrupted the heap
+    // and Windows closed the app at once (seen on Windows 11 with a Chrome window source).
+    let prop = std::mem::ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -76,7 +79,7 @@ fn client_for(pid: u32) -> Result<IAudioClient, String> {
                 },
             }),
         },
-    };
+    });
     let (tx, rx) = mpsc::channel();
     let handler: IActivateAudioInterfaceCompletionHandler = Activated(Mutex::new(Some(tx))).into();
     // SAFETY: `prop` points at `params`, both alive until the activation has answered below
@@ -85,7 +88,7 @@ fn client_for(pid: u32) -> Result<IAudioClient, String> {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&raw const prop),
+            Some(&raw const *prop),
             &handler,
         )
     }
