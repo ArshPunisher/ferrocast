@@ -112,10 +112,14 @@ pub const OWNER_DENIED: &[Rule] = &[
     // The live socket has its own route on the relay, never a request frame.
     ("*", "/live"),
     // Go live: the local stream key, and adding or removing a server with its key, stay on
-    // the PC. Watching, ticking platforms and the checks are fine from a phone.
+    // the PC. Watching, ticking platforms and the checks are fine from a phone. Trying an
+    // address that isn't saved stays on the PC too: a phone mustn't make it reach any host
+    // (a saved server's own test is fine). Nor does the list of its networks and addresses.
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
+    ("*", "/golive/test"),
+    ("*", "/golive/networks"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:

@@ -20,6 +20,36 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+# SRT sends (the Studio's direct destinations): pure Rust SRT, Apache-2.0.
+srt-tokio = "0.4.4"
+futures = "0.3"
+# WHIP sends: WebRTC (sans-IO, as the guest crate uses it), the offer posted over HTTPS, and the
+# stream's AAC made Opus (WebRTC's sound): Symphonia's AAC decoder (MPL-2.0), libopus (BSD-3,
+# built from its source).
+str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
+reqwest = { version = "0.13" }
+symphonia-core = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+opus = "0.4"
+# RIST's main profile with a passphrase (VSF TR-06-2, as librist does it): AES-CTR keyed by
+# PBKDF2-HMAC-SHA256 (RustCrypto, MIT/Apache-2.0).
+aes = "0.8"
+ctr = "0.9"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+# RIST with a username and password (librist's EAP-SRP, SRP-6a): big numbers (num-bigint,
+# MIT/Apache-2.0) and the OS's random numbers (getrandom, MIT/Apache-2.0).
+num-bigint = "0.4"
+getrandom = "0.3"
+# Sending over two connections at once (RIST over Wi-Fi and a phone's hotspot): the computer's
+# networks (if-addrs, MIT/BSD-3) and a socket held to one of them (socket2, MIT/Apache-2.0).
+if-addrs = "0.13"
+socket2 = { version = "0.6", features = ["all"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# The examples print their log.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

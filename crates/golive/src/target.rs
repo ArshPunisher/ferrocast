@@ -16,6 +16,11 @@ pub struct Target {
     pub app: String,
     /// The address as the server expects it in `connect` (no trailing slash).
     pub tc_url: String,
+    /// Connect to this address, not to whatever the host name says then (a service that
+    /// checked where the name led keeps it there: the name can't move it later). TLS still
+    /// checks the host name.
+    #[serde(skip)]
+    pub pin: Option<std::net::SocketAddr>,
 }
 
 /// Why an address was refused, in words for the person who typed it.
@@ -73,7 +78,7 @@ impl Target {
         let host = host.to_ascii_lowercase();
         let scheme = if tls { "rtmps" } else { "rtmp" };
         let tc_url = format!("{scheme}://{authority}/{app}");
-        Ok(Self { tls, host, port, app: app.to_string(), tc_url })
+        Ok(Self { tls, host, port, app: app.to_string(), tc_url, pin: None })
     }
 }
 

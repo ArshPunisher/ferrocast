@@ -224,8 +224,22 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Sends what's on air out as the NDI source `name`, or stops → `{ active, name }`.
+    async fn ndi_output(&self, _on: bool, _name: Option<String>) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Starts a new file of the recording now (OBS's Split recording).
     async fn record_split(&self) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Where the eye goes in each picture (RGBA, `w`×`h`), across from 0 to 1: a face that
+    /// fills enough of it, else what stands out; None where nothing is found.
+    async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
+    /// set, from now on; what's saved doesn't change.
+    async fn set_live_quality(&self, _pct: u8) -> Result<(), String> {
         Err(NOT_HERE.into())
     }
     /// Marks a chapter in the recording (MP4 and MOV), named or numbered.
@@ -272,8 +286,9 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
     /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
-    /// when the Studio isn't streaming.
-    async fn direct_start(&self, _id: String, _url: String, _key: String) -> Result<(), String> {
+    /// when the Studio isn't streaming. `simulcast` (WebRTC): the lighter stream goes beside it
+    /// as a second layer, while it runs.
+    async fn direct_start(&self, _id: String, _url: String, _key: String, _simulcast: bool) -> Result<(), String> {
         Err(NOT_HERE.into())
     }
     async fn direct_stop(&self, _id: String) -> Result<(), String> {
@@ -809,13 +824,9 @@ pub struct StudioSettings {
     pub true_peak: bool,
     /// OBS's Low Latency Audio Buffering (after a restart).
     pub low_latency_audio: bool,
-    /// Streams through Ferrocast's own encoder (ENGINE.md E1, a beta) instead of OBS's: libobs
-    /// still draws and mixes. From the next stream; a delay, Twitch's VOD track or a scaled
-    /// stream still use OBS's.
+    /// Kept from when OBS's engine was there too (settings files still carry them): Ferrocore
+    /// always encodes, draws and mixes now.
     pub own_encoder: bool,
-    /// Ferrocast's own engine draws and mixes the stream and recording too (ENGINE.md E7, a
-    /// beta, macOS): libobs keeps the preview. Sources and filters it can't run yet are left
-    /// out of what goes out (and named in the log); edits reopen the scenes in it.
     pub own_drawing: bool,
     /// How a Mac draws the picture: "metal" (Apple's own, the default from 29 Oct) or
     /// "opengl" (the older way, for a filter or plugin that draws wrong with Metal). After a
@@ -912,7 +923,33 @@ impl Default for StudioSettings {
     }
 }
 
+/// x264, OBS's software encoder (`obs_x264`).
+fn is_x264(id: &str) -> bool {
+    id.to_ascii_lowercase().contains("x264")
+}
+
 impl StudioSettings {
+    /// Whether streaming uses x264 (the software encoder), which Ferrocast's own engine runs
+    /// through FFmpeg; with "record when streaming", the recording's encoder counts too.
+    pub fn stream_needs_ffmpeg(&self) -> bool {
+        let x264 = self.encoder == "software" || self.video_encoder.as_deref().is_some_and(is_x264);
+        x264 || (self.record_when_streaming && self.record_needs_ffmpeg())
+    }
+
+    /// Whether recording uses x264: Lossless, a custom x264, or the stream's encoder when that's x264.
+    pub fn record_needs_ffmpeg(&self) -> bool {
+        match (self.record_quality.as_str(), self.record_encoder.as_deref()) {
+            ("lossless", _) => true,
+            ("custom", Some(id)) => is_x264(id),
+            _ => self.encoder == "software" || self.video_encoder.as_deref().is_some_and(is_x264),
+        }
+    }
+
+    /// Whether any of it does (fetched as soon as such settings are saved).
+    pub fn needs_ffmpeg(&self) -> bool {
+        self.stream_needs_ffmpeg() || self.record_needs_ffmpeg()
+    }
+
     /// Refuses a value outside what OBS takes, naming the field and what's allowed.
     pub fn check(&self) -> Result<(), EngineError> {
         let bad = |m: &str| Err(EngineError::Invalid(m.into()));
@@ -1284,6 +1321,23 @@ pub enum StudioAct {
     Levels {
         names: Vec<String>,
     },
+    /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
+    /// frozen camera).
+    Look {
+        names: Vec<String>,
+    },
+    /// The sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs }`.
+    AudioCare,
+    /// Sets it (as `AudioCare` gives it).
+    SetAudioCare {
+        care: Value,
+    },
+    /// The privacy guard: `{ hide_notifications, hide_apps }`, what a display capture leaves out.
+    Privacy,
+    /// Sets it (as `Privacy` gives it).
+    SetPrivacy {
+        privacy: Value,
+    },
     Filters {
         name: String,
     },
@@ -1516,7 +1570,20 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources | A::StopVertical => Ok(()),
+            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy => Ok(()),
+            A::SetPrivacy { privacy } => {
+                if !privacy.is_object() || privacy.to_string().len() > 8_000 {
+                    return Err(EngineError::Invalid("privacy: { hide_notifications, hide_apps }.".into()));
+                }
+                Ok(())
+            }
+            // The Studio checks the names and numbers (it knows the sources); here only its size.
+            A::SetAudioCare { care } => {
+                if !care.is_object() || care.to_string().len() > 8_000 {
+                    return Err(EngineError::Invalid("care: { ducking, loudness_lufs }.".into()));
+                }
+                Ok(())
+            }
             A::AddScene { name, .. } | A::StartVertical { scene: name } => check_source_name(name),
             A::RemoveScene { scene }
             | A::MoveScene { scene, .. }
@@ -1592,9 +1659,9 @@ impl StudioAct {
                 }
                 device.as_mut().map(new).transpose().map(|_| ())
             }
-            A::Levels { names } => {
+            A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
-                    return Err(EngineError::Invalid("names: up to 64 sounds at once.".into()));
+                    return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
                 }
                 names.iter().try_for_each(|n| check_source_name(n))
             }
@@ -1761,6 +1828,9 @@ impl StudioAct {
                 | A::Options { .. }
                 | A::Audio { .. }
                 | A::Levels { .. }
+                | A::Look { .. }
+                | A::AudioCare
+                | A::Privacy
                 | A::Filters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
@@ -1845,6 +1915,11 @@ impl Engine {
     }
 
     pub async fn studio_start(&self) -> Result<StudioStatus, EngineError> {
+        // Off a Mac, cameras, video files and some screen capture go through FFmpeg: fetched
+        // now, in the background, so a new streamer never installs anything or waits later.
+        if !cfg!(target_os = "macos") && self.ffmpeg_path().is_none() {
+            let _ = self.get_ffmpeg().await;
+        }
         let mut status = self.studio_host()?.start().await.map_err(failed)?;
         // After a crash: the replay buffer and the recording come back on as they were (a new
         // file); the stream waits for the streamer.
@@ -1891,17 +1966,46 @@ impl Engine {
     /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
     pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
         s.check()?;
+        // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
+        // time Record or Go live is pressed.
+        if s.needs_ffmpeg() && self.ffmpeg_path().is_none() {
+            let _ = self.get_ffmpeg().await;
+        }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
         Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
     }
 
+    /// The Studio's stats, with the stream's health while it's live.
     pub async fn studio_stats(&self) -> Result<Value, EngineError> {
-        self.studio_host()?.stats().await.map_err(failed)
+        let mut v = self.studio_host()?.stats().await.map_err(failed)?;
+        let health = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
+        if let (Some(o), Some(h)) = (v.as_object_mut(), health) {
+            o.insert("health".into(), serde_json::json!(h));
+        }
+        Ok(v)
     }
 
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
-        self.studio_host()?.record(on).await.map_err(failed)
+        let host = self.studio_host()?;
+        if on {
+            let s = host.settings().await;
+            self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
+        }
+        host.record(on).await.map_err(failed)
+    }
+
+    /// Refuses (and starts fetching FFmpeg) when x264 is `needed` and FFmpeg isn't here yet.
+    async fn ffmpeg_first(&self, needed: bool) -> Result<(), EngineError> {
+        if !needed || self.ffmpeg_path().is_some() {
+            return Ok(());
+        }
+        self.get_ffmpeg().await?;
+        Err(crate::golive::refused_pub(
+            "ffmpeg_downloading",
+            "Ferrocast is downloading FFmpeg for the software encoder (x264) and Lossless (about 30 MB).",
+            "Try again in a minute, or pick the Mac's hardware encoder.",
+        ))
     }
 
     pub async fn studio_record_source(&self, name: &str, on: bool) -> Result<Value, EngineError> {
@@ -1928,6 +2032,14 @@ impl Engine {
             check_source_name(s)?;
         }
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
+    }
+
+    /// NDI output: what's on air sent on the network as `name` (default "Ferrocast"), or stopped.
+    pub async fn studio_ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, EngineError> {
+        if let Some(n) = &name {
+            check_source_name(n)?;
+        }
+        self.studio_host()?.ndi_output(on, name).await.map_err(failed)
     }
 
     /// Searches a folder for the missing files (by file name).
@@ -2044,6 +2156,9 @@ impl Engine {
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        if on {
+            self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
+        }
         if !on {
             host.stream_stop().await.map_err(failed)?;
             // The stream has ended either way; what didn't stop with it comes back in words.
@@ -2102,7 +2217,12 @@ impl Engine {
     pub(crate) async fn studio_sync_light(&self) -> Option<String> {
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
-        let wanted = self.golive_config().destinations.iter().any(|d| d.enabled && d.wants_light());
+        // For a platform that takes it, or as a WebRTC server's simulcast layer.
+        let wanted = self
+            .golive_config()
+            .destinations
+            .iter()
+            .any(|d| d.enabled && (self.wants_light_now(d) || self.simulcast(d)));
         if !streaming || !wanted {
             if let Err(e) = host.light_stream_stop().await {
                 tracing::warn!(error = %e, "the Studio's lighter stream didn't stop");
@@ -2731,6 +2851,24 @@ mod tests {
         assert!(old.check().is_ok());
         let gl = StudioSettings { renderer: "opengl".into(), ..StudioSettings::default() };
         assert!(gl.check().is_ok());
+    }
+
+    #[test]
+    fn x264_and_lossless_need_ffmpeg() {
+        let s = StudioSettings::default();
+        assert!(!s.needs_ffmpeg(), "the hardware encoder doesn't");
+        assert!(StudioSettings { encoder: "software".into(), ..s.clone() }.needs_ffmpeg());
+        assert!(StudioSettings { record_quality: "lossless".into(), ..s.clone() }.needs_ffmpeg());
+        let custom =
+            StudioSettings { record_quality: "custom".into(), record_encoder: Some("obs_x264".into()), ..s.clone() };
+        assert!(custom.record_needs_ffmpeg() && !custom.stream_needs_ffmpeg());
+        // Lossless recordings don't hold up a hardware stream, unless it records too.
+        let lossless = StudioSettings { record_quality: "lossless".into(), ..s.clone() };
+        assert!(!lossless.stream_needs_ffmpeg());
+        assert!(StudioSettings { record_when_streaming: true, ..lossless }.stream_needs_ffmpeg());
+        // "Same as stream" recordings use the stream's x264.
+        let software = StudioSettings { encoder: "software".into(), ..s };
+        assert!(software.record_needs_ffmpeg() && software.stream_needs_ffmpeg());
     }
 
     #[test]

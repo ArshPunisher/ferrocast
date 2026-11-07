@@ -21,12 +21,16 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/ingest", get(ingest))
         .route("/golive/destinations", put(order).post(add))
         .route("/golive/destinations/{id}", delete(remove))
+        .route("/golive/destinations/{id}/test", post(test_destination))
+        .route("/golive/test", post(test_address))
+        .route("/golive/networks", get(networks))
         .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
         .route("/golive/protection", put(protection))
         .route("/golive/aitum", put(aitum_ok))
+        .route("/golive/auto-quality", put(auto_quality))
         .route("/golive/vertical/obs/setup", post(point_vertical))
         .route("/golive/vertical/source", put(vertical_source))
         .route("/golive/vertical/cut", put(vertical_cut))
@@ -77,6 +81,29 @@ struct AddBody {
     /// `vertical` for a server that takes OBS's vertical canvas.
     #[serde(default)]
     canvas: ferrocast_engine::golive::Canvas,
+}
+
+/// "Test connection" on a saved destination → `{ ok, rtt_ms?, message, srt_latency_ms? }`.
+async fn test_destination(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_test(&id).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestBody {
+    url: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// This computer's network connections, for sending RIST over two at once (`via=`).
+async fn networks(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.golive_networks()))
+}
+
+/// "Test connection" in the add dialog, before saving.
+async fn test_address(State(app): State<AppState>, Body(b): Body<TestBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.golive_test_address(&b.url, &b.key).await?)))
 }
 
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {
@@ -133,6 +160,11 @@ async fn resume(State(app): State<AppState>, Path(id): Path<String>) -> ApiResul
 #[serde(deny_unknown_fields)]
 struct AitumBody {
     ok: bool,
+}
+
+/// `PUT /golive/auto-quality` `{ on }`: auto quality on or off.
+async fn auto_quality(State(app): State<AppState>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_auto_quality(b.on).await?)))
 }
 
 /// "I use Aitum Multistream on purpose" (A2.2): hides the setup note.

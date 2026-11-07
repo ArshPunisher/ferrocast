@@ -221,6 +221,7 @@ impl Engine {
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
         engine.watch_obs();
         engine.watch_obs_health();
+        engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
         Ok(engine)

@@ -125,6 +125,43 @@ impl Engine {
     }
 
     /// Whether a source shows in a scene: None when it isn't in it.
+    /// The loudest each of these sounds got over about a second and a half (dBFS), sampled a
+    /// few times: a mic that's on but hears nothing stays near silence. The Studio only (None
+    /// with OBS).
+    pub(crate) async fn rig_loudest(
+        &self,
+        rig: &Rig,
+        names: &[String],
+    ) -> Option<std::collections::HashMap<String, f32>> {
+        if !matches!(rig, Rig::Studio) || names.is_empty() {
+            return None;
+        }
+        let mut loudest: std::collections::HashMap<String, f32> = Default::default();
+        for i in 0..6 {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let Ok(v) = self.studio_act(StudioAct::Levels { names: names.to_vec() }).await else { return None };
+            for n in names {
+                let peak =
+                    v[n]["peak"].as_array().into_iter().flatten().filter_map(Value::as_f64).fold(f64::MIN, f64::max);
+                if peak > f64::MIN {
+                    let e = loudest.entry(n.clone()).or_insert(f32::MIN);
+                    *e = e.max(peak as f32);
+                }
+            }
+        }
+        Some(loudest)
+    }
+
+    /// How these sources' pictures look now (`StudioAct::Look`). The Studio only.
+    pub(crate) async fn rig_look(&self, rig: &Rig, names: &[String]) -> Option<Value> {
+        if !matches!(rig, Rig::Studio) || names.is_empty() {
+            return None;
+        }
+        self.studio_act(StudioAct::Look { names: names.to_vec() }).await.ok()
+    }
+
     pub(crate) async fn rig_visible(&self, rig: &Rig, scene: &str, source: &str) -> Result<Option<bool>, EngineError> {
         match rig {
             Rig::Obs(c) => ferrocast_obs::control::source_visible(c, scene, source).await.map_err(obs_error),

@@ -1,0 +1,84 @@
+[package]
+name = "ferrocore"
+description = "Ferrocore: Ferrocast's own video and sound engine (GPU compositor on wgpu, capture, encoders, mixer)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+rubato = "0.14"
+cosmic-text = "0.19"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+thiserror.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+half = "2"
+# Checks shader effects of one's own before they're used (the naga wgpu itself uses).
+naga = { version = "30", features = ["wgsl-in"] }
+
+
+[dev-dependencies]
+# The own_engine example streams through Go live's hub, as the app will.
+ferrocast-golive.workspace = true
+tokio.workspace = true
+
+# Hearing a sound locally (monitoring). Linux would need ALSA's headers; not there yet.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+cpal = "0.18"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    # Windows' own capture (Windows.Graphics.Capture) through Direct3D 11.
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # One app's sound (WASAPI process loopback).
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+# `#[implement]` (a COM object of ours) names windows-core directly.
+windows-core = "0.61"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "libc", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "SCShareableContent", "SCStream", "SCError"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMBase", "CMTime", "CMTimeRange", "CMFormatDescription", "CMBlockBuffer", "objc2-core-video", "objc2-core-audio-types"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "AVCaptureSession", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureVideoDataOutput", "AVCaptureAudioDataOutput", "AVMediaFormat", "AVCaptureSessionPreset", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetTrack", "AVTime"] }
+
+# The workspace forbids unsafe code. Apple's media frameworks are C, so here it is denied instead
+# and allowed in src/apple only, each block with its SAFETY reason (as ferrocast-studio's ffi).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"

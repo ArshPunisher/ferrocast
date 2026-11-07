@@ -233,6 +233,10 @@ impl Engine {
                 }
             }
             EventKind::StreamOffline => {
+                if e.platform == Platform::Youtube && e.origin == Origin::Live {
+                    let since = self.state().session.started_at.map_or(at.0 - 43_200_000, |m| m.0);
+                    self.youtube_chapters_later(since);
+                }
                 let mut st = self.state_mut();
                 st.live.insert(e.platform, false);
                 // An ended stream's last count must not keep adding to the peak.

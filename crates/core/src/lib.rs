@@ -7,6 +7,7 @@
 mod macros;
 
 pub mod alert;
+pub mod auto_quality;
 pub mod autoreply;
 pub mod chatbot;
 pub mod cloudbot;
@@ -18,6 +19,7 @@ pub mod event;
 pub mod filter;
 pub mod giveaway;
 pub mod goal;
+pub mod health;
 pub mod layer;
 pub mod loyalty;
 pub mod moderation;

@@ -123,6 +123,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/filters/{filter}/options", get(engine_filter_options))
         .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
         .route("/studio/engine/levels", post(engine_levels))
+        .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
+        .route("/studio/engine/privacy", get(privacy).put(set_privacy))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
@@ -134,6 +136,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
+        .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
@@ -155,6 +158,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/show", get(show))
         .route("/show/config", get(show_config).put(save_show_config))
         .route("/show/preflight", get(preflight))
+        .route("/show/alerts", get(live_alerts))
         .route("/show/preflight/fix", post(preflight_fix))
         .route("/show/start", post(start_show))
         .route("/show/countdown/skip", post(skip_countdown))
@@ -1316,6 +1320,20 @@ async fn engine_virtual_camera(State(app): State<AppState>, Body(b): Body<Camera
     Ok(Json(app.engine.studio_virtual_camera(b.on, b.source).await?))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NdiBody {
+    on: bool,
+    /// The name it's sent under (default "Ferrocast").
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /studio/engine/ndi` `{ on, name? }` → `{ active, name }`.
+async fn engine_ndi_output(State(app): State<AppState>, Body(b): Body<NdiBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_ndi_output(b.on, b.name).await?))
+}
+
 /// `POST /studio/engine/record/split`: the recording goes on in a new file.
 async fn engine_record_split(State(app): State<AppState>) -> ApiResult<StatusCode> {
     app.engine.studio_record_split().await?;
@@ -1368,6 +1386,25 @@ async fn engine_monitoring(State(app): State<AppState>) -> ApiResult<Json<Value>
     Ok(Json(app.engine.studio_monitoring().await?))
 }
 
+/// The sound care: ducking and loudness (the Studio's document).
+async fn audio_care(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::AudioCare).await
+}
+
+async fn set_audio_care(State(app): State<AppState>, Body(care): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetAudioCare { care }).await?;
+    act(&app, StudioAct::AudioCare).await
+}
+
+async fn privacy(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Privacy).await
+}
+
+async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetPrivacy { privacy }).await?;
+    act(&app, StudioAct::Privacy).await
+}
+
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
 async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::Levels { names: b.names }).await
@@ -1393,6 +1430,11 @@ pub async fn save_music(State(app): State<AppState>, Body(b): Body<Map<String, V
 
 async fn preflight(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.preflight().await))
+}
+
+/// The live watch's alerts raised now (`{ alerts: string[] }`, their ids).
+async fn live_alerts(State(app): State<AppState>) -> Json<Value> {
+    Json(json!({ "alerts": app.engine.live_alerts() }))
 }
 
 #[derive(Deserialize)]
@@ -1570,7 +1612,7 @@ async fn delete_marker(State(app): State<AppState>, Path(id): Path<String>) -> A
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A download: `?format=csv|txt&since=<ms>`.
+/// A download: `?format=csv|txt|youtube&since=<ms>`.
 async fn export_markers(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> ApiResult<Response> {
     let format = q.get("format").map(String::as_str).unwrap_or("csv");
     let (ct, name, body) = app.engine.export_markers(format, since(&q)?).await?;
