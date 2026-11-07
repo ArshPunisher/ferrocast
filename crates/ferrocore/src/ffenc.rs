@@ -7,8 +7,9 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::AvError;
@@ -109,16 +110,29 @@ pub fn h264_encoder() -> Option<String> {
 /// One FLV tag: kind (8 audio, 9 video), time in ms, body.
 type Tag = (u8, u32, Vec<u8>);
 
+/// What may wait for FFmpeg to read it, at most (about a second of 1080p frames).
+const QUEUED_BYTES: usize = 96 * 1024 * 1024;
+
 /// A running FFmpeg: what goes in, the tags coming out, and its last words.
+///
+/// Input goes through a thread of its own, a few frames queued: FFmpeg reads its pipe only as
+/// fast as it encodes, and stops reading for the half second it takes to set up a GPU's
+/// encoder after the first frame, so writing from the frame loop stalled the loop (and
+/// skipped frames) at the start of every recording. A queue that stays full still holds the
+/// loop back, as before, so a slow encoder never piles frames up without end.
 struct Proc {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<SyncSender<Vec<u8>>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    /// The pipe broke (FFmpeg stopped).
+    broken: Arc<AtomicBool>,
     tags: Receiver<Tag>,
     stderr: Arc<Mutex<String>>,
 }
 
 impl Proc {
-    fn spawn(args: &[String]) -> Result<Self, AvError> {
+    /// `chunk`: about how many bytes each write is, to size the queue.
+    fn spawn(args: &[String], chunk: usize) -> Result<Self, AvError> {
         let ff =
             ffmpeg().ok_or_else(|| AvError::Encoder("FFmpeg isn't here, so this system can't encode yet".into()))?;
         let mut child = Command::new(ff)
@@ -129,7 +143,24 @@ impl Proc {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AvError::Encoder(format!("FFmpeg didn't start ({e})")))?;
-        let stdin = child.stdin.take();
+        let mut pipe = child.stdin.take().ok_or_else(|| AvError::Encoder("FFmpeg took no input".into()))?;
+        let (stdin, queued) = sync_channel::<Vec<u8>>((QUEUED_BYTES / chunk.max(1)).clamp(2, 64));
+        let broken = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let broken = broken.clone();
+            std::thread::Builder::new()
+                .name("ferrocast-ffmpeg-in".into())
+                .spawn(move || {
+                    for bytes in queued {
+                        if pipe.write_all(&bytes).is_err() {
+                            broken.store(true, Ordering::Release);
+                            return;
+                        }
+                    }
+                    // The queue closed: so does FFmpeg's input (end of stream).
+                })
+                .map_err(|e| AvError::Encoder(format!("FFmpeg's input thread didn't start ({e})")))?
+        };
         let mut out = child.stdout.take().ok_or_else(|| AvError::Encoder("FFmpeg gave no output".into()))?;
         let (tx, tags) = channel();
         std::thread::spawn(move || {
@@ -165,12 +196,23 @@ impl Proc {
                 }
             });
         }
-        Ok(Self { child, stdin, tags, stderr })
+        Ok(Self { child, stdin: Some(stdin), writer: Some(writer), broken, tags, stderr })
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), AvError> {
-        let w = self.stdin.as_mut().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
-        w.write_all(bytes).map_err(|_| self.died())
+    fn write(&mut self, bytes: Vec<u8>) -> Result<(), AvError> {
+        let w = self.stdin.as_ref().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
+        if self.broken.load(Ordering::Acquire) || w.send(bytes).is_err() {
+            return Err(self.died());
+        }
+        Ok(())
+    }
+
+    /// Ends FFmpeg's input once what's queued is written.
+    fn close_input(&mut self) {
+        self.stdin = None;
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 
     fn died(&mut self) -> AvError {
@@ -185,7 +227,7 @@ impl Proc {
 
     /// Closes the input and waits for everything still coming.
     fn finish(&mut self) -> Vec<Tag> {
-        self.stdin = None;
+        self.close_input();
         let tags: Vec<Tag> = self.tags.iter().collect();
         let _ = self.child.wait();
         tags
@@ -194,9 +236,13 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
+        // Killed first, so a writer stuck on a full pipe fails and ends.
         self.stdin = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 }
 
@@ -235,7 +281,7 @@ impl Video {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
         Ok(Self {
-            proc: Proc::spawn(&args(cfg, &enc))?,
+            proc: Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?,
             times: VecDeque::new(),
             header: None,
             width: cfg.width,
@@ -257,10 +303,16 @@ impl Video {
         }
         let mut cfg = self.cfg;
         cfg.bitrate_kbps = kbps;
-        self.next = Some(Proc::spawn(&args(&cfg, &self.name))?);
+        self.next = Some(Proc::spawn(&args(&cfg, &self.name), frame_bytes(&cfg))?);
         self.cfg = cfg;
         Ok(())
     }
+}
+
+/// One raw frame's bytes as `cfg` sends them.
+fn frame_bytes(cfg: &VideoConfig) -> usize {
+    let px = cfg.width as usize * cfg.height as usize;
+    if cfg.input == PixelFormat::Nv12 { px * 3 / 2 } else { px * 4 }
 }
 
 /// FFmpeg's arguments for encoder `enc` as `cfg` says.
@@ -400,7 +452,7 @@ impl Video {
             self.inline = old_header;
         }
         self.times.push_back(pts_us);
-        self.proc.write(&raw)?;
+        self.proc.write(raw)?;
         out.extend(self.take(self.proc.tags.try_iter().collect()));
         Ok(out)
     }
@@ -480,7 +532,7 @@ impl Audio {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        Ok(Self { proc: Proc::spawn(&a)?, channels: cfg.channels as usize })
+        Ok(Self { proc: Proc::spawn(&a, AAC_FRAME * cfg.channels as usize * 4)?, channels: cfg.channels as usize })
     }
 
     /// The input ends: every frame still inside comes out.
@@ -496,7 +548,7 @@ impl Audio {
     pub(crate) fn encode(&mut self, pcm: &[f32]) -> Result<Vec<Vec<u8>>, AvError> {
         debug_assert_eq!(pcm.len(), AAC_FRAME * self.channels);
         let bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.proc.write(&bytes)?;
+        self.proc.write(bytes)?;
         Ok(self
             .proc
             .tags

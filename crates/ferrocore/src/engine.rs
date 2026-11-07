@@ -1078,11 +1078,12 @@ impl Engine {
                 "a canvas needs even sides, a rate divisor of 1 or more, and a track from 1 to 6".into(),
             ));
         }
-        let mut st = self.lock();
-        if let Some(name) = &canvas.scene
-            && !st.scenes.contains_key(name)
-        {
-            return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+        let known = |st: &State| canvas.scene.as_ref().is_none_or(|name| st.scenes.contains_key(name));
+        if !known(&self.lock()) {
+            return Err(AvError::Source(format!(
+                "there's no scene called \"{}\"",
+                canvas.scene.as_deref().unwrap_or("")
+            )));
         }
         let record = match &kind {
             OutputKind::Record(p) => Some(p.clone()),
@@ -1108,6 +1109,16 @@ impl Engine {
         }
         if let Some((seconds, mb)) = replay {
             pipe.keep_replay(seconds, mb);
+        }
+        // Made above without the engine's lock: starting FFmpeg (and, the first time, trying
+        // each encoder) takes a second or more, and the frame loop waits on that lock every
+        // frame, so every recording started with a burst of skipped frames.
+        let mut st = self.lock();
+        if !known(&st) {
+            return Err(AvError::Source(format!(
+                "there's no scene called \"{}\"",
+                canvas.scene.as_deref().unwrap_or("")
+            )));
         }
         let id = st.next_output;
         st.next_output += 1;
