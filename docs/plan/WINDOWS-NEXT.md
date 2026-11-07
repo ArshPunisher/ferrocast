@@ -1,5 +1,39 @@
 # Windows: plan for the next session (written 4 Nov 2026)
 
+## Status (7 Nov 2026, worked on the owner's Windows 11 PC)
+
+Steps 1-4 are done and pushed on `own-engine-only` (both repos). Each was reproduced on the
+PC first, then fixed and checked there with a release build.
+
+| Step | Cause found | Fix | Checked |
+|---|---|---|---|
+| 1 Chrome window crash | Heap corruption in `win/app_sound.rs`: the `PROPVARIANT` VT_BLOB pointed at a stack struct and its `Drop` (PropVariantClear) freed it with CoTaskMemFree. Found from a ProcDump crash dump (`!heap`). | `ManuallyDrop` (d7056ff) | Chrome window + sound plays, app stays up, sound peaks at -26 dB |
+| 2 Lag | Not the CPU path: wgpu took the laptop's Intel iGPU (Windows' first adapter); drawing + readback took 22-34 ms a 1080p60 frame | Ask for `HighPerformance` (4a33a72) | 1080p60 recording 60.2 fps, 0 late frames, 4.6 ms a frame, ~10.5% CPU (was 24-38 fps) |
+| 3 Preview empty | The page only placed the picture when the whole stage fitted; the narrow layout (short window) never does | Place it whenever any of it shows, cut out under the top bar and tab bar (ferrocast-web 9986ddc) | 1000×700 at 125%: picture shows, follows scroll |
+| 3 Resize error | "Failed to wait for GPU to come idle before reconfiguring the Surface": the frame loop submitted while the main thread configured the preview surface | One lock for submits and surface configure (3e4f211) | 100 resizes (60 while recording): none (before: every couple) |
+| 4 Installer | Icon was already in the exe (checked on a renamed copy): the 4 Nov disc icon was Explorer's cache | Sidebar + header images from the brand script (ferrocast-web 236904e, bd148c3) | Built locally with `cargo tauri build --bundles nsis`, pages screenshotted |
+
+Not done, on purpose: custom NSIS wording and fewer pages (needs a copy of Tauri's 1000-line
+template to maintain; `apps/setup` replaces NSIS once builds are signed). The zero-copy
+capture idea in Step 2 wasn't needed for 60 fps; keep it for later.
+
+Step 0 A is in: `tools/windows-smoke.ps1` (display, an Edge window playing a tone with its
+sound, desktop sound, 20 s recording; checks the app lived, picture and sound in the file,
+fps, CPU; ProcDump catches a crash) and `.github/workflows/windows-smoke.yml` runs it on
+GitHub's Windows runner. Passed 3 runs on the owner's PC (29.1-29.9 of 30 fps, 5-8% CPU,
+7-48 frames dropped, the tone in the file). Its first run on the runner is still to be seen
+(WARP, no real GPU: the frame-rate check may need a lower bar there).
+
+Still to do: minidump crash reports in the app itself (Step 0), the frames dropped at the
+start of every recording. libobs stays out (not needed).
+
+**What this PC needed beyond the list below:** CMake (opusic-sys) and LLVM with
+`LIBCLANG_PATH="C:\Program Files\LLVM\bin"` (whisper-rs bindgen); pnpm 11.22.0 to match the
+lockfile (`npx pnpm@11.22.0`). A release build that still writes the token file:
+`cargo build --release -p ferrocast-desktop --config 'profile.release.package.ferrocast-desktop.debug-assertions=true'`.
+Recordings go to the real `Videos\Ferrocast` even with `FERROCAST_HOME` set: delete test ones.
+Crash dumps: Sysinternals ProcDump (`procdump64 -ma -e -x <dir> <exe>`), read with WinDbg's cdb.
+
 ## Start here (Claude running on the owner's Windows PC)
 
 You are on the owner's own Windows 11 PC, which is the machine the bugs below happen on. That
