@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+mod crash;
 mod studio;
 mod studio_history;
 mod studio_keys;
@@ -85,7 +87,9 @@ fn init_tracing(dir: &std::path::Path) {
     let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!(%info, "Ferrocast stopped unexpectedly");
+        // Where it came from too (function names in builds with symbols, addresses without).
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%info, %trace, "Ferrocast stopped unexpectedly");
         default(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
@@ -94,6 +98,10 @@ fn init_tracing(dir: &std::path::Path) {
 fn main() {
     let dir = data_dir();
     init_tracing(&dir);
+    #[cfg(windows)]
+    crash::install(&dir);
+    #[cfg(all(windows, debug_assertions))]
+    crash::test_crash_if_asked();
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
