@@ -1,4 +1,4 @@
-# Windows: plan for the next session (written 4 Nov 2026)
+# Windows: plan for the next session (written 4 Nov 2026, status to 8 Nov)
 
 ## Status (7 Nov 2026, worked on the owner's Windows 11 PC)
 
@@ -24,8 +24,37 @@ GitHub's Windows runner. Passed 3 runs on the owner's PC (29.1-29.9 of 30 fps, 5
 7-48 frames dropped, the tone in the file). Its first run on the runner is still to be seen
 (WARP, no real GPU: the frame-rate check may need a lower bar there).
 
-Still to do: minidump crash reports in the app itself (Step 0), the frames dropped at the
-start of every recording. libobs stays out (not needed).
+## Status (8 Nov 2026, same PC)
+
+| What | Cause found | Fix | Checked |
+|---|---|---|---|
+| Crash reports | The app wrote nothing when it crashed | `apps/desktop/src/crash.rs`: an unhandled-exception filter wakes a thread made at start that writes a minidump to `%APPDATA%\Ferrocast\crashes`; the next start logs it, keeps 5 (9a65e14). `FERROCAST_TEST_CRASH=1` crashes a debug-assertions build after 5 s; `windows-smoke.ps1 -Crash` tests it (e8dfba8) | Dump written (0.3 MB), cdb shows the access violation |
+| Frames dropped at the start | The pipeline was built while holding the engine lock, and FFmpeg's input blocked the frame loop | Pipeline built outside the lock; FFmpeg input on its own thread with a 96 MiB queue (6e69da9); stats count from the output's start (2d347c7) | 30 fps: 0 dropped (was 7-48). 60 fps varies: the PC is on the "Silent" power plan |
+| First-run setup | Opened on picking an alert look | Asks streaming or recording, then picture size (4K/1440p/1080p/720p, "Your screen" badge) and fps, and sets size, fps, hardware encoder and bitrate (ferrocast-web c922966) | E2E tests for both paths |
+| Recording opened two empty terminals; file 0 bytes | An installed (GUI) app gives every console child a window; closing one killed FFmpeg. Debug-assertions test builds are console apps, so it never showed | `ferrocore::ffenc::hidden` (CREATE_NO_WINDOW) on every FFmpeg and PowerShell start: recording, encoder probe, remux, network media, vertical clips, speech, the vertical cutter | Owner installed the 8 Nov build: "it works now" |
+| "Mac hardware" on Windows | Wording written for macOS | `lib/os.ts`: "Graphics card", Ctrl shortcuts, Videos folder, Ctrl/Alt/Win in keys (ferrocast-web 8fca28e) | Unit tests, owner |
+| Path-only fields | Recordings folder and song file needed a typed path | Browse buttons with the computer's picker (8fca28e, 435dc9f) | Owner |
+
+**Smart App Control.** It blocked the 8 Nov installer the first time (CodeIntegrity log,
+event 3077, "did not meet the Enterprise signing level"). An hour later the very same file
+opened. For an unsigned file it asks Microsoft's cloud, and a file it has never seen can be
+blocked at first; nothing in the code caused it. A copy of the file is checked again (the old
+verdict is cached on the file). Every new build is a new file, so users can hit this on any
+release until Windows builds are signed. The owner said no to signing (SignPath) for now.
+Check a build: start the setup, close it, then look for 3077 events in
+`Microsoft-Windows-CodeIntegrity/Operational`.
+
+**CI is red on this branch** (since 2 Nov, before this work): CI fails at rustfmt and the
+Tests job on all three systems, and the Windows smoke workflow failed both runs. The logs
+need a signed-in `gh`, which this PC doesn't have yet. Fix that first next time.
+
+Still to do: CI above; a medium recording quality for "Recording only" (files were ~68 Mbps
+at 'high', the owner hasn't decided); the uninstaller is unsigned like the setup. libobs
+stays out (not needed).
+
+**Test the installer without touching the owner's Ferrocast:** never install it here. Build
+with `cargo tauri build --bundles nsis --features deepfilter` in `apps/desktop` (plus
+`FERROCAST_WEB_DIST`); local builds have no Twitch/YouTube ids, so sign-in doesn't work.
 
 **What this PC needed beyond the list below:** CMake (opusic-sys) and LLVM with
 `LIBCLANG_PATH="C:\Program Files\LLVM\bin"` (whisper-rs bindgen); pnpm 11.22.0 to match the
