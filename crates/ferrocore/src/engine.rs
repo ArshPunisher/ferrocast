@@ -2698,6 +2698,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn monitoring_plays_on_the_speakers() {
         use crate::mix::{Monitoring, SourceSettings};
+        // GitHub's Macs open a sound device that never asks for sound: nothing to hear there.
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
         let Some(e) = engine() else { return };
         // A quiet beep heard here only (left out of every output).
         e.set_source(1, SourceKind::Tone { hz: 660.0, every_ms: 400, beep_ms: 60 }).unwrap_or_else(|x| panic!("{x}"));
