@@ -5,6 +5,33 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.1
+
+Ferrocast now has its own engine. The Studio no longer uses any part of OBS: Ferrocast draws,
+encodes, streams and records everything itself, so it's lighter on your computer and the download
+is smaller.
+
+- Windows gets its own capture for screens, windows and games, and can take one app's sound on
+  its own. Two-graphics-card laptops draw on the fast card.
+- A new Windows setup that installs without asking for admin.
+- Add a source opens straight away and lists your cameras, screens and windows at once, as tiles
+  or a list. If nothing is plugged in, it says so and what to try.
+- New sources: Application Capture on a Mac, slideshows and video playlists, NDI in and out,
+  shader effects, and screens and cameras on Linux, with a Linux virtual camera.
+- More ways to go live: SRT, RIST, WebRTC (WHIP) and SRTLA, which sends over all your internet
+  connections at once. Test connection checks a server before you go live.
+- Steadier streams:
+  - each destination can have a backup;
+  - a failing stream moves to another connection;
+  - auto quality lowers the bitrate when your upload struggles;
+  - a health score sits in the status bar.
+- While live, Ferrocast warns you when your mic goes silent, a camera goes black or freezes, or
+  a platform stops getting your stream, and the warning stays until it's fixed. It can also switch to BRB by itself when your camera goes black.
+- The privacy guard keeps chosen apps out of a screen capture.
+- Steady loudness, and music that dips under your voice.
+- Moments become YouTube chapters in your video's description.
+- Stats show your busiest sources and name a capture that shows nothing.
+
 ## 2.3.0
 
 - The Studio works without OBS installed, on Mac and now on Windows too: Ferrocast brings OBS's
