@@ -22,9 +22,16 @@ pub enum Problem {
     Cancelled,
     Damaged(String),
     /// Not enough room on the drive.
-    NoSpace { need: u64, free: u64, drive: String },
+    NoSpace {
+        need: u64,
+        free: u64,
+        drive: String,
+    },
     /// A file couldn't be written, moved or removed.
-    Io { what: String, err: io::Error },
+    Io {
+        what: String,
+        err: io::Error,
+    },
 }
 
 impl Problem {
@@ -53,14 +60,18 @@ impl Problem {
                     mb(*free)
                 ),
             ),
-            Self::Io { what, err } if is_full(err) => {
-                (format!("The drive filled up while {what}."), "Free some space and try again. Nothing was changed.".into())
-            }
+            Self::Io { what, err } if is_full(err) => (
+                format!("The drive filled up while {what}."),
+                "Free some space and try again. Nothing was changed.".into(),
+            ),
             Self::Io { what, err } if err.kind() == io::ErrorKind::PermissionDenied => (
                 format!("Windows didn't allow {what} ({err})."),
                 "Close Ferrocast and any window showing its folder, then try again.".into(),
             ),
-            Self::Io { what, err } => (format!("Something went wrong while {what}: {err}."), "Try again. If it keeps happening, send us the details.".into()),
+            Self::Io { what, err } => (
+                format!("Something went wrong while {what}: {err}."),
+                "Try again. If it keeps happening, send us the details.".into(),
+            ),
         }
     }
 }
@@ -102,7 +113,9 @@ pub fn ours_or_empty(dir: &Path, main: &str) -> bool {
     match std::fs::read_dir(dir) {
         Err(e) => e.kind() == io::ErrorKind::NotFound,
         Ok(mut entries) => {
-            entries.next().is_none() || dir.join(MARK).is_file() || (dir.join(main).is_file() && dir.join("uninstall.exe").is_file())
+            entries.next().is_none()
+                || dir.join(MARK).is_file()
+                || (dir.join(main).is_file() && dir.join("uninstall.exe").is_file())
         }
     }
 }
@@ -169,7 +182,8 @@ pub fn install(
             let rel = payload::safe_path(name).ok_or_else(|| Problem::Damaged(format!("unsafe name {name}")))?;
             std::fs::write(new.join(rel), bytes).map_err(Problem::io(format!("writing {name}")))?;
         }
-        let json = serde_json::to_vec_pretty(manifest).map_err(|e| Problem::Io { what: "noting what was installed".into(), err: io::Error::other(e) })?;
+        let json = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| Problem::Io { what: "noting what was installed".into(), err: io::Error::other(e) })?;
         std::fs::write(new.join(MARK), json).map_err(Problem::io("noting what was installed"))
     });
     if let Err(e) = marked {
@@ -183,11 +197,10 @@ pub fn install(
 fn swap(dir: &Path) -> Result<(), Problem> {
     let (new, prev) = (incoming(dir), previous(dir));
     let had_old = dir.exists();
-    if had_old
-        && let Err(err) = rename(dir, &prev) {
-            let _ = remove_all(&new);
-            return Err(Problem::Io { what: "moving the old version aside".into(), err });
-        }
+    if had_old && let Err(err) = rename(dir, &prev) {
+        let _ = remove_all(&new);
+        return Err(Problem::Io { what: "moving the old version aside".into(), err });
+    }
     if let Err(err) = rename(&new, dir) {
         if had_old {
             let _ = rename(&prev, dir);
@@ -215,7 +228,12 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Removes the install folder, file by file so progress is real. `skip` is left in place (the
 /// running uninstaller, which deletes itself after). Only a folder that holds Ferrocast.
-pub fn remove_app(dir: &Path, main: &str, skip: Option<&Path>, on: &mut dyn FnMut(usize, usize, &Path)) -> Result<(), Problem> {
+pub fn remove_app(
+    dir: &Path,
+    main: &str,
+    skip: Option<&Path>,
+    on: &mut dyn FnMut(usize, usize, &Path),
+) -> Result<(), Problem> {
     if !dir.exists() {
         return Ok(());
     }

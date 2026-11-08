@@ -8,25 +8,35 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HWND};
-use windows::Win32::Security::Credentials::{CRED_FLAGS, CREDENTIALW, CredDeleteW, CredEnumerateW, CredFree, CRED_TYPE_GENERIC};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::Security::Credentials::{
+    CRED_FLAGS, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredEnumerateW, CredFree,
+};
 use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, STGM_READ};
-use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile,
+    STGM_READ,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-    TerminateProcess, WaitForSingleObject,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
+use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Programs, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, IShellLinkW,
-    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderPath, SHStrDupW, SIGDN_FILESYSPATH, SLGP_RAWPATH, ShellExecuteW, ShellLink,
+    FOLDERID_Desktop, FOLDERID_Programs, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
+    IFileOpenDialog, IShellItem, IShellLinkW, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderPath,
+    SHStrDupW, SIGDN_FILESYSPATH, SLGP_RAWPATH, ShellExecuteW, ShellLink,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, MB_ICONERROR, MB_OK, MessageBoxW, SW_MINIMIZE, SW_SHOWNORMAL, SendMessageW, ShowWindow, WM_NCLBUTTONDOWN};
-use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HTCAPTION, MB_ICONERROR, MB_OK, MessageBoxW, SW_MINIMIZE, SW_SHOWNORMAL, SendMessageW, ShowWindow, WM_NCLBUTTONDOWN,
+};
 use windows::core::{HSTRING, Interface, PCWSTR, PWSTR};
 
 fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
@@ -83,9 +93,10 @@ pub fn running_in(dir: &Path) -> Vec<(u32, PathBuf)> {
         while ok {
             if e.th32ProcessID != me
                 && let Some(path) = image_of(e.th32ProcessID)
-                    && normalize(&path).starts_with(&dir) {
-                        out.push((e.th32ProcessID, path));
-                    }
+                && normalize(&path).starts_with(&dir)
+            {
+                out.push((e.th32ProcessID, path));
+            }
             ok = Process32NextW(snap, &mut e).is_ok();
         }
         let _ = CloseHandle(snap);
@@ -221,9 +232,12 @@ pub fn forget_signins(service: &str) -> usize {
             return 0;
         }
         let creds = std::slice::from_raw_parts(list, count as usize);
-        let names: Vec<(PWSTR, u32)> = creds.iter().filter(|c| !c.is_null()).map(|c| ((**c).TargetName, (**c).Type.0)).collect();
+        let names: Vec<(PWSTR, u32)> =
+            creds.iter().filter(|c| !c.is_null()).map(|c| ((**c).TargetName, (**c).Type.0)).collect();
         for (name, kind) in names {
-            if kind == CRED_TYPE_GENERIC.0 && CredDeleteW(PCWSTR(name.0), CRED_TYPE_GENERIC, Some(CRED_FLAGS(0).0)).is_ok() {
+            if kind == CRED_TYPE_GENERIC.0
+                && CredDeleteW(PCWSTR(name.0), CRED_TYPE_GENERIC, Some(CRED_FLAGS(0).0)).is_ok()
+            {
                 removed += 1;
             }
         }

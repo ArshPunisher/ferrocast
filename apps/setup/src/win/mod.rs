@@ -28,7 +28,11 @@ const SECRETS_SERVICE: &str = "Ferrocast";
 pub fn log(line: &str) {
     let path = std::env::temp_dir().join("ferrocast-setup.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "[{:?}] {line}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+        let _ = writeln!(
+            f,
+            "[{:?}] {line}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+        );
     }
 }
 
@@ -117,7 +121,14 @@ fn install_mode(opts: Install) -> ExitCode {
     let installed = reg::installed();
     let dir = opts.dir.clone().or_else(|| installed.as_ref().map(|(d, _)| d.clone())).unwrap_or_else(default_dir);
     let old_version = installed.and_then(|(_, v)| v);
-    log(&format!("install {} into {} (update {}, silent {}, passive {})", pkg.manifest.version, dir.display(), opts.update, opts.silent, opts.passive));
+    log(&format!(
+        "install {} into {} (update {}, silent {}, passive {})",
+        pkg.manifest.version,
+        dir.display(),
+        opts.update,
+        opts.silent,
+        opts.passive
+    ));
 
     if opts.silent {
         let job = InstallJob { dir, desktop: false, opts: opts.clone() };
@@ -144,7 +155,9 @@ fn webview_ready() -> bool {
     if wry::webview_version().is_ok() {
         return true;
     }
-    complain("Ferrocast needs Microsoft Edge WebView2, which is missing on this PC.\n\nSetup will open Microsoft's download page. Install \"Evergreen Bootstrapper\", then run Ferrocast's setup again.");
+    complain(
+        "Ferrocast needs Microsoft Edge WebView2, which is missing on this PC.\n\nSetup will open Microsoft's download page. Install \"Evergreen Bootstrapper\", then run Ferrocast's setup again.",
+    );
     sys::open_url("https://developer.microsoft.com/microsoft-edge/webview2/#download");
     false
 }
@@ -154,14 +167,28 @@ fn webview_ready() -> bool {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Event {
     /// A step of the job started (index into the job's steps).
-    Step { index: usize },
+    Step {
+        index: usize,
+    },
     /// Bytes (or files) done of the total, and what's being written or removed.
-    Progress { done: u64, total: u64, file: String },
-    Done { seconds: f64, bytes: u64 },
-    Error { title: String, detail: String, log: Vec<String> },
+    Progress {
+        done: u64,
+        total: u64,
+        file: String,
+    },
+    Done {
+        seconds: f64,
+        bytes: u64,
+    },
+    Error {
+        title: String,
+        detail: String,
+        log: Vec<String>,
+    },
 }
 
-pub const INSTALL_STEPS: [&str; 5] = ["Checking space", "Closing Ferrocast", "Unpacking Ferrocast", "Adding shortcuts", "Registering uninstall"];
+pub const INSTALL_STEPS: [&str; 5] =
+    ["Checking space", "Closing Ferrocast", "Unpacking Ferrocast", "Adding shortcuts", "Registering uninstall"];
 pub const UNINSTALL_STEPS: [&str; 4] = ["Closing Ferrocast", "Removing files", "Removing shortcuts", "Removing extras"];
 
 #[derive(Debug, Clone)]
@@ -181,9 +208,10 @@ impl InstallJob {
         // Room for the new files beside the old ones until the swap, plus a little.
         let need = m.total + m.total / 10;
         if let Some(free) = sys::free_space(dir)
-            && free < need {
-                return Err(Problem::NoSpace { need, free, drive: sys::drive_of(dir) });
-            }
+            && free < need
+        {
+            return Err(Problem::NoSpace { need, free, drive: sys::drive_of(dir) });
+        }
         if !flow::ours_or_empty(dir, &m.main) {
             return Err(Problem::NotOurs(dir.clone()));
         }
@@ -218,14 +246,14 @@ impl InstallJob {
         let target = dir.join(&m.main);
         let start_menu = sys::programs_dir().map(|d| d.join(format!("{APP}.lnk")));
         let desktop = sys::desktop_dir().map(|d| d.join(format!("{APP}.lnk")));
-        for (lnk, wanted) in [(start_menu, !self.opts.no_shortcuts), (desktop, self.desktop && !self.opts.no_shortcuts)] {
+        for (lnk, wanted) in [(start_menu, !self.opts.no_shortcuts), (desktop, self.desktop && !self.opts.no_shortcuts)]
+        {
             let Some(lnk) = lnk else { continue };
             // An update refreshes the shortcuts there are; it adds none.
             let make = if self.opts.update { lnk.exists() } else { wanted };
-            if make
-                && let Err(e) = sys::shortcut(&lnk, &target, APP_ID) {
-                    log(&format!("shortcut {}: {e}", lnk.display()));
-                }
+            if make && let Err(e) = sys::shortcut(&lnk, &target, APP_ID) {
+                log(&format!("shortcut {}: {e}", lnk.display()));
+            }
         }
 
         on(Event::Step { index: 4 });
@@ -367,7 +395,8 @@ impl UninstallJob {
 
         on(Event::Step { index: 2 });
         let target = self.dir.join(&self.main);
-        for lnk in [sys::programs_dir(), sys::desktop_dir()].into_iter().flatten().map(|d| d.join(format!("{APP}.lnk"))) {
+        for lnk in [sys::programs_dir(), sys::desktop_dir()].into_iter().flatten().map(|d| d.join(format!("{APP}.lnk")))
+        {
             // Only shortcuts that open this install.
             if lnk.is_file() && shortcut_points_at(&lnk, &target) {
                 let _ = std::fs::remove_file(&lnk);

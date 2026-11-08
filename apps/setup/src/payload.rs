@@ -91,7 +91,8 @@ fn list(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
                 walk(root, &path, out)?;
             } else {
                 let rel = path.strip_prefix(root).map_err(io::Error::other)?;
-                let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+                let parts: Vec<String> =
+                    rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
                 out.push((parts.join("/"), path));
             }
         }
@@ -405,7 +406,9 @@ mod tests {
 
     #[test]
     fn no_file_can_leave_the_install_folder() {
-        for bad in ["../evil.exe", "a/../../b", "/etc/passwd", "C:/Windows/x", "a\\..\\b", "a//b", "", "con.", "a/ ", "x?y"] {
+        for bad in
+            ["../evil.exe", "a/../../b", "/etc/passwd", "C:/Windows/x", "a\\..\\b", "a//b", "", "con.", "a/ ", "x?y"]
+        {
             assert!(safe_path(bad).is_none(), "{bad}");
         }
         assert_eq!(safe_path("resources/app.js"), Some(PathBuf::from("resources").join("app.js")));

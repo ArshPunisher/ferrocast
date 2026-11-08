@@ -12,7 +12,12 @@ pub enum Mode {
     Install(Install),
     Uninstall(Uninstall),
     /// `pack <folder> --main <Ferrocast.exe> --version <x.y.z> --out <setup.exe>`
-    Pack { dir: PathBuf, main: String, version: String, out: PathBuf },
+    Pack {
+        dir: PathBuf,
+        main: String,
+        version: String,
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -145,7 +150,12 @@ mod tests {
         assert!(u.relocated && u.from == Some(PathBuf::from("C:\\x")));
         assert_eq!(
             p("pack stage --main Ferrocast.exe --version 2.4.0 --out out.exe"),
-            Mode::Pack { dir: "stage".into(), main: "Ferrocast.exe".into(), version: "2.4.0".into(), out: "out.exe".into() }
+            Mode::Pack {
+                dir: "stage".into(),
+                main: "Ferrocast.exe".into(),
+                version: "2.4.0".into(),
+                out: "out.exe".into()
+            }
         );
         assert!(parse(&["/bogus".into()]).is_err());
         assert!(parse(&["pack".into(), "dir".into()]).is_err());

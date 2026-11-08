@@ -21,7 +21,10 @@ use tao::window::{Icon, WindowBuilder};
 use wry::WebViewBuilder;
 use wry::http::{Request, Response, StatusCode};
 
-use super::{Event, INSTALL_STEPS, InstallJob, Package, UNINSTALL_STEPS, UninstallJob, install_dir_for, log, open_app, sys, tail_log};
+use super::{
+    Event, INSTALL_STEPS, InstallJob, Package, UNINSTALL_STEPS, UninstallJob, install_dir_for, log, open_app, sys,
+    tail_log,
+};
 use crate::args::Install;
 use crate::flow;
 
@@ -33,8 +36,10 @@ const FONTS: [(&str, &[u8]); 3] = [
 ];
 
 /// Links the page may open; anything else is ignored.
-const LINKS: [(&str, &str); 2] =
-    [("site", "https://ferrocast.clearcraftlabs.com"), ("feedback", "https://github.com/ArshPunisher/ferrocast/issues/new")];
+const LINKS: [(&str, &str); 2] = [
+    ("site", "https://ferrocast.clearcraftlabs.com"),
+    ("feedback", "https://github.com/ArshPunisher/ferrocast/issues/new"),
+];
 
 pub enum Start {
     Install { pkg: Arc<Package>, dir: PathBuf, old_version: Option<String>, opts: Install },
@@ -123,7 +128,10 @@ fn serve(req: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
         p => match FONTS.iter().find(|(name, _)| p == format!("fonts/{name}")) {
             Some((_, bytes)) => (bytes, "font/woff2"),
             None => {
-                return Response::builder().status(StatusCode::NOT_FOUND).body(Cow::Borrowed(&b""[..])).unwrap_or_default();
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Cow::Borrowed(&b""[..]))
+                    .unwrap_or_default();
             }
         },
     };
@@ -234,10 +242,12 @@ pub fn show(start: Start) -> ExitCode {
             _ => {}
         }
         if let ControlFlow::ExitWithCode(_) = *flow
-            && std::env::current_exe().is_ok_and(|e| e.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ferrocast-uninstall-")))
-                && let Ok(me) = std::env::current_exe() {
-                    sys::delete_after_exit(&me);
-                }
+            && std::env::current_exe()
+                .is_ok_and(|e| e.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ferrocast-uninstall-")))
+            && let Ok(me) = std::env::current_exe()
+        {
+            sys::delete_after_exit(&me);
+        }
         // The window lives as long as the loop.
         let _ = &window;
     })
@@ -311,10 +321,9 @@ fn handle(s: &Arc<Session>, proxy: &EventLoopProxy<Ui>, ask: Ask) {
             }
         }
         Ask::Finish { open } => {
-            if open
-                && let Some(exe) = s.installed.lock().ok().and_then(|i| i.clone()) {
-                    open_app(&exe, &[]);
-                }
+            if open && let Some(exe) = s.installed.lock().ok().and_then(|i| i.clone()) {
+                open_app(&exe, &[]);
+            }
             let _ = proxy.send_event(Ui::Exit(0));
         }
         Ask::Close => {
