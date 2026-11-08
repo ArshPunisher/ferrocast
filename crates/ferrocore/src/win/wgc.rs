@@ -419,8 +419,11 @@ mod tests {
         let b = spare.get(16);
         let p = b.as_ptr();
         spare.give(b);
-        assert_eq!(spare.get(16).as_ptr(), p, "the same buffer again");
-        assert_eq!(spare.get(8).len(), 8, "another size: a new one");
+        // Each buffer bound first: a pointer into a temporary is a hard error on Windows CI.
+        let again = spare.get(16);
+        assert_eq!(again.as_ptr(), p, "the same buffer again");
+        let other = spare.get(8);
+        assert_eq!(other.len(), 8, "another size: a new one");
     }
 
     #[test]
