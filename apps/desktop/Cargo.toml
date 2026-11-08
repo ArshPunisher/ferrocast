@@ -56,9 +56,14 @@ whisper-rs = { version = "0.16", features = ["metal", "tracing_backend"] }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = { version = "0.16", features = ["tracing_backend"] }
 
-# Crash reports on Windows (src/crash.rs): a minidump when a native fault ends the app.
+# Crash reports on Windows (src/crash.rs): a minidump when a native fault ends the app; the
+# Store package's checks (src/store.rs).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
+    # The Microsoft Store package (src/store.rs): is it packaged, its startup task.
+    "ApplicationModel",
+    "ApplicationModel_Activation",
+    "Foundation",
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
