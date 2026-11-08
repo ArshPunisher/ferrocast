@@ -780,9 +780,12 @@ impl OwnStream {
 
     pub(crate) fn record_stats(&self) -> RecordStats {
         let s = self.stats();
-        let paused =
-            self.drawn.as_ref().is_some_and(|d| d.shared.engine.output_record_state(d.output).is_ok_and(|r| r.paused));
-        RecordStats { active: s.active, paused, bytes: s.bytes, frames: s.frames }
+        let state = self.drawn.as_ref().and_then(|d| d.shared.engine.output_record_state(d.output).ok());
+        let paused = state.is_some_and(|r| r.paused);
+        // A recording our engine writes counts its bytes in the file itself (nothing is sent):
+        // the Stats panel's recording size and rate were always 0 before.
+        let bytes = state.map_or(s.bytes, |r| r.bytes.max(s.bytes));
+        RecordStats { active: s.active, paused, bytes, frames: s.frames }
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {

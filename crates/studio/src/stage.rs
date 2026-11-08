@@ -3593,6 +3593,9 @@ mod tests {
             encode: plan.encode.clone(),
         }));
         std::thread::sleep(std::time::Duration::from_millis(1500));
+        // What's written so far shows in its stats (the Stats panel's size and rate).
+        let stats = rec.record_stats();
+        assert!(stats.active && stats.bytes > 0, "bytes written are counted: {stats:?}");
         ok(rec.split());
         let second = rec.path().to_path_buf();
         assert_ne!(first, second, "a new file, named again (\" (2)\" if in the same second)");
