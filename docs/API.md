@@ -177,6 +177,7 @@ type UpdateView = {
   notes: string | null /* what's new, plain text ("- " lines are a list); null when the release has none */
   published_at: string | null /* RFC 3339 */
   can_install: boolean /* the desktop app; false in the headless app (and so in a browser on it) */
+  store: boolean /* installed from the Microsoft Store, which updates it: can_install false, and check/install/restart answer 409 store_updates */
   checking: boolean
   checked_at: number | null /* ms; when the last check finished, whatever it found */
   error: UpdateProblem | null /* the last check's problem: offline, feed_unavailable, no_build; an earlier find stays in latest */

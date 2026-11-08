@@ -1274,6 +1274,22 @@ async fn updates_are_offered_only_when_found_and_never_while_live() {
 }
 
 #[tokio::test]
+async fn a_store_install_points_to_the_store_for_updates() {
+    let r = start().await;
+    r.engine.updates_from_store();
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!((v["store"].as_bool(), v["can_install"].as_bool()), (Some(true), Some(false)));
+    // Checks and restarts say where updates come from, not "download it yourself".
+    let check = r.post("/api/v1/updates/check", json!({})).await;
+    assert_eq!(error_code(check).await, (StatusCode::CONFLICT, "store_updates".into()));
+    let restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(error_code(restart).await, (StatusCode::CONFLICT, "store_updates".into()));
+    r.engine.set_available_update(Some(found("9.9.9")));
+    let install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(error_code(install).await, (StatusCode::CONFLICT, "store_updates".into()));
+}
+
+#[tokio::test]
 async fn an_install_shows_progress_then_waits_for_the_restart_never_while_live() {
     let r = start().await;
     let mut live = r.engine.subscribe_live();
