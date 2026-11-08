@@ -41,6 +41,9 @@ opened. For an unsigned file it asks Microsoft's cloud, and a file it has never 
 blocked at first; nothing in the code caused it. A copy of the file is checked again (the old
 verdict is cached on the file). Every new build is a new file, so users can hit this on any
 release until Windows builds are signed. The owner said no to signing (SignPath) for now.
+**Answer (8 Nov night): the Microsoft Store.** Free, signed by Microsoft (trusted from the first
+install), and the publisher reads as ours. Built and tested on CI; the owner's steps (a free
+developer account, reserving the name) are in `docs/plan/MICROSOFT-STORE.md`.
 Check a build: start the setup, close it, then look for 3077 events in
 `Microsoft-Windows-CodeIntegrity/Operational`.
 
@@ -62,6 +65,28 @@ lockfile (`npx pnpm@11.22.0`). A release build that still writes the token file:
 `cargo build --release -p ferrocast-desktop --config 'profile.release.package.ferrocast-desktop.debug-assertions=true'`.
 Recordings go to the real `Videos\Ferrocast` even with `FERROCAST_HOME` set: delete test ones.
 Crash dumps: Sysinternals ProcDump (`procdump64 -ma -e -x <dir> <exe>`), read with WinDbg's cdb.
+
+## Status (8 Nov 2026, night, done on the Mac: needs a check on the Windows PC)
+
+Owner's report: opening Add a source, the live picture (grey stage round it) stayed over the
+dialog for 3-4 s; Camera, Screen and Capture card took time to show; no camera showed a
+"Settings" bar.
+
+| What | Cause found | Fix | Checked (Mac) |
+|---|---|---|---|
+| Picture over the dialog for seconds | `options()` read device lists (FFmpeg asking DirectShow for cameras) **on the main thread**; the `PUT /preview` that cuts the dialog out of the picture waited behind it | `kinds::options_cached` read with `spawn_blocking` (only AppKit display names on the main thread); a read is shared for 1.5 s | API: camera list 0.6 s off the main thread, then cached |
+| Adding a camera/window/file froze the window | `Engine::set_source` opened captures and media (FFmpeg probe + GPU decode test) on the caller's thread, which is the main thread | `open_soon`: opened on its own thread, the caller waits 250 ms (quick errors still come back), a late failure is retried by the watchdog (captures) or let go (files) | Camera add 2 ms, file 5 ms; pictures arrive |
+| Lists slow in the dialog | each kind asked the engine when picked | dashboard reads every device list ahead and shows the last one at once | e2e, 6x CPU throttle: kind switch ~100 ms |
+| Thumbnails/screenshots | PNG made on the main thread | drawn there, PNG off it; screenshot names claimed before writing | two at once get two names |
+| Recording size 0 in Stats | nothing counted bytes the engine writes | `record_stats` reads `output_record_state().bytes` | test |
+| CI red | rustfmt (`apps/setup`), wgc.rs test pointer, Linux dead field, Mac speaker test | fixed; speaker test skipped on CI | local clippy/fmt/deny/tests |
+
+`tools/windows-smoke.ps1` now also checks the picture's place changes in < 0.5 s while cameras
+are listed, and takes `-MinShare` (CI uses 0.3: GitHub's runner has no GPU).
+
+**To check on the PC:** Add a source with the Studio running: no grey box over the dialog;
+Camera/Screen/Capture card show at once; unplug the camera: "No camera found"; Tiles/List kept
+after closing the app.
 
 ## Start here (Claude running on the owner's Windows PC)
 
