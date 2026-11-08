@@ -1817,6 +1817,11 @@ impl StudioHost for DesktopStudio {
                 "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "name": n.name() })),
                 // Captures on air that show nothing (the black screen fixer).
                 "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
+                // Pictures each source has sent to the card, and their size: the page works out
+                // each one's rate between two reads ("What's slowing my stream?").
+                "sources": h.collection.as_ref().map(|c| c.source_load()).unwrap_or_default().into_iter()
+                    .map(|l| json!({ "name": l.name, "sent": l.sent, "width": l.width, "height": l.height }))
+                    .collect::<Vec<_>>(),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             }))

@@ -2570,8 +2570,31 @@ impl Stage {
 
     pub fn let_thumbs_go(&self, _all: bool) {}
 
+    /// Each source's load on the engine (pictures sent to the card so far, their size): Stats
+    /// shows which one keeps it busiest. Empty before the engine opens.
+    pub fn source_load(&self) -> Vec<ferrocore::engine::SourceLoad> {
+        self.engine.borrow().as_ref().map(|e| e.engine.source_load()).unwrap_or_default()
+    }
+
+    /// Captures on air that have shown nothing for a few seconds (the black screen fixer):
+    /// a screen, window or app capture without Screen Recording allowed (macOS), or one with no
+    /// picture (nothing picked, the window gone, a camera that never sent). The status bar and
+    /// the Ready check say why and what to do.
     pub fn capture_problems(&self) -> Vec<crate::collection::CaptureProblem> {
-        Vec::new()
+        let Some(e) = self.engine.borrow().clone() else { return Vec::new() };
+        let quiet = e.engine.quiet_captures(3_000_000_000);
+        if quiet.is_empty() {
+            return Vec::new();
+        }
+        let allowed = crate::screen_access();
+        quiet
+            .into_iter()
+            .map(|(source, screen)| {
+                let kind = self.source(&source).map(|s| kind_of(&s).to_string()).unwrap_or_default();
+                let problem = if screen && !allowed { "permission" } else { "no_picture" };
+                crate::collection::CaptureProblem { source, kind, problem }
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------ transitions
