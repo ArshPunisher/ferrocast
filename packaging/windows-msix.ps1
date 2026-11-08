@@ -34,6 +34,17 @@ function Tool($name) {
   return $found.FullName
 }
 function Sha256($path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant() }
+# GitHub's release downloads sometimes answer 502/504 for a moment: try a few times before failing.
+function Download($uri, $dest) {
+  for ($try = 1; ; $try++) {
+    try { Invoke-WebRequest -Uri $uri -OutFile $dest -UseBasicParsing; return }
+    catch {
+      if ($try -ge 4) { Fail "couldn't download $uri ($($_.Exception.Message))" }
+      Write-Host "Download of $uri failed ($($_.Exception.Message)); trying again in $($try * 10) s"
+      Start-Sleep -Seconds ($try * 10)
+    }
+  }
+}
 
 $Exe = (Resolve-Path $Exe).Path
 $main = Split-Path -Leaf $Exe
@@ -74,7 +85,7 @@ $sha = [regex]::Match($getter, '"ffmpeg-win32-x64\.gz",\s*"([0-9a-f]{64})"').Gro
 if (-not $release -or -not $sha) { Fail "can't read the pinned FFmpeg build from ffmpeg_get.rs" }
 $base = "https://github.com/eugeneware/ffmpeg-static/releases/download/$release"
 $gz = Join-Path $work 'ffmpeg.gz'
-Invoke-WebRequest -Uri "$base/ffmpeg-win32-x64.gz" -OutFile $gz -UseBasicParsing
+Download "$base/ffmpeg-win32-x64.gz" $gz
 if ((Sha256 $gz) -ne $sha) { Fail "FFmpeg's download doesn't match its pinned SHA-256" }
 $in = [IO.File]::OpenRead($gz)
 try {
@@ -89,7 +100,7 @@ $notes = @{
 }
 foreach ($name in $notes.Keys) {
   $dest = Join-Path $pkg $notes[$name][0]
-  Invoke-WebRequest -Uri "$base/$name" -OutFile $dest -UseBasicParsing
+  Download "$base/$name" $dest
   if ((Sha256 $dest) -ne $notes[$name][1]) { Fail "FFmpeg's $name doesn't match its pinned SHA-256" }
 }
 Write-Host ("FFmpeg {0}: {1:N1} MB" -f $release, ((Get-Item (Join-Path $pkg 'ffmpeg.exe')).Length / 1MB))
