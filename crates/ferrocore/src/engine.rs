@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -406,6 +406,10 @@ struct Src {
     watch: Watch,
     /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
     pending: Option<Fresh>,
+    /// Being opened on its own thread (that open's token): the watchdog leaves it alone.
+    opening: Option<u64>,
+    /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
+    sent: u64,
 }
 
 /// A new picture for the card: pixels of ours, or (on a Mac) a frame of the screen as the
@@ -438,7 +442,15 @@ impl Fresh {
 
 impl Src {
     fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
-        Src { live, size, kind, watch: Watch { since: now_ns(), ..Watch::default() }, pending: None }
+        Src {
+            live,
+            size,
+            kind,
+            watch: Watch { since: now_ns(), ..Watch::default() },
+            pending: None,
+            opening: None,
+            sent: 0,
+        }
     }
 }
 
@@ -491,6 +503,10 @@ struct State {
     error: Option<String>,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
+    /// Cameras just taken out, still running for [`PARK_NS`]: one added again meanwhile (Undo,
+    /// a rename, the same camera added back) comes back at once instead of being opened again,
+    /// which takes seconds on Windows. What each was, and when it was parked.
+    parked: Vec<(SourceKind, Live, u64)>,
 }
 
 /// How a preview looks, and what it shows (its window is with its own thread).
@@ -554,7 +570,7 @@ pub struct Engine {
     watchdog: Option<JoinHandle<()>>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    next_preview: std::sync::atomic::AtomicU64,
+    next_preview: AtomicU64,
 }
 
 impl std::fmt::Debug for Engine {
@@ -605,6 +621,7 @@ impl Engine {
             stats: Stats::default(),
             error: None,
             previews: HashMap::new(),
+            parked: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -633,7 +650,7 @@ impl Engine {
             thread: Some(thread),
             watchdog,
             preview: Mutex::new(HashMap::new()),
-            next_preview: std::sync::atomic::AtomicU64::new(1),
+            next_preview: AtomicU64::new(1),
         })
     }
 
@@ -695,8 +712,6 @@ impl Engine {
             | SourceKind::DesktopSound
             | SourceKind::Camera(_)
             | SourceKind::Microphone(_) => {
-                let live = open_capture(&self.config, &kind)
-                    .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
                 let heard = match &kind {
                     SourceKind::Screen { sound, .. } => *sound,
                     SourceKind::DesktopSound | SourceKind::Microphone(_) => true,
@@ -705,15 +720,37 @@ impl Engine {
                 if heard {
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
                 }
-                (live, None)
+                if let Some(live) = self.unpark(&kind) {
+                    tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
+                    self.lock().sources.insert(id, Src::new(live, None, Some(kind)));
+                    return Ok(());
+                }
+                let config = self.config;
+                let open = kind.clone();
+                return self.open_soon(
+                    id,
+                    Some(kind),
+                    Box::new(move || {
+                        open_capture(&config, &open)
+                            .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))
+                            .map(|live| (live, false))
+                    }),
+                );
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Media { path, looping } => {
-                let m = crate::media::Media::open(&path, looping)?;
-                if m.has_audio {
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
-                }
-                (Live::Media(m), None)
+                // Opening a file can take a while (FFmpeg looks at it, then tries the GPU
+                // decoder): on its own thread like a capture. A missing file still says so at once.
+                return self.open_soon(
+                    id,
+                    None,
+                    Box::new(move || {
+                        crate::media::Media::open(&path, looping).map(|m| {
+                            let heard = m.has_audio;
+                            (Live::Media(m), heard)
+                        })
+                    }),
+                );
             }
             SourceKind::Slides(s) => {
                 let feed = Feed::default();
@@ -744,12 +781,128 @@ impl Engine {
         Ok(())
     }
 
-    pub fn remove_source(&self, id: u64) {
+    /// A parked capture of this kind, taken back (see `State::parked`).
+    fn unpark(&self, kind: &SourceKind) -> Option<Live> {
+        let mut st = self.lock();
+        let at = st.parked.iter().position(|(k, ..)| k == kind)?;
+        Some(st.parked.swap_remove(at).1)
+    }
+
+    /// Opens capture `kind` as source `id` on its own thread. Opening one can take seconds (on
+    /// Windows FFmpeg looks at a camera before reading it), and whoever adds a source is often
+    /// the window's own thread: it froze, and the live picture couldn't move out from under a
+    /// dialog meanwhile (owner, 8 Nov). Waits [`OPEN_WAIT`] so a quick failure (a camera in
+    /// use) still comes back as the error; a slower open lands by itself, and one that fails
+    /// then is tried again by the watchdog (a capture) or let go (a file: the next opening of the
+    /// collection tries it again).
+    fn open_soon(&self, id: u64, restart: Option<SourceKind>, open: Opener) -> Result<(), AvError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
         {
-            let mut st = self.lock();
-            st.sources.remove(&id);
-            st.globals.remove(&id);
+            let mut src = Src::new(Live::Still, None, restart);
+            src.opening = Some(token);
+            self.lock().sources.insert(id, src);
         }
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
+        let state = self.state.clone();
+        let mixer = self.mixer.clone();
+        let spawned = std::thread::Builder::new().name("ferrocore-open".into()).spawn(move || {
+            // A panic opening it is an error like any other: the token is cleared below and the
+            // watchdog tries again (CodeRabbit), instead of a source stuck "opening".
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+                .unwrap_or_else(|p| Err(AvError::Source(format!("opening it failed: {}", panic_text(&*p)))));
+            let mut leftover = None;
+            let mut discard = false;
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            // Still the same source (not removed or replaced while it opened)?
+            let mine = st.sources.get_mut(&id).filter(|s| s.opening == Some(token));
+            let answer = match (opened, mine) {
+                (Ok((live, heard)), Some(src)) => {
+                    src.live = live;
+                    src.opening = None;
+                    src.watch = Watch { since: now_ns(), ..Watch::default() };
+                    // Its sound into the mix (a file with sound), under the same lock so a
+                    // removal can't slip in between (state, then mixer: the frame loop's order).
+                    if heard {
+                        mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    }
+                    Ok(())
+                }
+                (Err(e), Some(src)) => {
+                    src.opening = None;
+                    if src.kind.is_some() {
+                        // A capture: the watchdog tries again later, waiting longer each time.
+                        src.watch.next_try = now_ns() + backoff_ns(0);
+                        src.watch.tries = 1;
+                    } else {
+                        // Nothing restarts a file: let it go, so the next opening of the
+                        // collection tries again and says why it's left out (CodeRabbit).
+                        discard = true;
+                    }
+                    Err(e)
+                }
+                // Gone meanwhile: let go below, outside the lock (stopping a camera can wait).
+                (Ok((live, _)), None) => {
+                    leftover = Some(live);
+                    Ok(())
+                }
+                (Err(e), None) => Err(e),
+            };
+            if discard {
+                st.sources.remove(&id);
+            }
+            drop(st);
+            drop(leftover);
+            let failed = answer.as_ref().err().map(ToString::to_string);
+            // Told to whoever added it when they're still waiting; logged when it came too late
+            // for that (otherwise a missing file was logged again at every edit).
+            if tx.send(answer).is_err()
+                && let Some(e) = failed
+            {
+                tracing::warn!(source = id, error = %e, "a source didn't open");
+            }
+        });
+        if let Err(e) = spawned {
+            self.lock().sources.remove(&id);
+            return Err(AvError::Source(format!("couldn't start opening it: {e}")));
+        }
+        match rx.recv_timeout(OPEN_WAIT) {
+            Ok(Err(e)) => {
+                // Said straight away: not kept as a source that never opened (nor its sound).
+                let mut st = self.lock();
+                if st.sources.get(&id).is_some_and(|s| matches!(s.live, Live::Still) && s.opening.is_none()) {
+                    st.sources.remove(&id);
+                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                }
+                Err(e)
+            }
+            // Opened, or still opening: it lands by itself.
+            _ => Ok(()),
+        }
+    }
+
+    /// Sources still opening (captures and files started by [`Engine::set_source`], not in yet).
+    pub fn opening(&self) -> usize {
+        self.lock().sources.values().filter(|s| s.opening.is_some()).count()
+    }
+
+    pub fn remove_source(&self, id: u64) {
+        let gone = {
+            let mut st = self.lock();
+            st.globals.remove(&id);
+            match st.sources.remove(&id) {
+                // A running camera is parked a moment (see `State::parked`).
+                Some(src) if src.opening.is_none() && matches!(src.kind, Some(SourceKind::Camera(_))) => {
+                    if let (Some(kind), live @ Live::Camera(_)) = (src.kind, src.live) {
+                        st.parked.push((kind, live, now_ns()));
+                    }
+                    None
+                }
+                other => other,
+            }
+        };
+        // Let go outside the lock (stopping a capture can wait).
+        drop(gone);
         self.gpu.forget(id);
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
@@ -1995,6 +2148,16 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     })
 }
 
+/// Opens a slow source on its own thread: what it plays, and whether it has sound to mix.
+type Opener = Box<dyn FnOnce() -> Result<(Live, bool), AvError> + Send>;
+
+/// How long a removed camera stays open in case it's added back (Undo, a rename).
+const PARK_NS: u64 = 8_000_000_000;
+
+/// How long adding a capture waits for it to open before handing back (the rest happens on
+/// its own thread): short enough that the window never feels stuck.
+const OPEN_WAIT: Duration = Duration::from_millis(250);
+
 /// The watchdog: once a second it looks at every capture, and one that faulted, ended or
 /// went quiet is started again (waiting longer after each try that didn't hold).
 fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
@@ -2007,10 +2170,23 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
         }
         let now = now_ns();
         let mut todo = Vec::new();
+        let mut expired = Vec::new();
         {
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            // Parked cameras not wanted back: closed (outside the lock, below).
+            let mut i = 0;
+            while i < st.parked.len() {
+                if now.saturating_sub(st.parked[i].2) >= PARK_NS {
+                    expired.push(st.parked.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
             for (id, src) in st.sources.iter_mut() {
                 let Some(kind) = &src.kind else { continue };
+                if src.opening.is_some() {
+                    continue;
+                }
                 let running = !matches!(src.live, Live::Still);
                 let w = &mut src.watch;
                 let why = look(w, running, signs(&src.live), now);
@@ -2028,6 +2204,7 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
                 }
             }
         }
+        drop(expired);
         for (id, kind, why, old) in todo {
             drop(old);
             tracing::warn!(source = id, %why, "the watchdog starts a source again");
@@ -2300,6 +2477,30 @@ mod tests {
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
+    }
+
+    /// A capture that can't open says so to whoever added it, and isn't kept (macOS and Linux:
+    /// on Windows looking for a camera through FFmpeg can take longer than the wait).
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_capture_that_cant_open_says_so_at_once() {
+        let Some(e) = engine() else { return };
+        let t = Instant::now();
+        let r = e.set_source(7, SourceKind::Camera("/no/such/camera".into()));
+        assert!(r.is_err(), "the error comes back: {r:?}");
+        assert!(t.elapsed() < Duration::from_secs(2), "without waiting long");
+        assert_eq!(e.opening(), 0);
+        assert!(!e.lock().sources.contains_key(&7), "not kept");
+    }
+
+    /// A file that isn't there says so at once too (it opens on its own thread like a camera).
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn a_missing_media_file_says_so_at_once() {
+        let Some(e) = engine() else { return };
+        let r = e.set_source(9, SourceKind::Media { path: "/no/such/clip.mp4".into(), looping: false });
+        assert!(r.is_err(), "the error comes back: {r:?}");
+        assert!(!e.lock().sources.contains_key(&9), "not kept");
     }
 
     #[test]
