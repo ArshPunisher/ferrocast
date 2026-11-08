@@ -1162,6 +1162,20 @@ impl DesktopStudio {
     }
 
     /// Runs `f` on the main thread with the libobs state and waits for its answer.
+    /// A kind's form, its device lists read off the window's thread: listing cameras can take
+    /// seconds (on Windows FFmpeg asks DirectShow), and on the main thread that froze the
+    /// window and held up the live picture's place, so it stayed over the Add dialog for
+    /// seconds (owner, 8 Nov). Only the displays' names (AppKit) are read on the main thread.
+    async fn read_options(&self, kind: String) -> Result<Option<Vec<ferrocast_studio::OptionInfo>>, String> {
+        #[cfg(target_os = "macos")]
+        if kind == "screen_capture" {
+            self.on_main(|_| ferrocast_studio::kinds::read_screen_names()).await?;
+        }
+        tokio::task::spawn_blocking(move || ferrocast_studio::kinds::options_cached(&kind))
+            .await
+            .map_err(|e| format!("The list couldn't be read: {e}"))
+    }
+
     async fn on_main<T: Send + 'static>(&self, f: impl FnOnce(&mut Held) -> T + Send + 'static) -> Result<T, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.app
@@ -1399,10 +1413,8 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn options(&self, kind: String) -> Result<Value, String> {
-        // On the main thread: a display's name ("VG271U M3") comes from AppKit, read there only.
-        let k = kind.clone();
         let opts = self
-            .on_main(move |_| ferrocast_studio::kinds::options(&k))
+            .read_options(kind.clone())
             .await?
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))?;
         serde_json::to_value(opts).map_err(|e| e.to_string())
@@ -1527,6 +1539,81 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
+        // A source's form: its kind found on the main thread, the form read off it (devices).
+        if let StudioAct::Options { name } = &act {
+            let n = name.clone();
+            let kind = self
+                .on_main(move |h| -> Result<String, String> {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    c.kind(&n).map_err(|e| e.to_string())
+                })
+                .await??;
+            let opts = self
+                .read_options(kind)
+                .await?
+                .ok_or_else(|| format!("Ferrocast's own engine can't show \"{name}\" yet."))?;
+            return serde_json::to_value(opts).map_err(|e| e.to_string());
+        }
+        // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
+        // milliseconds there, and the scene grid asks for one every few seconds).
+        if let StudioAct::Thumbnail { scene, width } = &act {
+            let (s, w) = (scene.clone(), *width);
+            let (px, pw, ph) = self
+                .on_main(move |h| -> Result<_, String> {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    c.thumbnail_pixels(&s, w).map_err(|e| e.to_string())
+                })
+                .await??;
+            let scene = scene.clone();
+            let image = tokio::task::spawn_blocking(move || ferrocast_studio::png_data_url(&px, pw, ph, &scene))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "image": image }));
+        }
+        if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
+            let data = self.data.clone();
+            let shot = act.clone();
+            let (path, px, size) = self
+                .on_main(move |h| -> Result<_, String> {
+                    // Next to the recordings, as OBS does.
+                    let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    let (px, size) = match &shot {
+                        StudioAct::Screenshot { name } => c.screenshot_pixels(name),
+                        _ => c.screenshot_program_pixels(),
+                    }
+                    .map_err(|e| e.to_string())?;
+                    std::fs::create_dir_all(&folder)
+                        .map_err(|e| format!("The screenshot folder couldn't be made: {e}"))?;
+                    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+                    // Two in the same second get their own files: the name is taken here (the
+                    // file made empty), so a second shot before this one is written can't pick it.
+                    let mut n = 1;
+                    loop {
+                        let path = if n == 1 {
+                            folder.join(format!("Screenshot {stamp}.png"))
+                        } else {
+                            folder.join(format!("Screenshot {stamp} ({n}).png"))
+                        };
+                        match std::fs::File::create_new(&path) {
+                            Ok(_) => return Ok((path, px, size)),
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                            Err(e) => return Err(format!("The screenshot couldn't be saved: {e}")),
+                        }
+                    }
+                })
+                .await??;
+            let at = path.clone();
+            let written = tokio::task::spawn_blocking(move || ferrocast_studio::stage::write_png(&at, &px, size))
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&path);
+                return Err(e.to_string());
+            }
+            return Ok(json!({ "file": path.display().to_string() }));
+        }
         let data = self.data.clone();
         let app = self.app.clone();
         self.on_main(move |h| {
@@ -1536,26 +1623,6 @@ impl StudioHost for DesktopStudio {
             if act == StudioAct::Scenes && h.collection.is_none() {
                 let saved = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
                 return Ok(saved_scenes(saved.as_ref()));
-            }
-            if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
-                // Next to the recordings, as OBS does.
-                let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
-                let c = h.collection.as_ref().ok_or(STOPPED)?;
-                std::fs::create_dir_all(&folder).map_err(|e| format!("The screenshot folder couldn't be made: {e}"))?;
-                let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-                // Two in the same second get their own files.
-                let mut path = folder.join(format!("Screenshot {stamp}.png"));
-                let mut n = 2;
-                while path.exists() {
-                    path = folder.join(format!("Screenshot {stamp} ({n}).png"));
-                    n += 1;
-                }
-                match &act {
-                    StudioAct::Screenshot { name } => c.screenshot(name, &path),
-                    _ => c.screenshot_program(&path),
-                }
-                .map_err(|e| e.to_string())?;
-                return Ok(json!({ "file": path.display().to_string() }));
             }
             if let StudioAct::Select { scene, id, frames, also } = &act {
                 h.selected = scene.clone().zip(*id).map(|(s, id)| {

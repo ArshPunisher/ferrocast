@@ -2,9 +2,90 @@
 //! settings form, with no libobs: the same ids and settings keys OBS uses (so collections go
 //! both ways), drawn by the app's forms as libobs's properties were.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 
 use crate::{Kind, Kinds, OptionInfo};
+
+/// Kinds whose form lists what's on this computer now (cameras, screens, windows, mics, NDI):
+/// reading those can take seconds (on Windows FFmpeg asks DirectShow for the cameras), so
+/// they're read off the window's thread and kept a moment for the next ask.
+pub fn lists_devices(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ndi_source"
+            | "screen_capture"
+            | "av_capture_input"
+            | "av_capture_input_v2"
+            | "coreaudio_input_capture"
+            | "sck_audio_capture"
+            | "coreaudio_output_capture"
+            | "monitor_capture"
+            | "window_capture"
+            | "dshow_input"
+            | "xshm_input"
+            | "v4l2_input"
+            | "pulse_input_capture"
+            | "wasapi_process_output_capture"
+            | "wasapi_input_capture"
+    )
+}
+
+/// How long a device list read is given again without reading the devices anew: long enough
+/// that the dialog's read-ahead and the click that follows share one read, short enough that a
+/// camera plugged in shows the next time you look.
+const FRESH: Duration = Duration::from_millis(1500);
+
+type Slot = Arc<Mutex<Option<(Instant, Option<Vec<OptionInfo>>)>>>;
+
+fn slot(kind: &str) -> Slot {
+    static SLOTS: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
+    let mut all = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    all.get_or_insert_with(HashMap::new).entry(kind.to_string()).or_default().clone()
+}
+
+/// `options`, with device lists read at most once per [`FRESH`]: two asks at once (the
+/// dialog reading ahead while you click) wait for the same read instead of each starting one.
+/// Call it off the window's thread for device kinds.
+pub fn options_cached(kind: &str) -> Option<Vec<OptionInfo>> {
+    if !lists_devices(kind) {
+        return options(kind);
+    }
+    let slot = slot(kind);
+    // Held while reading, so a second ask waits for this read and takes its answer.
+    let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, got)) = held.as_ref()
+        && at.elapsed() < FRESH
+    {
+        return got.clone();
+    }
+    let got = options(kind);
+    *held = Some((Instant::now(), got.clone()));
+    got
+}
+
+/// Each display's name as macOS shows it ("VG271U M3"), read on the main thread by the app
+/// and kept here, so a display list read on another thread still names them.
+static SCREEN_NAMES: Mutex<Option<HashMap<u32, String>>> = Mutex::new(None);
+
+/// Reads the displays' names (main thread only; elsewhere this keeps the last ones).
+#[cfg(target_os = "macos")]
+pub fn read_screen_names() {
+    let names = crate::ffi::projector_window::screen_names();
+    if !names.is_empty() {
+        *SCREEN_NAMES.lock().unwrap_or_else(|e| e.into_inner()) = Some(names);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn screen_names() -> HashMap<u32, String> {
+    #[cfg(target_os = "macos")]
+    read_screen_names();
+    SCREEN_NAMES.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
 
 fn kind(id: &str, name: &str) -> Kind {
     Kind { id: id.into(), name: name.into() }
@@ -271,7 +352,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             ])];
             #[cfg(target_os = "macos")]
             if let Ok((displays, windows)) = ferrocore::screen::shareable() {
-                let names = crate::ffi::projector_window::screen_names();
+                let names = screen_names();
                 let d: Vec<(String, Value)> =
                     displays.iter().enumerate().map(|(i, d)| (display_label(i, d, &names), json!(d.id))).collect();
                 let w: Vec<(String, Value)> = windows

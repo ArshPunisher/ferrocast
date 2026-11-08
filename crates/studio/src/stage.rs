@@ -1073,6 +1073,11 @@ impl Stage {
         Ok(self.source(name)?.get("settings").cloned().unwrap_or_else(|| json!({})))
     }
 
+    /// A source's kind ("dshow_input").
+    pub fn kind(&self, name: &str) -> Result<String, StudioError> {
+        Ok(kind_of(&self.source(name)?).to_string())
+    }
+
     /// A source's settings form (its kind's, from our engine's kinds).
     pub fn options(&self, name: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
         let s = self.source(name)?;
@@ -1307,6 +1312,13 @@ impl Stage {
     /// A small picture of a scene as it looks now (`width` pixels wide, the canvas's shape), as
     /// a PNG data URL: the Scenes grid's tiles.
     pub fn thumbnail(&self, scene: &str, width: u32) -> Result<String, StudioError> {
+        let (px, w, h) = self.thumbnail_pixels(scene, width)?;
+        crate::collection::png_data_url(&px, w, h, scene)
+    }
+
+    /// A scene's picture `width` wide as RGBA pixels (with its height): the drawing, which needs
+    /// this thread; turning it into a PNG ([`png_data_url`]) can happen elsewhere.
+    pub fn thumbnail_pixels(&self, scene: &str, width: u32) -> Result<(Vec<u8>, u32, u32), StudioError> {
         self.scene_index(scene)?;
         let (cw, ch) = (self.canvas.width.max(1), self.canvas.height.max(1));
         let w = width.clamp(64, 640);
@@ -1316,7 +1328,7 @@ impl Stage {
             .engine
             .snapshot_scene_at(scene, (cw, ch), (w, h))
             .map_err(|e| fail(format!("\"{scene}\" couldn't be drawn: {e}")))?;
-        crate::collection::png_data_url(&px, w, h, scene)
+        Ok((px, w, h))
     }
 
     // ------------------------------------------------------------------ outputs
@@ -1902,6 +1914,13 @@ impl Stage {
 
     /// A picture of a scene (at its canvas's size) as a PNG at `path`.
     pub fn screenshot(&self, name: &str, path: &Path) -> Result<(), StudioError> {
+        let (px, size) = self.screenshot_pixels(name)?;
+        write_png(path, &px, size)
+    }
+
+    /// A scene (or vertical scene) at its picture's full size, as RGBA pixels: saving them as a
+    /// PNG ([`write_png`]) can happen off this thread.
+    pub fn screenshot_pixels(&self, name: &str) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
         let size = if self.vertical_order().iter().any(|n| n == name) {
             crate::collection::VERTICAL_SIZE
         } else {
@@ -1909,13 +1928,19 @@ impl Stage {
             (self.canvas.width, self.canvas.height)
         };
         let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
-        write_png(path, &px, size)
+        Ok((px, size))
     }
 
     /// A picture of what's on air exactly, as a PNG at `path`.
     pub fn screenshot_program(&self, path: &Path) -> Result<(), StudioError> {
+        let (px, size) = self.screenshot_program_pixels()?;
+        write_png(path, &px, size)
+    }
+
+    /// What's on air as RGBA pixels and their size.
+    pub fn screenshot_program_pixels(&self) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
         let px = self.engine()?.engine.snapshot().map_err(|e| fail(e.to_string()))?;
-        write_png(path, &px, (self.canvas.width, self.canvas.height))
+        Ok((px, (self.canvas.width, self.canvas.height)))
     }
 
     // ------------------------------------------------------------------ the vertical picture
@@ -3280,7 +3305,8 @@ impl Stage {
 }
 
 /// RGBA rows saved as a PNG.
-fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), StudioError> {
+/// Saves RGBA pixels as a PNG (any thread).
+pub fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), StudioError> {
     let file = std::fs::File::create(path).map_err(|e| fail(format!("the screenshot couldn't be saved ({e})")))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
     enc.set_color(png::ColorType::Rgba);

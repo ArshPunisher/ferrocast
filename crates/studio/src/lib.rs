@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The kind id of Ferrocast's Web page source (macOS; OBS's Browser source keys).
 pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
+pub use collection::png_data_url;
 pub use collection::{
     AudioInfo, BOUNDS, CHANNEL_KEYS, Captions, DEINTERLACE, Face, FaceFollow, FilterInfo, FollowLook, ItemEdit,
     ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SoundTap, SourceUse, StudioOptions,

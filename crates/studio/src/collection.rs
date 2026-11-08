@@ -311,7 +311,8 @@ pub struct TBarState {
 }
 
 /// RGBA rows as a PNG data URL (a scene's tile).
-pub(crate) fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, StudioError> {
+/// RGBA pixels as a PNG `data:` URL (any thread).
+pub fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, StudioError> {
     use base64::Engine as _;
     {
         let mut out = Vec::with_capacity(px.len() / 4);
