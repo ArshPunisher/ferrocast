@@ -1275,6 +1275,16 @@ impl Compositor {
     pub fn upload_surface(&self, id: u64, s: &crate::screen::Surface) -> Result<(), AvError> {
         let (w, h) = s.size();
         check_size(w, h)?;
+        // On a Mac the frame's own memory becomes the texture: no copy at all.
+        #[cfg(target_os = "macos")]
+        if crate::apple::zerocopy::enabled()
+            && let Some(t) = crate::apple::zerocopy::texture(&self.device, s, "screen")
+        {
+            self.uploads.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (t, w, h));
+            // The copying path's buffers for it aren't needed now.
+            self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            return Ok(());
+        }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(ups.get(&id), Some((t, tw, th)) if (*tw, *th) == (w, h) && t.format() == BGRA) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {

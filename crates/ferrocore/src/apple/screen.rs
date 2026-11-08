@@ -406,6 +406,8 @@ fn window_size((w, h): (f64, f64), max: (u32, u32)) -> (u32, u32) {
 
 /// A frame of a display as the system holds it: BGRA, colours multiplied by alpha, not copied.
 /// It is kept (so ScreenCaptureKit can't reuse its memory) until it has been sent to the card.
+/// Cloning keeps the same buffer one more time (no pixels are copied).
+#[derive(Clone)]
 pub struct Surface {
     image: CFRetained<objc2_core_video::CVImageBuffer>,
     width: u32,
@@ -424,7 +426,7 @@ impl std::fmt::Debug for Surface {
 
 impl Surface {
     /// None for a buffer that isn't 32-bit BGRA or has no size.
-    fn of(image: CFRetained<objc2_core_video::CVImageBuffer>) -> Option<Self> {
+    pub(crate) fn of(image: CFRetained<objc2_core_video::CVImageBuffer>) -> Option<Self> {
         let (w, h) = (CVPixelBufferGetWidth(&image), CVPixelBufferGetHeight(&image));
         if w == 0 || h == 0 || CVPixelBufferGetPixelFormatType(&image) != BGRA {
             return None;
@@ -434,6 +436,17 @@ impl Surface {
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Its pixels copied out as a picture of ours (RGBA), for whoever needs them on the CPU.
+    pub fn copy(&self) -> Option<Picture> {
+        copy_bgra(&self.image)
+    }
+
+    /// The IOSurface the pixels live in, when the buffer has one (ScreenCaptureKit's always do).
+    pub fn io_surface(&self) -> Option<CFRetained<objc2_io_surface::IOSurfaceRef>> {
+        // Retained for us by the binding (the "Get" rule's retain is done there).
+        objc2_core_video::CVPixelBufferGetIOSurface(Some(&self.image))
     }
 
     /// Reads the pixels where they are: `f` gets them (BGRA, `stride` bytes a row), or None when

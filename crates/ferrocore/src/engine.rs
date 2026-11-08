@@ -2377,6 +2377,11 @@ fn frame(
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Camera(cap) => {
+                // A Mac camera's frames go to the card as the camera holds them (no copy).
+                #[cfg(target_os = "macos")]
+                if let Some(s) = cap.take_surface() {
+                    uploads.push((*id, Fresh::Screen(s)));
+                }
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, Fresh::Pic(p)));
                 }

@@ -7,6 +7,7 @@ pub mod camera;
 pub mod media;
 pub mod screen;
 pub(crate) mod vt;
+pub mod zerocopy;
 
 use std::ffi::{c_char, c_void};
 use std::ptr;

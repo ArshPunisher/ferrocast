@@ -54,9 +54,11 @@ pub fn microphones() -> Vec<Device> {
 }
 
 /// What a capture's delegate keeps.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Shared {
     frame: Mutex<Option<(Picture, u64)>>,
+    /// The newest frame as the camera holds it (no copy), when the card can read it directly.
+    surface: Mutex<Option<(super::screen::Surface, u64)>>,
     sound: Mutex<VecDeque<(Vec<f32>, u64)>>,
     count: AtomicU64,
 }
@@ -87,6 +89,18 @@ define_class!(
             // Video frames carry an image; sound pieces don't.
             // SAFETY: the sample buffer is live for this call.
             if let Some(image) = unsafe { sample.image_buffer() } {
+                // Kept as the camera holds it and handed to the card with no copy (as a screen's
+                // frames are); copied out only when that's switched off.
+                // A frame that can't be kept that way (not BGRA) is copied below (CodeRabbit).
+                if super::zerocopy::enabled()
+                    && let Some(s) = super::screen::Surface::of(image.clone())
+                {
+                    if let Ok(mut f) = self.ivars().surface.lock() {
+                        *f = Some((s, ts));
+                    }
+                    self.ivars().count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 if let Some(p) = super::screen::copy_bgra(&image) {
                     if let Ok(mut f) = self.ivars().frame.lock() {
                         *f = Some((p, ts));
@@ -234,9 +248,19 @@ impl Capture {
         }
     }
 
-    /// The newest camera frame and its host time (taken).
+    /// The newest camera frame and its host time (taken). With no copy (the default), frames
+    /// come from [`Capture::take_surface`] instead, and this gives a copy of one when asked.
     pub fn take_frame(&self) -> Option<(Picture, u64)> {
-        self.shared.frame.lock().ok().and_then(|mut f| f.take())
+        if let Some(f) = self.shared.frame.lock().ok().and_then(|mut f| f.take()) {
+            return Some(f);
+        }
+        let (s, ts) = self.shared.surface.lock().ok().and_then(|mut f| f.take())?;
+        Some((s.copy()?, ts))
+    }
+
+    /// The newest camera frame as the camera holds it, for the card to read with no copy (taken).
+    pub fn take_surface(&self) -> Option<super::screen::Surface> {
+        self.shared.surface.lock().ok().and_then(|mut f| f.take()).map(|(s, _)| s)
     }
 
     /// Every sound piece since the last call, oldest first, each with its host time.
