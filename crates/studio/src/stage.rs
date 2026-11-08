@@ -41,6 +41,8 @@ pub struct Stage {
     /// straight to the engine's item, not through opening the whole collection again).
     quiet: std::cell::Cell<bool>,
     /// Where monitored sound plays (a device's name; None: the system's), kept for each engine.
+    // Read only where monitoring plays (macOS, Windows); Linux keeps it for the next build.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     monitor_device: RefCell<Option<String>>,
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
