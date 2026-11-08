@@ -336,6 +336,16 @@ pub struct RecordState {
     pub splitting: bool,
 }
 
+/// One source's load on the engine (see [`Engine::source_load`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLoad {
+    pub name: String,
+    /// Pictures sent to the card since it started.
+    pub sent: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// How the engine is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Stats {
@@ -1107,7 +1117,58 @@ impl Engine {
         }
     }
 
-    /// The scenes there are (groups left out).
+    /// Every source a collection brought, by name: pictures sent to the card so far and their
+    /// size. Read twice, the difference is each one's rate (what keeps the engine busiest).
+    pub fn source_load(&self) -> Vec<SourceLoad> {
+        let st = self.lock();
+        let mut out: Vec<SourceLoad> = st
+            .opened
+            .iter()
+            .filter_map(|(name, (id, _))| {
+                let s = st.sources.get(id)?;
+                let (width, height) = s.size.map_or((0, 0), |(w, h, _)| (w, h));
+                Some(SourceLoad { name: name.clone(), sent: s.sent, width, height })
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
+    /// least `quiet_ns` (and aren't still opening): each one's name, and whether it captures the
+    /// screen (a window, a display, an app) rather than a camera. The Studio's black screen
+    /// fixer says why and what to do.
+    pub fn quiet_captures(&self, quiet_ns: u64) -> Vec<(String, bool)> {
+        let st = self.lock();
+        let shown = seen(&st);
+        let now = now_ns();
+        let mut out: Vec<(String, bool)> = st
+            .opened
+            .iter()
+            .filter_map(|(name, (id, kind))| {
+                let screen = match kind {
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                    SourceKind::Camera(_) => false,
+                    #[cfg(target_os = "macos")]
+                    SourceKind::App { .. } => true,
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                    SourceKind::Screen { .. } => true,
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                    SourceKind::Window(_) => true,
+                    _ => return None,
+                };
+                let s = st.sources.get(id)?;
+                (shown.contains(id)
+                    && s.size.is_none()
+                    && s.opening.is_none()
+                    && now.saturating_sub(s.watch.since) >= quiet_ns)
+                    .then(|| (name.clone(), screen))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// A source an opened collection brought, by name: its id, and its picture's size once
     /// it has one.
     pub fn source_named(&self, name: &str) -> Option<(u64, Option<(u32, u32)>)> {
@@ -1132,6 +1193,7 @@ impl Engine {
         }
     }
 
+    /// The scenes there are (groups left out).
     pub fn scene_names(&self) -> Vec<String> {
         let st = self.lock();
         st.scenes.keys().filter(|n| !st.groups.contains(n)).cloned().collect()
@@ -2367,6 +2429,7 @@ fn frame(
         }
         if f.send(gpu, id) {
             s.size = Some(f.info());
+            s.sent += 1;
         }
     }
     let blocks = mx.mix_until(now_ns());
@@ -3223,6 +3286,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[255, 0, 0, 255], "the picture handed in");
         assert!(e.fed(2).is_none());
+    }
+
+    /// Stats' "what keeps the engine busiest": pictures each named source sent, and their size.
+    #[test]
+    fn each_source_counts_the_pictures_it_sends() {
+        let Some(e) = engine() else { return };
+        let kind = SourceKind::Fed { width: 640, height: 360 };
+        e.set_source(1, kind.clone()).unwrap_or_else(|x| panic!("{x}"));
+        e.lock().opened.insert("Phone".into(), (1, kind));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let feed = e.fed(1).unwrap_or_else(|| panic!("a fed source"));
+        for _ in 0..3 {
+            feed.picture(Picture::solid(320, 180, [0, 0, 255, 255]));
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        let load = e.source_load();
+        assert_eq!(load.len(), 1);
+        assert_eq!((load[0].name.as_str(), load[0].width, load[0].height), ("Phone", 320, 180));
+        assert!(load[0].sent >= 2, "pictures counted: {}", load[0].sent);
+    }
+
+    /// The black screen fixer's list: a capture on air with no picture yet, not one still
+    /// opening, nor one that's off air or has a picture.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn captures_on_air_with_no_picture_are_named() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            let mut add = |id: u64, name: &str, kind: SourceKind, size: Option<(u32, u32, bool)>, opening| {
+                let mut s = Src::new(Live::Still, size, Some(kind.clone()));
+                s.watch.since = 0;
+                s.opening = opening;
+                st.sources.insert(id, s);
+                st.opened.insert(name.into(), (id, kind));
+            };
+            add(1, "Webcam", SourceKind::Camera("x".into()), None, None);
+            add(2, "Game", SourceKind::Window(7), None, None);
+            add(3, "Opening", SourceKind::Camera("y".into()), None, Some(9));
+            add(4, "Fine", SourceKind::Camera("z".into()), Some((640, 360, true)), None);
+            add(5, "Off air", SourceKind::Camera("w".into()), None, None);
+        }
+        let items = [1, 2, 3, 4].map(|id| SceneItem::new(id, Placement::default()));
+        e.set_scene("Main", items.to_vec());
+        e.set_scene("Other", vec![SceneItem::new(5, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.quiet_captures(1_000), vec![("Game".to_string(), true), ("Webcam".to_string(), false)]);
     }
 
     #[test]
