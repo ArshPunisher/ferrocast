@@ -14,6 +14,9 @@ param(
   [string]$Out = 'smoke',
   [int]$Seconds = 20,
   [int]$Fps = 30,
+  # The share of $Fps the engine must reach: 0.9 on a real PC. GitHub's runner has no
+  # graphics card (WARP draws on 4 CPU cores, ~14 of 30 fps), so CI asks for less there.
+  [double]$MinShare = 0.9,
   # A minidump on a native crash (Sysinternals ProcDump, downloaded when missing).
   [string]$ProcDump = '',
   # Instead: the app faults on purpose (FERROCAST_TEST_CRASH) and its own crash report must
@@ -149,6 +152,25 @@ for ($i = 0; $i -lt 180 -and -not (Get-ChildItem $ffDir -Recurse -Filter ffmpeg.
 Check 'FFmpeg fetched' ([bool](Get-ChildItem $ffDir -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue)) "under $ffDir"
 Start-Sleep 2
 
+# Listing cameras (FFmpeg asks DirectShow) is off the window's own thread: the live picture's
+# place still changes at once meanwhile (owner, 8 Nov: it sat over the Add dialog for seconds).
+$list = Start-Job -ArgumentList $base, $token -ScriptBlock {
+  param($b, $t)
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  Invoke-WebRequest -Uri "$b/api/v1/studio/engine/kinds/dshow_input/options" -Headers @{ Authorization = "Bearer $t" } -UseBasicParsing | Out-Null
+  $sw.ElapsedMilliseconds
+}
+Start-Sleep -Milliseconds 150
+$sw = [Diagnostics.Stopwatch]::StartNew()
+try { Api PUT '/preview' @{ rect = @{ x = 0; y = 0; w = 640; h = 360; vh = 800 } } | Out-Null } catch { }
+$placeMs = $sw.ElapsedMilliseconds
+$listMs = Receive-Job $list -Wait -AutoRemoveJob
+Check 'preview placed while cameras are listed' ($placeMs -lt 500) "placed in $placeMs ms; the camera list took $listMs ms"
+$sw = [Diagnostics.Stopwatch]::StartNew()
+Api GET '/kinds/dshow_input/options' | Out-Null
+Note "the camera list again: $($sw.ElapsedMilliseconds) ms"
+try { Api PUT '/preview' @{ rect = $null } | Out-Null } catch { }
+
 # Record, sampling the app's CPU (Windows' view) and the engine's own numbers each second.
 $r = Try-Api 'recording starts' POST '/record' @{ on = $true }
 $cpu = @(); $fpsSeen = @(); $frameMs = @()
@@ -182,7 +204,7 @@ $result.numbers = [ordered]@{
   cores = $cores
 }
 Write-Host ("numbers: " + ($result.numbers | ConvertTo-Json -Compress))
-if ($null -ne $result.numbers.engine_fps) { Check 'frame rate' ($result.numbers.engine_fps -ge 0.9 * $Fps) "$($result.numbers.engine_fps) of $Fps fps" }
+if ($null -ne $result.numbers.engine_fps) { Check 'frame rate' ($result.numbers.engine_fps -ge $MinShare * $Fps) "$($result.numbers.engine_fps) of $Fps fps (needs $([math]::Round($MinShare * $Fps, 1)))" }
 
 # The file: picture and sound in it (FFmpeg's own reading, the copy the app fetched).
 $file = Get-ChildItem $rec -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1

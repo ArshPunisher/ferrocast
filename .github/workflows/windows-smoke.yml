@@ -71,7 +71,7 @@ jobs:
           --config 'profile.release.package.ferrocast-desktop.debug-assertions=true'
       - name: Smoke test
         shell: pwsh
-        run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke/run -Seconds 20 -Fps 30
+        run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke/run -Seconds 20 -Fps 30 -MinShare 0.3
       - name: Crash report test (the app faults on purpose; its minidump must be written)
         if: always()
         shell: pwsh
