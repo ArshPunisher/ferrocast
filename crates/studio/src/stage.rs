@@ -653,8 +653,30 @@ impl Stage {
 
     // ------------------------------------------------------------------ items
 
-    /// The source's picture size, once our engine has one (else what its settings say).
+    /// The source's size as drawn in a scene: its own size through its filters (a crop makes
+    /// it smaller, a shadow or border bigger), as OBS sizes a source. The outline round it on
+    /// the canvas and every move or resize use this (9 Nov: a cropped source kept the outline
+    /// of its whole picture).
     fn size_of(&self, source: &str) -> (u32, u32) {
+        let (w, h) = self.own_size_of(source);
+        if w == 0 || h == 0 {
+            return (w, h);
+        }
+        let s = self.source(source).unwrap_or(Value::Null);
+        let filters = s.get("filters").and_then(Value::as_array).cloned().unwrap_or_default();
+        filters
+            .iter()
+            .filter(|f| f.get("enabled").and_then(Value::as_bool) != Some(false))
+            .filter_map(|f| {
+                let set = with_defaults(f);
+                ferrocore::obs::effect_from(kind_of(f), &set)
+            })
+            .fold((w, h), |(w, h), e| e.out_size(w, h))
+    }
+
+    /// The source's own picture size, before its filters, once our engine has one (else what
+    /// its settings say).
+    fn own_size_of(&self, source: &str) -> (u32, u32) {
         if let Some(e) = self.engine.borrow().as_ref()
             && let Some((_, Some(size))) = e.engine.source_named(source)
         {
@@ -2124,7 +2146,7 @@ impl Stage {
     pub fn follow_look(&self, f: &crate::FaceFollow) -> Result<Option<crate::FollowLook>, StudioError> {
         use crate::collection::follow::LOOK_WIDTH;
         let name = name_of(&self.item(&f.scene, f.id)?).to_string();
-        let (sw, sh) = self.size_of(&name);
+        let (sw, sh) = self.own_size_of(&name);
         let e = self.engine()?;
         let Some((id, _)) = e.engine.source_named(&name) else { return Ok(None) };
         if sw == 0 || sh == 0 {
@@ -3774,6 +3796,24 @@ mod tests {
         assert!(ok(s.options("Back")).iter().any(|o| o.key == "color"));
         ok(s.add_filter("Back", "chroma_key_filter_v2", "Key", &json!({})));
         assert!(ok(s.filter_options("Back", "Key")).iter().any(|o| o.key == "similarity"));
+        // What OBS left unsaved reads as its default (a crop saved by OBS has no "relative").
+        ok(s.add_filter("Back", "crop_filter", "Crop", &json!({})));
+        ok(s.with_filters("Back", |l| l.iter_mut().for_each(|f| f["settings"] = json!({ "left": 28 }))));
+        let crop = ok(s.filter_settings("Back", "Crop"));
+        assert_eq!((crop["left"].as_i64(), crop["relative"].as_bool()), (Some(28), Some(true)));
+    }
+
+    #[test]
+    fn a_cropped_source_is_outlined_at_its_cropped_size() {
+        let s = stage();
+        ok(s.add_source("Main", "color_source_v3", "Card", &json!({ "width": 1920, "height": 1080 }), false));
+        let frame = || ok(s.items("Main")).into_iter().find(|i| i.name == "Card").map(|i| i.frame).unwrap_or_default();
+        assert_eq!(frame()[0..4], [1920.0, 0.0, 0.0, 1080.0]);
+        ok(s.add_filter("Card", "crop_filter", "Crop", &json!({ "left": 100, "right": 20, "top": 30 })));
+        assert_eq!(frame()[0..4], [1800.0, 0.0, 0.0, 1050.0], "the crop's size, not the whole picture's");
+        // Switched off, the whole picture again.
+        ok(s.with_filters("Card", |l| l.iter_mut().for_each(|f| f["enabled"] = json!(false))));
+        assert_eq!(frame()[0..4], [1920.0, 0.0, 0.0, 1080.0]);
     }
 
     #[test]
