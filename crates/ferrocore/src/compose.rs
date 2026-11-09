@@ -940,6 +940,10 @@ impl Compositor {
             Content::Group { items, .. } => self.draw_items(enc, &cur, items, &Affine::IDENTITY)?,
         }
         for e in &item.effects {
+            // Freeze only holds the picture (the engine stops taking new ones): nothing to draw.
+            if matches!(e, Effect::Freeze) {
+                continue;
+            }
             // A shader effect of one's own that can't run is left out (the picture as it was).
             let custom = match e {
                 Effect::Custom { code, .. } => match self.custom_pipeline(code) {
@@ -1000,6 +1004,8 @@ impl Compositor {
                     ("fs_luma_key", [0.0; 6], [0.0; 4])
                 }
                 Effect::Sharpen { sharpness } => ("fs_sharpen", [*sharpness, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                // Skipped above, before a target is made.
+                Effect::Freeze => continue,
                 Effect::Crop { left, top, .. } => {
                     ("fs_crop", [*left as f32, *top as f32, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }

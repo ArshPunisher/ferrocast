@@ -152,6 +152,7 @@ pub fn kinds() -> Kinds {
             kind("ferrocast_blur_area", "Blur or Pixelate"),
             kind("ferrocast_look", "Look"),
             kind("ferrocast_shader", "Shader Effect"),
+            kind("ferrocast_freeze", "Freeze"),
             kind("gain_filter", "Gain"),
             kind("noise_gate_filter", "Noise Gate"),
             kind("compressor_filter", "Compressor"),
@@ -304,6 +305,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 crate::ffi::ndi::sources(1500).unwrap_or_default().into_iter().map(|n| (n.clone(), json!(n))).collect();
             vec![opt("ndi_source_name", "Source name", "list").choices(&as_refs(&found))]
         }
+        // Nothing to set: its switch freezes and unfreezes.
+        "ferrocast_freeze" => vec![],
         "ferrocast_shader" => vec![
             opt("shader_file", "Shader File", "path").file("WGSL Shaders (*.wgsl);;All Files (*.*)"),
             opt("shader_text", "Or Write One Here", "text").multiline().mono(),
@@ -688,6 +691,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "color_source" | "color_source_v2" => json!({ "color": 0xFFFF_FFFFu32, "width": 0, "height": 0 }),
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
         "ndi_source" => json!({ "ndi_source_name": "" }),
+        "ferrocast_freeze" => json!({}),
         "ferrocast_shader" => json!({
             "shader_file": "",
             "shader_text": "// Each point of the picture: pic(uv) reads it; time(), size() and params() help.\nfn effect(uv: vec2<f32>) -> vec4<f32> {\n    let c = pic(uv);\n    let gray = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));\n    return vec4<f32>(mix(c.rgb, vec3<f32>(gray), params().x), c.a);\n}\n",

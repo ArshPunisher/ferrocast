@@ -130,6 +130,7 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             min_smooth: n("luma_min_smooth", 0.0),
         },
         "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        "ferrocast_freeze" | "freeze_filter" => Effect::Freeze,
         "scroll_filter" => {
             let size = |on: &str, k: &str| {
                 s.get(on)

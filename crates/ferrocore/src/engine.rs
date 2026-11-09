@@ -1591,7 +1591,9 @@ impl Engine {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let item = {
             let mut st = self.lock();
+            let held = frozen(&st).contains(&id);
             if let Some(src) = st.sources.get_mut(&id)
+                && !(held && src.sent > 0)
                 && let Some(f) = src.pending.take()
                 && f.send(&self.gpu, id)
             {
@@ -1915,6 +1917,17 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
 
 /// Sources something drawn shows now: on air, a transition's or stinger's, an output's own
 /// scene, a preview's or a multiview's, with the scenes inside them and the masks they use.
+/// Sources a Freeze filter holds: one on any of the source's items in any scene (a source's
+/// filters are the same wherever it's shown).
+fn frozen(st: &State) -> std::collections::HashSet<u64> {
+    st.scenes
+        .values()
+        .flatten()
+        .filter(|it| it.scene.is_none() && it.effects.iter().any(|e| matches!(e, Effect::Freeze)))
+        .map(|it| it.source)
+        .collect()
+}
+
 fn seen(st: &State) -> std::collections::HashSet<u64> {
     fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
         let Some(items) = st.scenes.get(scene) else { return };
@@ -1958,7 +1971,13 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
 /// Pictures kept back while unseen, sent to the GPU now (something is about to draw them
 /// another way: a thumbnail, a snapshot).
 fn send_pending(st: &mut State, gpu: &Compositor) {
+    let frozen = frozen(st);
     for (id, src) in st.sources.iter_mut() {
+        // A frozen source keeps its picture: what came in meanwhile is dropped.
+        if frozen.contains(id) && src.sent > 0 {
+            src.pending = None;
+            continue;
+        }
         if let Some(f) = src.pending.take()
             && f.send(gpu, *id)
         {
@@ -2480,8 +2499,13 @@ fn frame(
         }
     }
     st.stats.recovered += st_recovered;
+    let frozen = frozen(&st);
     for (id, f) in uploads {
         let Some(s) = st.sources.get_mut(&id) else { continue };
+        // A frozen source keeps the picture it has (its first one still comes in).
+        if frozen.contains(&id) && s.sent > 0 {
+            continue;
+        }
         if !seen.contains(&id) && s.size.is_some() {
             s.pending = Some(f);
             continue;
@@ -3541,6 +3565,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[0, 255, 0, 255], "the newest, on air");
     }
+    /// A scene showing fed source 1 (with `effects`) and fed source 2 beside it.
+    fn freeze_scene(e: &Engine, effects: Vec<Effect>) {
+        let mut one = SceneItem::new(1, Placement::default());
+        one.effects = effects;
+        let two = SceneItem::new(2, Placement { x: 320.0, ..Placement::default() });
+        e.set_scene("Main", vec![one, two]);
+    }
+
+    #[test]
+    fn freeze_holds_the_picture_until_it_is_off() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        }
+        freeze_scene(&e, vec![Effect::Freeze]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let (one, two) = (e.fed(1).unwrap_or_else(|| panic!("fed")), e.fed(2).unwrap_or_else(|| panic!("fed")));
+        let px = |e: &Engine, x: usize| e.snapshot().unwrap_or_default()[x * 4..x * 4 + 4].to_vec();
+        // Its first picture still comes in (the placeholder doesn't count).
+        one.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        two.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(px(&e, 0), [0, 0, 255, 255], "the first picture of a frozen source");
+        // New pictures: the frozen one keeps blue, the other one moves on.
+        one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
+        two.picture(Picture::solid(64, 36, [255, 0, 0, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(px(&e, 0), [0, 0, 255, 255], "held");
+        assert_eq!(px(&e, 330), [255, 0, 0, 255], "only the frozen source is held");
+        // A thumbnail doesn't slip the new picture in either.
+        one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
+        let thumb = e.snapshot_scene("Main").unwrap_or_default();
+        assert_eq!(&thumb[0..4], &[0, 0, 255, 255], "a thumbnail shows it frozen");
+        assert_eq!(e.snapshot_source_at(1, (8, 8)).unwrap_or_default()[0..4], [0, 0, 255, 255]);
+        // Off: new pictures come in again.
+        freeze_scene(&e, Vec::new());
+        one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(px(&e, 0), [0, 255, 0, 255], "moving again");
+    }
+
+    #[test]
+    fn freeze_comes_from_either_filter_name_and_only_when_on() {
+        assert_eq!(crate::obs::effect_from("ferrocast_freeze", &serde_json::Value::Null), Some(Effect::Freeze));
+        assert_eq!(crate::obs::effect_from("freeze_filter", &serde_json::Value::Null), Some(Effect::Freeze));
+        // A freeze switched off in the collection holds nothing.
+        let Some(e) = engine() else { return };
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "color_source", "versioned_id": "color_source_v3", "name": "Red",
+                  "settings": { "width": 64, "height": 36, "color": 4278190335u32 },
+                  "filters": [{ "id": "ferrocast_freeze", "name": "Freeze", "enabled": false, "settings": {} }] },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Red", "id": 1 }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty(), "nothing left out");
+        let st = e.lock();
+        assert!(frozen(&st).is_empty(), "a switched-off freeze holds nothing");
+    }
+
     /// A collection: "Main" all blue, "Other" all green, and "Logo" with a small red box at the
     /// top left; `top` names the top layer.
     fn top_doc(top: serde_json::Value) -> serde_json::Value {

@@ -310,6 +310,9 @@ pub enum Effect {
         params: [f32; 4],
         elapsed_ms: u64,
     },
+    /// Holds the source's last picture: new ones aren't taken in while it's on (Exeldro's Freeze
+    /// filter). It draws nothing itself; turning it off lets new pictures in again.
+    Freeze,
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
