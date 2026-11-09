@@ -2606,6 +2606,7 @@ dependencies = [
  "ferrocast-golive",
  "half",
  "image",
+ "libc",
  "naga",
  "objc2",
  "objc2-av-foundation",
