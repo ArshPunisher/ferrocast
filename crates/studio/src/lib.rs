@@ -120,6 +120,17 @@ pub struct OptionInfo {
     pub text_type: &'static str,
     /// A text OBS shows in a fixed-width font (code, CSS).
     pub monospace: bool,
+    /// Shown only while another option holds one of some values (OBS hides these in its
+    /// "modified" callbacks: a Window Capture has no use for the Display list).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shown_when: Option<ShownWhen>,
+}
+
+/// The option and values an option is shown for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShownWhen {
+    pub key: String,
+    pub values: Vec<serde_json::Value>,
 }
 
 /// A box inside a window, in points from its top-left corner (the page's own coordinates).

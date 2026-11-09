@@ -217,6 +217,7 @@ fn opt(key: &str, label: &str, kind: &'static str) -> OptionInfo {
         filter: String::new(),
         text_type: "",
         monospace: false,
+        shown_when: None,
     }
 }
 
@@ -264,6 +265,12 @@ impl OptionInfo {
         self.text_type = "multiline";
         self
     }
+
+    /// Shown only while `key` holds one of `values`.
+    fn when(mut self, key: &str, values: &[Value]) -> Self {
+        self.shown_when = Some(crate::ShownWhen { key: key.into(), values: values.to_vec() });
+        self
+    }
 }
 
 /// The running apps with a window or sound to capture, by name (their bundle ids kept).
@@ -309,7 +316,10 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("files", "Image Files", "editable_list").files(IMAGES),
             opt("slide_time", "Time Between Slides", "int").range(50.0, 3_600_000.0, 50.0).unit(" ms"),
             opt("transition", "Transition", "list").choices(&[("Fade", json!("fade")), ("Cut", json!("cut"))]),
-            opt("transition_speed", "Transition Speed", "int").range(0.0, 3600000.0, 50.0).unit(" ms"),
+            opt("transition_speed", "Transition Speed", "int")
+                .range(0.0, 3600000.0, 50.0)
+                .unit(" ms")
+                .when("transition", &[json!("fade")]),
             opt("loop", "Loop", "bool"),
             opt("randomize", "Randomize Playback", "bool"),
         ],
@@ -325,9 +335,11 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         ],
         "text_ft2_source" | "text_ft2_source_v2" => vec![
             opt("font", "Font", "font"),
-            opt("text", "Text", "text").multiline(),
+            opt("text", "Text", "text").multiline().when("from_file", &[json!(false)]),
             opt("from_file", "Read from file", "bool"),
-            opt("text_file", "Text File (UTF-8 or UTF-16)", "path").file("Text Files (*.txt);;All Files (*.*)"),
+            opt("text_file", "Text File (UTF-8 or UTF-16)", "path")
+                .file("Text Files (*.txt);;All Files (*.*)")
+                .when("from_file", &[json!(true)]),
             opt("antialiasing", "Antialiasing", "bool"),
             opt("color1", "Color 1", "color_alpha"),
             opt("color2", "Color 2", "color_alpha"),
@@ -360,11 +372,15 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                     .filter(|w| !w.title.is_empty())
                     .map(|w| (format!("[{}] {}", w.app, w.title), json!(w.id)))
                     .collect();
-                v.push(opt("display", "Display", "list").choices(&as_refs(&d)));
-                v.push(opt("window", "Window", "list").choices(&as_refs(&w)));
+                // Display Capture and Application Capture pick a display, Window Capture a
+                // window, Application Capture an app.
+                v.push(opt("display", "Display", "list").choices(&as_refs(&d)).when("type", &[json!(0), json!(2)]));
+                v.push(opt("window", "Window", "list").choices(&as_refs(&w)).when("type", &[json!(1)]));
             }
             #[cfg(target_os = "macos")]
-            v.push(opt("application", "Application", "list").choices(&as_refs(&app_choices())));
+            v.push(
+                opt("application", "Application", "list").choices(&as_refs(&app_choices())).when("type", &[json!(2)]),
+            );
             v.push(opt("show_cursor", "Show Cursor", "bool"));
             v
         }
@@ -391,7 +407,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                     .choices(&[("Desktop Audio Capture", json!(0)), ("Application Audio Capture", json!(1))]),
             ];
             #[cfg(target_os = "macos")]
-            v.push(opt("application", "Application", "list").choices(&as_refs(&app_choices())));
+            v.push(
+                opt("application", "Application", "list").choices(&as_refs(&app_choices())).when("type", &[json!(1)]),
+            );
             v
         }
         // Windows (OBS's own keys).
@@ -477,8 +495,10 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         }
         "browser_source" | "ferrocast_web" => vec![
             opt("is_local_file", "Local file", "bool"),
-            opt("local_file", "Local file", "path").file("HTML Files (*.html *.htm);;All Files (*.*)"),
-            opt("url", "URL", "text"),
+            opt("local_file", "Local file", "path")
+                .file("HTML Files (*.html *.htm);;All Files (*.*)")
+                .when("is_local_file", &[json!(true)]),
+            opt("url", "URL", "text").when("is_local_file", &[json!(false)]),
             opt("width", "Width", "int").range(1.0, 8192.0, 1.0),
             opt("height", "Height", "int").range(1.0, 8192.0, 1.0),
             opt("fps", "FPS", "int").range(1.0, 60.0, 1.0),
@@ -520,7 +540,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 ("Magenta", json!("magenta")),
                 ("Custom", json!("custom")),
             ]),
-            opt("key_color", "Key Color", "color"),
+            opt("key_color", "Key Color", "color").when("key_color_type", &[json!("custom")]),
             opt("similarity", "Similarity", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("smoothness", "Smoothness", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("spill", "Key Color Spill Reduction", "int").range(1.0, 1000.0, 1.0).slider(),
@@ -537,7 +557,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 ("Magenta", json!("magenta")),
                 ("Custom", json!("custom")),
             ]),
-            opt("key_color", "Key Color", "color"),
+            opt("key_color", "Key Color", "color").when("key_color_type", &[json!("custom")]),
             opt("similarity", "Similarity", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("smoothness", "Smoothness", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("opacity", "Opacity", "float").range(0.0, 1.0, 0.0001).slider(),
@@ -568,10 +588,11 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("relative", "Relative", "bool"),
             opt("left", "Left", "int").range(-8192.0, 8192.0, 1.0),
             opt("top", "Top", "int").range(-8192.0, 8192.0, 1.0),
-            opt("right", "Right", "int").range(-8192.0, 8192.0, 1.0),
-            opt("bottom", "Bottom", "int").range(-8192.0, 8192.0, 1.0),
-            opt("cx", "Width", "int").range(0.0, 8192.0, 1.0),
-            opt("cy", "Height", "int").range(0.0, 8192.0, 1.0),
+            // Relative trims all four edges; otherwise it keeps a box of a width and height.
+            opt("right", "Right", "int").range(-8192.0, 8192.0, 1.0).when("relative", &[json!(true)]),
+            opt("bottom", "Bottom", "int").range(-8192.0, 8192.0, 1.0).when("relative", &[json!(true)]),
+            opt("cx", "Width", "int").range(0.0, 8192.0, 1.0).when("relative", &[json!(false)]),
+            opt("cy", "Height", "int").range(0.0, 8192.0, 1.0).when("relative", &[json!(false)]),
         ],
         "mask_filter" | "mask_filter_v2" => vec![
             opt("type", "Type", "list").choices(&[
@@ -595,9 +616,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("speed_x", "Horizontal Speed", "float").range(-500.0, 500.0, 1.0).slider(),
             opt("speed_y", "Vertical Speed", "float").range(-500.0, 500.0, 1.0).slider(),
             opt("limit_cx", "Limit Width", "bool"),
-            opt("cx", "Width", "int").range(1.0, 8192.0, 1.0),
+            opt("cx", "Width", "int").range(1.0, 8192.0, 1.0).when("limit_cx", &[json!(true)]),
             opt("limit_cy", "Limit Height", "bool"),
-            opt("cy", "Height", "int").range(1.0, 8192.0, 1.0),
+            opt("cy", "Height", "int").range(1.0, 8192.0, 1.0).when("limit_cy", &[json!(true)]),
             opt("loop", "Loop", "bool"),
         ],
         "gain_filter" => vec![opt("db", "Gain", "float").range(-30.0, 30.0, 0.1).slider().unit(" dB")],
@@ -635,7 +656,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         "ferrocast_remove_background" => vec![
             opt("mode", "Background", "list").choices(&[("Remove it", json!(0)), ("Blur it", json!(1))]),
             opt("soft", "Soft edge", "int").range(0.0, 40.0, 1.0).slider().unit("%"),
-            opt("blur", "Blur", "int").range(2.0, 100.0, 1.0).slider().unit(" px"),
+            opt("blur", "Blur", "int").range(2.0, 100.0, 1.0).slider().unit(" px").when("mode", &[json!(1)]),
         ],
         "ferrocast_deepfilter" => vec![opt("strength", "Strength", "int").range(1.0, 100.0, 1.0).slider()],
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
@@ -768,6 +789,31 @@ fn display_label(i: usize, d: &ferrocore::screen::Display, names: &std::collecti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An option shown only for some values of another names one in its own form, with values
+    /// that option can hold (else it would never show).
+    #[test]
+    fn shown_when_names_an_option_of_its_form() {
+        let k = kinds();
+        for id in k.inputs.iter().chain(&k.filters).chain(&k.transitions).map(|k| k.id.as_str()) {
+            let form = options(id).unwrap_or_default();
+            for o in &form {
+                let Some(w) = &o.shown_when else { continue };
+                let by = form.iter().find(|x| x.key == w.key);
+                let by = by.unwrap_or_else(|| panic!("{id}: {} is shown by {}, not in its form", o.key, w.key));
+                for v in &w.values {
+                    let can = if by.kind == "bool" { v.is_boolean() } else { by.values.contains(v) };
+                    assert!(can, "{id}: {} is shown when {} is {v}, which it can't be", o.key, w.key);
+                }
+            }
+        }
+        // A Window Capture's form keeps the Display list for the other two methods.
+        let form = options("screen_capture").unwrap_or_default();
+        let show = |key: &str| form.iter().find(|o| o.key == key).and_then(|o| o.shown_when.clone());
+        assert_eq!(show("show_cursor"), None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(show("application").map(|w| w.values), Some(vec![json!(2)]));
+    }
 
     #[test]
     fn every_kind_has_a_form_and_defaults_our_engine_reads() {
