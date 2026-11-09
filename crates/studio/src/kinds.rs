@@ -684,9 +684,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
 /// A kind's settings to start with (the keys its form shows, at OBS's defaults).
 pub fn defaults(kind: &str) -> Option<Value> {
     Some(match kind {
-        "color_source" | "color_source_v2" | "color_source_v3" => {
-            json!({ "color": 0xFFD1_D1D1u32, "width": 0, "height": 0 })
-        }
+        "color_source_v3" => json!({ "color": 0xFFD1_D1D1u32, "width": 0, "height": 0 }),
+        "color_source" | "color_source_v2" => json!({ "color": 0xFFFF_FFFFu32, "width": 0, "height": 0 }),
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_shader" => json!({

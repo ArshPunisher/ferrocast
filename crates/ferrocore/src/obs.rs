@@ -340,7 +340,12 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // 0 (or none) is the canvas's size, as OBS's defaults have it.
                 width: s.get("width").and_then(Value::as_u64).filter(|v| *v > 0).map_or(canvas.0, |v| v as u32),
                 height: s.get("height").and_then(Value::as_u64).filter(|v| *v > 0).map_or(canvas.1, |v| v as u32),
-                rgba: color(s.get("color").and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF)),
+                // OBS's default: light grey for the v3 source, white for the older two.
+                rgba: color(s.get("color").and_then(Value::as_u64).unwrap_or(if id == "color_source_v3" {
+                    0xFFD1_D1D1
+                } else {
+                    0xFFFF_FFFF
+                })),
             },
             false,
         ),

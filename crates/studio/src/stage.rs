@@ -68,6 +68,19 @@ fn name_of(s: &Value) -> &str {
     s.get("name").and_then(Value::as_str).unwrap_or_default()
 }
 
+/// A source's or filter's settings with its kind's defaults under them, as OBS reads them: OBS
+/// saves only what differs from the defaults, so an imported crop with no "relative" is a
+/// relative one, and its form should say so (9 Nov).
+fn with_defaults(it: &Value) -> Value {
+    let mut out = crate::kinds::defaults(kind_of(it)).filter(Value::is_object).unwrap_or_else(|| json!({}));
+    if let (Some(all), Some(own)) = (out.as_object_mut(), it.get("settings").and_then(Value::as_object)) {
+        for (k, v) in own {
+            all.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
 fn kind_of(s: &Value) -> &str {
     s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default()
 }
@@ -1070,7 +1083,7 @@ impl Stage {
     }
 
     pub fn settings(&self, name: &str) -> Result<Value, StudioError> {
-        Ok(self.source(name)?.get("settings").cloned().unwrap_or_else(|| json!({})))
+        Ok(with_defaults(&self.source(name)?))
     }
 
     /// A source's kind ("dshow_input").
@@ -1242,7 +1255,7 @@ impl Stage {
         self.filter_list(name)?
             .into_iter()
             .find(|f| name_of(f) == filter)
-            .map(|f| f.get("settings").cloned().unwrap_or_else(|| json!({})))
+            .map(|f| with_defaults(&f))
             .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))
     }
 
