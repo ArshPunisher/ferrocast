@@ -5,6 +5,14 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.5
+
+- On a Mac, Ferrocast keeps its place in the Dock when it updates. Before, an update could leave
+  your pinned icon behind and open Ferrocast as a second icon.
+- A plan change shows without restarting: Pro given to you, or bought on the website, appears
+  when you come back to the window (and within a few minutes while it's open).
+- Pro given to you for good says it never ends.
+
 ## 3.0.4
 
 - Quitting Ferrocast with the Studio running no longer ends in a crash: the Studio now closes
