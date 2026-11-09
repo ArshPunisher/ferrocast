@@ -15,9 +15,53 @@ use crate::now_ms;
 pub const PREFIX: &str = "comp_";
 /// The plan stored (and shown by `/v1/pro/status`) for a comp grant.
 pub const PLAN: &str = "comp";
-/// The longest a grant reaches past now, however often it's extended.
+/// The longest a grant of days reaches past now, however often it's extended.
 pub const MAX_DAYS: i64 = 90;
 const DAY_MS: i64 = 86_400_000;
+/// A forever grant's end: the last moment of 9999 (owner, 9 Nov). Stored like any end, so
+/// every "is it Pro now" check works unchanged; it lasts until revoked.
+pub const FOREVER: i64 = 253_402_300_799_000;
+
+/// Whether an end is a forever grant's.
+pub fn is_forever(end: Option<i64>) -> bool {
+    end.is_some_and(|e| e >= FOREVER)
+}
+
+/// How long a grant gives Pro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Length {
+    /// 1..=[`MAX_DAYS`] days, added to what's left of the grant (or from now).
+    Days(i64),
+    /// Until it's revoked.
+    Forever,
+}
+
+impl Length {
+    /// The days written in the grant history (0 for forever).
+    pub fn days(self) -> i64 {
+        match self {
+            Length::Days(d) => d,
+            Length::Forever => 0,
+        }
+    }
+
+    /// The grant's new end, extending `left` (the grant's current end while it still gives
+    /// Pro). Days never shorten a forever grant, and never reach past [`MAX_DAYS`] from now.
+    pub fn until(self, left: Option<i64>, now: i64) -> i64 {
+        match self {
+            Length::Forever => FOREVER,
+            Length::Days(_) if is_forever(left) => FOREVER,
+            Length::Days(d) => (left.filter(|e| *e > now).unwrap_or(now) + d * DAY_MS).min(now + MAX_DAYS * DAY_MS),
+        }
+    }
+
+    fn valid(self) -> bool {
+        match self {
+            Length::Days(d) => (1..=MAX_DAYS).contains(&d),
+            Length::Forever => true,
+        }
+    }
+}
 
 pub fn is_comp(sub_id: &str) -> bool {
     sub_id.starts_with(PREFIX)
@@ -96,7 +140,18 @@ pub(crate) fn grant_in(
     now: i64,
     by: &GrantBy,
 ) -> Result<Granted, CompError> {
-    if !(1..=MAX_DAYS).contains(&days) {
+    grant_length_in(tx, install, Length::Days(days), now, by)
+}
+
+/// [`grant_in`] for days or forever.
+pub(crate) fn grant_length_in(
+    tx: &rusqlite::Transaction<'_>,
+    install: &str,
+    length: Length,
+    now: i64,
+    by: &GrantBy,
+) -> Result<Granted, CompError> {
+    if !length.valid() {
         return Err(CompError::Days);
     }
     let known = tx.query_row("SELECT 1 FROM installs WHERE id = ?1", [install], |_| Ok(())).optional()?.is_some();
@@ -111,12 +166,10 @@ pub(crate) fn grant_in(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0, r.get(4)?)),
         )
         .optional()?;
-    let cap = now + MAX_DAYS * DAY_MS;
     let granted = match linked {
         Some((id, status, end, _, _)) if is_comp(&id) => {
             // Extend from what's left (or from now once it ran out).
-            let from = end.filter(|e| status == "active" && *e > now).unwrap_or(now);
-            let until = (from + days * DAY_MS).min(cap);
+            let until = length.until(end.filter(|_| status == "active"), now);
             tx.execute(
                 "UPDATE pro_subs SET status = 'active', current_end = ?2, cancel_at_end = 1, refunded_at = NULL,
                    synced_at = ?3 WHERE id = ?1",
@@ -129,11 +182,11 @@ pub(crate) fn grant_in(
             if (access::BLOCKING.contains(&status.as_str()) && !refunded) || access::is_pro(&a, now) {
                 return Err(CompError::RealSubscription { install: install.to_string(), id, status });
             }
-            new_grant(tx, install, days, now)?
+            new_grant(tx, install, length, now)?
         }
-        None => new_grant(tx, install, days, now)?,
+        None => new_grant(tx, install, length, now)?,
     };
-    log(tx, &granted.sub_id, install, "grant", by, days, granted.until, now)?;
+    log(tx, &granted.sub_id, install, "grant", by, length.days(), granted.until, now)?;
     Ok(granted)
 }
 
@@ -142,14 +195,14 @@ impl Db {
     /// period, no renewal grace (`cancel_at_end`). Refuses an unknown install, and one whose
     /// real subscription still grants or renews Pro.
     pub fn comp_grant(&self, install: &str, days: i64) -> Result<Granted, String> {
-        self.comp_grant_by(install, days, &GrantBy::cli()).map_err(|e| e.to_string())
+        self.comp_grant_by(install, Length::Days(days), &GrantBy::cli()).map_err(|e| e.to_string())
     }
 
-    /// [`Db::comp_grant`], saying who gave it.
-    pub fn comp_grant_by(&self, install: &str, days: i64, by: &GrantBy) -> Result<Granted, CompError> {
+    /// [`Db::comp_grant`], saying who gave it, for days or forever.
+    pub fn comp_grant_by(&self, install: &str, length: Length, by: &GrantBy) -> Result<Granted, CompError> {
         let mut c = self.c();
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let g = grant_in(&tx, install, days, now_ms(), by)?;
+        let g = grant_length_in(&tx, install, length, now_ms(), by)?;
         tx.commit()?;
         Ok(g)
     }
@@ -210,9 +263,9 @@ impl Db {
     }
 }
 
-fn new_grant(tx: &rusqlite::Transaction<'_>, install: &str, days: i64, now: i64) -> rusqlite::Result<Granted> {
+fn new_grant(tx: &rusqlite::Transaction<'_>, install: &str, length: Length, now: i64) -> rusqlite::Result<Granted> {
     let id = format!("{PREFIX}{}", crate::random(12));
-    let until = now + days * DAY_MS;
+    let until = length.until(None, now);
     tx.execute(
         "INSERT INTO pro_subs(id, plan, email_hash, status, current_end, cancel_at_end, created_at, synced_at)
          VALUES (?1, ?2, '', 'active', ?3, 1, ?4, ?4)",

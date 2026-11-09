@@ -575,9 +575,9 @@ async fn grant(
 ) -> Result<Response, ApiError> {
     let (now, actor) = writer(&st, peer, &headers)?;
     let b = body(&headers, &raw)?;
-    if !b["email"].is_null() || b["forever"].as_bool() == Some(true) {
-        return Err(bad("unsupported", "Ferrocast has no accounts and no forever grants.")
-            .hint("Give Pro to an install id for 1 to 90 days."));
+    if !b["email"].is_null() {
+        return Err(bad("unsupported", "Grants here go to an install id; give an account Pro on its page.")
+            .hint("Accounts: POST /admin/v1/accounts/{id}/grant."));
     }
     if b["plan"].as_str().is_some_and(|p| p != "pro") {
         return Err(bad("unsupported", "Ferrocast has one plan: pro."));
@@ -587,11 +587,11 @@ async fn grant(
             bad("invalid_install", "install_id is required.")
                 .hint("It's the part before the dot in the app's relay-install secret.")
         })?;
-    let days = int(&b["days"], "days", "invalid_days", 1..=comp::MAX_DAYS)?
-        .ok_or_else(|| bad("invalid_days", format!("days must be a whole number from 1 to {}.", comp::MAX_DAYS)))?;
+    let length = grant_length(&b)?;
+    let days = length.days();
     let note = text(&b["note"], "note", 255)?;
     let by = GrantBy { source: "admin", code: None, actor: Some(actor.clone()), note: note.clone() };
-    let g = st.db.comp_grant_by(install, days, &by).map_err(|err| match err {
+    let g = st.db.comp_grant_by(install, length, &by).map_err(|err| match err {
         CompError::Days => bad("invalid_days", format!("days must be a whole number from 1 to {}.", comp::MAX_DAYS)),
         CompError::UnknownInstall(_) => {
             e(StatusCode::NOT_FOUND, "unknown_install", "No install with that id on this relay.")
@@ -611,12 +611,28 @@ async fn grant(
         &actor,
         "grant.create",
         &g.sub_id,
-        json!({ "install": mask(install), "days": days, "until": g.until, "extended": g.extended, "note": note }),
+        json!({ "install": mask(install), "days": days, "forever": comp::is_forever(Some(g.until)),
+                "until": g.until, "extended": g.extended, "note": note }),
     );
     Ok(reply(
         StatusCode::CREATED,
-        json!({ "id": g.sub_id, "plan": "pro", "starts_at": iso(now), "ends_at": iso(g.until), "extended": g.extended }),
+        json!({ "id": g.sub_id, "plan": "pro", "starts_at": iso(now), "ends_at": iso(g.until),
+                "forever": comp::is_forever(Some(g.until)), "extended": g.extended }),
     ))
+}
+
+/// A grant's length from its body: `{ "forever": true }` or `{ "days": 1..=90 }`.
+pub(crate) fn grant_length(b: &Value) -> Result<comp::Length, ApiError> {
+    if b["forever"].as_bool() == Some(true) {
+        if !b["days"].is_null() {
+            return Err(bad("invalid_days", "Send days or forever, not both."));
+        }
+        return Ok(comp::Length::Forever);
+    }
+    let days = int(&b["days"], "days", "invalid_days", 1..=comp::MAX_DAYS)?.ok_or_else(|| {
+        bad("invalid_days", format!("days must be a whole number from 1 to {}, or forever: true.", comp::MAX_DAYS))
+    })?;
+    Ok(comp::Length::Days(days))
 }
 
 /// `POST /admin/v1/grants/{id}/revoke`

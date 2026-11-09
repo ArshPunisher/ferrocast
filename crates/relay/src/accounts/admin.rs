@@ -12,8 +12,7 @@ use serde_json::{Value, json};
 
 use super::store::Account;
 use crate::admin_pro::{
-    Peer, audit_log, bad, body, e, grant_history, int, iso, iso_opt, mask, not_found, ok, page_arg, reader, reply,
-    text, writer,
+    Peer, audit_log, body, e, grant_history, iso, iso_opt, mask, not_found, ok, page_arg, reader, reply, text, writer,
 };
 use crate::billing::access;
 use crate::billing::comp::{self, GrantBy};
@@ -195,6 +194,7 @@ async fn detail(
                 "current_end": iso_opt(s.current_end), "access_until": iso_opt(access::access_until(&st_)),
                 "cancel_at_period_end": s.cancel_at_end, "refunded_at": iso_opt(s.refunded_at),
                 "linked_by": link.0, "linked_at": iso(link.1),
+                "forever": comp::is_comp(&s.id) && comp::is_forever(s.current_end),
             });
             if comp::is_comp(&s.id) {
                 let mut g = row;
@@ -238,12 +238,12 @@ impl From<rusqlite::Error> for GrantRefused {
 }
 
 impl Db {
-    /// Gives (or extends) free Pro to an account for `days`, capped at 90 days from now, like
-    /// an install's grant: one `comp_` subscription that belongs to the account.
+    /// Gives (or extends) free Pro to an account for some days (capped at 90 from now) or
+    /// forever, like an install's grant: one `comp_` subscription that belongs to the account.
     fn account_grant(
         &self,
         account: &str,
-        days: i64,
+        length: comp::Length,
         by: &GrantBy,
         now: i64,
     ) -> Result<(String, i64, bool), GrantRefused> {
@@ -273,12 +273,10 @@ impl Db {
                 return Err(GrantRefused::Paying(status.clone()));
             }
         }
-        let cap = now + comp::MAX_DAYS * DAY_MS;
         let existing = subs.iter().find(|s| comp::is_comp(&s.0));
         let (id, until, extended) = match existing {
             Some((id, status, end, ..)) => {
-                let from = end.filter(|e| status == "active" && *e > now).unwrap_or(now);
-                let until = (from + days * DAY_MS).min(cap);
+                let until = length.until(end.filter(|_| status == "active"), now);
                 tx.execute(
                     "UPDATE pro_subs SET status = 'active', current_end = ?2, cancel_at_end = 1, refunded_at = NULL,
                        synced_at = ?3 WHERE id = ?1",
@@ -288,7 +286,7 @@ impl Db {
             }
             None => {
                 let id = format!("{}{}", comp::PREFIX, crate::random(12));
-                let until = now + days * DAY_MS;
+                let until = length.until(None, now);
                 tx.execute(
                     "INSERT INTO pro_subs(id, plan, email_hash, status, current_end, cancel_at_end, created_at, synced_at)
                      VALUES (?1, ?2, '', 'active', ?3, 1, ?4, ?4)",
@@ -304,7 +302,7 @@ impl Db {
         tx.execute(
             "INSERT INTO pro_grants(sub_id, install_id, kind, source, code, actor, note, days, until, at)
              VALUES (?1, '', 'grant', ?2, NULL, ?3, ?4, ?5, ?6, ?7)",
-            params![id, by.source, by.actor, by.note, days, until, now],
+            params![id, by.source, by.actor, by.note, length.days(), until, now],
         )?;
         tx.commit()?;
         Ok((id, until, extended))
@@ -321,7 +319,7 @@ impl Db {
     }
 }
 
-/// `POST /admin/v1/accounts/{id}/grant {days, note?}`
+/// `POST /admin/v1/accounts/{id}/grant {days | forever: true, note?}`
 async fn grant(
     State(st): State<AppState>,
     peer: Peer,
@@ -332,11 +330,11 @@ async fn grant(
     let (now, actor) = writer(&st, peer, &headers)?;
     let a = account_or_404(&st, &id)?;
     let b = body(&headers, &raw)?;
-    let days = int(&b["days"], "days", "invalid_days", 1..=comp::MAX_DAYS)?
-        .ok_or_else(|| bad("invalid_days", format!("days must be a whole number from 1 to {}.", comp::MAX_DAYS)))?;
+    let length = crate::admin_pro::grant_length(&b)?;
+    let days = length.days();
     let note = text(&b["note"], "note", 255)?;
     let by = GrantBy { source: "admin", code: None, actor: Some(actor.clone()), note: note.clone() };
-    let (sub, until, extended) = st.db.account_grant(&a.id, days, &by, now).map_err(|err| match err {
+    let (sub, until, extended) = st.db.account_grant(&a.id, length, &by, now).map_err(|err| match err {
         GrantRefused::Paying(status) => e(
             StatusCode::CONFLICT,
             "has_subscription",
@@ -351,12 +349,13 @@ async fn grant(
         &actor,
         "account.grant",
         &a.id,
-        json!({ "sub": sub, "days": days, "until": until,
+        json!({ "sub": sub, "days": days, "forever": comp::is_forever(Some(until)), "until": until,
         "extended": extended, "note": note }),
     );
     Ok(reply(
         StatusCode::CREATED,
-        json!({ "id": sub, "account_id": a.id, "plan": "pro", "starts_at": iso(now), "ends_at": iso(until), "extended": extended }),
+        json!({ "id": sub, "account_id": a.id, "plan": "pro", "starts_at": iso(now), "ends_at": iso(until),
+                "forever": comp::is_forever(Some(until)), "extended": extended }),
     ))
 }
 
