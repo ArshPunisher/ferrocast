@@ -2572,6 +2572,43 @@ mod tests {
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
     }
 
+    /// Frame pacing at 1080p60 for a while: the share of frame times the loop woke too late for
+    /// (the Stats panel's "Missed"). Ignored by default (it takes `FERROCAST_PACE_SECS`, 30 s);
+    /// run it with the machine busy to see the loop hold its clock, as OBS's does:
+    /// `cargo test -p ferrocore --release pacing_holds -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing measurement; run by hand, ideally with the CPU loaded"]
+    fn pacing_holds() {
+        let secs = std::env::var("FERROCAST_PACE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            bitrate_kbps: 6000,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        };
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let config = EngineConfig { width: 1920, height: 1080, fps: 60, ..Default::default() };
+        let Ok(e) = Engine::new(config, video, audio) else { return };
+        e.set_source(1, SourceKind::Color { width: 1920, height: 1080, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_secs(1));
+        let before = e.stats();
+        std::thread::sleep(Duration::from_secs(secs));
+        let s = e.stats();
+        let (drawn, missed) = (s.frames - before.frames, s.skipped - before.skipped);
+        let share = missed as f64 * 100.0 / (drawn + missed).max(1) as f64;
+        eprintln!("pacing over {secs} s at 60 fps: {drawn} drawn, {missed} missed ({share:.2}%)");
+        assert!(share < 1.0, "{missed} of {} frame times missed", drawn + missed);
+    }
+
     /// A capture that can't open says so to whoever added it, and isn't kept (macOS and Linux:
     /// on Windows looking for a camera through FFmpeg can take longer than the wait).
     #[test]
@@ -3157,6 +3194,91 @@ mod tests {
             let errors = String::from_utf8_lossy(&out.stderr).to_string();
             assert!(out.status.success() && errors.trim().is_empty(), "{}: {errors}", f.display());
         }
+    }
+
+    /// Picture and sound stay together through the engine, as OBS's "Sync Test Pair" sources
+    /// check by eye (test/test-input/sync-pair-*.c): a clip that flashes white and beeps at
+    /// the same instant every second is played, recorded, and each flash in the recording is
+    /// matched with its beep. Needs ffmpeg (skipped without it). `FERROCAST_SYNC_SECS` records
+    /// longer than the 6 s default, to see drift.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_flash_and_its_beep_stay_together() {
+        let secs: u64 = std::env::var("FERROCAST_SYNC_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+        let dir = std::env::temp_dir();
+        let (clip, rec) = (dir.join("ferrocore-sync-clip.mp4"), dir.join("ferrocore-sync-rec.mp4"));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("color=c=black:s=640x360:r=30:d={},drawbox=c=white:t=fill:enable='lt(mod(t\\,1)\\,0.1)'", secs + 2))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("sine=f=1000:r=48000:d={},volume='if(lt(mod(t\\,1)\\,0.1)\\,1\\,0)':eval=frame", secs + 2))
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
+            .arg(&clip)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipped the check: no ffmpeg");
+            return;
+        }
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Media { path: clip.clone(), looping: false }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let id = e.start_output(OutputKind::Record(rec.clone())).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_secs(secs));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+
+        let flashes = flash_times(&rec);
+        let beeps = beep_times(&rec);
+        let offsets: Vec<f64> = flashes
+            .iter()
+            .filter_map(|f| beeps.iter().map(|b| b - f).min_by(|a, b| a.abs().total_cmp(&b.abs())))
+            .filter(|d| d.abs() < 0.5)
+            .collect();
+        eprintln!("flashes {flashes:.3?}\nbeeps   {beeps:.3?}\nsound minus picture {offsets:.3?} s");
+        assert!(offsets.len() >= 3, "too few flash and beep pairs: {flashes:?} {beeps:?}");
+        // Within about a frame and a half at 30 fps: well inside what anyone can see (~45 ms).
+        assert!(offsets.iter().all(|d| d.abs() <= 0.05), "out of sync: {offsets:.3?} s");
+    }
+
+    /// When the recording's picture turns bright (a flash starts), in seconds.
+    #[cfg(target_os = "macos")]
+    fn flash_times(file: &std::path::Path) -> Vec<f64> {
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(file)
+            .args(["-an", "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"])
+            .output()
+            .unwrap_or_else(|x| panic!("{x}"));
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (mut at, mut bright, mut times) = (0.0, false, Vec::new());
+        for line in text.lines() {
+            if let Some(t) = line.split("pts_time:").nth(1) {
+                at = t.trim().parse().unwrap_or(at);
+            } else if let Some(y) = line.strip_prefix("lavfi.signalstats.YAVG=") {
+                let now = y.trim().parse::<f64>().unwrap_or(0.0) > 128.0;
+                if now && !bright {
+                    times.push(at);
+                }
+                bright = now;
+            }
+        }
+        times
+    }
+
+    /// When the recording's sound starts after a silence (a beep starts), in seconds.
+    #[cfg(target_os = "macos")]
+    fn beep_times(file: &std::path::Path) -> Vec<f64> {
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "info", "-i"])
+            .arg(file)
+            .args(["-vn", "-af", "silencedetect=n=-30dB:d=0.2", "-f", "null", "-"])
+            .output()
+            .unwrap_or_else(|x| panic!("{x}"));
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter_map(|l| l.split("silence_end: ").nth(1))
+            .filter_map(|t| t.split_whitespace().next()?.parse().ok())
+            .collect()
     }
 
     #[test]
