@@ -222,13 +222,19 @@ struct Sub {
     list_amount: Option<i64>,
     code: Option<String>,
     sale_id: Option<String>,
+    /// The account it belongs to (signed in to buy it, matched by email, or given to it),
+    /// with its email and name: who it is, in the Control Center's lists. None for a
+    /// subscription only an install has (bought before accounts).
+    account: Option<(String, String, Option<String>)>,
 }
 
 const SUB_COLS: &str = "s.id, s.plan, s.status, s.current_end, s.cancel_at_end, s.refunded_at, s.created_at,
     s.email_hash <> '', (SELECT COUNT(*) FROM pro_installs i WHERE i.sub_id = s.id),
     p.amount, p.list_amount, p.code, p.sale_id,
-    (SELECT amount FROM pro_payments x WHERE x.sub_id = s.id ORDER BY x.at LIMIT 1)";
-const SUB_FROM: &str = "FROM pro_subs s LEFT JOIN pro_sub_prices p ON p.sub_id = s.id";
+    (SELECT amount FROM pro_payments x WHERE x.sub_id = s.id ORDER BY x.at LIMIT 1),
+    acc.id, acc.email, acc.name";
+const SUB_FROM: &str = "FROM pro_subs s LEFT JOIN pro_sub_prices p ON p.sub_id = s.id
+    LEFT JOIN account_subs acs ON acs.sub_id = s.id LEFT JOIN accounts acc ON acc.id = acs.account_id";
 
 fn sub_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Sub> {
     let plan: String = r.get(1)?;
@@ -248,6 +254,10 @@ fn sub_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Sub> {
         list_amount: r.get::<_, Option<i64>>(10)?.or(default),
         code: r.get(11)?,
         sale_id: r.get(12)?,
+        account: match (r.get::<_, Option<String>>(14)?, r.get::<_, Option<String>>(15)?) {
+            (Some(id), Some(email)) => Some((id, email, r.get(16)?)),
+            _ => None,
+        },
         plan,
     })
 }
@@ -268,11 +278,21 @@ impl Sub {
         Plan::parse(&self.plan).map_or(Value::Null, |p| json!(p.key()))
     }
 
+    /// The account's id, email and name as JSON (nulls without one).
+    fn who(&self) -> (Value, Value, Value) {
+        match &self.account {
+            Some((id, email, name)) => (json!(id), json!(email), json!(name)),
+            None => (Value::Null, Value::Null, Value::Null),
+        }
+    }
+
     fn user(&self, now: i64) -> Value {
         let a = self.state();
         let pro = access::is_pro(&a, now);
+        let (account_id, email, name) = self.who();
         json!({
-            "id": self.id, "email": null, "email_on_file": self.email_on_file, "display_name": null,
+            "id": self.id, "email": email, "email_on_file": self.email_on_file, "display_name": name,
+            "account_id": account_id, "forever": self.grant() && comp::is_forever(self.current_end),
             "auth_provider": if self.grant() { "grant" } else { "razorpay" },
             "source": if self.grant() { "grant" } else { "paid" },
             "plan": if pro { "pro" } else { "free" }, "pro": pro,
@@ -285,7 +305,9 @@ impl Sub {
     }
 
     fn subscription_row(&self) -> Value {
+        let (account_id, email, name) = self.who();
         json!({
+            "email": email, "name": name, "account_id": account_id,
             "gateway_subscription_id": self.id, "plan": "pro", "period": self.period(), "status": self.status,
             "amount": self.amount, "list_amount": self.list_amount, "currency": "INR",
             "current_end": iso_opt(self.current_end), "access_until": iso_opt(access::access_until(&self.state())),
@@ -327,6 +349,7 @@ async fn users(State(st): State<AppState>, peer: Peer, headers: HeaderMap, Query
     };
     let filter = format!(
         "WHERE s.status <> 'created'{source} AND (?1 IS NULL OR instr(lower(s.id), lower(?1)) > 0
+           OR instr(lower(acc.email), lower(?1)) > 0 OR instr(lower(COALESCE(acc.name, '')), lower(?1)) > 0
            OR s.id IN (SELECT sub_id FROM pro_install_subs WHERE install_id = ?1))"
     );
     let c = st.db.c();
@@ -370,8 +393,10 @@ fn grant_json(c: &rusqlite::Connection, s: &Sub, now: i64) -> rusqlite::Result<V
         )
         .optional()?;
     let revoked = (s.status == "cancelled").then(|| last_revoke.map(|r| r["at"].clone())).flatten();
+    let (account_id, email, _) = s.who();
     Ok(json!({
-        "id": s.id, "plan": "pro",
+        "id": s.id, "plan": "pro", "email": email, "account_id": account_id,
+        "forever": comp::is_forever(s.current_end),
         "source": last_grant.map_or(json!("unknown"), |g| g["source"].clone()),
         "code": last_grant.map_or(Value::Null, |g| g["code"].clone()),
         "created_by": last_grant.map_or(Value::Null, |g| g["actor"].clone()),
@@ -442,7 +467,9 @@ async fn user(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let a = s.state();
         let mut u = s.user(now);
-        let user = json!({ "id": s.id, "email": null, "email_on_file": s.email_on_file, "display_name": null,
+        let (account_id, email, name) = s.who();
+        let user = json!({ "id": s.id, "email": email, "email_on_file": s.email_on_file, "display_name": name,
+                           "account_id": account_id,
                            "auth_provider": u["auth_provider"].take(), "created_at": iso(s.created_at) });
         Ok(json!({
             "user": user,

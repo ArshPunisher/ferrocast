@@ -1356,3 +1356,43 @@ async fn google_from_the_website_comes_back_to_its_dashboard() {
     assert_eq!(cb.status, 303);
     assert!(cb.location.as_deref().unwrap().starts_with(&format!("{WEB}/login/?error=")), "{:?}", cb.location);
 }
+
+/// Pro forever from the Control Center (owner, 9 Nov): it lasts until revoked, a later grant of
+/// days doesn't shorten it, and the lists name the account it belongs to.
+#[tokio::test]
+async fn an_account_gets_pro_forever_and_the_lists_name_it() {
+    let w = world().await;
+    let auth = w.install("i1");
+    w.app_sign_in(&auth, "asha@example.com").await;
+    let (_, v) = w.admin(Method::GET, "/admin/v1/accounts?q=asha", None, None).await;
+    let id = v["items"][0]["id"].as_str().unwrap().to_string();
+    let grant = |body: Value| {
+        let w = &w;
+        let id = id.clone();
+        async move { w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/grant"), Some(body), Some("o@x.co")).await }
+    };
+    for bad in [json!({ "forever": true, "days": 3 }), json!({ "forever": false }), json!({})] {
+        assert_eq!(grant(bad.clone()).await.0, 422, "{bad}");
+    }
+    let (s, v) = grant(json!({ "forever": true, "note": "friend" })).await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!((v["forever"].as_bool(), v["ends_at"].as_str()), (Some(true), Some("9999-12-31T23:59:59Z")));
+    // Days after forever keep it forever.
+    let (_, v) = grant(json!({ "days": 7 })).await;
+    assert_eq!((v["forever"].as_bool(), v["extended"].as_bool()), (Some(true), Some(true)));
+    let (_, v) = w.admin(Method::GET, &format!("/admin/v1/accounts/{id}"), None, None).await;
+    assert_eq!((v["plan"].as_str(), v["grants"][0]["forever"].as_bool()), (Some("pro"), Some(true)));
+    // The Users list says whose it is, and finds it by email.
+    let (_, users) = w.admin(Method::GET, "/admin/v1/users?q=asha@", None, None).await;
+    assert_eq!(users["total"], 1, "{users}");
+    let u = &users["items"][0];
+    assert_eq!((u["email"].as_str(), u["account_id"].as_str()), (Some("asha@example.com"), Some(id.as_str())));
+    assert_eq!((u["forever"].as_bool(), u["plan"].as_str()), (Some(true), Some("pro")));
+    let (_, grants) = w.admin(Method::GET, "/admin/v1/grants", None, None).await;
+    assert_eq!((grants[0]["email"].as_str(), grants[0]["forever"].as_bool()), (Some("asha@example.com"), Some(true)));
+    // Remove Pro still ends it.
+    let (s, _) = w.admin(Method::POST, &format!("/admin/v1/accounts/{id}/revoke"), None, Some("o@x.co")).await;
+    assert_eq!(s, 200);
+    let (_, v) = w.admin(Method::GET, &format!("/admin/v1/accounts/{id}"), None, None).await;
+    assert_eq!((v["plan"].as_str(), v["grants"][0]["forever"].as_bool()), (Some("free"), Some(false)));
+}
