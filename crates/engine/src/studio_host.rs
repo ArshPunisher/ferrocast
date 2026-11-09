@@ -768,6 +768,10 @@ pub struct StudioSettings {
     pub fps: u32,
     /// Where recordings go (absolute); None is the Movies folder's Ferrocast folder.
     pub record_folder: Option<String>,
+    /// That Movies (Videos) folder's Ferrocast folder on this computer, so Settings can show
+    /// the real path when none is set. Filled when read, never saved or taken from a save.
+    #[serde(skip_deserializing, skip_serializing_if = "String::is_empty")]
+    pub record_folder_default: String,
     /// "mp4" or "mov" (both crash-safe).
     pub record_format: String,
     /// "stream" (same as the stream), "high" (near-lossless), "lossless".
@@ -871,6 +875,7 @@ impl Default for StudioSettings {
             height: 1080,
             fps: 30,
             record_folder: None,
+            record_folder_default: String::new(),
             record_format: "mp4".into(),
             record_quality: "stream".into(),
             reconnect: true,

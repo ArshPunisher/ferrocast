@@ -1718,7 +1718,12 @@ impl StudioHost for DesktopStudio {
 
     async fn settings(&self) -> StudioSettings {
         let data = self.data.clone();
-        self.on_main(move |h| h.settings.get_or_insert_with(|| load_settings(&data)).clone()).await.unwrap_or_default()
+        let mut s = self
+            .on_main(move |h| h.settings.get_or_insert_with(|| load_settings(&data)).clone())
+            .await
+            .unwrap_or_default();
+        s.record_folder_default = record_folder(&StudioSettings::default()).display().to_string();
+        s
     }
 
     async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
