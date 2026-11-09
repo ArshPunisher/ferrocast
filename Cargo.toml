@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*"]
 exclude = ["vendor/srt-protocol"]
 
 [workspace.package]
-version = "3.0.3"
+version = "3.0.4"
 edition = "2024"
 rust-version = "1.99"
 license = "GPL-3.0-or-later"

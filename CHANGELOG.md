@@ -5,6 +5,12 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.4
+
+- Quitting Ferrocast with the Studio running no longer ends in a crash: the Studio now closes
+  first, so the Mac doesn't show a "quit unexpectedly" report and the next start doesn't think
+  Ferrocast stopped by accident.
+
 ## 3.0.3
 
 A security update for the database Ferrocast keeps your chat, alerts and settings in: it now uses
