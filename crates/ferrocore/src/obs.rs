@@ -326,6 +326,12 @@ const PICTURES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 const MEDIA: &[&str] =
     &["mp4", "m4v", "mov", "mkv", "webm", "flv", "ts", "avi", "mp3", "m4a", "aac", "wav", "ogg", "opus", "flac"];
 
+/// A capture's mouse-pointer switch (`key` differs by kind), on when it isn't set, as in OBS.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn cursor_on(s: &Value, key: &str) -> bool {
+    s.get(key).and_then(Value::as_bool).unwrap_or(true)
+}
+
 fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result<(SourceKind, bool), String> {
     let text_of = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(match id {
@@ -421,16 +427,17 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         #[cfg(target_os = "macos")]
         "screen_capture" | "display_capture" => {
             let n = |k: &str| s.get(k).and_then(Value::as_u64).map(|v| v as u32);
+            let cursor = cursor_on(s, "show_cursor");
             match (s.get("type").and_then(Value::as_u64).unwrap_or(0), n("window")) {
                 // Window Capture, by its window number (as OBS keeps it), with its app's sound
                 // (a browser's video heard as it's shown; muted or turned down in the mixer).
-                (1, Some(w)) => (SourceKind::Window(w), true),
+                (1, Some(w)) => (SourceKind::Window { id: w, cursor }, true),
                 (1, None) => return Err("a window capture with no window picked".into()),
                 (0, _) => {
                     // The display picked (by number), else the first (OBS keeps a display's UUID).
                     let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
                     let display = n("display").or_else(first).unwrap_or(0);
-                    (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
+                    (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
                 }
                 // Application Capture: one app's windows (its bundle id) on a display.
                 (2, _) => {
@@ -440,7 +447,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                     if app.is_empty() {
                         return Err("an Application Capture with no app picked".into());
                     }
-                    (SourceKind::App { display, app, sound: false }, false)
+                    (SourceKind::App { display, app, sound: false, cursor }, false)
                 }
                 _ => return Err("an unknown screen capture method".into()),
             }
@@ -481,7 +488,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             // OBS 30 keeps the monitor's device path ("monitor_id"), older ones its place
             // ("monitor"): the place, else the first.
             let display = s.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
-            (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
+            let cursor = cursor_on(s, "capture_cursor");
+            (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "windows")]
         "window_capture" | "game_capture" => {
@@ -504,7 +512,11 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             };
             match w {
                 // With its app's sound, as on a Mac (muted or turned down in the mixer).
-                Some(w) => (SourceKind::Window(w), true),
+                // Window Capture's switch is "cursor", Game Capture's "capture_cursor".
+                Some(w) => {
+                    let cursor = cursor_on(s, if id == "game_capture" { "capture_cursor" } else { "cursor" });
+                    (SourceKind::Window { id: w, cursor }, true)
+                }
                 None => return Err("a window capture whose window isn't open".into()),
             }
         }
@@ -536,7 +548,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         #[cfg(target_os = "linux")]
         "xshm_input" | "xshm_input_v2" => {
             let display = s.get("screen").and_then(Value::as_u64).unwrap_or(0) as u32;
-            (SourceKind::Screen { display, sound: false, hide: hide.to_vec() }, false)
+            let cursor = cursor_on(s, "show_cursor");
+            (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "linux")]
         "v4l2_input" => (SourceKind::Camera(text_of("device_id")), false),
@@ -763,6 +776,22 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Show Cursor off leaves the pointer out of the picture (it was always drawn, 9 Nov).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn show_cursor_reaches_the_capture() {
+        let kind = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.0);
+        assert_eq!(kind(json!({ "type": 1, "window": 7 })), Ok(SourceKind::Window { id: 7, cursor: true }));
+        assert_eq!(
+            kind(json!({ "type": 1, "window": 7, "show_cursor": false })),
+            Ok(SourceKind::Window { id: 7, cursor: false })
+        );
+        assert_eq!(
+            kind(json!({ "type": 2, "display": 1, "application": "com.google.Chrome", "show_cursor": false })),
+            Ok(SourceKind::App { display: 1, app: "com.google.Chrome".into(), sound: false, cursor: false })
+        );
+    }
 
     #[test]
     fn a_shader_file_is_read_safely() {

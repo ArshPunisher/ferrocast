@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for (i, d) in displays.iter().enumerate().filter(|_| screens) {
         let id = i as u64 + 1;
-        e.set_source(id, SourceKind::Screen { display: d.id, sound: false, hide: Vec::new() })?;
+        e.set_source(id, SourceKind::Screen { display: d.id, sound: false, hide: Vec::new(), cursor: true })?;
         items.push(SceneItem::new(
             id,
             Placement { bounds: Bounds::Fit, bounds_width: 1920.0, bounds_height: 1080.0, ..Default::default() },

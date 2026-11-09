@@ -48,10 +48,16 @@ pub enum SourceKind {
         display: u32,
         sound: bool,
         hide: Vec<String>,
+        /// The mouse pointer drawn in the picture (OBS's Show Cursor / Capture Cursor).
+        cursor: bool,
     },
-    /// One window (macOS), by its window number, as it looks wherever it is.
+    /// One window (macOS), by its window number, as it looks wherever it is; with `cursor`,
+    /// the mouse pointer drawn in it.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    Window(u32),
+    Window {
+        id: u32,
+        cursor: bool,
+    },
     /// One app's windows on a display (macOS, OBS's Application Capture), by bundle id or
     /// name; with `sound`, its sound too.
     #[cfg(target_os = "macos")]
@@ -59,6 +65,7 @@ pub enum SourceKind {
         display: u32,
         app: String,
         sound: bool,
+        cursor: bool,
     },
     /// One app's sound alone (OBS's Application Audio Capture): its bundle id on a Mac, its
     /// program's name ("chrome") on Windows.
@@ -718,7 +725,7 @@ impl Engine {
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Screen { .. }
-            | SourceKind::Window(_)
+            | SourceKind::Window { .. }
             | SourceKind::DesktopSound
             | SourceKind::Camera(_)
             | SourceKind::Microphone(_) => {
@@ -1154,7 +1161,7 @@ impl Engine {
                     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                     SourceKind::Screen { .. } => true,
                     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-                    SourceKind::Window(_) => true,
+                    SourceKind::Window { .. } => true,
                     _ => return None,
                 };
                 let s = st.sources.get(id)?;
@@ -2089,7 +2096,7 @@ fn is_capture(kind: &SourceKind) -> bool {
     if matches!(
         kind,
         SourceKind::Screen { .. }
-            | SourceKind::Window(_)
+            | SourceKind::Window { .. }
             | SourceKind::DesktopSound
             | SourceKind::Camera(_)
             | SourceKind::Microphone(_)
@@ -2113,24 +2120,24 @@ fn is_capture(kind: &SourceKind) -> bool {
 fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
     use crate::screen::{ScreenCapture, Target};
     Some(match kind {
-        SourceKind::Screen { display, sound, hide } => ScreenCapture::start_with(
+        SourceKind::Screen { display, sound, hide, cursor } => ScreenCapture::start_with(
             Target::Display(*display),
             config.width,
             config.height,
             config.fps,
-            true,
+            *cursor,
             *sound,
             hide,
         )
         .map(Live::Screen),
         // The window's app's sound comes with it (ScreenCaptureKit filters it to the window on
         // a Mac, WASAPI's process loopback hears its app on Windows); none on Linux.
-        SourceKind::Window(window) => ScreenCapture::start_with(
-            Target::Window(*window),
+        SourceKind::Window { id, cursor } => ScreenCapture::start_with(
+            Target::Window(*id),
             config.width,
             config.height,
             config.fps,
-            true,
+            *cursor,
             cfg!(any(target_os = "macos", target_os = "windows")),
             &[],
         )
@@ -2151,8 +2158,8 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             .and_then(|d| ScreenCapture::start_with(Target::Display(d), 2, 2, 1, false, true, &[]))
             .map(Live::Screen),
         #[cfg(target_os = "macos")]
-        SourceKind::App { display, app, sound } => {
-            ScreenCapture::start_app(*display, app, config.width, config.height, config.fps, true, *sound)
+        SourceKind::App { display, app, sound, cursor } => {
+            ScreenCapture::start_app(*display, app, config.width, config.height, config.fps, *cursor, *sound)
                 .map(Live::Screen)
         }
         #[cfg(target_os = "macos")]
@@ -3329,7 +3336,7 @@ mod tests {
                 st.opened.insert(name.into(), (id, kind));
             };
             add(1, "Webcam", SourceKind::Camera("x".into()), None, None);
-            add(2, "Game", SourceKind::Window(7), None, None);
+            add(2, "Game", SourceKind::Window { id: 7, cursor: true }, None, None);
             add(3, "Opening", SourceKind::Camera("y".into()), None, Some(9));
             add(4, "Fine", SourceKind::Camera("z".into()), Some((640, 360, true)), None);
             add(5, "Off air", SourceKind::Camera("w".into()), None, None);
