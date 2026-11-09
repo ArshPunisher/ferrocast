@@ -613,6 +613,62 @@ pub fn placement_of(it: &Value) -> Placement {
     }
 }
 
+/// What a Source Clone shows.
+#[derive(Debug, PartialEq)]
+enum CloneOf {
+    /// A source's picture (its id), with these filters.
+    Source(u64, Vec<crate::Effect>),
+    /// A scene, with these filters.
+    Scene(String, Vec<crate::Effect>),
+}
+
+/// How deep a clone of a clone of… may go.
+const CLONE_DEPTH: usize = 8;
+
+/// Follows `target` (through other clones) to the source or scene it shows: its filters first
+/// when `with_filters`, then each clone's own on the way, then `own`.
+fn clone_of(
+    name: &str,
+    target: &str,
+    with_filters: bool,
+    own: &[crate::Effect],
+    clones: &[(String, String, bool, Vec<crate::Effect>)],
+    ids: &[(String, u64, Vec<crate::Effect>, bool)],
+    scene_names: &[String],
+) -> Result<CloneOf, String> {
+    let mut at = target.to_string();
+    let mut on_the_way: Vec<crate::Effect> = Vec::new();
+    let mut with = with_filters;
+    for _ in 0..CLONE_DEPTH {
+        if at.is_empty() {
+            return Err("Source Clone has no source picked".into());
+        }
+        if at == name {
+            return Err("Source Clone can't show itself".into());
+        }
+        if let Some((_, id, effects, _)) = ids.iter().find(|(n, ..)| *n == at) {
+            let mut all = if with { effects.clone() } else { Vec::new() };
+            all.extend(on_the_way);
+            all.extend(own.iter().cloned());
+            return Ok(CloneOf::Source(*id, all));
+        }
+        if scene_names.contains(&at) {
+            on_the_way.extend(own.iter().cloned());
+            return Ok(CloneOf::Scene(at, on_the_way));
+        }
+        let Some((_, next, next_with, next_own)) = clones.iter().find(|(n, ..)| *n == at) else {
+            return Err(format!("Source Clone shows \"{at}\", which isn't there"));
+        };
+        // A clone of a clone: that one's own filters come after its source's.
+        let mut front = next_own.clone();
+        front.extend(on_the_way);
+        on_the_way = front;
+        with = with && *next_with;
+        at = next.clone();
+    }
+    Err("Source Clone goes round in a circle".into())
+}
+
 /// Reads a collection. `canvas` sizes colour sources that don't say.
 pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
     let mut out = Imported {
@@ -640,6 +696,9 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
         .collect();
     let channels: Vec<Value> = CHANNELS.iter().filter_map(|k| doc.get(*k).cloned()).collect();
     let hide = privacy_hide(doc);
+    // Source Clone (Exeldro's plugin, built in): its name, the source or scene it shows,
+    // whether that one's filters come along, and its own filters.
+    let mut clones: Vec<(String, String, bool, Vec<crate::Effect>)> = Vec::new();
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -710,6 +769,12 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
                 out.skipped.push(format!("{name}: the filter {kind}"));
             }
         }
+        if id == "ferrocast_clone" || id == "source-clone" {
+            let target = settings.get("clone").and_then(Value::as_str).unwrap_or_default().to_string();
+            let with_filters = settings.get("filters").and_then(Value::as_bool).unwrap_or(true);
+            clones.push((name, target, with_filters, effects));
+            continue;
+        }
         match kind_from(id, &settings, canvas, &hide) {
             Ok((kind, has_sound)) => {
                 let flags = s.get("flags").and_then(Value::as_u64).unwrap_or(0);
@@ -740,6 +805,16 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             Err(what) => out.skipped.push(format!("{name}: {what}")),
         }
     }
+    // Clones show their source's picture (no second copy of it, no second sound) with their own
+    // filters after; a clone of a scene shows that scene.
+    let mut clone_scenes: Vec<(String, String, Vec<crate::Effect>)> = Vec::new();
+    for (name, target, with_filters, own) in &clones {
+        match clone_of(name, target, *with_filters, own, &clones, &ids, &scene_names) {
+            Ok(CloneOf::Source(id, effects)) => ids.push((name.clone(), id, effects, false)),
+            Ok(CloneOf::Scene(scene, effects)) => clone_scenes.push((name.clone(), scene, effects)),
+            Err(why) => out.skipped.push(format!("{name}: {why}")),
+        }
+    }
     // Scenes and groups: their items, bottom first, with each source's filters; nested scenes
     // and groups by name.
     for s in sources.iter().filter(|s| is_scene(s)) {
@@ -753,6 +828,11 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             let src = it.get("name").and_then(Value::as_str).unwrap_or_default();
             let mut si = if let Some((_, id, effects, _)) = ids.iter().find(|(n, ..)| n == src) {
                 let mut si = SceneItem::new(*id, placement_of(it));
+                si.effects = effects.clone();
+                si
+            } else if let Some((_, scene, effects)) = clone_scenes.iter().find(|(n, ..)| n == src) {
+                let mut si = SceneItem::new(0, placement_of(it));
+                si.scene = Some(scene.clone());
                 si.effects = effects.clone();
                 si
             } else if scene_names.iter().any(|n| n == src) {
@@ -791,6 +871,92 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collection: a red colour source with a rounded-corners filter, a scene "Inner", the
+    /// clones given, and a scene "Main" showing `shown`.
+    fn with_clones(clones: Value, shown: &[&str]) -> Imported {
+        let mut sources = vec![
+            json!({ "id": "color_source", "versioned_id": "color_source_v3", "name": "Red",
+                    "settings": { "width": 64, "height": 36, "color": 4278190335u32 },
+                    "filters": [{ "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": 9 } }] }),
+            json!({ "id": "scene", "name": "Inner", "settings": { "items": [{ "name": "Red", "id": 1 }] } }),
+        ];
+        sources.extend(clones.as_array().cloned().unwrap_or_default());
+        let items: Vec<Value> = shown.iter().enumerate().map(|(i, n)| json!({ "name": n, "id": i + 1 })).collect();
+        sources.push(json!({ "id": "scene", "name": "Main", "settings": { "items": items } }));
+        import(&json!({ "current_program_scene": "Main", "sources": sources }), (1920, 1080))
+    }
+
+    fn clone(name: &str, of: &str, filters: Option<bool>, own: Value) -> Value {
+        let mut settings = json!({ "clone": of });
+        if let Some(f) = filters {
+            settings["filters"] = json!(f);
+        }
+        json!({ "id": "ferrocast_clone", "name": name, "settings": settings, "filters": own })
+    }
+
+    fn main_items(im: &Imported) -> Vec<SceneItem> {
+        im.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_clone_shows_its_source_with_its_own_filters_after() {
+        let shadow = json!([{ "id": "ferrocast_border", "name": "Edge", "settings": { "width": 4 } }]);
+        let im = with_clones(json!([clone("Copy", "Red", None, shadow.clone())]), &["Red", "Copy"]);
+        assert!(im.skipped.is_empty(), "{:?}", im.skipped);
+        let items = main_items(&im);
+        assert_eq!(items[0].source, items[1].source, "the same picture, not a second source");
+        assert_eq!(im.sources.iter().filter(|s| s.name == "Copy").count(), 0, "no source of its own");
+        assert!(matches!(items[1].effects[0], crate::Effect::RoundedCorners { .. }), "its source's filters first");
+        assert!(matches!(items[1].effects[1], crate::Effect::Border { .. }), "then its own");
+        // Without its source's filters.
+        let im = with_clones(json!([clone("Copy", "Red", Some(false), shadow)]), &["Copy"]);
+        let items = main_items(&im);
+        assert_eq!(items[0].effects.len(), 1);
+        assert!(matches!(items[0].effects[0], crate::Effect::Border { .. }));
+    }
+
+    #[test]
+    fn a_clone_of_a_scene_or_of_a_clone() {
+        let none = json!([]);
+        let im = with_clones(json!([clone("Whole", "Inner", None, none.clone())]), &["Whole"]);
+        assert_eq!(main_items(&im)[0].scene.as_deref(), Some("Inner"));
+        // Exeldro's id and a chain: Copy2 shows Copy, which shows Red.
+        let mut c2 = clone("Copy2", "Copy", None, none.clone());
+        c2["id"] = json!("source-clone");
+        let im = with_clones(json!([clone("Copy", "Red", None, none), c2]), &["Copy2"]);
+        assert!(im.skipped.is_empty(), "{:?}", im.skipped);
+        let red = im.sources.iter().find(|s| s.name == "Red").map(|s| s.id);
+        assert_eq!(Some(main_items(&im)[0].source), red);
+    }
+
+    #[test]
+    fn a_clone_that_cant_show_anything_says_why() {
+        let none = json!([]);
+        let cases = [
+            (json!([clone("Empty", "", None, none.clone())]), "Empty", "no source picked"),
+            (json!([clone("Gone", "Nope", None, none.clone())]), "Gone", "isn't there"),
+            (json!([clone("Me", "Me", None, none.clone())]), "Me", "can't show itself"),
+            (json!([clone("A", "B", None, none.clone()), clone("B", "A", None, none.clone())]), "A", "can't show itself"),
+        ];
+        for (clones, name, why) in cases {
+            let im = with_clones(clones, &[name]);
+            assert!(
+                im.skipped.iter().any(|s| s.starts_with(&format!("{name}:")) && s.contains(why)),
+                "{name}: {:?}",
+                im.skipped
+            );
+            assert!(main_items(&im).is_empty(), "{name} isn't drawn");
+        }
+        // A ring of three ends too.
+        let ring = json!([
+            clone("A", "B", None, none.clone()),
+            clone("B", "C", None, none.clone()),
+            clone("C", "B", None, none)
+        ]);
+        let im = with_clones(ring, &["A"]);
+        assert!(im.skipped.iter().any(|s| s.starts_with("A:")), "{:?}", im.skipped);
+    }
 
     /// Show Cursor off leaves the pointer out of the picture (it was always drawn, 9 Nov).
     #[cfg(target_os = "macos")]

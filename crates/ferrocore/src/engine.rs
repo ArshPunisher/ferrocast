@@ -3565,6 +3565,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[0, 255, 0, 255], "the newest, on air");
     }
+
     /// A scene showing fed source 1 (with `effects`) and fed source 2 beside it.
     fn freeze_scene(e: &Engine, effects: Vec<Effect>) {
         let mut one = SceneItem::new(1, Placement::default());
@@ -3624,6 +3625,30 @@ mod tests {
         assert!(e.load_obs(&doc).is_empty(), "nothing left out");
         let st = e.lock();
         assert!(frozen(&st).is_empty(), "a switched-off freeze holds nothing");
+    }
+
+    /// A Source Clone draws its source's picture a second time, where it's placed.
+    #[test]
+    fn a_clone_draws_the_same_picture_again() {
+        let Some(e) = engine() else { return };
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "color_source", "versioned_id": "color_source_v3", "name": "Red",
+                  "settings": { "width": 64, "height": 36, "color": 4278190335u32 } },
+                { "id": "ferrocast_clone", "name": "Copy", "settings": { "clone": "Red" } },
+                { "id": "scene", "name": "Main", "settings": { "items": [
+                    { "name": "Red", "id": 1 },
+                    { "name": "Copy", "id": 2, "pos": { "x": 320.0, "y": 0.0 } }
+                ] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty());
+        std::thread::sleep(Duration::from_millis(150));
+        let px = e.snapshot().unwrap_or_default();
+        assert_eq!(&px[0..4], &[255, 0, 0, 255], "the source");
+        assert_eq!(&px[330 * 4..330 * 4 + 4], &[255, 0, 0, 255], "its clone, beside it");
+        assert_eq!(&px[200 * 4..200 * 4 + 4], &[0, 0, 0, 0], "nothing between");
     }
 
     /// A collection: "Main" all blue, "Other" all green, and "Logo" with a small red box at the

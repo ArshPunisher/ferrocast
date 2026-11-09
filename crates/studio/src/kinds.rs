@@ -99,6 +99,7 @@ pub fn kinds() -> Kinds {
         kind("text_ft2_source_v2", "Text"),
         kind("slideshow", "Image Slide Show"),
         kind("ndi_source", "NDI Source"),
+        kind("ferrocast_clone", "Source Clone"),
     ];
     if cfg!(target_os = "macos") {
         inputs.extend([
@@ -307,6 +308,11 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         }
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
+        // Its choices are the collection's sources and scenes (Stage::options fills them in).
+        "ferrocast_clone" => vec![
+            opt("clone", "Source", "list").choices(&[]),
+            opt("filters", "Include its filters", "bool"),
+        ],
         "ferrocast_shader" => vec![
             opt("shader_file", "Shader File", "path").file("WGSL Shaders (*.wgsl);;All Files (*.*)"),
             opt("shader_text", "Or Write One Here", "text").multiline().mono(),
@@ -691,6 +697,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "color_source" | "color_source_v2" => json!({ "color": 0xFFFF_FFFFu32, "width": 0, "height": 0 }),
         "image_source" => json!({ "file": "", "unload": false, "linear_alpha": false }),
         "ndi_source" => json!({ "ndi_source_name": "" }),
+        "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
         "ferrocast_shader" => json!({
             "shader_file": "",

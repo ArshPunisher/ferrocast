@@ -1145,8 +1145,20 @@ impl Stage {
     /// A source's settings form (its kind's, from our engine's kinds).
     pub fn options(&self, name: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
         let s = self.source(name)?;
-        crate::kinds::options(kind_of(&s))
-            .ok_or_else(|| fail(format!("Ferrocast's own engine can't show \"{name}\" yet.")))
+        let mut opts = crate::kinds::options(kind_of(&s))
+            .ok_or_else(|| fail(format!("Ferrocast's own engine can't show \"{name}\" yet.")))?;
+        // A clone picks from this collection: every other source, then the scenes.
+        if kind_of(&s) == "ferrocast_clone"
+            && let Some(o) = opts.iter_mut().find(|o| o.key == "clone")
+        {
+            let all = self.sources_list();
+            let (scenes, others): (Vec<&Value>, Vec<&Value>) =
+                all.iter().filter(|x| name_of(x) != name).partition(|x| is_scene(x));
+            let names: Vec<String> = others.iter().chain(&scenes).map(|x| name_of(x).to_string()).collect();
+            o.choices = names.clone();
+            o.values = names.into_iter().map(Value::from).collect();
+        }
+        Ok(opts)
     }
 
     /// Changes some of a source's settings (the rest kept).
@@ -3534,6 +3546,21 @@ mod tests {
         ok(s.set_top_layer(Some("Logo")));
         ok(s.set_top_layer(None));
         assert_eq!(s.top_layer(), None);
+    }
+
+    /// A clone's Source list holds every other source, then the scenes, never itself.
+    #[test]
+    fn a_clone_picks_from_this_collection() {
+        let s = stage();
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 20, "height": 20 }), false));
+        ok(s.add_source("Main", "ferrocast_clone", "Copy", &json!({}), false));
+        let opts = ok(s.options("Copy"));
+        let pick = opts.iter().find(|o| o.key == "clone").unwrap_or_else(|| panic!("a Source list"));
+        assert_eq!(pick.choices, ["Red", "Main"], "the other source, then the scene; not itself");
+        assert_eq!(pick.values, [json!("Red"), json!("Main")]);
+        assert!(opts.iter().any(|o| o.key == "filters" && o.kind == "bool"));
+        // Its defaults: nothing picked yet, the source's filters included.
+        assert_eq!(ok(s.settings("Copy"))["filters"], json!(true));
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {
