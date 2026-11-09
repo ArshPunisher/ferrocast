@@ -111,6 +111,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
         .route("/studio/engine/sources/{name}/web", post(engine_web))
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
+        .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
@@ -1110,6 +1111,16 @@ async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult
 
 async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_streamlabs(&b.id).await?))
+}
+
+/// `GET …/sources/{name}/picture?w=256` → `{ image, width, height }`: the source's own picture
+/// now, before its filters (the crop editor and filter previews draw on it).
+async fn engine_source_picture(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ThumbQuery>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SourcePicture { name, width: q.w }).await
 }
 
 async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {

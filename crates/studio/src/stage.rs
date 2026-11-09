@@ -1329,6 +1329,32 @@ impl Stage {
         crate::collection::png_data_url(&px, w, h, scene)
     }
 
+    /// One source's own picture now, before its filters, `width` wide as RGBA pixels, with its
+    /// height and the source's real size (the crop editor draws on it); None until it has one.
+    #[allow(clippy::type_complexity)]
+    pub fn source_picture_pixels(
+        &self,
+        name: &str,
+        width: u32,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        self.source(name)?;
+        let e = self.engine()?;
+        let Some((id, Some((sw, sh)))) = e.engine.source_named(name) else { return Ok(None) };
+        if sw == 0 || sh == 0 {
+            return Ok(None);
+        }
+        // `width` wide at the source's own shape; a tall one (a phone camera) is kept to 640
+        // high, narrower to match, so it's never squashed.
+        let mut w = u64::from(width.clamp(64, 640).min(sw.max(64)));
+        let mut h = (w * u64::from(sh) / u64::from(sw)).max(1);
+        if h > 640 {
+            w = (640 * u64::from(sw) / u64::from(sh)).max(1);
+            h = 640;
+        }
+        let (w, h) = (w as u32, h as u32);
+        Ok(e.engine.snapshot_source_at(id, (w, h)).map(|px| (px, w, h, (sw, sh))))
+    }
+
     /// A scene's picture `width` wide as RGBA pixels (with its height): the drawing, which needs
     /// this thread; turning it into a PNG ([`png_data_url`]) can happen elsewhere.
     pub fn thumbnail_pixels(&self, scene: &str, width: u32) -> Result<(Vec<u8>, u32, u32), StudioError> {

@@ -1466,6 +1466,13 @@ pub enum StudioAct {
         scene: String,
         width: u32,
     },
+    /// One source's own picture now, before its filters, `width` pixels wide → `{ image,
+    /// width, height }` (its real size, for the crop editor), or `{ image: null }` before it
+    /// has a picture.
+    SourcePicture {
+        name: String,
+        width: u32,
+    },
     /// Puts these sources of a scene into a new group, each where it is on screen (OBS's
     /// Group Selected Items) → the group.
     GroupItems {
@@ -1716,8 +1723,8 @@ impl StudioAct {
                 check_source_name(name)
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
-            A::Thumbnail { scene, width } => {
-                check_source_name(scene)?;
+            A::Thumbnail { scene: name, width } | A::SourcePicture { name, width } => {
+                check_source_name(name)?;
                 if !(64..=640).contains(width) {
                     return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
                 }
@@ -1822,6 +1829,7 @@ impl StudioAct {
             self,
             A::Scenes
                 | A::Thumbnail { .. }
+                | A::SourcePicture { .. }
                 | A::Items { .. }
                 | A::Sources
                 | A::Settings { .. }

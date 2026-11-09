@@ -838,6 +838,12 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
+        A::SourcePicture { name, width } => Ok(match c.source_picture_pixels(&name, width)? {
+            Some((px, w, h, (sw, sh))) => {
+                json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
+            }
+            None => json!({ "image": null }),
+        }),
         A::GroupItems { scene, ids, name } => v(to_json!(c.group_together(&scene, &ids, &name)?)),
         A::ItemOrder { scene, id, to } => done(c.item_order(&scene, id, to)),
         A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
@@ -1556,6 +1562,23 @@ impl StudioHost for DesktopStudio {
         }
         // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
         // milliseconds there, and the scene grid asks for one every few seconds).
+        // A source's own picture (the crop editor's): the same, without its filters.
+        if let StudioAct::SourcePicture { name, width } = &act {
+            let (n, w) = (name.clone(), *width);
+            let got = self
+                .on_main(move |h| -> Result<_, String> {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    c.source_picture_pixels(&n, w).map_err(|e| e.to_string())
+                })
+                .await??;
+            let Some((px, pw, ph, (sw, sh))) = got else { return Ok(json!({ "image": null })) };
+            let name = name.clone();
+            let image = tokio::task::spawn_blocking(move || ferrocast_studio::png_data_url(&px, pw, ph, &name))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "image": image, "width": sw, "height": sh }));
+        }
         if let StudioAct::Thumbnail { scene, width } = &act {
             let (s, w) = (scene.clone(), *width);
             let (px, pw, ph) = self
