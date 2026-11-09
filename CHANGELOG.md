@@ -5,6 +5,12 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.3
+
+A security update for the database Ferrocast keeps your chat, alerts and settings in: it now uses
+a SQLite with a fix for a memory bug (CVE-2026-119375). Nothing else changes; 3.0.2's new filters
+and settings are all here.
+
 ## 3.0.2
 
 Easier source settings and filters, and fixes from your first days with 3.0.
