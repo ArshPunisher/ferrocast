@@ -5,6 +5,16 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.6
+
+- Settings are easier to read: each page is a short list, one setting per row with a line
+  saying what it does. Settings that need another one show only once it's on.
+- Selected tabs, scenes and sources are now Ferrocast blue instead of grey.
+- First-time setup is shorter: it ends after connecting your accounts. Pick a look and add the
+  overlay any time in Overlays.
+- A steadier frame rate when your Mac is busy or Ferrocast is in the background.
+- If the browser doesn't open when you sign in, click "Finish in browser" to open it again.
+
 ## 3.0.5
 
 - On a Mac, Ferrocast keeps its place in the Dock when it updates. Before, an update could leave
