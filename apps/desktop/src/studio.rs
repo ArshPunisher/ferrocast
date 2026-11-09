@@ -511,6 +511,16 @@ pub fn end_session() {
     }
 }
 
+/// Closes the Studio (its engine, outputs and preview) now, on the main thread while it's still
+/// whole. Left to the thread's own end, the engine's graphics queue waited for the GPU inside an
+/// Objective-C autorelease pool whose thread-local list was already gone: a panic in a
+/// thread-local destructor, and Ferrocast aborted on every quit with the Studio running (9 Nov).
+pub fn close() {
+    // Taken out first, then dropped: nothing borrows HELD while the engine closes.
+    let held = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h)));
+    drop(held);
+}
+
 /// What live captions last heard, as the "Captions" text source shows it.
 static HEARD: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 

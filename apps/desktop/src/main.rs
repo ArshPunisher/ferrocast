@@ -226,6 +226,9 @@ fn main() {
         RunEvent::Exit => {
             studio::end_session();
             tracing::info!("Ferrocast quitting");
+            // Before the main thread's own end, which can't run the engine's GPU cleanup.
+            studio::close();
+            tracing::info!("the Studio closed");
         }
         _ => {}
     });
