@@ -499,6 +499,29 @@ impl Stage {
         self.doc.borrow().get("current_program_scene").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    /// The scene shown over whatever is on air (the top layer: Exeldro's Downstream Keyer, built
+    /// in), when one is set and still there.
+    pub fn top_layer(&self) -> Option<String> {
+        let top = self.doc.borrow().get("ferrocast_top_layer").and_then(Value::as_str).map(String::from)?;
+        self.order().contains(&top).then_some(top)
+    }
+
+    /// Shows `scene` over every scene on air, or none.
+    pub fn set_top_layer(&self, scene: Option<&str>) -> Result<(), StudioError> {
+        if let Some(s) = scene {
+            self.scene_index(s)?;
+        }
+        self.edit(|d| match scene {
+            Some(s) => d["ferrocast_top_layer"] = json!(s),
+            None => {
+                if let Some(o) = d.as_object_mut() {
+                    o.remove("ferrocast_top_layer");
+                }
+            }
+        });
+        Ok(())
+    }
+
     pub fn scene_index(&self, name: &str) -> Result<usize, StudioError> {
         self.order().iter().position(|n| n == name).ok_or_else(|| fail(format!("There's no scene called \"{name}\".")))
     }
@@ -541,6 +564,12 @@ impl Stage {
             if on_air {
                 d["current_scene"] = json!(rest[0]);
                 d["current_program_scene"] = json!(rest[0]);
+            }
+            // A removed top layer is no top layer.
+            if d.get("ferrocast_top_layer").and_then(Value::as_str) == Some(name)
+                && let Some(o) = d.as_object_mut()
+            {
+                o.remove("ferrocast_top_layer");
             }
         });
         self.set_order(&rest);
@@ -603,7 +632,7 @@ impl Stage {
         let order: Vec<String> =
             self.order().into_iter().map(|n| if n == name { new_name.to_string() } else { n }).collect();
         self.edit(|d| {
-            for k in ["current_scene", "current_program_scene"] {
+            for k in ["current_scene", "current_program_scene", "ferrocast_top_layer"] {
                 if d.get(k).and_then(Value::as_str) == Some(name) {
                     d[k] = json!(new_name);
                 }
@@ -3485,6 +3514,26 @@ mod tests {
         assert_eq!(s.privacy(), kept);
         s.set_privacy(&json!({})).unwrap();
         assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec![ferrocore::obs::NOTIFICATIONS.to_string()]);
+    }
+
+    /// The top layer follows its scene's name and goes with it; only a scene can be one.
+    #[test]
+    fn the_top_layer_is_a_scene_and_follows_it() {
+        let s = stage();
+        ok(s.add_scene("Logo"));
+        assert_eq!(s.top_layer(), None);
+        assert!(s.set_top_layer(Some("Nope")).is_err(), "no such scene");
+        ok(s.set_top_layer(Some("Logo")));
+        assert_eq!(s.top_layer().as_deref(), Some("Logo"));
+        ok(s.rename("Logo", "Brand"));
+        assert_eq!(s.top_layer().as_deref(), Some("Brand"), "renamed with its scene");
+        ok(s.remove_scene("Brand"));
+        assert_eq!(s.top_layer(), None, "gone with its scene");
+        ok(s.add_scene("Logo"));
+        assert_eq!(s.top_layer(), None, "a new scene of the same name isn't the top layer again");
+        ok(s.set_top_layer(Some("Logo")));
+        ok(s.set_top_layer(None));
+        assert_eq!(s.top_layer(), None);
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {

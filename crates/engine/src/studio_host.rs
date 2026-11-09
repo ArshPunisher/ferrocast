@@ -1269,6 +1269,10 @@ pub enum StudioAct {
         kind: String,
         ms: u32,
     },
+    /// The scene shown over every scene on air (the top layer), or none.
+    SetTopLayer {
+        scene: Option<String>,
+    },
     /// A scene's own transition (OBS's Transition Override), or none to use the Studio's.
     SetSceneTransition {
         scene: String,
@@ -1620,6 +1624,7 @@ impl StudioAct {
                 }
                 Ok(())
             }
+            A::SetTopLayer { scene } => scene.as_deref().map_or(Ok(()), check_source_name),
             A::SetTransition { kind, ms } => {
                 check_kind(kind)?;
                 if *ms > 20_000 {

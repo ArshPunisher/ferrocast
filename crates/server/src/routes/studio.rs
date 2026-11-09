@@ -91,6 +91,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/top-layer", put(engine_top_layer))
         .route(
             "/studio/engine/transitions/{kind}/settings",
             get(engine_transition_settings).put(engine_set_transition_settings),
@@ -546,6 +547,16 @@ struct TransitionBody {
 
 async fn engine_transition(State(app): State<AppState>, Body(b): Body<TransitionBody>) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetTransition { kind: b.kind, ms: b.ms }).await
+}
+
+#[derive(Deserialize)]
+struct TopLayerBody {
+    scene: Option<String>,
+}
+
+/// The scene shown over every scene on air (the top layer), or `null` for none.
+async fn engine_top_layer(State(app): State<AppState>, Body(b): Body<TopLayerBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTopLayer { scene: b.scene }).await
 }
 
 #[derive(Deserialize)]

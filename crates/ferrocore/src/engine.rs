@@ -494,6 +494,8 @@ struct State {
     sources: BTreeMap<u64, Src>,
     scenes: BTreeMap<String, Vec<SceneItem>>,
     on_air: Option<String>,
+    /// A scene drawn over whatever is on air, transitions included (the top layer).
+    top: Option<String>,
     /// A transition under way: from which scene, how, when it began and how long it lasts (ns).
     moving: Option<(String, TransitionKind, u64, u64)>,
     /// A stinger under way: the scene it came from, when it started, when the scene changes
@@ -622,6 +624,7 @@ impl Engine {
             sources: BTreeMap::new(),
             scenes: BTreeMap::new(),
             on_air: None,
+            top: None,
             moving: None,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             stinger: None,
@@ -1058,6 +1061,7 @@ impl Engine {
             st.started.clear();
             st.on_air = None;
             st.moving = None;
+            st.top = imported.top_layer.clone();
             st.groups = imported.groups;
             st.globals.clear();
             st.opened.clear();
@@ -1737,11 +1741,34 @@ enum Draw {
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 const STINGER: u64 = u64::MAX - 1;
 
-/// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps).
+/// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps), with the top
+/// layer over it.
 fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64) -> Draw {
     if let Some(name) = scene {
         return Draw::Scene(build(st, width, height, Some(name), ts));
     }
+    let mut draw = on_air_draw(st, width, height, ts);
+    // The top layer over both sides of a transition, so it stays still through it; never
+    // over itself.
+    if let Some(top) = st.top.as_deref()
+        && st.on_air.as_deref() != Some(top)
+    {
+        let mut over = SceneItem::new(0, Placement::default());
+        over.scene = Some(top.to_string());
+        let item = || item_of(st, &over, ts, (width, height));
+        match &mut draw {
+            Draw::Scene(s) => s.items.extend(item()),
+            Draw::Moving(t) => {
+                t.from.items.extend(item());
+                t.to.items.extend(item());
+            }
+        }
+    }
+    draw
+}
+
+/// What's on air: one scene, or two mid-transition.
+fn on_air_draw(st: &State, width: u32, height: u32, ts: u64) -> Draw {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if let Some((from, _, cut, _)) = &st.stinger {
         let under = if ts < *cut { Some(from.as_str()) } else { st.on_air.as_deref() };
@@ -1873,6 +1900,7 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
     let mut out = st.globals.clone();
     let mut roots: Vec<&str> = Vec::new();
     roots.extend(st.on_air.as_deref());
+    roots.extend(st.top.as_deref());
     roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
@@ -1908,6 +1936,7 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
     let mut out = std::collections::HashSet::new();
     let mut roots: Vec<&str> = Vec::new();
     roots.extend(st.on_air.as_deref());
+    roots.extend(st.top.as_deref());
     roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
@@ -3511,5 +3540,62 @@ mod tests {
         e.go("Other").unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[0, 255, 0, 255], "the newest, on air");
+    }
+    /// A collection: "Main" all blue, "Other" all green, and "Logo" with a small red box at the
+    /// top left; `top` names the top layer.
+    fn top_doc(top: serde_json::Value) -> serde_json::Value {
+        let colour = |name: &str, c: u32, w: u32, h: u32| {
+            serde_json::json!({ "id": "color_source", "versioned_id": "color_source_v3", "name": name,
+                                "settings": { "width": w, "height": h, "color": c } })
+        };
+        let scene = |name: &str, item: &str| {
+            serde_json::json!({ "id": "scene", "name": name, "settings": { "items": [{ "name": item, "id": 1 }] } })
+        };
+        serde_json::json!({
+            "current_program_scene": "Main",
+            "ferrocast_top_layer": top,
+            "sources": [
+                colour("Blue", 0xFFFF_0000, 640, 360), colour("Green", 0xFF00_FF00, 640, 360),
+                colour("Red", 0xFF00_00FF, 32, 32),
+                scene("Main", "Blue"), scene("Other", "Green"), scene("Logo", "Red"),
+                { "id": "group", "name": "Box", "settings": { "items": [], "cx": 10, "cy": 10 } }
+            ]
+        })
+    }
+
+    #[test]
+    fn the_top_layer_is_over_whatever_is_on_air() {
+        let Some(e) = engine() else { return };
+        assert!(e.load_obs(&top_doc(serde_json::json!("Logo"))).is_empty());
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(150));
+        let px = |e: &Engine, x: usize| e.snapshot().unwrap_or_default()[x * 4..x * 4 + 4].to_vec();
+        assert_eq!(px(&e, 5), [255, 0, 0, 255], "the logo over Main");
+        assert_eq!(px(&e, 100), [0, 0, 255, 255], "Main under it");
+        // Mid-fade the logo stays where it is.
+        e.go_with("Other", TransitionKind::Fade, 4000).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(px(&e, 5), [255, 0, 0, 255], "still there mid-transition");
+        let mid = px(&e, 100);
+        assert!(mid[1] > 0 && mid[2] > 0, "Main and Other mixing under it: {mid:?}");
+        // Not over itself, not in a thumbnail of a scene.
+        e.go("Logo").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(px(&e, 5), [255, 0, 0, 255]);
+        assert_eq!(px(&e, 100), [0, 0, 0, 0], "drawn once, not twice over a black canvas");
+        let thumb = e.snapshot_scene("Other").unwrap_or_default();
+        assert_eq!(&thumb[20..24], &[0, 255, 0, 255], "a thumbnail is the scene alone");
+    }
+
+    #[test]
+    fn a_top_layer_that_isnt_a_scene_is_left_out() {
+        let Some(e) = engine() else { return };
+        for top in [serde_json::json!("Nope"), serde_json::json!("Box"), serde_json::json!(7), serde_json::json!(null)] {
+            assert!(e.load_obs(&top_doc(top.clone())).is_empty());
+            assert_eq!(e.lock().top, None, "{top}");
+            e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(&e.snapshot().unwrap_or_default()[20..24], &[0, 0, 255, 255], "{top}: Main alone");
+        }
     }
 }

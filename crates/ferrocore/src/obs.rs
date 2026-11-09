@@ -46,6 +46,9 @@ pub struct Imported {
     pub groups: Vec<String>,
     /// What couldn't come over yet ("Browser: OBS's Browser source"), for the app to say.
     pub skipped: Vec<String>,
+    /// The scene shown over whatever is on air (`ferrocast_top_layer`: Exeldro's Downstream
+    /// Keyer, built in), when it names one of `scenes`.
+    pub top_layer: Option<String>,
 }
 
 fn f(v: &Value, k: &str, d: f64) -> f32 {
@@ -770,6 +773,12 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
         }
         out.scenes.push((name, items));
     }
+    // The top layer, when it names a scene that came over (not a group).
+    out.top_layer = doc
+        .get("ferrocast_top_layer")
+        .and_then(Value::as_str)
+        .filter(|t| out.scenes.iter().any(|(n, _)| n == t) && !out.groups.iter().any(|g| g == t))
+        .map(String::from);
     // OBS's scene list order where it's saved.
     if let Some(order) = doc.get("scene_order").and_then(Value::as_array) {
         let names: Vec<&str> = order.iter().filter_map(|o| o.get("name").and_then(Value::as_str)).collect();
