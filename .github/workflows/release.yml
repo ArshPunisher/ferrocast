@@ -198,6 +198,8 @@ jobs:
           MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
           MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
           MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+          # Signed-in downloads of FFmpeg (GitHub serves those first when it's busy).
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./packaging/windows-msix.ps1 -Exe target/release/ferrocast.exe -Out store -Test
       - name: Keep the Store package
         if: matrix.name == 'Windows'

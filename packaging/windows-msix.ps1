@@ -34,10 +34,15 @@ function Tool($name) {
   return $found.FullName
 }
 function Sha256($path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant() }
-# GitHub's release downloads sometimes answer 502/504 for a moment: try a few times before failing.
+# GitHub's release downloads sometimes answer 502/504: try a few times before failing. On CI the
+# workflow's token goes along, because GitHub serves signed-in downloads first when it's busy
+# (anonymous ones timed out for a day in Nov 2026). PowerShell drops the header when GitHub
+# redirects to its file host, so the token only ever goes to github.com.
 function Download($uri, $dest) {
+  $headers = @{}
+  if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
   for ($try = 1; ; $try++) {
-    try { Invoke-WebRequest -Uri $uri -OutFile $dest -UseBasicParsing; return }
+    try { Invoke-WebRequest -Uri $uri -OutFile $dest -UseBasicParsing -Headers $headers; return }
     catch {
       if ($try -ge 4) { Fail "couldn't download $uri ($($_.Exception.Message))" }
       Write-Host "Download of $uri failed ($($_.Exception.Message)); trying again in $($try * 10) s"
@@ -104,6 +109,8 @@ foreach ($name in $notes.Keys) {
   if ((Sha256 $dest) -ne $notes[$name][1]) { Fail "FFmpeg's $name doesn't match its pinned SHA-256" }
 }
 Write-Host ("FFmpeg {0}: {1:N1} MB" -f $release, ((Get-Item (Join-Path $pkg 'ffmpeg.exe')).Length / 1MB))
+# Downloads done: the token isn't needed again, so the test copy started below never sees it.
+Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
 
 # 3. Icons and the manifest.
 Copy-Item (Join-Path $PSScriptRoot 'msix/Assets/*.png') (Join-Path $pkg 'Assets')
