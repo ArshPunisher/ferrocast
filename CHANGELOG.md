@@ -5,6 +5,24 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.0.2
+
+Easier source settings and filters, and fixes from your first days with 3.0.
+
+- Screen capture on a Mac is now three buttons: Whole screen, One window or One app. Only the
+  list you need shows, so a window capture no longer shows a Display and an App list that did
+  nothing.
+- Show Cursor works: switched off, the mouse arrow stays out of your stream and recordings.
+- Crop is a box you drag on the source's own picture, with the four edges as numbers underneath.
+  The outline on the canvas now follows the crop.
+- Filters are compact: one line per setting, values in percent, the main settings first and the
+  rest under More. Reset and More sit in each filter's header.
+- Green screen: pick Green, Blue, or click any colour on your picture. Each colour starts at a
+  strength that keeps black, white and greys, and Ferrocast warns you if you push it past that.
+- Recording quality shows how big a minute and an hour of recording will be, what it uses on your
+  computer and when to choose it. Save to shows your real folder.
+- Removing a filter asks with a clear red Remove button.
+
 ## 3.0.1
 
 Ferrocast now has its own engine. The Studio no longer uses any part of OBS: Ferrocast draws,
