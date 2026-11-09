@@ -19,6 +19,8 @@ use std::time::Duration;
 
 #[cfg(windows)]
 mod crash;
+#[cfg(target_os = "macos")]
+mod mac_update;
 mod store;
 mod studio;
 mod studio_history;
@@ -479,7 +481,20 @@ async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             continue;
         }
         // Unpacking and moving the app takes a moment: off the async workers.
-        let installed = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        let installed = tokio::task::spawn_blocking(move || {
+            // A Mac keeps the same Ferrocast.app folder, so the Dock's pin survives the update;
+            // the plugin's own install (it swaps the whole folder) is the fallback, and asks
+            // for an admin password where the folder needs one.
+            #[cfg(target_os = "macos")]
+            if let Some(app) = std::env::current_exe().ok().and_then(|e| mac_update::bundle_of(&e)) {
+                match mac_update::install(&bytes, &app) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::warn!(error = %e, "couldn't update inside the app folder; replacing it whole"),
+                }
+            }
+            update.install(bytes)
+        })
+        .await;
         match installed {
             Ok(Ok(())) => {
                 tracing::info!(%version, "update installed; waiting for the restart");
