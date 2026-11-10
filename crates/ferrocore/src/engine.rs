@@ -867,7 +867,14 @@ impl Engine {
             }
             None => None,
         };
-        self.lock().sources.insert(id, Src::new(live, size, restart));
+        let gone = {
+            let mut st = self.lock();
+            // A capture opened in place (an App capture handed over) keeps the old picture on
+            // the card until its first one comes.
+            let size = size.or_else(|| restart.as_ref().and(st.sources.get(&id).and_then(|s| s.size)));
+            st.sources.insert(id, Src::new(live, size, restart))
+        };
+        drop(gone);
         Ok(())
     }
 
@@ -909,9 +916,23 @@ impl Engine {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT.fetch_add(1, Ordering::Relaxed);
         {
-            let mut src = Src::new(Live::Still, None, restart);
-            src.opening = Some(token);
-            self.lock().sources.insert(id, src);
+            let mut st = self.lock();
+            match st.sources.get_mut(&id) {
+                // Already here with a picture (a screen capture handed over): it keeps running
+                // and showing until the new one is open.
+                Some(src) if src.size.is_some() => {
+                    src.kind = restart;
+                    src.opening = Some(token);
+                }
+                _ => {
+                    let mut src = Src::new(Live::Still, None, restart);
+                    src.opening = Some(token);
+                    // Whatever was there before goes after the lock (stopping it can wait).
+                    let gone = st.sources.insert(id, src);
+                    drop(st);
+                    drop(gone);
+                }
+            }
         }
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
@@ -928,7 +949,8 @@ impl Engine {
             let mine = st.sources.get_mut(&id).filter(|s| s.opening == Some(token));
             let answer = match (opened, mine) {
                 (Ok((live, heard)), Some(src)) => {
-                    src.live = live;
+                    // The one it took over from (when handed over) stops outside the lock.
+                    leftover = Some(std::mem::replace(&mut src.live, live));
                     src.opening = None;
                     src.watch = Watch { since: now_ns(), ..Watch::default() };
                     // Its sound into the mix (a file with sound), under the same lock so a
@@ -940,6 +962,10 @@ impl Engine {
                 }
                 (Err(e), Some(src)) => {
                     src.opening = None;
+                    // The new one didn't open: the old one handed over stops too (the watchdog
+                    // starts what was asked for, not what was there), and no stale picture.
+                    leftover = Some(std::mem::replace(&mut src.live, Live::Still));
+                    src.size = None;
                     if src.kind.is_some() {
                         // A capture: the watchdog tries again later, waiting longer each time.
                         src.watch.next_try = now_ns() + backoff_ns(0);
@@ -983,6 +1009,9 @@ impl Engine {
                 if st.sources.get(&id).is_some_and(|s| matches!(s.live, Live::Still) && s.opening.is_none()) {
                     st.sources.remove(&id);
                     self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                    drop(st);
+                    // A picture left from a capture it took over from.
+                    self.gpu.forget(id);
                 }
                 Err(e)
             }
@@ -1106,20 +1135,35 @@ impl Engine {
     /// Opened again (the Studio changed), a source with the same name and settings keeps
     /// running: a camera doesn't blink when something else moves.
     pub fn load_obs(&self, doc: &serde_json::Value) -> Vec<String> {
-        let mut imported = crate::obs::import(doc, (self.config.width, self.config.height));
+        let before: HashMap<String, SourceKind> =
+            self.lock().opened.iter().map(|(n, (_, k))| (n.clone(), k.clone())).collect();
+        let mut imported =
+            crate::obs::import_with(doc, (self.config.width, self.config.height), &|n| before.get(n).cloned());
         let mut skipped = std::mem::take(&mut imported.skipped);
         // Which imported sources are already here, running as they should; the rest get ids
-        // after every id in use.
-        let (keep, ids) = {
+        // after every id in use. A screen capture switched to another method (Screen, Window,
+        // App) keeps its id and its last picture until the new one opens: no black between
+        // (owner's recording, 10 Nov).
+        let (keep, handed, ids) = {
             let st = self.lock();
             let mut next = st.sources.keys().max().map_or(1, |m| m + 1);
             let mut ids: HashMap<u64, u64> = HashMap::new();
             let mut keep: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut handed: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for src in &imported.sources {
                 match st.opened.get(&src.name) {
                     Some((id, kind)) if *kind == src.kind && st.sources.contains_key(id) && !keep.contains(id) => {
                         ids.insert(src.id, *id);
                         keep.insert(*id);
+                    }
+                    Some((id, kind))
+                        if hands_over(kind, &src.kind)
+                            && st.sources.contains_key(id)
+                            && !keep.contains(id)
+                            && !handed.contains(id) =>
+                    {
+                        ids.insert(src.id, *id);
+                        handed.insert(*id);
                     }
                     _ => {
                         ids.insert(src.id, next);
@@ -1127,9 +1171,10 @@ impl Engine {
                     }
                 }
             }
-            (keep, ids)
+            (keep, handed, ids)
         };
-        let old: Vec<u64> = self.lock().sources.keys().copied().filter(|id| !keep.contains(id)).collect();
+        let old: Vec<u64> =
+            self.lock().sources.keys().copied().filter(|id| !keep.contains(id) && !handed.contains(id)).collect();
         for id in old {
             self.remove_source(id);
         }
@@ -2395,6 +2440,24 @@ fn open_video(path: &std::path::Path, looping: bool) -> Result<crate::media::Med
 }
 
 /// Sources the watchdog can start again: captures (a file or a picture doesn't stop by itself).
+/// A screen capture changing method or what it shows (Screen, Window, App): the old one keeps
+/// showing until the new one opens. Not cameras (two sessions on one device give no picture).
+fn hands_over(from: &SourceKind, to: &SourceKind) -> bool {
+    fn screenish(k: &SourceKind) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        if matches!(k, SourceKind::Screen { .. } | SourceKind::Window { .. }) {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(k, SourceKind::App { .. }) {
+            return true;
+        }
+        let _ = k;
+        false
+    }
+    screenish(from) && screenish(to)
+}
+
 fn is_capture(kind: &SourceKind) -> bool {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if matches!(
@@ -3171,6 +3234,47 @@ mod tests {
         let px = e.snapshot_scene("Main").unwrap_or_else(|x| panic!("{x}"));
         let at = (10 * 640 + 110) * 4;
         assert_eq!(&px[at..at + 4], &[0, 255, 0, 255], "the new box, where it moved");
+    }
+
+    #[test]
+    fn a_handed_over_capture_keeps_its_picture_until_the_new_one_opens() {
+        let Some(e) = engine() else { return };
+        e.set_source(7, SourceKind::Color { width: 8, height: 8, rgba: [255, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let slow: Opener = Box::new(|| {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok((Live::Still, false))
+        });
+        e.open_soon(7, None, slow).unwrap_or_else(|x| panic!("{x}"));
+        {
+            let st = e.lock();
+            let src = &st.sources[&7];
+            assert!(src.opening.is_some(), "still opening");
+            assert!(src.size.is_some(), "the old picture stays meanwhile");
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while e.opening() > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(e.opening(), 0);
+        // One that fails straight away lets the old one go with it.
+        let bad: Opener = Box::new(|| Err(AvError::Source("no".into())));
+        e.set_source(8, SourceKind::Color { width: 8, height: 8, rgba: [0, 255, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.open_soon(8, None, bad).is_err());
+        assert!(!e.lock().sources.contains_key(&8));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn only_screen_captures_hand_over() {
+        let screen = SourceKind::Screen { display: 1, sound: false, hide: Vec::new(), cursor: true };
+        let window = SourceKind::Window { id: 4, cursor: true };
+        assert!(hands_over(&screen, &window));
+        assert!(hands_over(&window, &screen));
+        let cam = SourceKind::Camera("a".into());
+        assert!(!hands_over(&cam, &SourceKind::Camera("b".into())));
+        assert!(!hands_over(&screen, &cam));
     }
 
     #[test]

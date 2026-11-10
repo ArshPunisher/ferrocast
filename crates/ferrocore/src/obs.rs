@@ -807,6 +807,30 @@ fn clone_of(
 
 /// Reads a collection. `canvas` sizes colour sources that don't say.
 pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
+    import_with(doc, canvas, &|_| None)
+}
+
+/// A capture switched to a method still waiting for its pick (Window or App with nothing
+/// chosen yet): the engine keeps what it showed until something is picked, instead of a black
+/// hole while the list is open (owner's recording, 10 Nov).
+fn waiting_for_pick(what: &str) -> bool {
+    what.ends_with("no window picked") || what.ends_with("no app picked")
+}
+
+/// Whether a source of `kind` brings sound into the mix (as `kind_from` says for it).
+fn heard(kind: &SourceKind) -> bool {
+    match kind {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        SourceKind::Window { .. } | SourceKind::DesktopSound => true,
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        SourceKind::AppSound(_) => true,
+        _ => false,
+    }
+}
+
+/// [`import`], with `before` giving what each source (by name) was running as: a capture
+/// waiting for its pick keeps that.
+pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Option<SourceKind>) -> Imported {
     let mut out = Imported {
         current: doc.get("current_program_scene").and_then(Value::as_str).map(String::from),
         ..Default::default()
@@ -911,7 +935,16 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
             clones.push((name, target, with_filters, effects));
             continue;
         }
-        match kind_from(id, &settings, canvas, &hide) {
+        let kind = kind_from(id, &settings, canvas, &hide).or_else(|what| {
+            match before(&name).filter(|_| waiting_for_pick(&what)) {
+                Some(kind) => {
+                    let sound = heard(&kind);
+                    Ok((kind, sound))
+                }
+                None => Err(what),
+            }
+        });
+        match kind {
             Ok((kind, has_sound)) => {
                 let flags = s.get("flags").and_then(Value::as_u64).unwrap_or(0);
                 let sound = has_sound.then(|| SourceSettings {
@@ -1006,6 +1039,78 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 
 #[cfg(test)]
 mod tests {
+
+    /// A screen capture switched to Window or App with nothing picked yet keeps what it ran
+    /// as before; with nothing before, it's left out and says why.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_capture_waiting_for_its_pick_keeps_what_it_showed() {
+        use crate::engine::SourceKind;
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "screen_capture", "name": "Desk", "settings": { "type": 1 } },
+                { "id": "scene", "name": "Main", "settings": { "items": [ { "name": "Desk" } ] } }
+            ]
+        });
+        let was = SourceKind::Screen { display: 3, sound: false, hide: Vec::new(), cursor: true };
+        let got = super::import_with(&doc, (640, 360), &|n| (n == "Desk").then(|| was.clone()));
+        assert!(got.skipped.is_empty(), "{:?}", got.skipped);
+        assert_eq!(got.sources.len(), 1);
+        assert_eq!(got.sources[0].kind, was);
+        assert_eq!(got.scenes[0].1.len(), 1, "still in its scene");
+        let fresh = super::import(&doc, (640, 360));
+        assert!(fresh.sources.is_empty());
+        assert!(fresh.skipped[0].ends_with("no window picked"), "{:?}", fresh.skipped);
+    }
+
+    /// A screen capture leaves out what Privacy hides and its own apps, each once.
+    #[test]
+    fn a_screen_capture_leaves_out_its_own_apps_too() {
+        let hide = vec![super::NOTIFICATIONS.to_string(), "com.1password.1password".to_string()];
+        let s = serde_json::json!({ "exclude_apps": ["com.tinyspeck.slackmacgap", "com.1password.1password", ""] });
+        assert_eq!(
+            super::with_own_hide(&hide, &s),
+            [super::NOTIFICATIONS, "com.1password.1password", "com.tinyspeck.slackmacgap"].map(String::from)
+        );
+        assert_eq!(super::with_own_hide(&hide, &serde_json::json!({})), hide);
+    }
+
+    /// A text's box behind it: its colour at the opacity asked; none at 0.
+    #[test]
+    fn a_text_background_is_its_colour_at_its_opacity() {
+        let on = super::text_style_of(
+            "text_ft2_source_v2",
+            &serde_json::json!({ "bk_color": 0xFF33_2211u32, "bk_opacity": 60 }),
+        );
+        assert_eq!(on.background, Some([0x11, 0x22, 0x33, 153]));
+        assert!(on.padding > 0, "room round the words");
+        let off = super::text_style_of(
+            "text_ft2_source_v2",
+            &serde_json::json!({ "bk_color": 0xFF33_2211u32, "bk_opacity": 0 }),
+        );
+        assert_eq!((off.background, off.padding), (None, 0));
+        let centred = super::text_style_of(
+            "text_ft2_source_v2",
+            &serde_json::json!({ "align": "center", "font": { "flags": 3 } }),
+        );
+        assert_eq!(centred.align, super::TextAlign::Center);
+        assert!(centred.bold && centred.italic);
+    }
+
+    /// A camera's size and frame rate come from its settings; "" and 0 keep its own.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_camera_asks_for_the_size_and_rate_picked() {
+        let s = serde_json::json!({ "device": "cam1", "resolution": "1920x1080", "fps": 60 });
+        let c = super::camera_spec(&s, "device");
+        assert_eq!((c.id.as_str(), c.size, c.fps), ("cam1", Some((1920, 1080)), Some(60)));
+        let own = super::camera_spec(&serde_json::json!({ "device": "cam1", "resolution": "", "fps": 0 }), "device");
+        assert_eq!((own.size, own.fps), (None, None));
+        assert_eq!(crate::engine::camera_args(&c), ["-video_size", "1920x1080", "-framerate", "60"].map(String::from));
+        assert!(crate::engine::camera_args(&own).is_empty());
+    }
+
     use super::*;
 
     /// A filter set to a plugin's effect runs it while the plugin is installed and on, and is
