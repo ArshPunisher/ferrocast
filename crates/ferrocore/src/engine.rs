@@ -3331,7 +3331,10 @@ mod tests {
         let (clip, rec) = (dir.join("ferrocore-sync-clip.mp4"), dir.join("ferrocore-sync-rec.mp4"));
         let made = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-            .arg(format!("color=c=black:s=640x360:r=30:d={},drawbox=c=white:t=fill:enable='lt(mod(t\\,1)\\,0.1)'", secs + 2))
+            .arg(format!(
+                "color=c=black:s=640x360:r=30:d={},drawbox=c=white:t=fill:enable='lt(mod(t\\,1)\\,0.1)'",
+                secs + 2
+            ))
             .args(["-f", "lavfi", "-i"])
             .arg(format!("sine=f=1000:r=48000:d={},volume='if(lt(mod(t\\,1)\\,0.1)\\,1\\,0)':eval=frame", secs + 2))
             .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest"])
@@ -3812,9 +3815,7 @@ mod tests {
             serde_json::json!({ "id": "color_source", "versioned_id": "color_source_v3", "name": name,
                                 "settings": { "width": w, "height": h, "color": c } })
         };
-        let scene = |name: &str, item: &str| {
-            serde_json::json!({ "id": "scene", "name": name, "settings": { "items": [{ "name": item, "id": 1 }] } })
-        };
+        let scene = |name: &str, item: &str| serde_json::json!({ "id": "scene", "name": name, "settings": { "items": [{ "name": item, "id": 1 }] } });
         serde_json::json!({
             "current_program_scene": "Main",
             "ferrocast_top_layer": top,
@@ -3854,7 +3855,8 @@ mod tests {
     #[test]
     fn a_top_layer_that_isnt_a_scene_is_left_out() {
         let Some(e) = engine() else { return };
-        for top in [serde_json::json!("Nope"), serde_json::json!("Box"), serde_json::json!(7), serde_json::json!(null)] {
+        for top in [serde_json::json!("Nope"), serde_json::json!("Box"), serde_json::json!(7), serde_json::json!(null)]
+        {
             assert!(e.load_obs(&top_doc(top.clone())).is_empty());
             assert_eq!(e.lock().top, None, "{top}");
             e.go("Main").unwrap_or_else(|x| panic!("{x}"));

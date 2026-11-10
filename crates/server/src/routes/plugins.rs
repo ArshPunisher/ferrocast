@@ -9,9 +9,9 @@ use axum::{Json, Router, routing::get, routing::put};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::extract::Body;
-use crate::AppState;
 
 /// Upload body limit: the biggest plugin file and room for the form around it.
 pub const MAX_PLUGIN_BODY: usize = ferrocast_engine::plugins::MAX_ZIP as usize + 64 * 1024;
@@ -52,8 +52,10 @@ pub async fn install(
     let mut out = tokio::fs::File::create(&path).await.map_err(io)?;
     let mut size: u64 = 0;
     let copied: ApiResult<()> = async {
-        while let Some(chunk) =
-            field.chunk().await.map_err(|e| ApiError::invalid(format!("The upload didn't arrive whole: {}", e.body_text())))?
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| ApiError::invalid(format!("The upload didn't arrive whole: {}", e.body_text())))?
         {
             size += chunk.len() as u64;
             if size > ferrocast_engine::plugins::MAX_ZIP {

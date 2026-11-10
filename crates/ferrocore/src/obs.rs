@@ -203,7 +203,9 @@ pub fn shader_from(s: &Value) -> Result<Effect, String> {
             .ok_or_else(|| format!("the plugin {id} isn't installed, or is switched off"))?
             .to_string()
     } else if preset != "custom" {
-        crate::shaderfx::preset(preset).ok_or_else(|| format!("there's no ready-made effect called {preset}"))?.to_string()
+        crate::shaderfx::preset(preset)
+            .ok_or_else(|| format!("there's no ready-made effect called {preset}"))?
+            .to_string()
     } else if file.is_empty() {
         s.get("shader_text").and_then(Value::as_str).unwrap_or_default().to_string()
     } else {
@@ -631,11 +633,7 @@ fn text_style_of(id: &str, s: &Value) -> TextStyle {
         color: c1,
         gradient: c2.filter(|c| *c != c1),
         outline: s.get("outline").and_then(Value::as_bool).unwrap_or(false).then_some((2.0, [0, 0, 0, 255])),
-        shadow: s
-            .get("drop_shadow")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            .then_some(((4, 4), [0, 0, 0, 255])),
+        shadow: s.get("drop_shadow").and_then(Value::as_bool).unwrap_or(false).then_some(((4, 4), [0, 0, 0, 255])),
         wrap_width: s
             .get("word_wrap")
             .and_then(Value::as_bool)
@@ -940,7 +938,8 @@ mod tests {
     #[test]
     fn sound_bars_read_their_settings() {
         let kind = |set: Value| kind_from("ferrocast_visualizer", &set, (1920, 1080), &[]).map(|k| k.0);
-        let Ok(SourceKind::Visualizer(v)) = kind(json!({ "source": "Mic", "bars": 24, "width": 600, "height": 120, "mirror": true }))
+        let Ok(SourceKind::Visualizer(v)) =
+            kind(json!({ "source": "Mic", "bars": 24, "width": 600, "height": 120, "mirror": true }))
         else {
             panic!("sound bars")
         };
@@ -954,7 +953,8 @@ mod tests {
     fn a_countdown_reads_its_settings() {
         use crate::source::countdown::CountTo;
         let kind = |set: Value| kind_from("ferrocast_countdown", &set, (1920, 1080), &[]).map(|k| k.0);
-        let Ok(SourceKind::Countdown(c)) = kind(json!({ "minutes": 5, "seconds": 30, "before": "Starting in ", "end": "Live!" }))
+        let Ok(SourceKind::Countdown(c)) =
+            kind(json!({ "minutes": 5, "seconds": 30, "before": "Starting in ", "end": "Live!" }))
         else {
             panic!("a countdown")
         };
@@ -966,7 +966,8 @@ mod tests {
         // A time of day: the next one, within a day.
         let Ok(SourceKind::Countdown(c)) = kind(json!({ "mode": "until", "until": "21:30" })) else { panic!() };
         let CountTo::Until(at) = c.to else { panic!("until a moment") };
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
         assert!(at > now && at <= now + 24 * 3600 * 1000, "within the next day");
         for bad in ["9pm", "25:00", "", "21:30:00x"] {
             let e = kind(json!({ "mode": "until", "until": bad })).unwrap_err();
@@ -1050,7 +1051,11 @@ mod tests {
             (json!([clone("Empty", "", None, none.clone())]), "Empty", "no source picked"),
             (json!([clone("Gone", "Nope", None, none.clone())]), "Gone", "isn't there"),
             (json!([clone("Me", "Me", None, none.clone())]), "Me", "can't show itself"),
-            (json!([clone("A", "B", None, none.clone()), clone("B", "A", None, none.clone())]), "A", "can't show itself"),
+            (
+                json!([clone("A", "B", None, none.clone()), clone("B", "A", None, none.clone())]),
+                "A",
+                "can't show itself",
+            ),
         ];
         for (clones, name, why) in cases {
             let im = with_clones(clones, &[name]);

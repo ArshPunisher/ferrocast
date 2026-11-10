@@ -337,18 +337,19 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
         // Its choices are the collection's sources and scenes (Stage::options fills them in).
-        "ferrocast_clone" => vec![
-            opt("clone", "Source", "list").choices(&[]),
-            opt("filters", "Include its filters", "bool"),
-        ],
+        "ferrocast_clone" => {
+            vec![opt("clone", "Source", "list").choices(&[]), opt("filters", "Include its filters", "bool")]
+        }
         "ferrocast_shader" => {
             // The gallery first; one's own code only for "Your own".
             let mut presets: Vec<(String, Value)> = vec![("Your own".into(), json!("custom"))];
             presets.extend(ferrocore::shaderfx::PRESETS.iter().map(|(id, name, _)| ((*name).to_string(), json!(id))));
             // Installed plugins' effects that are on, after the ready-made ones.
-            presets.extend(ferrocore::shaderfx::plugins().into_iter().map(|p| {
-                (format!("{} (plugin)", p.name), json!(ferrocore::shaderfx::plugin_preset(&p.id)))
-            }));
+            presets.extend(
+                ferrocore::shaderfx::plugins()
+                    .into_iter()
+                    .map(|p| (format!("{} (plugin)", p.name), json!(ferrocore::shaderfx::plugin_preset(&p.id)))),
+            );
             let own = [json!("custom")];
             vec![
                 opt("preset", "Effect", "list").choices(&as_refs(&presets)),

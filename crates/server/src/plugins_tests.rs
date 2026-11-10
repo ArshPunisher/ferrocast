@@ -32,8 +32,8 @@ impl Running {
         self.client.delete(self.url(path)).bearer_auth(&self.token).send().await.unwrap()
     }
     async fn upload(&self, bytes: Vec<u8>) -> reqwest::Response {
-        let form =
-            reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(bytes).file_name("plugin.zip"));
+        let form = reqwest::multipart::Form::new()
+            .part("file", reqwest::multipart::Part::bytes(bytes).file_name("plugin.zip"));
         self.client.post(self.url("/plugins")).bearer_auth(&self.token).multipart(form).send().await.unwrap()
     }
 }
@@ -87,7 +87,10 @@ async fn a_plugin_installs_lists_turns_off_and_goes() {
     let res = s.upload(plugin("com.ana.invert", FX)).await;
     assert_eq!(res.status(), StatusCode::CREATED);
     let p: Value = res.json().await.unwrap();
-    assert_eq!((p["id"].as_str(), p["on"].as_bool(), p["problem"].is_null()), (Some("com.ana.invert"), Some(true), true));
+    assert_eq!(
+        (p["id"].as_str(), p["on"].as_bool(), p["problem"].is_null()),
+        (Some("com.ana.invert"), Some(true), true)
+    );
     let list: Value = s.get("/plugins").await.json().await.unwrap();
     assert_eq!(list.as_array().map(Vec::len), Some(1));
     let off: Value = s.put("/plugins/com.ana.invert", json!({ "on": false })).await.json().await.unwrap();
