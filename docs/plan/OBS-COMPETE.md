@@ -3,6 +3,24 @@
 Written 10 Nov 2026 for the owner's morning review. Nothing here is built yet except where it
 says so. Sections 2 and 3 need your picks (questions at the end).
 
+## Progress (10 Nov, overnight)
+
+The owner approved all of it ("make all of them, you decide the order", WebAssembly plus shaders,
+no native plugins). Built, tested (unit, negative, and in the real app with recordings), committed:
+
+| Item | State |
+|---|---|
+| Top layer over every scene (Downstream Keyer) | **Done**: a scene's menu, "Show over every scene" |
+| Freeze filter | **Done** |
+| Source Clone | **Done**: "Copy of a source" in Add a source |
+| Shader gallery | **Done**: 8 ready-made effects; "Effects" in Add a filter |
+| Countdown | **Done**: a source, set time or time of day |
+| Plugin system, step 1: effect plugins and the plugin manager | **Done**: Settings › Plugins, `docs/PLUGINS.md`, `examples/plugins/scanlines` |
+| Move, Source Record, NDI output, shape masks, area blur, vertical, caption translation to English | **Were already built** (the table below said otherwise) |
+| Audio visualizer, instant replay in a scene, URL/API text, "When X, do Y", input overlay | Next, in this order |
+| Plugin system steps 3 to 5 (WebAssembly logic plugins, panels, catalog) | After those |
+| Windows track, encoders | Need a Windows PC to test on |
+
 ## 1. Is the comparison true?
 
 Mostly, but four claims about OBS were wrong. Checked against OBS's own source
