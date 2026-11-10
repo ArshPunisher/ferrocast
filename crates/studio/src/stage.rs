@@ -92,6 +92,34 @@ fn is_scene(s: &Value) -> bool {
     matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))
 }
 
+/// Takes out the sources no scene shows any more, as OBS does when a source's last item goes:
+/// a group too (and then its own sources). Scenes stay, and so do what a Copy of a source
+/// copies and the sound Sound bars show. Before, on 10 Nov on Windows, every removed source kept running in the engine (six
+/// FFmpegs for one clip on air, 26% CPU, frames late) and its name stayed taken.
+fn drop_unused(d: &mut Value) {
+    let Some(list) = d.get_mut("sources").and_then(Value::as_array_mut) else { return };
+    let scene = |s: &Value| s.get("id").and_then(Value::as_str) == Some("scene");
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut todo: Vec<&Value> = list.iter().filter(|s| scene(s)).collect();
+    while let Some(s) = todo.pop() {
+        let items = s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten().map(name_of);
+        // What a Copy of a source copies, and the sound Sound bars show.
+        let copied = match kind_of(s) {
+            "ferrocast_clone" | "source-clone" => s.pointer("/settings/clone").and_then(Value::as_str),
+            "ferrocast_visualizer" => s.pointer("/settings/source").and_then(Value::as_str),
+            _ => None,
+        };
+        for n in items.chain(copied) {
+            if used.insert(n.to_string())
+                && let Some(next) = list.iter().find(|x| name_of(x) == n)
+            {
+                todo.push(next);
+            }
+        }
+    }
+    list.retain(|s| scene(s) || used.contains(name_of(s)));
+}
+
 /// A new id for something saved (OBS writes UUIDs; any unique string does).
 fn uuid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,6 +202,8 @@ impl Stage {
         if !doc.get("sources").is_some_and(Value::is_array) {
             doc["sources"] = json!([]);
         }
+        // Sources an older Ferrocast kept after their last scene item went (they ran unseen).
+        drop_unused(&mut doc);
         let s = Self {
             canvas,
             doc: RefCell::new(doc),
@@ -604,6 +634,8 @@ impl Stage {
                     }
                 }
             }
+            // Its sources go too, unless another scene shows them.
+            drop_unused(d);
             if on_air {
                 d["current_scene"] = json!(rest[0]);
                 d["current_program_scene"] = json!(rest[0]);
@@ -1058,7 +1090,19 @@ impl Stage {
             E::Lock => set("locked", json!(true)),
             E::Unlock => set("locked", json!(false)),
             E::Remove => {
-                self.with_items(scene, |items, _| items.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id)))
+                self.item(scene, id)?;
+                // Out of the scene, and the source with it when nothing shows it any more: one
+                // change, so the engine closes it at once.
+                self.edit(|d| {
+                    let found = d["sources"].as_array_mut().and_then(|l| l.iter_mut().find(|s| name_of(s) == scene));
+                    if let Some(items) =
+                        found.and_then(|s| s.pointer_mut("/settings/items")).and_then(Value::as_array_mut)
+                    {
+                        items.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id));
+                    }
+                    drop_unused(d);
+                });
+                Ok(())
             }
             E::Up | E::Down | E::Top | E::Bottom => {
                 let (at, _) = self.item_place(scene, id)?;
@@ -3804,7 +3848,68 @@ mod tests {
         assert!(s.sources().iter().any(|u| u.name == "Red 2"), "a copy of the source");
         ok(s.edit_item("Main", blue.id, ItemEdit::Remove));
         assert_eq!(ok(s.items("Main")).len(), 2);
-        assert_eq!(ok(s.add_existing("Main", "Blue")).name, "Blue", "a source can come back from the list");
+        assert!(!s.sources().iter().any(|u| u.name == "Blue"), "its last item gone, the source goes too");
+        assert!(s.add_existing("Main", "Blue").is_err());
+        ok(s.add_source("Main", "color_source_v3", "Blue", &json!({}), false));
+    }
+
+    #[test]
+    fn the_frame_rate_is_the_last_seconds() {
+        let s = stage();
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        // A busy start (half the frames skipped) shows at first, with nothing before it…
+        assert_eq!(s.fps_now(1000, 1000, at(0)), 15.0);
+        // …then each second's own rate, read again no sooner than a second later.
+        assert_eq!(s.fps_now(1015, 1000, at(500)), 15.0);
+        assert_eq!(s.fps_now(1030, 1000, at(1000)), 30.0);
+        assert_eq!(s.fps_now(1050, 1010, at(2000)), 20.0);
+        // Never above the canvas's rate; a new engine starts its count again.
+        assert_eq!(s.fps_now(1200, 1010, at(3000)), 30.0);
+        assert_eq!(s.fps_now(10, 0, at(4000)), 30.0);
+    }
+
+    #[test]
+    fn a_copy_of_a_source_has_its_size() {
+        let s = stage();
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 200, "height": 100 }), false));
+        let copy = ok(s.add_source("Main", "ferrocast_clone", "Copy", &json!({ "clone": "Red" }), false));
+        assert_eq!(copy.frame, [200.0, 0.0, 0.0, 100.0, 0.0, 0.0], "the copied one's size, not 0×0");
+        let sized = ok(s.set_item_box("Main", copy.id, 10.0, 20.0, 400.0, 200.0));
+        assert_eq!(sized.frame, [400.0, 0.0, 0.0, 200.0, 10.0, 20.0], "it can be sized");
+        // A copy of a copy, and one of itself (nothing to size by).
+        let again = ok(s.add_source("Main", "ferrocast_clone", "Copy 2", &json!({ "clone": "Copy" }), false));
+        assert_eq!(again.frame[0], 200.0);
+        let looped = ok(s.add_source("Main", "ferrocast_clone", "Loop", &json!({ "clone": "Loop" }), false));
+        assert_eq!(looped.frame[0], 0.0);
+    }
+
+    #[test]
+    fn a_source_goes_when_no_scene_shows_it() {
+        let s = stage();
+        ok(s.add_scene("Two"));
+        let red = ok(s.add_source("Main", "color_source_v3", "Red", &json!({}), false));
+        ok(s.add_existing("Two", "Red"));
+        ok(s.add_source("Two", "ferrocast_clone", "Copy", &json!({ "clone": "Red" }), false));
+        let before = s.snapshot();
+        ok(s.edit_item("Main", red.id, ItemEdit::Remove));
+        assert!(s.sources().iter().any(|u| u.name == "Red"), "still shown in Two");
+        let two = ok(s.items("Two"));
+        let red_in_two = two.iter().find(|i| i.name == "Red").map(|i| i.id).unwrap_or_default();
+        ok(s.edit_item("Two", red_in_two, ItemEdit::Remove));
+        assert!(s.sources().iter().any(|u| u.name == "Red"), "the Copy in Two still shows it");
+        ok(s.remove_scene("Two"));
+        let names: Vec<String> = s.sources().into_iter().map(|u| u.name).collect();
+        assert!(!names.iter().any(|n| n == "Red" || n == "Copy"), "nothing shows them now: {names:?}");
+        s.restore_all(&before);
+        assert!(s.sources().iter().any(|u| u.name == "Red"), "undo brings it back");
+        // A collection that kept one anyway (older Ferrocast) loses it when opened.
+        let mut doc = s.snapshot();
+        if let Some(l) = doc["sources"].as_array_mut() {
+            l.push(json!({ "id": "color_source_v3", "name": "Left over" }));
+        }
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &doc, "Main"));
+        assert!(!again.sources().iter().any(|u| u.name == "Left over"));
     }
 
     #[test]
