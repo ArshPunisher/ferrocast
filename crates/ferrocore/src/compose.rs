@@ -83,6 +83,46 @@ struct Staging {
     bufs: Vec<(wgpu::Buffer, Arc<AtomicBool>)>,
 }
 
+/// A file's NV12 planes on the card (`upload_nv12`), and what reads them, for one size and one
+/// way of reading its colours (`key`: width, height, BT.709, full range).
+#[derive(Debug)]
+struct Planes {
+    key: (u32, u32, bool, bool),
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    _buf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+}
+
+/// NV12 → RGB as three rows, each `dot(row.xyz, (y, u, v)) + row.w` on values 0-1: BT.709's or
+/// BT.601's matrix, TV range (Y 16-235, U and V 16-240) or full.
+fn yuv_rows(bt709: bool, full: bool) -> [f32; 12] {
+    let (kr, kb) = if bt709 { (0.2126_f32, 0.0722_f32) } else { (0.299, 0.114) };
+    let kg = 1.0 - kr - kb;
+    // Y' = sy·Y + oy, and each colour difference C = sc·U + oc.
+    let (sy, oy, sc, oc) = if full {
+        (1.0, 0.0, 1.0, -128.0 / 255.0)
+    } else {
+        (255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0)
+    };
+    let (cr_r, cb_b) = (2.0 * (1.0 - kr), 2.0 * (1.0 - kb));
+    let (cb_g, cr_g) = (2.0 * kb * (1.0 - kb) / kg, 2.0 * kr * (1.0 - kr) / kg);
+    [
+        sy,
+        0.0,
+        cr_r * sc,
+        oy + cr_r * oc,
+        sy,
+        -cb_g * sc,
+        -cr_g * sc,
+        oy - (cb_g + cr_g) * oc,
+        sy,
+        cb_b * sc,
+        0.0,
+        oy + cb_b * oc,
+    ]
+}
+
 /// What one NV12 frame needs on the card, kept between frames: the canvas drawn into, the two
 /// planes it is converted to, their readback buffers and the conversion's constants. Making
 /// and freeing these through the driver each frame (35 MB of memory to allocate, zero and give
@@ -151,6 +191,10 @@ pub struct Compositor {
     rigs: Mutex<Vec<Rig>>,
     /// NV12 out: the Y and UV pipelines.
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
+    /// NV12 in (a file's pictures, `upload_nv12`): the pipeline and its layout, made when first
+    /// needed, and each source's planes on the card.
+    yuv_in: std::sync::OnceLock<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    planes: Mutex<HashMap<u64, Planes>>,
     /// The preview's painter, by the window surface's format.
     pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     /// Held to submit and to configure a window surface (see `configure`).
@@ -453,6 +497,8 @@ impl Compositor {
             staging: Mutex::new(HashMap::new()),
             rigs: Mutex::new(Vec::new()),
             nv12,
+            yuv_in: std::sync::OnceLock::new(),
+            planes: Mutex::new(HashMap::new()),
             effect_module,
             effect_layout,
             effect_pipeline_layout,
@@ -1334,10 +1380,203 @@ impl Compositor {
         sent.ok_or_else(|| AvError::Source("a frame of the screen couldn't be read".into()))
     }
 
+    /// A file's picture as NV12 (`ffsrc::Nv12Picture`), turned into RGB on the card into source
+    /// `id`'s texture, the same bytes an RGBA upload of it would give: FFmpeg doesn't make RGBA on
+    /// the CPU and sends 1.5 bytes a pixel instead of 4.
+    pub fn upload_nv12(&self, id: u64, p: &crate::ffsrc::Nv12Picture) -> Result<(), AvError> {
+        let (w, h) = (p.width, p.height);
+        check_size(w, h)?;
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) || p.data.len() != w as usize * h as usize * 3 / 2 {
+            return Err(AvError::BadPixels(w, h));
+        }
+        let (pipeline, layout) = self.yuv_in.get_or_init(|| self.yuv_pipeline());
+        // The picture it becomes: the source's own texture, drawn into here.
+        let target = {
+            let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+            match ups.get(&id) {
+                Some((t, tw, th))
+                    if (*tw, *th) == (w, h)
+                        && t.format() == GAMMA
+                        && t.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT) =>
+                {
+                    t.clone()
+                }
+                _ => {
+                    let t = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("video"),
+                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: GAMMA,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_DST
+                            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[LINEAR],
+                    });
+                    ups.insert(id, (t.clone(), w, h));
+                    t
+                }
+            }
+        };
+        let mut planes = self.planes.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (w, h, p.bt709, p.full_range);
+        if planes.get(&id).is_none_or(|pl| pl.key != key) {
+            planes.insert(id, self.new_planes(layout, key));
+        }
+        let Some(pl) = planes.get(&id) else { return Err(AvError::NotUploaded(id)) };
+        let (y, uv) = p.data.split_at(w as usize * h as usize);
+        let write = |tex: &wgpu::Texture, bytes: &[u8], row: u32, size: (u32, u32)| {
+            self.queue.write_texture(
+                tex.as_image_copy(),
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(size.1) },
+                wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            );
+        };
+        write(&pl.y, y, w, (w, h));
+        // Interleaved U and V, two bytes each, at half size.
+        write(&pl.uv, uv, w, (w / 2, h / 2));
+        let view = target.create_view(&wgpu::TextureViewDescriptor { format: Some(GAMMA), ..Default::default() });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("video") });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("video"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &pl.bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        drop(planes);
+        self.submit(std::iter::once(enc.finish()));
+        Ok(())
+    }
+
+    /// The NV12 → RGB pipeline (`yuv.wgsl`), into a gamma-encoded RGBA target.
+    fn yuv_pipeline(&self) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        };
+        let plane = || wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(1, plane()),
+                entry(2, plane()),
+                entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("yuv"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuv"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("yuv.wgsl").into()),
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("yuv"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_full"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_rgb"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: GAMMA,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        (pipeline, layout)
+    }
+
+    /// A source's Y and UV planes on the card, and what reads them, for `key`'s size and colours.
+    fn new_planes(&self, layout: &wgpu::BindGroupLayout, key: (u32, u32, bool, bool)) -> Planes {
+        let (w, h, bt709, full) = key;
+        let plane = |label, size: (u32, u32), format| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let y = plane("luma", (w, h), wgpu::TextureFormat::R8Unorm);
+        let uv = plane("chroma", (w / 2, h / 2), wgpu::TextureFormat::Rg8Unorm);
+        let rows = yuv_rows(bt709, full);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv"),
+            size: (rows.len() * 4) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, &rows.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yuv"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&y.create_view(&Default::default())),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&uv.create_view(&Default::default())),
+                },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
+            ],
+        });
+        Planes { key, y, uv, _buf: buf, bind }
+    }
+
     /// Lets an uploaded picture go.
     pub fn forget(&self, id: u64) {
         self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
 
     /// A LUT on the card: a 3D texture (a 1D one for a 1D table), made once per table.
@@ -1911,6 +2150,71 @@ fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureVi
 
 fn floats(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+#[cfg(test)]
+mod yuv_tests {
+    use super::*;
+    use crate::{Placement, Scene};
+
+    fn rgb(bt709: bool, full: bool, y: f32, u: f32, v: f32) -> [f32; 3] {
+        let r = yuv_rows(bt709, full);
+        let row = |i: usize| r[i] * y + r[i + 1] * u + r[i + 2] * v + r[i + 3];
+        [row(0), row(4), row(8)]
+    }
+
+    fn close(got: [f32; 3], want: [f32; 3]) {
+        assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 0.01), "{got:?} for {want:?}");
+    }
+
+    #[test]
+    fn the_matrices_give_known_colours() {
+        let b = |v: f32| v / 255.0;
+        // TV range, BT.709: white, black, and pure red.
+        close(rgb(true, false, b(235.0), b(128.0), b(128.0)), [1.0, 1.0, 1.0]);
+        close(rgb(true, false, b(16.0), b(128.0), b(128.0)), [0.0, 0.0, 0.0]);
+        let (y, u) = (16.0 + 219.0 * 0.2126, 128.0 - 112.0 * 0.2126 / (1.0 - 0.0722));
+        close(rgb(true, false, b(y), b(u), b(240.0)), [1.0, 0.0, 0.0]);
+        // Full range, BT.601: white and grey.
+        close(rgb(false, true, 1.0, b(128.0), b(128.0)), [1.0, 1.0, 1.0]);
+        close(rgb(false, true, 0.5, b(128.0), b(128.0)), [0.5, 0.5, 0.5]);
+    }
+
+    /// A file's NV12 picture comes out of the card as RGB: red on the left, blue on the right.
+    #[test]
+    fn a_file_picture_becomes_rgb_on_the_card() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (w, h) = (16u32, 8u32);
+        // BT.709, TV range: red is Y 63, U 102, V 240; blue is Y 32, U 240, V 118.
+        let mut data = vec![0u8; (w * h * 3 / 2) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                data[(y * w + x) as usize] = if x < w / 2 { 63 } else { 32 };
+            }
+        }
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                let at = (w * h + y * w + x * 2) as usize;
+                let (u, v) = if x < w / 4 { (102, 240) } else { (240, 118) };
+                data[at] = u;
+                data[at + 1] = v;
+            }
+        }
+        let p = crate::ffsrc::Nv12Picture { width: w, height: h, data, bt709: true, full_range: false };
+        gpu.upload_nv12(1, &p).unwrap_or_else(|e| panic!("{e}"));
+        let item = Item {
+            content: Content::Uploaded { id: 1, width: w, height: h, premultiplied: false },
+            ..Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default())
+        };
+        let px = gpu.render(&Scene { width: w, height: h, items: vec![item] }).unwrap_or_else(|e| panic!("{e}"));
+        let at = |x: u32, y: u32| px[((y * w + x) * 4) as usize..((y * w + x) * 4 + 3) as usize].to_vec();
+        let near = |got: Vec<u8>, want: [u8; 3]| got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 4);
+        assert!(near(at(2, 4), [255, 0, 0]), "red: {:?}", at(2, 4));
+        assert!(near(at(13, 4), [0, 0, 255]), "blue: {:?}", at(13, 4));
+        // Uploaded again, the same texture is drawn into (no new one each frame).
+        gpu.upload_nv12(1, &p).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(gpu.uploads.lock().map(|u| u.len()).unwrap_or(0), 1);
+    }
 }
 
 #[cfg(test)]

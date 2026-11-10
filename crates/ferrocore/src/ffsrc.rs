@@ -18,6 +18,9 @@ use crate::{AvError, Picture};
 const MAX_SOUND: usize = 240;
 /// Frames of sound per piece.
 const PIECE: usize = 1024;
+/// Pictures a file shows before its sound is placed on their clock: the first few come in a
+/// burst, so the clock (the earliest start they give) settles by then.
+const SETTLE_FRAMES: u64 = 8;
 
 /// FFmpeg, as the engine knows it (the app's own, or the PATH's).
 pub fn ffmpeg() -> Result<PathBuf, AvError> {
@@ -41,6 +44,26 @@ pub struct Probe {
     pub size: Option<(u32, u32)>,
     pub audio: bool,
     pub duration_ns: u64,
+    /// Pictures a second, rounded up (29.97 is 30); 0 when FFmpeg doesn't say.
+    pub fps: u32,
+    /// The colour matrix FFmpeg names for the picture: Some(true) BT.709, Some(false) BT.601
+    /// (bt470bg, smpte170m), None when it says nothing.
+    pub bt709: Option<bool>,
+    /// Full range ("pc", or a yuvj format) rather than TV range (16-235).
+    pub full_range: bool,
+}
+
+/// A picture as FFmpeg's NV12 (the Y plane, then U and V interleaved at half size), and how its
+/// colours are read: turned into RGB on the card (`Compositor::upload_nv12`), so no RGBA copy is
+/// made on the CPU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nv12Picture {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+    /// BT.709's matrix, else BT.601's.
+    pub bt709: bool,
+    pub full_range: bool,
 }
 
 /// FFmpeg's description of `input` (its arguments, `-i` and all), read in at most `wait`.
@@ -139,6 +162,31 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
                     Some((w.parse().ok()?, h.trim_end_matches(']').parse().ok()?))
                 })
             });
+            // "…, 29.97 fps, 30 tbr, …": its own rate (else the guessed one, tbr).
+            let rate =
+                |unit: &str| l.split(", ").find_map(|part| part.trim().strip_suffix(unit)?.trim().parse::<f64>().ok());
+            p.fps = rate(" fps").or_else(|| rate(" tbr")).map_or(0, |f| f.ceil().clamp(0.0, 240.0) as u32);
+            // "yuv420p(tv, bt709, progressive)", "yuvj420p(pc, bt470bg/bt709/unknown)": the range,
+            // then the matrix (the first of matrix/primaries/transfer when they differ).
+            let after = l.split("Video:").nth(1).unwrap_or_default();
+            // The pixel format's own brackets, not the codec's ("h264 (High) (avc1 / …)").
+            let tags: Vec<&str> = after
+                .match_indices('(')
+                .find(|(at, _)| {
+                    let word = after[..*at].rsplit([' ', ',']).next().unwrap_or_default();
+                    word.starts_with("yuv") || word.starts_with("nv")
+                })
+                .and_then(|(at, _)| after[at + 1..].split_once(')'))
+                .map(|(inside, _)| inside.split(',').map(str::trim).collect())
+                .unwrap_or_default();
+            let ranged = matches!(tags.first(), Some(&"tv" | &"pc"));
+            p.full_range = tags.first() == Some(&"pc") || after.split([' ', ',']).any(|t| t.starts_with("yuvj"));
+            let matrix = if ranged { tags.get(1).and_then(|t| t.split('/').next()) } else { None };
+            p.bt709 = match matrix {
+                Some("bt709") => Some(true),
+                Some("bt470bg" | "smpte170m" | "bt601") => Some(false),
+                _ => None,
+            };
         } else if l.contains("Audio:") {
             any = true;
             p.audio = true;
@@ -150,7 +198,14 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
 #[derive(Debug, Default)]
 struct Shared {
     picture: Mutex<Option<(Picture, u64)>>,
-    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64)>>,
+    /// The newest NV12 picture (`Out::Nv12`), for the card.
+    nv12: Mutex<Option<Nv12Picture>>,
+    /// Sound as it came: its samples, when it came (ns), and how many samples came before it.
+    sound: Mutex<std::collections::VecDeque<(Vec<f32>, u64, u64)>>,
+    /// Pictures: when the input's start would have shown, by the earliest picture so far (each
+    /// picture's arrival less its place, `-r` making it frame n at n/fps). A file's sound is
+    /// placed on this clock (`Media::take_sound`).
+    start_ns: Mutex<Option<u64>>,
     frames: AtomicU64,
     stop: AtomicBool,
     ended: AtomicBool,
@@ -183,6 +238,8 @@ impl Drop for Reader {
 enum Out {
     /// RGBA pictures this size.
     Pictures(u32, u32),
+    /// NV12 pictures this size (even), and their colours' matrix and range, for the card.
+    Nv12(u32, u32, bool, bool),
     /// 48 kHz stereo floats.
     Sound,
 }
@@ -195,6 +252,12 @@ impl Reader {
             Out::Pictures(w, h) => {
                 let vf = format!("scale={w}:{h}:flags=bilinear,format=rgba");
                 cmd.args(["-an", "-vf", &vf, "-r", &fps.max(1).to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+            }
+            // As decoded (the GPU decoder's frames come down as NV12 already): sized, no
+            // colour change; the card turns it into RGB.
+            Out::Nv12(w, h, ..) => {
+                let vf = format!("scale={w}:{h}:flags=bilinear,format=nv12");
+                cmd.args(["-an", "-vf", &vf, "-r", &fps.max(1).to_string(), "-f", "rawvideo", "-pix_fmt", "nv12", "-"]);
             }
             Out::Sound => {
                 cmd.args(["-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "-"]);
@@ -215,22 +278,46 @@ impl Reader {
             .name("ferrocast-ffsrc".into())
             .spawn(move || {
                 match out {
-                    Out::Pictures(w, h) => {
-                        let mut buf = vec![0u8; (w * h * 4) as usize];
+                    Out::Pictures(w, h) | Out::Nv12(w, h, ..) => {
+                        let nv12 = match out {
+                            Out::Nv12(_, _, bt709, full_range) => Some((bt709, full_range)),
+                            _ => None,
+                        };
+                        let size = if nv12.is_some() { w * h * 3 / 2 } else { w * h * 4 };
+                        let mut buf = vec![0u8; size as usize];
+                        let frame_ns = 1_000_000_000 / u64::from(fps.max(1));
                         while !s.stop.load(Ordering::Acquire) && stdout.read_exact(&mut buf).is_ok() {
-                            let p = Picture { width: w, height: h, rgba: buf.clone(), premultiplied: false };
-                            if let Ok(mut l) = s.picture.lock() {
-                                *l = Some((p, now_ns()));
+                            let at = now_ns();
+                            match nv12 {
+                                Some((bt709, full_range)) => {
+                                    let p = Nv12Picture { width: w, height: h, data: buf.clone(), bt709, full_range };
+                                    if let Ok(mut l) = s.nv12.lock() {
+                                        *l = Some(p);
+                                    }
+                                }
+                                None => {
+                                    let p = Picture { width: w, height: h, rgba: buf.clone(), premultiplied: false };
+                                    if let Ok(mut l) = s.picture.lock() {
+                                        *l = Some((p, at));
+                                    }
+                                }
                             }
-                            s.frames.fetch_add(1, Ordering::Relaxed);
+                            let n = s.frames.fetch_add(1, Ordering::Relaxed);
+                            let start = at.saturating_sub(n * frame_ns);
+                            if let Ok(mut st) = s.start_ns.lock() {
+                                *st = Some(st.map_or(start, |was| was.min(start)));
+                            }
                         }
                     }
                     Out::Sound => {
                         let mut buf = vec![0u8; PIECE * 2 * 4];
+                        let mut before = 0u64;
                         while !s.stop.load(Ordering::Acquire) && stdout.read_exact(&mut buf).is_ok() {
                             let pcm: Vec<f32> = buf.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+                            let pos = before;
+                            before += PIECE as u64;
                             if let Ok(mut q) = s.sound.lock() {
-                                q.push_back((pcm, now_ns()));
+                                q.push_back((pcm, now_ns(), pos));
                                 while q.len() > MAX_SOUND {
                                     q.pop_front();
                                 }
@@ -273,7 +360,7 @@ impl LiveSound {
 
     /// Sound since the last call, oldest first.
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
-        self.0.shared.sound.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+        self.0.shared.sound.lock().map(|mut q| q.drain(..).map(|(pcm, at, _)| (pcm, at)).collect()).unwrap_or_default()
     }
 
     /// FFmpeg stopped (the device went), and its last words.
@@ -319,7 +406,7 @@ impl Live {
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
         self.sound
             .as_ref()
-            .and_then(|s| s.shared.sound.lock().ok().map(|mut q| q.drain(..).collect()))
+            .and_then(|s| s.shared.sound.lock().ok().map(|mut q| q.drain(..).map(|(pcm, at, _)| (pcm, at)).collect()))
             .unwrap_or_default()
     }
 
@@ -375,6 +462,11 @@ pub struct Media {
     pub has_video: bool,
     pub has_audio: bool,
     pub duration_ns: u64,
+    /// Pictures a second FFmpeg hands over: the file's own, at most 60.
+    fps: u32,
+    /// Pictures as NV12 for the card (`frame_nv12`) with this matrix (BT.709?) and range (full?),
+    /// else RGBA (`frame_at`).
+    nv12: Option<(bool, bool)>,
 }
 
 impl Media {
@@ -385,6 +477,17 @@ impl Media {
 
     /// The same, pictures fitted into `max`.
     pub fn open_fit(path: &Path, looping: bool, max: (u32, u32)) -> Result<Self, AvError> {
+        Self::open_as(path, looping, max, false)
+    }
+
+    /// Opens `path` for the card: its pictures come as NV12 (`frame_nv12`), turned into RGB there,
+    /// not on the CPU. FFmpeg making RGBA (and 4 bytes a pixel through the pipe) was most of a
+    /// video file's CPU on Windows (10 Nov: ~10% of the machine for one 1080p30 clip).
+    pub fn open_for_card(path: &Path, looping: bool) -> Result<Self, AvError> {
+        Self::open_as(path, looping, (1920, 1080), true)
+    }
+
+    fn open_as(path: &Path, looping: bool, max: (u32, u32), for_card: bool) -> Result<Self, AvError> {
         if !path.is_file() {
             return Err(AvError::Source(format!("{} isn't there", path.display())));
         }
@@ -406,6 +509,13 @@ impl Media {
             has_video: p.size.is_some(),
             has_audio: p.audio,
             duration_ns: p.duration_ns,
+            // Its own rate, not 60 for every file: a 30 fps 1080p clip sent 60 RGBA pictures a
+            // second (500 MB/s through the pipe), FFmpeg fell behind and the clip ended half a
+            // minute late, with the CPU busy all the while (10 Nov, Windows).
+            fps: if p.fps == 0 { 30 } else { p.fps.min(60) },
+            // A file that doesn't name its matrix: BT.709 from 720 lines up, BT.601 below, as
+            // players read one.
+            nv12: for_card.then(|| (p.bt709.unwrap_or(p.size.is_some_and(|(_, h)| h >= 720)), p.full_range)),
         };
         m.play_from(0)?;
         Ok(m)
@@ -430,7 +540,11 @@ impl Media {
         let ff = ffmpeg()?;
         let input = self.input(from_ns);
         let pictures = if self.has_video {
-            Reader::start(&ff, &input, Out::Pictures(self.max.0, self.max.1), 60, Arc::new(Shared::default()))?
+            let out = match self.nv12 {
+                Some((bt709, full)) => Out::Nv12(self.max.0, self.max.1, bt709, full),
+                None => Out::Pictures(self.max.0, self.max.1),
+            };
+            Reader::start(&ff, &input, out, self.fps, Arc::new(Shared::default()))?
         } else {
             // No picture: the sound's reader stands in (it ends when the file does).
             Reader::start(&ff, &input, Out::Sound, 60, Arc::new(Shared::default()))?
@@ -483,6 +597,16 @@ impl Media {
         p.shared.picture.lock().ok()?.take().map(|(pic, _)| pic)
     }
 
+    /// The newest picture as NV12 (taken), when opened for the card (`open_for_card`).
+    pub fn frame_nv12(&self) -> Option<Nv12Picture> {
+        let r = self.run.lock().ok()?;
+        let (p, _, _, _) = r.as_ref()?;
+        if !self.has_video {
+            return None;
+        }
+        p.shared.nv12.lock().ok()?.take()
+    }
+
     pub fn control(&self, c: Control) {
         match c {
             Control::Play => {
@@ -521,11 +645,39 @@ impl Media {
         (s, self.position())
     }
 
+    /// The file's sound since the last call, each piece placed where it is in the file on the
+    /// pictures' clock. Stamped when it came, it played 0.35-0.45 s before its picture (10 Nov,
+    /// Windows: FFmpeg hands sound over that far ahead of time, pictures about on time). Held
+    /// until a few pictures have set the clock; a file with no picture keeps when it came.
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
         let r = self.run.lock();
         let Some((p, s, _, _)) = r.as_ref().ok().and_then(|r| r.as_ref()) else { return Vec::new() };
-        let src = s.as_ref().unwrap_or(p);
-        src.shared.sound.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+        let Some(sound) = s.as_ref() else {
+            return p
+                .shared
+                .sound
+                .lock()
+                .map(|mut q| q.drain(..).map(|(pcm, at, _)| (pcm, at)).collect())
+                .unwrap_or_default();
+        };
+        if p.shared.frames.load(Ordering::Relaxed) < SETTLE_FRAMES {
+            return Vec::new();
+        }
+        let Some(start) = p.shared.start_ns.lock().ok().and_then(|s| *s) else { return Vec::new() };
+        // Sound for a moment already shown is let go (the first pieces, held while the clock
+        // settled): handed to the mixer late, it would hold every sound back that much for good.
+        let floor = now_ns().saturating_sub(20_000_000);
+        sound
+            .shared
+            .sound
+            .lock()
+            .map(|mut q| {
+                q.drain(..)
+                    .map(|(pcm, _, pos)| (pcm, start + pos * 1_000_000_000 / 48_000))
+                    .filter(|(_, ts)| *ts >= floor)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn ended(&self) -> bool {
@@ -560,6 +712,23 @@ mod tests {
         assert_eq!(p.size, Some((2560, 1440)));
         assert!(p.audio);
         assert_eq!(p.duration_ns, 62_500_000_000);
+        assert_eq!(p.fps, 30);
+        let file = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), \
+            1920x1080 [SAR 1:1 DAR 16:9], 5967 kb/s, 29.97 fps, 29.97 tbr, 30k tbn (default)";
+        assert_eq!(parse_probe(file).unwrap().fps, 30, "rounded up");
+        // Its colours: the pixel format's brackets, not the codec's.
+        let tagged = parse_probe(file).unwrap();
+        assert_eq!((tagged.bt709, tagged.full_range), (Some(true), false));
+        let jpeg = parse_probe(
+            "  Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc, bt470bg/unknown/unknown), 1280x720, 30 fps",
+        )
+        .unwrap();
+        assert_eq!((jpeg.bt709, jpeg.full_range), (Some(false), true));
+        assert_eq!(
+            parse_probe("  Stream #0:0: Video: h264 (High), yuv420p(progressive), 1920x1080, 30 fps").unwrap().bt709,
+            None
+        );
+        assert_eq!(parse_probe("  Stream #0:0: Video: vp9, yuv420p, 640x360, 25 tbr").unwrap().fps, 25);
         // dshow's line has a pixel format with brackets before the size.
         let cam =
             "  Stream #0:0: Video: rawvideo (YUY2 / 0x32595559), yuyv422(tv, bt470bg/bt709/unknown), 1280x720, 30 fps";
@@ -576,7 +745,8 @@ mod tests {
             crate::ffenc::set_ffmpeg(p);
             return true;
         }
-        false
+        // Windows (and anywhere else): one on the PATH. These never ran on Windows before.
+        crate::ffenc::ffmpeg_path().is_some()
     }
 
     /// A live input (FFmpeg's test pattern standing in for a screen or camera), fitted, with
@@ -636,6 +806,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert_eq!(m.state().0, MediaState::Ended, "played to the end");
         assert!(m.ended());
+
+        // For the card: NV12 pictures (no RGBA), the file's own matrix, sound placed on their clock.
+        let card = Media::open_for_card(&file, true).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let p = card.frame_nv12().unwrap_or_else(|| panic!("NV12 pictures come"));
+        assert_eq!((p.width, p.height, p.data.len()), (320, 180, 320 * 180 * 3 / 2));
+        assert!(!p.bt709, "an untagged 180-line picture is read as BT.601");
+        assert!(card.frame_at(0).is_none(), "no RGBA made");
+        let sound = card.take_sound();
+        assert!(!sound.is_empty(), "sound comes once the pictures set the clock");
+        assert!(sound.windows(2).all(|w| w[1].1 > w[0].1), "in order on the pictures' clock");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

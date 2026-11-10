@@ -445,6 +445,9 @@ enum Fresh {
     Pic(Picture),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     Screen(crate::screen::Surface),
+    /// A file's picture as FFmpeg decodes it, turned into RGB on the card (Windows, Linux).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Yuv(crate::ffsrc::Nv12Picture),
 }
 
 impl Fresh {
@@ -454,6 +457,7 @@ impl Fresh {
             Fresh::Pic(p) => (p.width, p.height, p.premultiplied),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Fresh::Screen(s) => (s.size().0, s.size().1, true),
+            Fresh::Yuv(p) => (p.width, p.height, false),
         }
     }
 
@@ -463,6 +467,7 @@ impl Fresh {
             Fresh::Pic(p) => gpu.upload(id, p).is_ok(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Fresh::Screen(s) => gpu.upload_surface(id, s).is_ok(),
+            Fresh::Yuv(p) => gpu.upload_nv12(id, p).is_ok(),
         }
     }
 }
@@ -776,7 +781,7 @@ impl Engine {
                     id,
                     None,
                     Box::new(move || {
-                        crate::media::Media::open(&path, looping).map(|m| {
+                        open_video(&path, looping).map(|m| {
                             let heard = m.has_audio;
                             (Live::Media(m), heard)
                         })
@@ -1274,7 +1279,7 @@ impl Engine {
         if !self.lock().scenes.contains_key(name) {
             return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
         }
-        let m = crate::media::Media::open(video, false)?;
+        let m = open_video(video, false)?;
         if !m.has_video {
             return Err(AvError::Source("a stinger needs a video with a picture".into()));
         }
@@ -2240,6 +2245,16 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
     }
 }
 
+/// A video file as its pictures are best drawn: as NV12 turned into RGB on the card where FFmpeg
+/// plays it (Windows, Linux), as RGBA where the system does (a Mac).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn open_video(path: &std::path::Path, looping: bool) -> Result<crate::media::Media, AvError> {
+    #[cfg(target_os = "macos")]
+    return crate::media::Media::open(path, looping);
+    #[cfg(not(target_os = "macos"))]
+    return crate::media::Media::open_for_card(path, looping);
+}
+
 /// Sources the watchdog can start again: captures (a file or a picture doesn't stop by itself).
 fn is_capture(kind: &SourceKind) -> bool {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2554,8 +2569,13 @@ fn frame(
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Media(m) => {
-                if let Some(p) = m.frame_at(ts) {
-                    uploads.push((*id, Fresh::Pic(p)));
+                // As NV12 for the card where FFmpeg plays it (`open_video`), else RGBA.
+                #[cfg(not(target_os = "macos"))]
+                let fresh = m.frame_nv12().map(Fresh::Yuv).or_else(|| m.frame_at(ts).map(Fresh::Pic));
+                #[cfg(target_os = "macos")]
+                let fresh = m.frame_at(ts).map(Fresh::Pic);
+                if let Some(f) = fresh {
+                    uploads.push((*id, f));
                 }
                 for (pcm, t) in m.take_sound() {
                     if heard.contains(id) {
