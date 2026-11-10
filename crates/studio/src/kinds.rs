@@ -103,6 +103,10 @@ pub fn kinds() -> Kinds {
         kind("ferrocast_countdown", "Countdown"),
         kind("ferrocast_visualizer", "Audio Visualizer"),
     ];
+    // Where media files report how far they've played (the replay's scene goes back when it ends).
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        inputs.push(kind("ferrocast_replay", "Instant Replay"));
+    }
     if cfg!(target_os = "macos") {
         inputs.extend([
             kind("ffmpeg_source", "Media Source"),
@@ -334,6 +338,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 opt("drop_shadow", "Drop Shadow", "bool"),
             ]
         }
+        // Its file is set by the app each time a replay is saved.
+        "ferrocast_replay" => vec![opt("switch", "Show its scene while it plays", "bool")],
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
         // Its choices are the collection's sources and scenes (Stage::options fills them in).
@@ -741,6 +747,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
+        "ferrocast_replay" => json!({ "local_file": "", "switch": true }),
         "ferrocast_visualizer" => json!({
             "source": "", "bars": 32, "width": 800, "height": 200, "color": 0xFFFF_FFFFu32, "mirror": false,
         }),

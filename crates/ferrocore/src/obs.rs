@@ -424,6 +424,16 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             let c = Countdown { to, before: text_of("before"), end: text_of("end"), style: text_style_of(id, s) };
             (SourceKind::Countdown(c), false)
         }
+        // Instant replay (OBS's Replay Source, built in): the last replay saved, played once
+        // from the start each time a new one comes (the app sets its file). Clear until then.
+        "ferrocast_replay" => {
+            let path = text_of("local_file");
+            if path.is_empty() {
+                (SourceKind::Color { width: 16, height: 16, rgba: [0, 0, 0, 0] }, false)
+            } else {
+                (SourceKind::Media { path: path.into(), looping: false }, true)
+            }
+        }
         "ffmpeg_source" => {
             // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
             // with FFmpeg and hands its pictures in, fitted into 1280x720.
@@ -947,6 +957,21 @@ mod tests {
         // The sound on air, and sizes held to what can be drawn.
         let Ok(SourceKind::Visualizer(v)) = kind(json!({ "source": " ", "bars": 500, "width": 0 })) else { panic!() };
         assert_eq!((v.of, v.bars, v.width), (None, 64, 16));
+    }
+
+    /// An instant replay is clear until the app hands it a replay, then plays it once.
+    #[test]
+    fn an_instant_replay_plays_the_file_its_given() {
+        let kind = |set: Value| kind_from("ferrocast_replay", &set, (1920, 1080), &[]).map(|k| k.0);
+        assert!(matches!(kind(json!({})), Ok(SourceKind::Color { rgba: [0, 0, 0, 0], .. })));
+        assert!(matches!(kind(json!({ "local_file": "" })), Ok(SourceKind::Color { .. })));
+        match kind(json!({ "local_file": "/rec/Replay.mp4", "looping": true })) {
+            Ok(SourceKind::Media { path, looping }) => {
+                assert_eq!(path, std::path::PathBuf::from("/rec/Replay.mp4"));
+                assert!(!looping, "a replay plays once");
+            }
+            other => panic!("a media file: {other:?}"),
+        }
     }
 
     #[test]

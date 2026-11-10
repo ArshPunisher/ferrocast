@@ -507,6 +507,36 @@ impl Stage {
     }
 
     /// The scene shown over whatever is on air (the top layer: Exeldro's Downstream Keyer, built
+    /// Instant replay: every Instant Replay source plays `file` (a replay just saved) from the
+    /// start. Returns the first such source that asked to be shown while it plays, and the scene
+    /// it's in (the app goes there and back), when one did.
+    pub fn show_replay(&self, file: &Path) -> Result<Option<(String, String)>, StudioError> {
+        let file = file.to_str().ok_or_else(|| fail("The replay's file name isn't readable."))?;
+        let replays: Vec<(String, bool)> = self
+            .sources_list()
+            .iter()
+            .filter(|s| kind_of(s) == "ferrocast_replay")
+            .map(|s| (name_of(s).to_string(), s.pointer("/settings/switch").and_then(Value::as_bool).unwrap_or(true)))
+            .collect();
+        if replays.is_empty() {
+            return Ok(None);
+        }
+        self.edit(|d| {
+            for s in d["sources"].as_array_mut().into_iter().flatten() {
+                if kind_of(s) == "ferrocast_replay" {
+                    s["settings"]["local_file"] = json!(file);
+                }
+            }
+        });
+        let scenes = self.order();
+        Ok(replays.into_iter().filter(|(_, switch)| *switch).find_map(|(name, _)| {
+            let scene = scenes
+                .iter()
+                .find(|sc| self.scene_items(sc).is_ok_and(|items| items.iter().any(|it| name_of(it) == name)))?;
+            Some((name, scene.clone()))
+        }))
+    }
+
     /// in), when one is set and still there.
     pub fn top_layer(&self) -> Option<String> {
         let top = self.doc.borrow().get("ferrocast_top_layer").and_then(Value::as_str).map(String::from)?;
@@ -740,7 +770,8 @@ impl Stage {
         let (cw, ch) = ferrocore::cropped(w, h, p.crop);
         let (cw, ch) = (cw as f32, ch as f32);
         let kind = kind_of(&src).to_string();
-        let media = matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2");
+        let media =
+            matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2" | "ferrocast_replay");
         let audio = src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
             && !matches!(
                 kind.as_str(),
@@ -3630,6 +3661,34 @@ mod tests {
     /// A clone's Source list holds every other source, then the scenes, never itself.
     #[test]
     fn a_clone_picks_from_this_collection() {
+    /// Instant replay: a saved replay goes to every Instant Replay source; the first that asked
+    /// names its scene to show; none set, a source not in a scene, or switch off: no scene.
+    #[test]
+    fn an_instant_replay_gets_each_new_replay() {
+        let s = stage();
+        let file = Path::new("/rec/Replay 1.mp4");
+        assert_eq!(ok(s.show_replay(file)), None, "no replay source: nothing to do");
+        ok(s.add_scene("Replay"));
+        ok(s.add_source("Replay", "ferrocast_replay", "Instant replay", &json!({}), false));
+        ok(s.add_source("Main", "ferrocast_replay", "Corner replay", &json!({ "switch": false }), false));
+        assert_eq!(ok(s.settings("Instant replay"))["local_file"], json!(""), "clear until one is saved");
+        assert_eq!(ok(s.show_replay(file)), Some(("Instant replay".into(), "Replay".into())));
+        for name in ["Instant replay", "Corner replay"] {
+            assert_eq!(ok(s.settings(name))["local_file"], json!("/rec/Replay 1.mp4"), "{name} plays it");
+        }
+        // The next one replaces it.
+        ok(s.show_replay(Path::new("/rec/Replay 2.mp4")));
+        assert_eq!(ok(s.settings("Corner replay"))["local_file"], json!("/rec/Replay 2.mp4"));
+        // Switch off everywhere: it plays where it is, no scene goes on air.
+        ok(s.update("Instant replay", &json!({ "switch": false })));
+        assert_eq!(ok(s.show_replay(file)), None);
+        // It has sound: it's in the mixer, and it's media (its play controls show).
+        let item = ok(s.items("Main")).into_iter().find(|i| i.name == "Corner replay");
+        assert!(item.is_some_and(|i| i.media), "an instant replay has play controls");
+        let opts = crate::kinds::options("ferrocast_replay").unwrap_or_default();
+        assert_eq!(opts.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["switch"], "its file isn't in its form");
+    }
+
         let s = stage();
         ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 20, "height": 20 }), false));
         ok(s.add_source("Main", "ferrocast_clone", "Copy", &json!({}), false));

@@ -53,6 +53,11 @@ struct Held {
     /// Guests here now (crates/guest): their name, their source, their connection.
     guests: Vec<(String, String, ferrocast_guest::Guest)>,
     replay: Option<ferrocast_studio::stage::StageOutput>,
+    /// The last saved replay the Instant Replay sources were handed.
+    replay_shown: Option<PathBuf>,
+    /// While an instant replay plays in its scene: the scene to go back to, the replay's
+    /// scene and source, and since when.
+    replay_back: Option<(String, String, String, std::time::Instant)>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
     /// What's on air sent out as NDI.
     ndi: Option<ferrocast_studio::NdiOut>,
@@ -96,6 +101,64 @@ struct Held {
     /// The vertical item following a face, and which run of the loop moves it.
     follow: Option<ferrocast_studio::FaceFollow>,
     follow_run: u64,
+}
+
+/// Instant replay in a scene (OBS's Replay Source, built in), on the app's tick: a replay
+/// just saved plays in every Instant Replay source; one that asked goes on air in its scene,
+/// and when it ends (or after two minutes at most) the scene before comes back, unless
+/// someone switched away meanwhile.
+fn instant_replay(h: &mut Held) {
+    let Some(c) = h.collection.as_ref() else { return };
+    let last = h.replay.as_ref().and_then(|r| r.last_replay());
+    if last.is_some() && last != h.replay_shown {
+        h.replay_shown = last.clone();
+        if let Some(file) = last {
+            match c.show_replay(&file) {
+                Ok(Some((source, scene))) => {
+                    let back = c.current();
+                    if let Some(rb) = h.replay_back.as_mut().filter(|rb| rb.1 == scene) {
+                        // Another replay while one plays: its clock starts again.
+                        rb.2 = source;
+                        rb.3 = std::time::Instant::now();
+                    } else if back != scene {
+                        match c.set_current(&scene) {
+                            Ok(()) => {
+                                // A Move transition is stepped like any scene change.
+                                if c.moving() {
+                                    glide();
+                                }
+                                h.replay_back = Some((back, scene, source, std::time::Instant::now()));
+                            }
+                            Err(e) => tracing::warn!("the instant replay's scene couldn't go on air: {e}"),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("the instant replay couldn't play: {e}"),
+            }
+        }
+    }
+    let Some((back, scene, source, since)) = h.replay_back.as_ref() else { return };
+    let waited = since.elapsed();
+    // A moment to open the file before its state means anything.
+    if waited < std::time::Duration::from_millis(1500) {
+        return;
+    }
+    // Not open yet is waiting, unless it never opens.
+    let ended = match c.media_state(source) {
+        Ok(m) => m.state == "ended" || m.state == "stopped",
+        Err(_) => waited > std::time::Duration::from_secs(10),
+    };
+    if ended || waited > std::time::Duration::from_secs(120) {
+        if c.current() == *scene {
+            match c.set_current(back) {
+                Ok(()) if c.moving() => glide(),
+                Ok(()) => {}
+                Err(e) => tracing::warn!("the scene before the instant replay couldn't come back: {e}"),
+            }
+        }
+        h.replay_back = None;
+    }
 }
 
 /// The vertical picture's preview and what the page last said about its box.
@@ -1178,6 +1241,7 @@ impl DesktopStudio {
                             *file = r.path().to_path_buf();
                         }
                     }
+                    instant_replay(h);
                 })
                 .await;
         }
