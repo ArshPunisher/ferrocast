@@ -231,8 +231,9 @@ $edgeDir = Join-Path $Out 'edge'
 Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like "*$edgeDir*" } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if ($dump -and -not $dump.HasExited) { Stop-Process -Id $dump.Id -Force -ErrorAction SilentlyContinue }
-$crash = Get-ChildItem (Join-Path $Out 'dumps') -Filter *.dmp -ErrorAction SilentlyContinue
-if ($crash) { Check 'no crash dump' $false ($crash.Name -join ', ') }
+# Not $crash: PowerShell names ignore case, so that is the -Crash switch (5.1 then fails).
+$dumpFiles = Get-ChildItem (Join-Path $Out 'dumps') -Filter *.dmp -ErrorAction SilentlyContinue
+if ($dumpFiles) { Check 'no crash dump' $false ($dumpFiles.Name -join ', ') }
 $result.ok = -not ($result.checks.Values | Where-Object { -not $_.ok })
 $result | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $Out 'results.json')
 Write-Host $(if ($result.ok) { 'SMOKE PASSED' } else { 'SMOKE FAILED' })
