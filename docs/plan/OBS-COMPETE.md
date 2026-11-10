@@ -3,7 +3,7 @@
 Written 10 Nov 2026 for the owner's morning review. Nothing here is built yet except where it
 says so. Sections 2 and 3 need your picks (questions at the end).
 
-## Progress (10 Nov, overnight)
+## Progress (10 Nov)
 
 The owner approved all of it ("make all of them, you decide the order", WebAssembly plus shaders,
 no native plugins). Built, tested (unit, negative, and in the real app with recordings), committed:
@@ -17,8 +17,13 @@ no native plugins). Built, tested (unit, negative, and in the real app with reco
 | Countdown | **Done**: a source, set time or time of day |
 | Plugin system, step 1: effect plugins and the plugin manager | **Done**: Settings › Plugins, `docs/PLUGINS.md`, `examples/plugins/scanlines` |
 | Move, Source Record, NDI output, shape masks, area blur, vertical, caption translation to English | **Were already built** (the table below said otherwise) |
-| Audio visualizer, instant replay in a scene, URL/API text, "When X, do Y", input overlay | Next, in this order |
-| Plugin system steps 3 to 5 (WebAssembly logic plugins, panels, catalog) | After those |
+| Audio visualizer ("Sound bars") | **Done** |
+| Instant replay in a scene | **Done**: an Instant Replay source; its scene goes on air and back |
+| URL/API text | **Done**: Web text |
+| "When X, do Y" | **Done**: Settings › Automations |
+| Input overlay | **Done**: Keys on screen |
+| Plugin system steps 3 and 4 (WebAssembly logic plugins, panels) | **Done** (wasmi sandbox; `docs/PLUGINS.md`) |
+| Plugin step 5 (a catalog on the website, signed packages) | Later |
 | Windows track, encoders | Need a Windows PC to test on |
 
 ## 1. Is the comparison true?

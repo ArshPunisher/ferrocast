@@ -101,7 +101,7 @@ AssemblyScript…):
   `ferrocast.log(ptr: i32, len: i32)` (a line for Ferrocast's log). No WASI: a module that
   imports anything else is refused.
 
-An event, as JSON: `{"type":"raid","platform":"twitch","name":"Ana","viewers":12}`. `type` is
+An event, as JSON: `{"type":"raid","platform":"Twitch","name":"Ana","viewers":12}`. `type` is
 one of `chat_message`, `follow`, `raid`, `subscription`, `gift_batch`, `tip`, `paid_message`,
 `platform_gift`, `reward_redemption`, `stream_online`, `stream_offline`…; `text`, `amount`,
 `months`, `count` and `reward` come when they apply. Never ids or tokens.
