@@ -763,6 +763,27 @@ impl Stage {
             }
             "scene" => (self.canvas.width, self.canvas.height),
             "group" => (n("cx").unwrap_or(0), n("cy").unwrap_or(0)),
+            // A copy is its source's size, through that one's filters when it brings them; it
+            // isn't a source of its own in the engine. It was 0×0, so it couldn't be sized or
+            // dragged by its handles (10 Nov). A copy of a copy is followed a few steps.
+            "ferrocast_clone" | "source-clone" => {
+                let mut seen = vec![source.to_string()];
+                let mut cur = s.clone();
+                loop {
+                    let target = cur.pointer("/settings/clone").and_then(Value::as_str).unwrap_or_default().to_string();
+                    if target.is_empty() || seen.contains(&target) || seen.len() > 8 {
+                        return (0, 0);
+                    }
+                    let filters = cur.pointer("/settings/filters").and_then(Value::as_bool).unwrap_or(true);
+                    let t = self.source(&target).unwrap_or(Value::Null);
+                    if matches!(kind_of(&t), "ferrocast_clone" | "source-clone") {
+                        seen.push(target);
+                        cur = t;
+                        continue;
+                    }
+                    return if filters { self.size_of(&target) } else { self.own_size_of(&target) };
+                }
+            }
             _ => (0, 0),
         }
     }
