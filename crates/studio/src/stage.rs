@@ -753,6 +753,7 @@ impl Stage {
                     | "ferrocast_clone"
                     | "source-clone"
                     | "ferrocast_countdown"
+                    | "ferrocast_visualizer"
             );
         ItemInfo {
             id: it.get("id").and_then(Value::as_i64).unwrap_or(0),
@@ -1165,6 +1166,31 @@ impl Stage {
         let s = self.source(name)?;
         let mut opts = crate::kinds::options(kind_of(&s))
             .ok_or_else(|| fail(format!("Ferrocast's own engine can't show \"{name}\" yet.")))?;
+        // Sound bars listen to the sound on air or a source with sound in this collection.
+        if kind_of(&s) == "ferrocast_visualizer"
+            && let Some(o) = opts.iter_mut().find(|o| o.key == "source")
+        {
+            let all = self.sources_list();
+            let heard: Vec<String> = all
+                .iter()
+                .filter(|x| name_of(x) != name && !is_scene(x))
+                .filter(|x| x.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0))
+                .filter(|x| {
+                    !matches!(
+                        kind_of(x),
+                        "image_source"
+                            | "color_source_v3"
+                            | "text_ft2_source_v2"
+                            | "ferrocast_clone"
+                            | "ferrocast_countdown"
+                            | "ferrocast_visualizer"
+                    )
+                })
+                .map(|x| name_of(x).to_string())
+                .collect();
+            o.choices = std::iter::once("Sound on air".to_string()).chain(heard.iter().cloned()).collect();
+            o.values = std::iter::once(json!("")).chain(heard.into_iter().map(Value::from)).collect();
+        }
         // A clone picks from this collection: every other source, then the scenes.
         if kind_of(&s) == "ferrocast_clone"
             && let Some(o) = opts.iter_mut().find(|o| o.key == "clone")
@@ -3544,6 +3570,21 @@ mod tests {
         assert_eq!(s.privacy(), kept);
         s.set_privacy(&json!({})).unwrap();
         assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec![ferrocore::obs::NOTIFICATIONS.to_string()]);
+    }
+
+    /// Sound bars listen to the sound on air or a source with sound, never to themselves or
+    /// to a picture; they aren't in the mixer.
+    #[test]
+    fn sound_bars_listen_to_sources_with_sound() {
+        let s = stage();
+        ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/no/such.mp3" }), false));
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({}), false));
+        ok(s.add_source("Main", "ferrocast_visualizer", "Bars", &json!({}), false));
+        let opts = ok(s.options("Bars"));
+        let o = opts.iter().find(|o| o.key == "source").unwrap_or_else(|| panic!("a Listen to list"));
+        assert_eq!(o.choices, ["Sound on air", "Music"]);
+        assert_eq!(o.values, [json!(""), json!("Music")]);
+        assert!(ok(s.audio("Main")).iter().all(|a| a.name != "Bars"), "not in the mixer");
     }
 
     /// Installed plugins' effects that are on are offered in the Effect list, after the ready-made.

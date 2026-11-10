@@ -398,6 +398,19 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             let style = text_style_of(id, s);
             (SourceKind::Text { text: text_of("text"), style }, false)
         }
+        "ferrocast_visualizer" => {
+            let n = |k: &str, d: u64| s.get(k).and_then(Value::as_u64).unwrap_or(d);
+            let of = text_of("source");
+            let spec = crate::source::visualizer::VisualizerSpec {
+                of: (!of.trim().is_empty()).then_some(of),
+                bars: n("bars", 32).clamp(8, 64) as u32,
+                width: n("width", 800).clamp(16, 3840) as u32,
+                height: n("height", 200).clamp(8, 2160) as u32,
+                rgba: color(s.get("color").and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF)),
+                mirror: s.get("mirror").and_then(Value::as_bool).unwrap_or(false),
+            };
+            (SourceKind::Visualizer(spec), false)
+        }
         "ferrocast_countdown" => {
             use crate::source::countdown::{CountTo, Countdown};
             let to = if s.get("mode").and_then(Value::as_str) == Some("until") {
@@ -922,6 +935,19 @@ mod tests {
         set_plugins(Vec::new());
         let e = shader_from(&json!({ "preset": "plugin:com.ana.invert" })).unwrap_err();
         assert!(e.contains("com.ana.invert isn't installed, or is switched off"), "{e}");
+    }
+
+    #[test]
+    fn sound_bars_read_their_settings() {
+        let kind = |set: Value| kind_from("ferrocast_visualizer", &set, (1920, 1080), &[]).map(|k| k.0);
+        let Ok(SourceKind::Visualizer(v)) = kind(json!({ "source": "Mic", "bars": 24, "width": 600, "height": 120, "mirror": true }))
+        else {
+            panic!("sound bars")
+        };
+        assert_eq!((v.of.as_deref(), v.bars, v.width, v.height, v.mirror), (Some("Mic"), 24, 600, 120, true));
+        // The sound on air, and sizes held to what can be drawn.
+        let Ok(SourceKind::Visualizer(v)) = kind(json!({ "source": " ", "bars": 500, "width": 0 })) else { panic!() };
+        assert_eq!((v.of, v.bars, v.width), (None, 64, 16));
     }
 
     #[test]

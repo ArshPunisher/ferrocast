@@ -5,3 +5,4 @@ pub mod countdown;
 pub mod image;
 pub mod series;
 pub mod text;
+pub mod visualizer;

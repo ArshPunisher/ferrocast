@@ -37,6 +37,8 @@ pub enum SourceKind {
     },
     /// Counts down for a set time or to a time of day, then says its end message.
     Countdown(crate::source::countdown::Countdown),
+    /// Bars that move with the sound on air, or one source's.
+    Visualizer(crate::source::visualizer::VisualizerSpec),
     /// A test tone (a beep of `beep_ms` every `every_ms`), for checks and line-ups.
     Tone {
         hz: f32,
@@ -414,6 +416,8 @@ enum Live {
         feed: Feed,
         _worker: crate::source::series::Worker,
     },
+    /// Sound bars: drawn each frame from what was heard.
+    Visualizer(Box<crate::source::visualizer::VisualizerLive>),
 }
 
 struct Src {
@@ -774,6 +778,11 @@ impl Engine {
                         })
                     }),
                 );
+            }
+            SourceKind::Visualizer(spec) => {
+                let (w, h) = (spec.width.clamp(16, 3840), spec.height.clamp(8, 2160));
+                let live = crate::source::visualizer::VisualizerLive::new(spec);
+                (Live::Visualizer(Box::new(live)), Some(Picture::solid(w, h, [0, 0, 0, 0])))
             }
             SourceKind::Countdown(c) => {
                 let feed = Feed::default();
@@ -1925,6 +1934,56 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
 
 /// Sources something drawn shows now: on air, a transition's or stinger's, an output's own
 /// scene, a preview's or a multiview's, with the scenes inside them and the masks they use.
+/// Sound bars that are shown: what they heard this frame (the sound on air, or their
+/// source's through a tap opened by name, again if that source is opened anew), drawn now.
+fn visualize(
+    st: &mut State,
+    blocks: &[crate::mix::Block],
+    seen: &std::collections::HashSet<u64>,
+    gpu: &Compositor,
+    mixer: &Mutex<Mixer>,
+    rate: u32,
+) {
+    let mut on_air: Option<Vec<f32>> = None;
+    let names: HashMap<String, u64> = st.opened.iter().map(|(n, (id, _))| (n.clone(), *id)).collect();
+    for (id, src) in st.sources.iter_mut() {
+        let Live::Visualizer(v) = &mut src.live else { continue };
+        if !seen.contains(id) {
+            continue;
+        }
+        let heard = match v.spec.of.clone() {
+            None => on_air
+                .get_or_insert_with(|| {
+                    blocks
+                        .iter()
+                        .filter_map(|b| b.tracks.first())
+                        .flat_map(|t| t.chunks(2).map(|c| (c[0] + c.get(1).copied().unwrap_or(c[0])) * 0.5))
+                        .collect()
+                })
+                .clone(),
+            Some(name) => match names.get(&name) {
+                Some(&target) => {
+                    if v.tap.as_ref().is_none_or(|(t, _)| *t != target) {
+                        let tap = mixer.lock().unwrap_or_else(|e| e.into_inner()).tap(target);
+                        v.tap = Some((target, tap));
+                    }
+                    v.tap.as_ref().map(|(_, t)| t.take()).unwrap_or_default()
+                }
+                // Its source isn't there (yet): flat bars.
+                None => {
+                    v.tap = None;
+                    Vec::new()
+                }
+            },
+        };
+        let picture = v.next(&heard, rate);
+        if gpu.upload(*id, &picture).is_ok() {
+            src.size = Some((picture.width, picture.height, picture.premultiplied));
+            src.sent += 1;
+        }
+    }
+}
+
 /// Sources a Freeze filter holds: one on any of the source's items in any scene (a source's
 /// filters are the same wherever it's shown).
 fn frozen(st: &State) -> std::collections::HashSet<u64> {
@@ -2407,7 +2466,8 @@ fn frame(
     let mut st_recovered = 0;
     for (id, src) in st.sources.iter_mut() {
         let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut src.live {
-            Live::Still => {}
+            // Drawn after the sound is mixed (`visualize`).
+            Live::Still | Live::Visualizer(_) => {}
             Live::Image { src: img, since, last } => {
                 if img.animated() {
                     let p = img.frame_at(since.elapsed());
@@ -2525,6 +2585,7 @@ fn frame(
     }
     let blocks = mx.mix_until(now_ns());
     drop(mx);
+    visualize(&mut st, &blocks, &seen, gpu, mixer, rate);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(f) = &st.monitor {
         for b in &blocks {
@@ -3666,6 +3727,38 @@ mod tests {
         assert!(e.load_obs(&doc(serde_json::json!({ "shader_text": own }))).is_empty());
         std::thread::sleep(Duration::from_millis(200));
         assert!(e.snapshot().unwrap_or_default()[0] < 10, "its own code still runs (white inverted)");
+    }
+
+    /// Sound bars on air rise with a tone heard on air, and sit as slivers in silence.
+    #[test]
+    fn sound_bars_move_with_the_sound_on_air() {
+        let Some(e) = engine() else { return };
+        let spec = |of: Option<String>| crate::source::visualizer::VisualizerSpec {
+            of,
+            bars: 16,
+            width: 320,
+            height: 100,
+            rgba: [255, 255, 255, 255],
+            mirror: false,
+        };
+        e.set_source(1, SourceKind::Visualizer(spec(None))).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let lit = |e: &Engine| {
+            let px = e.snapshot().unwrap_or_default();
+            (0..100usize).filter(|y| (0..320usize).any(|x| px[(y * 640 + x) * 4 + 3] > 0)).count()
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(lit(&e) <= 3, "silence: slivers only ({} rows lit)", lit(&e));
+        // A steady tone heard everywhere.
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 100, beep_ms: 100 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(lit(&e) > 40, "a tone lifts its bars ({} rows lit)", lit(&e));
+        // Listening to a source that isn't there: flat.
+        e.set_source(1, SourceKind::Visualizer(spec(Some("Nope".into())))).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(lit(&e) <= 3, "nothing to hear: slivers ({} rows lit)", lit(&e));
     }
 
     /// A countdown draws its words where it's placed.

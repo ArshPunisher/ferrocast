@@ -101,6 +101,7 @@ pub fn kinds() -> Kinds {
         kind("ndi_source", "NDI Source"),
         kind("ferrocast_clone", "Source Clone"),
         kind("ferrocast_countdown", "Countdown"),
+        kind("ferrocast_visualizer", "Audio Visualizer"),
     ];
     if cfg!(target_os = "macos") {
         inputs.extend([
@@ -307,6 +308,16 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 crate::ffi::ndi::sources(1500).unwrap_or_default().into_iter().map(|n| (n.clone(), json!(n))).collect();
             vec![opt("ndi_source_name", "Source name", "list").choices(&as_refs(&found))]
         }
+        // Its Listen to list is the sound on air and the collection's sources with sound
+        // (Stage::options fills them in).
+        "ferrocast_visualizer" => vec![
+            opt("source", "Listen to", "list").choices(&[("Sound on air", json!(""))]),
+            opt("bars", "Bars", "int").range(8.0, 64.0, 1.0).slider(),
+            opt("width", "Width", "int").range(16.0, 3840.0, 1.0),
+            opt("height", "Height", "int").range(8.0, 2160.0, 1.0),
+            opt("color", "Color", "color_alpha"),
+            opt("mirror", "From the middle", "bool"),
+        ],
         "ferrocast_countdown" => {
             let set_time = [json!("for")];
             vec![
@@ -729,6 +740,9 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
+        "ferrocast_visualizer" => json!({
+            "source": "", "bars": 32, "width": 800, "height": 200, "color": 0xFFFF_FFFFu32, "mirror": false,
+        }),
         "ferrocast_countdown" => json!({
             "mode": "for", "minutes": 5, "seconds": 0, "until": "21:00",
             "before": "Starting in ", "end": "Starting now",
