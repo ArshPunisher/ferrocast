@@ -34,6 +34,7 @@ pub mod music;
 mod obs;
 pub mod obs_theme;
 mod patch;
+pub mod plugins;
 mod pipeline;
 mod polls;
 mod pro;
@@ -224,6 +225,8 @@ impl Engine {
         engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
+        // Installed plugins' effects that are on (OBS-COMPETE.md §4).
+        engine.load_plugins();
         Ok(engine)
     }
 
