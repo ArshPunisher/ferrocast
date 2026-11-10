@@ -2600,6 +2600,7 @@ name = "ferrocore"
 version = "3.0.6"
 dependencies = [
  "block2",
+ "chrono",
  "cosmic-text",
  "cpal",
  "dispatch2",

@@ -35,6 +35,8 @@ pub enum SourceKind {
         text: String,
         style: TextStyle,
     },
+    /// Counts down for a set time or to a time of day, then says its end message.
+    Countdown(crate::source::countdown::Countdown),
     /// A test tone (a beep of `beep_ms` every `every_ms`), for checks and line-ups.
     Tone {
         hz: f32,
@@ -583,7 +585,8 @@ pub struct Engine {
     state: Arc<Mutex<State>>,
     gpu: Arc<Compositor>,
     mixer: Arc<Mutex<Mixer>>,
-    text: Mutex<TextRenderer>,
+    /// Shared with countdowns, so fonts are loaded once.
+    text: Arc<Mutex<TextRenderer>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
@@ -665,7 +668,7 @@ impl Engine {
             state,
             gpu,
             mixer,
-            text: Mutex::new(TextRenderer::new()),
+            text: Arc::new(Mutex::new(TextRenderer::new())),
             stop,
             thread: Some(thread),
             watchdog,
@@ -771,6 +774,11 @@ impl Engine {
                         })
                     }),
                 );
+            }
+            SourceKind::Countdown(c) => {
+                let feed = Feed::default();
+                let worker = crate::source::countdown::countdown(c, feed.clone(), self.text.clone());
+                (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
             }
             SourceKind::Slides(s) => {
                 let feed = Feed::default();
@@ -3658,6 +3666,26 @@ mod tests {
         assert!(e.load_obs(&doc(serde_json::json!({ "shader_text": own }))).is_empty());
         std::thread::sleep(Duration::from_millis(200));
         assert!(e.snapshot().unwrap_or_default()[0] < 10, "its own code still runs (white inverted)");
+    }
+
+    /// A countdown draws its words where it's placed.
+    #[test]
+    fn a_countdown_draws() {
+        let Some(e) = engine() else { return };
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "ferrocast_countdown", "name": "Timer",
+                  "settings": { "minutes": 5, "before": "Starting in ", "end": "Now",
+                                "font": { "size": 48 }, "color1": 4294967295u32 } },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Timer", "id": 1 }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty());
+        std::thread::sleep(Duration::from_millis(400));
+        let px = e.snapshot().unwrap_or_default();
+        let lit = px.chunks(4).take(640 * 80).filter(|p| p[3] > 0 && p[0] > 200).count();
+        assert!(lit > 200, "white words in the top left: {lit} lit pixels");
     }
 
     /// A Source Clone draws its source's picture a second time, where it's placed.

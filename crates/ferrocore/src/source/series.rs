@@ -50,7 +50,7 @@ impl Drop for Worker {
     }
 }
 
-fn spawn(name: &str, f: impl FnOnce(&AtomicBool) + Send + 'static) -> Worker {
+pub(crate) fn spawn(name: &str, f: impl FnOnce(&AtomicBool) + Send + 'static) -> Worker {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
         let stop = stop.clone();
@@ -60,7 +60,7 @@ fn spawn(name: &str, f: impl FnOnce(&AtomicBool) + Send + 'static) -> Worker {
 }
 
 /// Waits `d`, in short steps → false when stopped meanwhile.
-fn wait(stop: &AtomicBool, d: Duration) -> bool {
+pub(crate) fn wait(stop: &AtomicBool, d: Duration) -> bool {
     let step = Duration::from_millis(20);
     let mut left = d;
     while !left.is_zero() {

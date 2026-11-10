@@ -100,6 +100,7 @@ pub fn kinds() -> Kinds {
         kind("slideshow", "Image Slide Show"),
         kind("ndi_source", "NDI Source"),
         kind("ferrocast_clone", "Source Clone"),
+        kind("ferrocast_countdown", "Countdown"),
     ];
     if cfg!(target_os = "macos") {
         inputs.extend([
@@ -305,6 +306,22 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             let found: Vec<(String, Value)> =
                 crate::ffi::ndi::sources(1500).unwrap_or_default().into_iter().map(|n| (n.clone(), json!(n))).collect();
             vec![opt("ndi_source_name", "Source name", "list").choices(&as_refs(&found))]
+        }
+        "ferrocast_countdown" => {
+            let set_time = [json!("for")];
+            vec![
+                opt("mode", "Count", "list")
+                    .choices(&[("For a set time", json!("for")), ("Until a time of day", json!("until"))]),
+                opt("minutes", "Minutes", "int").range(0.0, 1440.0, 1.0).when("mode", &set_time),
+                opt("seconds", "Seconds", "int").range(0.0, 59.0, 1.0).when("mode", &set_time),
+                opt("until", "Time of day (21:30)", "text").when("mode", &[json!("until")]),
+                opt("before", "Before the time", "text"),
+                opt("end", "When it ends", "text"),
+                opt("font", "Font", "font"),
+                opt("color1", "Color", "color_alpha"),
+                opt("outline", "Outline", "bool"),
+                opt("drop_shadow", "Drop Shadow", "bool"),
+            ]
         }
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
@@ -708,6 +725,12 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
+        "ferrocast_countdown" => json!({
+            "mode": "for", "minutes": 5, "seconds": 0, "until": "21:00",
+            "before": "Starting in ", "end": "Starting now",
+            "font": { "face": "Helvetica", "size": 96, "style": "Bold", "flags": 1 },
+            "color1": 0xFFFF_FFFFu32, "color2": 0xFFFF_FFFFu32, "outline": true, "drop_shadow": false,
+        }),
         "ferrocast_shader" => json!({
             "preset": "custom",
             "shader_file": "",

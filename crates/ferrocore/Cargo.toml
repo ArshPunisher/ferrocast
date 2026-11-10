@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A countdown to a time of day: the local clock (source/countdown.rs via obs.rs).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 wgpu = "30"
 pollster = "0.4"
 rubato = "0.14"

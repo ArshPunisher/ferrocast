@@ -391,38 +391,19 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             (SourceKind::Playlist(p), true)
         }
         "text_ft2_source" | "text_ft2_source_v2" | "text_gdiplus" | "text_gdiplus_v2" | "text_gdiplus_v3" => {
-            let font = s.get("font").cloned().unwrap_or(Value::Null);
-            let flags = font.get("flags").and_then(Value::as_u64).unwrap_or(0);
-            let gdi = id.starts_with("text_gdiplus");
-            let c1 = color(s.get(if gdi { "color" } else { "color1" }).and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF));
-            let c2 = (!gdi).then(|| color(s.get("color2").and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF)));
-            let style = TextStyle {
-                font: font.get("face").and_then(Value::as_str).unwrap_or_default().to_string(),
-                size: font.get("size").and_then(Value::as_f64).unwrap_or(48.0) as f32,
-                bold: flags & 1 != 0,
-                italic: flags & 2 != 0,
-                color: c1,
-                gradient: c2.filter(|c| *c != c1),
-                outline: s.get("outline").and_then(Value::as_bool).unwrap_or(false).then_some((2.0, [0, 0, 0, 255])),
-                shadow: s
-                    .get("drop_shadow")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                    .then_some(((4, 4), [0, 0, 0, 255])),
-                wrap_width: s
-                    .get("word_wrap")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                    .then(|| s.get("custom_width").and_then(Value::as_u64).unwrap_or(0) as u32)
-                    .filter(|w| *w > 0),
-                align: match s.get("align").and_then(Value::as_str) {
-                    Some("center") => TextAlign::Center,
-                    Some("right") => TextAlign::Right,
-                    _ => TextAlign::Left,
-                },
-                ..TextStyle::default()
-            };
+            let style = text_style_of(id, s);
             (SourceKind::Text { text: text_of("text"), style }, false)
+        }
+        "ferrocast_countdown" => {
+            use crate::source::countdown::{CountTo, Countdown};
+            let to = if s.get("mode").and_then(Value::as_str) == Some("until") {
+                CountTo::Until(next_time_of_day(&text_of("until"))?)
+            } else {
+                let n = |k: &str, hi: u64| s.get(k).and_then(Value::as_u64).unwrap_or(0).min(hi);
+                CountTo::For(std::time::Duration::from_secs(n("minutes", 1440) * 60 + n("seconds", 59)))
+            };
+            let c = Countdown { to, before: text_of("before"), end: text_of("end"), style: text_style_of(id, s) };
+            (SourceKind::Countdown(c), false)
         }
         "ffmpeg_source" => {
             // A network address (a guest's camera, an RTMP or HLS stream): the app reads it
@@ -616,6 +597,54 @@ pub fn placement_of(it: &Value) -> Placement {
         bounds_height: bh,
         crop: [crop("crop_left"), crop("crop_top"), crop("crop_right"), crop("crop_bottom")],
     }
+}
+
+/// A Text source's look from its settings (FreeType's keys, or GDI+'s for `text_gdiplus*`).
+fn text_style_of(id: &str, s: &Value) -> TextStyle {
+    let font = s.get("font").cloned().unwrap_or(Value::Null);
+    let flags = font.get("flags").and_then(Value::as_u64).unwrap_or(0);
+    let gdi = id.starts_with("text_gdiplus");
+    let c1 = color(s.get(if gdi { "color" } else { "color1" }).and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF));
+    let c2 = (!gdi).then(|| color(s.get("color2").and_then(Value::as_u64).unwrap_or(0xFFFF_FFFF)));
+    TextStyle {
+        font: font.get("face").and_then(Value::as_str).unwrap_or_default().to_string(),
+        size: font.get("size").and_then(Value::as_f64).unwrap_or(48.0) as f32,
+        bold: flags & 1 != 0,
+        italic: flags & 2 != 0,
+        color: c1,
+        gradient: c2.filter(|c| *c != c1),
+        outline: s.get("outline").and_then(Value::as_bool).unwrap_or(false).then_some((2.0, [0, 0, 0, 255])),
+        shadow: s
+            .get("drop_shadow")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then_some(((4, 4), [0, 0, 0, 255])),
+        wrap_width: s
+            .get("word_wrap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| s.get("custom_width").and_then(Value::as_u64).unwrap_or(0) as u32)
+            .filter(|w| *w > 0),
+        align: match s.get("align").and_then(Value::as_str) {
+            Some("center") => TextAlign::Center,
+            Some("right") => TextAlign::Right,
+            _ => TextAlign::Left,
+        },
+        ..TextStyle::default()
+    }
+}
+
+/// The next time the local clock reads `hm` ("21:30"), as milliseconds since 1970 (UTC):
+/// today if it's still ahead, else tomorrow.
+fn next_time_of_day(hm: &str) -> Result<u64, String> {
+    use chrono::{Duration as Days, Local, NaiveTime, TimeZone};
+    let bad = || format!("a countdown time is written like 21:30, not \"{hm}\"");
+    let t = NaiveTime::parse_from_str(hm.trim(), "%H:%M").map_err(|_| bad())?;
+    let now = Local::now();
+    let today = now.date_naive().and_time(t);
+    let at = if today > now.naive_local() { today } else { today + Days::days(1) };
+    let local = Local.from_local_datetime(&at).earliest().ok_or_else(bad)?;
+    u64::try_from(local.timestamp_millis()).map_err(|_| bad())
 }
 
 /// What a Source Clone shows.
@@ -876,6 +905,41 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_countdown_reads_its_settings() {
+        use crate::source::countdown::CountTo;
+        let kind = |set: Value| kind_from("ferrocast_countdown", &set, (1920, 1080), &[]).map(|k| k.0);
+        let Ok(SourceKind::Countdown(c)) = kind(json!({ "minutes": 5, "seconds": 30, "before": "Starting in ", "end": "Live!" }))
+        else {
+            panic!("a countdown")
+        };
+        assert_eq!(c.to, CountTo::For(std::time::Duration::from_secs(330)));
+        assert_eq!((c.before.as_str(), c.end.as_str()), ("Starting in ", "Live!"));
+        // Too much is held to a day and a minute.
+        let Ok(SourceKind::Countdown(c)) = kind(json!({ "minutes": 99_999, "seconds": 999 })) else { panic!() };
+        assert_eq!(c.to, CountTo::For(std::time::Duration::from_secs(1440 * 60 + 59)));
+        // A time of day: the next one, within a day.
+        let Ok(SourceKind::Countdown(c)) = kind(json!({ "mode": "until", "until": "21:30" })) else { panic!() };
+        let CountTo::Until(at) = c.to else { panic!("until a moment") };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        assert!(at > now && at <= now + 24 * 3600 * 1000, "within the next day");
+        for bad in ["9pm", "25:00", "", "21:30:00x"] {
+            let e = kind(json!({ "mode": "until", "until": bad })).unwrap_err();
+            assert!(e.contains("written like 21:30"), "{bad}: {e}");
+        }
+        // Text keeps reading as it did (the style moved into text_style_of).
+        let Ok(SourceKind::Text { style, .. }) = kind_from(
+            "text_ft2_source_v2",
+            &json!({ "text": "hi", "font": { "face": "Helvetica", "size": 72, "flags": 1 }, "outline": true }),
+            (1920, 1080),
+            &[],
+        )
+        .map(|k| k.0) else {
+            panic!("text")
+        };
+        assert_eq!((style.size, style.bold, style.outline.is_some()), (72.0, true, true));
+    }
 
     /// A collection: a red colour source with a rounded-corners filter, a scene "Inner", the
     /// clones given, and a scene "Main" showing `shown`.
