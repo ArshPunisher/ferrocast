@@ -31,6 +31,10 @@ const CHANNEL_KEYS: [&str; 6] = [
     "AuxAudioDevice4",
 ];
 
+/// The hidden scenes Studio Mode puts on air: copies of a scene's layout (two, so the old one is
+/// still there while the transition to the new one plays). Not a name anyone can type.
+pub(crate) const PROGRAM_COPY: [&str; 2] = ["\u{1}On air 1", "\u{1}On air 2"];
+
 /// The scene store.
 #[derive(Debug)]
 pub struct Stage {
@@ -97,10 +101,24 @@ fn is_scene(s: &Value) -> bool {
 /// copies and the sound Sound bars show. Before, on 10 Nov on Windows, every removed source kept running in the engine (six
 /// FFmpegs for one clip on air, 26% CPU, frames late) and its name stayed taken.
 fn drop_unused(d: &mut Value) {
+    // What Studio Mode's copy on air shows stays until the next transition, as in OBS.
+    let on_air: Vec<String> = ["program_copy", "program_prev"]
+        .iter()
+        .filter_map(|k| d.pointer(&format!("/ferrocast/{k}/items")).and_then(Value::as_array))
+        .flatten()
+        .map(|i| name_of(i).to_string())
+        .collect();
     let Some(list) = d.get_mut("sources").and_then(Value::as_array_mut) else { return };
     let scene = |s: &Value| s.get("id").and_then(Value::as_str) == Some("scene");
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut todo: Vec<&Value> = list.iter().filter(|s| scene(s)).collect();
+    for n in &on_air {
+        if used.insert(n.clone())
+            && let Some(next) = list.iter().find(|x| name_of(x) == n)
+        {
+            todo.push(next);
+        }
+    }
     while let Some(s) = todo.pop() {
         let items = s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten().map(name_of);
         // What a Copy of a source copies, and the sound Sound bars show.
@@ -676,6 +694,11 @@ impl Stage {
             }
             d["current_program_scene"] = json!(name);
         }
+        if studio_mode {
+            // On air as a copy of its own (a scene picked straight for the program): edits in
+            // the preview wait for the next transition.
+            return self.send_copy_on_air(name, &t.kind, u64::from(t.ms));
+        }
         if was != name
             && let Some(e) = self.engine.borrow().as_ref()
         {
@@ -750,6 +773,18 @@ impl Stage {
             }
             if d.pointer("/ferrocast/studio_mode").and_then(Value::as_str) == Some(name) {
                 d["ferrocast"]["studio_mode"] = json!(new_name);
+            }
+            // Studio Mode's copy on air: its scene, and the sources it shows, by name.
+            for k in ["program_copy", "program_prev"] {
+                let Some(c) = d.pointer_mut(&format!("/ferrocast/{k}")) else { continue };
+                if c.get("scene").and_then(Value::as_str) == Some(name) {
+                    c["scene"] = json!(new_name);
+                }
+                for i in c.get_mut("items").and_then(Value::as_array_mut).into_iter().flatten() {
+                    if name_of(i) == name {
+                        i["name"] = json!(new_name);
+                    }
+                }
             }
         });
         Ok(())
@@ -1737,14 +1772,72 @@ impl Stage {
     }
 
     /// Turns Studio Mode on (the preview starts on what's on air) or off.
+    ///
+    /// On, what's on air is a copy of its scene's layout (OBS's "Duplicate Scene", on by
+    /// default): the items' places, sizes, order and visibility, showing the same sources. The
+    /// preview edits the scene itself; the copy changes only at a transition (owner, 11 Nov:
+    /// resizing in the preview moved it on air at once).
     pub fn set_studio_mode(&self, on: bool) {
         let now = self.current();
-        let mut d = self.doc.borrow_mut();
-        if !d.get("ferrocast").is_some_and(Value::is_object) {
-            d["ferrocast"] = json!({});
+        {
+            let mut d = self.doc.borrow_mut();
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"]["studio_mode"] = if on { json!(now) } else { Value::Null };
+            d["current_scene"] = json!(now);
+            if let Some(f) = d["ferrocast"].as_object_mut() {
+                for k in ["program_copy", "program_prev", "program_on_air"] {
+                    f.remove(k);
+                }
+            }
         }
-        d["ferrocast"]["studio_mode"] = if on { json!(now) } else { Value::Null };
-        d["current_scene"] = json!(now);
+        if on {
+            let items = self.scene_items(&now).unwrap_or_default();
+            let mut d = self.doc.borrow_mut();
+            d["ferrocast"]["program_copy"] = json!({ "scene": now, "items": items, "private": PROGRAM_COPY[0] });
+            d["ferrocast"]["program_on_air"] = json!(PROGRAM_COPY[0]);
+        }
+        self.refresh();
+    }
+
+    /// Studio Mode: `scene` on air as a new copy of its layout, through a transition from the
+    /// copy on air now (both are in the engine while it plays; the old one goes after).
+    fn send_copy_on_air(&self, scene: &str, kind: &str, ms: u64) -> Result<(), StudioError> {
+        let items = self.scene_items(scene)?;
+        let prev = self.doc.borrow().pointer("/ferrocast/program_copy").cloned();
+        let prev_private = prev.as_ref().and_then(|p| p.get("private")).and_then(Value::as_str).map(String::from);
+        let private = if prev_private.as_deref() == Some(PROGRAM_COPY[0]) { PROGRAM_COPY[1] } else { PROGRAM_COPY[0] };
+        {
+            let mut d = self.doc.borrow_mut();
+            d["current_program_scene"] = json!(scene);
+            d["ferrocast"]["program_copy"] = json!({ "scene": scene, "items": items, "private": private });
+            match (prev, &prev_private) {
+                (Some(p), Some(on)) => {
+                    d["ferrocast"]["program_prev"] = p;
+                    d["ferrocast"]["program_on_air"] = json!(on);
+                }
+                _ => {
+                    if let Some(f) = d["ferrocast"].as_object_mut() {
+                        f.remove("program_prev");
+                        f.remove("program_on_air");
+                    }
+                }
+            }
+            drop_unused(&mut d);
+        }
+        // The engine with both copies, the old one still on air; then the transition.
+        self.refresh();
+        let settings = self.transition_settings(kind);
+        if let Some(e) = self.engine.borrow().as_ref() {
+            e.go_with(private, kind, ms, &settings)?;
+        }
+        let mut d = self.doc.borrow_mut();
+        d["ferrocast"]["program_on_air"] = json!(private);
+        if let Some(f) = d["ferrocast"].as_object_mut() {
+            f.remove("program_prev");
+        }
+        Ok(())
     }
 
     /// Picks the scene Studio Mode's preview shows.
@@ -1765,18 +1858,14 @@ impl Stage {
     pub fn transition_now(&self, quick: Option<&TransitionInfo>) -> Result<(), StudioError> {
         let pre = self.preview_scene().ok_or_else(|| fail("Studio Mode is off."))?;
         let old = self.current();
-        if pre == old {
-            return Ok(());
-        }
+        // The same scene too: what was edited in the preview goes on air (OBS, with Duplicate
+        // Scene on).
         match quick {
             Some(t) => {
                 if t.ms > 20_000 {
                     return Err(fail("ms: a transition lasts 0 to 20000 ms."));
                 }
-                self.doc.borrow_mut()["current_program_scene"] = json!(pre);
-                if let Some(e) = self.engine.borrow().as_ref() {
-                    e.go_with(&pre, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
-                }
+                self.send_copy_on_air(&pre, &t.kind, u64::from(t.ms))?;
             }
             None => self.set_current(&pre)?,
         }
@@ -4179,6 +4268,51 @@ mod tests {
         assert_eq!(saved["current_scene"], "Next", "OBS keeps Studio Mode's preview as current_scene");
         s.set_studio_mode(false);
         assert_eq!(s.preview_scene(), None);
+    }
+
+    /// Studio Mode as OBS has it (Duplicate Scene): the same scene in the preview and on air,
+    /// an edit in the preview doesn't move it on air until the transition (owner, 11 Nov).
+    #[test]
+    fn studio_mode_edits_wait_for_the_transition() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let red = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Red",
+            &json!({ "color": 0xFF00_00FFu32, "width": 40, "height": 40 }),
+            false,
+        ));
+        ok(s.set_item_box("Main", red.id, 0.0, 0.0, 40.0, 40.0));
+        s.set_studio_mode(true);
+        let copy = |s: &Stage| s.snapshot().pointer("/ferrocast/program_copy/items/0/pos/x").and_then(Value::as_f64);
+        assert_eq!(copy(&s), Some(0.0), "on air: a copy of the scene");
+        ok(s.set_item_box("Main", red.id, 200.0, 0.0, 40.0, 40.0));
+        assert_eq!(copy(&s), Some(0.0), "the preview's edit isn't on air yet");
+        let engine = s.engine().is_ok();
+        let red_at = |s: &Stage, x: u32| {
+            let (px, (w, _)) = s.screenshot_program_pixels().unwrap_or_else(|e| panic!("{e}"));
+            let i = ((10 * w + x) * 4) as usize;
+            px[i] > 200 && px[i + 1] < 60
+        };
+        if engine {
+            assert!(red_at(&s, 10) && !red_at(&s, 210), "on air: still where it was");
+        }
+        // The same scene in the preview and on air: the transition sends the edit.
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        assert_eq!(copy(&s), Some(200.0));
+        assert_eq!(s.current(), "Main");
+        if engine {
+            assert!(red_at(&s, 210) && !red_at(&s, 10), "on air: where the preview put it");
+        }
+        // A source taken out of the preview stays on air until the next transition.
+        ok(s.edit_item("Main", red.id, ItemEdit::Remove));
+        assert!(s.sources().iter().any(|u| u.name == "Red"), "kept for the copy on air");
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        ok(s.rename("Main", "Show"));
+        assert_eq!(s.snapshot().pointer("/ferrocast/program_copy/scene").and_then(Value::as_str), Some("Show"));
+        // Off: what's on air is the scene itself again.
+        s.set_studio_mode(false);
+        assert!(s.snapshot().pointer("/ferrocast/program_copy").is_none());
     }
 
     #[test]

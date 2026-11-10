@@ -181,6 +181,8 @@ struct Seen {
 impl Shared {
     /// Starts the engine at `canvas` with the collection `doc` open.
     pub(crate) fn open_at(canvas: crate::Canvas, doc: &serde_json::Value) -> Result<Arc<Self>, StudioError> {
+        let drawn = engine_doc(doc);
+        let doc: &serde_json::Value = &drawn;
         // The strong noise removal, when this build has it.
         #[cfg(feature = "deepfilter")]
         crate::denoiser::install();
@@ -235,6 +237,8 @@ impl Shared {
     /// Opens `doc` again now, whatever changed (the scene store calls it after each edit;
     /// unchanged sources keep running).
     pub(crate) fn reopen(&self, doc: &serde_json::Value) {
+        let drawn = engine_doc(doc);
+        let doc: &serde_json::Value = &drawn;
         let mut seen = self.seen();
         let skipped = self.engine.load_obs(doc);
         // What an edit just left out says why (a shader effect that doesn't compile…).
@@ -447,6 +451,35 @@ impl Drop for Delayed {
             self.pass(t);
         }
     }
+}
+
+/// The collection as the engine draws it: in Studio Mode, the copy of the scene on air (and
+/// the one before it, while a transition plays) as hidden scenes of their own, one of them on
+/// air; else as it is.
+pub(crate) fn engine_doc(doc: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+    use serde_json::{Value, json};
+    let f = &doc["ferrocast"];
+    if !f["studio_mode"].is_string() {
+        return std::borrow::Cow::Borrowed(doc);
+    }
+    let copies: Vec<&Value> = ["program_copy", "program_prev"]
+        .iter()
+        .map(|k| &f[*k])
+        .filter(|c| {
+            c["private"].as_str().is_some_and(|p| crate::stage::PROGRAM_COPY.contains(&p)) && c["items"].is_array()
+        })
+        .collect();
+    let Some(on) = f["program_on_air"].as_str().filter(|p| copies.iter().any(|c| c["private"] == *p)) else {
+        return std::borrow::Cow::Borrowed(doc);
+    };
+    let mut d = doc.clone();
+    if let Some(list) = d["sources"].as_array_mut() {
+        for c in &copies {
+            list.push(json!({ "id": "scene", "versioned_id": "scene", "name": c["private"], "settings": { "items": c["items"] } }));
+        }
+    }
+    d["current_program_scene"] = json!(on);
+    std::borrow::Cow::Owned(d)
 }
 
 /// A collection without which scene is on air (what a reopen depends on).
