@@ -17,7 +17,22 @@ use crate::extract::Body;
 pub const MAX_PLUGIN_BODY: usize = ferrocast_engine::plugins::MAX_ZIP as usize + 64 * 1024;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/plugins", get(list)).route("/plugins/{id}", put(set_on).delete(remove))
+    Router::new()
+        .route("/plugins", get(list))
+        .route("/plugins/{id}", put(set_on).delete(remove))
+        .route("/plugins/{id}/panel", get(panel))
+        .route("/plugins/{id}/act", axum::routing::post(act))
+}
+
+/// `GET /plugins/{id}/panel` → `{ html, actions }`: a panel plugin's page, for a sandboxed frame.
+async fn panel(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.plugin_panel(&id).await?))
+}
+
+/// `POST /plugins/{id}/act` with a step → 204, when the panel's plugin is on and may do it.
+async fn act(State(app): State<AppState>, Path(id): Path<String>, Body(step): Body<Value>) -> ApiResult<StatusCode> {
+    app.engine.plugin_act(&id, step).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list(State(app): State<AppState>) -> Json<Value> {

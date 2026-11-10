@@ -36,6 +36,7 @@ mod obs;
 pub mod obs_theme;
 mod patch;
 mod pipeline;
+pub mod plugin_logic;
 pub mod plugins;
 mod polls;
 mod pro;
@@ -199,6 +200,8 @@ struct Inner {
     studio_host: studio_host::Slot,
     /// "When X, do Y" rules and when each last ran.
     automations: Mutex<automation::Automations>,
+    /// Logic plugins that are on, loaded and ready to be told about events.
+    plugin_logic: Mutex<plugins::Running>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -334,6 +337,7 @@ impl Engine {
                 music: Default::default(),
                 studio_host: Default::default(),
                 automations: Mutex::new(Default::default()),
+                plugin_logic: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));

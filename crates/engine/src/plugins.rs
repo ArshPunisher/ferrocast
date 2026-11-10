@@ -23,8 +23,19 @@ pub const MAX_ZIP: u64 = 2 * 1024 * 1024;
 /// The biggest single file inside one, and how many files it may hold.
 const MAX_ENTRY: u64 = 512 * 1024;
 const MAX_ENTRIES: usize = 20;
-/// What a plugin may hold: its manifest, its effects, words and a picture.
-const ALLOWED: &[&str] = &["json", "wgsl", "md", "txt", "png"];
+/// What a plugin may hold: its manifest, its effects, words and a picture; a logic plugin its
+/// WebAssembly module, a panel its page.
+const ALLOWED: &[&str] = &["json", "wgsl", "md", "txt", "png", "wasm", "html"];
+/// What each kind may hold beyond the common files.
+fn kind_files(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "logic" => &["wasm"],
+        "panel" => &["html"],
+        _ => &["wgsl"],
+    }
+}
+/// The steps a plugin may ask to be allowed (as "When X, do Y" has them; not waiting).
+pub const ACTIONS: &[&str] = &["scene", "show", "hide", "filter", "save_replay", "record", "chat"];
 
 /// A plugin's `plugin.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,10 +47,21 @@ pub struct Manifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
-    /// What it is: only "effect" so far.
+    /// What it is: "effect" (a WGSL effect), "logic" (a WebAssembly module told about events)
+    /// or "panel" (a page shown in the dashboard, in a sandbox).
     pub kind: String,
-    /// The effect's file, beside `plugin.json`.
+    /// An effect's file, beside `plugin.json`.
+    #[serde(default)]
     pub effect: String,
+    /// A logic plugin's module (`.wasm`).
+    #[serde(default)]
+    pub module: String,
+    /// A panel's page (`.html`, everything inline).
+    #[serde(default)]
+    pub panel: String,
+    /// The steps a logic plugin or panel may ask for (`ACTIONS`), shown at install.
+    #[serde(default)]
+    pub actions: Vec<String>,
 }
 
 /// An installed plugin, as the app lists it.
@@ -51,6 +73,8 @@ pub struct PluginInfo {
     pub author: String,
     pub description: String,
     pub kind: String,
+    /// What it may do (a logic plugin's or panel's steps).
+    pub actions: Vec<String>,
     pub on: bool,
     /// Why it can't run now (its effect no longer compiles…), or null.
     pub problem: Option<String>,
@@ -87,13 +111,32 @@ pub fn check_manifest(m: &Manifest) -> Result<(), String> {
     if !len(&m.author, 60) || !len(&m.description, 200) {
         return Err("its author (60) or description (200) is too long".into());
     }
-    if m.kind != "effect" {
-        return Err(format!("it's a \"{}\" plugin; this Ferrocast takes effect plugins", m.kind));
+    let beside =
+        |f: &str, ext: &str| Path::new(f).extension().and_then(|e| e.to_str()) == Some(ext) && !f.contains(['/', '\\']);
+    match m.kind.as_str() {
+        "effect" if !beside(&m.effect, "wgsl") => Err("its effect must be a .wgsl file beside plugin.json".into()),
+        "logic" if !beside(&m.module, "wasm") => Err("its module must be a .wasm file beside plugin.json".into()),
+        "panel" if !beside(&m.panel, "html") => Err("its panel must be an .html file beside plugin.json".into()),
+        "effect" | "logic" | "panel" => {
+            if m.kind == "effect" && !m.actions.is_empty() {
+                return Err("an effect can't ask for actions".into());
+            }
+            if let Some(a) = m.actions.iter().find(|a| !ACTIONS.contains(&a.as_str())) {
+                return Err(format!("it asks for \"{a}\", which isn't an action plugins can have"));
+            }
+            Ok(())
+        }
+        other => Err(format!("it's a \"{other}\" plugin; this Ferrocast takes effect, logic and panel plugins")),
     }
-    if Path::new(&m.effect).extension().and_then(|e| e.to_str()) != Some("wgsl") || m.effect.contains(['/', '\\']) {
-        return Err("its effect must be a .wgsl file beside plugin.json".into());
+}
+
+/// The file that is the plugin's work: its effect, module or panel.
+fn main_file(m: &Manifest) -> &str {
+    match m.kind.as_str() {
+        "logic" => &m.module,
+        "panel" => &m.panel,
+        _ => &m.effect,
     }
-    Ok(())
 }
 
 /// A zip entry's name, inside the plugin (one leading folder allowed and dropped) → None when
@@ -117,7 +160,12 @@ pub type Files = Vec<(String, Vec<u8>)>;
 /// Reads a plugin file: its manifest and every file in it, all checked.
 pub fn read_zip(path: &Path) -> Result<(Manifest, Files), EngineError> {
     let not_one = |why: &str| {
-        refused(415, "plugin_not_a_plugin", format!("That isn't a Ferrocast plugin: {why}."), "Pick the plugin's .zip file.")
+        refused(
+            415,
+            "plugin_not_a_plugin",
+            format!("That isn't a Ferrocast plugin: {why}."),
+            "Pick the plugin's .zip file.",
+        )
     };
     let size = std::fs::metadata(path).map_err(|e| EngineError::Internal(e.to_string()))?.len();
     if size > MAX_ZIP {
@@ -146,7 +194,9 @@ pub fn read_zip(path: &Path) -> Result<(Manifest, Files), EngineError> {
             return Err(refused(
                 415,
                 "plugin_file_type",
-                format!("The plugin holds \"{name}\"; plugins hold only .json, .wgsl, .md, .txt and .png files."),
+                format!(
+                    "The plugin holds \"{name}\"; plugins hold only .json, .wgsl, .wasm, .html, .md, .txt and .png files."
+                ),
                 "Plugins can't bring programs. Ask its maker for an effect plugin.",
             ));
         }
@@ -169,19 +219,57 @@ pub fn read_zip(path: &Path) -> Result<(Manifest, Files), EngineError> {
         }
         files.push((name, bytes));
     }
-    let manifest = files
-        .iter()
-        .find(|(n, _)| n == "plugin.json")
-        .ok_or_else(|| not_one("it has no plugin.json"))
-        .and_then(|(_, b)| serde_json::from_slice::<Manifest>(b).map_err(|e| not_one(&format!("its plugin.json is wrong ({e})"))))?;
+    let manifest =
+        files.iter().find(|(n, _)| n == "plugin.json").ok_or_else(|| not_one("it has no plugin.json")).and_then(
+            |(_, b)| {
+                serde_json::from_slice::<Manifest>(b).map_err(|e| not_one(&format!("its plugin.json is wrong ({e})")))
+            },
+        )?;
     check_manifest(&manifest).map_err(|why| {
-        refused(422, "plugin_manifest", format!("The plugin's plugin.json is wrong: {why}."), "Ask its maker to fix it.")
+        refused(
+            422,
+            "plugin_manifest",
+            format!("The plugin's plugin.json is wrong: {why}."),
+            "Ask its maker to fix it.",
+        )
     })?;
-    let code = files
+    // Only the files its kind uses: a module or a page in an effect plugin is refused.
+    for (name, _) in &files {
+        let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let common = ["json", "md", "txt", "png"].contains(&ext.as_str());
+        if !common && !kind_files(&manifest.kind).contains(&ext.as_str()) {
+            return Err(refused(
+                415,
+                "plugin_file_type",
+                format!("The plugin holds \"{name}\", which a {} plugin doesn't use.", manifest.kind),
+                "Ask its maker for a plugin without it.",
+            ));
+        }
+    }
+    let main = main_file(&manifest);
+    let body = files
         .iter()
-        .find(|(n, _)| *n == manifest.effect)
-        .ok_or_else(|| not_one(&format!("its effect \"{}\" isn't in it", manifest.effect)))?;
-    let code = std::str::from_utf8(&code.1).map_err(|_| not_one("its effect isn't text"))?;
+        .find(|(n, _)| n == main)
+        .ok_or_else(|| not_one(&format!("its {} \"{main}\" isn't in it", manifest.kind)))?;
+    match manifest.kind.as_str() {
+        "logic" => {
+            crate::plugin_logic::load(&body.1).map_err(|why| {
+                refused(
+                    422,
+                    "plugin_module_broken",
+                    format!("The plugin's module doesn't work: {why}."),
+                    "Ask its maker for a version that does.",
+                )
+            })?;
+            return Ok((manifest, files));
+        }
+        "panel" => {
+            std::str::from_utf8(&body.1).map_err(|_| not_one("its panel isn't text"))?;
+            return Ok((manifest, files));
+        }
+        _ => {}
+    }
+    let code = std::str::from_utf8(&body.1).map_err(|_| not_one("its effect isn't text"))?;
     if let Some(word) = endless(code) {
         return Err(refused(
             422,
@@ -236,9 +324,12 @@ pub fn list(dir: &Path) -> Vec<PluginInfo> {
             }
             let problem = check_manifest(&m)
                 .err()
-                .or_else(|| match std::fs::read_to_string(folder.join(&m.effect)) {
-                    Ok(code) => ferrocore::shaderfx::check(&code).err(),
-                    Err(_) => Some(format!("its effect \"{}\" is missing", m.effect)),
+                .or_else(|| match (m.kind.as_str(), std::fs::read_to_string(folder.join(main_file(&m)))) {
+                    ("effect", Ok(code)) => ferrocore::shaderfx::check(&code).err(),
+                    (_, Ok(_)) => None,
+                    // A module isn't text: there just has to be one.
+                    ("logic", Err(_)) if folder.join(&m.module).is_file() => None,
+                    (kind, Err(_)) => Some(format!("its {kind} \"{}\" is missing", main_file(&m))),
                 })
                 .map(|why| format!("It can't run: {why}."));
             Some(PluginInfo {
@@ -249,6 +340,7 @@ pub fn list(dir: &Path) -> Vec<PluginInfo> {
                 author: m.author,
                 description: m.description,
                 kind: m.kind,
+                actions: m.actions,
                 problem,
             })
         })
@@ -261,7 +353,7 @@ pub fn list(dir: &Path) -> Vec<PluginInfo> {
 pub fn apply(dir: &Path) {
     let effects = list(dir)
         .into_iter()
-        .filter(|p| p.on && p.problem.is_none())
+        .filter(|p| p.on && p.problem.is_none() && p.kind == "effect")
         .filter_map(|p| {
             let m: Manifest = serde_json::from_slice(&std::fs::read(dir.join(&p.id).join("plugin.json")).ok()?).ok()?;
             let code = std::fs::read_to_string(dir.join(&p.id).join(&m.effect)).ok()?;
@@ -329,7 +421,227 @@ fn missing() -> EngineError {
     }
 }
 
+/// A logic plugin that's on.
+#[derive(Debug)]
+struct Slot {
+    name: String,
+    actions: Vec<String>,
+    logic: std::sync::Arc<std::sync::Mutex<crate::plugin_logic::Logic>>,
+    /// Calls that stopped in a row; three and it's told nothing more until turned on again.
+    fails: u32,
+    /// Why it stopped being told, shown in the list.
+    stopped: Option<String>,
+    /// When its last steps ran (at most `PER_MINUTE` a minute).
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+/// The logic plugins that are on.
+#[derive(Debug, Default)]
+pub(crate) struct Running {
+    slots: std::collections::HashMap<String, Slot>,
+}
+
+/// Steps a plugin may run a minute.
+pub const PER_MINUTE: usize = 30;
+
+/// An event as plugins hear it: what happened and to whom, never ids, tokens or raw data.
+pub fn event_for_plugins(e: &ferrocast_core::event::Event) -> serde_json::Value {
+    use ferrocast_core::event::EventKind as K;
+    let mut v = serde_json::json!({ "type": e.kind.name(), "platform": e.platform.to_string() });
+    if let Some(a) = e.kind.actor() {
+        v["name"] = a.display_name.clone().into();
+    }
+    if let Some(amount) = e.kind.amount_display() {
+        v["amount"] = amount.into();
+    }
+    match &e.kind {
+        K::ChatMessage { content, .. } => v["text"] = content.text.clone().into(),
+        K::Raid { viewers, .. } => v["viewers"] = (*viewers).into(),
+        K::Subscription { months, .. } => v["months"] = (*months).into(),
+        K::GiftBatch { count, .. } => v["count"] = (*count).into(),
+        K::RewardRedemption { reward, input, .. } => {
+            v["reward"] = reward.clone().into();
+            if let Some(i) = input {
+                v["text"] = i.clone().into();
+            }
+        }
+        K::Tip { message: Some(m), .. } => v["text"] = m.clone().into(),
+        _ => {}
+    }
+    v
+}
+
 impl Engine {
+    /// Loads the logic plugins that are on (after any change to plugins).
+    fn load_logic(&self) {
+        let dir = self.plugins_dir();
+        let mut slots = std::collections::HashMap::new();
+        for p in list(&dir).into_iter().filter(|p| p.on && p.problem.is_none() && p.kind == "logic") {
+            let Some(m) = std::fs::read(dir.join(&p.id).join("plugin.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+            else {
+                continue;
+            };
+            match std::fs::read(dir.join(&p.id).join(&m.module))
+                .map_err(|e| e.to_string())
+                .and_then(|b| crate::plugin_logic::load(&b))
+            {
+                Ok(logic) => {
+                    slots.insert(
+                        p.id.clone(),
+                        Slot {
+                            name: p.name,
+                            actions: p.actions,
+                            logic: std::sync::Arc::new(std::sync::Mutex::new(logic)),
+                            fails: 0,
+                            stopped: None,
+                            recent: Default::default(),
+                        },
+                    );
+                }
+                Err(why) => tracing::warn!(plugin = %p.id, "a logic plugin didn't load: {why}"),
+            }
+        }
+        self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner()).slots = slots;
+    }
+
+    /// Tells each logic plugin that's on about `e` (live and test events), off the pipeline.
+    pub(crate) fn plugins_saw(&self, e: &ferrocast_core::event::Event) {
+        use ferrocast_core::event::Origin;
+        if !matches!(e.origin, Origin::Live | Origin::Test) {
+            return;
+        }
+        let todo: Vec<(String, std::sync::Arc<std::sync::Mutex<crate::plugin_logic::Logic>>)> = {
+            let r = self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner());
+            r.slots.iter().filter(|(_, s)| s.stopped.is_none()).map(|(id, s)| (id.clone(), s.logic.clone())).collect()
+        };
+        if todo.is_empty() {
+            return;
+        }
+        let event = serde_json::to_vec(&event_for_plugins(e)).unwrap_or_default();
+        let who = e.kind.actor().map(|a| a.display_name.clone()).unwrap_or_default();
+        for (id, logic) in todo {
+            let engine = self.clone();
+            let (event, who) = (event.clone(), who.clone());
+            tokio::spawn(async move {
+                let said =
+                    tokio::task::spawn_blocking(move || logic.lock().unwrap_or_else(|e| e.into_inner()).tell(&event))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                engine.plugin_said(&id, said, &who).await;
+            });
+        }
+    }
+
+    /// Runs what a plugin asked for, as far as it's allowed, or counts its failure.
+    async fn plugin_said(&self, id: &str, said: Result<crate::plugin_logic::Said, String>, who: &str) {
+        let steps = {
+            let mut r = self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(slot) = r.slots.get_mut(id) else { return };
+            let said = match said {
+                Ok(s) => {
+                    slot.fails = 0;
+                    s
+                }
+                Err(why) => {
+                    slot.fails += 1;
+                    tracing::warn!(plugin = %id, "a logic plugin stopped: {why}");
+                    if slot.fails >= 3 {
+                        slot.stopped =
+                            Some(format!("It stopped three times in a row ({why}); turn it off and on to try again."));
+                        let name = slot.name.clone();
+                        drop(r);
+                        self.plugin_notice(id, format!("{name} was paused: it stopped three times in a row ({why})."));
+                    }
+                    return;
+                }
+            };
+            for line in &said.logs {
+                tracing::info!(plugin = %id, "{}", line.chars().take(300).collect::<String>());
+            }
+            let now = std::time::Instant::now();
+            while slot.recent.front().is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(60)) {
+                slot.recent.pop_front();
+            }
+            let mut steps = Vec::new();
+            for v in said.steps {
+                let kind = v.get("type").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+                if !slot.actions.contains(&kind) {
+                    tracing::warn!(plugin = %id, step = %kind, "a plugin asked for a step it isn't allowed");
+                    continue;
+                }
+                if slot.recent.len() >= PER_MINUTE {
+                    tracing::warn!(plugin = %id, "a plugin asked for too many steps this minute");
+                    break;
+                }
+                match serde_json::from_value::<crate::automation::Step>(v) {
+                    Ok(step) => {
+                        slot.recent.push_back(now);
+                        steps.push(step);
+                    }
+                    Err(e) => tracing::warn!(plugin = %id, "a plugin asked for a step that isn't one: {e}"),
+                }
+            }
+            steps
+        };
+        for step in steps {
+            if let Err(e) = self.automation_step(&step, who).await {
+                tracing::warn!(plugin = %id, "a plugin's step failed: {e}");
+            }
+        }
+    }
+
+    fn plugin_notice(&self, id: &str, message: String) {
+        self.send_live(crate::frames::LiveFrame::new(
+            "notice",
+            &crate::frames::Notice {
+                key: Some(format!("plugin:{id}")),
+                level: crate::frames::NoticeLevel::Warn,
+                message,
+                action: Some(crate::frames::NoticeAction {
+                    label: "Plugins".into(),
+                    href: "#/settings/plugins".into(),
+                }),
+            },
+        ));
+    }
+
+    /// A panel plugin's page and what it may do → `{ html, actions }`.
+    pub async fn plugin_panel(&self, id: &str) -> Result<serde_json::Value, EngineError> {
+        let dir = self.plugins_dir();
+        let p = self.plugins().await.into_iter().find(|p| p.id == id && p.kind == "panel").ok_or_else(missing)?;
+        if !p.on {
+            return Err(EngineError::Unavailable(format!("{} is off: turn it on first.", p.name)));
+        }
+        let m: Manifest = std::fs::read(dir.join(id).join("plugin.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(missing)?;
+        let html = std::fs::read_to_string(dir.join(id).join(&m.panel)).map_err(|_| missing())?;
+        Ok(serde_json::json!({ "html": html, "actions": p.actions }))
+    }
+
+    /// A step a panel asked for, if its plugin is on and allowed it.
+    pub async fn plugin_act(&self, id: &str, step: serde_json::Value) -> Result<(), EngineError> {
+        let p = self.plugins().await.into_iter().find(|p| p.id == id && p.kind == "panel").ok_or_else(missing)?;
+        if !p.on {
+            return Err(EngineError::Unavailable(format!("{} is off: turn it on first.", p.name)));
+        }
+        let kind = step.get("type").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        if !p.actions.contains(&kind) {
+            return Err(refused(
+                403,
+                "plugin_not_allowed",
+                format!("{} isn't allowed to do \"{kind}\".", p.name),
+                "Its plugin.json lists what it may do; ask its maker.",
+            ));
+        }
+        let step: crate::automation::Step =
+            serde_json::from_value(step).map_err(|e| EngineError::Invalid(format!("That isn't a step: {e}.")))?;
+        self.automation_step(&step, "").await
+    }
+
     /// Where plugins are installed.
     pub fn plugins_dir(&self) -> PathBuf {
         self.store().dir().join("plugins")
@@ -338,11 +650,20 @@ impl Engine {
     /// Loads the installed plugins that are on (at start).
     pub fn load_plugins(&self) {
         apply(&self.plugins_dir());
+        self.load_logic();
     }
 
     pub async fn plugins(&self) -> Vec<PluginInfo> {
         let dir = self.plugins_dir();
-        tokio::task::spawn_blocking(move || list(&dir)).await.unwrap_or_default()
+        let mut out = tokio::task::spawn_blocking(move || list(&dir)).await.unwrap_or_default();
+        // A logic plugin paused for stopping too often says why.
+        let r = self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner());
+        for p in out.iter_mut().filter(|p| p.problem.is_none()) {
+            if let Some(why) = r.slots.get(&p.id).and_then(|s| s.stopped.clone()) {
+                p.problem = Some(why);
+            }
+        }
+        out
     }
 
     /// Installs the plugin file at `zip` (it's checked first) and puts its effect to use.
@@ -355,6 +676,7 @@ impl Engine {
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
+        self.load_logic();
         self.refresh_studio().await;
         Ok(got)
     }
@@ -368,6 +690,7 @@ impl Engine {
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
+        self.load_logic();
         self.refresh_studio().await;
         Ok(got)
     }
@@ -381,6 +704,7 @@ impl Engine {
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
+        self.load_logic();
         self.refresh_studio().await;
         Ok(())
     }
@@ -436,11 +760,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let dir = tmp.path().join("plugins");
         let p = install(&dir, &good(tmp.path(), "com.ana.invert")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((p.id.as_str(), p.name.as_str(), p.on, p.problem.as_deref()), ("com.ana.invert", "Invert", true, None));
+        assert_eq!(
+            (p.id.as_str(), p.name.as_str(), p.on, p.problem.as_deref()),
+            ("com.ana.invert", "Invert", true, None)
+        );
         assert_eq!(list(&dir).len(), 1);
         // In a folder inside the zip works too.
         let m = manifest("com.ana.folder");
-        let z = zip_of(tmp.path(), "f.zip", &[("Folder/plugin.json", m.as_bytes()), ("Folder/effect.wgsl", FX.as_bytes())]);
+        let z =
+            zip_of(tmp.path(), "f.zip", &[("Folder/plugin.json", m.as_bytes()), ("Folder/effect.wgsl", FX.as_bytes())]);
         assert!(install(&dir, &z).is_ok());
         // Off, on, gone.
         assert!(!set_on(&dir, "com.ana.invert", false).unwrap_or_else(|e| panic!("{e}")).on);
@@ -465,8 +793,11 @@ mod tests {
         assert!(ferrocore::shaderfx::effect_code("plugin:com.ana.invert").is_none(), "off: gone from the engine");
         // A plugin whose effect broke after it was installed is listed with why, not used.
         set_on(&dir, "com.ana.invert", true).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(dir.join("com.ana.invert/effect.wgsl"), "fn effect(uv: vec2<f32>) -> vec4<f32> { return nope; }")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            dir.join("com.ana.invert/effect.wgsl"),
+            "fn effect(uv: vec2<f32>) -> vec4<f32> { return nope; }",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         let p = list(&dir).into_iter().next().unwrap_or_else(|| panic!("listed"));
         assert!(p.problem.as_deref().is_some_and(|w| w.contains("nope")), "{:?}", p.problem);
         apply(&dir);
@@ -482,7 +813,11 @@ mod tests {
         let m2 = manifest("com.ana.invert").replace("1.0.0", "2.0.0");
         let z = zip_of(tmp.path(), "v2.zip", &[("plugin.json", m2.as_bytes()), ("effect.wgsl", FX.as_bytes())]);
         assert_eq!(install(&dir, &z).unwrap_or_else(|e| panic!("{e}")).version, "2.0.0");
-        let bad = zip_of(tmp.path(), "v3.zip", &[("plugin.json", m2.replace("2.0.0", "3.0.0").as_bytes()), ("effect.wgsl", b"nope")]);
+        let bad = zip_of(
+            tmp.path(),
+            "v3.zip",
+            &[("plugin.json", m2.replace("2.0.0", "3.0.0").as_bytes()), ("effect.wgsl", b"nope")],
+        );
         assert!(install(&dir, &bad).is_err());
         assert_eq!(list(&dir)[0].version, "2.0.0", "the working version stays");
     }
@@ -504,7 +839,10 @@ mod tests {
             (zip_of(d, "a.zip", &[("effect.wgsl", fx)]), (415, "plugin_not_a_plugin")),
             (zip_of(d, "b.zip", &[("plugin.json", b"{ nope")]), (415, "plugin_not_a_plugin")),
             (zip_of(d, "c.zip", &[("plugin.json", m.as_bytes())]), (415, "plugin_not_a_plugin")),
-            (zip_of(d, "e.zip", &[("plugin.json", m.as_bytes()), ("effect.wgsl", b"fn x() {}")]), (422, "plugin_effect_broken")),
+            (
+                zip_of(d, "e.zip", &[("plugin.json", m.as_bytes()), ("effect.wgsl", b"fn x() {}")]),
+                (422, "plugin_effect_broken"),
+            ),
             (
                 zip_of(d, "f.zip", &[("plugin.json", m.as_bytes()), ("effect.wgsl", fx), ("evil.dylib", b"MZ")]),
                 (415, "plugin_file_type"),
@@ -522,15 +860,30 @@ mod tests {
                 (413, "plugin_too_big"),
             ),
             (
-                zip_of(d, "j.zip", &[("plugin.json", m.replace(r#""kind": "effect""#, r#""kind": "bot""#).as_bytes()), ("effect.wgsl", fx)]),
+                zip_of(
+                    d,
+                    "j.zip",
+                    &[
+                        ("plugin.json", m.replace(r#""kind": "effect""#, r#""kind": "bot""#).as_bytes()),
+                        ("effect.wgsl", fx),
+                    ],
+                ),
                 (422, "plugin_manifest"),
             ),
             (
-                zip_of(d, "k.zip", &[("plugin.json", m.replace("com.ana.invert", "Bad Id!").as_bytes()), ("effect.wgsl", fx)]),
+                zip_of(
+                    d,
+                    "k.zip",
+                    &[("plugin.json", m.replace("com.ana.invert", "Bad Id!").as_bytes()), ("effect.wgsl", fx)],
+                ),
                 (422, "plugin_manifest"),
             ),
             (
-                zip_of(d, "l.zip", &[("plugin.json", m.replace("effect.wgsl", "../effect.wgsl").as_bytes()), ("effect.wgsl", fx)]),
+                zip_of(
+                    d,
+                    "l.zip",
+                    &[("plugin.json", m.replace("effect.wgsl", "../effect.wgsl").as_bytes()), ("effect.wgsl", fx)],
+                ),
                 (422, "plugin_manifest"),
             ),
         ];
@@ -565,7 +918,8 @@ mod tests {
         let copy = |to: &str| {
             std::fs::create_dir_all(dir.join(to)).unwrap_or_else(|e| panic!("{e}"));
             for f in ["plugin.json", "effect.wgsl"] {
-                std::fs::copy(dir.join("com.ana.invert").join(f), dir.join(to).join(f)).unwrap_or_else(|e| panic!("{e}"));
+                std::fs::copy(dir.join("com.ana.invert").join(f), dir.join(to).join(f))
+                    .unwrap_or_else(|e| panic!("{e}"));
             }
         };
         copy(".com.ana.invert.new");
@@ -580,7 +934,8 @@ mod tests {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/scanlines");
         let read = |f: &str| std::fs::read(src.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
         let (m, fx, readme) = (read("plugin.json"), read("effect.wgsl"), read("README.md"));
-        let z = zip_of(tmp.path(), "scanlines.zip", &[("plugin.json", &m), ("effect.wgsl", &fx), ("README.md", &readme)]);
+        let z =
+            zip_of(tmp.path(), "scanlines.zip", &[("plugin.json", &m), ("effect.wgsl", &fx), ("README.md", &readme)]);
         let p = install(&tmp.path().join("plugins"), &z).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((p.name.as_str(), p.problem.as_deref()), ("Scanlines", None));
     }
@@ -595,6 +950,9 @@ mod tests {
             description: String::new(),
             kind: "effect".into(),
             effect: "e.wgsl".into(),
+            module: String::new(),
+            panel: String::new(),
+            actions: Vec::new(),
         };
         for ok in ["com.ana.invert", "abc", "a-b_c.d1"] {
             assert!(check_manifest(&m(ok)).is_ok(), "{ok}");
@@ -605,5 +963,132 @@ mod tests {
         let mut long = m("abc");
         long.name = "n".repeat(61);
         assert!(check_manifest(&long).is_err());
+    }
+
+    /// A logic plugin that switches to "BRB" and starts recording on every event (it's only
+    /// allowed scenes), and logs what it heard.
+    const LOGIC: &str = r#"
+        (module
+          (import "ferrocast" "act" (func $act (param i32 i32)))
+          (import "ferrocast" "log" (func $log (param i32 i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{\"type\":\"scene\",\"name\":\"BRB\"}")
+          (data (i32.const 64) "{\"type\":\"record\",\"on\":true}")
+          (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+          (func (export "on_event") (param $p i32) (param $l i32)
+            (call $act (i32.const 0) (i32.const 29))
+            (call $act (i32.const 64) (i32.const 27))
+            (call $log (local.get $p) (local.get $l))))
+    "#;
+
+    fn logic_zip(dir: &Path, id: &str, actions: &str, extra: &[(&str, &[u8])]) -> PathBuf {
+        let m = format!(
+            r#"{{ "id": "{id}", "name": "BRB on follow", "version": "1.0.0", "kind": "logic", "module": "plugin.wasm", "actions": {actions} }}"#
+        );
+        let wasm = wat::parse_str(LOGIC).unwrap_or_else(|e| panic!("{e}"));
+        let mut files: Vec<(&str, &[u8])> = vec![("plugin.json", m.as_bytes()), ("plugin.wasm", &wasm)];
+        files.extend_from_slice(extra);
+        zip_of(dir, &format!("{id}.zip"), &files)
+    }
+
+    #[test]
+    fn logic_and_panel_plugins_install_and_bad_ones_say_why() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = tmp.path().join("plugins");
+        let p =
+            install(&dir, &logic_zip(tmp.path(), "com.ana.brb", r#"["scene"]"#, &[])).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((p.kind.as_str(), p.actions.clone(), p.problem), ("logic", vec!["scene".to_string()], None));
+        let html = br#"<button onclick="parent.postMessage({type:'act',step:{type:'save_replay'}},'*')">Save</button>"#;
+        let pm = br#"{ "id": "com.ana.panel", "name": "Buttons", "version": "1", "kind": "panel", "panel": "panel.html", "actions": ["save_replay"] }"#;
+        let p = install(&dir, &zip_of(tmp.path(), "panel.zip", &[("plugin.json", pm), ("panel.html", html)]))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((p.kind.as_str(), p.problem), ("panel", None));
+        // Refusals, each with its code.
+        let bad_actions = logic_zip(tmp.path(), "com.ana.bad", r#"["secrets"]"#, &[]);
+        assert_eq!(why(install(&dir, &bad_actions).unwrap_err()), (422, "plugin_manifest"));
+        let wait = logic_zip(tmp.path(), "com.ana.wait", r#"["wait"]"#, &[]);
+        assert_eq!(why(install(&dir, &wait).unwrap_err()), (422, "plugin_manifest"), "waiting isn't an action");
+        let page_in_logic = logic_zip(tmp.path(), "com.ana.page", "[]", &[("x.html", b"<p>")]);
+        assert_eq!(why(install(&dir, &page_in_logic).unwrap_err()), (415, "plugin_file_type"));
+        let fx_with_wasm = zip_of(
+            tmp.path(),
+            "fxw.zip",
+            &[
+                ("plugin.json", manifest("com.ana.fxw").as_bytes()),
+                ("effect.wgsl", FX.as_bytes()),
+                ("x.wasm", b"\0asm"),
+            ],
+        );
+        assert_eq!(why(install(&dir, &fx_with_wasm).unwrap_err()), (415, "plugin_file_type"));
+        let m = br#"{ "id": "com.ana.wasi", "name": "W", "version": "1", "kind": "logic", "module": "plugin.wasm" }"#;
+        let wasi = wat::parse_str(
+            r#"(module (import "wasi_snapshot_preview1" "fd_write" (func)) (memory (export "memory") 1))"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let z = zip_of(tmp.path(), "wasi.zip", &[("plugin.json", m), ("plugin.wasm", &wasi)]);
+        assert_eq!(why(install(&dir, &z).unwrap_err()), (422, "plugin_module_broken"));
+        let not_wasm = zip_of(tmp.path(), "nw.zip", &[("plugin.json", m), ("plugin.wasm", b"MZ\x90\0")]);
+        assert_eq!(why(install(&dir, &not_wasm).unwrap_err()), (422, "plugin_module_broken"));
+        let no_module = zip_of(tmp.path(), "nm.zip", &[("plugin.json", m)]);
+        assert_eq!(why(install(&dir, &no_module).unwrap_err()), (415, "plugin_not_a_plugin"));
+        let exe = zip_of(tmp.path(), "exe.zip", &[("plugin.json", m), ("run.exe", b"MZ")]);
+        assert_eq!(why(install(&dir, &exe).unwrap_err()), (415, "plugin_file_type"));
+        assert_eq!(list(&dir).len(), 2, "only the good ones");
+    }
+
+    /// End to end: a follow reaches the plugin; its allowed step runs, the one it wasn't
+    /// allowed doesn't; a panel may do only what it listed.
+    #[tokio::test]
+    async fn a_logic_plugin_hears_events_and_does_only_what_it_may() {
+        use crate::automation::tests::{did, engine, live, until};
+        use ferrocast_core::event::{Actor, EventKind, Platform};
+        let (e, tmp, studio, _chat) = engine().await;
+        let z = logic_zip(tmp.path(), "com.ana.brb", r#"["scene"]"#, &[]);
+        e.install_plugin(&z).await.unwrap_or_else(|e| panic!("{e}"));
+        e.ingest(live(EventKind::Follow { actor: Actor::named(Platform::Twitch, "Ana") })).await;
+        until(|| did(&studio).contains(&"scene BRB".to_string())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!did(&studio).iter().any(|d| d.starts_with("record")), "record wasn't allowed: {:?}", did(&studio));
+        // Off: it hears nothing.
+        e.set_plugin_on("com.ana.brb", false).await.unwrap_or_else(|e| panic!("{e}"));
+        let before = did(&studio).len();
+        e.ingest(live(EventKind::Follow { actor: Actor::named(Platform::Twitch, "Bo") })).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(did(&studio).len(), before);
+        // A panel: its page, a step it listed, and one it didn't.
+        let html = b"<p>Hi</p>";
+        let pm = br#"{ "id": "com.ana.panel", "name": "Buttons", "version": "1", "kind": "panel", "panel": "panel.html", "actions": ["scene"] }"#;
+        let z = zip_of(tmp.path(), "panel.zip", &[("plugin.json", pm), ("panel.html", html)]);
+        e.install_plugin(&z).await.unwrap_or_else(|e| panic!("{e}"));
+        let page = e.plugin_panel("com.ana.panel").await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(page["html"], "<p>Hi</p>");
+        e.plugin_act("com.ana.panel", serde_json::json!({ "type": "scene", "name": "Main" }))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(did(&studio).contains(&"scene Main".to_string()));
+        let no = e.plugin_act("com.ana.panel", serde_json::json!({ "type": "record", "on": true })).await;
+        assert!(matches!(no, Err(EngineError::Refused { status: 403, code: "plugin_not_allowed", .. })));
+        let no = e.plugin_act("com.ana.brb", serde_json::json!({ "type": "scene", "name": "Main" })).await;
+        assert!(matches!(no, Err(EngineError::Missing { .. })), "a logic plugin has no panel");
+        assert!(e.plugin_panel("nope.nope").await.is_err());
+    }
+
+    #[test]
+    fn plugins_hear_what_happened_never_ids() {
+        use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
+        let mut a = Actor::named(Platform::Twitch, "Ana");
+        a.id = Some("secret-user-id".into());
+        let mut ev = Event::live(
+            Platform::Twitch,
+            Some("msg-1".into()),
+            Millis(0),
+            EventKind::ChatMessage { actor: a, content: Content::plain("!hi"), reply_to: None, is_action: false },
+        );
+        ev.raw = Some(serde_json::json!({ "token": "x" }));
+        let v = event_for_plugins(&ev);
+        assert_eq!(v["type"], "chat_message");
+        assert_eq!((v["name"].as_str(), v["text"].as_str()), (Some("Ana"), Some("!hi")));
+        let s = v.to_string();
+        assert!(!s.contains("secret-user-id") && !s.contains("msg-1") && !s.contains("token"), "{s}");
     }
 }

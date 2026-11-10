@@ -260,6 +260,7 @@ impl Engine {
         // "When X, do Y" (hidden chat never sets a rule off).
         if show_in_overlays || !matches!(e.kind, EventKind::ChatMessage { .. }) {
             self.automation_saw(&e);
+            self.plugins_saw(&e);
         }
 
         self.send_live_event(e.seq, LiveFrame::new("event", &e));
