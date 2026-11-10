@@ -735,7 +735,17 @@ impl Stage {
         let kind = kind_of(&src).to_string();
         let media = matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2");
         let audio = src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
-            && !matches!(kind.as_str(), "scene" | "group" | "image_source" | "color_source_v3" | "text_ft2_source_v2");
+            && !matches!(
+                kind.as_str(),
+                "scene"
+                    | "group"
+                    | "image_source"
+                    | "color_source_v3"
+                    | "text_ft2_source_v2"
+                    // A copy has no sound of its own: its source's is heard once.
+                    | "ferrocast_clone"
+                    | "source-clone"
+            );
         ItemInfo {
             id: it.get("id").and_then(Value::as_i64).unwrap_or(0),
             name,
@@ -3561,6 +3571,10 @@ mod tests {
         assert!(opts.iter().any(|o| o.key == "filters" && o.kind == "bool"));
         // Its defaults: nothing picked yet, the source's filters included.
         assert_eq!(ok(s.settings("Copy"))["filters"], json!(true));
+        // No sound of its own: not in the mixer (found in the real app, 10 Nov).
+        let item = ok(s.items("Main")).into_iter().find(|i| i.name == "Copy").unwrap_or_else(|| panic!("the copy"));
+        assert!(!item.audio, "a copy has no sound of its own");
+        assert!(ok(s.audio("Main")).iter().all(|a| a.name != "Copy"), "not in the mixer");
     }
 
     fn ok<T>(r: Result<T, StudioError>) -> T {
