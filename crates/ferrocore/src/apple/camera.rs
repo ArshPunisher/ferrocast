@@ -12,12 +12,13 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::{
     AVCaptureAudioDataOutput, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureConnection, AVCaptureDevice,
-    AVCaptureDeviceInput, AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
-    AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeAudio, AVMediaTypeVideo,
+    AVCaptureDeviceInput, AVCaptureOutput, AVCaptureSession, AVCaptureSessionPresetInputPriority,
+    AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeAudio, AVMediaTypeVideo,
 };
-use objc2_core_media::CMSampleBuffer;
+use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetDimensions};
 use objc2_foundation::{NSDictionary, NSNumber, NSString};
 
+use crate::engine::CameraSpec;
 use crate::{AvError, Picture};
 
 /// A camera or microphone.
@@ -177,10 +178,114 @@ fn open(id: &str, video: bool) -> Result<Retained<AVCaptureDeviceInput>, AvError
     }
 }
 
+/// The camera format to use for a size and frame rate asked: among `formats` (width, height,
+/// highest frame rate), the asked size that reaches the frame rate; else the asked size at its
+/// best rate; else the nearest size at or under it. None when nothing was asked, or no format.
+pub fn pick_format(formats: &[(u32, u32, f64)], size: Option<(u32, u32)>, fps: Option<u32>) -> Option<usize> {
+    if size.is_none() && fps.is_none() {
+        return None;
+    }
+    let want_fps = f64::from(fps.unwrap_or(0));
+    let area = |(w, h): (u32, u32)| u64::from(w) * u64::from(h);
+    // Closer in size first (never over it when a size was asked), then reaching the frame rate,
+    // then the higher rate.
+    formats
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| size.is_none_or(|s| area((f.0, f.1)) <= area(s)))
+        .max_by(|(_, a), (_, b)| {
+            let size_of = |f: &(u32, u32, f64)| match size {
+                Some(s) => area((f.0, f.1)) as i128 - area(s) as i128,
+                None => area((f.0, f.1)) as i128,
+            };
+            let reaches = |f: &(u32, u32, f64)| f.2 + 0.01 >= want_fps;
+            // A size asked comes first; a frame rate alone puts reaching it first.
+            let (first, second) = match size {
+                Some(_) => (size_of(a).cmp(&size_of(b)), reaches(a).cmp(&reaches(b))),
+                None => (reaches(a).cmp(&reaches(b)), size_of(a).cmp(&size_of(b))),
+            };
+            first.then(second).then(a.2.total_cmp(&b.2))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Asks the camera for the size and frame rate in `spec` (the nearest it has); a camera that
+/// can't be configured keeps its own. AVFoundation throws (an Objective-C exception, which
+/// would end the app) for a value it doesn't take: frame times come from the format's own
+/// ranges, and anything thrown is caught and logged (owner's test, 10 Nov: 720p at 30 ended the
+/// app).
+fn configure(device: &AVCaptureDevice, spec: &CameraSpec) {
+    // SAFETY: reading the device's formats and their ranges; nothing is set here.
+    let (formats, list) = unsafe {
+        let formats = device.formats();
+        let list: Vec<(u32, u32, f64)> = formats
+            .iter()
+            .map(|f| {
+                let d = CMVideoFormatDescriptionGetDimensions(&f.formatDescription());
+                let top = f.videoSupportedFrameRateRanges().iter().map(|r| r.maxFrameRate()).fold(0.0, f64::max);
+                (u32::try_from(d.width).unwrap_or(0), u32::try_from(d.height).unwrap_or(0), top)
+            })
+            .collect();
+        (formats, list)
+    };
+    let Some(i) = pick_format(&list, spec.size, spec.fps) else { return };
+    let Some(format) = formats.iter().nth(i) else { return };
+    tracing::info!(
+        asked = ?(spec.size, spec.fps),
+        picked = ?list[i],
+        modes = list.len(),
+        "the camera's mode for the size and frame rate asked"
+    );
+    // SAFETY: locked for configuration, as AVFoundation asks; unlocked whatever happens.
+    if unsafe { device.lockForConfiguration() }.is_err() {
+        return;
+    }
+    let set = std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the format is one the device lists, and each frame time is one of the
+        // format's own (an exact range end) or inside one of its ranges.
+        unsafe {
+            device.setActiveFormat(&format);
+            if let Some(want) = spec.fps.map(f64::from) {
+                let ranges = format.videoSupportedFrameRateRanges();
+                let inside = ranges.iter().find(|r| r.minFrameRate() - 0.01 <= want && want <= r.maxFrameRate() + 0.01);
+                let time = match inside {
+                    // A range of one rate: its own time, exactly as the camera writes it.
+                    Some(r) if (r.maxFrameRate() - r.minFrameRate()).abs() < 0.01 => Some(r.minFrameDuration()),
+                    Some(_) => Some(CMTime::new(1, want.round() as i32)),
+                    // Outside every range (faster, slower, or in a gap): the nearest rate it has,
+                    // that range's own end.
+                    None => {
+                        let gap = |r: &objc2_av_foundation::AVFrameRateRange| {
+                            if want > r.maxFrameRate() { want - r.maxFrameRate() } else { r.minFrameRate() - want }
+                        };
+                        ranges
+                            .iter()
+                            .min_by(|a, b| gap(a).total_cmp(&gap(b)))
+                            .map(|r| if want > r.maxFrameRate() { r.minFrameDuration() } else { r.maxFrameDuration() })
+                    }
+                };
+                if let Some(t) = time {
+                    device.setActiveVideoMinFrameDuration(t);
+                    device.setActiveVideoMaxFrameDuration(t);
+                }
+            }
+        }
+    });
+    if let Err(e) = objc2::exception::catch(set) {
+        tracing::warn!(
+            "the camera wouldn't take that size or frame rate; it keeps its own: {}",
+            e.map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+    // SAFETY: locked above.
+    unsafe { device.unlockForConfiguration() };
+}
+
 impl Capture {
-    /// Starts a camera: its frames as BGRA at the camera's own size.
-    pub fn camera(id: &str) -> Result<Self, AvError> {
-        let input = open(id, true)?;
+    /// Starts a camera: its frames as BGRA, at the size and frame rate asked (its own when
+    /// none).
+    pub fn camera(spec: &CameraSpec) -> Result<Self, AvError> {
+        let input = open(&spec.id, true)?;
         let shared = Arc::new(Shared::default());
         let delegate = Output::new(shared.clone());
         let queue = DispatchQueue::new("ferrocast.camera", DispatchQueueAttr::SERIAL);
@@ -201,6 +306,14 @@ impl Capture {
             session.addInput(&input);
             session.addOutput(&output);
             session.startRunning();
+            // Once it runs (set before, the session's preset put the camera's own mode back:
+            // owner's test, 10 Nov), with the session told the camera's mode leads.
+            if spec.size.is_some() || spec.fps.is_some() {
+                if session.canSetSessionPreset(AVCaptureSessionPresetInputPriority) {
+                    session.setSessionPreset(AVCaptureSessionPresetInputPriority);
+                }
+                configure(&input.device(), spec);
+            }
             Ok(Self { session, _output: delegate, _queue: queue, shared })
         }
     }
@@ -288,5 +401,44 @@ impl Drop for Capture {
     fn drop(&mut self) {
         // SAFETY: the session is live; stopping it ends the callbacks.
         unsafe { self.session.stopRunning() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_format;
+
+    // A webcam's formats: (width, height, highest frame rate).
+    const CAM: [(u32, u32, f64); 5] =
+        [(640, 480, 30.0), (1280, 720, 30.0), (1280, 720, 60.0), (1920, 1080, 30.0), (3840, 2160, 15.0)];
+
+    #[test]
+    fn nothing_asked_keeps_the_cameras_own() {
+        assert_eq!(pick_format(&CAM, None, None), None);
+    }
+
+    #[test]
+    fn the_asked_size_at_the_asked_rate() {
+        assert_eq!(pick_format(&CAM, Some((1280, 720)), Some(60)), Some(2));
+        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(30)), Some(3));
+    }
+
+    #[test]
+    fn a_rate_it_cant_reach_still_gets_the_size() {
+        // 1080p only goes to 30: the size wins, at its best rate.
+        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(60)), Some(3));
+    }
+
+    #[test]
+    fn a_size_it_doesnt_have_gets_the_nearest_under_it() {
+        assert_eq!(pick_format(&CAM, Some((1600, 900)), None), Some(2));
+        assert_eq!(pick_format(&CAM, Some((320, 240)), None), None);
+    }
+
+    #[test]
+    fn only_a_rate_picks_the_biggest_that_reaches_it() {
+        assert_eq!(pick_format(&CAM, None, Some(60)), Some(2));
+        // 30 is reached by 1080p, the biggest that does (4K only goes to 15).
+        assert_eq!(pick_format(&CAM, None, Some(30)), Some(3));
     }
 }

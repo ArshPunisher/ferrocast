@@ -286,6 +286,20 @@ impl OptionInfo {
     }
 }
 
+/// A camera's size and frame rate, after its device: its own, or one asked (the nearest it
+/// has is used).
+fn camera_size_rate() -> [OptionInfo; 2] {
+    [
+        opt("resolution", "Size", "list").choices(&[
+            ("Its own", json!("")),
+            ("720p", json!("1280x720")),
+            ("1080p", json!("1920x1080")),
+            ("4K", json!("3840x2160")),
+        ]),
+        opt("fps", "Frame rate", "list").choices(&[("Its own", json!(0)), ("30", json!(30)), ("60", json!(60))]),
+    ]
+}
+
 /// The running apps with a window or sound to capture, by name (their bundle ids kept).
 #[cfg(target_os = "macos")]
 fn app_choices() -> Vec<(String, Value)> {
@@ -477,7 +491,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             #[cfg(target_os = "macos")]
             list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
             let l: Vec<(&str, Value)> = list.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
-            vec![opt("device", "Device", "list").choices(&l)]
+            let mut v = vec![opt("device", "Device", "list").choices(&l)];
+            v.extend(camera_size_rate());
+            v
         }
         "coreaudio_input_capture" => {
             #[allow(unused_mut)]
@@ -528,7 +544,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             let mut list: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "windows")]
             list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
-            vec![opt("video_device_id", "Device", "list").choices(&as_refs(&list))]
+            let mut v = vec![opt("video_device_id", "Device", "list").choices(&as_refs(&list))];
+            v.extend(camera_size_rate());
+            v
         }
         // Linux (OBS's own keys).
         "xshm_input" => {
@@ -547,7 +565,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             let mut list: Vec<(String, Value)> = Vec::new();
             #[cfg(target_os = "linux")]
             list.extend(ferrocore::camera::cameras().into_iter().map(|d| (d.name, json!(d.id))));
-            vec![opt("device_id", "Device", "list").choices(&as_refs(&list))]
+            let mut v = vec![opt("device_id", "Device", "list").choices(&as_refs(&list))];
+            v.extend(camera_size_rate());
+            v
         }
         "pulse_input_capture" => {
             #[allow(unused_mut)]

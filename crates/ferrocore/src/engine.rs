@@ -22,6 +22,33 @@ use crate::{
     TransitionKind,
 };
 
+/// A camera to open: its device, and the size and frame rate to ask it for (its own when
+/// none). A camera that can't do them gives the nearest it can.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CameraSpec {
+    pub id: String,
+    pub size: Option<(u32, u32)>,
+    pub fps: Option<u32>,
+}
+
+impl From<&str> for CameraSpec {
+    fn from(id: &str) -> Self {
+        Self { id: id.to_string(), ..Self::default() }
+    }
+}
+
+/// ffmpeg's options asking a camera for a size and frame rate (Windows' dshow, Linux's v4l2).
+pub fn camera_args(spec: &CameraSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((w, h)) = spec.size {
+        out.extend(["-video_size".to_string(), format!("{w}x{h}")]);
+    }
+    if let Some(f) = spec.fps {
+        out.extend(["-framerate".to_string(), f.to_string()]);
+    }
+    out
+}
+
 /// What a source makes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceKind {
@@ -82,9 +109,9 @@ pub enum SourceKind {
     /// What the Mac plays, with no picture (OBS's Desktop Audio; Ferrocast's own left out).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     DesktopSound,
-    /// A camera (macOS), by its id.
+    /// A camera, by its id, with the size and frame rate asked of it.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    Camera(String),
+    Camera(CameraSpec),
     /// A microphone (macOS), by its id.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(String),
@@ -761,6 +788,10 @@ impl Engine {
                     self.lock().sources.insert(id, Src::new(live, None, Some(kind)));
                     return Ok(());
                 }
+                // The same camera parked with other settings (a new size or frame rate): let it go
+                // first, or two sessions share the device and neither gets a picture (owner's
+                // test, 10 Nov).
+                self.unpark_device(&kind);
                 let config = self.config;
                 let open = kind.clone();
                 return self.open_soon(
@@ -838,6 +869,26 @@ impl Engine {
         };
         self.lock().sources.insert(id, Src::new(live, size, restart));
         Ok(())
+    }
+
+    /// Stops any parked camera on the same device as `kind` (its settings differ), outside the
+    /// lock.
+    fn unpark_device(&self, kind: &SourceKind) {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        {
+            let SourceKind::Camera(want) = kind else { return };
+            let gone: Vec<_> = {
+                let mut st = self.lock();
+                let (same, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut st.parked)
+                    .into_iter()
+                    .partition(|(k, ..)| matches!(k, SourceKind::Camera(c) if c.id == want.id));
+                st.parked = keep;
+                same
+            };
+            drop(gone);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let _ = kind;
     }
 
     /// A parked capture of this kind, taken back (see `State::parked`).
@@ -2426,7 +2477,7 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             .map(Live::Screen),
         #[cfg(target_os = "windows")]
         SourceKind::AppSound(app) => ScreenCapture::start_app_sound(app).map(Live::Screen),
-        SourceKind::Camera(dev) => crate::camera::Capture::camera(dev).map(Live::Camera),
+        SourceKind::Camera(spec) => crate::camera::Capture::camera(spec).map(Live::Camera),
         SourceKind::Microphone(dev) => crate::camera::Capture::microphone(dev).map(Live::Microphone),
         _ => return None,
     })

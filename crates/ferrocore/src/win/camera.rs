@@ -58,11 +58,21 @@ pub struct Capture {
 
 impl Capture {
     /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
-    pub fn camera(id: &str) -> Result<Self, AvError> {
+    pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
+        let id = spec.id.as_str();
         let dev = if id.starts_with('@') { id.to_string() } else { id.split(":\\\\").next().unwrap_or(id).to_string() };
-        let input =
-            vec!["-f".into(), "dshow".into(), "-rtbufsize".into(), "256M".into(), "-i".into(), format!("video={dev}")];
-        Ok(Capture { live: Some(Live::start(&input, (1920, 1080), 60, None)?), sound: None })
+        let open = |asked: bool| {
+            let mut input: Vec<String> = vec!["-f".into(), "dshow".into(), "-rtbufsize".into(), "256M".into()];
+            if asked {
+                input.extend(crate::engine::camera_args(spec));
+            }
+            input.extend(["-i".into(), format!("video={dev}")]);
+            Live::start(&input, spec.size.unwrap_or((1920, 1080)), spec.fps.unwrap_or(60), None)
+        };
+        // A size or rate the camera can't do: its own instead.
+        let live =
+            open(true).or_else(|e| if spec.size.is_some() || spec.fps.is_some() { open(false) } else { Err(e) })?;
+        Ok(Capture { live: Some(live), sound: None })
     }
 
     /// A microphone by name ("default" or empty: the system's).

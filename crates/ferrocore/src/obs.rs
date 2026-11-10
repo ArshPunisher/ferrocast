@@ -347,6 +347,22 @@ fn cursor_on(s: &Value, key: &str) -> bool {
     s.get(key).and_then(Value::as_bool).unwrap_or(true)
 }
 
+/// A camera's device (under `key`, which differs by kind), with the size ("1920x1080") and
+/// frame rate asked of it when picked; "" and 0 leave the camera's own.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn camera_spec(s: &Value, key: &str) -> crate::engine::CameraSpec {
+    let size = s.get("resolution").and_then(Value::as_str).and_then(|r| {
+        let (w, h) = r.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    let fps = s.get("fps").and_then(Value::as_u64).filter(|f| (1..=240).contains(f)).map(|f| f as u32);
+    crate::engine::CameraSpec {
+        id: s.get(key).and_then(Value::as_str).unwrap_or_default().to_string(),
+        size: size.filter(|&(w, h): &(u32, u32)| w > 0 && h > 0),
+        fps,
+    }
+}
+
 fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result<(SourceKind, bool), String> {
     let text_of = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(match id {
@@ -512,7 +528,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         }
         #[cfg(target_os = "macos")]
         "av_capture_input" | "av_capture_input_v2" | "macos-avcapture" | "macos-avcapture-fast" => {
-            (SourceKind::Camera(text_of("device")), false)
+            (SourceKind::Camera(camera_spec(s, "device")), false)
         }
         // What the Mac plays: all of it (an app's own sound isn't separated yet).
         #[cfg(target_os = "macos")]
@@ -579,7 +595,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             }
         }
         #[cfg(target_os = "windows")]
-        "dshow_input" => (SourceKind::Camera(text_of("video_device_id")), false),
+        "dshow_input" => (SourceKind::Camera(camera_spec(s, "video_device_id")), false),
         #[cfg(target_os = "windows")]
         "wasapi_output_capture" | "wasapi_process_output_capture" => {
             if id == "wasapi_process_output_capture" {
@@ -610,7 +626,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "linux")]
-        "v4l2_input" => (SourceKind::Camera(text_of("device_id")), false),
+        "v4l2_input" => (SourceKind::Camera(camera_spec(s, "device_id")), false),
         #[cfg(target_os = "linux")]
         "pulse_output_capture" => (SourceKind::DesktopSound, true),
         #[cfg(target_os = "linux")]

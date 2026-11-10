@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(c) = cams.first() {
-        let cap = Capture::camera(&c.id)?;
+        let cap = Capture::camera(&c.id.as_str().into())?;
         std::thread::sleep(std::time::Duration::from_secs(3));
         let size = cap.take_frame().map(|(p, _)| (p.width, p.height));
         println!("{}: {} frames in 3 s, {size:?}", c.name, cap.received());
