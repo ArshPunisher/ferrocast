@@ -5,6 +5,25 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.1.0
+
+Popular OBS plugins, built in, and plugins you can add safely.
+
+- **Instant replay in a scene**: add Instant replay to a scene; each replay you save plays
+  there, the scene goes on air and comes back when the clip ends.
+- **When X, do Y** (Settings › Automations): when someone follows, raids, subs, tips, redeems a
+  reward, types a chat command, or the stream starts or ends, switch scenes, show or hide a
+  source, turn a filter on or off, save the replay, record or say something in chat.
+- **Top layer over every scene**: a scene's menu, "Show over every scene", for a logo or frame.
+- **New sources**: Countdown ("Starting in 4:59"), Sound bars that move with the music, Web
+  text (a number from any web address, like a viewer count), Keys on screen (your keys and
+  mouse buttons while you play), and Copy of a source.
+- **New filters**: Freeze, and Effects: CRT, Pixelate, Vignette, Colour split, Glitch, Wave,
+  Old film and Night vision.
+- **Plugins** (Settings › Plugins): effects, logic that answers events, and panels with
+  buttons. They can't read your files, keys or accounts, and do only what they list when you
+  add them.
+
 ## 3.0.6
 
 - Settings are easier to read: each page is a short list, one setting per row with a line
