@@ -1660,10 +1660,20 @@ impl StudioHost for DesktopStudio {
                     c.kind(&n).map_err(|e| e.to_string())
                 })
                 .await??;
-            let opts = self
+            let mut opts = self
                 .read_options(kind)
                 .await?
                 .ok_or_else(|| format!("Ferrocast's own engine can't show \"{name}\" yet."))?;
+            // The choices it takes from the collection (a clone's sources, what sound bars hear):
+            // a kind's form read on its own has them empty (owner, 10 Nov: "Nothing to choose").
+            let n = name.clone();
+            let opts = self
+                .on_main(move |h| -> Result<_, String> {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    c.fill_choices(&n, &mut opts).map_err(|e| e.to_string())?;
+                    Ok(opts)
+                })
+                .await??;
             return serde_json::to_value(opts).map_err(|e| e.to_string());
         }
         // How a source is doing: its settings read on the main thread, a Browser source's

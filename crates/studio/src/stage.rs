@@ -1270,6 +1270,15 @@ impl Stage {
         let s = self.source(name)?;
         let mut opts = crate::kinds::options(kind_of(&s))
             .ok_or_else(|| fail(format!("Ferrocast's own engine can't show \"{name}\" yet.")))?;
+        self.fill_choices(name, &mut opts)?;
+        Ok(opts)
+    }
+
+    /// The choices a form takes from this collection, put into `opts` (a kind's form read on
+    /// its own has them empty): a clone's sources and scenes, the sounds sound bars can listen
+    /// to. The app reads a kind's form off the main thread (devices) and fills these after.
+    pub fn fill_choices(&self, name: &str, opts: &mut [crate::OptionInfo]) -> Result<(), StudioError> {
+        let s = self.source(name)?;
         // Sound bars listen to the sound on air or a source with sound in this collection.
         if kind_of(&s) == "ferrocast_visualizer"
             && let Some(o) = opts.iter_mut().find(|o| o.key == "source")
@@ -1280,6 +1289,7 @@ impl Stage {
                 .filter(|x| name_of(x) != name && !is_scene(x))
                 .filter(|x| x.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0))
                 .filter(|x| {
+                    // Pictures and words never make sound, whatever their mixer flags say.
                     !matches!(
                         kind_of(x),
                         "image_source"
@@ -1288,6 +1298,11 @@ impl Stage {
                             | "ferrocast_clone"
                             | "ferrocast_countdown"
                             | "ferrocast_visualizer"
+                            | "ferrocast_web_text"
+                            | "ferrocast_inputs"
+                            | "slideshow"
+                            | "slideshow_v2"
+                            | "image_slide_show"
                     )
                 })
                 .map(|x| name_of(x).to_string())
@@ -1306,7 +1321,7 @@ impl Stage {
             o.choices = names.clone();
             o.values = names.into_iter().map(Value::from).collect();
         }
-        Ok(opts)
+        Ok(())
     }
 
     /// Changes some of a source's settings (the rest kept).
@@ -3722,6 +3737,9 @@ mod tests {
         let s = stage();
         ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/no/such.mp3" }), false));
         ok(s.add_source("Main", "color_source_v3", "Red", &json!({}), false));
+        // Silent kinds the mixer may still list (owner, 10 Nov): not offered.
+        ok(s.add_source("Main", "ferrocast_web_text", "Viewers", &json!({}), false));
+        ok(s.add_source("Main", "slideshow", "Photos", &json!({}), false));
         ok(s.add_source("Main", "ferrocast_visualizer", "Bars", &json!({}), false));
         let opts = ok(s.options("Bars"));
         let o = opts.iter().find(|o| o.key == "source").unwrap_or_else(|| panic!("a Listen to list"));
@@ -3809,6 +3827,13 @@ mod tests {
         assert_eq!(pick.choices, ["Red", "Main"], "the other source, then the scene; not itself");
         assert_eq!(pick.values, [json!("Red"), json!("Main")]);
         assert!(opts.iter().any(|o| o.key == "filters" && o.kind == "bool"));
+        // The app's way: the kind's form read on its own (empty list), then filled from the
+        // collection (owner, 10 Nov: the drawer said "Nothing to choose").
+        let mut read = crate::kinds::options("ferrocast_clone").unwrap_or_default();
+        assert!(read.iter().find(|o| o.key == "clone").is_some_and(|o| o.choices.is_empty()));
+        ok(s.fill_choices("Copy", &mut read));
+        let pick = read.iter().find(|o| o.key == "clone").unwrap_or_else(|| panic!("a Source list"));
+        assert_eq!(pick.choices, ["Red", "Main"]);
         // Its defaults: nothing picked yet, the source's filters included.
         assert_eq!(ok(s.settings("Copy"))["filters"], json!(true));
         // A countdown is silent too.
