@@ -1923,7 +1923,8 @@ impl Stage {
         // only outputs count (and started again if the size can't change).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.cutouts.borrow_mut().clear();
-        if self.engine.borrow().as_ref().is_some_and(|e| Arc::strong_count(e) > 1) {
+        if let Some(n) = self.engine.borrow().as_ref().map(Arc::strong_count).filter(|n| *n > 1) {
+            tracing::warn!(holders = n - 1, "the picture size can't change: something still uses the engine");
             self.sync_pages();
             return Err(fail("The picture size can't change while streaming or recording. Stop first."));
         }
@@ -3206,8 +3207,15 @@ impl Stage {
         // window included), not when the page next says.
         #[cfg(target_os = "macos")]
         {
-            let (engine, pid) = (shared.clone(), id);
-            view.on_resize(Box::new(move |w, h| engine.engine.resize_preview(pid, w, h)));
+            // Weak: AppKit can keep the view (and this) a moment after the preview is dropped,
+            // and a strong one made the engine look busy, so a new picture size was refused as
+            // "streaming or recording" when nothing was (owner, 11 Nov).
+            let (engine, pid) = (Arc::downgrade(&shared), id);
+            view.on_resize(Box::new(move |w, h| {
+                if let Some(e) = engine.upgrade() {
+                    e.engine.resize_preview(pid, w, h);
+                }
+            }));
         }
         let v = StageView { shared, id, view, look: RefCell::new(look), vertical };
         v.follow(self);
@@ -3506,8 +3514,10 @@ impl Stage {
         // Resizes reach the engine once the preview is there (a multiview is laid out again).
         let id_cell = std::rc::Rc::new(std::cell::Cell::new(None::<u64>));
         let resize = {
-            let (shared, id_cell, mv) = (shared.clone(), id_cell.clone(), multiview.clone());
+            // Weak, as the stage view's: the window can outlive the projector a moment.
+            let (weak, id_cell, mv) = (Arc::downgrade(&shared), id_cell.clone(), multiview.clone());
             Box::new(move |w: u32, h: u32| {
+                let Some(shared) = weak.upgrade() else { return };
                 if let Some(id) = id_cell.get() {
                     shared.engine.resize_preview(id, w, h);
                     if let Some(mv) = &mv {
