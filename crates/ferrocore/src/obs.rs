@@ -462,7 +462,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         "ferrocast_replay" => {
             let path = text_of("local_file");
             if path.is_empty() {
-                (SourceKind::Color { width: 16, height: 16, rgba: [0, 0, 0, 0] }, false)
+                // Canvas-sized, so fitting it before the first replay fits the replay too.
+                (SourceKind::Color { width: canvas.0.max(1), height: canvas.1.max(1), rgba: [0, 0, 0, 0] }, false)
             } else {
                 (SourceKind::Media { path: path.into(), looping: false }, true)
             }
@@ -1038,7 +1039,10 @@ mod tests {
     #[test]
     fn an_instant_replay_plays_the_file_its_given() {
         let kind = |set: Value| kind_from("ferrocast_replay", &set, (1920, 1080), &[]).map(|k| k.0);
-        assert!(matches!(kind(json!({})), Ok(SourceKind::Color { rgba: [0, 0, 0, 0], .. })));
+        assert!(
+            matches!(kind(json!({})), Ok(SourceKind::Color { width: 1920, height: 1080, rgba: [0, 0, 0, 0] })),
+            "clear and canvas-sized, so fitting it fits the replay"
+        );
         assert!(matches!(kind(json!({ "local_file": "" })), Ok(SourceKind::Color { .. })));
         match kind(json!({ "local_file": "/rec/Replay.mp4", "looping": true })) {
             Ok(SourceKind::Media { path, looping }) => {
