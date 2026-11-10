@@ -560,6 +560,7 @@ The cloud copy wins a conflict: this PC's overlay or design is kept as "… (thi
 | PUT | `/api/v1/plugins/{id}` | `{ on }` → the plugin. Off: its effect leaves the Effect lists and filters using it are left out (with why) until it's on again. 404 `plugin_not_found` |
 | DELETE | `/api/v1/plugins/{id}` | → 204. 404 `plugin_not_found` |
 | GET | `/api/v1/plugins/{id}/panel` | a panel plugin → `{ html, actions }`, for a sandboxed frame. 404 `plugin_not_found` (or not a panel), 422 when it's off |
+| GET | `/plugin-panel/{id}` (not under `/api/v1`, no token: never reached from a phone) | the same page as a page of its own, for the dashboard's frame (`sandbox="allow-scripts"`) when the dashboard is the engine's own: a `srcdoc` frame is held to the dashboard's policy too, which runs no inline scripts. Its policy: `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts`. Same 404 / 422 |
 | POST | `/api/v1/plugins/{id}/act` | a step (as Automations' `then`) a panel asked for → 204. 403 `plugin_not_allowed` when its `plugin.json` doesn't list that step, 404, 422 when off |
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 

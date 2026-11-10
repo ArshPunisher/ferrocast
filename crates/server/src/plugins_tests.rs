@@ -126,3 +126,29 @@ async fn every_refusal_has_its_status_and_says_why() {
     // Nothing got in.
     assert_eq!(s.get("/plugins").await.json::<Value>().await.unwrap(), json!([]));
 }
+
+/// A panel's page on its own (not the frame's srcdoc, which the dashboard's policy kept from
+/// running scripts): its inline code may run, nothing else loads, only the dashboard frames it.
+#[tokio::test]
+async fn a_panel_is_a_page_of_its_own() {
+    let s = start().await;
+    let m = json!({ "id": "com.ana.panel", "name": "Buttons", "version": "1.0.0", "kind": "panel", "panel": "panel.html", "actions": ["scene"] });
+    let html = b"<button onclick=\"parent.postMessage({type:'act',step:{type:'scene',name:'A'}},'*')\">A</button><script>1</script>";
+    let z = zip_of(&[("plugin.json", m.to_string().as_bytes()), ("panel.html", html)]);
+    assert_eq!(s.upload(z).await.status(), StatusCode::CREATED);
+    let page = s.client.get(format!("{}/plugin-panel/com.ana.panel", s.base)).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    for want in ["script-src 'unsafe-inline'", "default-src 'none'", "frame-ancestors 'self'", "sandbox allow-scripts"]
+    {
+        assert!(csp.contains(want), "{want} in {csp}");
+    }
+    assert!(page.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    assert!(page.text().await.unwrap().contains("<button onclick="));
+    // Off, or not a panel: no page.
+    s.put("/plugins/com.ana.panel", json!({ "on": false })).await;
+    let off = s.client.get(format!("{}/plugin-panel/com.ana.panel", s.base)).send().await.unwrap();
+    assert!(off.status().is_client_error());
+    let none = s.client.get(format!("{}/plugin-panel/nope.nope", s.base)).send().await.unwrap();
+    assert_eq!(none.status(), StatusCode::NOT_FOUND);
+}
