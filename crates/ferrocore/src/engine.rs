@@ -2205,7 +2205,88 @@ fn on_time() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: the frame loop at a high priority (libobs raises its video thread too), and the
+/// thread and the app out of Windows 11's power throttling (EcoQoS: Windows' App Nap, put on
+/// apps that are minimized or behind a game, which slows their threads and their timers).
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn on_time() {
+    use windows::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, GetCurrentProcess, GetCurrentThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation, SetThreadInformation,
+        SetThreadPriority, THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST, ThreadPowerThrottling,
+    };
+    // How, by `FERROCAST_FRAME_PRIORITY` (to compare on a PC, and a way out if one misbehaves):
+    // "highest", "above" (normal + 1), "mmcss" (Windows' multimedia scheduler, as a game) or
+    // "normal"; `FERROCAST_FRAME_THROTTLING=on` leaves power throttling to Windows.
+    let pick = std::env::var("FERROCAST_FRAME_PRIORITY").unwrap_or_default();
+    let mode = match pick.as_str() {
+        "above" | "normal" | "mmcss" => pick.as_str(),
+        _ => "highest",
+    };
+    let throttle = std::env::var("FERROCAST_FRAME_THROTTLING").is_ok_and(|v| v == "on");
+    // SAFETY: the pseudo-handle of this thread (never closed); MMCSS takes a static task name and
+    // a u32 of ours, and lets go of the thread when it ends.
+    let priority = unsafe {
+        match mode {
+            "highest" => SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST),
+            "above" => SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL),
+            "mmcss" => {
+                let mut index = 0u32;
+                AvSetMmThreadCharacteristicsW(windows::core::w!("Games"), &mut index).map(drop)
+            }
+            _ => Ok(()),
+        }
+    };
+    // Each in the control mask with its state off: "never throttle this", not "Windows decides".
+    let thread = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: if throttle { 0 } else { THREAD_POWER_THROTTLING_EXECUTION_SPEED },
+        StateMask: 0,
+    };
+    let process = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: if throttle {
+            0
+        } else {
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        },
+        StateMask: 0,
+    };
+    // SAFETY: the pseudo-handles of this thread and process (never closed), and structs of the
+    // sizes given, alive for each call.
+    let (slowed, app) = unsafe {
+        (
+            SetThreadInformation(
+                GetCurrentThread(),
+                ThreadPowerThrottling,
+                (&raw const thread).cast(),
+                size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+            ),
+            SetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                (&raw const process).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            ),
+        )
+    };
+    tracing::info!(
+        priority = mode,
+        power_throttling = if throttle { "Windows'" } else { "off" },
+        "the frame loop's place"
+    );
+    // Older Windows 10 lacks power throttling: the priority still counts.
+    for (what, r) in [("priority", priority), ("thread throttling", slowed), ("app throttling", app)] {
+        if let Err(e) = r {
+            tracing::debug!(%e, what, "the frame loop kept Windows' default");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn on_time() {}
 
 /// The frame loop.
@@ -2729,6 +2810,22 @@ mod tests {
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
+    }
+
+    /// The frame loop's thread runs high and isn't throttled (Windows 11's EcoQoS).
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_frame_thread_is_raised() {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        let got = std::thread::spawn(|| {
+            on_time();
+            // SAFETY: this thread's pseudo-handle.
+            unsafe { GetThreadPriority(GetCurrentThread()) }
+        })
+        .join()
+        .unwrap_or_default();
+        assert_eq!(got, THREAD_PRIORITY_HIGHEST.0);
     }
 
     /// Frame pacing at 1080p60 for a while: the share of frame times the loop woke too late for
