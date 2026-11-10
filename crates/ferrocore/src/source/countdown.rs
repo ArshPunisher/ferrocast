@@ -127,13 +127,26 @@ mod tests {
     #[test]
     fn the_worker_draws_and_ends() {
         let fonts = Arc::new(Mutex::new(TextRenderer::new()));
+        // The fonts read before the clock starts: a debug build reading a PC's many fonts took
+        // longer than the 150 ms the first words had (10 Nov, Windows), which isn't what's tested.
+        fonts.lock().unwrap_or_else(|e| e.into_inner()).render("warm", &TextStyle::default());
         let feed = Feed::default();
         let w = countdown(cd(CountTo::For(Duration::from_millis(300))), feed.clone(), fonts.clone());
-        std::thread::sleep(Duration::from_millis(150));
-        let first = feed.take_picture().unwrap_or_else(|| panic!("a first picture"));
+        let next = || {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(p) = feed.take_picture() {
+                    return Some(p);
+                }
+                if Instant::now() > until {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let first = next().unwrap_or_else(|| panic!("a first picture"));
         assert!(first.width > 1, "words drawn");
-        std::thread::sleep(Duration::from_millis(500));
-        let last = feed.take_picture().unwrap_or_else(|| panic!("the end message"));
+        let last = next().unwrap_or_else(|| panic!("the end message"));
         assert!(last.width > 1);
         // Nothing new while nothing changes.
         std::thread::sleep(Duration::from_millis(300));

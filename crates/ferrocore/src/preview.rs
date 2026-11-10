@@ -528,7 +528,8 @@ mod tests {
         // The canvas fills 142x80 at (29, 10): grey round it, red inside.
         let (ax, ay, aw, _) = canvas_area((200, 100), (160, 90), &look);
         assert_eq!((ax, ay, aw), (29.0, 10.0, 142.0));
-        assert_eq!(at(5, 50), [128, 128, 128], "background");
+        // Half grey: 127 or 128 by the card's rounding (NVIDIA on Windows gives 127).
+        assert!(at(5, 50).iter().all(|c| (127..=128).contains(c)), "background {:?}", at(5, 50));
         assert_eq!(at(100, 50), [255, 0, 0], "canvas");
         // The outline's top edge: canvas y 20 → view y 10 + 20 * 142/160 ≈ 27.75.
         assert_eq!(at(100, 28), [0, 255, 0], "outline");

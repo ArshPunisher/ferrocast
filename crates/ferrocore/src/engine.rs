@@ -3465,7 +3465,7 @@ mod tests {
     /// matched with its beep. Needs ffmpeg (skipped without it). `FERROCAST_SYNC_SECS` records
     /// longer than the 6 s default, to see drift.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn a_flash_and_its_beep_stay_together() {
         let secs: u64 = std::env::var("FERROCAST_SYNC_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
         let dir = std::env::temp_dir();
@@ -3507,7 +3507,7 @@ mod tests {
     }
 
     /// When the recording's picture turns bright (a flash starts), in seconds.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn flash_times(file: &std::path::Path) -> Vec<f64> {
         let out = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-i"])
@@ -3532,7 +3532,7 @@ mod tests {
     }
 
     /// When the recording's sound starts after a silence (a beep starts), in seconds.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn beep_times(file: &std::path::Path) -> Vec<f64> {
         let out = std::process::Command::new("ffmpeg")
             .args(["-v", "info", "-i"])
