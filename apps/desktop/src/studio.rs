@@ -58,6 +58,9 @@ struct Held {
     /// While an instant replay plays in its scene: the scene to go back to, the replay's
     /// scene and source, and since when.
     replay_back: Option<(String, String, String, std::time::Instant)>,
+    /// A replay handed to its source, waiting to play before its scene goes on air: the scene,
+    /// the source, and since when.
+    replay_wait: Option<(String, String, std::time::Instant)>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
     /// What's on air sent out as NDI.
     ndi: Option<ferrocast_studio::NdiOut>,
@@ -121,21 +124,39 @@ fn instant_replay(h: &mut Held) {
                         rb.2 = source;
                         rb.3 = std::time::Instant::now();
                     } else if back != scene {
-                        match c.set_current(&scene) {
-                            Ok(()) => {
-                                // A Move transition is stepped like any scene change.
-                                if c.moving() {
-                                    glide();
-                                }
-                                h.replay_back = Some((back, scene, source, std::time::Instant::now()));
-                            }
-                            Err(e) => tracing::warn!("the instant replay's scene couldn't go on air: {e}"),
-                        }
+                        h.replay_wait = Some((scene, source, std::time::Instant::now()));
                     }
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!("the instant replay couldn't play: {e}"),
             }
+        }
+    }
+    // Its scene goes on air once the replay plays and its first picture is in, not before:
+    // opening the file takes a moment (more on Windows, where FFmpeg looks at it first), and the
+    // scene was black meanwhile (10 Nov: up to 10 s on stream). One that doesn't open in 10 s
+    // doesn't go on air.
+    if let Some((scene, source, since)) = h.replay_wait.as_ref() {
+        let playing = c.media_state(source).is_ok_and(|m| m.state == "playing") && c.has_picture(source);
+        if playing {
+            let (scene, source) = (scene.clone(), source.clone());
+            h.replay_wait = None;
+            let back = c.current();
+            if back != scene {
+                match c.set_current(&scene) {
+                    Ok(()) => {
+                        // A Move transition is stepped like any scene change.
+                        if c.moving() {
+                            glide();
+                        }
+                        h.replay_back = Some((back, scene, source, std::time::Instant::now()));
+                    }
+                    Err(e) => tracing::warn!("the instant replay's scene couldn't go on air: {e}"),
+                }
+            }
+        } else if since.elapsed() > std::time::Duration::from_secs(10) {
+            tracing::warn!(source = %source, "the instant replay didn't open in 10 s: its scene stays off air");
+            h.replay_wait = None;
         }
     }
     let Some((back, scene, source, since)) = h.replay_back.as_ref() else { return };

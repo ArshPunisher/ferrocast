@@ -2733,6 +2733,12 @@ impl Stage {
         }
     }
 
+    /// Whether a source's first picture is in (our engine knows its size by then): an instant
+    /// replay's scene waits for it, or it went on air empty for up to a second.
+    pub fn has_picture(&self, name: &str) -> bool {
+        self.engine.borrow().as_ref().and_then(|e| e.engine.source_named(name)).is_some_and(|(_, size)| size.is_some())
+    }
+
     pub fn media_state(&self, name: &str) -> Result<crate::collection::MediaInfo, StudioError> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
