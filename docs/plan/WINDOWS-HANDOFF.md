@@ -1,5 +1,8 @@
 # Windows hand-off (written 10 Nov 2026, on the Mac)
 
+> **Run on the Windows PC 10-11 Nov:** results are in §8. The story (what got in the way, each
+> fix and its cause, what's left) is in `docs/plan/WINDOWS-SESSION-10NOV.md`.
+
 For Claude running on the owner's Windows 11 PC. Read this first, all of it, then
 `docs/plan/WINDOWS-NEXT.md` (the 7-8 Nov Windows work and how this PC was set up). Everything
 below was built and tested on a Mac and only **compiled** and smoke-tested for Windows on
@@ -77,6 +80,11 @@ api PUT /studio/engine/settings $s
 ```
 
 Notes:
+- **Smart App Control must be off to build** (owner turned it off 10 Nov). When on, it blocks
+  the newly built build scripts and proc-macro DLLs, and Rust reports "can't find crate"
+  (E0463) for a different crate each run. The CodeIntegrity log (event 3077) shows the blocks.
+- Run the smoke script from Windows PowerShell 5.1 too, not only `pwsh`: a `$crash`
+  variable was the `-Crash` switch there (names ignore case) and broke the end of the run.
 - Recordings may still go to `Videos\Ferrocast` even with `FERROCAST_HOME`: set
   `record_folder` as above, and delete test files.
 - Logs: `$T\home\logs\ferrocast.log`.
@@ -284,21 +292,31 @@ How the engine runs a frame (all systems):
 
 | Check | Result | Numbers / notes |
 |---|---|---|
-| Smoke 30 fps | | |
-| Smoke 60 fps | | |
-| 4.1 Add a source / freezes / filters / quit | | |
-| Instant replay | | |
-| Web text (http and https) | | |
-| Keys on screen | | |
-| Countdown, Sound bars, Copy, Freeze, Effects ×8, Top layer | | |
-| Automations, logic plugin, panel plugin | | |
-| Settings / setup / sign-in | | |
-| pacing_holds idle / busy (before → after) | | |
-| A/V sync test on Windows (ported) | | |
-| CPU at 30 / 60 fps | | |
-| Minimized behind a game (before → after) | | |
-| Encoder picked | | |
-| Preview, web sources, sound, background removal | | |
+| Smoke 30 fps | Pass (10 Nov) | 29.9 fps, 3 late, 0 of 645 recorded frames dropped, 5.3% CPU, sound -16.5 dB. NVIDIA GTX 1650 Ti, PC on the "Silent" power plan |
+| Smoke 60 fps | Pass, just (10 Nov) | Silent plan: 54.8 fps (bar 54), 265 late, 47 of 1320 dropped, 12.2% CPU. Performance plan: 59.5 fps, 27 late, 10 dropped, 7.6% CPU. The power plan is most of it  After the priority and media fixes: 59.6 fps, 11 late, 8 dropped. The smoke test has the odd run of 80-150 late on every build (a fresh home downloads the background-removal model and FFmpeg meanwhile, and the mic overruns), and its "preview placed while cameras are listed" check once took 602 ms (bar 500) while the camera list took 3.7 s: compare builds with `tools/windows-pace.ps1`, which is steady |
+| 4.1 Add a source / freezes / filters / quit | Pass, after fixes | No grey box; lists at once; this PC has no camera ("No camera found" is right); List view kept. **Fixed:** the window list showed tool and cloaked windows (our single-instance window, NVIDIA's overlay, Program Manager, suspended Settings, the input panel): now OBS's rules (`win/screen.rs` `pickable`). Adding a video stalls the window's thread once, ≤ 250 ms (`OPEN_WAIT`, by design). Filters on/off/remove and crop work. **Fixed:** a removed source kept running in the engine (14 FFmpegs, 32% CPU, frames late, a camera would stay on) and its name stayed taken: a source goes when no scene shows it, as in OBS (`stage.rs` `drop_unused`, also on load; Undo brings it back) |
+| Instant replay | Pass, after fixes | Re-checked: on air 1.6 s after Save with its picture already in, back 11.1 s later as the clip ended. **Fixed:** media forced to 60 RGBA fps (500 MB/s for 1080p) fell behind, so the clip ended ~30 s late and the CPU worked hard: now the file's own rate (`ffsrc.rs`). **Fixed:** the scene went on air before the file opened (up to 10 s black): now when it plays and its first picture is in (`studio.rs` `replay_wait`, `Stage::has_picture`) |
+| Web text (http and https) | Pass | Value drawn, updates within its 5 s minimum, https (schannel) works, a bad address warns once and draws nothing |
+| Keys on screen | Pass | W lights while held, dark in a classic password box. A browser's password field isn't detected on Windows (told the owner) |
+| Countdown, Sound bars, Copy, Freeze, Effects ×8, Top layer | Pass, after a fix | Countdown ticks, the font looks right. Bars: the 440 Hz tone lights one low-middle bar (a hidden source plays no sound, as in OBS). Copy: same picture, not in the mixer. **Fixed:** a Copy was 0×0 to the editor, so it couldn't be sized (`stage.rs` `own_size_of`). Freeze holds (0 change), moves when off. All 8 effects draw on D3D12, no shader errors. Top layer is over the scene in the recording |
+| Automations, logic plugin, panel plugin | Pass, panel fixed | Follow rule: Tests at 0.1 s, back at 2.2 s; a rule with no steps says why. Logic plugin: its log line, its allowed step ran, a step it didn't list was refused and logged. **Fixed (every system):** a panel's script never ran in the app, as a `srcdoc` frame is held to the dashboard's CSP (`script-src 'self'`): the engine now serves `/plugin-panel/{id}` with its own policy (`assets.rs`, dashboard `plugins-settings.tsx`) |
+| Settings / setup / sign-in | Pass, sign-in not tried | Layout fine at 100%, 125%, a short window and 375 px; picks in Ferrocast blue; setup 3 steps to Connect; no Mac words. **Fixed:** "Recording only" set high quality, which the Windows engine refused: constant quality on NVENC (`-cq`), QSV (`-global_quality`), AMF (`-rc cqp`), MF and x264 (`ffenc.rs`). Sign-in needs a CI build (client ids) and the owner's account |
+| Frames late at 1080p60, idle / busy (before → after) | Measured with the app (`tools/windows-pace.ps1`, a colour + a 1080p clip, recording, 60 s each, Silent plan) | Before: idle 0.08%, busy (burners on 6 of 8 threads) 9.84% late. **After** `on_time()` on Windows (the frame thread at THREAD_PRIORITY_HIGHEST, the thread and app out of power throttling, `engine.rs`): idle 0.03%, busy 0.19% (7 of 3,608). `FERROCAST_FRAME_PRIORITY` = highest (default), above, mmcss ("Games") or normal, and `FERROCAST_FRAME_THROTTLING=on`, to compare or as a way out. MMCSS measured the same (0.06% / 0.19% / 0.08%); in the smoke test (screen, Edge window, desktop sound, mic) every mode, normal included, had runs of 0-15 late and the odd run of 110-120, so those spikes aren't the priority (a fresh home downloads the background-removal model and FFmpeg meanwhile)  Final build (with a 1080p clip on the card's NV12 path): **0 late** idle, busy and minimized (3,602-3,613 frames each). A 10-minute 1080p60 recording: 35,996 frames (59.99 a second), longest step 34 ms, 6 late |
+| A/V sync test on Windows (ported) | Ported; **fixed** a 0.36 s offset | `a_flash_and_its_beep_stay_together` and its helpers now build on Windows (`cfg` macOS or Windows); it needs `ffmpeg` on the PATH (skipped without). The 6 s default passed but 60 s (`FERROCAST_SYNC_SECS=60`) showed a file's sound 0.35-0.39 s **before** its picture, steady, no drift: FFmpeg hands sound over ~0.44 s ahead of real time (`-re`, with or without `-readrate_initial_burst 0`), pictures about on time, and sound was stamped when it came. Now each piece is placed by its place in the file on the pictures' clock (`ffsrc.rs` `Shared::start_ns`, `Media::take_sound`): -31 to +21 ms over 60 s, within a frame. Left: a file whose sound track starts later than its picture (a stream `start` offset) still has its sound that much early (FFmpeg starts each output at 0). Tests: ferrocore 107 pass; studio 73 pass (`headless::a_page_reaches_the_engine` failed once under a full parallel run, passes alone: Edge starting late under load) |
+| CPU at 30 / 60 fps | Measured; video files on the card | `cpu.ps1` (scratch): one 1080p30 clip at 30 fps, 13.2% of the machine (the app 3.6%, its two FFmpegs 9.5%). Three clips at 60 fps: 78% CPU, 12 fps, 594 late in 20 s before the media fix → 49%, no late frames after.  **Then (10 Nov night) NV12 on the card:** FFmpeg hands a file's pictures over as NV12 (1.5 bytes a pixel, no RGBA made) and `yuv.wgsl` turns them into RGB in the source's own texture (`Compositor::upload_nv12`, `Media::open_for_card`, `Fresh::Yuv`; BT.709 or BT.601 and TV or full range from the file's tags, untagged: BT.709 from 720 lines; chroma sited left as H.264's). One 1080p30 clip at 30 fps: 12.2% → **4.8%** of the machine; three at 60 fps: 50.7% → **16.8%**, no late frames. Colours against FFmpeg's own bars: mean difference 0.67 (BT.709) and 1.05 (BT.601) of 255, the RGBA path 0.69 and 1.66. 60 fps files, seek, restart, looping and Instant replay checked in the app; the ffsrc tests now run on Windows too (they looked for FFmpeg in Mac and Linux paths only). The Mac keeps AVFoundation's pictures |
+| Minimized behind a game (before → after) | Measured | Before: minimized and busy 17.9% late (646 of 3,604): Windows throttles a minimized app. **After:** 0.03% (1 of 3,612), recording dropped 1 |
+| Encoder picked | h264_nvenc | Logged when an output starts ("an output starts encoder=…") and in `/studio/engine/stats` `record.encoder` / `stream.encoder`; the Stats panel says "Encoder: NVIDIA graphics card". 10 minutes at 1080p60: 35,996 frames, no gap over two frames |
+| Status bar FPS | Fixed | It was the share of frames made since the Studio started, so one busy minute kept it at "20 / 30" while every frame came on time. Now the last second's rate, as OBS shows it (`Stage::fps_now`) |
+| Preview while resizing | Pass, slow to follow | 30 resizes while recording: no GPU errors, the app lived, the file was written. With the PC compiling, the picture took 2-5 s to move to its new place |
+| Preview, web sources, sound, background removal | Pass, web pages fixed | One app's sound (the Edge tone window) recorded at -13.8 dB. Remove background on a 1080p30 clip: +11.5% CPU, 30 fps held. Strong noise removal (DeepFilterNet) on the mic: +2.6%. Not done here: two monitors, 150% scaling, unplugging a USB mic (needs the owner).  Web page source: drawn by the hidden Edge, transparent where the page is; its Edge and temp profile go with a normal quit. **Fixed:** `browser_source` wasn't in the Windows kinds, so Add a source had no web page or overlay (`kinds.rs`) |
+
+**What's next (10 Nov):**
+- The preview following a resize faster when the PC is busy (it's moved from the window's
+  thread, normal priority).
+- Sign-in on Windows ("Finish in browser") with a CI-built installer and the owner's account;
+  two monitors and 150% scaling; unplugging a USB mic mid-recording.
+- The pacing check is `tools/windows-pace.ps1`. The other scripts used here (`fc.ps1`, `cdp.mjs`, `cpu.ps1`, `check42.ps1`…) lived in
+  the session's scratch folder; the useful ones could become `tools/windows-*.ps1`.
 
 ---
 

@@ -3,6 +3,7 @@
 Read this first, every session.
 
 - **On Windows:** start with `docs/plan/WINDOWS-HANDOFF.md`, all of it, then
+  `docs/plan/WINDOWS-SESSION-10NOV.md` (what the 10-11 Nov session hit, fixed and left), then
   `docs/plan/WINDOWS-NEXT.md`. Run everything on the PC before calling it fixed.
 - **Branch:** `own-engine-only` in this repo and in `ferrocast-web`, the dashboard, which sits
   beside this repo.
