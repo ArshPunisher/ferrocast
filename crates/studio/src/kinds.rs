@@ -448,6 +448,13 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("drop_shadow", "Drop Shadow", "bool"),
             opt("custom_width", "Custom text width", "int").range(0.0, 4096.0, 1.0),
             opt("word_wrap", "Word Wrap", "bool"),
+            opt("align", "Align", "list").choices(&[
+                ("Left", json!("left")),
+                ("Centre", json!("center")),
+                ("Right", json!("right")),
+            ]),
+            opt("bk_color", "Background", "color"),
+            opt("bk_opacity", "Background opacity", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
         ],
         "ffmpeg_source" => vec![
             opt("is_local_file", "Local File", "bool"),
@@ -483,6 +490,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 opt("application", "Application", "list").choices(&as_refs(&app_choices())).when("type", &[json!(2)]),
             );
             v.push(opt("show_cursor", "Show Cursor", "bool"));
+            // Apps this display capture leaves out (bundle ids), as Privacy does for all.
+            #[cfg(target_os = "macos")]
+            v.push(opt("exclude_apps", "Leave out", "editable_list").when("type", &[json!(0)]));
             v
         }
         "av_capture_input" | "av_capture_input_v2" => {
@@ -830,21 +840,22 @@ pub fn defaults(kind: &str) -> Option<Value> {
             "font": { "face": "Helvetica", "size": 256, "style": "Regular", "flags": 0 },
             "text": "", "color1": 0xFFFF_FFFFu32, "color2": 0xFFFF_FFFFu32, "outline": false,
             "drop_shadow": false, "word_wrap": false, "custom_width": 0, "antialiasing": true,
+            "align": "left", "bk_color": 0xFF00_0000u32, "bk_opacity": 0,
         }),
         "ffmpeg_source" => {
             json!({ "is_local_file": true, "local_file": "", "looping": false, "restart_on_activate": true, "close_when_inactive": false, "speed_percent": 100 })
         }
-        "screen_capture" => json!({ "type": 0, "show_cursor": true, "application": "" }),
-        "av_capture_input" | "av_capture_input_v2" => json!({ "device": "" }),
+        "screen_capture" => json!({ "type": 0, "show_cursor": true, "application": "", "exclude_apps": [] }),
+        "av_capture_input" | "av_capture_input_v2" => json!({ "device": "", "resolution": "", "fps": 0 }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
         "sck_audio_capture" | "coreaudio_output_capture" => json!({ "type": 0, "application": "" }),
         "monitor_capture" => json!({ "monitor": 0, "capture_cursor": true }),
         "window_capture" => json!({ "cursor": true }),
-        "dshow_input" => json!({ "video_device_id": "" }),
+        "dshow_input" => json!({ "video_device_id": "", "resolution": "", "fps": 0 }),
         "wasapi_input_capture" | "wasapi_output_capture" => json!({ "device_id": "default" }),
         "wasapi_process_output_capture" => json!({ "window": "" }),
         "xshm_input" => json!({ "screen": 0, "show_cursor": true }),
-        "v4l2_input" => json!({ "device_id": "" }),
+        "v4l2_input" => json!({ "device_id": "", "resolution": "", "fps": 0 }),
         "pulse_input_capture" | "pulse_output_capture" => json!({ "device_id": "default" }),
         "browser_source" | "ferrocast_web" => json!({
             "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",

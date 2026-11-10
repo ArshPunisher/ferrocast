@@ -37,7 +37,7 @@ pub(crate) fn fetch(url: &str) -> Result<String, String> {
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
         return Err("only http and https addresses can be read".into());
     }
-    let reply = client()?.get(url.trim()).send().map_err(|e| e.without_url().to_string())?;
+    let reply = client()?.get(url.trim()).send().map_err(said)?;
     let status = reply.status();
     if !status.is_success() {
         return Err(format!("the address answered {status}"));
@@ -47,8 +47,22 @@ pub(crate) fn fetch(url: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// Hands our engine this client (once).
-pub(crate) fn install() {
+/// Why a request failed, in words people read in the drawer (not reqwest's).
+fn said(e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        "it took too long to answer".into()
+    } else if e.is_connect() {
+        "nothing answered at that address".into()
+    } else if e.is_redirect() {
+        "it sent the request round too many times".into()
+    } else {
+        e.without_url().to_string()
+    }
+}
+
+/// Hands our engine this client (once). Also before a source's status is read, which can
+/// come before the engine's first picture.
+pub fn install() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| ferrocore::source::webtext::set_fetcher(fetch));
 }

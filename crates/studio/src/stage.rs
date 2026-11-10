@@ -2756,12 +2756,21 @@ impl Stage {
                 },
                 time_ms: (at / 1_000_000) as i64,
                 duration_ms: (dur / 1_000_000) as i64,
+                file_bytes: self.file_bytes(name),
             })
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(fail(format!("\"{name}\": media files play on a Mac for now.")))
         }
+    }
+
+    /// A media source's file size, when its file is on this computer.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn file_bytes(&self, name: &str) -> Option<u64> {
+        let v = self.settings(name).ok()?;
+        let path = v.get("local_file").and_then(Value::as_str).filter(|p| !p.is_empty())?;
+        std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len())
     }
 
     /// Jumps to `ms` into a video or sound file.

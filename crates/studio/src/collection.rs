@@ -146,6 +146,9 @@ pub struct MediaInfo {
     /// Played and total, ms (0 when unknown, as for a slideshow).
     pub time_ms: i64,
     pub duration_ms: i64,
+    /// The file's size on disk, bytes, when it's one file here (shown beside its name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
 }
 
 /// `enum obs_blending_type`, in order.

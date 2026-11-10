@@ -42,6 +42,43 @@ fn fetch(url: &str) -> Result<String, String> {
     f.ok_or_else(|| "this app can't read web addresses".to_string())?(url)
 }
 
+/// Whether an address answers (a page a Browser source would show): Ok, or why not ("404",
+/// "couldn't reach it"). Through the app's web client, with its limits.
+pub fn check(url: &str) -> Result<(), String> {
+    fetch(url).map(|_| ())
+}
+
+/// The last read of a Web text: when (ms since 1970), the value it showed, and why the last
+/// read failed (None when it worked).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub at_ms: u64,
+    pub value: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The last read of each address and path being read.
+static STATUS: Mutex<Option<std::collections::HashMap<(String, String), Status>>> = Mutex::new(None);
+
+/// How the last read of `url` at `path` went, if it's been read.
+pub fn status(url: &str, path: &str) -> Option<Status> {
+    STATUS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(url.to_string(), path.to_string())).cloned()
+}
+
+fn note(url: &str, path: &str, got: &Result<String, String>) {
+    let at_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut all = STATUS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = all.get_or_insert_with(Default::default);
+    let key = (url.to_string(), path.to_string());
+    // A failed read keeps the value it last showed.
+    let value = match got {
+        Ok(v) => Some(v.clone()),
+        Err(_) => map.get(&key).and_then(|s| s.value.clone()),
+    };
+    map.insert(key, Status { at_ms, value, error: got.as_ref().err().cloned() });
+}
+
 /// The most a value shows (characters), so a whole web page can't fill the screen.
 const MOST: usize = 300;
 
@@ -103,7 +140,9 @@ pub(crate) fn web_text(w: WebText, feed: Feed, text: Arc<Mutex<TextRenderer>>) -
                     Err(_) => return,
                 }
             };
-            match got.and_then(|r| pick(&r, &w.path).ok_or_else(|| format!("nothing at \"{}\"", w.path))) {
+            let got = got.and_then(|r| pick(&r, &w.path).ok_or_else(|| format!("nothing at \"{}\"", w.path)));
+            note(&w.url, &w.path, &got);
+            match got {
                 Ok(v) => {
                     said_why = false;
                     let now = fill(&w.words, &v);
@@ -194,5 +233,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert!(bad.take_picture().is_none(), "nothing read, nothing drawn (it stays clear)");
         drop(worker);
+        // How each went, for the drawer's "Read 12 s ago" (the path here is "n").
+        let ok = status("https://ok.test/", "n").unwrap_or_else(|| panic!("a read noted"));
+        assert!(ok.at_ms > 0 && ok.error.is_none() && ok.value.is_some());
+        let down = status("https://down.test/", "n").unwrap_or_else(|| panic!("a failed read noted"));
+        assert!(down.error.is_some() && down.value.is_none());
     }
 }

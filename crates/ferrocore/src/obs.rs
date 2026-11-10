@@ -307,6 +307,19 @@ pub fn privacy_hide(doc: &Value) -> Vec<String> {
     hide
 }
 
+/// What a display capture leaves out: everything Privacy hides, and the apps this capture
+/// leaves out itself (`exclude_apps`, bundle ids).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_own_hide(hide: &[String], s: &Value) -> Vec<String> {
+    let mut out = hide.to_vec();
+    for a in s.get("exclude_apps").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        if !a.is_empty() && !out.iter().any(|h| h == a) {
+            out.push(a.to_string());
+        }
+    }
+    out
+}
+
 /// The files in an OBS file list (`[{ value, hidden }]`), a folder's files with one of `exts`
 /// in its place (sorted by name), hidden ones left out.
 fn files_of(list: Option<&Value>, exts: &[&str]) -> Vec<std::path::PathBuf> {
@@ -455,7 +468,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             }
             let w = crate::source::webtext::WebText {
                 url: url.trim().to_string(),
-                path: text_of("path"),
+                path: text_of("path").trim().to_string(),
                 words: s.get("words").and_then(Value::as_str).unwrap_or("{}").to_string(),
                 every_s: s.get("every").and_then(Value::as_u64).unwrap_or(30).clamp(5, 3600),
                 style: text_style_of(id, s),
@@ -511,7 +524,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                     // The display picked (by number), else the first (OBS keeps a display's UUID).
                     let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
                     let display = n("display").or_else(first).unwrap_or(0);
-                    (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
+                    (SourceKind::Screen { display, sound: false, hide: with_own_hide(hide, s), cursor }, false)
                 }
                 // Application Capture: one app's windows (its bundle id) on a display.
                 (2, _) => {
@@ -705,8 +718,22 @@ fn text_style_of(id: &str, s: &Value) -> TextStyle {
             Some("right") => TextAlign::Right,
             _ => TextAlign::Left,
         },
+        background: background_of(s),
+        padding: if background_of(s).is_some() { 12 } else { 0 },
         ..TextStyle::default()
     }
+}
+
+/// A box behind the text (OBS's Text GDI+ keys): its colour, seen through as much as
+/// `bk_opacity` (0 to 100) leaves; none at 0.
+fn background_of(s: &Value) -> Option<[u8; 4]> {
+    let opacity = s.get("bk_opacity").and_then(Value::as_u64).unwrap_or(0).min(100);
+    if opacity == 0 {
+        return None;
+    }
+    let mut c = color(s.get("bk_color").and_then(Value::as_u64).unwrap_or(0xFF00_0000));
+    c[3] = ((opacity * 255 + 50) / 100) as u8;
+    Some(c)
 }
 
 /// The next time the local clock reads `hm` ("21:30"), as milliseconds since 1970 (UTC):

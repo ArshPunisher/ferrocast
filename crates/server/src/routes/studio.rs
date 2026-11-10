@@ -113,6 +113,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/web", post(engine_web))
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
         .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
+        .route("/studio/engine/sources/{name}/status", get(engine_source_status))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
@@ -1132,6 +1133,12 @@ async fn engine_source_picture(
     Query(q): Query<ThumbQuery>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SourcePicture { name, width: q.w }).await
+}
+
+/// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a
+/// Browser source's address answers), for its drawer.
+async fn engine_source_status(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SourceStatus { name }).await
 }
 
 async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {

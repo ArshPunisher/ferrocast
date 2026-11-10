@@ -940,6 +940,9 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
+        A::SourceStatus { .. } => {
+            Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
+        }
         A::SourcePicture { name, width } => Ok(match c.source_picture_pixels(&name, width)? {
             Some((px, w, h, (sw, sh))) => {
                 json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
@@ -1662,6 +1665,39 @@ impl StudioHost for DesktopStudio {
                 .await?
                 .ok_or_else(|| format!("Ferrocast's own engine can't show \"{name}\" yet."))?;
             return serde_json::to_value(opts).map_err(|e| e.to_string());
+        }
+        // How a source is doing: its settings read on the main thread, a Browser source's
+        // address tried off it (the app's web client, its time limit).
+        if let StudioAct::SourceStatus { name } = &act {
+            let n = name.clone();
+            let (kind, settings) = self
+                .on_main(move |h| -> Result<(String, Value), String> {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    Ok((c.kind(&n).map_err(|e| e.to_string())?, c.settings(&n).map_err(|e| e.to_string())?))
+                })
+                .await??;
+            // Trimmed, as the engine keeps them (a Web text's reads are noted under these).
+            let text = |k: &str| settings.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+            return Ok(match kind.as_str() {
+                "ferrocast_web_text" => match ferrocore::source::webtext::status(&text("url"), &text("path")) {
+                    Some(s) => json!({ "web_text": { "at_ms": s.at_ms, "value": s.value, "error": s.error } }),
+                    None => json!({ "web_text": null }),
+                },
+                "browser_source" | "ferrocast_web"
+                    if !settings.get("is_local_file").and_then(Value::as_bool).unwrap_or(false) && {
+                        let u = text("url").to_ascii_lowercase();
+                        u.starts_with("http://") || u.starts_with("https://")
+                    } =>
+                {
+                    let url = text("url");
+                    ferrocast_studio::webfetch::install();
+                    let r = tokio::task::spawn_blocking(move || ferrocore::source::webtext::check(&url))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    json!({ "page": { "ok": r.is_ok(), "error": r.err() } })
+                }
+                _ => json!({}),
+            });
         }
         // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
         // milliseconds there, and the scene grid asks for one every few seconds).

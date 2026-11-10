@@ -1484,6 +1484,12 @@ pub enum StudioAct {
         name: String,
         width: u32,
     },
+    /// How a source is doing, for its drawer → `{ web_text?: { at_ms, value, error } | null }`
+    /// for a Web text (its last read), `{ page?: { ok, error } }` for a Browser source on the
+    /// web (whether its address answers); `{}` for the rest.
+    SourceStatus {
+        name: String,
+    },
     /// Puts these sources of a scene into a new group, each where it is on screen (OBS's
     /// Group Selected Items) → the group.
     GroupItems {
@@ -1735,6 +1741,7 @@ impl StudioAct {
                 check_source_name(name)
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
+            A::SourceStatus { name } => check_source_name(name),
             A::Thumbnail { scene: name, width } | A::SourcePicture { name, width } => {
                 check_source_name(name)?;
                 if !(64..=640).contains(width) {
@@ -1842,6 +1849,7 @@ impl StudioAct {
             A::Scenes
                 | A::Thumbnail { .. }
                 | A::SourcePicture { .. }
+                | A::SourceStatus { .. }
                 | A::Items { .. }
                 | A::Sources
                 | A::Settings { .. }

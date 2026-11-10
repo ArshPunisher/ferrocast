@@ -27,7 +27,7 @@ pub mod system;
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod virtualcam;
-mod webfetch;
+pub mod webfetch;
 
 use std::path::{Path, PathBuf};
 
