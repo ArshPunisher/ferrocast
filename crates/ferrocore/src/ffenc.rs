@@ -313,7 +313,8 @@ impl Video {
     /// this one's work), and takes over at the next frame, which it makes a keyframe; this one
     /// finishes what it was given first. Nothing's lost or doubled.
     pub(crate) fn set_kbps(&mut self, kbps: u32) -> Result<(), AvError> {
-        if matches!(self.cfg.rate, RateControl::Crf(_)) || kbps == self.cfg.bitrate_kbps {
+        // A quality has no bitrate to change.
+        if matches!(self.cfg.rate, RateControl::Crf(_) | RateControl::Quality(_)) || kbps == self.cfg.bitrate_kbps {
             return Ok(());
         }
         let mut cfg = self.cfg;
@@ -376,14 +377,47 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             "bt709".into(),
         ]);
         let cbr = matches!(cfg.rate, RateControl::Cbr);
-        match cfg.rate {
+        // Constant quality on libobs's scale, 0 (best) … 51, from the 0-1 the engine carries.
+        let cq = match cfg.rate {
+            RateControl::Quality(f) => Some((((1.0 - f.clamp(0.0, 1.0)) * 51.0).round() as u32).clamp(1, 51)),
+            _ => None,
+        };
+        match (cfg.rate, cq) {
             // A quality, not a bitrate: x264's rate factor (0 is lossless).
-            RateControl::Crf(q) => a.extend(["-crf".into(), q.min(51).to_string()]),
+            (RateControl::Crf(q), _) => a.extend(["-crf".into(), q.min(51).to_string()]),
+            // Each encoder's own quality option, below (VideoToolbox keeps its bitrate here).
+            (_, Some(_)) if enc != "h264_videotoolbox" => {}
             _ => a.extend(["-b:v".into(), format!("{kbps}k")]),
         }
         // A rate cap for steady encoders; VideoToolbox's own CBR turns off when one is given.
         if cbr && enc != "h264_videotoolbox" {
             a.extend(["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{}k", kbps * 2)]);
+        }
+        // Constant quality as OBS sets it on each encoder ("high" recordings: 16). Before, the
+        // Windows engine refused a recording at that quality (10 Nov, the owner's PC).
+        if let Some(q) = cq {
+            let q = q.to_string();
+            let quality: Vec<String> = match enc.as_str() {
+                "libx264" => vec!["-crf".into(), q, "-preset".into(), "veryfast".into()],
+                "h264_nvenc" => ["-preset", "p4", "-rc", "vbr", "-cq", &q, "-b:v", "0"].map(String::from).to_vec(),
+                "h264_qsv" => {
+                    ["-preset", "veryfast", "-look_ahead", "0", "-global_quality", &q].map(String::from).to_vec()
+                }
+                "h264_amf" => ["-usage", "transcoding", "-rc", "cqp", "-qp_i", &q, "-qp_p", &q, "-qp_b", &q]
+                    .map(String::from)
+                    .to_vec(),
+                "h264_mf" => {
+                    let pct = (100 - q.parse::<u32>().unwrap_or(16) * 100 / 51).to_string();
+                    ["-rate_control", "quality", "-quality", &pct, "-scenario", "archive"].map(String::from).to_vec()
+                }
+                _ => Vec::new(),
+            };
+            if !quality.is_empty() {
+                a.extend(quality);
+                a.extend(must_have(&enc).iter().map(|s| s.to_string()));
+                a.extend(["-f".into(), "flv".into(), "pipe:1".into()]);
+                return a;
+            }
         }
         let extra: &[&str] = match enc.as_str() {
             "libx264" if cbr => {
@@ -570,5 +604,46 @@ impl Audio {
             .try_iter()
             .filter_map(|(k, _, b)| (k == 8 && b.len() > 2 && b[1] == 1).then(|| b[2..].to_vec()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(rate: RateControl) -> VideoConfig {
+        VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            bitrate_kbps: 6000,
+            rate,
+            keyframe_secs: 2,
+            software: false,
+        }
+    }
+
+    fn has(a: &[String], pair: [&str; 2]) -> bool {
+        a.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1])
+    }
+
+    /// "High" recordings (libobs's 16) on each encoder's own quality option, with no bitrate.
+    #[test]
+    fn constant_quality_is_each_encoders_own() {
+        let high = cfg(RateControl::Quality(0.69));
+        let nv = args(&high, "h264_nvenc");
+        assert!(has(&nv, ["-rc", "vbr"]) && has(&nv, ["-cq", "16"]) && has(&nv, ["-b:v", "0"]), "{nv:?}");
+        assert!(!has(&nv, ["-b:v", "6000k"]) && !nv.iter().any(|s| s == "-maxrate"));
+        assert!(has(&args(&high, "h264_qsv"), ["-global_quality", "16"]));
+        assert!(has(&args(&high, "h264_amf"), ["-rc", "cqp"]));
+        assert!(has(&args(&high, "h264_mf"), ["-rate_control", "quality"]));
+        assert!(has(&args(&high, "libx264"), ["-crf", "16"]));
+        assert_eq!(args(&high, "h264_nvenc").last().map(String::as_str), Some("pipe:1"));
+        // A stream keeps its steady bitrate.
+        let cbr = args(&cfg(RateControl::Cbr), "h264_nvenc");
+        assert!(has(&cbr, ["-b:v", "6000k"]) && has(&cbr, ["-rc", "cbr"]));
     }
 }

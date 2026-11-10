@@ -51,8 +51,6 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("the vertical picture's stream")
     } else if s.vod_track.is_some_and(|t| !(2..=6).contains(&t)) {
         Some("a VOD track other than 2 to 6")
-    } else if s.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&s.encode.video_encoder) {
-        Some("constant quality")
     } else if !s.encode.extra.is_empty() {
         Some("an encoder's own options")
     } else if is_x264(&s.encode.video_encoder) && !ferrocore::ffenc::available() {
@@ -70,8 +68,6 @@ pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
         Some("this format (ours writes MP4 and MKV)")
     } else if !plan.muxer.trim().is_empty() {
         Some("custom muxer settings")
-    } else if plan.encode.quality.is_some() && !cfg!(target_os = "macos") && !is_x264(&plan.encode.video_encoder) {
-        Some("constant quality")
     } else if !plan.encode.extra.is_empty() {
         Some("an encoder's own options")
     } else if is_x264(&plan.encode.video_encoder) && !ferrocore::ffenc::available() {
@@ -979,14 +975,17 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }), None);
         }
-        assert!(
-            unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }).is_none()
-                == cfg!(target_os = "macos")
+        // Splitting is never why one is refused (off a Mac this held only because constant
+        // quality refused every recording there).
+        assert_eq!(
+            unsupported_recording(&RecordPlan { split_minutes: 10, ..plan.clone() }),
+            unsupported_recording(&plan)
         );
-        // Recordings default to constant quality: ours does it on the Mac.
+        // Constant quality ("high" recordings): ours does it everywhere (FFmpeg's encoders
+        // through their own quality options off a Mac), so it's never why one is refused.
         let mut cq = plan.clone();
         cq.encode.quality = Some(16);
-        assert_eq!(unsupported_recording(&cq).is_none(), cfg!(target_os = "macos"));
+        assert_eq!(unsupported_recording(&cq), unsupported_recording(&plan));
         assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
         cq.encode.quality = None;
         assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
