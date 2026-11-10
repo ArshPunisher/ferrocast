@@ -1,0 +1,9 @@
+{
+  "id": "com.ferrocast.example.scanlines",
+  "name": "Scanlines",
+  "version": "1.0.0",
+  "author": "Ferrocast",
+  "description": "Thin lines across the picture, like an old monitor.",
+  "kind": "effect",
+  "effect": "effect.wgsl"
+}

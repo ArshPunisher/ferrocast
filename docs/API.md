@@ -555,6 +555,10 @@ The cloud copy wins a conflict: this PC's overlay or design is kept as "… (thi
 |---|---|---|
 | POST | `/api/v1/media` | multipart `file` → `{ id, kind: "image" \| "sound" \| "video", name, bytes, url }`. Limits: images 10 MB (png, jpeg, gif, webp, svg not allowed), sounds 5 MB (mp3, ogg, wav), video 50 MB (webm, mp4). 413 / 415 with the limit in the message. |
 | GET | `/api/v1/media` | → media list |
+| GET | `/api/v1/plugins` | → installed plugins by name: `{ id, name, version, author, description, kind /* "effect" */, on, problem /* why it can't run, or null */ }[]`. Plugins bring code, so phones can't reach any `/plugins` route (403) |
+| POST | `/api/v1/plugins` | multipart `file` (the plugin's `.zip`, up to 2 MB) → 201 the plugin, installed and on (an update replaces the same id; a bad update keeps the old one). Its effect shows in a shader filter's Effect list as "Name (plugin)". Refusals: 413 `plugin_too_big` (the file, or a file in it over 512 KB), 415 `plugin_not_a_plugin` (not a zip, no `plugin.json`, a path outside its folder, more than 20 files), 415 `plugin_file_type` (anything but .json, .wgsl, .md, .txt, .png), 422 `plugin_manifest` (a bad id, name, version or kind), 422 `plugin_effect_broken` (its effect doesn't compile, with the first problem, or uses `loop`/`while`: plugin effects only loop a fixed number of times). Format: `docs/PLUGINS.md` |
+| PUT | `/api/v1/plugins/{id}` | `{ on }` → the plugin. Off: its effect leaves the Effect lists and filters using it are left out (with why) until it's on again. 404 `plugin_not_found` |
+| DELETE | `/api/v1/plugins/{id}` | → 204. 404 `plugin_not_found` |
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
 ### Discord go-live posts
