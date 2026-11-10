@@ -130,6 +130,9 @@ pub fn kinds() -> Kinds {
             kind("wasapi_input_capture", "Audio Input Capture"),
             kind("wasapi_output_capture", "Audio Output Capture"),
             kind("wasapi_process_output_capture", "Application Audio Capture"),
+            // A hidden Edge draws it (`ffi::headless`, since 2 Nov), but it wasn't listed, so
+            // Add a source had no web page or overlay to add on Windows (10 Nov).
+            kind("browser_source", "Browser"),
         ]);
     }
     if cfg!(target_os = "linux") {
