@@ -181,6 +181,42 @@ pub fn preset(id: &str) -> Option<&'static str> {
     PRESETS.iter().find(|(i, ..)| *i == id).map(|(.., code)| *code)
 }
 
+/// An effect a plugin brings (a checked WGSL `effect`, the same rules as one's own).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginEffect {
+    /// The plugin's id ("com.example.crt").
+    pub id: String,
+    pub name: String,
+    pub code: std::sync::Arc<str>,
+}
+
+/// The installed plugins' effects that are on; the app sets them at start and after a change.
+static PLUGINS: std::sync::RwLock<Vec<PluginEffect>> = std::sync::RwLock::new(Vec::new());
+
+/// What a plugin effect is called in a filter's settings (`preset`).
+pub fn plugin_preset(id: &str) -> String {
+    format!("plugin:{id}")
+}
+
+/// Replaces the plugin effects (the ones that are on).
+pub fn set_plugins(list: Vec<PluginEffect>) {
+    *PLUGINS.write().unwrap_or_else(|e| e.into_inner()) = list;
+}
+
+/// The plugin effects that are on, in the order they were set.
+pub fn plugins() -> Vec<PluginEffect> {
+    PLUGINS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The code of a filter's `preset`: a ready-made effect, or a plugin's (`plugin:<id>`) that is
+/// installed and on.
+pub fn effect_code(preset_id: &str) -> Option<std::sync::Arc<str>> {
+    if let Some(id) = preset_id.strip_prefix("plugin:") {
+        return PLUGINS.read().unwrap_or_else(|e| e.into_inner()).iter().find(|p| p.id == id).map(|p| p.code.clone());
+    }
+    preset(preset_id).map(std::sync::Arc::from)
+}
+
 /// The whole shader for an effect's code.
 pub fn source(code: &str) -> String {
     format!("{PRELUDE}\n{code}\n")

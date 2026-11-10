@@ -198,7 +198,11 @@ pub fn shader_from(s: &Value) -> Result<Effect, String> {
     // A ready-made effect from the gallery, or one's own (what a filter saved before the
     // gallery is).
     let preset = s.get("preset").and_then(Value::as_str).unwrap_or("custom");
-    let code = if preset != "custom" {
+    let code = if let Some(id) = preset.strip_prefix("plugin:") {
+        crate::shaderfx::effect_code(preset)
+            .ok_or_else(|| format!("the plugin {id} isn't installed, or is switched off"))?
+            .to_string()
+    } else if preset != "custom" {
         crate::shaderfx::preset(preset).ok_or_else(|| format!("there's no ready-made effect called {preset}"))?.to_string()
     } else if file.is_empty() {
         s.get("shader_text").and_then(Value::as_str).unwrap_or_default().to_string()
@@ -905,6 +909,20 @@ pub fn import(doc: &Value, canvas: (u32, u32)) -> Imported {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A filter set to a plugin's effect runs it while the plugin is installed and on, and is
+    /// left out with why once it isn't.
+    #[test]
+    fn a_plugin_effect_runs_only_while_installed() {
+        use crate::shaderfx::{PluginEffect, set_plugins};
+        let code = "fn effect(uv: vec2<f32>) -> vec4<f32> { let c = pic(uv); return vec4<f32>(1.0 - c.rgb, c.a); }";
+        set_plugins(vec![PluginEffect { id: "com.ana.invert".into(), name: "Invert".into(), code: code.into() }]);
+        let got = shader_from(&json!({ "preset": "plugin:com.ana.invert", "param1": 0.3 }));
+        assert!(matches!(got, Ok(Effect::Custom { ref code, .. }) if code.contains("1.0 - c.rgb")), "{got:?}");
+        set_plugins(Vec::new());
+        let e = shader_from(&json!({ "preset": "plugin:com.ana.invert" })).unwrap_err();
+        assert!(e.contains("com.ana.invert isn't installed, or is switched off"), "{e}");
+    }
 
     #[test]
     fn a_countdown_reads_its_settings() {
