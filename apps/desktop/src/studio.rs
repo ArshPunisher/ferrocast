@@ -806,6 +806,7 @@ fn record_stats(r: &(Recording, PathBuf, std::time::Instant)) -> Value {
         o.insert("file".into(), Value::String(r.1.display().to_string()));
         o.insert("seconds".into(), json!(r.2.elapsed().as_secs()));
         o.insert("error".into(), r.0.last_error().map_or(Value::Null, Value::String));
+        o.insert("encoder".into(), r.0.encoder().map_or(Value::Null, Value::String));
     }
     v
 }
@@ -814,6 +815,7 @@ fn stats_of(s: &Streaming) -> Value {
     let mut v = serde_json::to_value(s.stats()).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
         o.insert("error".into(), s.last_error().map_or(Value::Null, Value::String));
+        o.insert("encoder".into(), s.encoder().map_or(Value::Null, Value::String));
     }
     v
 }

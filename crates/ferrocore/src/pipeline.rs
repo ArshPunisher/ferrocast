@@ -251,6 +251,11 @@ impl Pipeline {
         })
     }
 
+    /// Which encoder its pictures go through ("h264_nvenc", "VideoToolbox", "libx264"…).
+    pub fn encoder(&self) -> String {
+        self.video.name()
+    }
+
     /// Makes this output a replay buffer: it keeps the last `seconds` (and at most `mb`
     /// megabytes, 0: no limit) in memory instead of writing a file; `replay_clip` takes it.
     pub fn keep_replay(&mut self, seconds: u32, mb: u32) {

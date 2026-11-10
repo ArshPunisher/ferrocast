@@ -1375,6 +1375,8 @@ impl Engine {
         if let Some((seconds, mb)) = replay {
             pipe.keep_replay(seconds, mb);
         }
+        // Which encoder this output got: libx264 here means the hardware ones failed their test.
+        tracing::info!(encoder = %pipe.encoder(), replay = replay.is_some(), "an output starts");
         // Made above without the engine's lock: starting FFmpeg (and, the first time, trying
         // each encoder) takes a second or more, and the frame loop waits on that lock every
         // frame, so every recording started with a burst of skipped frames.
@@ -1389,6 +1391,11 @@ impl Engine {
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
         Ok(id)
+    }
+
+    /// Which encoder an output's pictures go through ("h264_nvenc", "VideoToolbox", "libx264").
+    pub fn output_encoder(&self, id: u64) -> Option<String> {
+        self.with_output(id, |pipe| Ok(pipe.encoder())).ok()
     }
 
     /// A new video bitrate for an output from now on; false when its encoder has none to change

@@ -58,6 +58,9 @@ pub struct Stage {
     /// Remove background filters at work, by their mask picture's name.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
+    /// The frame rate as last worked out: when, the engine's frames and skipped count then,
+    /// and the rate over the second before (`stats`).
+    fps_seen: std::cell::Cell<Option<(std::time::Instant, u64, u64, f64)>>,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -159,6 +162,7 @@ impl Stage {
             ndi_failed: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
+            fps_seen: std::cell::Cell::new(None),
         };
         s.add_scene(first_scene)?;
         Ok(s)
@@ -183,6 +187,7 @@ impl Stage {
             ndi_failed: RefCell::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
+            fps_seen: std::cell::Cell::new(None),
         };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
@@ -1851,10 +1856,9 @@ impl Stage {
     pub fn stats(&self) -> crate::EngineStats {
         let (cpu, memory_mb) = crate::system::usage();
         let s = self.engine.borrow().as_ref().map(|e| e.engine.stats()).unwrap_or_default();
-        let total = (s.frames + s.skipped).max(1);
         crate::EngineStats {
             cpu,
-            fps: f64::from(self.canvas.fps) * s.frames as f64 / total as f64,
+            fps: self.fps_now(s.frames, s.skipped, std::time::Instant::now()),
             frame_ms: f64::from(s.frame_ms),
             lagged: s.skipped.min(u64::from(u32::MAX)) as u32,
             frames: s.frames.min(u64::from(u32::MAX)) as u32,
@@ -1864,6 +1868,26 @@ impl Stage {
             recovered: s.recovered.min(u64::from(u32::MAX)) as u32,
             restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
         }
+    }
+
+    /// The frame rate now, as OBS shows it: over the last second or so (at least a second
+    /// between counts), not since the Studio started. That average stayed low long after a
+    /// busy moment: "20 / 30" on 10 Nov while every frame came on time. The first count, with
+    /// nothing before it, is the share since the start.
+    fn fps_now(&self, frames: u64, skipped: u64, now: std::time::Instant) -> f64 {
+        let canvas = f64::from(self.canvas.fps);
+        let since_start = canvas * frames as f64 / (frames + skipped).max(1) as f64;
+        let fps = match self.fps_seen.get() {
+            Some((at, f, _, fps)) if now.duration_since(at) < std::time::Duration::from_secs(1) && frames >= f => {
+                return fps;
+            }
+            Some((at, f, _, _)) if frames >= f => (frames - f) as f64 / now.duration_since(at).as_secs_f64().max(0.001),
+            // A new engine (its count started again), or the first count.
+            _ => since_start,
+        };
+        let fps = fps.min(canvas);
+        self.fps_seen.set(Some((now, frames, skipped, fps)));
+        fps
     }
 
     /// Where "Hear it" plays: the system's default, then every output device by name.
@@ -2838,6 +2862,11 @@ impl StageOutput {
 
     pub fn record_stats(&self) -> RecordStats {
         self.own.record_stats()
+    }
+
+    /// Which encoder the output uses ("h264_nvenc"…), while it runs.
+    pub fn encoder(&self) -> Option<String> {
+        self.own.encoder()
     }
 
     pub fn last_error(&self) -> Option<String> {

@@ -784,6 +784,11 @@ impl OwnStream {
         RecordStats { active: s.active, paused, bytes, frames: s.frames }
     }
 
+    /// Which encoder our engine's output uses ("h264_nvenc"…), while it runs.
+    pub(crate) fn encoder(&self) -> Option<String> {
+        self.drawn.as_ref().and_then(|d| d.shared.engine.output_encoder(d.output))
+    }
+
     pub(crate) fn last_error(&self) -> Option<String> {
         if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.error()) {
             return Some(e);
