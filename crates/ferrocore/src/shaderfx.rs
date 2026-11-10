@@ -67,6 +67,120 @@ fn fx_fs(i: FxOut) -> @location(0) vec4<f32> {
 }
 ";
 
+/// Ready-made effects (the gallery, as OBS users get from Shaderfilter's examples): id, name
+/// and code. Slider 1 is how strong it is, slider 2 a size or a speed.
+pub const PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "crt",
+        "CRT screen",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let p = params();
+    let k = p.x * 0.004;
+    let c = pic(uv);
+    let rgb = vec3<f32>(pic(uv + vec2<f32>(k, 0.0)).r, c.g, pic(uv - vec2<f32>(k, 0.0)).b);
+    let rows = mix(size().y * 0.25, size().y * 0.5, p.y);
+    let line = 0.5 + 0.5 * sin(uv.y * rows * 6.28318);
+    let d = uv - vec2<f32>(0.5);
+    let shade = mix(1.0, 0.7 + 0.3 * line, p.x) * (1.0 - dot(d, d) * p.x * 1.4);
+    return vec4<f32>(rgb * shade, c.a);
+}",
+    ),
+    (
+        "pixelate",
+        "Pixelate",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let block = mix(4.0, 64.0, params().y);
+    let cells = max(size() / block, vec2<f32>(1.0));
+    let at = (floor(uv * cells) + vec2<f32>(0.5)) / cells;
+    return mix(pic(uv), pic(at), params().x);
+}",
+    ),
+    (
+        "vignette",
+        "Vignette",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let c = pic(uv);
+    let inner = mix(0.15, 0.55, params().y);
+    let v = 1.0 - smoothstep(inner, inner + 0.45, distance(uv, vec2<f32>(0.5)));
+    return vec4<f32>(c.rgb * mix(1.0, v, params().x), c.a);
+}",
+    ),
+    (
+        "chromatic",
+        "Colour split",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let o = (uv - vec2<f32>(0.5)) * params().x * mix(0.01, 0.06, params().y);
+    let c = pic(uv);
+    return vec4<f32>(pic(uv + o).r, c.g, pic(uv - o).b, c.a);
+}",
+    ),
+    (
+        "glitch",
+        "Glitch",
+        r"fn noise(x: f32) -> f32 {
+    return fract(sin(x * 127.1) * 43758.547);
+}
+
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let p = params();
+    let tick = floor(time() * mix(2.0, 20.0, p.y));
+    let band = floor(uv.y * 24.0);
+    let on = step(1.0 - p.x * 0.5, noise(band + tick * 13.0));
+    let shift = (noise(band * 3.1 + tick) - 0.5) * 0.08 * on;
+    let x = fract(uv.x + shift);
+    let c = pic(vec2<f32>(x, uv.y));
+    let s = 0.006 * on;
+    return vec4<f32>(pic(vec2<f32>(fract(x + s), uv.y)).r, c.g, pic(vec2<f32>(fract(x - s), uv.y)).b, c.a);
+}",
+    ),
+    (
+        "wave",
+        "Wave",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let p = params();
+    let dx = sin(uv.y * mix(6.0, 40.0, p.y) + time() * 3.0) * p.x * 0.03;
+    return pic(vec2<f32>(clamp(uv.x + dx, 0.0, 1.0), uv.y));
+}",
+    ),
+    (
+        "old_film",
+        "Old film",
+        r"fn grain(uv: vec2<f32>, t: f32) -> f32 {
+    return fract(sin(dot(uv * 997.0 + vec2<f32>(t, t * 1.7), vec2<f32>(12.9898, 78.233))) * 43758.547);
+}
+
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let p = params();
+    let c = pic(uv);
+    let y = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let sepia = vec3<f32>(y * 1.07, y * 0.88, y * 0.68);
+    let flicker = 1.0 - 0.06 * p.x * sin(time() * 23.0);
+    let noise = (grain(uv, floor(time() * 24.0)) - 0.5) * 0.25 * p.y;
+    let rgb = mix(c.rgb, sepia, p.x) * flicker + vec3<f32>(noise);
+    return vec4<f32>(rgb, c.a);
+}",
+    ),
+    (
+        "night_vision",
+        "Night vision",
+        r"fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let p = params();
+    let c = pic(uv);
+    let y = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let lit = clamp(y * mix(1.2, 2.5, p.y), 0.0, 1.0);
+    let green = vec3<f32>(lit * 0.25, lit, lit * 0.3);
+    let d = uv - vec2<f32>(0.5);
+    let ring = 1.0 - smoothstep(0.3, 0.75, length(d));
+    return vec4<f32>(mix(c.rgb, green * ring, p.x), c.a);
+}",
+    ),
+];
+
+/// A ready-made effect's code, by its id.
+pub fn preset(id: &str) -> Option<&'static str> {
+    PRESETS.iter().find(|(i, ..)| *i == id).map(|(.., code)| *code)
+}
+
 /// The whole shader for an effect's code.
 pub fn source(code: &str) -> String {
     format!("{PRELUDE}\n{code}\n")
@@ -118,6 +232,20 @@ mod tests {
 
     const INVERT: &str =
         "fn effect(uv: vec2<f32>) -> vec4<f32> { let c = pic(uv); return vec4<f32>(1.0 - c.rgb, c.a); }";
+
+    /// Every ready-made effect compiles (a broken one would be left out of the picture).
+    #[test]
+    fn every_ready_made_effect_compiles() {
+        assert!(PRESETS.len() >= 8);
+        for (id, name, code) in PRESETS {
+            assert_eq!(check(code), Ok(()), "{name} ({id})");
+            assert_eq!(preset(id), Some(*code));
+        }
+        let ids: std::collections::HashSet<_> = PRESETS.iter().map(|(i, ..)| *i).collect();
+        assert_eq!(ids.len(), PRESETS.len(), "ids are unique");
+        assert_eq!(preset("custom"), None);
+        assert_eq!(preset("nope"), None);
+    }
 
     #[test]
     fn a_good_effect_passes() {

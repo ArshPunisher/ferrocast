@@ -313,14 +313,23 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("clone", "Source", "list").choices(&[]),
             opt("filters", "Include its filters", "bool"),
         ],
-        "ferrocast_shader" => vec![
-            opt("shader_file", "Shader File", "path").file("WGSL Shaders (*.wgsl);;All Files (*.*)"),
-            opt("shader_text", "Or Write One Here", "text").multiline().mono(),
-            opt("param1", "Slider 1", "float").range(0.0, 1.0, 0.01).slider(),
-            opt("param2", "Slider 2", "float").range(0.0, 1.0, 0.01).slider(),
-            opt("param3", "Slider 3", "float").range(0.0, 1.0, 0.01).slider(),
-            opt("param4", "Slider 4", "float").range(0.0, 1.0, 0.01).slider(),
-        ],
+        "ferrocast_shader" => {
+            // The gallery first; one's own code only for "Your own".
+            let mut presets: Vec<(String, Value)> = vec![("Your own".into(), json!("custom"))];
+            presets.extend(ferrocore::shaderfx::PRESETS.iter().map(|(id, name, _)| ((*name).to_string(), json!(id))));
+            let own = [json!("custom")];
+            vec![
+                opt("preset", "Effect", "list").choices(&as_refs(&presets)),
+                opt("shader_file", "Shader File", "path")
+                    .file("WGSL Shaders (*.wgsl);;All Files (*.*)")
+                    .when("preset", &own),
+                opt("shader_text", "Or Write One Here", "text").multiline().mono().when("preset", &own),
+                opt("param1", "Strength", "float").range(0.0, 1.0, 0.01).slider(),
+                opt("param2", "Size or speed", "float").range(0.0, 1.0, 0.01).slider(),
+                opt("param3", "Slider 3", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
+                opt("param4", "Slider 4", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
+            ]
+        }
         "slideshow" | "slideshow_v2" | "image_slide_show" => vec![
             opt("files", "Image Files", "editable_list").files(IMAGES),
             opt("slide_time", "Time Between Slides", "int").range(50.0, 3_600_000.0, 50.0).unit(" ms"),
@@ -700,6 +709,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
         "ferrocast_shader" => json!({
+            "preset": "custom",
             "shader_file": "",
             "shader_text": "// Each point of the picture: pic(uv) reads it; time(), size() and params() help.\nfn effect(uv: vec2<f32>) -> vec4<f32> {\n    let c = pic(uv);\n    let gray = dot(c.rgb, vec3<f32>(0.299, 0.587, 0.114));\n    return vec4<f32>(mix(c.rgb, vec3<f32>(gray), params().x), c.a);\n}\n",
             "param1": 0.5, "param2": 0.5, "param3": 0.5, "param4": 0.5,

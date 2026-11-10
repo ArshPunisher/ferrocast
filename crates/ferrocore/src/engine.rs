@@ -3627,6 +3627,39 @@ mod tests {
         assert!(frozen(&st).is_empty(), "a switched-off freeze holds nothing");
     }
 
+    /// A ready-made effect from the gallery draws: a full vignette darkens the corners and
+    /// leaves the middle; an unknown one is left out with why; a filter saved before the
+    /// gallery (no "preset") keeps its own code.
+    #[test]
+    fn a_ready_made_effect_draws() {
+        let doc = |shader: serde_json::Value| {
+            serde_json::json!({
+                "current_program_scene": "Main",
+                "sources": [
+                    { "id": "color_source", "versioned_id": "color_source_v3", "name": "White",
+                      "settings": { "width": 640, "height": 360, "color": 4294967295u32 },
+                      "filters": [{ "id": "ferrocast_shader", "name": "Look", "settings": shader }] },
+                    { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "White", "id": 1 }] } }
+                ]
+            })
+        };
+        let Some(e) = engine() else { return };
+        let skipped = e.load_obs(&doc(serde_json::json!({ "preset": "vignette", "param1": 1.0, "param2": 0.0 })));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        std::thread::sleep(Duration::from_millis(200));
+        let px = e.snapshot().unwrap_or_default();
+        let at = |x: usize, y: usize| px[(y * 640 + x) * 4];
+        assert!(at(320, 180) > 240, "the middle stays white: {}", at(320, 180));
+        assert!(at(2, 2) < 60, "the corner goes dark: {}", at(2, 2));
+        let skipped = e.load_obs(&doc(serde_json::json!({ "preset": "nope" })));
+        assert!(skipped.iter().any(|s| s.contains("no ready-made effect called nope")), "{skipped:?}");
+        // Saved before the gallery: its own code (invert), no "preset".
+        let own = "fn effect(uv: vec2<f32>) -> vec4<f32> { let c = pic(uv); return vec4<f32>(1.0 - c.rgb, c.a); }";
+        assert!(e.load_obs(&doc(serde_json::json!({ "shader_text": own }))).is_empty());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(e.snapshot().unwrap_or_default()[0] < 10, "its own code still runs (white inverted)");
+    }
+
     /// A Source Clone draws its source's picture a second time, where it's placed.
     #[test]
     fn a_clone_draws_the_same_picture_again() {

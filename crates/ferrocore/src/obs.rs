@@ -195,7 +195,12 @@ fn mask_from(kind: &str, s: &Value, image: u64) -> Option<(Effect, std::path::Pa
 /// or else `shader_text`, and four sliders `param1`…`param4` (0 to 1). Err says why it can't run.
 pub fn shader_from(s: &Value) -> Result<Effect, String> {
     let file = s.get("shader_file").and_then(Value::as_str).unwrap_or_default().trim();
-    let code = if file.is_empty() {
+    // A ready-made effect from the gallery, or one's own (what a filter saved before the
+    // gallery is).
+    let preset = s.get("preset").and_then(Value::as_str).unwrap_or("custom");
+    let code = if preset != "custom" {
+        crate::shaderfx::preset(preset).ok_or_else(|| format!("there's no ready-made effect called {preset}"))?.to_string()
+    } else if file.is_empty() {
         s.get("shader_text").and_then(Value::as_str).unwrap_or_default().to_string()
     } else {
         let bytes = crate::read_file(std::path::Path::new(file), crate::shaderfx::MAX_LEN as u64).map_err(|e| {
