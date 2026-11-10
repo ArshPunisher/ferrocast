@@ -39,6 +39,8 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    # Whether a window is cloaked (left out of the window list).
+    "Win32_Graphics_Dwm",
     # Windows' own capture (Windows.Graphics.Capture) through Direct3D 11.
     "Foundation",
     "Graphics",

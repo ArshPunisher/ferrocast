@@ -3,11 +3,15 @@
 //! isn't there) and a window through GDI; and what the computer plays through WASAPI's loopback.
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    WS_CHILD, WS_EX_TOOLWINDOW,
+};
 use windows::core::BOOL;
 
 use crate::ffsrc::Live;
@@ -97,12 +101,35 @@ fn app_of(hwnd: HWND) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or("").trim_end_matches(".exe").to_string()
 }
 
-fn windows() -> Vec<Window> {
+/// A window someone would pick, by OBS's rules: not a tool window (tray helpers, overlays like
+/// NVIDIA's, the desktop's "Program Manager", our own single-instance window), not a child,
+/// and not cloaked (a Store app's frame while it's suspended, Windows' input panel, a window
+/// on another desktop). On 10 Nov the list showed all of those.
+fn pickable(hwnd: HWND) -> bool {
+    // SAFETY: a window handle EnumWindows gave; reading its styles changes nothing.
+    let (style, ex) = unsafe { (GetWindowLongW(hwnd, GWL_STYLE) as u32, GetWindowLongW(hwnd, GWL_EXSTYLE) as u32) };
+    if ex & WS_EX_TOOLWINDOW.0 != 0 || style & WS_CHILD.0 != 0 {
+        return false;
+    }
+    let mut cloaked = 0u32;
+    // SAFETY: a u32 for DWMWA_CLOAKED to fill, with its size given.
+    let got = unsafe {
+        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), size_of::<u32>() as u32)
+    };
+    got.is_err() || cloaked == 0
+}
+
+/// The visible windows with a title; `pick`: only those someone would pick (`pickable`).
+fn windows_of(pick: bool) -> Vec<Window> {
+    struct Found {
+        pick: bool,
+        list: Vec<Window>,
+    }
     unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> BOOL {
-        // SAFETY: `data` is the Vec given below, alive for EnumWindows.
-        let list = unsafe { &mut *(data.0 as *mut Vec<Window>) };
+        // SAFETY: `data` is the `Found` given below, alive for EnumWindows.
+        let found = unsafe { &mut *(data.0 as *mut Found) };
         // SAFETY: a window handle EnumWindows gave.
-        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() || (found.pick && !pickable(hwnd)) {
             return true.into();
         }
         let mut buf = [0u16; 512];
@@ -110,28 +137,33 @@ fn windows() -> Vec<Window> {
         let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
         if n > 0 {
             let title = String::from_utf16_lossy(&buf[..n as usize]);
-            list.push(Window { id: hwnd.0 as usize as u32, title, app: app_of(hwnd) });
+            found.list.push(Window { id: hwnd.0 as usize as u32, title, app: app_of(hwnd) });
         }
         true.into()
     }
-    let mut list: Vec<Window> = Vec::new();
-    // SAFETY: the callback reads `list` only during this call.
+    let mut found = Found { pick, list: Vec::new() };
+    // SAFETY: the callback reads `found` only during this call.
     unsafe {
-        let _ = EnumWindows(Some(each), LPARAM(&mut list as *mut _ as isize));
+        let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
     }
-    list
+    found.list
 }
 
-/// What can be captured now: displays, and visible windows with a title.
+/// Every visible window with a title (to find one that was picked, whatever it is now).
+fn windows() -> Vec<Window> {
+    windows_of(false)
+}
+
+/// What can be captured now: displays, and the windows someone would pick.
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     let displays =
         monitors().iter().enumerate().map(|(i, m)| Display { id: i as u32, width: m.2, height: m.3 }).collect();
-    Ok((displays, windows()))
+    Ok((displays, windows_of(true)))
 }
 
-/// The apps with a window open, by name.
+/// The apps with a window someone would pick, by name.
 pub fn apps() -> Result<Vec<App>, AvError> {
-    let mut names: Vec<String> = windows().into_iter().map(|w| w.app).filter(|a| !a.is_empty()).collect();
+    let mut names: Vec<String> = windows_of(true).into_iter().map(|w| w.app).filter(|a| !a.is_empty()).collect();
     names.sort_by_key(|n| n.to_lowercase());
     names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     Ok(names.into_iter().map(|n| App { id: n.clone(), name: n }).collect())
@@ -309,5 +341,47 @@ impl ScreenCapture {
             Pictures::Native(w) => w.ended(),
             Pictures::Ffmpeg(l) => l.ended(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    };
+    use windows::core::w;
+
+    /// A visible window of the predefined STATIC class, closed when dropped.
+    struct Shown(HWND);
+    impl Shown {
+        fn new(ex: WINDOW_EX_STYLE, title: windows::core::PCWSTR) -> Shown {
+            // SAFETY: a system class, no parent, menu or instance; the handle is ours to destroy.
+            let h = unsafe {
+                CreateWindowExW(ex, w!("STATIC"), title, WS_POPUP | WS_VISIBLE, 0, 0, 40, 40, None, None, None, None)
+            }
+            .expect("a test window");
+            Shown(h)
+        }
+        fn listed(&self, list: &[Window]) -> bool {
+            list.iter().any(|w| w.id == self.0.0 as usize as u32)
+        }
+    }
+    impl Drop for Shown {
+        fn drop(&mut self) {
+            // SAFETY: the window this test made, on this thread.
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[test]
+    fn the_window_list_leaves_out_tool_windows() {
+        let normal = Shown::new(WINDOW_EX_STYLE(0), w!("ferrocast test window"));
+        let tool = Shown::new(WS_EX_TOOLWINDOW, w!("ferrocast test tool window"));
+        let (_, picked) = shareable().unwrap();
+        assert!(normal.listed(&picked), "a normal window is listed");
+        assert!(!tool.listed(&picked), "a tool window (a tray helper, an overlay) isn't");
+        // Found again whatever it is, for a source that already names it.
+        assert!(tool.listed(&windows()));
     }
 }
