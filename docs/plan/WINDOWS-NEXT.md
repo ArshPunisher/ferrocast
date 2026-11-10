@@ -1,5 +1,8 @@
 # Windows: plan for the next session (written 4 Nov 2026, status to 8 Nov)
 
+> **Newer: `docs/plan/WINDOWS-HANDOFF.md` (10 Nov) says what to do next on Windows. Read it
+> first; this file is the history and how the PC was set up.**
+
 ## Status (7 Nov 2026, worked on the owner's Windows 11 PC)
 
 Steps 1-4 are done and pushed on `own-engine-only` (both repos). Each was reproduced on the
