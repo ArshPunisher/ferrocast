@@ -499,6 +499,13 @@ impl Stage {
         self.doc.borrow().get("current_program_scene").and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    /// Opens the scenes again in the engine as they are (a plugin's effect came or went).
+    pub fn refresh(&self) {
+        if let Some(e) = self.engine.borrow().as_ref() {
+            e.reopen(&self.doc.borrow());
+        }
+    }
+
     /// The scene shown over whatever is on air (the top layer: Exeldro's Downstream Keyer, built
     /// in), when one is set and still there.
     pub fn top_layer(&self) -> Option<String> {
@@ -3537,6 +3544,26 @@ mod tests {
         assert_eq!(s.privacy(), kept);
         s.set_privacy(&json!({})).unwrap();
         assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec![ferrocore::obs::NOTIFICATIONS.to_string()]);
+    }
+
+    /// Installed plugins' effects that are on are offered in the Effect list, after the ready-made.
+    #[test]
+    fn plugin_effects_are_in_the_effect_list() {
+        let fx = "fn effect(uv: vec2<f32>) -> vec4<f32> { return pic(uv); }";
+        ferrocore::shaderfx::set_plugins(vec![ferrocore::shaderfx::PluginEffect {
+            id: "com.ana.same".into(),
+            name: "Same".into(),
+            code: fx.into(),
+        }]);
+        let opts = crate::kinds::options("ferrocast_shader").unwrap_or_default();
+        let list = opts.iter().find(|o| o.key == "preset").unwrap_or_else(|| panic!("an Effect list"));
+        assert_eq!(list.choices.first().map(String::as_str), Some("Your own"));
+        assert_eq!(list.choices.last().map(String::as_str), Some("Same (plugin)"));
+        assert_eq!(list.values.last(), Some(&json!("plugin:com.ana.same")));
+        ferrocore::shaderfx::set_plugins(Vec::new());
+        let opts = crate::kinds::options("ferrocast_shader").unwrap_or_default();
+        let list = opts.iter().find(|o| o.key == "preset").unwrap_or_else(|| panic!("an Effect list"));
+        assert!(!list.choices.iter().any(|c| c.ends_with("(plugin)")), "gone once it's off");
     }
 
     /// The top layer follows its scene's name and goes with it; only a scene can be one.

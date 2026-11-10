@@ -334,6 +334,10 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             // The gallery first; one's own code only for "Your own".
             let mut presets: Vec<(String, Value)> = vec![("Your own".into(), json!("custom"))];
             presets.extend(ferrocore::shaderfx::PRESETS.iter().map(|(id, name, _)| ((*name).to_string(), json!(id))));
+            // Installed plugins' effects that are on, after the ready-made ones.
+            presets.extend(ferrocore::shaderfx::plugins().into_iter().map(|p| {
+                (format!("{} (plugin)", p.name), json!(ferrocore::shaderfx::plugin_preset(&p.id)))
+            }));
             let own = [json!("custom")];
             vec![
                 opt("preset", "Effect", "list").choices(&as_refs(&presets)),

@@ -1382,6 +1382,8 @@ pub enum StudioAct {
     },
     /// A PNG of exactly what's on air (black when faded, mid-transition as it is) → `{ file }`.
     ScreenshotProgram,
+    /// The scenes opened again in the engine, as they are (after a plugin changed).
+    Refresh,
     /// Clicks into, stops clicking or reloads a Web page source.
     Web {
         name: String,
@@ -1727,7 +1729,7 @@ impl StudioAct {
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
-            A::SwapScenes | A::FadeToBlack | A::MissingFiles | A::ScreenshotProgram => Ok(()),
+            A::SwapScenes | A::FadeToBlack | A::MissingFiles | A::ScreenshotProgram | A::Refresh => Ok(()),
             A::AddGroup { scene, name } | A::PasteCopy { scene, name } => {
                 check_source_name(scene)?;
                 check_source_name(name)
@@ -1852,6 +1854,7 @@ impl StudioAct {
                 | A::Filters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
+                | A::Refresh
                 | A::FilterSettings { .. }
                 | A::FilterOptions { .. }
                 | A::Select { .. }

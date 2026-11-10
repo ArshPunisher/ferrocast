@@ -834,6 +834,10 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             "top_layer": c.top_layer(),
         }))),
         A::SetTopLayer { scene } => done(c.set_top_layer(scene.as_deref())),
+        A::Refresh => {
+            c.refresh();
+            Ok(Value::Null)
+        }
         A::StartVertical { scene } => done(c.start_vertical(&scene)),
         A::StopVertical => {
             c.stop_vertical();
