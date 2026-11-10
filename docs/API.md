@@ -561,6 +561,16 @@ The cloud copy wins a conflict: this PC's overlay or design is kept as "… (thi
 | DELETE | `/api/v1/plugins/{id}` | → 204. 404 `plugin_not_found` |
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
+### Automations ("When X, do Y", free, local)
+
+A rule has one `when` and up to 10 steps in `then`, run one after another; it runs at most once per `cooldown_s` (3 to 3600, default 10). Kept in the data folder's `automations.json`. Events caught up on after a gap (backfill) and hidden chat never set a rule off.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/v1/automations` | → the rules: `{ id, name, on, when, then, cooldown_s }[]` |
+| PUT | `/api/v1/automations` | the whole list → the list as saved. `when.type`: `follow`, `raid { min }`, `sub` (subs and gifted subs), `support` (tips that arrived, paid messages, bits and stars), `reward { name /* "" any */ }`, `chat { text /* "!clip": the message starts with it */, anyone /* false: mods and the streamer only */ }`, `live_start`, `live_end`, `scene { name }` (a scene going on air), `every { minutes /* 1-720, while live */ }`. Step `type`: `scene { name }`, `show`/`hide { scene, source }`, `filter { source, filter, on }`, `save_replay`, `record { on }`, `chat { text /* {name}: who set it off */ }`, `wait { seconds /* 1-600 */ }`. Up to 50 rules; names up to 60 characters, texts up to 300. 422 `automation_invalid` with what's wrong (the saved list stays) |
+| POST | `/api/v1/automations/{id}/run` | → 202: its steps run now, cooldown or not (the Test button). 404 `automation_not_found`. A step that fails stops the rule and sends a `notice` saying which step and why |
+
 ### Discord go-live posts
 The streamer pastes a Discord webhook URL; Ferrocast posts when a platform goes live. The URL is a secret: it is kept in the secret store (R-45), never in the database, never in a `.ferropack`, never sent back.
 

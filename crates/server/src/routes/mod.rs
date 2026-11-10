@@ -16,6 +16,7 @@ mod import;
 mod loyalty;
 #[cfg(test)]
 pub(crate) use core::lan_ip;
+mod automations;
 mod media;
 mod moderation;
 mod plugins;
@@ -222,6 +223,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(crate::remote::routes())
         // Plugins: effects others make (see routes/plugins.rs; installing is an upload)
         .merge(plugins::routes())
+        // "When X, do Y" rules (routes/automations.rs)
+        .merge(automations::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.

@@ -195,6 +195,8 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
 }
 
 #[cfg(test)]
+mod automations_tests;
+#[cfg(test)]
 mod designs_tests;
 #[cfg(test)]
 mod plugins_tests;

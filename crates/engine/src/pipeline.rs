@@ -257,6 +257,11 @@ impl Engine {
             self.support_event(&e).await;
         }
 
+        // "When X, do Y" (hidden chat never sets a rule off).
+        if show_in_overlays || !matches!(e.kind, EventKind::ChatMessage { .. }) {
+            self.automation_saw(&e);
+        }
+
         self.send_live_event(e.seq, LiveFrame::new("event", &e));
         // The dashboard gets the message first, then the mark that it's held (R-48).
         if let Some(reason) = held {

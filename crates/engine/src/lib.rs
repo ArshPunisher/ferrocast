@@ -18,6 +18,7 @@ mod cloud_sync_tests;
 #[cfg(test)]
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
+pub mod automation;
 pub mod designs;
 mod discord;
 mod dispatcher;
@@ -34,8 +35,8 @@ pub mod music;
 mod obs;
 pub mod obs_theme;
 mod patch;
-pub mod plugins;
 mod pipeline;
+pub mod plugins;
 mod polls;
 mod pro;
 pub mod speech_model;
@@ -196,6 +197,8 @@ struct Inner {
     music: music::Music,
     /// The Studio's engine, run by the desktop app (2.1, Track B).
     studio_host: studio_host::Slot,
+    /// "When X, do Y" rules and when each last ran.
+    automations: Mutex<automation::Automations>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -330,6 +333,7 @@ impl Engine {
                 golive: Default::default(),
                 music: Default::default(),
                 studio_host: Default::default(),
+                automations: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -337,6 +341,7 @@ impl Engine {
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(automation::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
         tokio::spawn(giveaways::run(engine.clone()));
