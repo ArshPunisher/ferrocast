@@ -209,6 +209,7 @@ impl Stage {
         if let Some(e) = self.engine.borrow().as_ref() {
             return Ok(e.clone());
         }
+        crate::webfetch::install();
         let shared = own::Shared::open_at(self.canvas, &self.doc.borrow())?;
         // Monitoring plays from the start, as libobs keeps its device open: opened only when
         // Settings were saved, every new engine (each start, a new picture size) had none, and
@@ -506,7 +507,6 @@ impl Stage {
         }
     }
 
-    /// The scene shown over whatever is on air (the top layer: Exeldro's Downstream Keyer, built
     /// Instant replay: every Instant Replay source plays `file` (a replay just saved) from the
     /// start. Returns the first such source that asked to be shown while it plays, and the scene
     /// it's in (the app goes there and back), when one did.
@@ -537,6 +537,7 @@ impl Stage {
         }))
     }
 
+    /// The scene shown over whatever is on air (the top layer: Exeldro's Downstream Keyer, built
     /// in), when one is set and still there.
     pub fn top_layer(&self) -> Option<String> {
         let top = self.doc.borrow().get("ferrocast_top_layer").and_then(Value::as_str).map(String::from)?;
@@ -785,6 +786,8 @@ impl Stage {
                     | "source-clone"
                     | "ferrocast_countdown"
                     | "ferrocast_visualizer"
+                    | "ferrocast_web_text"
+                    | "ferrocast_inputs"
             );
         ItemInfo {
             id: it.get("id").and_then(Value::as_i64).unwrap_or(0),
@@ -3658,9 +3661,6 @@ mod tests {
         assert_eq!(s.top_layer(), None);
     }
 
-    /// A clone's Source list holds every other source, then the scenes, never itself.
-    #[test]
-    fn a_clone_picks_from_this_collection() {
     /// Instant replay: a saved replay goes to every Instant Replay source; the first that asked
     /// names its scene to show; none set, a source not in a scene, or switch off: no scene.
     #[test]
@@ -3689,6 +3689,9 @@ mod tests {
         assert_eq!(opts.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["switch"], "its file isn't in its form");
     }
 
+    /// A clone's Source list holds every other source, then the scenes, never itself.
+    #[test]
+    fn a_clone_picks_from_this_collection() {
         let s = stage();
         ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 20, "height": 20 }), false));
         ok(s.add_source("Main", "ferrocast_clone", "Copy", &json!({}), false));

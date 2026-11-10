@@ -413,6 +413,39 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             };
             (SourceKind::Visualizer(spec), false)
         }
+        "ferrocast_inputs" => {
+            use crate::source::inputs::{InputSpec, LAYOUTS, layout};
+            let pick = text_of("layout");
+            let text = match LAYOUTS.iter().find(|(id, ..)| *id == pick) {
+                Some((.., l)) => (*l).to_string(),
+                None if pick == "custom" => text_of("keys"),
+                None => LAYOUTS[0].2.to_string(),
+            };
+            let c = |k: &str, d: u64| color(s.get(k).and_then(Value::as_u64).unwrap_or(d));
+            let spec = InputSpec {
+                rows: layout(&text)?,
+                cap: s.get("size").and_then(Value::as_u64).unwrap_or(64).clamp(16, 256) as u32,
+                rest: c("color_rest", 0xCC28_2828),
+                held: c("color_held", 0xFF1F_5AFF),
+                text: c("color_text", 0xFFFF_FFFF),
+            };
+            (SourceKind::Inputs(spec), false)
+        }
+        "ferrocast_web_text" => {
+            let url = text_of("url");
+            let u = url.trim().to_ascii_lowercase();
+            if !(u.starts_with("https://") || u.starts_with("http://")) {
+                return Err("a web text source needs an http or https address".into());
+            }
+            let w = crate::source::webtext::WebText {
+                url: url.trim().to_string(),
+                path: text_of("path"),
+                words: s.get("words").and_then(Value::as_str).unwrap_or("{}").to_string(),
+                every_s: s.get("every").and_then(Value::as_u64).unwrap_or(30).clamp(5, 3600),
+                style: text_style_of(id, s),
+            };
+            (SourceKind::WebText(w), false)
+        }
         "ferrocast_countdown" => {
             use crate::source::countdown::{CountTo, Countdown};
             let to = if s.get("mode").and_then(Value::as_str) == Some("until") {
@@ -957,6 +990,48 @@ mod tests {
         // The sound on air, and sizes held to what can be drawn.
         let Ok(SourceKind::Visualizer(v)) = kind(json!({ "source": " ", "bars": 500, "width": 0 })) else { panic!() };
         assert_eq!((v.of, v.bars, v.width), (None, 64, 16));
+    }
+
+    /// An input overlay's keys come from a ready layout or one's own; unknown keys are refused.
+    #[test]
+    fn an_input_overlay_shows_its_layouts_keys() {
+        use crate::source::inputs::{Cap, Key};
+        let kind = |set: Value| kind_from("ferrocast_inputs", &set, (1920, 1080), &[]).map(|k| k.0);
+        match kind(json!({ "layout": "arrows", "size": 9999 })) {
+            Ok(SourceKind::Inputs(s)) => {
+                assert_eq!(s.rows[1], vec![Cap::Key(Key::Left), Cap::Key(Key::Down), Cap::Key(Key::Right)]);
+                assert_eq!(s.cap, 256, "held to a sane size");
+            }
+            other => panic!("an input overlay: {other:?}"),
+        }
+        assert!(
+            matches!(kind(json!({ "layout": "custom", "keys": "Q E" })), Ok(SourceKind::Inputs(s)) if s.rows[0].len() == 2)
+        );
+        assert!(matches!(kind(json!({})), Ok(SourceKind::Inputs(s)) if s.rows.len() == 3), "WASD by default");
+        assert!(kind(json!({ "layout": "custom", "keys": "Q ?" })).is_err());
+        assert!(kind(json!({ "layout": "custom", "keys": "" })).is_err());
+    }
+
+    /// A web text source takes only web addresses, and reads at most every 5 seconds.
+    #[test]
+    fn a_web_text_reads_a_web_address() {
+        let kind = |set: Value| kind_from("ferrocast_web_text", &set, (1920, 1080), &[]).map(|k| k.0);
+        for bad in ["", "file:///etc/passwd", "ftp://x.test/", "javascript:alert(1)", "localhost:8080"] {
+            assert!(kind(json!({ "url": bad })).is_err(), "{bad:?} isn't a web address");
+        }
+        match kind(json!({ "url": " https://api.test/stats ", "path": "data.n", "words": "Viewers: {}", "every": 1 })) {
+            Ok(SourceKind::WebText(w)) => {
+                assert_eq!(
+                    (w.url.as_str(), w.path.as_str(), w.words.as_str()),
+                    ("https://api.test/stats", "data.n", "Viewers: {}")
+                );
+                assert_eq!(w.every_s, 5, "not more often than every 5 seconds");
+            }
+            other => panic!("a web text: {other:?}"),
+        }
+        assert!(
+            matches!(kind(json!({ "url": "HTTP://x.test/" })), Ok(SourceKind::WebText(w)) if w.every_s == 30 && w.words == "{}")
+        );
     }
 
     /// An instant replay is clear until the app hands it a replay, then plays it once.

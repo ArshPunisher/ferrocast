@@ -37,6 +37,10 @@ pub enum SourceKind {
     },
     /// Counts down for a set time or to a time of day, then says its end message.
     Countdown(crate::source::countdown::Countdown),
+    /// Keys and mouse buttons, lit while held (only the layout's keys are looked at).
+    Inputs(crate::source::inputs::InputSpec),
+    /// Text read from a web address every so often.
+    WebText(crate::source::webtext::WebText),
     /// Bars that move with the sound on air, or one source's.
     Visualizer(crate::source::visualizer::VisualizerSpec),
     /// A test tone (a beep of `beep_ms` every `every_ms`), for checks and line-ups.
@@ -787,6 +791,19 @@ impl Engine {
             SourceKind::Countdown(c) => {
                 let feed = Feed::default();
                 let worker = crate::source::countdown::countdown(c, feed.clone(), self.text.clone());
+                (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
+            }
+            SourceKind::Inputs(spec) => {
+                crate::source::inputs::ask_once();
+                let (w, h) = crate::source::inputs::size(&spec);
+                let feed = Feed::default();
+                let keys = Box::new(crate::source::inputs::System);
+                let worker = crate::source::inputs::input_overlay(spec, keys, feed.clone(), self.text.clone());
+                (Live::Series { feed, _worker: worker }, Some(Picture::solid(w.max(1), h.max(1), [0, 0, 0, 0])))
+            }
+            SourceKind::WebText(w) => {
+                let feed = Feed::default();
+                let worker = crate::source::webtext::web_text(w, feed.clone(), self.text.clone());
                 (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
             }
             SourceKind::Slides(s) => {

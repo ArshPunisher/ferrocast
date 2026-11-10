@@ -3,6 +3,8 @@
 
 pub mod countdown;
 pub mod image;
+pub mod inputs;
 pub mod series;
 pub mod text;
 pub mod visualizer;
+pub mod webtext;

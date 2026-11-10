@@ -19,6 +19,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 png = "0.17"
+# Web text sources read their address with it (ferrocore has no web client).
+reqwest = { version = "0.13", features = ["blocking"] }
 # Recording names from OBS's pattern (%CCYY-%MM-%DD…) in local time.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Free disk space and the app's own CPU and memory use.

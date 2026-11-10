@@ -102,6 +102,8 @@ pub fn kinds() -> Kinds {
         kind("ferrocast_clone", "Source Clone"),
         kind("ferrocast_countdown", "Countdown"),
         kind("ferrocast_visualizer", "Audio Visualizer"),
+        kind("ferrocast_web_text", "Web Text"),
+        kind("ferrocast_inputs", "Input Overlay"),
     ];
     // Where media files report how far they've played (the replay's scene goes back when it ends).
     if cfg!(any(target_os = "macos", target_os = "windows")) {
@@ -321,6 +323,31 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("height", "Height", "int").range(8.0, 2160.0, 1.0),
             opt("color", "Color", "color_alpha"),
             opt("mirror", "From the middle", "bool"),
+        ],
+        "ferrocast_inputs" => {
+            let mut layouts: Vec<(String, Value)> = ferrocore::source::inputs::LAYOUTS
+                .iter()
+                .map(|(id, name, _)| ((*name).to_string(), json!(id)))
+                .collect();
+            layouts.push(("Your own".into(), json!("custom")));
+            vec![
+                opt("layout", "Keys", "list").choices(&as_refs(&layouts)),
+                opt("keys", "Your keys (W / A S D)", "text").when("layout", &[json!("custom")]),
+                opt("size", "Size", "int").range(16.0, 256.0, 1.0).slider().unit("px"),
+                opt("color_rest", "Key", "color_alpha"),
+                opt("color_held", "Held", "color_alpha"),
+                opt("color_text", "Letters", "color_alpha"),
+            ]
+        }
+        "ferrocast_web_text" => vec![
+            opt("url", "Address", "text"),
+            opt("path", "Value (data.viewers)", "text"),
+            opt("words", "Text ({} is the value)", "text"),
+            opt("every", "Every", "int").range(5.0, 3600.0, 1.0).unit("s"),
+            opt("font", "Font", "font"),
+            opt("color1", "Color", "color_alpha"),
+            opt("outline", "Outline", "bool"),
+            opt("drop_shadow", "Drop Shadow", "bool"),
         ],
         "ferrocast_countdown" => {
             let set_time = [json!("for")];
@@ -750,6 +777,15 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ferrocast_replay" => json!({ "local_file": "", "switch": true }),
         "ferrocast_visualizer" => json!({
             "source": "", "bars": 32, "width": 800, "height": 200, "color": 0xFFFF_FFFFu32, "mirror": false,
+        }),
+        "ferrocast_inputs" => json!({
+            "layout": "wasd", "keys": "_ W _ / A S D", "size": 64,
+            "color_rest": 0xCC28_2828u32, "color_held": 0xFF1F_5AFFu32, "color_text": 0xFFFF_FFFFu32,
+        }),
+        "ferrocast_web_text" => json!({
+            "url": "https://", "path": "", "words": "{}", "every": 30,
+            "font": { "face": "Helvetica", "size": 72, "style": "Bold", "flags": 1 },
+            "color1": 0xFFFF_FFFFu32, "color2": 0xFFFF_FFFFu32, "outline": true, "drop_shadow": false,
         }),
         "ferrocast_countdown" => json!({
             "mode": "for", "minutes": 5, "seconds": 0, "until": "21:00",
