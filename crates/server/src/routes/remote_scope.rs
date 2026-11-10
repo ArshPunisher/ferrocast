@@ -103,6 +103,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/import"),
     ("*", "/import/**"),
     ("*", "/designs/import"),
+    // Plugins bring code (effects): installed and managed on the PC only.
+    ("*", "/plugins"),
+    ("*", "/plugins/**"),
     ("*", "/designs/*/export"),
     ("*", "/backups/*/restore"),
     // Media uploads (the tip page's avatar and banner too).
@@ -322,6 +325,11 @@ mod tests {
             ("POST", "/discord/test"),
             ("PUT", "/obs"),
             ("POST", "/obs/detect"),
+            // Plugins bring code: never from a phone, not even the list.
+            ("GET", "/plugins"),
+            ("POST", "/plugins"),
+            ("PUT", "/plugins/com.ana.invert"),
+            ("DELETE", "/plugins/com.ana.invert"),
             ("POST", "/export"),
             ("POST", "/import"),
             ("POST", "/import/apply"),

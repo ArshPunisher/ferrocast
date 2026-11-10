@@ -102,6 +102,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/import"),
     ("*", "/import/**"),
     ("*", "/designs/import"),
+    // Plugins bring code (effects): installed and managed on the PC only.
+    ("*", "/plugins"),
+    ("*", "/plugins/**"),
     ("*", "/designs/*/export"),
     ("*", "/backups/*/restore"),
     // Media uploads (the tip page's avatar and banner too).
