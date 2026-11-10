@@ -242,6 +242,11 @@ enum Out {
     Nv12(u32, u32, bool, bool),
     /// 48 kHz stereo floats.
     Sound,
+    /// A file's sound, the same, with its gaps filled with silence so each sample sits at its
+    /// place in the file (`Media::take_sound` counts them): a looping file's sound left a gap at
+    /// each loop, its count fell behind the pictures and its sound was dropped as too late. A
+    /// sound track that starts after the picture gets the silence before it too.
+    FileSound,
 }
 
 impl Reader {
@@ -261,6 +266,20 @@ impl Reader {
             }
             Out::Sound => {
                 cmd.args(["-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "-"]);
+            }
+            Out::FileSound => {
+                cmd.args([
+                    "-vn",
+                    "-af",
+                    "aresample=async=1:first_pts=0",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "48000",
+                    "-f",
+                    "f32le",
+                    "-",
+                ]);
             }
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -303,13 +322,19 @@ impl Reader {
                                 }
                             }
                             let n = s.frames.fetch_add(1, Ordering::Relaxed);
-                            let start = at.saturating_sub(n * frame_ns);
-                            if let Ok(mut st) = s.start_ns.lock() {
-                                *st = Some(st.map_or(start, |was| was.min(start)));
+                            // Set by the first pictures, then held: at each loop of a looping
+                            // file FFmpeg hands a burst over early, and taking that as the
+                            // clock put every later piece of sound in the past, so it was all
+                            // dropped and the file went silent after its first loop.
+                            if n < SETTLE_FRAMES {
+                                let start = at.saturating_sub(n * frame_ns);
+                                if let Ok(mut st) = s.start_ns.lock() {
+                                    *st = Some(st.map_or(start, |was| was.min(start)));
+                                }
                             }
                         }
                     }
-                    Out::Sound => {
+                    Out::Sound | Out::FileSound => {
                         let mut buf = vec![0u8; PIECE * 2 * 4];
                         let mut before = 0u64;
                         while !s.stop.load(Ordering::Acquire) && stdout.read_exact(&mut buf).is_ok() {
@@ -547,10 +572,10 @@ impl Media {
             Reader::start(&ff, &input, out, self.fps, Arc::new(Shared::default()))?
         } else {
             // No picture: the sound's reader stands in (it ends when the file does).
-            Reader::start(&ff, &input, Out::Sound, 60, Arc::new(Shared::default()))?
+            Reader::start(&ff, &input, Out::FileSound, 60, Arc::new(Shared::default()))?
         };
         let sound = if self.has_audio && self.has_video {
-            Some(Reader::start(&ff, &input, Out::Sound, 60, Arc::new(Shared::default()))?)
+            Some(Reader::start(&ff, &input, Out::FileSound, 60, Arc::new(Shared::default()))?)
         } else {
             None
         };
@@ -817,6 +842,42 @@ mod tests {
         let sound = card.take_sound();
         assert!(!sound.is_empty(), "sound comes once the pictures set the clock");
         assert!(sound.windows(2).all(|w| w[1].1 > w[0].1), "in order on the pictures' clock");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A looping file keeps its sound after it starts over: FFmpeg's burst at each loop moved the
+    /// pictures' clock and every later piece of sound was dropped as too late (11 Nov, found
+    /// auditing the 10 Nov Windows work), and the gap each loop left made it drift there anyway.
+    #[test]
+    fn a_looping_file_keeps_its_sound() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ffsrc-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("loop.mp4");
+        // Its sound is shorter than its picture, as many clips' are.
+        let ok = Command::new(ffmpeg().unwrap())
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=1"])
+            .args(["-f", "lavfi", "-i", "sine=duration=0.8", "-map", "0:v", "-map", "1:a"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let m = Media::open_for_card(&file, true).unwrap();
+        let start = std::time::Instant::now();
+        let mut late = 0usize;
+        while start.elapsed() < Duration::from_millis(4500) {
+            let _ = m.frame_nv12();
+            let got = m.take_sound().len();
+            // Past the third loop: a second's worth of pieces (about 47) should still come.
+            if start.elapsed() > Duration::from_millis(3500) {
+                late += got;
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        assert!(late > 30, "sound after it looped: {late} pieces in its last second");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
