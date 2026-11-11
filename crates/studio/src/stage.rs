@@ -708,8 +708,31 @@ impl Stage {
     }
 
     pub fn duplicate_scene(&self, name: &str, new_name: &str) -> Result<(), StudioError> {
-        let items = self.scene_items(name)?;
+        let mut items = self.scene_items(name)?;
         self.add_scene(new_name)?;
+        // A group belongs to one scene (as in OBS): the copy gets groups of its own, holding the
+        // same sources, so changing one scene's group leaves the other's alone.
+        for it in items.iter_mut() {
+            let gname = name_of(it).to_string();
+            let Ok(src) = self.source(&gname) else { continue };
+            if kind_of(&src) != "group" {
+                continue;
+            }
+            let mut n = 2;
+            let copy = loop {
+                let c = format!("{gname} {n}");
+                if self.name_free(&c).is_ok() {
+                    break c;
+                }
+                n += 1;
+            };
+            let mut g = src.clone();
+            g["name"] = json!(copy);
+            g["uuid"] = json!(uuid());
+            self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(g.clone())));
+            it["name"] = json!(copy);
+            it["source_uuid"] = g["uuid"].clone();
+        }
         self.with_source(new_name, |s| {
             s["settings"]["items"] = Value::Array(items.clone());
             s["settings"]["id_counter"] = json!(items.iter().filter_map(|i| i.get("id")?.as_i64()).max().unwrap_or(0));
@@ -856,6 +879,12 @@ impl Stage {
     }
 
     fn info_of(&self, it: &Value) -> ItemInfo {
+        self.info_with(it, true)
+    }
+
+    /// An item's info; `expand` lists a group's sources (one level: a group's own sources
+    /// are never expanded again, so a group shown inside another can't loop).
+    fn info_with(&self, it: &Value, expand: bool) -> ItemInfo {
         let name = name_of(it).to_string();
         let src = self.source(&name).unwrap_or(Value::Null);
         let (w, h) = self.size_of(&name);
@@ -882,6 +911,24 @@ impl Stage {
                     | "ferrocast_web_text"
                     | "ferrocast_inputs"
             );
+        // A group's sources, top first, each framed on the canvas through the group.
+        let children = if kind == "group" && expand {
+            self.scene_items(&name)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .map(|c| {
+                    let mut ci = self.info_with(c, false);
+                    let f = ci.frame;
+                    let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+                    let on = unit.then(&a);
+                    ci.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+                    ci
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         ItemInfo {
             id: it.get("id").and_then(Value::as_i64).unwrap_or(0),
             name,
@@ -896,7 +943,7 @@ impl Stage {
             },
             srgb_off: it.get("blend_method").and_then(Value::as_str) == Some("srgb_off"),
             frame: [a.a * cw, a.b * cw, a.c * ch, a.d * ch, a.e, a.f],
-            children: Vec::new(),
+            children,
             show_transition: None,
             hide_transition: None,
             deinterlace: None,
@@ -916,10 +963,135 @@ impl Stage {
     }
 
     fn item(&self, scene: &str, id: i64) -> Result<Value, StudioError> {
-        self.scene_items(scene)?
+        self.scene_items(&self.home(scene, id))?
             .into_iter()
             .find(|i| i.get("id").and_then(Value::as_i64) == Some(id))
             .ok_or_else(|| fail(format!("\"{scene}\" has no item {id}.")))
+    }
+
+    /// Where an item of `scene` lives: the scene itself, or the group shown in it that holds
+    /// it (as OBS's, a group's sources are edited through the scene). An unknown id answers
+    /// `scene`, so the usual "has no item" follows.
+    fn home(&self, scene: &str, id: i64) -> String {
+        let Ok(items) = self.scene_items(scene) else { return scene.to_string() };
+        let has = |l: &[Value]| l.iter().any(|i| i.get("id").and_then(Value::as_i64) == Some(id));
+        if has(&items) {
+            return scene.to_string();
+        }
+        for g in items.iter().map(name_of) {
+            if self.source(g).is_ok_and(|s| kind_of(&s) == "group") && self.scene_items(g).is_ok_and(|l| has(&l)) {
+                return g.to_string();
+            }
+        }
+        scene.to_string()
+    }
+
+    /// The highest item id in `scene` and in the groups it shows: a new item takes the next,
+    /// so a source in a group never shares an id with one in its scene.
+    fn top_id(&self, scene: &str) -> i64 {
+        let items = self.scene_items(scene).unwrap_or_default();
+        let mut top = self
+            .source(scene)
+            .ok()
+            .and_then(|s| s.pointer("/settings/id_counter").and_then(Value::as_i64))
+            .unwrap_or(0);
+        for it in &items {
+            top = top.max(it.get("id").and_then(Value::as_i64).unwrap_or(0));
+            let name = name_of(it);
+            if self.source(name).is_ok_and(|s| kind_of(&s) == "group") {
+                for c in self.scene_items(name).unwrap_or_default() {
+                    top = top.max(c.get("id").and_then(Value::as_i64).unwrap_or(0));
+                }
+            }
+        }
+        top
+    }
+
+    /// The group item (in `scene`) holding item `id`, when it's inside one.
+    fn group_of(&self, scene: &str, id: i64) -> Option<Value> {
+        let home = self.home(scene, id);
+        (home != scene).then(|| self.scene_items(scene).ok()?.into_iter().find(|i| name_of(i) == home)).flatten()
+    }
+
+    /// A group's own scale on each side as it shows (signed: a flip is negative), Fit and
+    /// Stretch boxes included.
+    fn group_scale(&self, group_item: &Value) -> (f32, f32) {
+        let g = self.group_map(group_item);
+        let p = ferrocore::obs::placement_of(group_item);
+        let sign = |v: f32| if v < 0.0 { -1.0 } else { 1.0 };
+        (
+            (g.a * g.a + g.b * g.b).sqrt().max(1e-6) * sign(p.scale_x),
+            (g.c * g.c + g.d * g.d).sqrt().max(1e-6) * sign(p.scale_y),
+        )
+    }
+
+    /// How a group's own pixels map onto the canvas.
+    fn group_map(&self, group_item: &Value) -> ferrocore::Affine {
+        let (w, h) = self.size_of(name_of(group_item));
+        ferrocore::draw_transform(&ferrocore::obs::placement_of(group_item), w, h)
+    }
+
+    /// Fits a group to what it holds (OBS does the same): its size becomes the box round its
+    /// sources, which move so they stay where they show on the canvas. An empty group stays.
+    fn refit_group(&self, scene: &str, gid: i64) -> Result<(), StudioError> {
+        let gi = self.item(scene, gid)?;
+        let gname = name_of(&gi).to_string();
+        let kids = self.scene_items(&gname)?;
+        // Nothing to fit yet, or a source that doesn't know its size yet (a camera or a video
+        // still opening reads 0×0): fitting now would shrink the group round nothing.
+        if kids.is_empty() || kids.iter().any(|c| matches!(self.size_of(name_of(c)), (0, _) | (_, 0))) {
+            return Ok(());
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for c in &kids {
+            let f = self.info_of(c).frame;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                let (x, y) = (f[4] + u * f[0] + v * f[2], f[5] + u * f[1] + v * f[3]);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return Ok(());
+        }
+        // A group sized by a Fit or Stretch box: that box becomes its plain scale first, so a new
+        // size doesn't stretch what's already in it.
+        if gi.get("bounds_type").and_then(Value::as_u64).unwrap_or(0) != 0 {
+            let (gx, gy) = self.group_scale(&gi);
+            let at = self.group_map(&gi).apply(0.0, 0.0);
+            self.with_item(scene, gid, |i| {
+                i["bounds_type"] = json!(0);
+                i["scale"] = json!({ "x": gx, "y": gy });
+            })?;
+            let now = self.group_map(&self.item(scene, gid)?).apply(0.0, 0.0);
+            self.with_item(scene, gid, |i| {
+                let x = i.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32 + at.0 - now.0;
+                let y = i.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32 + at.1 - now.1;
+                i["pos"] = json!({ "x": x, "y": y });
+            })?;
+        }
+        let gi = self.item(scene, gid)?;
+        // Where the box's corner shows now, before anything changes.
+        let target = self.group_map(&gi).apply(x0, y0);
+        let (cx, cy) = ((x1 - x0).max(1.0).ceil() as u32, (y1 - y0).max(1.0).ceil() as u32);
+        self.with_items(&gname, |l, set| {
+            for c in l.iter_mut() {
+                let x = c.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32 - x0;
+                let y = c.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32 - y0;
+                c["pos"] = json!({ "x": x, "y": y });
+            }
+            set.insert("cx".into(), json!(cx));
+            set.insert("cy".into(), json!(cy));
+            set.insert("custom_size".into(), json!(true));
+        })?;
+        // The group moves so its new corner lands where the box's corner was.
+        let gi = self.item(scene, gid)?;
+        let now = self.group_map(&gi).apply(0.0, 0.0);
+        let (dx, dy) = (target.0 - now.0, target.1 - now.1);
+        self.with_item(scene, gid, |i| {
+            let x = i.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32 + dx;
+            let y = i.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32 + dy;
+            i["pos"] = json!({ "x": x, "y": y });
+        })
     }
 
     /// Changes a scene's item list.
@@ -941,7 +1113,7 @@ impl Stage {
     }
 
     fn with_item<T>(&self, scene: &str, id: i64, f: impl FnOnce(&mut Value) -> T) -> Result<T, StudioError> {
-        self.with_items(scene, |items, _| {
+        self.with_items(&self.home(scene, id), |items, _| {
             items.iter_mut().find(|i| i.get("id").and_then(Value::as_i64) == Some(id)).map(f)
         })?
         .ok_or_else(|| fail(format!("\"{scene}\" has no item {id}.")))
@@ -949,11 +1121,13 @@ impl Stage {
 
     /// Puts `source` (an existing one) at the top of `scene` → its item.
     fn place(&self, scene: &str, source: &Value) -> Result<ItemInfo, StudioError> {
+        let floor = self.top_id(scene);
         let item = self.with_items(scene, |items, set| {
             let id = set
                 .get("id_counter")
                 .and_then(Value::as_i64)
                 .unwrap_or(0)
+                .max(floor)
                 .max(items.iter().filter_map(|i| i.get("id")?.as_i64()).max().unwrap_or(0))
                 + 1;
             set.insert("id_counter".into(), json!(id));
@@ -1057,6 +1231,34 @@ impl Stage {
         });
         self.quiet.set(false);
         let it = it?;
+        // Inside a group: the group fits its sources again, as OBS does after every move
+        // (that also hands the engine the whole change).
+        let home = self.home(scene, id);
+        if home != scene {
+            let gid = self
+                .scene_items(scene)?
+                .iter()
+                .find(|i| name_of(i) == home)
+                .and_then(|i| i.get("id").and_then(Value::as_i64));
+            if let Some(gid) = gid {
+                self.refit_group(scene, gid)?;
+            }
+            // The move was saved quietly; a refit that had nothing to do (a source still
+            // opening) changed nothing else, so the engine is told here either way.
+            if let Some(e) = self.engine.borrow().as_ref() {
+                e.reopen(&self.doc.borrow());
+            }
+            self.sync_pages();
+            let it = self.item(scene, id)?;
+            let mut info = self.info_of(&it);
+            if let Some(gi) = gid.and_then(|g| self.item(scene, g).ok()) {
+                let f = info.frame;
+                let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+                let on = unit.then(&self.group_map(&gi));
+                info.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+            }
+            return Ok(info);
+        }
         let moved = self
             .engine
             .borrow()
@@ -1074,6 +1276,25 @@ impl Stage {
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
+        // In a group: the canvas box into the group's own pixels.
+        let home = self.home(scene, id);
+        let (x, y, w, h) = match (home != scene)
+            .then(|| self.scene_items(scene).ok()?.into_iter().find(|i| name_of(i) == home))
+            .flatten()
+        {
+            Some(gi) => {
+                let g = self.group_map(&gi);
+                match g.inverse() {
+                    Some(back) => {
+                        let (lx, ly) = back.apply(x, y);
+                        let (sx, sy) = ((g.a * g.a + g.b * g.b).sqrt(), (g.c * g.c + g.d * g.d).sqrt());
+                        (lx, ly, w / sx.max(1e-6), h / sy.max(1e-6))
+                    }
+                    None => (x, y, w, h),
+                }
+            }
+            None => (x, y, w, h),
+        };
         let mut t = self.transform(scene, id)?;
         let (cw, ch) = ferrocore::cropped(
             t.width,
@@ -1099,14 +1320,15 @@ impl Stage {
 
     /// Where an item is in its scene (0 is the top) and the scene's name.
     pub fn item_place(&self, scene: &str, id: i64) -> Result<(usize, String), StudioError> {
-        let ids = self.item_ids(scene)?;
+        let home = self.home(scene, id);
+        let ids = self.item_ids(&home)?;
         let at = ids.iter().position(|i| *i == id).ok_or_else(|| fail(format!("\"{scene}\" has no item {id}.")))?;
-        Ok((at, scene.to_string()))
+        Ok((at, home))
     }
 
     /// Moves an item to place `to` (0 is the top).
     pub fn item_order(&self, scene: &str, id: i64, to: usize) -> Result<(), StudioError> {
-        self.with_items(scene, |items, _| {
+        self.with_items(&self.home(scene, id), |items, _| {
             let Some(at) = items.iter().position(|i| i.get("id").and_then(Value::as_i64) == Some(id)) else { return };
             let it = items.remove(at);
             // Saved bottom first; `to` counts from the top.
@@ -1126,10 +1348,11 @@ impl Stage {
             E::Unlock => set("locked", json!(false)),
             E::Remove => {
                 self.item(scene, id)?;
-                // Out of the scene, and the source with it when nothing shows it any more: one
-                // change, so the engine closes it at once.
+                let home = self.home(scene, id);
+                // Out of the scene (or its group), and the source with it when nothing shows it
+                // any more: one change, so the engine closes it at once.
                 self.edit(|d| {
-                    let found = d["sources"].as_array_mut().and_then(|l| l.iter_mut().find(|s| name_of(s) == scene));
+                    let found = d["sources"].as_array_mut().and_then(|l| l.iter_mut().find(|s| name_of(s) == home));
                     if let Some(items) =
                         found.and_then(|s| s.pointer_mut("/settings/items")).and_then(Value::as_array_mut)
                     {
@@ -1140,8 +1363,8 @@ impl Stage {
                 Ok(())
             }
             E::Up | E::Down | E::Top | E::Bottom => {
-                let (at, _) = self.item_place(scene, id)?;
-                let last = self.item_ids(scene)?.len().saturating_sub(1);
+                let (at, home) = self.item_place(scene, id)?;
+                let last = self.item_ids(&home)?.len().saturating_sub(1);
                 let to = match edit {
                     E::Up => at.saturating_sub(1),
                     E::Down => (at + 1).min(last),
@@ -1155,15 +1378,37 @@ impl Stage {
                 let mut t = self.transform(scene, id)?;
                 (t.x, t.y, t.alignment, t.rotation, t.scale_x, t.scale_y) = (0.0, 0.0, 5, 0.0, 1.0, 1.0);
                 (t.bounds, t.bounds_alignment, t.bounds_width, t.bounds_height) = (bounds.into(), 0, cw, ch);
+                // Inside a group: the canvas's box, in the group's own pixels.
+                if let Some(gi) = self.group_of(scene, id) {
+                    let g = self.group_map(&gi);
+                    let back = g.inverse().ok_or_else(|| fail("That group is squashed flat: reset its size first."))?;
+                    let p = ferrocore::obs::placement_of(&gi);
+                    let (gx, gy) = self.group_scale(&gi);
+                    (t.x, t.y) = back.apply(0.0, 0.0);
+                    t.rotation = (-p.rotation).rem_euclid(360.0);
+                    (t.bounds_width, t.bounds_height) = (cw / gx.abs(), ch / gy.abs());
+                }
                 self.set_transform(scene, id, &t).map(drop)
             }
             E::Center => {
-                let info = self.info_of(&self.item(scene, id)?);
-                let f = info.frame;
-                // The box's middle onto the canvas's middle.
+                let it = self.item(scene, id)?;
+                let group = self.group_of(scene, id);
+                let mut f = self.info_of(&it).frame;
+                if let Some(gi) = &group {
+                    let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+                    let on = unit.then(&self.group_map(gi));
+                    f = [on.a, on.b, on.c, on.d, on.e, on.f];
+                }
+                // The box's middle onto the canvas's middle (through the group, inside one).
                 let (mx, my) = (f[4] + (f[0] + f[2]) / 2.0, f[5] + (f[1] + f[3]) / 2.0);
                 let mut t = self.transform(scene, id)?;
-                (t.x, t.y) = (t.x + cw / 2.0 - mx, t.y + ch / 2.0 - my);
+                match group.and_then(|gi| self.group_map(&gi).inverse()) {
+                    Some(back) => {
+                        let (to, from) = (back.apply(cw / 2.0, ch / 2.0), back.apply(mx, my));
+                        (t.x, t.y) = (t.x + to.0 - from.0, t.y + to.1 - from.1);
+                    }
+                    None => (t.x, t.y) = (t.x + cw / 2.0 - mx, t.y + ch / 2.0 - my),
+                }
                 self.set_transform(scene, id, &t).map(drop)
             }
             E::Reset => {
@@ -1206,7 +1451,25 @@ impl Stage {
                 let mut s = src.clone();
                 s["name"] = json!(copy);
                 s["uuid"] = json!(uuid());
+                self.fresh_ids(scene, &mut s);
                 self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(s.clone())));
+                // Inside a group: the copy goes in the same group, just above the original (OBS).
+                let home = self.home(scene, id);
+                if home != scene {
+                    let next = self.top_id(scene) + 1;
+                    let mut c = it.clone();
+                    c["id"] = json!(next);
+                    c["name"] = json!(copy);
+                    c["source_uuid"] = s["uuid"].clone();
+                    self.with_items(&home, |l, _| {
+                        // Saved bottom first: just after it in the list is just above it.
+                        let at = l.iter().position(|i| i.get("id").and_then(Value::as_i64) == Some(id));
+                        l.insert(at.map_or(l.len(), |a| a + 1), c);
+                    })?;
+                    return self.with_items(scene, |_, set| {
+                        set.insert("id_counter".into(), json!(next));
+                    });
+                }
                 let new = self.place(scene, &s)?;
                 // Where the original is, just above it.
                 self.with_item(scene, new.id, |i| {
@@ -1956,8 +2219,8 @@ impl Stage {
         let p = ferrocore::obs::placement_of(&g);
         let (gw, gh) = self.size_of(&name);
         let to_canvas = ferrocore::draw_transform(&p, gw, gh);
-        let (scale, turn) =
-            ((p.scale_x * p.scale_x + p.scale_y * p.scale_y).sqrt() / std::f32::consts::SQRT_2, p.rotation);
+        // Each side on its own, so a group scaled more one way keeps its sources' shapes.
+        let (scale, turn) = (self.group_scale(&g), p.rotation);
         let children: Vec<Value> =
             src.pointer("/settings/items").and_then(Value::as_array).cloned().unwrap_or_default();
         let (at, _) = self.item_place(scene, id)?;
@@ -1981,7 +2244,13 @@ impl Stage {
                     c.pointer("/scale/x").and_then(Value::as_f64).unwrap_or(1.0) as f32,
                     c.pointer("/scale/y").and_then(Value::as_f64).unwrap_or(1.0) as f32,
                 );
-                c["scale"] = json!({ "x": sx * scale, "y": sy * scale });
+                c["scale"] = json!({ "x": sx * scale.0, "y": sy * scale.1 });
+                // A bounding box is in the group's pixels too.
+                let (bw, bh) = (
+                    c.pointer("/bounds/x").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    c.pointer("/bounds/y").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                c["bounds"] = json!({ "x": bw * scale.0.abs(), "y": bh * scale.1.abs() });
                 c["rot"] = json!((c.get("rot").and_then(Value::as_f64).unwrap_or(0.0) as f32 + turn).rem_euclid(360.0));
                 next += 1;
                 c["id"] = json!(next);
@@ -2300,9 +2569,15 @@ impl Stage {
     pub fn screenshot_pixels(&self, name: &str) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
         let size = if self.vertical_order().iter().any(|n| n == name) {
             crate::collection::VERTICAL_SIZE
-        } else {
-            self.scene_index(name)?;
+        } else if self.scene_index(name).is_ok() {
             (self.canvas.width, self.canvas.height)
+        } else {
+            // A source (OBS's Screenshot (Source)): drawn on its own, at its own size.
+            self.source(name)?;
+            let e = self.engine()?;
+            let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
+            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
+            return Ok((px, (w, h)));
         };
         let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
         Ok((px, size))
@@ -2735,34 +3010,152 @@ impl Stage {
         };
         src["name"] = json!(copy);
         src["uuid"] = json!(uuid());
+        self.fresh_ids(scene, &mut src);
         self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(src.clone())));
         self.place(scene, &src)
     }
 
+    /// A copied group's sources get ids no other item of `scene` has (they're edited through
+    /// the scene, by id).
+    fn fresh_ids(&self, scene: &str, src: &mut Value) {
+        if kind_of(src) != "group" {
+            return;
+        }
+        let mut next = self.top_id(scene);
+        if let Some(items) = src.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
+            for c in items {
+                next += 1;
+                c["id"] = json!(next);
+            }
+        }
+        if let Some(set) = src.get_mut("settings").and_then(Value::as_object_mut) {
+            set.insert("id_counter".into(), json!(next));
+        }
+        let _ = self.with_items(scene, |_, set| {
+            set.insert("id_counter".into(), json!(next));
+        });
+    }
+
     /// Moves an item into a group of the same scene (by the group's item id), or out of any.
     pub fn set_group(&self, scene: &str, id: i64, group: Option<i64>) -> Result<(), StudioError> {
+        let it = self.item(scene, id)?;
+        let home = self.home(scene, id);
+        if kind_of(&self.source(name_of(&it))?) == "group" {
+            return Err(fail("A group can't go in a group."));
+        }
+        // Where it shows on the canvas now: its place, size and turn.
+        let (scale, turn, at_canvas) = match (home != scene)
+            .then(|| self.scene_items(scene).ok()?.into_iter().find(|i| name_of(i) == home))
+            .flatten()
+        {
+            Some(gi) => {
+                let p = ferrocore::obs::placement_of(&gi);
+                let g = self.group_map(&gi);
+                let (x, y) = (
+                    it.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    it.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                );
+                (self.group_scale(&gi), p.rotation, g.apply(x, y))
+            }
+            None => (
+                (1.0, 1.0),
+                0.0,
+                (
+                    it.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    it.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                ),
+            ),
+        };
+        let mut c = it.clone();
+        let (sx, sy) = (
+            c.pointer("/scale/x").and_then(Value::as_f64).unwrap_or(1.0) as f32 * scale.0,
+            c.pointer("/scale/y").and_then(Value::as_f64).unwrap_or(1.0) as f32 * scale.1,
+        );
+        let rot = c.get("rot").and_then(Value::as_f64).unwrap_or(0.0) as f32 + turn;
+        // A bounding box (Fit, Stretch…) is in its parent's pixels too.
+        let (bw, bh) = (
+            c.pointer("/bounds/x").and_then(Value::as_f64).unwrap_or(0.0) as f32 * scale.0.abs(),
+            c.pointer("/bounds/y").and_then(Value::as_f64).unwrap_or(0.0) as f32 * scale.1.abs(),
+        );
+        let old_group = (home != scene).then(|| {
+            self.scene_items(scene)
+                .ok()
+                .and_then(|l| l.into_iter().find(|i| name_of(i) == home))
+                .and_then(|g| g.get("id").and_then(Value::as_i64))
+        });
         match group {
             Some(g) => {
-                let gname = name_of(&self.item(scene, g)?).to_string();
-                let it = self.item(scene, id)?;
-                let gpos = (
-                    self.item(scene, g)?.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0),
-                    self.item(scene, g)?.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0),
-                );
-                self.with_items(scene, |l, _| l.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id)))?;
-                self.with_items(&gname, |l, set| {
-                    let mut c = it.clone();
-                    let x = c.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) - gpos.0;
-                    let y = c.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) - gpos.1;
-                    c["pos"] = json!({ "x": x, "y": y });
-                    let next = set.get("id_counter").and_then(Value::as_i64).unwrap_or(0) + 1;
+                let gi = self.item(scene, g)?;
+                let gname = name_of(&gi).to_string();
+                if kind_of(&self.source(&gname)?) != "group" {
+                    return Err(fail(format!("\"{gname}\" isn't a group.")));
+                }
+                if gname == home {
+                    return Ok(());
+                }
+                // An empty group takes the canvas's own pixels, so what goes in stays put.
+                if self.scene_items(&gname)?.is_empty() {
+                    self.with_item(scene, g, |i| {
+                        i["pos"] = json!({ "x": 0.0, "y": 0.0 });
+                        i["scale"] = json!({ "x": 1.0, "y": 1.0 });
+                        i["rot"] = json!(0.0);
+                        i["align"] = json!(5);
+                        i["bounds_type"] = json!(0);
+                    })?;
+                    let (cw, ch) = (self.canvas.width, self.canvas.height);
+                    self.with_items(&gname, |_, set| {
+                        set.insert("cx".into(), json!(cw));
+                        set.insert("cy".into(), json!(ch));
+                    })?;
+                }
+                let gi = self.item(scene, g)?;
+                let p = ferrocore::obs::placement_of(&gi);
+                let gmap = self.group_map(&gi);
+                let back = gmap.inverse().ok_or_else(|| fail("That group is squashed flat: reset its size first."))?;
+                let (lx, ly) = back.apply(at_canvas.0, at_canvas.1);
+                // Each side on its own, so a group scaled more one way doesn't change its shape.
+                let (gx, gy) = self.group_scale(&gi);
+                c["pos"] = json!({ "x": lx, "y": ly });
+                c["scale"] = json!({ "x": sx / gx, "y": sy / gy });
+                c["bounds"] = json!({ "x": bw / gx.abs(), "y": bh / gy.abs() });
+                c["rot"] = json!((rot - p.rotation).rem_euclid(360.0));
+                let next = self.top_id(scene) + 1;
+                c["id"] = json!(next);
+                self.with_items(&home, |l, _| l.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id)))?;
+                self.with_items(&gname, |l, _| l.push(c))?;
+                self.with_items(scene, |_, set| {
                     set.insert("id_counter".into(), json!(next));
-                    c["id"] = json!(next);
-                    l.push(c);
-                })
+                })?;
+                self.refit_group(scene, g)?;
             }
-            None => Err(fail("Ungroup the group to take its sources out.")),
+            None => {
+                let Some(Some(gid)) = old_group else {
+                    return Err(fail("It isn't in a group."));
+                };
+                c["pos"] = json!({ "x": at_canvas.0, "y": at_canvas.1 });
+                c["scale"] = json!({ "x": sx, "y": sy });
+                c["bounds"] = json!({ "x": bw, "y": bh });
+                c["rot"] = json!(rot.rem_euclid(360.0));
+                let next = self.top_id(scene) + 1;
+                c["id"] = json!(next);
+                let (at, _) = self.item_place(scene, gid)?;
+                self.with_items(&home, |l, _| l.retain(|i| i.get("id").and_then(Value::as_i64) != Some(id)))?;
+                self.with_items(scene, |l, set| {
+                    l.push(c);
+                    set.insert("id_counter".into(), json!(next));
+                })?;
+                // Just above its group.
+                self.item_order(scene, next, at)?;
+                self.refit_group(scene, gid)?;
+            }
         }
+        // The group it left fits what's left.
+        if let Some(Some(gid)) = old_group
+            && group.is_some()
+        {
+            self.refit_group(scene, gid)?;
+        }
+        Ok(())
     }
 
     /// A group item's name and its sources' names.
@@ -2785,7 +3178,18 @@ impl Stage {
     /// The sounds a scene makes (its sources with sound) and the global channels.
     pub fn audio(&self, scene: &str) -> Result<Vec<AudioInfo>, StudioError> {
         let mut out: Vec<AudioInfo> = Vec::new();
+        // Its sources top first, and those inside its groups with them (OBS's mixer lists a
+        // group's sources too; owner, 11 Nov: a video put in a group lost its sound row).
+        let mut all = Vec::new();
         for it in self.scene_items(scene)?.iter().rev() {
+            let name = name_of(it);
+            if self.source(name).is_ok_and(|s| kind_of(&s) == "group") {
+                all.extend(self.scene_items(name).unwrap_or_default().into_iter().rev());
+            } else {
+                all.push(it.clone());
+            }
+        }
+        for it in &all {
             let name = name_of(it);
             if let Ok(src) = self.source(name)
                 && !is_scene(&src)
@@ -4365,6 +4769,203 @@ mod tests {
             "{back:?}"
         );
         assert!(!s.sources().iter().any(|u| u.name == "Pair"), "the empty group went");
+    }
+
+    #[test]
+    fn a_source_moved_into_a_group_stays_where_it_shows_and_comes_out_again() {
+        // Owner's recording, 11 Nov: an image put into a new empty group vanished from the
+        // canvas and from the list (the group had no size, and its sources weren't listed).
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.set_item_box("Main", a.id, 100.0, 100.0, 100.0, 100.0));
+        ok(s.set_item_box("Main", b.id, 300.0, 150.0, 50.0, 50.0));
+        let g = ok(s.add_group("Main", "Box"));
+        ok(s.set_group("Main", a.id, Some(g.id)));
+        let items = ok(s.items("Main"));
+        let group = items.iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        assert_eq!(group.children.len(), 1, "listed inside its group");
+        let inside = &group.children[0];
+        assert_eq!(inside.frame, [100.0, 0.0, 0.0, 100.0, 100.0, 100.0], "where it was on the canvas");
+        assert_eq!(group.frame, [100.0, 0.0, 0.0, 100.0, 100.0, 100.0], "the group fits it");
+        assert_ne!(inside.id, b.id, "its own id, not one of the scene's");
+        // A second one: the group grows round both, and neither moves.
+        ok(s.set_group("Main", b.id, Some(g.id)));
+        let group = ok(s.items("Main")).into_iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        let frames: Vec<[f32; 6]> = group.children.iter().map(|c| c.frame).collect();
+        assert!(frames.contains(&[50.0, 0.0, 0.0, 50.0, 300.0, 150.0]), "{frames:?}");
+        assert_eq!(group.frame, [250.0, 0.0, 0.0, 100.0, 100.0, 100.0]);
+        // A video's sound stays in the scene's mixer once it's in the group.
+        let music = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/no/such.mp4" }), false));
+        assert!(ok(s.audio("Main")).iter().any(|a| a.name == "Music"));
+        ok(s.set_group("Main", music.id, Some(g.id)));
+        assert!(ok(s.audio("Main")).iter().any(|a| a.name == "Music"), "a grouped video is still listed");
+        // Edits reach a source inside: hidden, then dragged on the canvas.
+        let b_in = group.children.iter().find(|c| c.name == "B").map(|c| c.id).unwrap_or_default();
+        ok(s.edit_item("Main", b_in, ItemEdit::Hide));
+        ok(s.set_item_box("Main", b_in, 400.0, 200.0, 50.0, 50.0));
+        let group = ok(s.items("Main")).into_iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        let b_now = group.children.iter().find(|c| c.name == "B").unwrap_or_else(|| panic!("B left"));
+        assert!(!b_now.visible);
+        assert_eq!(b_now.frame, [50.0, 0.0, 0.0, 50.0, 400.0, 200.0], "dragged in canvas pixels");
+        // Out again, still where it shows, just above its group.
+        ok(s.set_group("Main", b_in, None));
+        let items = ok(s.items("Main"));
+        let out = items.iter().find(|i| i.name == "B").unwrap_or_else(|| panic!("B isn't back"));
+        assert_eq!(out.frame, [50.0, 0.0, 0.0, 50.0, 400.0, 200.0]);
+        assert_eq!(items.iter().position(|i| i.name == "B"), Some(0), "above the group");
+        assert_eq!(items.iter().find(|i| i.group).map(|g| g.children.len()), Some(2), "A and Music stay");
+        // Our engine reads it all.
+        let got = ferrocore::obs::import(&s.save("x"), (1920, 1080));
+        assert!(got.skipped.is_empty(), "{:?}", got.skipped);
+    }
+
+    #[test]
+    fn edits_on_a_source_inside_a_group_work_as_on_the_canvas() {
+        // Owner's "check more casualties", 11 Nov: Duplicate, Center, Fit, Duplicate scene and
+        // Screenshot on sources inside groups.
+        let s = stage();
+        let (cw, ch) = (s.canvas().width as f32, s.canvas().height as f32);
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 400, "height": 300 }), false));
+        ok(s.set_item_box("Main", a.id, 100.0, 100.0, 400.0, 300.0));
+        let g = ok(s.group_together("Main", &[a.id], "Box"));
+        let mut t = ok(s.transform("Main", g.id));
+        (t.scale_x, t.scale_y) = (0.5, 0.5);
+        ok(s.set_transform("Main", g.id, &t));
+        let inside = |s: &Stage, n: &str| {
+            ok(s.items("Main"))
+                .into_iter()
+                .flat_map(|i| i.children)
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n} isn't in the group"))
+        };
+        let a_in = inside(&s, "A").id;
+        // Center: the middle of the canvas, through a half-size group.
+        ok(s.edit_item("Main", a_in, ItemEdit::Center));
+        let f = inside(&s, "A").frame;
+        let (mx, my) = (f[4] + (f[0] + f[2]) / 2.0, f[5] + (f[1] + f[3]) / 2.0);
+        assert!((mx - cw / 2.0).abs() < 1.0 && (my - ch / 2.0).abs() < 1.0, "centred: {mx}, {my}");
+        // Fit: the canvas's box on the canvas.
+        ok(s.edit_item("Main", a_in, ItemEdit::Stretch));
+        let f = inside(&s, "A").frame;
+        assert!((f[0] - cw).abs() < 1.0 && (f[3] - ch).abs() < 1.0 && f[4].abs() < 1.0 && f[5].abs() < 1.0, "{f:?}");
+        // Duplicate: the copy is in the same group, above it, where it is.
+        ok(s.edit_item("Main", a_in, ItemEdit::Duplicate));
+        let group = ok(s.items("Main")).into_iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        assert_eq!(group.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["A 2", "A"]);
+        assert_eq!(group.children[0].frame, group.children[1].frame);
+        // Duplicate scene: the copy's group is its own.
+        ok(s.duplicate_scene("Main", "Copy"));
+        let copy_group = ok(s.items("Copy")).into_iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        assert_ne!(copy_group.name, "Box", "a group of its own");
+        assert_eq!(copy_group.children.len(), 2, "holding the same sources");
+        let a_copy = copy_group.children.iter().find(|c| c.name == "A").map(|c| c.id).unwrap_or_default();
+        ok(s.edit_item("Copy", a_copy, ItemEdit::Hide));
+        assert!(inside(&s, "A").visible, "hiding it in the copy leaves Main's alone");
+        // Screenshot of a source on its own (any source, inside a group or not).
+        if s.engine().is_ok() {
+            let (_, size) = ok(s.screenshot_pixels("A"));
+            assert_eq!(size, (400, 300), "at its own size");
+        }
+    }
+
+    #[test]
+    fn group_moves_keep_shapes_and_copies_keep_ids_apart() {
+        // CodeRabbit, 11 Nov: a group scaled more one way changed a source's shape going in and
+        // out; a copied group's sources shared ids with the original's.
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 100, "height": 50 }), false));
+        ok(s.set_item_box("Main", a.id, 0.0, 0.0, 100.0, 100.0));
+        ok(s.set_item_box("Main", b.id, 300.0, 300.0, 100.0, 50.0));
+        let g = ok(s.group_together("Main", &[a.id], "Wide"));
+        let mut t = ok(s.transform("Main", g.id));
+        (t.scale_x, t.scale_y) = (2.0, 1.0);
+        ok(s.set_transform("Main", g.id, &t));
+        let before = ok(s.items("Main")).into_iter().find(|i| i.name == "B").map(|i| i.frame);
+        ok(s.set_group("Main", b.id, Some(g.id)));
+        let group = ok(s.items("Main")).into_iter().find(|i| i.group).unwrap_or_else(|| panic!("no group"));
+        let inside = group.children.iter().find(|c| c.name == "B").map(|c| c.frame);
+        let close = |x: [f32; 6], y: [f32; 6]| x.iter().zip(y).all(|(p, q)| (p - q).abs() < 0.5);
+        assert!(close(inside.unwrap_or_default(), before.unwrap_or_default()), "{inside:?} vs {before:?}");
+        // Out again: the same shape and place.
+        let b_in = group.children.iter().find(|c| c.name == "B").map(|c| c.id).unwrap_or_default();
+        ok(s.set_group("Main", b_in, None));
+        let out = ok(s.items("Main")).into_iter().find(|i| i.name == "B").map(|i| i.frame);
+        assert!(close(out.unwrap_or_default(), before.unwrap_or_default()), "{out:?} vs {before:?}");
+        // A copy of the group: its sources' ids are its own.
+        ok(s.edit_item("Main", g.id, ItemEdit::Duplicate));
+        let ids: Vec<i64> = ok(s.items("Main"))
+            .into_iter()
+            .flat_map(|i| std::iter::once(i.id).chain(i.children.into_iter().map(|c| c.id)))
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "every id once: {ids:?}");
+    }
+
+    #[test]
+    fn every_source_moved_into_a_group_is_drawn() {
+        // Owner's check, 11 Nov: the second source put into a group vanished from the picture.
+        let s = stage();
+        let red = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Red",
+            &json!({ "width": 400, "height": 300, "color": 0xFF00_00FFu32 }),
+            false,
+        ));
+        let green = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Green",
+            &json!({ "width": 300, "height": 300, "color": 0xFF00_FF00u32 }),
+            false,
+        ));
+        ok(s.set_item_box("Main", red.id, 200.0, 200.0, 400.0, 300.0));
+        ok(s.set_item_box("Main", green.id, 900.0, 300.0, 300.0, 300.0));
+        let g = ok(s.add_group("Main", "Box"));
+        ok(s.set_group("Main", red.id, Some(g.id)));
+        ok(s.set_group("Main", green.id, Some(g.id)));
+        if s.engine().is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (px, (w, _)) = s.screenshot_program_pixels().unwrap_or_else(|e| panic!("{e}"));
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        assert_eq!(at(400, 350), [255, 0, 0], "red");
+        assert_eq!(at(1050, 450), [0, 255, 0], "green");
+    }
+
+    #[test]
+    fn a_group_fits_its_sources_after_one_is_resized_even_scaled() {
+        // Owner, 11 Nov: after resizing an image in a group, the group's frame was too small
+        // and a fitted image in a scaled group showed zoomed in.
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let g = ok(s.group_together("Main", &[a.id], "Box"));
+        // The group made half size, then the source inside fitted to a 300×200 box on the canvas.
+        let mut t = ok(s.transform("Main", g.id));
+        (t.scale_x, t.scale_y) = (0.5, 0.5);
+        ok(s.set_transform("Main", g.id, &t));
+        let a_in = ok(s.items("Main"))[0].children[0].id;
+        let mut ta = ok(s.transform("Main", a_in));
+        (ta.bounds, ta.bounds_width, ta.bounds_height) = ("stretch".into(), 400.0, 400.0);
+        ok(s.set_transform("Main", a_in, &ta));
+        let group = ok(s.items("Main")).into_iter().next().unwrap_or_else(|| panic!("no group"));
+        let kid = group.children[0].frame;
+        let gf = group.frame;
+        // The group's frame covers its source on the canvas.
+        assert!((gf[0] - kid[0]).abs() < 1.0 && (gf[3] - kid[3]).abs() < 1.0, "group {gf:?} source {kid:?}");
+        assert_eq!(kid[0].round(), 200.0, "a 400 px box in a half-size group is 200 px on the canvas");
+        // Out of the group: the same size on the canvas, its box now in canvas pixels.
+        ok(s.set_group("Main", a_in, None));
+        let out = ok(s.items("Main")).into_iter().find(|i| i.name == "A").unwrap_or_else(|| panic!("A isn't back"));
+        assert_eq!(out.frame[0].round(), 200.0, "{:?}", out.frame);
     }
 
     #[test]
