@@ -1610,11 +1610,7 @@ async fn go_live_routes_refuse_what_is_wrong() {
         |id: &str| r.client.delete(format!("{}/api/v1/golive/destinations/{id}", r.base)).bearer_auth(&r.token).send();
     assert_eq!(error_code(del("twitch").await.unwrap()).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(del("c_nope").await.unwrap()).await.0, StatusCode::NOT_FOUND);
-    // Nothing ticked: the upload check says so. No OBS: setup says how to fix it.
-    assert_eq!(
-        error_code(r.post("/api/v1/golive/upload-check", json!({})).await).await,
-        (StatusCode::UNPROCESSABLE_ENTITY, "golive_none".into())
-    );
+    // No OBS: setup says how to fix it.
     assert_eq!(
         error_code(r.post("/api/v1/golive/obs/restore", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "golive_nothing_saved".into())

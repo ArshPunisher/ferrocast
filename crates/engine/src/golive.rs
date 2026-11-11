@@ -1610,14 +1610,9 @@ impl Engine {
             .try_lock()
             .map_err(|_| EngineError::TooMany("An upload check or OBS change is already running.".into()))?;
         let cfg = self.golive_config();
+        // Nothing ticked still measures the upload (Cloudflare's speed test): Set up for me
+        // asks before any platform is picked, and the verdict says to turn one on.
         let ticked: Vec<DestinationConfig> = cfg.destinations.into_iter().filter(|d| d.enabled).collect();
-        if ticked.is_empty() {
-            return Err(refused(
-                "golive_none",
-                "No platform is ticked.",
-                "Tick at least one platform, then check again.",
-            ));
-        }
         let stats = self.golive().hub.stats();
         // The stream as it is now, else as it was last time, else a 1080p60 plan.
         let last = self.golive().last_kbps.load(std::sync::atomic::Ordering::Relaxed);
