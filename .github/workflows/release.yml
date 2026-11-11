@@ -154,6 +154,11 @@ jobs:
           mkdir -p apps/desktop/binaries
           lipo -create -output apps/desktop/binaries/ferrocast-vst-universal-apple-darwin \
             target/aarch64-apple-darwin/release/ferrocast-vst target/x86_64-apple-darwin/release/ferrocast-vst
+          # Each chip's own build looks for its own copy too (3.2.0's first build stopped at
+          # "binaries/ferrocast-vst-aarch64-apple-darwin doesn't exist").
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cp "target/$t/release/ferrocast-vst" "apps/desktop/binaries/ferrocast-vst-$t"
+          done
       - name: Build the app
         shell: bash
         env:
