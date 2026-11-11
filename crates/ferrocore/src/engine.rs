@@ -340,6 +340,9 @@ pub struct Canvas {
     /// More of the mixer's tracks a recording carries after `track`, each its own sound track
     /// in the file (OBS's recording tracks 2-6).
     pub more_tracks: Vec<usize>,
+    /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
+    /// Broadcasting): each width, height and kbps, drawn from the same picture scaled down.
+    pub video_tracks: Vec<(u32, u32, u32)>,
 }
 
 impl Canvas {
@@ -353,6 +356,21 @@ impl Canvas {
             track: 0,
             scaled_from: None,
             more_tracks: Vec::new(),
+            video_tracks: Vec::new(),
+        }
+    }
+
+    /// The canvas an extra video quality of this one is drawn on: the same picture, scaled to
+    /// `width`×`height` from the size this one is drawn at.
+    fn track(&self, width: u32, height: u32) -> Self {
+        let (w, h) = self.scaled_from.map_or((self.width, self.height), |(w, h, _)| (w, h));
+        Self {
+            width,
+            height,
+            scaled_from: Some((w, h, Filter::Bicubic)),
+            more_tracks: Vec::new(),
+            video_tracks: Vec::new(),
+            ..self.clone()
         }
     }
 
@@ -1467,6 +1485,29 @@ impl Engine {
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
         if matches!(kind, OutputKind::Stream(_)) {
             pipe.stream_extra_tracks();
+            // Twitch Enhanced Broadcasting's other qualities: H.264, even sides, a few at most.
+            if !canvas.video_tracks.is_empty() {
+                if canvas.video_tracks.len() > 4
+                    || canvas
+                        .video_tracks
+                        .iter()
+                        .any(|(w, h, k)| *w < 2 || *h < 2 || w % 2 != 0 || h % 2 != 0 || *k == 0)
+                {
+                    return Err(AvError::Source("extra qualities: at most 4, even sides and a bitrate each".into()));
+                }
+                let configs: Vec<VideoConfig> = canvas
+                    .video_tracks
+                    .iter()
+                    .map(|&(width, height, bitrate_kbps)| VideoConfig {
+                        width,
+                        height,
+                        bitrate_kbps,
+                        codec: crate::video::VideoCodec::H264,
+                        ..video
+                    })
+                    .collect();
+                pipe.add_video_tracks(&configs)?;
+            }
         }
         if let Some((seconds, mb)) = replay {
             pipe.keep_replay(seconds, mb);
@@ -2867,6 +2908,28 @@ fn frame(
             };
             drawn.push((canvas.clone(), frame.map_err(|e| e.to_string())));
         }
+        // Each extra quality's picture (Twitch Enhanced Broadcasting), drawn once like the rest.
+        for (.., canvas) in &st.outputs {
+            if !index.is_multiple_of(u64::from(canvas.every)) {
+                continue;
+            }
+            for &(w, h, _) in &canvas.video_tracks {
+                let c = canvas.track(w, h);
+                if drawn.iter().any(|(d, _)| *d == c) {
+                    continue;
+                }
+                let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
+                let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
+                    Draw::Scene(s) => gpu.render_nv12(&scaled(s, w, h, Filter::Bicubic)),
+                    Draw::Moving(mut t) => {
+                        t.from = scaled(t.from, w, h, Filter::Bicubic);
+                        t.to = scaled(t.to, w, h, Filter::Bicubic);
+                        gpu.render_transition_nv12(&t)
+                    }
+                };
+                drawn.push((c, frame.map_err(|e| e.to_string())));
+            }
+        }
         let mut failed = None;
         for (_, pipe, kind, canvas) in st.outputs.iter_mut() {
             let mut tags = Vec::new();
@@ -2880,6 +2943,16 @@ fn frame(
                         }
                     }
                     Err(e) => failed = Some(e.clone()),
+                }
+                for (i, &(w, h, _)) in canvas.video_tracks.iter().enumerate() {
+                    let c = canvas.track(w, h);
+                    if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
+                        let s = w as usize;
+                        match pipe.video_track(i, Frame::Nv12 { y: &f.y, y_stride: s, uv: &f.uv, uv_stride: s }, ts) {
+                            Ok(t) => tags.extend(t),
+                            Err(e) => failed = Some(e.to_string()),
+                        }
+                    }
                 }
             }
             for b in &blocks {
@@ -3784,6 +3857,43 @@ mod tests {
             // The long beep holds about 7 times the sound of the short one: about 8 dB more.
             assert!(two > one + 5.0, "{name}: track 1 {one} dB, track 2 {two} dB");
         }
+    }
+
+    /// Twitch Enhanced Broadcasting: one stream carries the main picture and two smaller ones,
+    /// each with its own header and frames under its track number (1, 2), the main track's
+    /// packets as before.
+    #[test]
+    fn a_stream_sends_more_qualities_as_tracks() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [200, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let got: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let into = got.clone();
+        let send: Box<dyn FnMut(Tag) + Send> = Box::new(move |t| {
+            if let Tag::Video { body, .. } = t {
+                into.lock().unwrap_or_else(|e| e.into_inner()).push(body);
+            }
+        });
+        let canvas = Canvas { video_tracks: vec![(320, 180, 600), (160, 90, 200)], ..Canvas::main(e.config()) };
+        let id = e.start_output_on(OutputKind::Stream(send), canvas).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1500));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let tags = got.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Multitrack video: 0x80 | frame type | 6, then one track + packet type, avc1, track id.
+        let track = |t: &[u8]| (t.len() > 6 && t[0] & 0x8F == 0x86 && &t[2..6] == b"avc1").then(|| (t[6], t[1] & 0x0F));
+        for n in [1u8, 2] {
+            let mine: Vec<u8> =
+                tags.iter().filter_map(|t| track(t)).filter(|(k, _)| *k == n).map(|(_, kind)| kind).collect();
+            assert_eq!(mine.first(), Some(&0), "track {n} starts with its header");
+            assert!(mine.iter().filter(|k| **k == 1 || **k == 3).count() > 10, "track {n} frames: {}", mine.len());
+        }
+        // The main track is still plain AVC (0x17 header, then frames).
+        assert!(tags.iter().any(|t| t.first() == Some(&0x17)), "the main track");
+        // A wrong quality is refused before anything starts.
+        let bad = Canvas { video_tracks: vec![(321, 180, 600)], ..Canvas::main(e.config()) };
+        assert!(e.start_output_on(OutputKind::Stream(Box::new(|_| {})), bad).is_err());
     }
 
     #[test]

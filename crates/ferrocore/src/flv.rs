@@ -27,6 +27,41 @@ pub fn video_header(codec: VideoCodec, record: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Enhanced RTMP's Multitrack video packet type (one track a packet, `trackId` after the FourCC),
+/// as OBS's `flv_packet_ex` writes Twitch Enhanced Broadcasting's extra qualities. H.264 only.
+const MULTITRACK: u8 = 6;
+const AVC1: [u8; 4] = *b"avc1";
+
+/// An extra video track's codec header (its AVCDecoderConfigurationRecord), `track` 1 or more.
+pub fn video_track_header(track: u8, record: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(record.len() + 7);
+    out.push(EX_HEADER | KEY << 4 | MULTITRACK);
+    out.push(0); // one track, SequenceStart
+    out.extend_from_slice(&AVC1);
+    out.push(track);
+    out.extend_from_slice(record);
+    out
+}
+
+/// An extra video track's frame and its time in ms, as `video_tag` times the main track's:
+/// CodedFrames with the composition time, or CodedFramesX when there's none.
+pub fn video_track_tag(track: u8, p: &VideoPacket, start_us: i64) -> (u32, Vec<u8>) {
+    let ms = |us: i64| (us - start_us).max(0) / 1000;
+    let dts = ms(p.dts_us);
+    let cts = (ms(p.pts_us) - dts).clamp(-(1 << 23), (1 << 23) - 1) as i32;
+    let kind = if p.key { KEY } else { INTER };
+    let mut out = Vec::with_capacity(p.data.len() + 10);
+    out.push(EX_HEADER | kind << 4 | MULTITRACK);
+    out.push(if cts == 0 { 3 } else { 1 });
+    out.extend_from_slice(&AVC1);
+    out.push(track);
+    if cts != 0 {
+        out.extend_from_slice(&cts.to_be_bytes()[1..]);
+    }
+    out.extend_from_slice(&p.data);
+    (dts as u32, out)
+}
+
 /// A frame's tag, and its timestamp in milliseconds (the decode time; the composition offset is
 /// inside). Times before `start_us` are clamped to 0.
 pub fn video_tag(codec: VideoCodec, p: &VideoPacket, start_us: i64) -> (u32, Vec<u8>) {

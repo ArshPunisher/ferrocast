@@ -49,6 +49,9 @@ pub struct Pipeline {
     /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
     stream_extra: bool,
     sent_extra_headers: Vec<bool>,
+    /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
+    /// Broadcasting): each its encoder, and whether its header went out.
+    video_tracks: Vec<(VideoEncoder, bool)>,
 }
 
 /// The last seconds of encoded picture and sound, kept from a keyframe on (OBS's replay buffer).
@@ -248,6 +251,7 @@ impl Pipeline {
             replay: None,
             stream_extra: false,
             sent_extra_headers: Vec::new(),
+            video_tracks: Vec::new(),
         })
     }
 
@@ -357,6 +361,49 @@ impl Pipeline {
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
         let packets = self.video.encode(frame, pts, key)?;
         self.video_out(packets)
+    }
+
+    /// Adds video qualities a stream sends after its main one (Twitch Enhanced Broadcasting,
+    /// docs/plan/TWITCH-EB.md): tracks 1, 2… in the order given. H.264 only.
+    pub fn add_video_tracks(&mut self, configs: &[VideoConfig]) -> Result<(), AvError> {
+        for c in configs {
+            self.video_tracks.push((VideoEncoder::new(*c)?, false));
+        }
+        Ok(())
+    }
+
+    /// How many extra video qualities it sends.
+    pub fn video_tracks(&self) -> usize {
+        self.video_tracks.len()
+    }
+
+    /// A frame for extra video track `i` (0 is track 1), at `ts_ns` on the main track's clock:
+    /// nothing until the main track has started it.
+    pub fn video_track(&mut self, i: usize, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
+        let Some(start) = self.start_ns else { return Ok(Vec::new()) };
+        if self.paused_at.is_some() || i >= self.video_tracks.len() {
+            return Ok(Vec::new());
+        }
+        let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
+        let (enc, sent) = &mut self.video_tracks[i];
+        let first = !*sent && enc.header().is_none();
+        let packets = enc.encode(frame, pts, first)?;
+        Ok(Self::track_tags(i, enc, sent, packets))
+    }
+
+    fn track_tags(i: usize, enc: &VideoEncoder, sent: &mut bool, packets: Vec<VideoPacket>) -> Vec<Tag> {
+        let track = u8::try_from(i + 1).unwrap_or(u8::MAX);
+        let mut tags = Vec::new();
+        for p in packets {
+            if !*sent {
+                let Some(h) = enc.header() else { continue };
+                *sent = true;
+                tags.push(Tag::Video { ms: 0, body: flv::video_track_header(track, &h) });
+            }
+            let (ms, body) = flv::video_track_tag(track, &p, 0);
+            tags.push(Tag::Video { ms, body });
+        }
+        tags
     }
 
     /// Sound (interleaved, the configured channels) whose first sample is at `ts_ns`.
@@ -475,6 +522,11 @@ impl Pipeline {
                 tags.extend(self.extra_tag(i, &p));
                 self.record_audio(i + 1, p);
             }
+        }
+        for i in 0..self.video_tracks.len() {
+            let (enc, sent) = &mut self.video_tracks[i];
+            let packets = enc.flush()?;
+            tags.extend(Self::track_tags(i, enc, sent, packets));
         }
         if let Some(Recording::On(w)) = self.recording.take() {
             w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
