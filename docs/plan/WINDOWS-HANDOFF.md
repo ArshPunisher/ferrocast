@@ -45,7 +45,12 @@ a test home (`FERROCAST_HOME`), never the owner's data; commit only when the own
     Check a free VST3 (e.g. a gain or EQ) and that a crash or hang in it leaves the sound dry.
 11. **Twitch Enhanced Broadcasting** (if built by then; see `docs/plan/OBS-COMPETE.md`): a short
     test stream on Twitch with NVENC.
-12. **CI:** look at the newest `CI` and `Windows smoke` runs on GitHub for these commits.
+12. **Playlist speed-up** (`source/series.rs`): a playlist's videos now go to the card as NV12,
+    as a single video file does. Play a playlist of two 1080p clips and compare its CPU with
+    one clip on its own (they should be close now); check the clips change cleanly.
+13. **Guest cameras over TURN:** once the relay has its TURN key, a guest on a phone's mobile
+    data (strict network) while the PC is on another strict network must still connect.
+14. **CI:** look at the newest `CI` and `Windows smoke` runs on GitHub for these commits.
 
 ## 1. Where things stand
 
