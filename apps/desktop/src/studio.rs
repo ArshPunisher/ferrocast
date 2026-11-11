@@ -940,7 +940,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
-        A::SourceStatus { .. } => {
+        A::SourceStatus { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
             Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
         }
         A::SourcePicture { name, width } => Ok(match c.source_picture_pixels(&name, width)? {
@@ -1708,6 +1708,58 @@ impl StudioHost for DesktopStudio {
                 }
                 _ => json!({}),
             });
+        }
+        // VST plugins: found, and each filter's plugin asked, off the main thread (a helper can
+        // take a moment); its state saved into the filter on the main thread.
+        if let StudioAct::VstPlugins { rescan } = &act {
+            let rescan = *rescan;
+            let why = ferrocast_vsthost::available().err();
+            let plugins = tokio::task::spawn_blocking(move || ferrocast_vsthost::plugins(rescan))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(json!({ "available": why.is_none(), "why": why, "plugins": plugins }));
+        }
+        if let StudioAct::Vst { name, filter, what } = &act {
+            // Slots stay when a filter's plugin is changed: the newest one running (CodeRabbit).
+            let live = ferrocore::afx::plugin_specs()
+                .into_iter()
+                .filter(|(_, p)| p.source == *name && p.filter == *filter)
+                .rev()
+                .find_map(|(slot, _)| ferrocast_vsthost::live(slot));
+            let not_running = || {
+                ferrocast_vsthost::available()
+                    .err()
+                    .unwrap_or_else(|| "Its plugin isn't running: pick one, and put the source in a scene.".into())
+            };
+            return match what.as_str() {
+                "status" => Ok(match &live {
+                    Some(l) => json!({ "running": l.running(), "problem": l.problem(), "changed": l.changed() }),
+                    None => json!({ "running": false, "problem": not_running(), "changed": false }),
+                }),
+                "open" | "close" => {
+                    let l = live.ok_or_else(not_running)?;
+                    let open = what == "open";
+                    tokio::task::spawn_blocking(move || l.window(open)).await.map_err(|e| e.to_string())??;
+                    Ok(json!({}))
+                }
+                _ => {
+                    let l = live.ok_or_else(not_running)?;
+                    let got = tokio::task::spawn_blocking(move || l.state()).await.map_err(|e| e.to_string())?;
+                    let Some(bytes) = got else { return Ok(json!({ "saved": false })) };
+                    let state = ferrocast_vsthost::encode_state(&bytes);
+                    let (n, f) = (name.clone(), filter.clone());
+                    let data = self.data.clone();
+                    self.on_main(move |h| -> Result<(), String> {
+                        let c = h.collection.as_ref().ok_or(STOPPED)?;
+                        c.update_filter(&n, &f, &json!({ "state": state })).map_err(|e| e.to_string())?;
+                        // Written now: a crash right after keeps what was saved (CodeRabbit).
+                        save(c, &scenes_file(&data));
+                        Ok(())
+                    })
+                    .await??;
+                    Ok(json!({ "saved": true }))
+                }
+            };
         }
         // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
         // milliseconds there, and the scene grid asks for one every few seconds).

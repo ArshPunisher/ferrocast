@@ -22,6 +22,8 @@ serde_json.workspace = true
 half = "2"
 # Checks shader effects of one's own before they're used (the naga wgpu itself uses).
 naga = { version = "30", features = ["wgsl-in"] }
+# A VST plugin's saved state in a collection (obs.rs `vst_effect`).
+base64 = "0.22"
 
 
 [dev-dependencies]
@@ -30,6 +32,7 @@ ferrocast-golive.workspace = true
 tokio.workspace = true
 
 # Hearing a sound locally (monitoring). Linux would need ALSA's headers; not there yet.
+
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 cpal = "0.18"
 

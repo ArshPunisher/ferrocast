@@ -114,6 +114,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
         .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
         .route("/studio/engine/sources/{name}/status", get(engine_source_status))
+        .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
+        .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
@@ -1123,6 +1125,36 @@ async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult
 
 async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_streamlabs(&b.id).await?))
+}
+
+#[derive(Deserialize)]
+struct RescanQuery {
+    #[serde(default)]
+    rescan: bool,
+}
+
+/// `GET …/vst/plugins?rescan=true` → `{ available, why, plugins }`: the VST3 sound plugins on
+/// this computer (each looked at in its own locked-down helper).
+async fn engine_vst_plugins(State(app): State<AppState>, Query(q): Query<RescanQuery>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::VstPlugins { rescan: q.rescan }).await
+}
+
+/// `GET …/sources/{name}/filters/{filter}/vst` → `{ running, problem, changed }`.
+async fn engine_vst_status(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Vst { name, filter, what: "status".into() }).await
+}
+
+/// `POST …/sources/{name}/filters/{filter}/vst` `{ "do": "open" | "close" | "save" }`: its own
+/// window, or its state saved into the filter.
+async fn engine_vst_act(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+    Body(b): Body<DoBody<String>>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Vst { name, filter, what: b.what }).await
 }
 
 /// `GET …/sources/{name}/picture?w=256` → `{ image, width, height }`: the source's own picture

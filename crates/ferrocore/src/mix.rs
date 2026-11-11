@@ -231,7 +231,18 @@ impl Mixer {
     pub fn set_effects(&mut self, id: u64, effects: &[AudioEffect]) {
         let rate = self.rate;
         if let Some(s) = self.sources.get_mut(&id) {
-            s.filters = effects.iter().map(|e| AudioFilter::new(*e, rate)).collect();
+            // A filter whose settings didn't change keeps running as it was (its envelope, the
+            // noise removal's model, a VST's helper): every edit of the collection sets them all.
+            let mut old: Vec<Option<AudioFilter>> = std::mem::take(&mut s.filters).into_iter().map(Some).collect();
+            s.filters = effects
+                .iter()
+                .map(|e| {
+                    old.iter_mut()
+                        .find(|o| o.as_ref().is_some_and(|f| f.effect == *e))
+                        .and_then(Option::take)
+                        .unwrap_or_else(|| AudioFilter::new(*e, rate))
+                })
+                .collect();
         }
     }
 
@@ -514,6 +525,36 @@ impl Mixer {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every edit of a collection sets each source's filters again: one whose settings didn't
+    /// change keeps running (a VST's helper isn't started again), a changed one is made anew.
+    #[test]
+    fn unchanged_filters_keep_running() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static MADE: AtomicU32 = AtomicU32::new(0);
+        #[derive(Debug)]
+        struct Counted;
+        impl crate::afx::SoundPlugin for Counted {
+            fn process(&mut self, _ch: [&mut [f32]; 2]) -> bool {
+                true
+            }
+        }
+        fn make(_slot: u32, _rate: u32) -> Option<Box<dyn crate::afx::SoundPlugin>> {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(Counted))
+        }
+        crate::afx::set_plugin_maker(make);
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        let vst = AudioEffect::Plugin { slot: 900 };
+        let gain = AudioEffect::Gain { db: -3.0 };
+        m.set_effects(1, &[gain, vst]);
+        assert_eq!(MADE.load(Ordering::SeqCst), 1);
+        m.set_effects(1, &[vst, gain]);
+        assert_eq!(MADE.load(Ordering::SeqCst), 1, "the same plugin, moved: still the one running");
+        m.set_effects(1, &[AudioEffect::Plugin { slot: 901 }]);
+        assert_eq!(MADE.load(Ordering::SeqCst), 2, "another plugin: made");
+    }
     /// A filter that holds sound back (as the strong noise removal does, 40 ms) is made up
     /// for: a click filed at a moment comes out at that moment, not the filter's delay later.
     #[test]

@@ -142,6 +142,18 @@ jobs:
           fi
           id=$(deploy/macos-signing.sh setup)
           echo "APPLE_SIGNING_IDENTITY=$id" >> "$GITHUB_ENV"
+      # VST plugins run in their own locked-down helper (docs/plan/VST.md), shipped beside the
+      # app's program. Mac only for now: Windows gets it with its sandbox.
+      - name: The VST helper (macOS)
+        if: matrix.name == 'macOS'
+        shell: bash
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p ferrocast-vsthost --bin ferrocast-vst --target "$t"
+          done
+          mkdir -p apps/desktop/binaries
+          lipo -create -output apps/desktop/binaries/ferrocast-vst-universal-apple-darwin \
+            target/aarch64-apple-darwin/release/ferrocast-vst target/x86_64-apple-darwin/release/ferrocast-vst
       - name: Build the app
         shell: bash
         env:
@@ -173,9 +185,14 @@ jobs:
             clang_rt="$(xcrun clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"
             export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$clang_rt"
           fi
+          # The VST helper goes in beside the program (built in the step before, Mac only).
+          config='{"bundle":{"createUpdaterArtifacts":true}}'
+          if [[ "$OS_NAME" == macOS ]]; then
+            config='{"bundle":{"createUpdaterArtifacts":true,"externalBin":["binaries/ferrocast-vst"]}}'
+          fi
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
-          cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config "$config"
       # Off until the Windows builds are code-signed: Smart App Control (on in fresh Windows 11)
       # blocks an unsigned setup Microsoft hasn't seen before, and ours carries the app packed
       # in one file. NSIS's installer, unsigned too, is let through (3 Nov 2026 test).

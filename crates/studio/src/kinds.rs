@@ -183,6 +183,8 @@ pub fn kinds() -> Kinds {
         )
         // Strong noise removal (DeepFilterNet), in builds that have it.
         .chain(cfg!(feature = "deepfilter").then(|| kind("ferrocast_deepfilter", "Strong Noise Removal")))
+        // A VST3 sound plugin, run in its own locked-down helper (Mac first; docs/plan/VST.md).
+        .chain(cfg!(target_os = "macos").then(|| kind("ferrocast_vst", "VST Plugin")))
         .collect(),
         transitions: vec![
             kind("cut_transition", "Cut"),
@@ -776,6 +778,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("blur", "Blur", "int").range(2.0, 100.0, 1.0).slider().unit(" px").when("mode", &[json!(1)]),
         ],
         "ferrocast_deepfilter" => vec![opt("strength", "Strength", "int").range(1.0, 100.0, 1.0).slider()],
+        // Picked from the plugins found (`GET …/vst/plugins`); its state is the plugin's own.
+        "ferrocast_vst" => Vec::new(),
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
             vec![opt("suppress_level", "Suppression Level", "int").range(-60.0, 0.0, 1.0).slider().unit(" dB")]
         }
@@ -890,6 +894,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         }
         "gain_filter" => json!({ "db": 0.0 }),
         "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "ferrocast_vst" => json!({ "path": "", "cid": "", "name": "", "state": "" }),
         "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -30 }),
         "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),
         "noise_gate_filter" => {
@@ -982,8 +987,8 @@ mod tests {
         let got = ferrocore::obs::import(&json!({ "sources": sources }), (1920, 1080));
         let effects: Vec<String> = got.skipped.clone();
         assert!(
-            // A mask and a LUT need their picture first.
-            effects.iter().all(|s| s.contains("mask_filter") || s.contains("clut_filter")),
+            // A mask and a LUT need their picture first, a VST its plugin.
+            effects.iter().all(|s| s.contains("mask_filter") || s.contains("clut_filter") || s.contains("VST plugin")),
             "left out: {effects:?}"
         );
     }

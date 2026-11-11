@@ -227,6 +227,20 @@ pub fn shader_from(s: &Value) -> Result<Effect, String> {
     })
 }
 
+/// A VST plugin filter (`ferrocast_vst`: `path`, `cid`, `state` in base64) on source `source`,
+/// its slot taken (the same slot as before for the same one); None when none is picked.
+pub fn vst_effect(source: &str, filter: &str, s: &Value) -> Option<AudioEffect> {
+    use base64::Engine as _;
+    let text = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    let (path, cid) = (text("path"), text("cid"));
+    if path.is_empty() || cid.is_empty() {
+        return None;
+    }
+    let state = base64::engine::general_purpose::STANDARD.decode(text("state")).unwrap_or_default();
+    let spec = crate::afx::PluginSpec { source: source.into(), filter: filter.into(), path, cid, state };
+    Some(AudioEffect::Plugin { slot: crate::afx::plugin_slot(spec) })
+}
+
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
@@ -923,6 +937,12 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 }
             } else if let Some(e) = effect_from(kind, &fs) {
                 effects.push(e);
+            } else if kind == "ferrocast_vst" {
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                match vst_effect(&name, fname, &fs) {
+                    Some(e) => sound_effects.push(e),
+                    None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
+                }
             } else if let Some(e) = audio_effect_from(kind, &fs) {
                 sound_effects.push(e);
             } else {

@@ -1490,6 +1490,18 @@ pub enum StudioAct {
     SourceStatus {
         name: String,
     },
+    /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
+    /// vendor, kinds }] }` (looked for once; `rescan` looks again).
+    VstPlugins {
+        rescan: bool,
+    },
+    /// A VST filter's plugin, by `what`: "status" → `{ running, problem, changed }`; "open" or
+    /// "close" its own window; "save" its state into the filter's settings → `{ saved }`.
+    Vst {
+        name: String,
+        filter: String,
+        what: String,
+    },
     /// Puts these sources of a scene into a new group, each where it is on screen (OBS's
     /// Group Selected Items) → the group.
     GroupItems {
@@ -1742,6 +1754,15 @@ impl StudioAct {
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
             A::SourceStatus { name } => check_source_name(name),
+            A::VstPlugins { .. } => Ok(()),
+            A::Vst { name, filter, what } => {
+                check_source_name(name)?;
+                check_source_name(filter)?;
+                if !["status", "open", "close", "save"].contains(&what.as_str()) {
+                    return Err(EngineError::Invalid("what: status, open, close or save.".into()));
+                }
+                Ok(())
+            }
             A::Thumbnail { scene: name, width } | A::SourcePicture { name, width } => {
                 check_source_name(name)?;
                 if !(64..=640).contains(width) {
@@ -1850,6 +1871,8 @@ impl StudioAct {
                 | A::Thumbnail { .. }
                 | A::SourcePicture { .. }
                 | A::SourceStatus { .. }
+                | A::VstPlugins { .. }
+                | A::Vst { .. }
                 | A::Items { .. }
                 | A::Sources
                 | A::Settings { .. }

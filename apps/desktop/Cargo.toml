@@ -28,6 +28,8 @@ ferrocast-server.workspace = true
 ferrocast-studio.workspace = true
 # FFmpeg for remuxing recordings (Ferrocast's own engine finds it).
 ferrocore.workspace = true
+# VST3 sound plugins, each in its own locked-down helper (docs/plan/VST.md).
+ferrocast-vsthost.workspace = true
 ferrocast-guest.workspace = true
 raw-window-handle = "0.6"
 async-trait = "0.1"

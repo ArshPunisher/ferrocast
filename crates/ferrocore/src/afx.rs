@@ -40,6 +40,68 @@ pub fn denoiser_available() -> bool {
     DENOISER.get().is_some()
 }
 
+/// A VST plugin on a source's sound: which one, and its saved state (opaque here: the VST
+/// helper's component and controller chunks). Kept by (source, filter, bundle, class): a new
+/// state for the same one doesn't start it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginSpec {
+    pub source: String,
+    pub filter: String,
+    /// The `.vst3` bundle.
+    pub path: String,
+    /// Its class id, 32 hex digits.
+    pub cid: String,
+    pub state: Vec<u8>,
+}
+
+static PLUGINS: std::sync::Mutex<Vec<PluginSpec>> = std::sync::Mutex::new(Vec::new());
+
+/// The slot for `spec` (the same one as before for the same source, filter and plugin; its
+/// state brought up to date).
+pub fn plugin_slot(spec: PluginSpec) -> u32 {
+    let mut l = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
+    let same =
+        |p: &PluginSpec| p.source == spec.source && p.filter == spec.filter && p.path == spec.path && p.cid == spec.cid;
+    if let Some(i) = l.iter().position(same) {
+        l[i].state = spec.state;
+        return i as u32;
+    }
+    l.push(spec);
+    (l.len() - 1) as u32
+}
+
+/// What slot `slot` holds.
+pub fn plugin_spec(slot: u32) -> Option<PluginSpec> {
+    PLUGINS.lock().unwrap_or_else(|e| e.into_inner()).get(slot as usize).cloned()
+}
+
+/// Every plugin slot in use, with its spec.
+pub fn plugin_specs() -> Vec<(u32, PluginSpec)> {
+    PLUGINS.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().enumerate().map(|(i, p)| (i as u32, p)).collect()
+}
+
+/// The newest state of a slot's plugin (its window changed it), kept for the next start.
+pub fn set_plugin_state(slot: u32, state: Vec<u8>) {
+    if let Some(p) = PLUGINS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(slot as usize) {
+        p.state = state;
+    }
+}
+
+/// Makes the plugin in a slot at a rate (the app's VST host), or None when it can't.
+pub type MakePlugin = fn(u32, u32) -> Option<Box<dyn SoundPlugin>>;
+
+static PLUGIN_MAKER: std::sync::OnceLock<MakePlugin> = std::sync::OnceLock::new();
+
+/// The app's VST host (set once).
+pub fn set_plugin_maker(make: MakePlugin) {
+    let _ = PLUGIN_MAKER.set(make);
+}
+
+/// Whether this app runs VST plugins.
+pub fn plugins_available() -> bool {
+    PLUGIN_MAKER.get().is_some()
+}
+
 /// A filter's kind and settings (OBS's keys and defaults in the comments).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AudioEffect {
@@ -100,6 +162,10 @@ pub enum AudioEffect {
     Denoise {
         strength: u32,
     },
+    /// A VST plugin (`ferrocast_vst`), in the slot `plugin_slot` gave it.
+    Plugin {
+        slot: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,6 +220,7 @@ impl AudioFilter {
                 AudioEffect::Denoise { strength } if rate == 48_000 => {
                     DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
                 }
+                AudioEffect::Plugin { slot } => PLUGIN_MAKER.get().and_then(|make| make(slot, rate)),
                 _ => None,
             },
             floor: 0.0,
@@ -183,10 +250,16 @@ impl AudioFilter {
             if p.process([&mut *l, &mut *r]) {
                 return;
             }
+            // A VST that was late or stopped: this block passes as it was; it starts itself again.
+            if matches!(self.effect, AudioEffect::Plugin { .. }) {
+                return;
+            }
             tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
             self.plugin = None;
         }
         match self.effect {
+            // No VST host in this app, or not running yet: the sound passes as it is.
+            AudioEffect::Plugin { .. } => {}
             AudioEffect::Gain { db } => {
                 let m = db_to_mul(db);
                 for v in l.iter_mut().chain(r.iter_mut()) {

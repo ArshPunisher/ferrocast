@@ -101,6 +101,10 @@ fn init_tracing(dir: &std::path::Path) {
 fn main() {
     let dir = data_dir();
     init_tracing(&dir);
+    // VST plugins run in their own locked-down helper, which may never read this folder (stream
+    // keys, sign-ins); the Studio's sound filters then reach them.
+    ferrocast_vsthost::client::keep_private(vec![dir.clone()]);
+    ferrocast_vsthost::install();
     #[cfg(windows)]
     crash::install(&dir);
     #[cfg(all(windows, debug_assertions))]
