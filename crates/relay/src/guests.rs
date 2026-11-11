@@ -185,6 +185,12 @@ async fn ice(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "invite_ended", "This guest link has ended.")
             .hint("Ask the streamer for a new link."));
     }
+    // Per link too: a leaked one can't mint TURN credentials from many addresses (CodeRabbit).
+    if let Err(wait) = lock(&st.guests.limits).take("guest_ice_invite", token, 30, 600_000, now) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "This link has been tried a lot.")
+            .hint(format!("Try again in {wait} s."))
+            .header(axum::http::header::RETRY_AFTER, wait.to_string()));
+    }
     let mut servers = vec![json!({ "urls": STUN })];
     if let Some((id, key)) = turn_key() {
         match turn_servers(&st.http, &id, &key).await {
