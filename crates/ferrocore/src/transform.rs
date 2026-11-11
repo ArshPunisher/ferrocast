@@ -130,6 +130,16 @@ impl Affine {
         Self { e: x, f: y, ..Self::IDENTITY }
     }
 
+    /// The map back (None when it squashes everything flat: a zero scale).
+    pub fn inverse(&self) -> Option<Self> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 || !det.is_finite() {
+            return None;
+        }
+        let (a, b, c, d) = (self.d / det, -self.b / det, -self.c / det, self.a / det);
+        Some(Self { a, b, c, d, e: -(a * self.e + c * self.f), f: -(b * self.e + d * self.f) })
+    }
+
     /// One map after another: a point goes through `self`, then `outer`.
     pub fn then(&self, outer: &Self) -> Self {
         Self {

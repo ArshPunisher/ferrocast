@@ -1922,6 +1922,26 @@ fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) 
                 out.push(crate::preview::Outline { corners: c, color: color(it.item_id), width: 2.0, handles: true });
             }
         }
+        // A picked source inside one of the scene's groups (OBS outlines it on the canvas,
+        // through its group, with handles to resize it).
+        for g in items.iter().filter(|i| i.group.is_some()) {
+            let (Some(gname), Some((gw, gh))) = (&g.scene, g.group) else { continue };
+            let Some(kids) = st.scenes.get(gname) else { continue };
+            let (gp, _) = animated(g, scene_ms(st, scene, ts));
+            let to_canvas = crate::transform::draw_transform(&gp, gw, gh);
+            // On the scene's clock, as it's drawn (a group's sources play along with it).
+            for it in kids.iter().filter(|i| i.item_id != 0 && ids.contains(&i.item_id)) {
+                if let Some(c) = corners(scene, it) {
+                    let c = c.map(|(x, y)| to_canvas.apply(x, y));
+                    out.push(crate::preview::Outline {
+                        corners: c,
+                        color: color(it.item_id),
+                        width: 2.0,
+                        handles: true,
+                    });
+                }
+            }
+        }
     }
     out
 }
@@ -2246,6 +2266,9 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) 
             let items =
                 scene.iter().filter(|i| i.visible).filter_map(|i| item_at(st, i, ms, depth + 1, canvas)).collect();
             match it.group {
+                // An empty group is 0×0: nothing to draw, and drawing it would fail the whole
+                // frame (owner, 11 Nov: the canvas stayed blank once a group was added).
+                Some((0, _) | (_, 0)) => return None,
                 Some((width, height)) => Content::Group { width, height, items },
                 None => Content::Scene(Scene { width: canvas.0, height: canvas.1, items }),
             }
@@ -3584,6 +3607,35 @@ mod tests {
         assert!(!e.set_item_placement("Other", 7, Placement::default()));
     }
 
+    /// A source picked inside a group is outlined on the canvas, through its group, with
+    /// handles (owner, 11 Nov: it had no frame, so it couldn't be resized).
+    #[test]
+    fn a_picked_source_in_a_group_is_outlined_through_it() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 100, height: 50, rgba: [200, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut kid = SceneItem::new(1, Placement { x: 10.0, y: 20.0, ..Default::default() });
+        kid.item_id = 9;
+        e.set_scene("Box", vec![kid]);
+        let mut group =
+            SceneItem::new(0, Placement { x: 100.0, y: 100.0, scale_x: 2.0, scale_y: 2.0, ..Default::default() });
+        group.item_id = 3;
+        group.scene = Some("Box".into());
+        group.group = Some((200, 100));
+        e.set_scene("Main", vec![group]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let marks = crate::preview::Marks {
+            scene: None,
+            picked: Some(("Main".into(), vec![9])),
+            colors: vec![[1.0, 0.0, 0.0, 1.0]],
+        };
+        let st = e.lock();
+        let o = outlines(&st, &marks, (640, 360), now_ns());
+        assert_eq!(o.len(), 1, "the source inside, outlined");
+        assert!(o[0].handles);
+        assert_eq!(o[0].corners, [(120.0, 140.0), (320.0, 140.0), (320.0, 240.0), (120.0, 240.0)]);
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn records_on_its_own_clock() {
@@ -4279,6 +4331,62 @@ mod tests {
         assert_eq!(px(&e, 100), [0, 0, 0, 0], "drawn once, not twice over a black canvas");
         let thumb = e.snapshot_scene("Other").unwrap_or_default();
         assert_eq!(&thumb[20..24], &[0, 255, 0, 255], "a thumbnail is the scene alone");
+    }
+
+    #[test]
+    fn a_colour_mask_hides_where_its_picture_is_black() {
+        // Owner's filter check, 11 Nov. Its colour kind reads black and white (the alpha kind
+        // reads the picture's own see-through parts).
+        let Some(e) = engine() else { return };
+        let dir = std::env::temp_dir().join(format!("fc-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|x| panic!("{x}"));
+        let mask = dir.join("mask.png");
+        // Left half black, right half white, as a PNG.
+        let (w, h) = (64u32, 36u32);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let v = if x < w / 2 { 0 } else { 255 };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        image::save_buffer(&mask, &px, w, h, image::ColorType::Rgba8).unwrap_or_else(|x| panic!("{x}"));
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "color_source", "versioned_id": "color_source_v3", "name": "Blue",
+                  "settings": { "width": 640, "height": 360, "color": 0xFFFF_0000u32 },
+                  "filters": [{ "id": "mask_filter", "versioned_id": "mask_filter_v2", "name": "Mask", "enabled": true,
+                                "settings": { "image_path": mask.to_string_lossy(), "type": "mask_color_filter.effect", "stretch": true } }] },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Blue", "id": 1 }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty(), "nothing left out");
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(400));
+        let shot = e.snapshot().unwrap_or_default();
+        let at = |x: usize| shot[x * 4..x * 4 + 4].to_vec();
+        assert_eq!(at(600), [0, 0, 255, 255], "the white side shows");
+        assert_eq!(at(40)[3], 0, "the black side is hidden: {:?}", at(40));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_group_doesnt_stop_the_picture() {
+        let Some(e) = engine() else { return };
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "color_source", "versioned_id": "color_source_v3", "name": "Blue",
+                  "settings": { "width": 640, "height": 360, "color": 0xFFFF_0000u32 } },
+                { "id": "group", "name": "Empty", "settings": { "items": [], "cx": 0, "cy": 0 } },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Blue", "id": 1 }, { "name": "Empty", "id": 2 }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty());
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(&e.snapshot().unwrap_or_default()[20..24], &[0, 0, 255, 255], "the scene still shows");
     }
 
     #[test]
