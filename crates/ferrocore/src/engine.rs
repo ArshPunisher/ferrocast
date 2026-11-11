@@ -142,6 +142,9 @@ pub struct Feed(Arc<FeedSlot>);
 #[derive(Debug, Default)]
 struct FeedSlot {
     picture: Mutex<Option<Picture>>,
+    /// A picture as NV12, turned into RGB on the card (a playlist's video where FFmpeg plays it).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    yuv: Mutex<Option<crate::ffsrc::Nv12Picture>>,
     sound: Mutex<std::collections::VecDeque<(Vec<f32>, u32, u64)>>,
 }
 
@@ -153,6 +156,12 @@ impl Feed {
 
     pub fn picture(&self, p: Picture) {
         *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    /// The same, as NV12 for the card (no RGB made on the CPU).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    pub fn yuv(&self, p: crate::ffsrc::Nv12Picture) {
+        *self.0.yuv.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
 
     /// Stereo, interleaved, at `rate` Hz; its first sample at `ts_ns` (`now_ns`'s clock). At
@@ -2473,7 +2482,7 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
 /// A video file as its pictures are best drawn: as NV12 turned into RGB on the card where FFmpeg
 /// plays it (Windows, Linux), as RGBA where the system does (a Mac).
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-fn open_video(path: &std::path::Path, looping: bool) -> Result<crate::media::Media, AvError> {
+pub(crate) fn open_video(path: &std::path::Path, looping: bool) -> Result<crate::media::Media, AvError> {
     #[cfg(target_os = "macos")]
     return crate::media::Media::open(path, looping);
     #[cfg(not(target_os = "macos"))]
@@ -2827,7 +2836,11 @@ fn frame(
                 }
             }
             Live::Fed(feed) | Live::Series { feed, .. } => {
-                if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                // The newest of the two kinds handed in (a playlist moves between them only at
+                // a file's start, so one is always empty then).
+                if let Some(p) = feed.0.yuv.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    uploads.push((*id, Fresh::Yuv(p)));
+                } else if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, Fresh::Pic(p)));
                 }
                 let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();

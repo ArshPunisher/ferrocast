@@ -155,7 +155,9 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
         loop {
             let mut played = false;
             for i in order(p.files.len(), p.random, &mut seed) {
-                let m = match crate::media::Media::open(&p.files[i], false) {
+                // As a single video file opens: NV12 to the card where FFmpeg plays it (11 Nov: the
+                // RGBA path cost a playlist several times the CPU of the same clip on its own).
+                let m = match crate::engine::open_video(&p.files[i], false) {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(error = %e, "a playlist file didn't open: skipped");
@@ -167,7 +169,12 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
                 };
                 played = true;
                 while !m.ended() {
-                    if let Some(pic) = m.frame_at(now_ns()) {
+                    // NV12 for the card where FFmpeg plays it; a Mac's own player gives RGBA.
+                    #[cfg(not(target_os = "macos"))]
+                    let fresh = m.frame_nv12().map(|y| feed.yuv(y)).is_some();
+                    #[cfg(target_os = "macos")]
+                    let fresh = false;
+                    if !fresh && let Some(pic) = m.frame_at(now_ns()) {
                         feed.picture(pic);
                     }
                     for (pcm, t) in m.take_sound() {
