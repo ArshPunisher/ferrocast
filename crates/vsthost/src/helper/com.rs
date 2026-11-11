@@ -439,10 +439,11 @@ impl IBStreamTrait for Stream {
 
     unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
         let len = self.bytes.borrow().len() as i64;
-        let base = match mode as u32 {
-            m if m == IBStream_::IStreamSeekMode_::kIBSeekSet => 0,
-            m if m == IBStream_::IStreamSeekMode_::kIBSeekCur => self.at.get() as i64,
-            m if m == IBStream_::IStreamSeekMode_::kIBSeekEnd => len,
+        // The SDK's enum is `i32` on Windows and `u32` elsewhere: compared as i64.
+        let base = match i64::from(mode) {
+            m if m == IBStream_::IStreamSeekMode_::kIBSeekSet as i64 => 0,
+            m if m == IBStream_::IStreamSeekMode_::kIBSeekCur as i64 => self.at.get() as i64,
+            m if m == IBStream_::IStreamSeekMode_::kIBSeekEnd as i64 => len,
             _ => return kInvalidArgument,
         };
         let to = (base + pos).clamp(0, len.max(base + pos).max(0));
@@ -513,6 +514,7 @@ mod tests {
         unsafe {
             assert_eq!(p.write(data.as_mut_ptr().cast(), 5, &mut n), kResultOk);
             assert_eq!(n, 5);
+            #[allow(clippy::unnecessary_cast)] // i32 on Windows, u32 elsewhere
             p.seek(1, IBStream_::IStreamSeekMode_::kIBSeekSet as i32, &mut pos);
             let mut back = [0u8; 8];
             p.read(back.as_mut_ptr().cast(), 8, &mut n);

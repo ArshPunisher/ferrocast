@@ -41,6 +41,7 @@ pub fn keep_private(dirs: Vec<PathBuf>) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn private_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = PRIVATE.get().and_then(|m| m.lock().ok().map(|l| l.clone())).unwrap_or_default();
     if let Some(h) = std::env::var_os("FERROCAST_HOME") {

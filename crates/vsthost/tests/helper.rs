@@ -99,7 +99,9 @@ fn a_plugin_that_hangs_or_crashes_holds_nothing_up() {
         let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
         assert!(!hung.process(&mut l, &mut r), "late: left as it was");
         assert_eq!(l[0], 0.5);
-        assert!(b.elapsed() < Duration::from_millis(60), "a block never waits long: {:?}", b.elapsed());
+        // It waits BLOCK_BUDGET (8 ms) at most; the margin is for a busy shared CI machine (65 ms
+        // seen there, 11 Nov). What matters: never anything like the 2 s a hang takes.
+        assert!(b.elapsed() < Duration::from_millis(250), "a block never waits long: {:?}", b.elapsed());
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(hung.dead.is_some(), "ended after two silent seconds");

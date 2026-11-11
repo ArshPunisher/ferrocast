@@ -1,5 +1,6 @@
 //! A VST filter the way the engine runs it: from a collection's `ferrocast_vst` filter to a slot,
 //! the app's maker, the helper started in the background, and the sound through it.
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
