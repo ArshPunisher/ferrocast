@@ -51,6 +51,11 @@ a test home (`FERROCAST_HOME`), never the owner's data; commit only when the own
 13. **Guest cameras over TURN:** once the relay has its TURN key, a guest on a phone's mobile
     data (strict network) while the PC is on another strict network must still connect.
 14. **CI:** look at the newest `CI` and `Windows smoke` runs on GitHub for these commits.
+15. **The smoke test's frame rate on GitHub isn't a measure:** on 11 Nov the same runner image
+    gave 3.3 to 16.8 fps (and 23 before) across commits, and a bisect over the day's commits
+    went slow, slow, slow, fast, slow, so no commit caused it. Measure the frame time here
+    (§5.1) before and after the 11 Nov commits; if it really dropped, the Mac's bisect points
+    were 74f6a16, e567ad6, 984c0ef and 0e3181d.
 
 ## 1. Where things stand
 
