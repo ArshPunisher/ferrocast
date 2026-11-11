@@ -575,6 +575,11 @@ struct Running {
     light: bool,
 }
 
+/// Twitch Enhanced Broadcasting's plan for the Studio stream on now (None: none).
+pub(crate) fn lock_enhanced(e: &Engine) -> std::sync::MutexGuard<'_, Option<ferrocast_golive::twitch_eb::Plan>> {
+    lock(&e.golive().enhanced)
+}
+
 /// The destination `id` backs up, if any.
 fn backs_up<'a>(cfg: &'a GoLiveConfig, id: &str) -> Option<&'a DestinationConfig> {
     let (primary, _) = cfg.advanced.per.iter().find(|(_, a)| a.backup.as_deref() == Some(id))?;

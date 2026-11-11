@@ -2231,6 +2231,8 @@ impl Engine {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
+            *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)
@@ -2239,9 +2241,20 @@ impl Engine {
         }
         let (server, key) = self.golive_ingest().await?;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
+        // Not while one already runs: its plan stays with it (Start then only says how it is).
+        let running = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
         let out = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
-        let (tracks, eb_note) = self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await;
-        let mut v = host.stream_start(server, key, tracks).await.map_err(failed)?;
+        let (tracks, eb_note) =
+            if running { (Vec::new(), None) } else { self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await };
+        let mut v = match host.stream_start(server, key, tracks).await {
+            Ok(v) => v,
+            Err(e) => {
+                if !running {
+                    *crate::golive::lock_enhanced(self) = None;
+                }
+                return Err(failed(e));
+            }
+        };
         let mut also = follow_stream(host.as_ref(), true, &s).await;
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
@@ -2888,6 +2901,24 @@ mod tests {
         taken();
         e.studio_sync_vertical().await;
         assert!(!sent(&taken()));
+    }
+
+    /// Twitch Enhanced Broadcasting's plan belongs to the Studio stream that fetched it: gone
+    /// when that stream stops, so OBS going live later never sends to an old address and key.
+    #[tokio::test]
+    async fn an_enhanced_broadcasting_plan_ends_with_its_stream() {
+        let (e, _d) = engine().await;
+        e.start_golive(0).await;
+        e.set_studio_host(Arc::new(Fake::default()));
+        e.studio_stream(true).await.unwrap();
+        *crate::golive::lock_enhanced(&e) = Some(ferrocast_golive::twitch_eb::Plan {
+            config_id: "c".into(),
+            url: "rtmps://ingest.test/app/old_key".into(),
+            encodes: Vec::new(),
+            warning: None,
+        });
+        e.studio_stream(false).await.unwrap();
+        assert!(crate::golive::lock_enhanced(&e).is_none());
     }
 
     #[test]
