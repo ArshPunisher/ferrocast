@@ -36,6 +36,7 @@ mod obs;
 pub mod obs_theme;
 mod patch;
 mod pipeline;
+pub mod plugin_catalog;
 pub mod plugin_logic;
 pub mod plugins;
 mod polls;

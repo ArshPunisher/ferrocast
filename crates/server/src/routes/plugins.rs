@@ -19,6 +19,8 @@ pub const MAX_PLUGIN_BODY: usize = ferrocast_engine::plugins::MAX_ZIP as usize +
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/plugins", get(list))
+        .route("/plugins/catalog", get(catalog))
+        .route("/plugins/catalog/install", axum::routing::post(catalog_install))
         .route("/plugins/{id}", put(set_on).delete(remove))
         .route("/plugins/{id}/panel", get(panel))
         .route("/plugins/{id}/act", axum::routing::post(act))
@@ -33,6 +35,34 @@ async fn panel(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult
 async fn act(State(app): State<AppState>, Path(id): Path<String>, Body(step): Body<Value>) -> ApiResult<StatusCode> {
     app.engine.plugin_act(&id, step).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct FreshQuery {
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// `GET /plugins/catalog?fresh=true` → `{ plugins }`: the signed catalog's plugins, each with
+/// `installed` (its version here, or null) and `update`. 503 `catalog_not_open` before the
+/// owner's catalog key is in the app.
+async fn catalog(
+    State(app): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<FreshQuery>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.plugin_catalog(q.fresh).await?))
+}
+
+#[derive(Deserialize)]
+struct IdBody {
+    id: String,
+}
+
+/// `POST /plugins/catalog/install` `{ id }` → 201 the plugin: fetched, checked against the
+/// signed catalog, installed and on.
+async fn catalog_install(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<impl IntoResponse> {
+    let p = app.engine.install_from_catalog(&b.id).await?;
+    Ok((StatusCode::CREATED, Json(json!(p))))
 }
 
 async fn list(State(app): State<AppState>) -> Json<Value> {

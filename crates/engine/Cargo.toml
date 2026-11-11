@@ -41,6 +41,8 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # features: no plugins, SSH keys, armor or async.
 age = { version = "0.12", default-features = false }
 sha2 = "0.11"
+# The plugin catalog's signature (minisign, as `cargo tauri signer` makes it).
+minisign-verify = "0.3"
 flate2 = "1"
 base64 = "0.23"
 # Logic plugins: WebAssembly run in a sandbox with a time (fuel) and memory budget (plugins.rs).

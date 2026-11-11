@@ -152,3 +152,25 @@ async fn a_panel_is_a_page_of_its_own() {
     let none = s.client.get(format!("{}/plugin-panel/nope.nope", s.base)).send().await.unwrap();
     assert_eq!(none.status(), StatusCode::NOT_FOUND);
 }
+
+/// The catalog before the owner's key is in the app: closed, said plainly (503 with a hint), and
+/// nothing can be installed from it.
+#[tokio::test]
+async fn the_catalog_is_closed_until_its_key_is_in() {
+    let s = start().await;
+    let r = s.client.get(format!("{}/api/v1/plugins/catalog", s.base)).bearer_auth(&s.token).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "catalog_not_open");
+    assert!(body["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()));
+    let r = s
+        .client
+        .post(format!("{}/api/v1/plugins/catalog/install", s.base))
+        .bearer_auth(&s.token)
+        .json(&json!({ "id": "com.ana.invert" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(s.get("/plugins").await.json::<Value>().await.unwrap().as_array().is_some_and(|a| a.is_empty()));
+}

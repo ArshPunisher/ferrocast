@@ -86,11 +86,13 @@ fn refused(status: u16, code: &'static str, message: impl Into<String>, hint: &s
 }
 
 /// An id: 3 to 64 of a-z, 0-9, `.`, `-`, `_`, starting with a letter (a reverse domain works).
-fn good_id(id: &str) -> bool {
+pub(crate) fn good_id(id: &str) -> bool {
     (3..=64).contains(&id.len())
         && id.starts_with(|c: char| c.is_ascii_lowercase())
         && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
         && !id.contains("..")
+        // `/plugins/catalog` is the catalog's own address.
+        && id != "catalog"
 }
 
 /// Checks a manifest's fields → what's wrong, in words.
