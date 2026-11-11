@@ -114,6 +114,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
         .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
         .route("/studio/engine/sources/{name}/status", get(engine_source_status))
+        .route("/studio/engine/screens/{id}/still", get(engine_screen_still))
         .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
         .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
@@ -1169,6 +1170,28 @@ async fn engine_source_picture(
     Query(q): Query<ThumbQuery>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SourcePicture { name, width: q.w }).await
+}
+
+#[derive(Deserialize)]
+struct StillQuery {
+    #[serde(default)]
+    window: bool,
+    #[serde(default = "still_width")]
+    w: u32,
+}
+
+fn still_width() -> u32 {
+    320
+}
+
+/// `GET …/screens/{id}/still?w=320&window=false` → `{ image }`: a still of a screen or window
+/// for the cards a capture is picked from (null where it can't be taken).
+async fn engine_screen_still(
+    State(app): State<AppState>,
+    Path(id): Path<u32>,
+    Query(q): Query<StillQuery>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w }).await
 }
 
 /// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a

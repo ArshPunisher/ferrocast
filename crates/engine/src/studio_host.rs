@@ -1490,6 +1490,15 @@ pub enum StudioAct {
     SourceStatus {
         name: String,
     },
+    /// A still of a screen (`window` false: a display by its id) or a window, at most `width`
+    /// wide, for the cards a capture is picked from → `{ image: data URL | null }` (null where
+    /// it can't be taken: not on a Mac yet, or no permission).
+    ScreenStill {
+        id: u32,
+        #[serde(default)]
+        window: bool,
+        width: u32,
+    },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
     /// vendor, kinds }] }` (looked for once; `rescan` looks again).
     VstPlugins {
@@ -1757,6 +1766,10 @@ impl StudioAct {
             }
             A::Ungroup { scene, .. } | A::SetGroup { scene, .. } => check_source_name(scene),
             A::SourceStatus { name } => check_source_name(name),
+            A::ScreenStill { width, .. } if !(64..=1280).contains(width) => {
+                Err(EngineError::Invalid("width: 64 to 1280.".into()))
+            }
+            A::ScreenStill { .. } => Ok(()),
             A::VstPlugins { .. } => Ok(()),
             A::Vst { name, filter, what } => {
                 check_source_name(name)?;
@@ -1874,6 +1887,7 @@ impl StudioAct {
                 | A::Thumbnail { .. }
                 | A::SourcePicture { .. }
                 | A::SourceStatus { .. }
+                | A::ScreenStill { .. }
                 | A::VstPlugins { .. }
                 | A::Vst { .. }
                 | A::Items { .. }

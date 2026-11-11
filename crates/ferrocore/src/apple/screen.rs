@@ -160,6 +160,23 @@ fn content() -> Result<Retained<SCShareableContent>, AvError> {
     }
 }
 
+/// A still of a display or window at most `width` wide (the cards a screen is picked from):
+/// the first frame of a small capture that stops at once, so nothing keeps running. macOS 13
+/// has no one-shot screenshot call (SCScreenshotManager is 14+).
+pub fn still(target: Target, width: u32) -> Result<Picture, AvError> {
+    let w = width.clamp(64, 1280);
+    // A square box: the picture is scaled to fit it, its own shape kept.
+    let cap = ScreenCapture::start(target, w, w, 4, false)?;
+    let until = std::time::Instant::now() + Duration::from_millis(1500);
+    while std::time::Instant::now() < until {
+        if let Some(p) = cap.take() {
+            return Ok(p);
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    Err(AvError::Source("the screen gave no picture in time".into()))
+}
+
 /// What can be captured now: displays, and apps' own windows that are on screen and have a title.
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     let c = content()?;

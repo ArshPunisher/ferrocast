@@ -940,7 +940,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
-        A::SourceStatus { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
+        A::SourceStatus { .. } | A::ScreenStill { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
             Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
         }
         A::SourcePicture { name, width } => Ok(match c.source_picture_pixels(&name, width)? {
@@ -1675,6 +1675,29 @@ impl StudioHost for DesktopStudio {
                 })
                 .await??;
             return serde_json::to_value(opts).map_err(|e| e.to_string());
+        }
+        // A screen's or window's still for the picker's cards: a short capture off the main
+        // thread (Mac; elsewhere none yet, and the card keeps its icon).
+        if let StudioAct::ScreenStill { id, window, width } = &act {
+            let (id, window, width) = (*id, *window, *width);
+            #[cfg(target_os = "macos")]
+            {
+                use ferrocore::screen::{Target, still};
+                let target = if window { Target::Window(id) } else { Target::Display(id) };
+                let image = tokio::task::spawn_blocking(move || {
+                    still(target, width)
+                        .ok()
+                        .and_then(|p| ferrocast_studio::png_data_url(&p.rgba, p.width, p.height, "screen").ok())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                return Ok(json!({ "image": image }));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (id, window, width);
+                return Ok(json!({ "image": null }));
+            }
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
