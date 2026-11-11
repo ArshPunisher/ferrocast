@@ -1515,7 +1515,8 @@ impl Engine {
                         ..video
                     })
                     .collect();
-                pipe.add_video_tracks(&configs)?;
+                let added = pipe.add_video_tracks(&configs);
+                tracing::info!(asked = configs.len(), added, "more qualities in the stream");
             }
         }
         if let Some((seconds, mb)) = replay {
@@ -3889,14 +3890,21 @@ mod tests {
                 into.lock().unwrap_or_else(|e| e.into_inner()).push(body);
             }
         });
-        let canvas = Canvas { video_tracks: vec![(320, 180, 600), (160, 90, 200)], ..Canvas::main(e.config()) };
+        let canvas = Canvas { video_tracks: vec![(320, 180, 600), (256, 144, 300)], ..Canvas::main(e.config()) };
         let id = e.start_output_on(OutputKind::Stream(send), canvas).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(1500));
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
         let tags = got.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // Multitrack video: 0x80 | frame type | 6, then one track + packet type, avc1, track id.
         let track = |t: &[u8]| (t.len() > 6 && t[0] & 0x8F == 0x86 && &t[2..6] == b"avc1").then(|| (t[6], t[1] & 0x0F));
-        for n in [1u8, 2] {
+        // Every quality that started (an encoder that won't open at a size is left out: GitHub's
+        // Windows runner has none for small ones), and on a Mac both.
+        let mut started: Vec<u8> = tags.iter().filter_map(|t| track(t)).map(|(k, _)| k).collect();
+        started.sort_unstable();
+        started.dedup();
+        #[cfg(target_os = "macos")]
+        assert_eq!(started, [1, 2]);
+        for n in started {
             let mine: Vec<u8> =
                 tags.iter().filter_map(|t| track(t)).filter(|(k, _)| *k == n).map(|(_, kind)| kind).collect();
             assert_eq!(mine.first(), Some(&0), "track {n} starts with its header");

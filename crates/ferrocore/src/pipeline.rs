@@ -364,12 +364,18 @@ impl Pipeline {
     }
 
     /// Adds video qualities a stream sends after its main one (Twitch Enhanced Broadcasting,
-    /// docs/plan/TWITCH-EB.md): tracks 1, 2… in the order given. H.264 only.
-    pub fn add_video_tracks(&mut self, configs: &[VideoConfig]) -> Result<(), AvError> {
+    /// docs/plan/TWITCH-EB.md): tracks 1, 2… in the order given. H.264 only. One whose encoder
+    /// won't open is left out (the stream goes on with the rest) → how many were added.
+    pub fn add_video_tracks(&mut self, configs: &[VideoConfig]) -> usize {
         for c in configs {
-            self.video_tracks.push((VideoEncoder::new(*c)?, false));
+            match VideoEncoder::new(*c) {
+                Ok(e) => self.video_tracks.push((e, false)),
+                Err(e) => {
+                    tracing::warn!(width = c.width, height = c.height, error = %e, "a quality left out of the stream")
+                }
+            }
         }
-        Ok(())
+        self.video_tracks.len()
     }
 
     /// How many extra video qualities it sends.
