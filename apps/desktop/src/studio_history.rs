@@ -88,7 +88,14 @@ fn verb(e: &Edit) -> &'static str {
 
 /// An item's source name, for a step's label.
 fn item_name(c: &Collection, scene: &str, id: i64) -> Option<String> {
-    c.items(scene).ok()?.into_iter().find(|i| i.id == id).map(|i| i.name)
+    // Inside a group too: an edit to a group's source is an undo step like any other (owner's
+    // check, 11 Nov: they weren't, so Undo took back the step before instead).
+    c.items(scene)
+        .ok()?
+        .into_iter()
+        .flat_map(|i| std::iter::once(i.clone()).chain(i.children))
+        .find(|i| i.id == id)
+        .map(|i| i.name)
 }
 
 impl History {
@@ -132,6 +139,20 @@ impl History {
             StudioAct::AddSource { source, .. } => Some(fresh(format!("Add {}", source.name), None, false)),
             StudioAct::AddGroup { name, .. } => Some(fresh(format!("Add group {name}"), None, false)),
             StudioAct::GroupItems { name, .. } => Some(fresh(format!("Group into {name}"), None, false)),
+            StudioAct::SetGroup { scene, id, group } => {
+                let what = item_name(c, scene, *id)?;
+                Some(fresh(
+                    match group.and_then(|g| item_name(c, scene, g)) {
+                        Some(g) => format!("Move {what} into {g}"),
+                        None => format!("Take {what} out of its group"),
+                    },
+                    None,
+                    false,
+                ))
+            }
+            StudioAct::Ungroup { scene, id } => {
+                Some(fresh(format!("Ungroup {}", item_name(c, scene, *id)?), None, false))
+            }
             StudioAct::PasteCopy { name, .. } => Some(fresh(format!("Paste a copy of {name}"), None, false)),
             StudioAct::AddExisting { name, .. } => Some(fresh(format!("Add {name}"), None, false)),
             StudioAct::SetItemTransition { scene, id, show, .. } => {
@@ -312,5 +333,40 @@ mod tests {
         assert_eq!(h.list().0, ["Move Box", "Add scene Two"]);
         assert_eq!(h.undo(&c), Ok(Some("Move Box".into())));
         assert_eq!(c.transform("Main", id).map(|t| t.x).ok(), Some(0.0), "back to before the drag");
+    }
+
+    /// Owner's check, 11 Nov: edits to a group's sources, and moving a source in or out of a
+    /// group, weren't undo steps (Undo took back the step before them instead).
+    #[test]
+    fn group_edits_are_undo_steps() {
+        let c = stage();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+        let id = c
+            .add_source("Main", "color_source_v3", "Box", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+        let g = c.add_group("Main", "Pair").unwrap_or_else(|e| panic!("{e}")).id;
+        step(&mut h, StudioAct::SetGroup { scene: "Main".into(), id, group: Some(g) }, &|| {
+            c.set_group("Main", id, Some(g)).map_err(|e| e.to_string())
+        });
+        let inside = c.items("Main").unwrap_or_default().into_iter().flat_map(|i| i.children).next();
+        let inside = inside.unwrap_or_else(|| panic!("in the group")).id;
+        step(
+            &mut h,
+            StudioAct::EditItem {
+                scene: "Main".into(),
+                id: inside,
+                edit: ferrocast_engine::studio_host::ItemEdit::Hide,
+            },
+            &|| c.edit_item("Main", inside, ferrocast_studio::ItemEdit::Hide).map_err(|e| e.to_string()),
+        );
+        assert_eq!(h.list().0, ["Hide Box", "Move Box into Pair"]);
+        assert_eq!(h.undo(&c), Ok(Some("Hide Box".into())));
+        assert_eq!(h.undo(&c), Ok(Some("Move Box into Pair".into())));
+        assert!(c.items("Main").unwrap_or_default().iter().any(|i| i.name == "Box"), "out of the group again");
     }
 }
