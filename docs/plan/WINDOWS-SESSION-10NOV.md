@@ -237,8 +237,12 @@ Things checked and fine, no change needed:
 - Not tried on this PC: two monitors, 150% scaling, unplugging a USB mic mid-recording.
 - **Preview catching up after a resize** is slow when the PC is busy (it's moved from the
   window's thread at normal priority).
-- **Network media** (`studio/netmedia.rs`, guests' cameras, streams) reads FFmpeg too: it may
-  have the same early-sound timing as files had. Not measured.
+- **Network media** (`studio/netmedia.rs`, guests' cameras, streams): checked on the Mac, 11 Nov,
+  by reading it: it has no shared start clock (pictures and sound are each stamped as they
+  arrive), so the files' loop-burst problem can't happen there. To measure on the PC: send
+  `ffmpeg -re -f lavfi -i "color=black:s=320x180:r=30,drawbox=c=white:t=fill:enable='lt(mod(t,1),0.1)'" -f lavfi -i "aevalsrc='if(lt(mod(t,1),0.1),sin(2*PI*1000*t),0)':s=48000" -c:v libx264 -tune zerolatency -c:a aac -f mpegts udp://127.0.0.1:5000`
+  to a Network media source on `udp://127.0.0.1:5000` and record: the flash and the beep must
+  line up within a frame or two.
 - A file whose sound track starts later than its picture (a stream `start` offset) still gets
   its sound that much early: FFmpeg starts each output at 0.
 - The playlist source (`source/series.rs`) still uses the RGBA path (`Media::open`). It could
