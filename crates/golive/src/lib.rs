@@ -27,6 +27,7 @@ mod rist_srp;
 pub mod srtla;
 pub mod target;
 pub mod ts;
+pub mod twitch_eb;
 mod whip;
 
 mod conn;
