@@ -339,6 +339,7 @@ fn stream_settings(s: &StudioSettings) -> StreamSettings {
         delay_s: s.delay_s,
         vod_track: (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track),
         own_encoder: s.own_encoder,
+        video_tracks: Vec::new(),
     }
 }
 
@@ -2978,7 +2979,7 @@ impl StudioHost for DesktopStudio {
         Ok(())
     }
 
-    async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
+    async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String> {
         self.on_main(move |h| {
             h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
@@ -2987,8 +2988,9 @@ impl StudioHost for DesktopStudio {
             // A stopped or failed one goes first: one output at a time.
             h.stream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let settings = stream_settings(&s);
-            tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, "the Studio starts streaming into Go live");
+            let mut settings = stream_settings(&s);
+            settings.video_tracks = tracks;
+            tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, qualities = settings.video_tracks.len() + 1, "the Studio starts streaming into Go live");
             // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
             // the reason (libobs no longer stands in).
             let c = h.collection.as_ref().ok_or(STOPPED)?;

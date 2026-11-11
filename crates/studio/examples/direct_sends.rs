@@ -45,7 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FERROCAST_ENCODER").unwrap_or_else(|_| "com.apple.videotoolbox.videoencoder.ave.avc".into());
     let mut enc = EncodeSettings::with_encoder(&encoder);
     enc.video_kbps = 2500;
-    let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: None, own_encoder: true };
+    let settings = StreamSettings {
+        encode: enc,
+        reconnect: None,
+        delay_s: 0,
+        vod_track: None,
+        own_encoder: true,
+        video_tracks: Vec::new(),
+    };
     let mut live = c.stream("rtmp://127.0.0.1:1935/main", "", &settings)?;
     // FERROCAST_SIMULCAST=1: a lighter stream (360 high) goes beside it to WebRTC as a second layer.
     let lighter = if std::env::var("FERROCAST_SIMULCAST").is_ok() {

@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         key: "k".into(),
         retry: Retry::default(),
         extra_audio: false,
+        extra_video: false,
     };
     let pusher = rt.spawn(push::run(dest, hub.clone(), health_tx, stop));
 

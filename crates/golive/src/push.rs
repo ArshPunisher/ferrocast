@@ -55,6 +55,9 @@ pub struct Destination {
     pub retry: Retry,
     /// Gets the stream's extra audio tracks (Twitch's VOD track); others get only the main one.
     pub extra_audio: bool,
+    /// Gets the stream's extra video tracks (Twitch Enhanced Broadcasting's other qualities);
+    /// others get only the main picture.
+    pub extra_video: bool,
 }
 
 impl std::fmt::Debug for Destination {
@@ -329,6 +332,12 @@ async fn session(
         let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
         p.send(r).await?;
     }
+    if dest.extra_video {
+        for (_, v) in headers.extra_video {
+            let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
+            p.send(r).await?;
+        }
+    }
     if dest.extra_audio {
         for (_, a) in headers.extra_audio {
             let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
@@ -356,7 +365,12 @@ async fn session(
                     Frame::Metadata(m) => p.client.publish_metadata(&m),
                     // Codec headers always go through; other packets wait for a real keyframe.
                     Frame::Video { ts, data, key } => {
-                        if !flv::video_is_header(&data) {
+                        let extra = flv::video_extra_track(&data);
+                        if extra.is_some() && !dest.extra_video {
+                            continue;
+                        }
+                        let header = flv::video_is_header(&data) || extra.is_some_and(|(_, h)| h);
+                        if !header {
                             if waiting_for_key && !key {
                                 continue;
                             }

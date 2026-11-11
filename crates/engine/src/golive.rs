@@ -79,6 +79,10 @@ pub struct DestinationConfig {
     /// one: for a platform whose route is slow, or that takes less. The main picture only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// Twitch Enhanced Broadcasting (docs/plan/TWITCH-EB.md): the Studio encodes the qualities
+    /// Twitch asks for and sends them all to Twitch in one stream. Twitch, main picture only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced: bool,
 }
 
 impl DestinationConfig {
@@ -303,6 +307,7 @@ impl Default for GoLiveConfig {
             enabled: false,
             canvas: Canvas::Main,
             light: false,
+            enhanced: false,
         };
         Self {
             destinations: vec![
@@ -461,6 +466,9 @@ pub struct DestinationView {
     /// Takes the Studio's lighter stream (left out when not).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// Twitch Enhanced Broadcasting is on for it (left out when not).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced: bool,
     /// On the lighter stream for now: its route fell behind while the others kept up. It tries
     /// the full stream again by itself.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -512,6 +520,8 @@ pub(crate) struct GoLive {
     quality: Mutex<ferrocast_golive::quality::Quality>,
     /// Pre-flight's last Test connection per destination, and when.
     tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
+    /// Twitch Enhanced Broadcasting's plan for the stream on now (None: a normal stream).
+    pub(crate) enhanced: Mutex<Option<ferrocast_golive::twitch_eb::Plan>>,
 }
 
 #[derive(Debug, Default)]
@@ -552,6 +562,7 @@ impl Default for GoLive {
             backup: Mutex::new(BackupState::default()),
             quality: Mutex::new(Default::default()),
             tested: Mutex::new(HashMap::new()),
+            enhanced: Mutex::new(None),
         }
     }
 }
@@ -905,6 +916,7 @@ impl Engine {
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
+                    enhanced: d.enhanced,
                     lighter_for_route: !d.wants_light() && self.on_light(d),
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
@@ -1199,6 +1211,90 @@ impl Engine {
         Ok(cfg)
     }
 
+    /// Twitch Enhanced Broadcasting for the Studio stream about to start (`out` its size,
+    /// `fps`): Twitch's plan is fetched and kept for Twitch's destination → the other
+    /// qualities for the Studio to encode (width, height, kbps), and a note in words when it
+    /// was wanted but can't be (the stream then goes out as usual).
+    pub(crate) async fn enhanced_tracks(
+        &self,
+        out: (u32, u32),
+        fps: u32,
+        vod: bool,
+    ) -> (Vec<(u32, u32, u32)>, Option<String>) {
+        use ferrocast_golive::twitch_eb;
+        *lock(&self.golive().enhanced) = None;
+        let wanted = self
+            .golive_config()
+            .destinations
+            .iter()
+            .any(|d| d.enabled && d.enhanced && d.kind == Service::Twitch && d.canvas == Canvas::Main);
+        if !wanted {
+            return (Vec::new(), None);
+        }
+        let off = |why: String| (Vec::new(), Some(format!("Enhanced Broadcasting is off for this stream: {why}")));
+        let Some(c) = platform_of(Service::Twitch).and_then(|p| self.connector(p)) else {
+            return off("connect Twitch in Settings, Accounts.".into());
+        };
+        let key = match c.ingest().await {
+            Ok(i) => i.key,
+            Err(e) => return off(format!("Twitch's stream key couldn't be read ({e}).")),
+        };
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let ask = twitch_eb::Ask {
+            stream_key: key,
+            version: env!("CARGO_PKG_VERSION").into(),
+            codecs: vec!["h264".into()],
+            width: out.0,
+            height: out.1,
+            canvas_width: out.0,
+            canvas_height: out.1,
+            fps: (fps.max(1), 1),
+            vod_track_audio: vod,
+            max_bitrate_kbps: None,
+            max_tracks: Some(twitch_eb::MAX_TRACKS),
+            audio_rate: 48_000,
+            audio_channels: 2,
+            capabilities: serde_json::json!({
+                "cpu": { "logical_cores": cores, "physical_cores": cores },
+                "system": { "name": std::env::consts::OS, "bits": 64, "arm": cfg!(target_arch = "aarch64") },
+            }),
+        };
+        let client = reqwest::Client::new();
+        match twitch_eb::fetch(&client, &ask).await {
+            Ok(plan) => {
+                // The main picture is track 0; Twitch's smaller ones follow (even sides, a few).
+                let tracks: Vec<(u32, u32, u32)> = plan
+                    .encodes
+                    .iter()
+                    .filter(|e| e.height < out.1 && e.width % 2 == 0 && e.height % 2 == 0)
+                    .map(|e| (e.width, e.height, e.kbps().max(300)))
+                    .take(4)
+                    .collect();
+                tracing::info!(config = %plan.config_id, qualities = tracks.len() + 1, "Twitch Enhanced Broadcasting");
+                let note = plan.warning.clone().map(|w| format!("Twitch says: {w}"));
+                *lock(&self.golive().enhanced) = Some(plan);
+                (tracks, note)
+            }
+            Err(e) => off(format!("{e}.")),
+        }
+    }
+
+    /// Turns Twitch Enhanced Broadcasting on or off for destination `id` (Twitch, main picture).
+    /// It takes effect the next time the Studio starts streaming.
+    pub async fn set_golive_enhanced(&self, id: &str, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
+        if on && (d.kind != Service::Twitch || d.canvas != Canvas::Main) {
+            return Err(EngineError::Invalid("enhanced: Twitch's main picture only.".into()));
+        }
+        if d.enhanced != on {
+            d.enhanced = on;
+            self.save_golive(cfg.clone()).await?;
+        }
+        Ok(cfg)
+    }
+
     /// Adds a custom destination: a name, an `rtmp://` or `rtmps://` server, and its key
     /// (kept in the secret store). It starts ticked.
     pub async fn add_golive_destination(
@@ -1262,6 +1358,7 @@ impl Engine {
             enabled: true,
             canvas,
             light: false,
+            enhanced: false,
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
@@ -1554,6 +1651,7 @@ impl Engine {
                             key: String::new(),
                             retry: Default::default(),
                             extra_audio: false,
+                            extra_video: false,
                         })
                         .map_err(|e| e.to_string()),
                     None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
@@ -1653,6 +1751,14 @@ impl Engine {
                 (url, key)
             }
         };
+        // Twitch Enhanced Broadcasting: to the address Twitch's plan gave, with every quality.
+        let plan = (d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main)
+            .then(|| lock(&self.golive().enhanced).clone())
+            .flatten();
+        let (url, key, extra_video) = match plan.as_ref().and_then(|p| p.url.rsplit_once('/')) {
+            Some((server, k)) => (server.to_string(), k.to_string(), true),
+            None => (url, key, false),
+        };
         let target = Target::parse(&url).map_err(|e| e.to_string())?;
         Ok(Destination {
             id: d.id.clone(),
@@ -1661,6 +1767,7 @@ impl Engine {
             retry: self.golive_config().advanced.retry(&d.id),
             // Twitch's VOD track: only Twitch knows what to do with an extra audio track.
             extra_audio: d.kind == Service::Twitch,
+            extra_video,
         })
     }
 

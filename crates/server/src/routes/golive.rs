@@ -25,6 +25,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/test", post(test_address))
         .route("/golive/networks", get(networks))
         .route("/golive/destinations/{id}/light", put(light))
+        .route("/golive/destinations/{id}/enhanced", put(enhanced))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
@@ -120,6 +121,16 @@ struct OnBody {
 /// `PUT /golive/destinations/{id}/light` `{ on }`: the Studio's lighter stream for it, or the full one.
 async fn light(State(app): State<AppState>, Path(id): Path<String>, Body(b): Body<OnBody>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.set_golive_light(&id, b.on).await?)))
+}
+
+/// `PUT /golive/destinations/{id}/enhanced` `{ on }`: Twitch Enhanced Broadcasting for it (Twitch,
+/// main picture), from the next time the Studio goes live.
+async fn enhanced(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Body(b): Body<OnBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.set_golive_enhanced(&id, b.on).await?)))
 }
 
 async fn remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {

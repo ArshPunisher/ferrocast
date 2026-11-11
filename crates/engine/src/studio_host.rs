@@ -262,7 +262,9 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// `{ devices: { name, id }[], current: { name, id } }` for "Hear it".
     async fn monitoring(&self) -> Result<Value, String>;
     /// Streams the program over RTMP (Ferrocast's own Go live ingest) → stats.
-    async fn stream_start(&self, server: String, key: String) -> Result<Value, String>;
+    /// Starts the Studio's stream into Go live; `tracks` are more qualities (width, height,
+    /// kbps) it sends as extra video tracks (Twitch Enhanced Broadcasting), usually none.
+    async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String>;
     /// Stops the stream (and the vertical picture's with it).
     async fn stream_stop(&self) -> Result<(), String>;
     /// Also streams the vertical picture, while it's on, over RTMP to `key` → whether it
@@ -2236,8 +2238,14 @@ impl Engine {
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
         let (server, key) = self.golive_ingest().await?;
-        let mut v = host.stream_start(server, key).await.map_err(failed)?;
+        // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
+        let out = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
+        let (tracks, eb_note) = self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await;
+        let mut v = host.stream_start(server, key, tracks).await.map_err(failed)?;
         let mut also = follow_stream(host.as_ref(), true, &s).await;
+        if let Some(note) = eb_note {
+            also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+        }
         if let Some(note) = self.studio_sync_vertical().await {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
@@ -2732,7 +2740,12 @@ mod tests {
             self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
             Ok(serde_json::to_value(act).unwrap_or_default())
         }
-        async fn stream_start(&self, server: String, key: String) -> Result<Value, String> {
+        async fn stream_start(
+            &self,
+            server: String,
+            key: String,
+            _tracks: Vec<(u32, u32, u32)>,
+        ) -> Result<Value, String> {
             self.streaming.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::json!({ "server": server, "key_len": key.len() }))
         }

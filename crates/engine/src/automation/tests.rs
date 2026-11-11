@@ -203,7 +203,12 @@ impl StudioHost for Studio {
         self.did.lock().unwrap_or_else(|e| e.into_inner()).push(line);
         Ok(Value::Null)
     }
-    async fn stream_start(&self, _server: String, _key: String) -> Result<Value, String> {
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
         Ok(json!({}))
     }
     async fn stream_stop(&self) -> Result<(), String> {

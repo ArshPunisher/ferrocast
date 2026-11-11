@@ -470,6 +470,10 @@ pub struct StreamSettings {
     /// always encodes now.
     #[serde(default)]
     pub own_encoder: bool,
+    /// More qualities sent as extra video tracks (width, height, kbps): Twitch Enhanced
+    /// Broadcasting's plan, set for one stream, never saved.
+    #[serde(skip)]
+    pub video_tracks: Vec<(u32, u32, u32)>,
 }
 
 /// The engine's own load.

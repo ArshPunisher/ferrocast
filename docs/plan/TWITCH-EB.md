@@ -36,10 +36,10 @@ viewer gets a quality option, also on channels without Twitch's own transcodes.
 |---|---|---|---|
 | 1 | The config request and answer (models, request from our settings, errors in words) | `crates/golive/src/twitch_eb.rs` | **Built 11 Nov**, tests on a recorded answer |
 | 2 | Multitrack video tags (and a reader that tells a track's packets apart) | `crates/golive/src/flv.rs` | **Built 11 Nov**, tests |
-| 3 | Extra encoders: the canvas scaled to each configuration, encoded with the hardware encoder, tagged with its track | `crates/ferrocore/src/pipeline.rs` | Next |
-| 4 | The hub passes extra tracks; only Twitch's push sends them, the rest drop them (`flv::video_extra_track`). A destination joining mid-stream must start at a main-track keyframe: `video_is_keyframe` is true for extra tracks' keyframes too | `crates/golive/src/push.rs`, `hub.rs` | Next |
-| 5 | Go live › Twitch: "Enhanced Broadcasting" switch with (i); its own failures fall back to a normal stream and say why | dashboard, `crates/engine` | Next |
-| 6 | Real test: a short Twitch stream with the owner (Mac VideoToolbox; Windows NVENC on the PC) | owner | After 5 |
+| 3 | Extra encoders: the canvas scaled to each configuration, encoded with the hardware encoder, tagged with its track | `crates/ferrocore/src/pipeline.rs`, `engine.rs` (`Canvas::video_tracks`) | **Built 11 Nov**, engine test |
+| 4 | The hub passes extra tracks; only Twitch's push sends them, the rest drop them (`flv::video_extra_track`). A destination joining mid-stream must start at a main-track keyframe: `video_is_keyframe` is true for extra tracks' keyframes too | `crates/golive/src/push.rs`, `hub.rs` | **Built 11 Nov**, Go Live test |
+| 5 | Go live › Twitch: "Enhanced Broadcasting" switch with (i); its own failures fall back to a normal stream and say why | `golive.rs` `enhanced_tracks`, `PUT /golive/destinations/{id}/enhanced`, Go live › Twitch | **Built 11 Nov**, tests |
+| 6 | Real test: a short Twitch stream with the owner (Mac VideoToolbox; Windows NVENC on the PC) | owner | **Waiting**: needs Twitch connected and a short live test |
 
 Limits to keep: Twitch caps total bitrate and track count in its answer; never more tracks
 than the encoder can run (VideoToolbox: test 3 at 1080p60); a failure to fetch the plan never

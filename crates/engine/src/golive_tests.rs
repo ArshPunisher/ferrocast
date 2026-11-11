@@ -477,7 +477,12 @@ impl crate::studio_host::StudioHost for DirectStudio {
     async fn monitoring(&self) -> Result<serde_json::Value, String> {
         Err("n/a".into())
     }
-    async fn stream_start(&self, _server: String, _key: String) -> Result<serde_json::Value, String> {
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<serde_json::Value, String> {
         Ok(serde_json::Value::Null)
     }
     async fn stream_stop(&self) -> Result<(), String> {
@@ -714,4 +719,26 @@ async fn the_preflight_tries_ticked_destinations() {
     let b = of(&bad.id);
     assert_eq!(b.status, ferrocast_core::show::CheckStatus::Fail);
     assert!(b.detail.contains("Couldn't reach"), "{b:?}");
+}
+
+/// Twitch Enhanced Broadcasting's switch: Twitch's main picture only, kept in the config; with
+/// it on but Twitch not connected, the stream goes out as usual and says why.
+#[tokio::test]
+async fn enhanced_broadcasting_is_twitchs_and_says_why_when_it_cant() {
+    let (e, _dir) = engine().await;
+    let cfg = e.set_golive_enhanced("twitch", true).await.unwrap();
+    assert!(cfg.destinations.iter().any(|d| d.id == "twitch" && d.enhanced));
+    let err = e.set_golive_enhanced("youtube", true).await.unwrap_err().to_string();
+    assert!(err.contains("Twitch"), "{err}");
+    // Not ticked: nothing asked of Twitch, no note.
+    assert_eq!(e.enhanced_tracks((1920, 1080), 60, false).await, (Vec::new(), None));
+    let order: Vec<(String, bool)> =
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "twitch")).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let (tracks, note) = e.enhanced_tracks((1920, 1080), 60, false).await;
+    assert!(tracks.is_empty());
+    assert!(note.is_some_and(|n| n.contains("connect Twitch")), "a note says why");
+    // Off again: kept off.
+    let cfg = e.set_golive_enhanced("twitch", false).await.unwrap();
+    assert!(cfg.destinations.iter().all(|d| !d.enhanced));
 }

@@ -358,6 +358,8 @@ pub(crate) struct Drawing<'a> {
     pub replay: Option<(u32, u32)>,
     /// One scene or source on its own (OBS's Source Record) instead of what's on air.
     pub solo: Option<&'a str>,
+    /// More qualities a stream sends as extra video tracks (Twitch Enhanced Broadcasting).
+    pub video_tracks: &'a [(u32, u32, u32)],
 }
 
 /// The empty scene Fade to Black shows (no collection names a scene like it).
@@ -547,7 +549,8 @@ impl OwnStream {
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(shared: Arc<Shared>, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
-        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo } = how;
+        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo, video_tracks } = how;
+        let streaming = send_to.is_some();
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -599,6 +602,9 @@ impl OwnStream {
         if let Some(first) = picked.next() {
             out.track = first;
             out.more_tracks = picked.collect();
+        }
+        if streaming && !vertical && solo.is_none() {
+            out.video_tracks = video_tracks.to_vec();
         }
         let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
         if vertical {
@@ -861,9 +867,16 @@ fn sender(
         Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
         None => Retry::default(),
     };
-    // Every track goes on (Go live then gives Twitch's VOD track to Twitch only); a stream
-    // without one has none to send.
-    let dest = Destination { id: "studio".into(), target, key: d.key.to_string(), retry, extra_audio: true };
+    // Every track goes on (Go live then gives Twitch's VOD track and Enhanced Broadcasting's
+    // other qualities to Twitch only); a stream without one has none to send.
+    let dest = Destination {
+        id: "studio".into(),
+        target,
+        key: d.key.to_string(),
+        retry,
+        extra_audio: true,
+        extra_video: true,
+    };
     let (health_tx, h) = tokio::sync::watch::channel(Health {
         state: PushState::Waiting,
         kbps: 0,
@@ -921,6 +934,7 @@ mod tests {
             delay_s: 0,
             vod_track: None,
             own_encoder: true,
+            video_tracks: Vec::new(),
         }
     }
 

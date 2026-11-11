@@ -1259,7 +1259,12 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn monitoring(&self) -> Result<Value, String> {
         Ok(json!({ "devices": [] }))
     }
-    async fn stream_start(&self, _server: String, _key: String) -> Result<Value, String> {
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
         self.acts.lock().unwrap().push("stream true".into());
         *self.streaming.lock().unwrap() = true;
         Ok(json!({ "active": true }))

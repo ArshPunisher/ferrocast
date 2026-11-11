@@ -1660,6 +1660,7 @@ impl Stage {
             vertical: false,
             replay: None,
             solo: None,
+            video_tracks: &s.video_tracks,
         };
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
     }
@@ -1687,6 +1688,7 @@ impl Stage {
             vertical: false,
             replay: None,
             solo,
+            video_tracks: &[],
         };
         let mut own = self.output(how)?;
         own.set_plan(plan);
@@ -1738,6 +1740,7 @@ impl Stage {
             vertical: false,
             replay: Some((plan.seconds, plan.mb)),
             solo: None,
+            video_tracks: &[],
         };
         let mut out = StageOutput::new(self.output(how)?, None, self.canvas);
         out.replay = Some((plan.clone(), Arc::default()));
@@ -2420,6 +2423,7 @@ impl Stage {
             vertical: true,
             replay: None,
             solo: None,
+            video_tracks: &[],
         };
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
     }
