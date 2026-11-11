@@ -156,7 +156,13 @@ async fn a_panel_is_a_page_of_its_own() {
 /// The catalog before the owner's key is in the app: closed, said plainly (503 with a hint), and
 /// nothing can be installed from it.
 #[tokio::test]
-async fn the_catalog_is_closed_until_its_key_is_in() {
+async fn the_catalog_is_closed_without_its_key() {
+    // A build without the catalog key (nothing is fetched: the key is checked first).
+    ferrocast_engine::plugin_catalog::set_source(ferrocast_engine::plugin_catalog::Source {
+        url: "http://127.0.0.1:9/catalog.json".into(),
+        key: String::new(),
+        local: true,
+    });
     let s = start().await;
     let r = s.client.get(format!("{}/api/v1/plugins/catalog", s.base)).bearer_auth(&s.token).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);

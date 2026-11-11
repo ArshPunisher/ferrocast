@@ -21,8 +21,9 @@ use crate::{Engine, EngineError};
 pub const CATALOG_URL: &str = "https://raw.githubusercontent.com/ArshPunisher/ferrocast-plugins/main/catalog.json";
 
 /// The owner's catalog public key (base64 of a minisign public key, as `cargo tauri signer
-/// generate` writes it). Empty: no catalog yet, and Browse says so.
-pub const CATALOG_KEY: &str = "";
+/// generate` writes it; made 11 Nov 2026, its private half kept off GitHub). Empty would close
+/// the catalog ("opens soon").
+pub const CATALOG_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4QTNGQTgzQjgxRjc3QTkKUldTcGR4KzRnL3FqS0tEYmlsQlJJNlFhN3hXQTAzaWFvVUpudmRQaC90a1h5M1UweThwY0hxNVEK";
 
 /// Hosts a plugin's file may come from (a release asset on GitHub redirects to its storage).
 const HOSTS: [&str; 4] = [
@@ -332,6 +333,26 @@ mod tests {
         assert!(verify(LIST, SIG, "").is_err(), "no key");
         // The app's own key isn't the tests'.
         assert_ne!(CATALOG_KEY.trim(), KEY.trim());
+    }
+
+    #[test]
+    fn the_catalog_key_reads() {
+        let b = base64::engine::general_purpose::STANDARD.decode(CATALOG_KEY.trim());
+        let text = b.ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+        assert!(minisign_verify::PublicKey::decode(&text).is_ok(), "CATALOG_KEY isn't a minisign key");
+    }
+
+    /// Before pushing the catalog: `FERROCAST_CATALOG_DIR=~/…/ferrocast-plugins cargo test -p
+    /// ferrocast-engine a_catalog_folder -- --ignored` checks its list is signed with the app's key.
+    #[test]
+    #[ignore]
+    fn a_catalog_folder_is_signed_with_the_app_key() {
+        let dir = std::path::PathBuf::from(std::env::var("FERROCAST_CATALOG_DIR").unwrap_or_default());
+        let list = std::fs::read(dir.join("catalog.json")).unwrap_or_else(|e| panic!("catalog.json: {e}"));
+        let sig = std::fs::read_to_string(dir.join("catalog.json.sig")).unwrap_or_else(|e| panic!("sig: {e}"));
+        assert_eq!(verify(&list, &sig, CATALOG_KEY), Ok(()));
+        let entries = entries(&list, &Source { url: CATALOG_URL.into(), key: CATALOG_KEY.into(), local: false });
+        assert!(entries.as_ref().is_ok_and(|e| !e.is_empty()), "{entries:?}");
     }
 
     #[test]
