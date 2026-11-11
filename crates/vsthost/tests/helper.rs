@@ -1,5 +1,7 @@
 //! The helper with our own test plugin (`ferrocast-vst-testgain`): found, run, its state kept,
 //! and a plugin that hangs or crashes never holds anything up. On a Mac, its sandbox too.
+// VST plugins run on a Mac only for now (Windows waits for its sandbox).
+#![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

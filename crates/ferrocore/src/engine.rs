@@ -3877,6 +3877,8 @@ mod tests {
     /// each with its own header and frames under its track number (1, 2), the main track's
     /// packets as before.
     #[test]
+    // Needs the system's own encoder (GitHub's Windows runner has none that opens here).
+    #[cfg(target_os = "macos")]
     fn a_stream_sends_more_qualities_as_tracks() {
         let Some(e) = engine() else { return };
         e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [200, 40, 60, 255] })
