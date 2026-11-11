@@ -11,6 +11,42 @@ Never call a Windows thing done without running it on this PC.
 
 ---
 
+## 0. From the Mac, 11 Nov: do these first on this PC
+
+Everything below was built or fixed on the Mac and needs this PC. Same rules as always (§3):
+a test home (`FERROCAST_HOME`), never the owner's data; commit only when the owner says.
+
+1. **Looping video sound** (fixed on the Mac, `ffsrc.rs` `Out::FileSound`): play a looping
+   clip with sound in a scene for a few minutes; the sound must stay and stay in sync. Re-run
+   the 60 s sync test (`tools/`), numbers in §8.
+2. **The capture switch** (Screen ↔ Window ↔ App, `engine.rs` `hands_over`): no black flash
+   while switching; Window with nothing picked keeps the old picture until a pick.
+3. **Studio Mode** (OBS's Duplicate Scene, `stage.rs` `send_copy_on_air`): edit a source in the
+   preview; what's on air must not move until Transition. Then the new bar under the two
+   pictures: nothing of either picture may draw over the bar or the labels (the child HWND
+   reaches 10 px past its box; the page keeps 12 px clear). Try 125% and 150% scaling.
+4. **Pixel guides** while dragging a source in the preview: red lines to each canvas edge with
+   the px distance; they go when it's let go. Check the label size at 150% scaling.
+5. **Source icons F2** (two-tone by kind, filled eye/lock) and the compact drawer: look only.
+6. **Camera size and frame rate** (§4.x): pick a size and rate the camera can't do; the picture
+   must still come.
+7. **The local installer test** the owner still owes from 10 Nov: a recording, a video file in
+   a scene, Instant replay, the Stats encoder line.
+8. **Sign-in on Windows** ("Finish in browser") with a CI-built installer and the owner's
+   account.
+9. **Not tried yet here:** two monitors (different scaling), 150% scaling, unplugging a USB mic
+   mid-recording (the watchdog must bring it back).
+10. **VST plugins on Windows:** off until their helper has a sandbox. Build it here:
+    `crates/vsthost/src/client.rs` starts `ferrocast-vst`; on Windows run it as a low-integrity
+    (or AppContainer) process in a job object (kill on close, one process, memory cap) with no
+    network capability, and only the plugin's own folder readable beyond system DLLs. Then make
+    `ferrocast_vsthost::available()` say yes on Windows, and run `cargo test -p
+    ferrocast-vsthost` (the test plugin `crates/vst-testgain` builds as a `.vst3` here too).
+    Check a free VST3 (e.g. a gain or EQ) and that a crash or hang in it leaves the sound dry.
+11. **Twitch Enhanced Broadcasting** (if built by then; see `docs/plan/OBS-COMPETE.md`): a short
+    test stream on Twitch with NVENC.
+12. **CI:** look at the newest `CI` and `Windows smoke` runs on GitHub for these commits.
+
 ## 1. Where things stand
 
 | | |
@@ -287,7 +323,8 @@ How the engine runs a frame (all systems):
   - NSIS installer with branded images.
   - Smart App Control can block a new unsigned build the first time (`WINDOWS-NEXT.md`).
   - Microsoft Store MSIX is the free signed route (`docs/plan/MICROSOFT-STORE.md`). 3.0.1 was
-    submitted 9 Nov (ID 9N0L9FPR0P8B); publishing waits for the owner.
+    submitted 9 Nov (ID 9N0L9FPR0P8B), passed certification and was published on 11 Nov.
+    A newer version needs a new submission (`windows-store.yml` builds the MSIX).
 
 ---
 
