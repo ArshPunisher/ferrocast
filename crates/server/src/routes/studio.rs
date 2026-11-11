@@ -844,11 +844,15 @@ struct SelectBody {
     frames: bool,
     #[serde(default)]
     also: Vec<i64>,
+    #[serde(default)]
+    guides: bool,
 }
 
-/// `PUT /studio/engine/preview/selection` `{ scene, id }` (both null for none).
+/// `PUT /studio/engine/preview/selection` `{ scene, id, frames?, also?, guides? }` (scene and
+/// id null for none).
 async fn engine_select(State(app): State<AppState>, Body(b): Body<SelectBody>) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames, also: b.also }).await
+    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames, also: b.also, guides: b.guides })
+        .await
 }
 
 /// `POST /studio/engine/pick-file` `{ kind, filter? }` → `{ path }` (null when cancelled).

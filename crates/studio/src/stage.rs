@@ -3221,6 +3221,10 @@ struct ViewLook {
     shade: f32,
     /// The scene shown instead of what's on air (Studio Mode).
     scene: Option<String>,
+    /// The view's pixels per point (the guides' labels are sized by it).
+    ppp: f32,
+    /// Distance guides for the picked source (while it's dragged).
+    guides: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3290,6 +3294,7 @@ impl Stage {
         let look = ViewLook {
             background: [10.0 / 255.0, 11.0 / 255.0, 13.0 / 255.0, 1.0],
             margin: crate::edge_px(scale) as f32,
+            ppp: ppp(scale),
             ..Default::default()
         };
         // The engine draws at the view's size the moment it changes (AppKit following the
@@ -3325,6 +3330,7 @@ impl StageView {
             let mut l = self.look.borrow_mut();
             l.area = None;
             l.margin = crate::edge_px(scale) as f32;
+            l.ppp = ppp(scale);
         }
         let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(r, scale));
         self.shared.engine.resize_preview(self.id, cx, cy);
@@ -3343,7 +3349,11 @@ impl StageView {
         self.look.borrow_mut().area =
             Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
         let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(area, scale));
-        self.look.borrow_mut().area_for = Some(crate::px(area, scale));
+        {
+            let mut l = self.look.borrow_mut();
+            l.area_for = Some(crate::px(area, scale));
+            l.ppp = ppp(scale);
+        }
         self.shared.engine.resize_preview(self.id, cx, cy);
         self.push();
     }
@@ -3368,6 +3378,13 @@ impl StageView {
     pub fn frames(&self, scene: Option<&str>) {
         self.look.borrow_mut().frames = scene.map(String::from);
         self.push();
+    }
+
+    /// Draws the picked source's distances to the canvas edges (while it's dragged), or not.
+    pub fn guides(&self, on: bool) {
+        if std::mem::replace(&mut self.look.borrow_mut().guides, on) != on {
+            self.push();
+        }
     }
 
     /// The colour round the canvas (0xAABBGGRR).
@@ -3441,9 +3458,16 @@ impl StageView {
                     colors: crate::ffi::FRAME_COLORS.iter().map(|&(r, g, b)| [r, g, b, 1.0]).collect(),
                 }),
                 shade: l.shade,
+                guides: l.guides.then_some(l.ppp),
             },
         );
     }
+}
+
+/// Pixels per point from a page's scale (1 when it's nonsense).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn ppp(scale: f64) -> f32 {
+    if scale.is_finite() && scale > 0.0 { scale as f32 } else { 1.0 }
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3700,6 +3724,7 @@ impl StageView {
     }
     pub fn select(&self, _pick: Option<(&str, &[i64])>) {}
     pub fn frames(&self, _scene: Option<&str>) {}
+    pub fn guides(&self, _on: bool) {}
     pub fn background(&self, _abgr: u32) {}
     pub fn set_shade(&self, _shade: f64) {}
     pub fn set_holes(&self, _holes: &[(f64, f64, f64, f64, f64)]) {}

@@ -1848,7 +1848,7 @@ impl StudioHost for DesktopStudio {
                 let saved = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
                 return Ok(saved_scenes(saved.as_ref()));
             }
-            if let StudioAct::Select { scene, id, frames, also } = &act {
+            if let StudioAct::Select { scene, id, frames, also, guides } = &act {
                 h.selected = scene.clone().zip(*id).map(|(s, id)| {
                     let mut ids = vec![id];
                     ids.extend(also.iter().filter(|a| **a != id));
@@ -1860,6 +1860,7 @@ impl StudioHost for DesktopStudio {
                 for p in h.preview.iter().chain(h.vertical.view.iter()) {
                     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
                     p.frames(h.frames.as_deref());
+                    p.guides(*guides && h.selected.is_some());
                 }
                 return Ok(Value::Null);
             }

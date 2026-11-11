@@ -1583,6 +1583,9 @@ pub enum StudioAct {
         /// More sources picked with it (⌘-click, Shift-click), each outlined with handles.
         #[serde(default)]
         also: Vec<i64>,
+        /// The picked source's distances to the canvas edges, in pixels (while it's dragged).
+        #[serde(default)]
+        guides: bool,
     },
 }
 
@@ -3029,17 +3032,26 @@ mod tests {
             bx("Main", f32::NAN, 0.0, 10.0, false),
             bx("Main", 0.0, 1e9, 10.0, false),
             bx("", 0.0, 0.0, 10.0, false),
-            StudioAct::Select { scene: Some("Main".into()), id: None, frames: false, also: vec![] },
+            StudioAct::Select { scene: Some("Main".into()), id: None, frames: false, also: vec![], guides: false },
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
-        let pick = StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4] };
+        let pick =
+            StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4], guides: false };
         assert!(!pick.changes());
         e.studio_act(pick).await.unwrap();
-        e.studio_act(StudioAct::Select { scene: Some("Main".into()), id: None, frames: true, also: vec![] })
+        e.studio_act(StudioAct::Select {
+            scene: Some("Main".into()),
+            id: None,
+            frames: true,
+            also: vec![],
+            guides: false,
+        })
+        .await
+        .unwrap();
+        e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![], guides: false })
             .await
             .unwrap();
-        e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![] }).await.unwrap();
         assert_eq!(fake.acts.lock().unwrap().len(), 4);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.

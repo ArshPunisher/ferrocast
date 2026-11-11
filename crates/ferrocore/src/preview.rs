@@ -41,6 +41,10 @@ pub struct PreviewLook {
     pub marks: Option<Marks>,
     /// A dark layer over everything, 0 (none) to 1, as a dialog's backdrop dims the page.
     pub shade: f32,
+    /// Distance guides for the first picked source (while it's dragged), as OBS draws them:
+    /// a line from each side to the canvas edge with its length in canvas pixels. The view's
+    /// pixels per point, so the labels read the same size on any screen; None draws none.
+    pub guides: Option<f32>,
 }
 
 impl Default for PreviewLook {
@@ -53,6 +57,7 @@ impl Default for PreviewLook {
             outlines: Vec::new(),
             marks: None,
             shade: 0.0,
+            guides: None,
         }
     }
 }
@@ -408,6 +413,90 @@ fn refit(area: (f32, f32, f32, f32), was: (u32, u32), now: (u32, u32)) -> (f32, 
     (w1 / 2.0 + ox - nw / 2.0, h1 / 2.0 + oy - nh / 2.0, nw, nh)
 }
 
+/// A point in the view or on the canvas, and a filled four-cornered shape.
+type Pt = (f32, f32);
+type Quad = [Pt; 4];
+
+/// The guides' colour, and their labels' text.
+const GUIDE: [f32; 4] = [1.0, 0.27, 0.27, 1.0];
+const GUIDE_TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// The guides round a box (canvas pixels): from each side's middle to the canvas edge it
+/// faces, for the sides inside the canvas, with the length rounded (as OBS's spacing helpers).
+fn guide_lines(corners: Quad, canvas: (u32, u32)) -> Vec<(Pt, Pt, i64)> {
+    let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
+    let xs = corners.map(|c| c.0);
+    let ys = corners.map(|c| c.1);
+    let (x0, x1) = (xs.iter().copied().fold(f32::MAX, f32::min), xs.iter().copied().fold(f32::MIN, f32::max));
+    let (y0, y1) = (ys.iter().copied().fold(f32::MAX, f32::min), ys.iter().copied().fold(f32::MIN, f32::max));
+    let (mx, my) = (((x0 + x1) / 2.0).clamp(0.0, cw), ((y0 + y1) / 2.0).clamp(0.0, ch));
+    let mut out = Vec::new();
+    let mut add = |from: Pt, to: Pt, d: f32| {
+        if d >= 0.5 && d.is_finite() {
+            out.push((from, to, d.round() as i64));
+        }
+    };
+    if x0 < cw {
+        add((0.0, my), (x0, my), x0);
+    }
+    if x1 > 0.0 {
+        add((x1, my), (cw, my), cw - x1);
+    }
+    if y0 < ch {
+        add((mx, 0.0), (mx, y0), y0);
+    }
+    if y1 > 0.0 {
+        add((mx, y1), (mx, ch), ch - y1);
+    }
+    out
+}
+
+/// A 5x7 pixel font for the guides' labels (digits, a minus, `p` and `x`), rows top down,
+/// two more below the line for `p`'s tail.
+#[rustfmt::skip]
+fn glyph(c: char) -> [u8; 9] {
+    match c {
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110, 0b00000, 0b00000],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110, 0b00000, 0b00000],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111, 0b00000, 0b00000],
+        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110, 0b00000, 0b00000],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010, 0b00000, 0b00000],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110, 0b00000, 0b00000],
+        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00000, 0b00000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110, 0b00000, 0b00000],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100, 0b00000, 0b00000],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
+        'p' => [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000],
+        'x' => [0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b00000, 0b00000],
+        _ => [0; 9],
+    }
+}
+
+/// A label's quads centred on `at` (view pixels): a backing in the guides' colour, then its
+/// text, `ppp` the view's pixels per point.
+fn label(text: &str, at: Pt, ppp: f32) -> Vec<(Quad, [f32; 4])> {
+    let dot = (1.5 * ppp).round().max(1.0);
+    let pad = 3.0 * dot;
+    let chars: Vec<char> = text.chars().collect();
+    let tw = (chars.len() as f32 * 6.0 - 1.0).max(0.0) * dot;
+    let th = 7.0 * dot;
+    let (left, top) = ((at.0 - tw / 2.0).round(), (at.1 - th / 2.0).round());
+    let r = |x: f32, y: f32, w: f32, h: f32| [(x, y), (x + w, y), (x + w, y + h), (x, y + h)];
+    let mut out = vec![(r(left - pad, top - pad, tw + 2.0 * pad, th + 2.0 * pad), GUIDE)];
+    for (i, c) in chars.iter().enumerate() {
+        for (row, bits) in glyph(*c).iter().enumerate() {
+            for col in 0..5 {
+                if bits & (16 >> col) != 0 {
+                    let x = left + (i as f32 * 6.0 + col as f32) * dot;
+                    out.push((r(x, top + row as f32 * dot, dot, dot), GUIDE_TEXT));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Every triangle the preview draws: the canvas, the outlines and handles, the shade.
 fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Vertex> {
     let (vw, vh) = (size.0.max(1) as f32, size.1.max(1) as f32);
@@ -467,6 +556,20 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
                         false,
                     );
                 }
+            }
+        }
+    }
+    if let Some(ppp) = look.guides
+        && let Some(o) = look.outlines.iter().find(|o| o.handles)
+    {
+        for (from, to, n) in guide_lines(o.corners, canvas) {
+            let (a, b) = (place(from), place(to));
+            let half = ppp.max(0.5) / 2.0;
+            let (x0, x1, y0, y1) = (a.0.min(b.0) - half, a.0.max(b.0) + half, a.1.min(b.1) - half, a.1.max(b.1) + half);
+            quad([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], none, GUIDE, false);
+            let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            for (r, color) in label(&format!("{n}px"), mid, ppp) {
+                quad(r, none, color, false);
             }
         }
     }
@@ -535,8 +638,68 @@ mod tests {
         assert_eq!(at(100, 28), [0, 255, 0], "outline");
         // A handle at the top-left corner (canvas 40,20 → view ~64.5, 27.75).
         assert_eq!(at(61, 25), [0, 255, 0], "handle");
+        // Guides: the top one runs down from the canvas edge (view y 10) to the box at its
+        // middle (canvas x 80 → view 100), drawn over the canvas; its label sits half way.
+        look.guides = Some(1.0);
+        let guided = gpu.render_preview(200, 100, Shown::Scene(&scene), &look).unwrap_or_else(|e| panic!("{e}"));
+        let g = &guided[(11 * 200 + 100) * 4..(11 * 200 + 100) * 4 + 3];
+        assert!(g[0] == 255 && (60..=80).contains(&g[1]), "guide {g:?}");
+        assert_eq!(at(100, 11), [255, 0, 0], "no guide unless asked");
+        look.guides = None;
         look.shade = 1.0;
         let dark = gpu.render_preview(200, 100, Shown::Scene(&scene), &look).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(&dark[(50 * 200 + 100) * 4..(50 * 200 + 100) * 4 + 3], [4, 5, 8], "dimmed under a dialog");
+    }
+
+    #[test]
+    fn guides_run_from_each_side_to_the_canvas_edge() {
+        // A 80x50 box at (40, 20) on a 160x90 canvas: 40 left, 40 right, 20 above, 20 below.
+        let corners = [(40.0, 20.0), (120.0, 20.0), (120.0, 70.0), (40.0, 70.0)];
+        let lines = guide_lines(corners, (160, 90));
+        let lengths: Vec<i64> = lines.iter().map(|l| l.2).collect();
+        assert_eq!(lengths, [40, 40, 20, 20]);
+        assert_eq!(lines[0].0, (0.0, 45.0), "the left one from the canvas edge, at the box's middle");
+        assert_eq!(lines[2].1, (80.0, 20.0), "the top one to the box's top");
+        // Touching the left edge and hanging off the bottom: no guide on either side.
+        let off = [(0.0, 50.0), (100.0, 50.0), (100.0, 120.0), (0.0, 120.0)];
+        assert_eq!(guide_lines(off, (160, 90)).iter().map(|l| l.2).collect::<Vec<_>>(), [60, 50]);
+        // Wholly off the canvas to the right: nothing to measure there.
+        let gone = [(200.0, 10.0), (240.0, 10.0), (240.0, 30.0), (200.0, 30.0)];
+        assert!(guide_lines(gone, (160, 90)).iter().all(|l| l.0.0 < 200.0 || l.1.0 <= 160.0));
+    }
+
+    #[test]
+    fn a_guides_label_spells_its_length() {
+        // "12px" at 1 pixel per point: dots of 2, four glyphs 5 wide with gaps of 1.
+        let quads = label("12px", (100.0, 50.0), 1.0);
+        let (back, color) = quads[0];
+        assert_eq!(color, GUIDE);
+        // 23 dots wide (4 * 6 - 1) of 2, plus 6 padding each side; 14 high plus 12.
+        assert_eq!((back[1].0 - back[0].0, back[3].1 - back[0].1), (58.0, 26.0));
+        let dots = quads[1..].iter().filter(|q| q.1 == GUIDE_TEXT).count();
+        let lit = |c: char| glyph(c).iter().map(|b| b.count_ones() as usize).sum::<usize>();
+        assert_eq!(dots, lit('1') + lit('2') + lit('p') + lit('x'));
+        assert!(glyph('?').iter().all(|b| *b == 0), "a character it can't draw is a space");
+    }
+
+    #[test]
+    fn the_preview_draws_guides_only_when_asked() {
+        let o = Outline {
+            corners: [(40.0, 20.0), (120.0, 20.0), (120.0, 70.0), (40.0, 70.0)],
+            color: [0.0, 1.0, 0.0, 1.0],
+            width: 2.0,
+            handles: true,
+        };
+        let mut look = PreviewLook { margin: 10.0, outlines: vec![o], ..Default::default() };
+        let without = layout((200, 100), (160, 90), &look).len();
+        look.guides = Some(1.0);
+        let with = layout((200, 100), (160, 90), &look);
+        assert!(with.len() > without, "guides add quads");
+        let red = with.iter().filter(|v| v[4..8] == GUIDE).count();
+        assert!(red >= 6 * 8, "four lines and four label backings");
+        // Without a picked source there's nothing to guide.
+        look.outlines[0].handles = false;
+        let plain = layout((200, 100), (160, 90), &PreviewLook { guides: None, ..look.clone() }).len();
+        assert_eq!(layout((200, 100), (160, 90), &look).len(), plain);
     }
 }
