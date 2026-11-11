@@ -187,6 +187,19 @@ All appear in Add a source / Add a filter in the dashboard (Build, Media, Effect
 
 ---
 
+### 4.x Added on the Mac on 10 Nov evening (check them here)
+
+- **Camera Size and Frame rate** (the source drawer's Settings): on Windows they become
+  ffmpeg's dshow `-video_size` / `-framerate` (`engine::camera_args`). A size the camera can't
+  do should fall back to its own (`win/camera.rs` retries without them), but ffmpeg starts
+  before it fails, so check: pick 4K and 60 on a camera that can't, and the picture must still
+  come. If it doesn't, read the camera's modes first (`ffmpeg -f dshow -list_options true -i
+  video=…`) and pick the nearest, as the Mac does (`apple/camera.rs` `pick_format`).
+- **Source status** (`GET …/sources/{name}/status`): a Web text's last read and a Browser
+  source's page check; try a dead address and a real one.
+- **Screen capture "Leave out"** is Mac only (ScreenCaptureKit); Windows' capture has no app
+  exclusion yet.
+
 ## 5. Engine and frames: what to measure and what to build
 
 How the engine runs a frame (all systems):

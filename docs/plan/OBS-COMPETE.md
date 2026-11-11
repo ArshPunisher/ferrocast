@@ -23,7 +23,8 @@ no native plugins). Built, tested (unit, negative, and in the real app with reco
 | "When X, do Y" | **Done**: Settings › Automations |
 | Input overlay | **Done**: Keys on screen |
 | Plugin system steps 3 and 4 (WebAssembly logic plugins, panels) | **Done** (wasmi sandbox; `docs/PLUGINS.md`) |
-| Plugin step 5 (a catalog on the website, signed packages) | Later |
+| Plugin step 5 (a catalog, signed) | **Built 11 Nov**: Settings › Plugins › Catalog, a signed list on GitHub; closed until the owner's catalog key is in (docs/plan/CATALOG.md) |
+| VST audio plugins | **Built 11 Nov on the Mac**: each in its own locked-down helper (docs/plan/VST.md); Windows waits for its sandbox |
 | Windows track, encoders | Need a Windows PC to test on |
 
 ## 1. Is the comparison true?

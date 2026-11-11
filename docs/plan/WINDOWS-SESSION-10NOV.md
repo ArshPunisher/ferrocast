@@ -211,6 +211,24 @@ Things checked and fine, no change needed:
 
 ## 6. What's left
 
+- **Re-check on the PC (found by the Mac's audit of this work, 11 Nov, fixed there):**
+  - **A looping video file went silent after its first loop** (Windows, Linux). At each loop
+    FFmpeg hands a burst of pictures over early, the sound clock (`Shared::start_ns`, the
+    earliest start ever seen) jumped ~0.4 s earlier, and every later sound piece was dropped as
+    late. The gap each loop leaves in the sound also made it drift. Now the clock is set by the
+    first `SETTLE_FRAMES` pictures and held, and a file's sound goes through
+    `aresample=async=1:first_pts=0` (`Out::FileSound`), which fills gaps with silence. That
+    also gives a sound track that starts after its picture its silence first (the "left" item
+    below). Test: `ffsrc::tests::a_looping_file_keeps_its_sound`. On the PC: re-run the 60 s
+    sync test and play a looping clip with sound for a few minutes.
+  - **VST plugins (new, docs/plan/VST.md)** are Mac only: on Windows the helper needs its
+    sandbox first (a low-integrity or AppContainer process in a job object, no network). Until
+    then `ferrocast_vsthost::available()` keeps them off there and says so.
+  - **A panel plugin could send its frame to another page** (any system, since 3.1.0): a
+    sandboxed frame may still navigate itself, and the dashboard kept running the steps that
+    page asked for. Now a second load closes the panel and its messages are ignored
+    (`plugins-settings.tsx`, e2e `a panel that sends its frame to another page…`).
+
 - **Check CI** on GitHub for these pushes (`CI`, `Windows smoke`).
 - **The owner tests the local installer** (recording, a video file in a scene, Instant replay,
   the Stats encoder line).
