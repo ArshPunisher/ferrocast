@@ -5,7 +5,7 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
-## 3.2.0
+## 3.2.1
 
 Your own sound plugins, Studio Mode as OBS has it, and groups that work properly.
 
