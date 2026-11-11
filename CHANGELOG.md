@@ -5,6 +5,32 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.2.0
+
+Your own sound plugins, Studio Mode as OBS has it, and groups that work properly.
+
+- **VST sound plugins**: add your EQ, compressor or noise gate to a mic (Add a filter › VST
+  plugin). Each runs on its own, so a plugin that crashes can't take Ferrocast with it. On a
+  Mac for now.
+- **Plugin catalog** (Settings › Plugins): install effects from Ferrocast's signed list in one
+  click. The page is tidier too.
+- **Studio Mode**: change a scene on the left while viewers still see the right, then send it
+  on air with the bar between the two pictures.
+- **Twitch Enhanced Broadcasting**: Go live › Twitch › Enhanced Broadcasting sends Twitch the
+  lower qualities from your PC, so viewers can pick 720p or 480p straight away.
+- **Groups work like OBS's**: put sources in a group and out again without them moving or
+  vanishing, resize a source inside a group, hear it in the mixer, and undo any of it.
+  Duplicate, Center, Fit and Duplicate scene all work on grouped sources.
+- **The Show tab** is one tidy column: what to fix before you go live, how the stream starts,
+  then Breaks, Scene control, Clips and Captions.
+- **Clearer buttons**: muted and "hear it" are solid in the mixer, the remove question is a small
+  card, and the group menu lists your groups as folders.
+- **Screens and cameras**: Add a source shows each screen's picture, and cameras can open at the
+  size and frame rate you pick.
+- **Fixes**: Set up for me works before you've picked a platform; the canvas no longer goes
+  blank when a scene has an empty group; Screenshot works on any source; follows that came in
+  while you were disconnected still show up.
+
 ## 3.1.0
 
 Popular OBS plugins, built in, and plugins you can add safely.
