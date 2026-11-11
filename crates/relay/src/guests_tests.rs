@@ -175,3 +175,28 @@ async fn invites_are_capped_and_offers_rate_limited() {
     }
     assert_eq!(last, 429, "the 11th try in a minute from one address waits");
 }
+
+#[tokio::test]
+async fn a_guest_gets_stun_for_a_live_link_and_nothing_for_an_ended_one() {
+    let w = world().await;
+    let auth = w.install("ice1");
+    let token = w.invite(&auth).await;
+    let (s, v) = w.post("/g/v1/ice", None, json!({ "token": token })).await;
+    assert_eq!(s, 200, "{v}");
+    // No TURN key on this relay: STUN only.
+    assert_eq!(v["iceServers"], json!([{ "urls": "stun:stun.cloudflare.com:3478" }]));
+    let (s, v) = w.post("/g/v1/ice", None, json!({ "token": "nope" })).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (404, Some("invite_ended")));
+    let (s, _) = w.post("/g/v1/ice", None, json!({})).await;
+    assert_eq!(s, 400);
+}
+
+#[test]
+fn cloudflares_turn_answers_in_both_shapes() {
+    let turn = json!({ "urls": ["turn:turn.cloudflare.com:3478?transport=udp"], "username": "u", "credential": "c" });
+    let list = json!({ "iceServers": [turn.clone(), { "nope": 1 }] });
+    assert_eq!(super::ice_servers_of(&list), vec![turn.clone()]);
+    let one = json!({ "iceServers": turn.clone() });
+    assert_eq!(super::ice_servers_of(&one), vec![turn]);
+    assert!(super::ice_servers_of(&json!({ "error": "x" })).is_empty());
+}
