@@ -2356,6 +2356,42 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn virtual_camera_setup(&self) -> Result<Value, String> {
+        #[cfg(target_os = "windows")]
+        return serde_json::to_value(ferrocast_studio::wincam::setup()).map_err(|e| e.to_string());
+        #[cfg(not(target_os = "windows"))]
+        Ok(json!({ "every_app_possible": false, "every_app_on": false, "store": false }))
+    }
+
+    async fn set_virtual_camera_every_app(&self, on: bool) -> Result<Value, String> {
+        #[cfg(target_os = "windows")]
+        {
+            // Waits for the UAC prompt (up to two minutes), off the main thread.
+            let setup = tokio::task::spawn_blocking(move || ferrocast_studio::wincam::set_every_app(on))
+                .await
+                .map_err(|e| e.to_string())??;
+            // A camera that's on moves to the new kind straight away; if it can't start again,
+            // say so rather than report the setup alone.
+            self.on_main(|h| -> Result<(), String> {
+                if h.virtualcam.take().is_some() {
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
+                    let cam = c
+                        .virtual_camera(h.virtualcam_source.as_deref())
+                        .map_err(|e| format!("The camera's setup changed, but the camera couldn't start again: {e}"))?;
+                    h.virtualcam = Some(cam);
+                }
+                Ok(())
+            })
+            .await??;
+            serde_json::to_value(setup).map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = on;
+            Err("Only Windows has a camera to set up for every app.".into())
+        }
+    }
+
     async fn ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, String> {
         self.on_main(move |h| {
             h.ndi = None;

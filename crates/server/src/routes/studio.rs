@@ -142,6 +142,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
+        .route(
+            "/studio/engine/virtualcam/setup",
+            get(engine_virtual_camera_setup).post(engine_set_virtual_camera_setup),
+        )
         .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
@@ -1393,6 +1397,25 @@ async fn engine_replay(State(app): State<AppState>, Body(b): Body<OnBody>) -> Ap
 /// `POST /studio/engine/replay/save` → `{ file }`: the last seconds saved to a file.
 async fn engine_replay_save(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_replay_save().await?))
+}
+
+/// `GET /studio/engine/virtualcam/setup` → `{ every_app_possible, every_app_on, store }`.
+async fn engine_virtual_camera_setup(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_virtual_camera_setup().await?))
+}
+
+#[derive(Deserialize)]
+struct CameraSetupBody {
+    /// Windows 11's camera for every app (asks for admin once), or back to DirectShow's.
+    every_app: bool,
+}
+
+/// `POST /studio/engine/virtualcam/setup` `{ every_app }` → the setup after.
+async fn engine_set_virtual_camera_setup(
+    State(app): State<AppState>,
+    Body(b): Body<CameraSetupBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_set_virtual_camera_every_app(b.every_app).await?))
 }
 
 #[derive(Deserialize)]

@@ -224,6 +224,16 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn virtual_camera(&self, _on: bool, _source: Option<String>) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// The virtual camera's setup on this computer → `{ every_app_possible, every_app_on, store }`
+    /// (Windows: whether Windows 11's camera for every app can be, and is, set up).
+    async fn virtual_camera_setup(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Sets up (or takes away) the camera for every app (Windows 11; asks for admin once) →
+    /// the setup as `virtual_camera_setup` gives it.
+    async fn set_virtual_camera_every_app(&self, _on: bool) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Sends what's on air out as the NDI source `name`, or stops → `{ active, name }`.
     async fn ndi_output(&self, _on: bool, _name: Option<String>) -> Result<Value, String> {
         Err(NOT_HERE.into())
@@ -2106,6 +2116,14 @@ impl Engine {
             check_source_name(s)?;
         }
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
+    }
+
+    pub async fn studio_virtual_camera_setup(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.virtual_camera_setup().await.map_err(failed)
+    }
+
+    pub async fn studio_set_virtual_camera_every_app(&self, on: bool) -> Result<Value, EngineError> {
+        self.studio_host()?.set_virtual_camera_every_app(on).await.map_err(failed)
     }
 
     /// NDI output: what's on air sent on the network as `name` (default "Ferrocast"), or stopped.
