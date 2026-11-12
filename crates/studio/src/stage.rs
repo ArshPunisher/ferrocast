@@ -3844,11 +3844,11 @@ impl StageView {
         let _ = cb;
     }
 
-    /// The cursor over it (Windows only), by its CSS name.
+    /// The cursor over it (Windows and Mac), by its CSS name.
     pub fn set_cursor(&self, css: &str) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.view.set_cursor(css);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let _ = css;
     }
 

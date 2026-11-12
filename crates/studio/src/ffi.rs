@@ -129,6 +129,9 @@ pub(crate) mod mac {
         resized: std::cell::RefCell<Option<Resized>>,
         /// It follows the window's size itself (fixed distances to the window's edges).
         follows: std::cell::Cell<bool>,
+        /// The page's cursor over the picture (an `NSCursor`), kept as this view's cursor area
+        /// so AppKit shows it again whenever it redoes the window's cursor areas.
+        cursor: std::cell::RefCell<Option<Retained<AnyObject>>>,
     }
 
     impl std::fmt::Debug for PassIvars {
@@ -189,6 +192,21 @@ pub(crate) mod mac {
             fn hit_test(&self, _point: NSPoint) -> *mut NSView {
                 std::ptr::null_mut()
             }
+
+            /// The page's cursor over the whole view. Clicks go through it, but the cursor
+            /// doesn't: AppKit redoes the window's cursor areas whenever a view in it changes
+            /// (this one resized, a menu's hole cut), and with none here it put the arrow back,
+            /// which WebKit doesn't undo until the page's cursor changes (owner, 12 Nov: a
+            /// resize cursor on a handle stayed an arrow).
+            #[unsafe(method(resetCursorRects))]
+            fn reset_cursor_rects(&self) {
+                if let Some(c) = self.ivars().cursor.borrow().as_ref() {
+                    let b = self.bounds();
+                    // SAFETY: NSView's addCursorRect:cursor: on this view, from inside its own
+                    // resetCursorRects (where AppKit wants it), with an NSCursor we hold.
+                    let _: () = unsafe { msg_send![self, addCursorRect: b, cursor: &**c] };
+                }
+            }
         }
     );
 
@@ -238,6 +256,64 @@ pub(crate) mod mac {
         let (x0, y0) = (((p.origin.x + x) * s).floor() / s, (top * s).floor() / s);
         let (x1, y1) = (((p.origin.x + x + w.max(1.0)) * s).ceil() / s, ((top + h.max(1.0)) * s).ceil() / s);
         NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0))
+    }
+
+    /// The Mac cursor for a CSS one, from AppKit's public cursors: macOS 15's frame-resize
+    /// arrows (what the system shows on window edges) for the resize ones, the older
+    /// left-right and up-down ones before that; `move` the open hand, as OBS shows on a Mac
+    /// (AppKit has no public move cursor and its private one throws now). None for "default"
+    /// and the rest: the arrow AppKit shows anyway, or whatever the page shows.
+    fn ns_cursor(css: &str) -> Option<Retained<AnyObject>> {
+        // NSCursorFrameResizePosition: top 1, top left 3, right 8, top right 9; directions:
+        // both ways (NSCursorFrameResizeDirectionsAll) 3.
+        let (position, older): (usize, Option<&std::ffi::CStr>) = match css {
+            "pointer" => return class_cursor(c"pointingHandCursor"),
+            "move" | "all-scroll" => return class_cursor(c"openHandCursor"),
+            "crosshair" => return class_cursor(c"crosshairCursor"),
+            "ew-resize" | "col-resize" => (8, Some(c"resizeLeftRightCursor")),
+            "ns-resize" | "row-resize" => (1, Some(c"resizeUpDownCursor")),
+            "nwse-resize" => (3, None),
+            "nesw-resize" => (9, None),
+            _ => return None,
+        };
+        let class = AnyClass::get(c"NSCursor")?;
+        let sel = objc2::sel!(frameResizeCursorFromPosition:inDirections:);
+        // SAFETY: NSObject's +respondsToSelector: on the NSCursor class.
+        let has: bool = unsafe { msg_send![class, respondsToSelector: sel] };
+        if has {
+            // SAFETY: macOS 15's +[NSCursor frameResizeCursorFromPosition:inDirections:]
+            // (checked above) with its two NSUInteger enums; it returns an NSCursor.
+            let c: Option<Retained<AnyObject>> =
+                unsafe { msg_send![class, frameResizeCursorFromPosition: position, inDirections: 3usize] };
+            if c.is_some() {
+                return c;
+            }
+        }
+        older.and_then(class_cursor)
+    }
+
+    /// One of NSCursor's public class cursors by its method's name, if this macOS has it.
+    fn class_cursor(name: &std::ffi::CStr) -> Option<Retained<AnyObject>> {
+        let class = AnyClass::get(c"NSCursor")?;
+        let sel = objc2::runtime::Sel::register(name);
+        // SAFETY: NSObject's +respondsToSelector: on the NSCursor class.
+        let has: bool = unsafe { msg_send![class, respondsToSelector: sel] };
+        if !has {
+            return None;
+        }
+        // SAFETY: a public NSCursor class method taking nothing and returning an NSCursor.
+        unsafe { msg_send![class, performSelector: sel] }
+    }
+
+    #[cfg(test)]
+    mod cursor_tests {
+        #[test]
+        fn the_page_cursors_have_mac_ones() {
+            // AppKit's cursors want the main thread, which tests aren't on: only what needs no
+            // cursor is checked here (the cursors themselves were checked on a main thread).
+            assert!(super::ns_cursor("default").is_none());
+            assert!(super::ns_cursor("").is_none());
+        }
     }
 
     /// Adds a view over `parent` (an `NSView *` the window toolkit handed out) at the rectangle.
@@ -353,6 +429,33 @@ pub(crate) mod mac {
         pub fn remove(&self) {
             if MainThreadMarker::new().is_some() {
                 self.view.removeFromSuperview();
+            }
+        }
+
+        /// The cursor over it, by its CSS name (what the page shows there); "default" leaves
+        /// it to the page. Main thread only; ignored elsewhere.
+        pub fn set_cursor(&self, css: &str) {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            let cursor = ns_cursor(css);
+            let had = self.pass.ivars().cursor.replace(cursor.clone()).is_some();
+            let Some(window) = self.view.window() else { return };
+            window.invalidateCursorRectsForView(&self.view);
+            // Shown now too, when the mouse is over it (the areas are redone a beat later):
+            // ours, or the arrow back in place of the one we showed.
+            let now = cursor.or_else(|| if had { class_cursor(c"arrowCursor") } else { None });
+            if let Some(c) = now {
+                let at = self.view.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
+                let b = self.view.bounds();
+                let inside = at.x >= b.origin.x
+                    && at.y >= b.origin.y
+                    && at.x < b.origin.x + b.size.width
+                    && at.y < b.origin.y + b.size.height;
+                if inside {
+                    // SAFETY: NSCursor's set on a cursor we hold, on the main thread.
+                    let _: () = unsafe { msg_send![&*c, set] };
+                }
             }
         }
 

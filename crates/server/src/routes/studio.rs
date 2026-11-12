@@ -408,7 +408,7 @@ struct CursorBody {
     cursor: String,
 }
 
-/// `PUT /studio/engine/preview/cursor` `{ cursor }`: the cursor over the pictures (Windows).
+/// `PUT /studio/engine/preview/cursor` `{ cursor }`: the cursor over the pictures (Windows, Mac).
 async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview_cursor(b.cursor).await?;
     Ok(StatusCode::NO_CONTENT)
