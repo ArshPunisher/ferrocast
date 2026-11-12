@@ -76,7 +76,8 @@ jobs:
             out: target/universal-apple-darwin/release/bundle
           - name: Windows
             os: windows-2025
-            targets: ""
+            # Ferrocast Camera's DLL for 32-bit apps.
+            targets: i686-pc-windows-msvc
             args: ""
             out: target/release/bundle
           - name: Linux
@@ -159,6 +160,20 @@ jobs:
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
             cp "target/$t/release/ferrocast-vst" "apps/desktop/binaries/ferrocast-vst-$t"
           done
+      # Ferrocast Camera (docs/plan/VIRTUAL-CAMERA-WINDOWS.md): its DLL for 64-bit apps and for
+      # 32-bit ones, put beside the program, named with the version (an app holding the camera
+      # open keeps the old file locked through an update).
+      - name: The camera DLLs (Windows)
+        if: matrix.name == 'Windows'
+        shell: bash
+        run: |
+          v="$(awk '/^\[workspace.package\]/{s=1;next} /^\[/{s=0} s&&$1=="version"{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+          cargo build --release --locked -p ferrocast-wincam
+          cargo build --release --locked -p ferrocast-wincam --target i686-pc-windows-msvc
+          mkdir -p apps/desktop/camera
+          cp target/release/ferrocast_camera.dll "apps/desktop/camera/ferrocast_camera-$v.dll"
+          cp target/i686-pc-windows-msvc/release/ferrocast_camera.dll "apps/desktop/camera/ferrocast_camera32-$v.dll"
+          echo "CAMERA_VERSION=$v" >> "$GITHUB_ENV"
       - name: Build the app
         shell: bash
         env:
@@ -194,6 +209,12 @@ jobs:
           config='{"bundle":{"createUpdaterArtifacts":true}}'
           if [[ "$OS_NAME" == macOS ]]; then
             config='{"bundle":{"createUpdaterArtifacts":true,"externalBin":["binaries/ferrocast-vst"]}}'
+          fi
+          # Ferrocast Camera's DLLs go in beside the program (built in the step before).
+          if [[ "$OS_NAME" == Windows ]]; then
+            c64="camera/ferrocast_camera-$CAMERA_VERSION.dll"
+            c32="camera/ferrocast_camera32-$CAMERA_VERSION.dll"
+            config="{\"bundle\":{\"createUpdaterArtifacts\":true,\"resources\":{\"$c64\":\"${c64#camera/}\",\"$c32\":\"${c32#camera/}\"}}}"
           fi
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).

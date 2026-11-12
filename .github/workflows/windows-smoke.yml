@@ -84,3 +84,31 @@ jobs:
           path: smoke/
           if-no-files-found: warn
           retention-days: 14
+
+  camera:
+    # Ferrocast Camera end to end (crates/wincam/examples/camera_check.rs): DirectShow lists it
+    # and FFmpeg reads the picture through it, then the placeholder; the Media Foundation source
+    # gives the picture; Windows 11's camera for every app where the runner has the frame server.
+    name: Virtual camera on Windows
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: The camera's tests (layout, reader, formats, registry data)
+        run: cargo test --locked -p ferrocast-camshare -p ferrocast-wincam
+      - name: The camera DLL, 64-bit and 32-bit
+        shell: bash
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --locked -p ferrocast-wincam
+          cargo build --locked -p ferrocast-wincam --target i686-pc-windows-msvc
+      - name: FFmpeg (to open the camera as apps do)
+        run: choco install ffmpeg -y --no-progress
+      - name: End to end
+        shell: pwsh
+        run: |
+          $ff = (Get-Command ffmpeg).Source
+          cargo run --locked -p ferrocast-wincam --example camera_check -- --dll target/debug/ferrocast_camera.dll --ffmpeg $ff

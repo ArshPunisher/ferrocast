@@ -64,6 +64,7 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
+        "installerHooks": "windows/hooks.nsh",
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "sidebarImage": "icons/installer-sidebar.bmp",
