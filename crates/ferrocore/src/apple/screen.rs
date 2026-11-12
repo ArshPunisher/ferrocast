@@ -281,7 +281,8 @@ impl Shared {
         let Some(fit) = fit.as_mut() else { return };
         let Some(px) = window_pixels(sample) else { return };
         let want = window_size(px, fit.max);
-        if want.0.abs_diff(fit.size.0) <= 2 && want.1.abs_diff(fit.size.1) <= 2 {
+        // Any change, a pixel too: a size even a pixel off is scaled, every pixel blurred.
+        if want == fit.size {
             return;
         }
         fit.size = want;
@@ -410,15 +411,35 @@ fn sound_of(sample: &CMSampleBuffer) -> Option<(Vec<f32>, u64)> {
     }
 }
 
-/// A window's capture size: its pixels, made smaller (never larger) to fit in `max` with its
-/// shape kept, both sides even (the encoders' NV12 needs it).
+/// Reads the screen at its full pixels (macOS 14's captureResolution "best"): left to
+/// "automatic", ScreenCaptureKit may read a Retina screen at its point size and scale that
+/// up, a softer picture than the screen's own. macOS 13 has no setting (it reads the pixels).
+fn best_resolution(config: &SCStreamConfiguration) {
+    // SCCaptureResolutionBest.
+    const BEST: isize = 1;
+    let sel = objc2::sel!(setCaptureResolution:);
+    // SAFETY: NSObject's respondsToSelector: on a live configuration; then, where it's there,
+    // its setCaptureResolution: with an SCCaptureResolutionType (NSInteger) value.
+    unsafe {
+        let has: bool = objc2::msg_send![config, respondsToSelector: sel];
+        if has {
+            let _: () = objc2::msg_send![config, setCaptureResolution: BEST];
+        }
+    }
+}
+
+/// A window's capture size: its own pixels exactly, made smaller (never larger) only to fit in
+/// `max` with its shape kept. Exactly: ScreenCaptureKit scales the window to the size asked
+/// for, and a size a pixel off (rounded to even, 1917 asked as 1918) resampled every pixel
+/// and blurred its text (owner's OBS comparison, 12 Nov). Nothing needs it even: the window
+/// is drawn on the canvas, and a recording of it alone crops to even sizes instead.
 fn window_size((w, h): (f64, f64), max: (u32, u32)) -> (u32, u32) {
     if !(w >= 1.0 && h >= 1.0) {
         return max;
     }
     let f = (f64::from(max.0) / w).min(f64::from(max.1) / h).min(1.0);
-    let even = |v: f64| ((v * f / 2.0).round() as u32).max(8) * 2;
-    (even(w), even(h))
+    let side = |v: f64| ((v * f).round() as u32).max(16);
+    (side(w), side(h))
 }
 
 /// A frame of a display as the system holds it: BGRA, colours multiplied by alpha, not copied.
@@ -651,6 +672,7 @@ impl ScreenCapture {
             config.setHeight(height.clamp(16, 8192) as usize);
             config.setScalesToFit(true);
             config.setPixelFormat(BGRA);
+            best_resolution(&config);
             config.setMinimumFrameInterval(CMTime {
                 value: 1,
                 timescale: fps.clamp(1, 240) as i32,
@@ -835,10 +857,12 @@ mod tests {
 
     #[test]
     fn a_window_keeps_its_shape_and_fits_the_canvas() {
-        // A tall 2x window: its shape kept, made to fit 1920x1080, sides even.
-        assert_eq!(window_size((2200.0, 2800.0), (1920, 1080)), (848, 1080));
-        // A small window keeps its own pixels (never blown up).
-        assert_eq!(window_size((801.0, 601.0), (1920, 1080)), (802, 602));
+        // A tall 2x window: its shape kept, made to fit 1920x1080.
+        assert_eq!(window_size((2200.0, 2800.0), (1920, 1080)), (849, 1080));
+        // A window that fits keeps its own pixels exactly, odd sides too (owner, 12 Nov: 1917
+        // asked as 1918 was scaled, its text blurred); never blown up.
+        assert_eq!(window_size((801.0, 601.0), (1920, 1080)), (801, 601));
+        assert_eq!(window_size((1917.0, 1197.0), (2560, 1440)), (1917, 1197));
         // A wide one fits by its width.
         assert_eq!(window_size((5120.0, 1440.0), (1920, 1080)), (1920, 540));
         // No size known: the canvas.
