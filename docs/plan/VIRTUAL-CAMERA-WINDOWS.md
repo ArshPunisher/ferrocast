@@ -79,6 +79,14 @@ Names and permissions:
 - The Microsoft Store version can't: an MSIX app's registry writes go to its own private hive,
   so other apps would never see the camera, and it can't run the elevated step. It says so and
   points to the installer. (A later fix: the restricted capability `unvirtualizedResources`.)
+- The frame server creates the class and asks it for `IMFActivate`, then activates the
+  source: the class hands out an activator, never the source itself (first PC test, 12 Nov:
+  without it `Start` failed with E_NOINTERFACE and Ferrocast fell back to DirectShow's camera).
+- The machine copy is named by Ferrocast's version and a hash of its bytes
+  (`ferrocast_camera-3.2.1-<hash>.dll`): one the frame server still holds can't be
+  overwritten, so a new build always gets a file of its own; older ones are deleted (at the
+  next restart if held). After an update, "Camera in every app" off and on again moves the
+  machine to the new copy. To do: notice an old copy and ask for that.
 - Windows "N" editions (no Media Foundation): the DLL looks Media Foundation up at run time, so
   it still loads there and the DirectShow camera works.
 - Several people signed in to one PC (security review, 12 Nov): the frame server's region

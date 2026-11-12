@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use ferrocast_camshare::regdata;
 use ferrocast_camshare::win::{Root, View, delete_keys, write_entries};
-use ferrocast_camshare::{CLSID_DSHOW, CLSID_MF, VERSION};
+use ferrocast_camshare::{CLSID_DSHOW, CLSID_MF};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_POINTER, HMODULE, S_FALSE, S_OK,
 };
@@ -113,46 +113,75 @@ fn own_path() -> Option<PathBuf> {
     (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
 }
 
-/// Where the machine-wide copy goes: a folder every account (the frame server's too) can read.
-fn machine_copy() -> PathBuf {
+/// The folder for the machine-wide copy: one every account (the frame server's too) can read.
+fn machine_dir() -> PathBuf {
     let base = std::env::var_os("ProgramW6432")
         .or_else(|| std::env::var_os("ProgramFiles"))
         .unwrap_or_else(|| "C:\\Program Files".into());
-    Path::new(&base).join("Ferrocast Camera").join(format!("ferrocast_camera_v{VERSION}.dll"))
+    Path::new(&base).join("Ferrocast Camera")
+}
+
+/// FNV-1a of the DLL's bytes: names each build's copy apart (not a security check).
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Deletes a file now, or at the next restart when an app holds it.
+fn remove_or_later(path: &Path) {
+    if std::fs::remove_file(path).is_err() && path.exists() {
+        // SAFETY: asks Windows to delete the file at the next restart.
+        let _ = unsafe { MoveFileExW(&HSTRING::from(path.as_os_str()), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+    }
+}
+
+/// The camera DLLs in the machine folder.
+fn machine_copies(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")))
+        .collect()
 }
 
 /// The Media Foundation camera for the whole machine (admin): copies this DLL where the frame
-/// server can read it and registers its class there. Ferrocast runs this once, elevated.
+/// server can read it and registers its class there. Ferrocast runs this once, elevated, and
+/// again after an update.
+///
+/// Each build's copy has its own name (version and a hash of its bytes): a copy the frame
+/// server still holds can't be overwritten, and keeping it would keep an old camera. Older
+/// copies are deleted, at the next restart if they're in use.
 pub fn install_machine() -> Result<PathBuf, String> {
     let from = own_path().ok_or("this DLL's path isn't known")?;
-    let to = machine_copy();
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} couldn't be made ({e})", dir.display()))?;
-    }
-    if from != to {
-        // In use by the frame server (an app has the camera open): the copy there stays, which
-        // reads the same layout (the file name carries its version).
-        if let Err(e) = std::fs::copy(&from, &to)
-            && !to.exists()
-        {
-            return Err(format!("the camera couldn't be copied to {} ({e})", to.display()));
+    let dir = machine_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{} couldn't be made ({e})", dir.display()))?;
+    let bytes = std::fs::read(&from).map_err(|e| format!("{} couldn't be read ({e})", from.display()))?;
+    // A name not taken: a file there that can't be deleted is held by the frame server and may
+    // be set to go at the next restart (camera off while in use), so it's never reused.
+    let stem = format!("ferrocast_camera-{}-{:016x}", env!("CARGO_PKG_VERSION"), fnv(&bytes));
+    let to = (0..100)
+        .map(|n| dir.join(if n == 0 { format!("{stem}.dll") } else { format!("{stem}-{n}.dll") }))
+        .find(|p| !p.exists() || std::fs::remove_file(p).is_ok())
+        .ok_or_else(|| format!("{} is full of camera copies in use: restart Windows", dir.display()))?;
+    std::fs::write(&to, &bytes).map_err(|e| format!("the camera couldn't be copied to {} ({e})", to.display()))?;
+    write_entries(Root::Machine, View::Bits64, &regdata::mf_entries(&to.to_string_lossy()))?;
+    for old in machine_copies(&dir) {
+        if old != to {
+            remove_or_later(&old);
         }
     }
-    write_entries(Root::Machine, View::Bits64, &regdata::mf_entries(&to.to_string_lossy()))?;
     Ok(to)
 }
 
-/// Undoes [`install_machine`]: the class, then the copy (at the next restart if it's in use).
+/// Undoes [`install_machine`]: the class, then the copies (at the next restart if in use).
 pub fn uninstall_machine() {
     delete_keys(Root::Machine, View::Bits64, &regdata::mf_keys());
-    let to = machine_copy();
-    if std::fs::remove_file(&to).is_err() && to.exists() {
-        // SAFETY: asks Windows to delete the file at the next restart.
-        let _ = unsafe { MoveFileExW(&HSTRING::from(to.as_os_str()), PCWSTR::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+    let dir = machine_dir();
+    for old in machine_copies(&dir) {
+        remove_or_later(&old);
     }
-    if let Some(dir) = to.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
+    let _ = std::fs::remove_dir(&dir);
 }
 
 /// `regsvr32` (elevated): the Media Foundation camera for the machine.
