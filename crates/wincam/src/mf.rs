@@ -103,7 +103,7 @@ unsafe fn take<T: Interface>(hr: HRESULT, raw: *mut std::ffi::c_void) -> windows
     Ok(unsafe { T::from_raw(raw) })
 }
 
-fn new_attributes(n: u32) -> windows::core::Result<IMFAttributes> {
+pub(crate) fn new_attributes(n: u32) -> windows::core::Result<IMFAttributes> {
     let mut raw = std::ptr::null_mut();
     // SAFETY: mfplat's function, filling `raw`.
     let hr = unsafe { (mf()?.attributes)(&mut raw, n) };
@@ -214,7 +214,9 @@ struct StreamInner {
 unsafe impl Send for StreamInner {}
 
 impl Source {
-    pub(crate) fn create() -> windows::core::Result<IUnknown> {
+    /// A new source; `from`: the activator's attributes (what the frame server set), copied
+    /// into the source's own.
+    pub(crate) fn create(from: Option<&IMFAttributes>) -> windows::core::Result<IUnknown> {
         let native = new_feed().peek(now_ms());
         // Ferrocast's own size first when it's sending, then the common ones, all NV12.
         let modes: Vec<Mode> = caps::offered(native).into_iter().filter(|m| m.format == Format::Nv12).collect();
@@ -263,9 +265,14 @@ impl Source {
                 nv12: Vec::new(),
             }),
         });
+        let attributes = new_attributes(4)?;
+        if let Some(from) = from {
+            // SAFETY: copying one store's items into our own.
+            unsafe { from.CopyAllItems(&attributes) }?;
+        }
         let source = windows_core::ComObject::new(Source {
             events: new_event_queue()?,
-            attributes: new_attributes(1)?,
+            attributes,
             pd,
             state: Mutex::new(SourceState { shut: false, streaming: false, stream: None }),
             shared: shared.clone(),

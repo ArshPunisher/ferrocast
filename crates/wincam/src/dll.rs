@@ -50,7 +50,8 @@ impl IClassFactory_Impl for Factory_Impl {
         }
         let obj = match self.0 {
             Class::DirectShow => crate::dshow::Filter::create(),
-            Class::MediaFoundation => crate::mf::Source::create()?,
+            // The frame server asks the class for IMFActivate, then activates the source.
+            Class::MediaFoundation => crate::activate::Activate::create()?,
         };
         // SAFETY: hands the caller the interface it asked for (counted), or E_NOINTERFACE.
         unsafe { obj.query(iid, out) }.ok()

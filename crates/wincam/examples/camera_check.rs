@@ -279,8 +279,10 @@ mod win {
         // SAFETY: plain Media Foundation calls on our own source.
         unsafe {
             MFStartup(0x0002_0070, 0).map_err(e)?;
-            let source: IMFMediaSource =
+            // As the frame server does: the class gives an activator, which makes the source.
+            let activate: IMFActivate =
                 CoCreateInstance(&GUID::from_u128(CLSID_MF), None, CLSCTX_INPROC_SERVER).map_err(e)?;
+            let source: IMFMediaSource = activate.ActivateObject().map_err(e)?;
             let pd = source.CreatePresentationDescriptor().map_err(e)?;
             source.Start(&pd, &GUID::zeroed(), &PROPVARIANT::default()).map_err(e)?;
             let mut stream: Option<IMFMediaStream> = None;
