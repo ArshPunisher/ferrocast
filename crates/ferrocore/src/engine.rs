@@ -395,6 +395,11 @@ impl Canvas {
     }
 }
 
+/// Where a frame tap's pictures go (the virtual camera): each NV12 frame drawn for it, with its
+/// time (ns). Called on the frame loop with the engine's state held, so it must be quick (a
+/// copy into shared memory).
+pub type FrameSink = Box<dyn FnMut(&Nv12, u64) + Send>;
+
 /// A recording output's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecordState {
@@ -582,6 +587,8 @@ struct State {
     opened: HashMap<String, (u64, SourceKind)>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
+    /// Pictures handed out as drawn, not encoded (the virtual camera): id, canvas, sink.
+    taps: Vec<(u64, Canvas, FrameSink)>,
     video: VideoConfig,
     audio: AudioConfig,
     /// Where monitored sound is played, when monitoring is on.
@@ -704,6 +711,7 @@ impl Engine {
             opened: HashMap::new(),
             outputs: Vec::new(),
             next_output: 1,
+            taps: Vec::new(),
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio },
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1554,6 +1562,40 @@ impl Engine {
         Ok(id)
     }
 
+    /// Hands every picture drawn on `canvas` to `sink` as NV12, not encoded (the virtual
+    /// camera). A recording on the same canvas shares the drawing. → its id, for `stop_tap`.
+    pub fn tap_frames(&self, canvas: Canvas, sink: FrameSink) -> Result<u64, AvError> {
+        if canvas.every == 0
+            || canvas.width < 2
+            || canvas.height < 2
+            || !canvas.width.is_multiple_of(2)
+            || !canvas.height.is_multiple_of(2)
+        {
+            return Err(AvError::Source("a frame tap needs even sides and a rate divisor of 1 or more".into()));
+        }
+        let mut st = self.lock();
+        if let Some(name) = &canvas.scene
+            && !st.scenes.contains_key(name)
+        {
+            return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+        }
+        // Ids shared with outputs, so neither is mistaken for the other.
+        let id = st.next_output;
+        st.next_output += 1;
+        st.taps.push((id, canvas, sink));
+        Ok(id)
+    }
+
+    /// Stops a frame tap (its sink is dropped). False when there's no such tap.
+    pub fn stop_tap(&self, id: u64) -> bool {
+        let taken = {
+            let mut st = self.lock();
+            st.taps.iter().position(|(i, ..)| *i == id).map(|at| st.taps.remove(at))
+        };
+        // Dropped outside the lock: a sink may close shared memory or wait on a thread.
+        taken.is_some()
+    }
+
     /// Which encoder an output's pictures go through ("h264_nvenc", "VideoToolbox", "libx264").
     pub fn output_encoder(&self, id: u64) -> Option<String> {
         self.with_output(id, |pipe| Ok(pipe.encoder())).ok()
@@ -2231,6 +2273,9 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
     roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
+    // A frame tap's scene too (the virtual camera showing one source alone), or its sources'
+    // new pictures would wait and it would look frozen.
+    roots.extend(st.taps.iter().filter_map(|(_, c, _)| c.scene.as_deref()));
     for p in st.previews.values() {
         roots.extend(p.scene.as_deref());
         if let Some(mv) = &p.multiview {
@@ -2934,12 +2979,12 @@ fn frame(
     if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
         st.moving = None;
     }
-    if !st.outputs.is_empty() {
+    if !st.outputs.is_empty() || !st.taps.is_empty() {
         // Each distinct canvas drawn once this frame (if it takes this one), then every output
-        // on it encodes the same pixels.
+        // on it encodes the same pixels, and every tap gets them.
         let index = st.stats.frames;
         let mut drawn: Vec<(Canvas, Result<Nv12, String>)> = Vec::new();
-        for (.., canvas) in &st.outputs {
+        for canvas in st.outputs.iter().map(|(.., c)| c).chain(st.taps.iter().map(|(_, c, _)| c)) {
             if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
                 continue;
             }
@@ -3026,6 +3071,13 @@ fn frame(
         }
         if failed.is_some() {
             st.error = failed;
+        }
+        // A tap's picture that failed to draw is left out (the camera repeats its last one); it
+        // doesn't stop the outputs.
+        for (_, canvas, sink) in st.taps.iter_mut() {
+            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas) {
+                sink(f, ts);
+            }
         }
     }
     let ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -3387,6 +3439,47 @@ mod tests {
             .unwrap_or_else(|x| panic!("{x}"));
         assert!(e.open_soon(8, None, bad).is_err());
         assert!(!e.lock().sources.contains_key(&8));
+    }
+
+    /// The virtual camera's way: pictures handed out as NV12 at the tap's size and rate, each
+    /// distinct canvas drawn once, nothing after the tap stops.
+    #[test]
+    fn frame_taps_get_nv12_at_their_size_and_rate() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        /// Each frame's size, first luma byte and chroma length.
+        type Got = Arc<Mutex<Vec<(u32, u32, u8, usize)>>>;
+        let got: Got = Arc::new(Mutex::new(Vec::new()));
+        let sink = |got: &Got| -> FrameSink {
+            let got = got.clone();
+            Box::new(move |f: &Nv12, _ts| {
+                got.lock().unwrap_or_else(|p| p.into_inner()).push((f.width, f.height, f.y[0], f.uv.len()));
+            })
+        };
+        let small = Canvas::scaled(e.config, 320, 180);
+        let half = Canvas { every: 2, ..Canvas::scaled(e.config, 160, 90) };
+        let slow = Arc::new(Mutex::new(Vec::new()));
+        let a = e.tap_frames(small, sink(&got)).unwrap_or_else(|x| panic!("{x}"));
+        let b = e.tap_frames(half, sink(&slow)).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(e.stop_tap(a) && e.stop_tap(b));
+        assert!(!e.stop_tap(a), "stopped once");
+        let fast = got.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let slow = slow.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(fast.len() >= 8, "about 30 a second: {}", fast.len());
+        assert!(fast.iter().all(|&(w, h, y, uv)| (w, h) == (320, 180) && uv == 320 * 90 && y > 200), "white, 320x180");
+        assert!(!slow.is_empty() && slow.len() < fast.len(), "every other frame: {} of {}", slow.len(), fast.len());
+        assert!(slow.iter().all(|&(w, h, ..)| (w, h) == (160, 90)));
+        let after = fast.len();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(got.lock().unwrap_or_else(|p| p.into_inner()).len(), after, "nothing after stopping");
+        // Odd sides, no rate, or a scene that isn't there are refused.
+        assert!(e.tap_frames(Canvas::scaled(e.config, 321, 180), sink(&got)).is_err());
+        assert!(e.tap_frames(Canvas { every: 0, ..Canvas::main(e.config) }, sink(&got)).is_err());
+        assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
