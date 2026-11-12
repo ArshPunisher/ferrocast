@@ -636,10 +636,11 @@ mod tests {
         let mem = Region::heap();
         let views: Vec<Region> = (0..3).map(|_| view(&mem)).collect();
         let done = Arc::new(AtomicBool::new(false));
+        let got = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let readers: Vec<_> = views
             .into_iter()
             .map(|v| {
-                let done = done.clone();
+                let (done, got) = (done.clone(), got.clone());
                 std::thread::spawn(move || {
                     let rd = Reader::new(v);
                     let (mut out, mut last, mut whole) = (Vec::new(), 0, 0u32);
@@ -651,6 +652,9 @@ mod tests {
                             assert!(out.iter().all(|&b| b == first), "a torn frame at {}", info.seq);
                             assert_eq!(first, (info.seq % 251) as u8, "the frame its number says");
                             whole += 1;
+                            if whole == 1 {
+                                got.fetch_add(1, Ordering::AcqRel);
+                            }
                         }
                     }
                     whole
@@ -658,7 +662,12 @@ mod tests {
             })
             .collect();
         let mut w = Writer::new(view(&mem));
-        for n in 1..=600u64 {
+        // At least 600 frames, and on until every reader has one: on a busy machine the
+        // writer can finish before a reader thread has even started.
+        let start = std::time::Instant::now();
+        let mut n = 0u64;
+        while n < 600 || (got.load(Ordering::Acquire) < 3 && start.elapsed().as_secs() < 10) {
+            n += 1;
             let (y, uv) = frame(320, 180, (n % 251) as u8);
             assert!(w.write((320, 180), (60, 1), n, &y, &uv, now_ms()).is_ok());
         }
