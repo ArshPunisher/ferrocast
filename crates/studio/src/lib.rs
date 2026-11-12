@@ -28,6 +28,10 @@ pub mod system;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod virtualcam;
 pub mod webfetch;
+// The virtual camera on Windows: Ferrocast Camera (DirectShow, and Windows 11's for every app).
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+pub mod wincam;
 
 use std::path::{Path, PathBuf};
 
@@ -329,19 +333,30 @@ pub enum CameraShows {
     Source(String),
 }
 
-/// The virtual camera: on Linux what's on air sent to a v4l2loopback camera; a Mac and Windows
-/// need a signed camera of their own, not here yet, so turning it on there says why.
+/// The virtual camera: on Linux what's on air sent to a v4l2loopback camera; on Windows
+/// Ferrocast Camera (`wincam`); a Mac needs a signed camera extension, not here yet, so
+/// turning it on there says why.
 #[derive(Debug)]
 pub struct VirtualCamera {
     #[cfg(target_os = "linux")]
     pub(crate) cam: virtualcam::Loopback,
+    #[cfg(target_os = "windows")]
+    pub(crate) cam: wincam::Camera,
 }
 
 impl VirtualCamera {
     pub fn active(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         return self.cam.active();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        false
+    }
+
+    /// Windows 11's camera for every app is what's on (not DirectShow's).
+    pub fn every_app(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.cam.every_app;
+        #[cfg(not(target_os = "windows"))]
         false
     }
 }

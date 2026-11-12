@@ -62,6 +62,9 @@ struct Held {
     /// the source, and since when.
     replay_wait: Option<(String, String, std::time::Instant)>,
     virtualcam: Option<ferrocast_studio::VirtualCamera>,
+    /// What the virtual camera shows (None: what's on air): in the stats, and to start it again
+    /// on a setup change.
+    virtualcam_source: Option<String>,
     /// What's on air sent out as NDI.
     ndi: Option<ferrocast_studio::NdiOut>,
     settings: Option<StudioSettings>,
@@ -2067,7 +2070,11 @@ impl StudioHost for DesktopStudio {
                     "last": r.last_replay().map(|p| p.display().to_string()),
                     "error": r.last_error(),
                 })),
-                "virtualcam": h.virtualcam.as_ref().map(|c| json!({ "active": c.active() })),
+                "virtualcam": h.virtualcam.as_ref().map(|c| json!({
+                    "active": c.active(),
+                    "every_app": c.every_app(),
+                    "source": h.virtualcam_source,
+                })),
                 "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "name": n.name() })),
                 // Captures on air that show nothing (the black screen fixer).
                 "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
@@ -2328,17 +2335,20 @@ impl StudioHost for DesktopStudio {
                 return Ok(json!({ "active": false }));
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
-                h.virtualcam = Some(c.virtual_camera(source.as_deref()).map_err(|e| e.to_string())?);
-                Ok(json!({ "active": true }))
+                let cam = c.virtual_camera(source.as_deref()).map_err(|e| e.to_string())?;
+                let every_app = cam.every_app();
+                h.virtualcam = Some(cam);
+                h.virtualcam_source = source;
+                Ok(json!({ "active": true, "every_app": every_app }))
             }
-            // A Mac and Windows need a camera of their own, signed, which Ferrocast doesn't have yet.
-            #[cfg(not(target_os = "linux"))]
+            // A Mac needs a camera extension signed by an Apple developer account.
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
                 let _ = (c, &source);
                 Err::<Value, String>(
-                    "The virtual camera works on Linux so far: on a Mac and Windows it needs a signed camera of Ferrocast's own, which comes later."
+                    "The virtual camera works on Windows and Linux so far: a Mac needs a camera signed with an Apple developer account, which comes later."
                         .into(),
                 )
             }

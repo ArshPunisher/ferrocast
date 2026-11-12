@@ -2200,6 +2200,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrocast-camshare"
+version = "3.2.1"
+dependencies = [
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "ferrocast-connector"
 version = "3.2.1"
 dependencies = [
@@ -2514,6 +2521,7 @@ dependencies = [
  "chrono",
  "deep_filter",
  "dispatch2",
+ "ferrocast-camshare",
  "ferrocast-golive",
  "ferrocast-guest",
  "ferrocore",
@@ -2545,6 +2553,7 @@ dependencies = [
  "tract-onnx 0.23.9",
  "tract-pulse",
  "tungstenite 0.29.0",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
 ]
 
@@ -2603,6 +2612,15 @@ dependencies = [
  "serde_json",
  "tracing",
  "vst3",
+]
+
+[[package]]
+name = "ferrocast-wincam"
+version = "3.2.1"
+dependencies = [
+ "ferrocast-camshare",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

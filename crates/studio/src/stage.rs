@@ -2840,6 +2840,29 @@ impl Stage {
         Ok(crate::VirtualCamera { cam })
     }
 
+    /// Starts the virtual camera (Windows: Ferrocast Camera) showing what's on air, or `source`
+    /// alone (a scene, or a source at its own size), fitted into the camera's size.
+    #[cfg(target_os = "windows")]
+    pub fn virtual_camera(&self, source: Option<&str>) -> Result<crate::VirtualCamera, StudioError> {
+        let e = self.engine()?;
+        let canvas = (self.canvas.width, self.canvas.height);
+        let (scene, size) = match source {
+            Some(name) => {
+                if e.engine.source_named(name).is_none()
+                    && self.scene_index(name).is_err()
+                    && e.engine.group_size(name).is_none()
+                {
+                    return Err(fail(format!("There's no source called \"{name}\".")));
+                }
+                let (scene, w, h) = own::show_alone(&e.engine, name, canvas)?;
+                (Some(scene), (w, h))
+            }
+            None => (None, canvas),
+        };
+        let cam = crate::wincam::Camera::start(Arc::downgrade(&e), scene, size, self.canvas.fps).map_err(fail)?;
+        Ok(crate::VirtualCamera { cam })
+    }
+
     /// Listens to a source's sound (mono, 48 kHz) for anything that wants it: Whisper captions.
     pub fn tap_sound(&self, source: &str) -> Result<crate::SoundTap, StudioError> {
         let e = self.engine()?;
