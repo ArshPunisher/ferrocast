@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use ferrocast_connector::EventSink;
-use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Platform};
+use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Origin, Platform};
 use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -53,12 +53,17 @@ enum End {
 pub async fn run(helix: Helix, broadcaster: String, url: String, sink: EventSink) {
     let url = with_keepalive(&url);
     let mut attempt: u32 = 0;
+    // When the connection was lost (Unix ms): follows from then on are caught up on.
+    let mut lost_at: Option<i64> = None;
     loop {
         let started = tokio::time::Instant::now();
         let outcome = match connect(&url).await {
             Ok((ws, welcome)) => match subscribe_all(&helix, &broadcaster, &welcome.session_id, &sink).await {
                 Ok(()) => {
                     status(&sink, ConnectorStatus::Connected).await;
+                    if let Some(since) = lost_at.take() {
+                        backfill_follows(&helix, &broadcaster, since, &sink).await;
+                    }
                     follow(ws, welcome, &sink).await
                 }
                 Err(TwitchError::SignInNeeded) => End::SignInNeeded,
@@ -78,6 +83,7 @@ pub async fn run(helix: Helix, broadcaster: String, url: String, sink: EventSink
                 if sink.is_closed() {
                     return;
                 }
+                lost_at.get_or_insert_with(now_ms);
                 if started.elapsed() >= STABLE_AFTER {
                     attempt = 0;
                 }
@@ -88,6 +94,44 @@ pub async fn run(helix: Helix, broadcaster: String, url: String, sink: EventSink
             }
         }
     }
+}
+
+/// Follows that came while the connection was down (EventSub doesn't send them again): the
+/// channel's newest followers since `since`, oldest first, as `Backfill` events. They show in
+/// the event list and never alert, count toward goals or pay loyalty (ferrocast-core).
+async fn backfill_follows(helix: &Helix, broadcaster: &str, since: i64, sink: &EventSink) {
+    let list = match helix.recent_followers(broadcaster).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "the follows from while Twitch was away couldn't be read");
+            return;
+        }
+    };
+    for e in backfilled(&list, since, now_ms()) {
+        if sink.send(e).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The follows in `list` (Helix's, newest first) made after `since`, as events, oldest first.
+pub(crate) fn backfilled(list: &[Value], since: i64, now: i64) -> Vec<Event> {
+    let mut out: Vec<Event> = list
+        .iter()
+        .filter_map(|f| {
+            let at = f.get("followed_at").and_then(Value::as_str).and_then(crate::channel::rfc3339_ms)?;
+            let id = f.get("user_id").and_then(Value::as_str).filter(|i| !i.is_empty())?;
+            (at > since).then(|| {
+                let kind = EventKind::Follow { actor: map::actor(f, "user") };
+                let mut e = Event::live(Platform::Twitch, Some(format!("backfill-follow-{id}-{at}")), Millis(at), kind);
+                e.origin = Origin::Backfill;
+                e.received_at = Millis(now);
+                e
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| e.occurred_at.0);
+    out
 }
 
 /// The EventSub address asking for a longer keepalive, unless it names one already.
@@ -264,5 +308,35 @@ mod tests {
         assert_eq!(with_keepalive("ws://127.0.0.1:9/ws?x=1"), "ws://127.0.0.1:9/ws?x=1&keepalive_timeout_seconds=30");
         let own = "wss://e.example/ws?keepalive_timeout_seconds=60";
         assert_eq!(with_keepalive(own), own);
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn follows_from_while_away_come_back_oldest_first_and_never_alert() {
+        let since = crate::channel::rfc3339_ms("2026-11-11T10:00:00Z").unwrap_or_default();
+        // Helix lists newest first.
+        let list = [
+            json!({ "user_id": "3", "user_login": "cee", "user_name": "Cee", "followed_at": "2026-11-11T10:02:00Z" }),
+            json!({ "user_id": "2", "user_login": "bee", "user_name": "Bee", "followed_at": "2026-11-11T10:01:00Z" }),
+            json!({ "user_id": "1", "user_login": "ay", "user_name": "Ay", "followed_at": "2026-11-11T09:59:00Z" }),
+            json!({ "user_login": "noid", "followed_at": "2026-11-11T10:03:00Z" }),
+        ];
+        let got = backfilled(&list, since, since + 300_000);
+        let names: Vec<_> = got
+            .iter()
+            .map(|e| match &e.kind {
+                EventKind::Follow { actor } => actor.display_name.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(names, ["Bee", "Cee"], "only after the loss, oldest first");
+        assert!(got.iter().all(|e| e.origin == Origin::Backfill && e.received_at.0 == since + 300_000));
+        assert_eq!(got[0].source_id.as_deref(), Some(format!("backfill-follow-2-{}", since + 60_000).as_str()));
+        assert!(backfilled(&[], since, since).is_empty());
     }
 }

@@ -53,7 +53,12 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, peer: PeerType)
 /// A fake platform on 127.0.0.1: any app, publishing only with `key` (a wrong key is refused
 /// and the connection closed, as Twitch does). Returns its port and what it saw.
 pub async fn platform(key: &'static str) -> (u16, mpsc::UnboundedReceiver<Got>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    platform_on(0, key).await
+}
+
+/// `platform` on a chosen port (0: any): a server that comes back where it was.
+pub async fn platform_on(port: u16, key: &'static str) -> (u16, mpsc::UnboundedReceiver<Got>) {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {

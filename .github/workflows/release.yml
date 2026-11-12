@@ -24,6 +24,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      web_ref:
+        description: "ferrocast-web branch to build the dashboard from (empty: its default branch)"
+        required: false
+        default: ""
 
 # Read-only by default; only the job that drafts the release may write.
 permissions:
@@ -71,7 +76,8 @@ jobs:
             out: target/universal-apple-darwin/release/bundle
           - name: Windows
             os: windows-2025
-            targets: ""
+            # Ferrocast Camera's DLL for 32-bit apps.
+            targets: i686-pc-windows-msvc
             args: ""
             out: target/release/bundle
           - name: Linux
@@ -87,6 +93,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/ferrocast-web
+          # A test build can take a branch of it; a release takes its default branch.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.web_ref || '' }}
           # ferrocast-web is public, so the built-in token can read it.
           token: ${{ github.token }}
           path: ferrocast-web
@@ -135,32 +143,37 @@ jobs:
           fi
           id=$(deploy/macos-signing.sh setup)
           echo "APPLE_SIGNING_IDENTITY=$id" >> "$GITHUB_ENV"
-      # A universal build merges only the app's own binary; the bundler then looks for every
-      # other [[bin]] (the recording muxer) already merged in target/universal-apple-darwin.
-      - name: Universal helper binaries (macOS)
+      # VST plugins run in their own locked-down helper (docs/plan/VST.md), shipped beside the
+      # app's program. Mac only for now: Windows gets it with its sandbox.
+      - name: The VST helper (macOS)
         if: matrix.name == 'macOS'
         shell: bash
-        env:
-          FERROCAST_WEB_DIST: ${{ github.workspace }}/ferrocast-web/dist
         run: |
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release -p ferrocast-desktop --bin obs-ffmpeg-mux --target "$t"
+            cargo build --release -p ferrocast-vsthost --bin ferrocast-vst --target "$t"
           done
-          mkdir -p target/universal-apple-darwin/release
-          lipo -create -output target/universal-apple-darwin/release/obs-ffmpeg-mux \
-            target/aarch64-apple-darwin/release/obs-ffmpeg-mux target/x86_64-apple-darwin/release/obs-ffmpeg-mux
-          # Signed as the app is: signing the app checks every binary inside it is signed.
-          codesign --force --options runtime --sign "${APPLE_SIGNING_IDENTITY:--}" \
-            target/universal-apple-darwin/release/obs-ffmpeg-mux
-      # The Studio runs OBS's engine; the app carries it, so users don't install OBS.
-      - name: OBS's engine inside the app (macOS)
-        if: matrix.name == 'macOS'
-        shell: bash
-        run: deploy/obs-runtime-macos.sh
-      - name: OBS's engine in the installer (Windows)
+          mkdir -p apps/desktop/binaries
+          lipo -create -output apps/desktop/binaries/ferrocast-vst-universal-apple-darwin \
+            target/aarch64-apple-darwin/release/ferrocast-vst target/x86_64-apple-darwin/release/ferrocast-vst
+          # Each chip's own build looks for its own copy too (3.2.0's first build stopped at
+          # "binaries/ferrocast-vst-aarch64-apple-darwin doesn't exist").
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cp "target/$t/release/ferrocast-vst" "apps/desktop/binaries/ferrocast-vst-$t"
+          done
+      # Ferrocast Camera (docs/plan/VIRTUAL-CAMERA-WINDOWS.md): its DLL for 64-bit apps and for
+      # 32-bit ones, put beside the program, named with the version (an app holding the camera
+      # open keeps the old file locked through an update).
+      - name: The camera DLLs (Windows)
         if: matrix.name == 'Windows'
-        shell: pwsh
-        run: deploy/obs-runtime-windows.ps1
+        shell: bash
+        run: |
+          v="$(awk '/^\[workspace.package\]/{s=1;next} /^\[/{s=0} s&&$1=="version"{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+          cargo build --release --locked -p ferrocast-wincam
+          cargo build --release --locked -p ferrocast-wincam --target i686-pc-windows-msvc
+          mkdir -p apps/desktop/camera
+          cp target/release/ferrocast_camera.dll "apps/desktop/camera/ferrocast_camera-$v.dll"
+          cp target/i686-pc-windows-msvc/release/ferrocast_camera.dll "apps/desktop/camera/ferrocast_camera32-$v.dll"
+          echo "CAMERA_VERSION=$v" >> "$GITHUB_ENV"
       - name: Build the app
         shell: bash
         env:
@@ -185,9 +198,6 @@ jobs:
         run: |
           bundles=""
           if [[ "$OS_NAME" == Linux && "$PRERELEASE" == true ]]; then bundles="--bundles appimage,deb"; fi
-          # deploy/obs-runtime-{macos.sh,windows.ps1} wrote the list of OBS's engine files to copy in.
-          obs=""
-          if [[ "$OS_NAME" == macOS || "$OS_NAME" == Windows ]]; then obs="--config obs-runtime/tauri.obs.json"; fi
           # whisper's Metal code calls __isPlatformVersionAtLeast (from @available), which lives in
           # clang's runtime; newer Xcodes stopped linking it for us (2.3.0's first build failed).
           # The runtime library is universal, so one link argument covers both architectures.
@@ -195,9 +205,52 @@ jobs:
             clang_rt="$(xcrun clang -print-resource-dir)/lib/darwin/libclang_rt.osx.a"
             export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$clang_rt"
           fi
-          # shellcheck disable=SC2086 # matrix.args, $bundles and $obs hold separate words.
+          # The VST helper goes in beside the program (built in the step before, Mac only).
+          config='{"bundle":{"createUpdaterArtifacts":true}}'
+          if [[ "$OS_NAME" == macOS ]]; then
+            config='{"bundle":{"createUpdaterArtifacts":true,"externalBin":["binaries/ferrocast-vst"]}}'
+          fi
+          # Ferrocast Camera's DLLs go in beside the program (built in the step before).
+          if [[ "$OS_NAME" == Windows ]]; then
+            c64="camera/ferrocast_camera-$CAMERA_VERSION.dll"
+            c32="camera/ferrocast_camera32-$CAMERA_VERSION.dll"
+            config="{\"bundle\":{\"createUpdaterArtifacts\":true,\"resources\":{\"$c64\":\"${c64#camera/}\",\"$c32\":\"${c32#camera/}\"}}}"
+          fi
+          # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
-          cargo tauri build ${{ matrix.args }} --features deepfilter $bundles $obs --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config "$config"
+      # Off until the Windows builds are code-signed: Smart App Control (on in fresh Windows 11)
+      # blocks an unsigned setup Microsoft hasn't seen before, and ours carries the app packed
+      # in one file. NSIS's installer, unsigned too, is let through (3 Nov 2026 test).
+      - name: Ferrocast's own Windows setup in place of NSIS's (built, then installed, updated, uninstalled here)
+        if: false && matrix.name == 'Windows'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUNDLE: ${{ matrix.out }}
+        run: ./packaging/windows-setup.ps1 -Bundle $env:BUNDLE
+      # The Microsoft Store package: Microsoft signs it, so Smart App Control and SmartScreen let
+      # it run from the first install with our own publisher name, at no cost. Packed from the
+      # program built above (with FFmpeg inside), then installed, started and removed here.
+      # Uploaded by hand in Partner Center (stable versions only); kept out of the GitHub release.
+      - name: Microsoft Store package (built, then installed, started and removed here)
+        if: matrix.name == 'Windows'
+        shell: pwsh
+        env:
+          MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+          # Signed-in downloads of FFmpeg (GitHub serves those first when it's busy).
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./packaging/windows-msix.ps1 -Exe target/release/ferrocast.exe -Out store -Test
+      - name: Keep the Store package
+        if: matrix.name == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: store-msix
+          path: store/*.msix
+          if-no-files-found: error
       - name: Remove the signing keychain
         if: always() && matrix.name == 'macOS'
         shell: bash
@@ -253,6 +306,8 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
+          # The installers only: the Store package (store-msix) is uploaded in Partner Center.
+          pattern: ferrocast-*
           merge-multiple: true
       - name: Put every bundle at the top of dist
         run: find dist -mindepth 2 -type f -exec mv -t dist {} +

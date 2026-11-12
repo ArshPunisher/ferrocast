@@ -63,7 +63,7 @@ pub async fn delay(t: &Target) -> Result<Duration, PushError> {
 /// upload speed in kbps. Use only where nothing goes live (Twitch with
 /// [`TWITCH_BANDWIDTH_TEST`] after the key, or a test server).
 pub async fn upload(t: &Target, key: &str, length: Duration) -> Result<u32, PushError> {
-    let mut p = Publisher::open(t, key).await?;
+    let mut p = Publisher::open(t, key, None).await?;
     let header = p.client.publish_video_data(Bytes::from_static(&[0x17, 0x00, 0, 0, 0]), RtmpTimestamp::new(0), false);
     p.send(header).await?;
     let mut payload = vec![0u8; CHUNK];

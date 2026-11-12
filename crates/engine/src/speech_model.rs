@@ -14,9 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{Engine, EngineError};
 
-/// The revision every model comes from (checked 30 Oct 2026).
-const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
-const BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve";
+// Every Whisper model comes from one revision of ggerganov/whisper.cpp (checked 30 Oct 2026).
 
 /// A model to offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +22,8 @@ pub struct Model {
     pub id: &'static str,
     pub label: &'static str,
     pub file: &'static str,
+    /// Where it's fetched from.
+    pub from: &'static str,
     pub bytes: u64,
     pub sha256: &'static str,
 }
@@ -33,6 +33,7 @@ pub const MODELS: [Model; 2] = [
         id: "base",
         label: "Fast",
         file: "ggml-base-q5_1.bin",
+        from: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base-q5_1.bin",
         bytes: 59_707_625,
         sha256: "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
     },
@@ -40,10 +41,22 @@ pub const MODELS: [Model; 2] = [
         id: "small",
         label: "Better for Hindi and other languages",
         file: "ggml-small-q5_1.bin",
+        from: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
         bytes: 190_085_487,
         sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
     },
 ];
+
+/// Remove background's model where Apple's Vision isn't (Windows): Robust Video Matting
+/// (MobileNetV3, GPL-3.0), from its v1.0.0 release, fetched the first time the Studio starts.
+pub const MATTE: Model = Model {
+    id: "matte",
+    label: "Remove background",
+    file: "rvm_mobilenetv3_fp32.onnx",
+    from: "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx",
+    bytes: 14_975_696,
+    sha256: "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+};
 
 pub fn model(id: &str) -> Option<&'static Model> {
     MODELS.iter().find(|m| m.id == id)
@@ -105,10 +118,10 @@ pub fn model_path(data: &Path, m: &Model) -> PathBuf {
 /// Streams `url` into `dest` (beside it, renamed when whole), hashing as it goes: a file of
 /// another size or checksum is thrown away. `progress` gets 0 to 100.
 pub async fn download_model(m: &Model, dest: &Path, progress: impl Fn(u8) + Send) -> Result<(), String> {
-    let url = format!("{BASE}/{REVISION}/{}", m.file);
+    let url = m.from;
     let http =
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(1800)).build().map_err(|e| e.to_string())?;
-    let mut res = http.get(&url).send().await.map_err(|e| format!("the download didn't start ({e})"))?;
+    let mut res = http.get(url).send().await.map_err(|e| format!("the download didn't start ({e})"))?;
     if !res.status().is_success() {
         return Err(format!("the download answered {}", res.status().as_u16()));
     }
@@ -239,7 +252,10 @@ mod tests {
         for m in MODELS {
             assert_eq!(m.sha256.len(), 64);
             assert!(m.file.ends_with(".bin") && !m.file.contains('/'));
+            assert!(m.from.starts_with("https://") && m.from.ends_with(m.file));
         }
+        assert!(model("matte").is_none(), "not a speech model");
+        assert!(MATTE.from.starts_with("https://github.com/") && MATTE.from.ends_with(MATTE.file));
         assert_eq!(model_path(Path::new("/d"), model("base").unwrap()), Path::new("/d/models/ggml-base-q5_1.bin"));
     }
 }

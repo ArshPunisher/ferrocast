@@ -18,6 +18,7 @@ mod cloud_sync_tests;
 #[cfg(test)]
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
+pub mod automation;
 pub mod designs;
 mod discord;
 mod dispatcher;
@@ -35,6 +36,9 @@ mod obs;
 pub mod obs_theme;
 mod patch;
 mod pipeline;
+pub mod plugin_catalog;
+pub mod plugin_logic;
+pub mod plugins;
 mod polls;
 mod pro;
 pub mod speech_model;
@@ -195,6 +199,10 @@ struct Inner {
     music: music::Music,
     /// The Studio's engine, run by the desktop app (2.1, Track B).
     studio_host: studio_host::Slot,
+    /// "When X, do Y" rules and when each last ran.
+    automations: Mutex<automation::Automations>,
+    /// Logic plugins that are on, loaded and ready to be told about events.
+    plugin_logic: Mutex<plugins::Running>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -221,8 +229,11 @@ impl Engine {
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
         engine.watch_obs();
         engine.watch_obs_health();
+        engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
+        // Installed plugins' effects that are on (OBS-COMPETE.md §4).
+        engine.load_plugins();
         Ok(engine)
     }
 
@@ -326,6 +337,8 @@ impl Engine {
                 golive: Default::default(),
                 music: Default::default(),
                 studio_host: Default::default(),
+                automations: Mutex::new(Default::default()),
+                plugin_logic: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -333,6 +346,7 @@ impl Engine {
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(automation::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
         tokio::spawn(giveaways::run(engine.clone()));

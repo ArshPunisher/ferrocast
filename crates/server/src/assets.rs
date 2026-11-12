@@ -83,6 +83,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/app", get(|| async { Redirect::permanent("/app/") }))
         .route("/app/", get(dashboard_index))
         .route("/app/{*path}", get(dashboard_file))
+        .route("/plugin-panel/{id}", get(plugin_panel_page))
         .route("/o/{token}", get(overlay_redirect))
         .route("/o/{token}/", get(overlay_index))
         .route("/o/{token}/{*path}", get(overlay_file))
@@ -107,6 +108,30 @@ fn file_response<E: Embed>(path: &str, csp: &str) -> Option<Response> {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
     Some(res)
+}
+
+/// A panel plugin's page: its own inline code only, no network, framed by the dashboard alone,
+/// and without an origin even when opened by itself.
+const PANEL_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+    img-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts";
+
+/// `GET /plugin-panel/{id}`: a panel plugin's page as a page of its own, for the dashboard's
+/// sandboxed frame. In the frame's `srcdoc` it was held to the dashboard's policy too (no inline
+/// scripts), so no panel's buttons ever worked in the app (10 Nov, Windows). Outside `/api/v1`,
+/// so a phone never reaches it; the page is the plugin's own, nothing secret.
+async fn plugin_panel_page(State(app): State<AppState>, Path(id): Path<String>) -> Response {
+    let html = match app.engine.plugin_panel(&id).await {
+        Ok(v) => v.get("html").and_then(serde_json::Value::as_str).unwrap_or_default().to_string(),
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, PANEL_CSP)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(format!("<!doctype html><meta charset=\"utf-8\">{html}")))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn dashboard_index() -> Response {

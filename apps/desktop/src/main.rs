@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+mod crash;
+#[cfg(target_os = "macos")]
+mod mac_update;
+mod store;
 mod studio;
 mod studio_history;
 mod studio_keys;
@@ -85,7 +90,9 @@ fn init_tracing(dir: &std::path::Path) {
     let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!(%info, "Ferrocast stopped unexpectedly");
+        // Where it came from too (function names in builds with symbols, addresses without).
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%info, %trace, "Ferrocast stopped unexpectedly");
         default(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
@@ -94,7 +101,19 @@ fn init_tracing(dir: &std::path::Path) {
 fn main() {
     let dir = data_dir();
     init_tracing(&dir);
-    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
+    // VST plugins run in their own locked-down helper, which may never read this folder (stream
+    // keys, sign-ins); the Studio's sound filters then reach them.
+    ferrocast_vsthost::client::keep_private(vec![dir.clone()]);
+    ferrocast_vsthost::install();
+    #[cfg(windows)]
+    crash::install(&dir);
+    #[cfg(all(windows, debug_assertions))]
+    crash::test_crash_if_asked();
+    // The Store package's startup task can't pass `--minimized`: it's asked instead.
+    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
+    if store::packaged() {
+        tracing::info!("running from the Microsoft Store package: the Store updates it");
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_opener::init())
@@ -155,7 +174,13 @@ fn main() {
                 tracing::warn!(error = %e, "couldn't register the show-window shortcut (another app may use it)");
             }
             tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
-            tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
+            if store::packaged() {
+                // Store installs get new versions from the Store (its rules, and the package
+                // folder is read-only), so the dashboard says that instead of offering ours.
+                engine.updates_from_store();
+            } else {
+                tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
+            }
             let pending = Pending::default();
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
@@ -207,6 +232,9 @@ fn main() {
         RunEvent::Exit => {
             studio::end_session();
             tracing::info!("Ferrocast quitting");
+            // Before the main thread's own end, which can't run the engine's GPU cleanup.
+            studio::close();
+            tracing::info!("the Studio closed");
         }
         _ => {}
     });
@@ -457,7 +485,20 @@ async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             continue;
         }
         // Unpacking and moving the app takes a moment: off the async workers.
-        let installed = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        let installed = tokio::task::spawn_blocking(move || {
+            // A Mac keeps the same Ferrocast.app folder, so the Dock's pin survives the update;
+            // the plugin's own install (it swaps the whole folder) is the fallback, and asks
+            // for an admin password where the folder needs one.
+            #[cfg(target_os = "macos")]
+            if let Some(app) = std::env::current_exe().ok().and_then(|e| mac_update::bundle_of(&e)) {
+                match mac_update::install(&bytes, &app) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::warn!(error = %e, "couldn't update inside the app folder; replacing it whole"),
+                }
+            }
+            update.install(bytes)
+        })
+        .await;
         match installed {
             Ok(Ok(())) => {
                 tracing::info!(%version, "update installed; waiting for the restart");
@@ -507,10 +548,24 @@ async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
         let settings = engine.settings();
         shell.close_to_tray.store(settings.close_to_tray, Ordering::Relaxed);
         if login != Some(settings.launch_at_login) {
-            let al = app.autolaunch();
-            let result = if settings.launch_at_login { al.enable() } else { al.disable() };
+            let on = settings.launch_at_login;
+            let result = if store::packaged() {
+                // The package's startup task (a Run key written from inside a package is never
+                // read by Windows).
+                tauri::async_runtime::spawn_blocking(move || store::set_launch_at_login(on))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                let al = app.autolaunch();
+                if on { al.enable() } else { al.disable() }.map_err(|e| e.to_string())
+            };
             match result {
-                Ok(()) => login = Some(settings.launch_at_login),
+                Ok(()) => {
+                    if store::packaged() {
+                        tracing::info!(on, "launch at login set through the package's startup task");
+                    }
+                    login = Some(on);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "couldn't change launch at login");
                     login = Some(settings.launch_at_login); // don't retry every two seconds

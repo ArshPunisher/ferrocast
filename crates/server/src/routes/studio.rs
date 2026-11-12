@@ -91,6 +91,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/top-layer", put(engine_top_layer))
         .route(
             "/studio/engine/transitions/{kind}/settings",
             get(engine_transition_settings).put(engine_set_transition_settings),
@@ -111,6 +112,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/paste-filters", post(engine_paste_filters))
         .route("/studio/engine/sources/{name}/web", post(engine_web))
         .route("/studio/engine/sources/{name}/screenshot", post(engine_screenshot))
+        .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
+        .route("/studio/engine/sources/{name}/status", get(engine_source_status))
+        .route("/studio/engine/screens/{id}/still", get(engine_screen_still))
+        .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
+        .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
@@ -123,6 +129,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/filters/{filter}/options", get(engine_filter_options))
         .route("/studio/engine/channels/{channel}", put(engine_set_channel).delete(engine_clear_channel))
         .route("/studio/engine/levels", post(engine_levels))
+        .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
+        .route("/studio/engine/privacy", get(privacy).put(set_privacy))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
@@ -134,6 +142,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/missing-files/search", post(engine_find_missing))
         .route("/studio/engine/replay/save", post(engine_replay_save))
         .route("/studio/engine/virtualcam", post(engine_virtual_camera))
+        .route(
+            "/studio/engine/virtualcam/setup",
+            get(engine_virtual_camera_setup).post(engine_set_virtual_camera_setup),
+        )
+        .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
@@ -155,6 +168,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/show", get(show))
         .route("/show/config", get(show_config).put(save_show_config))
         .route("/show/preflight", get(preflight))
+        .route("/show/alerts", get(live_alerts))
         .route("/show/preflight/fix", post(preflight_fix))
         .route("/show/start", post(start_show))
         .route("/show/countdown/skip", post(skip_countdown))
@@ -398,7 +412,7 @@ struct CursorBody {
     cursor: String,
 }
 
-/// `PUT /studio/engine/preview/cursor` `{ cursor }`: the cursor over the pictures (Windows).
+/// `PUT /studio/engine/preview/cursor` `{ cursor }`: the cursor over the pictures (Windows, Mac).
 async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview_cursor(b.cursor).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -541,6 +555,16 @@ struct TransitionBody {
 
 async fn engine_transition(State(app): State<AppState>, Body(b): Body<TransitionBody>) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetTransition { kind: b.kind, ms: b.ms }).await
+}
+
+#[derive(Deserialize)]
+struct TopLayerBody {
+    scene: Option<String>,
+}
+
+/// The scene shown over every scene on air (the top layer), or `null` for none.
+async fn engine_top_layer(State(app): State<AppState>, Body(b): Body<TopLayerBody>) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTopLayer { scene: b.scene }).await
 }
 
 #[derive(Deserialize)]
@@ -825,11 +849,15 @@ struct SelectBody {
     frames: bool,
     #[serde(default)]
     also: Vec<i64>,
+    #[serde(default)]
+    guides: bool,
 }
 
-/// `PUT /studio/engine/preview/selection` `{ scene, id }` (both null for none).
+/// `PUT /studio/engine/preview/selection` `{ scene, id, frames?, also?, guides? }` (scene and
+/// id null for none).
 async fn engine_select(State(app): State<AppState>, Body(b): Body<SelectBody>) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames, also: b.also }).await
+    act_done(&app, StudioAct::Select { scene: b.scene, id: b.id, frames: b.frames, also: b.also, guides: b.guides })
+        .await
 }
 
 /// `POST /studio/engine/pick-file` `{ kind, filter? }` → `{ path }` (null when cancelled).
@@ -1108,6 +1136,74 @@ async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdB
     Ok(Json(app.engine.studio_import_streamlabs(&b.id).await?))
 }
 
+#[derive(Deserialize)]
+struct RescanQuery {
+    #[serde(default)]
+    rescan: bool,
+}
+
+/// `GET …/vst/plugins?rescan=true` → `{ available, why, plugins }`: the VST3 sound plugins on
+/// this computer (each looked at in its own locked-down helper).
+async fn engine_vst_plugins(State(app): State<AppState>, Query(q): Query<RescanQuery>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::VstPlugins { rescan: q.rescan }).await
+}
+
+/// `GET …/sources/{name}/filters/{filter}/vst` → `{ running, problem, changed }`.
+async fn engine_vst_status(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Vst { name, filter, what: "status".into() }).await
+}
+
+/// `POST …/sources/{name}/filters/{filter}/vst` `{ "do": "open" | "close" | "save" }`: its own
+/// window, or its state saved into the filter.
+async fn engine_vst_act(
+    State(app): State<AppState>,
+    Path((name, filter)): Path<(String, String)>,
+    Body(b): Body<DoBody<String>>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Vst { name, filter, what: b.what }).await
+}
+
+/// `GET …/sources/{name}/picture?w=256` → `{ image, width, height }`: the source's own picture
+/// now, before its filters (the crop editor and filter previews draw on it).
+async fn engine_source_picture(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ThumbQuery>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SourcePicture { name, width: q.w }).await
+}
+
+#[derive(Deserialize)]
+struct StillQuery {
+    #[serde(default)]
+    window: bool,
+    #[serde(default = "still_width")]
+    w: u32,
+}
+
+fn still_width() -> u32 {
+    320
+}
+
+/// `GET …/screens/{id}/still?w=320&window=false` → `{ image }`: a still of a screen or window
+/// for the cards a capture is picked from (null where it can't be taken).
+async fn engine_screen_still(
+    State(app): State<AppState>,
+    Path(id): Path<u32>,
+    Query(q): Query<StillQuery>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w }).await
+}
+
+/// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a
+/// Browser source's address answers), for its drawer.
+async fn engine_source_status(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SourceStatus { name }).await
+}
+
 async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::Screenshot { name }).await
 }
@@ -1303,6 +1399,25 @@ async fn engine_replay_save(State(app): State<AppState>) -> ApiResult<Json<Value
     Ok(Json(app.engine.studio_replay_save().await?))
 }
 
+/// `GET /studio/engine/virtualcam/setup` → `{ every_app_possible, every_app_on, store }`.
+async fn engine_virtual_camera_setup(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_virtual_camera_setup().await?))
+}
+
+#[derive(Deserialize)]
+struct CameraSetupBody {
+    /// Windows 11's camera for every app (asks for admin once), or back to DirectShow's.
+    every_app: bool,
+}
+
+/// `POST /studio/engine/virtualcam/setup` `{ every_app }` → the setup after.
+async fn engine_set_virtual_camera_setup(
+    State(app): State<AppState>,
+    Body(b): Body<CameraSetupBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_set_virtual_camera_every_app(b.every_app).await?))
+}
+
 #[derive(Deserialize)]
 struct CameraBody {
     on: bool,
@@ -1314,6 +1429,20 @@ struct CameraBody {
 /// `POST /studio/engine/virtualcam` `{ on, source? }` → `{ active }`.
 async fn engine_virtual_camera(State(app): State<AppState>, Body(b): Body<CameraBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_virtual_camera(b.on, b.source).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NdiBody {
+    on: bool,
+    /// The name it's sent under (default "Ferrocast").
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /studio/engine/ndi` `{ on, name? }` → `{ active, name }`.
+async fn engine_ndi_output(State(app): State<AppState>, Body(b): Body<NdiBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_ndi_output(b.on, b.name).await?))
 }
 
 /// `POST /studio/engine/record/split`: the recording goes on in a new file.
@@ -1368,6 +1497,25 @@ async fn engine_monitoring(State(app): State<AppState>) -> ApiResult<Json<Value>
     Ok(Json(app.engine.studio_monitoring().await?))
 }
 
+/// The sound care: ducking and loudness (the Studio's document).
+async fn audio_care(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::AudioCare).await
+}
+
+async fn set_audio_care(State(app): State<AppState>, Body(care): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetAudioCare { care }).await?;
+    act(&app, StudioAct::AudioCare).await
+}
+
+async fn privacy(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Privacy).await
+}
+
+async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) -> ApiResult<Json<Value>> {
+    let _ = act(&app, StudioAct::SetPrivacy { privacy }).await?;
+    act(&app, StudioAct::Privacy).await
+}
+
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
 async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::Levels { names: b.names }).await
@@ -1393,6 +1541,11 @@ pub async fn save_music(State(app): State<AppState>, Body(b): Body<Map<String, V
 
 async fn preflight(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.preflight().await))
+}
+
+/// The live watch's alerts raised now (`{ alerts: string[] }`, their ids).
+async fn live_alerts(State(app): State<AppState>) -> Json<Value> {
+    Json(json!({ "alerts": app.engine.live_alerts() }))
 }
 
 #[derive(Deserialize)]
@@ -1570,7 +1723,7 @@ async fn delete_marker(State(app): State<AppState>, Path(id): Path<String>) -> A
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A download: `?format=csv|txt&since=<ms>`.
+/// A download: `?format=csv|txt|youtube&since=<ms>`.
 async fn export_markers(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> ApiResult<Response> {
     let format = q.get("format").map(String::as_str).unwrap_or("csv");
     let (ct, name, body) = app.engine.export_markers(format, since(&q)?).await?;

@@ -214,11 +214,20 @@ fn destination(port: u16, key: &str) -> Destination {
         key: key.into(),
         retry: Default::default(),
         extra_audio: false,
+        extra_video: false,
     }
 }
 
 fn start(w: &World, d: Destination) -> watch::Receiver<Health> {
-    let (tx, rx) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+    let (tx, rx) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
     tokio::spawn(push::run(d, w.hub.clone(), tx, w.stop.subscribe()));
     rx
 }
@@ -629,5 +638,48 @@ async fn only_twitch_gets_the_vod_track_and_late_it_gets_its_header() {
     assert_eq!(next(&mut other).await, Got::Video(0, Bytes::from_static(KEY)));
     assert_eq!(next(&mut other).await, Got::Audio(10, Bytes::from_static(AAC_FRAME)));
     // The other platform never sees the VOD track: next is the picture.
+    assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
+}
+
+/// Twitch Enhanced Broadcasting's extra qualities (Enhanced RTMP multitrack video, track 1 here).
+const EB_HEADER: &[u8] = b"\x96\x00avc1\x01\x01\x64\x00\x1f";
+const EB_KEY: &[u8] = b"\x96\x03avc1\x01\x00\x00\x00\x01";
+const EB_INTER: &[u8] = b"\xA6\x03avc1\x01\x00\x00\x00\x02";
+
+#[tokio::test]
+async fn only_enhanced_broadcasting_gets_the_other_qualities() {
+    let w = world().await;
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    obs.meta().await;
+    obs.video(0, AVC_HEADER).await;
+    obs.video(0, EB_HEADER).await;
+    obs.audio(0, AAC_HEADER).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (lt, lo) = (free_listener().await, free_listener().await);
+    let (pt, po) = (lt.local_addr().unwrap().port(), lo.local_addr().unwrap().port());
+    let (mut twitch, mut other) = (platform(lt, "t").await, platform(lo, "o").await);
+    let mut ht = start(&w, Destination { extra_video: true, ..destination(pt, "t") });
+    let mut ho = start(&w, destination(po, "o"));
+    state_is(&mut ht, |s| *s == PushState::Live).await;
+    state_is(&mut ho, |s| *s == PushState::Live).await;
+    for rx in [&mut twitch, &mut other] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Meta);
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+    // The late joiner gets the extra track's header too; Twitch only.
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_HEADER)));
+
+    // An extra track's keyframe isn't where a destination starts: the main one's is.
+    obs.video(900, EB_KEY).await;
+    obs.video(1000, KEY).await;
+    obs.video(1000, EB_INTER).await;
+    obs.video(1040, INTER).await;
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_INTER)));
+    assert_eq!(next(&mut other).await, Got::Video(0, Bytes::from_static(KEY)));
+    // The other platform never sees track 1: next is the main picture.
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }

@@ -14,10 +14,6 @@ name = "ferrocast"
 path = "src/main.rs"
 
 # Stands in for OBS's mux helper next to Ferrocast (MKV, FLV, TS recordings); bundled beside it.
-[[bin]]
-name = "obs-ffmpeg-mux"
-path = "src/bin/obs-ffmpeg-mux.rs"
-
 [features]
 # The Studio's Strong noise removal (DeepFilterNet): on in CI and release builds.
 deepfilter = ["ferrocast-studio/deepfilter"]
@@ -30,6 +26,10 @@ ferrocast-core.workspace = true
 ferrocast-engine.workspace = true
 ferrocast-server.workspace = true
 ferrocast-studio.workspace = true
+# FFmpeg for remuxing recordings (Ferrocast's own engine finds it).
+ferrocore.workspace = true
+# VST3 sound plugins, each in its own locked-down helper (docs/plan/VST.md).
+ferrocast-vsthost.workspace = true
 ferrocast-guest.workspace = true
 raw-window-handle = "0.6"
 async-trait = "0.1"
@@ -54,9 +54,28 @@ tauri-plugin-dialog = "2"
 # Live captions on every system (plan item 7b): whisper.cpp, on this computer; Metal on a Mac.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal", "tracing_backend"] }
+# Updates go inside the same Ferrocast.app folder (src/mac_update.rs), so the Dock keeps its pin.
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+libc = "0.2"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 whisper-rs = { version = "0.16", features = ["tracing_backend"] }
+
+# Crash reports on Windows (src/crash.rs): a minidump when a native fault ends the app; the
+# Store package's checks (src/store.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    # The Microsoft Store package (src/store.rs): is it packaged, its startup task.
+    "ApplicationModel",
+    "ApplicationModel_Activation",
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # A mock app runs the real updater plugin against local feeds (main.rs tests).
@@ -64,5 +83,15 @@ tauri = { version = "2", features = ["tray-icon", "test"] }
 base64 = "0.22"
 tempfile = "3"
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code. Windows' crash reports (src/crash.rs) are Win32 calls, so
+# here it is denied instead and allowed in that file only, each block with its SAFETY reason.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"

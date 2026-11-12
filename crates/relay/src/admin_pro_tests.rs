@@ -390,3 +390,19 @@ fn times_read_and_write_in_utc() {
     assert!(time_in(&json!("2026-10-18"), false).is_err());
     assert!(time_in(&json!("soon"), true).is_err());
 }
+
+/// An install can get Pro forever too (owner, 9 Nov); days given later don't shorten it.
+#[tokio::test]
+async fn give_an_install_pro_forever() {
+    let t = start(true).await;
+    let (auth, install) = t.install().await;
+    let (s, v) = t.write("POST", "/grants", json!({ "install_id": install, "forever": true })).await;
+    assert_eq!(s, 201, "{v}");
+    assert_eq!((v["forever"].as_bool(), v["ends_at"].as_str()), (Some(true), Some("9999-12-31T23:59:59Z")));
+    assert_eq!(t.status(&auth).await["pro"], true);
+    let (_, v) = t.write("POST", "/grants", json!({ "install_id": install, "days": 5 })).await;
+    assert_eq!((v["forever"].as_bool(), v["extended"].as_bool()), (Some(true), Some(true)));
+    let grants = t.get("/grants").await;
+    assert_eq!((grants[0]["forever"].as_bool(), grants[0]["active"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(grants[0]["history"][0]["days"], 0, "forever is written as 0 days");
+}

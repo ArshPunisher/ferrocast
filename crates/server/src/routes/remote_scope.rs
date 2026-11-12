@@ -103,6 +103,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/import"),
     ("*", "/import/**"),
     ("*", "/designs/import"),
+    // Plugins bring code (effects): installed and managed on the PC only.
+    ("*", "/plugins"),
+    ("*", "/plugins/**"),
     ("*", "/designs/*/export"),
     ("*", "/backups/*/restore"),
     // Media uploads (the tip page's avatar and banner too).
@@ -113,10 +116,14 @@ pub const OWNER_DENIED: &[Rule] = &[
     // The live socket has its own route on the relay, never a request frame.
     ("*", "/live"),
     // Go live: the local stream key, and adding or removing a server with its key, stay on
-    // the PC. Watching, ticking platforms and the checks are fine from a phone.
+    // the PC. Watching, ticking platforms and the checks are fine from a phone. Trying an
+    // address that isn't saved stays on the PC too: a phone mustn't make it reach any host
+    // (a saved server's own test is fine). Nor does the list of its networks and addresses.
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
+    ("*", "/golive/test"),
+    ("*", "/golive/networks"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -262,8 +269,10 @@ mod tests {
             ("POST", "/golive/upload-check"),
             ("POST", "/golive/obs/setup"),
             ("POST", "/golive/resume/kick"),
+            ("POST", "/golive/destinations/c_1/test"),
             ("PUT", "/golive/protection"),
             ("PUT", "/golive/aitum"),
+            ("PUT", "/golive/auto-quality"),
             ("GET", "/settings"),
             ("PUT", "/settings"),
             ("POST", "/chat/send"),
@@ -316,6 +325,11 @@ mod tests {
             ("POST", "/discord/test"),
             ("PUT", "/obs"),
             ("POST", "/obs/detect"),
+            // Plugins bring code: never from a phone, not even the list.
+            ("GET", "/plugins"),
+            ("POST", "/plugins"),
+            ("PUT", "/plugins/com.ana.invert"),
+            ("DELETE", "/plugins/com.ana.invert"),
             ("POST", "/export"),
             ("POST", "/import"),
             ("POST", "/import/apply"),
@@ -331,6 +345,8 @@ mod tests {
             ("GET", "/golive/ingest"),
             ("POST", "/golive/destinations"),
             ("DELETE", "/golive/destinations/c_1"),
+            ("POST", "/golive/test"),
+            ("GET", "/golive/networks"),
             ("GET", "/studio/engine"),
             ("POST", "/studio/engine/start"),
             ("PUT", "/studio/engine/preview"),

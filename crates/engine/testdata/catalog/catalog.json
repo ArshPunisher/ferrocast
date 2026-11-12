@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "com.ferrocast.invert",
+      "name": "Invert",
+      "version": "1.2.0",
+      "author": "Ferrocast tests",
+      "description": "Flips the colours.",
+      "kind": "effect",
+      "actions": [],
+      "url": "invert.zip",
+      "sha256": "77bed99ced8938e65308c2372b9bb8962288708de49158686457bbd0dcabb1a4",
+      "size": 417
+    }
+  ]
+}

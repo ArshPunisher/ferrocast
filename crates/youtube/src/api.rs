@@ -321,6 +321,59 @@ impl Api {
         Ok(())
     }
 
+    /// The broadcast that went live at `since_ms` or after (give or take 15 minutes): its video
+    /// id and when it went live, newest first; ended ones, then the live one (1 unit each).
+    pub async fn last_broadcast(&self, since_ms: i64) -> Result<Option<(String, i64)>, YoutubeError> {
+        let mut best: Option<(String, i64)> = None;
+        for status in ["completed", "active"] {
+            let q =
+                [("part", "id,snippet"), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "10")];
+            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+                let (Some(id), Some(start)) = (
+                    b.get("id").and_then(Value::as_str),
+                    b.pointer("/snippet/actualStartTime").and_then(Value::as_str).and_then(parse_rfc3339_ms),
+                ) else {
+                    continue;
+                };
+                if start >= since_ms - 900_000 && best.as_ref().is_none_or(|(_, s)| start > *s) {
+                    best = Some((id.to_string(), start));
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Puts `chapters` ("0:00 Start" lines) at the end of video `id`'s description, replacing
+    /// chapters put there before; the rest of it and the other details are kept
+    /// (videos.list + videos.update, 51 units).
+    pub async fn set_chapters(&self, id: &str, chapters: &str) -> Result<(), YoutubeError> {
+        let v = self.call(Method::GET, "/videos", &[("part", "snippet"), ("id", id)], None).await?;
+        let mut snippet = v
+            .pointer("/items/0/snippet")
+            .cloned()
+            .ok_or_else(|| YoutubeError::Protocol("the stream's video wasn't found".into()))?;
+        if let Some(o) = snippet.as_object_mut() {
+            for k in ["publishedAt", "channelId", "thumbnails", "channelTitle", "liveBroadcastContent", "localized"] {
+                o.remove(k);
+            }
+        }
+        let old = snippet.get("description").and_then(Value::as_str).unwrap_or_default();
+        let description = with_chapters(old, chapters);
+        if description.chars().count() > MAX_DESCRIPTION_CHARS {
+            return Err(YoutubeError::Refused(format!(
+                "the description would pass YouTube's {MAX_DESCRIPTION_CHARS} characters with the chapters"
+            )));
+        }
+        snippet["description"] = json!(description);
+        if snippet.get("categoryId").is_none() {
+            snippet["categoryId"] = json!("20");
+        }
+        self.call(Method::PUT, "/videos", &[("part", "snippet")], Some(json!({ "id": id, "snippet": snippet })))
+            .await?;
+        Ok(())
+    }
+
     /// Changes the broadcast video's title, category, tags, language and description
     /// (`videos.update`, 50 units). The video's snippet is read first so whatever isn't
     /// being changed (the description, unless given) is kept.
@@ -640,6 +693,75 @@ fn vertical_id(list: &Value) -> Option<String> {
         .find(|s| s.pointer("/snippet/title").and_then(Value::as_str) == Some(VERTICAL_STREAM_TITLE))
         .and_then(|s| s.get("id").and_then(Value::as_str))
         .map(String::from)
+}
+
+/// `2026-10-24T10:30:00Z` (or with `.123` and an offset) as Unix ms; None when it isn't one.
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d, hh, mm, ss) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Fractions of a second, then Z or ±hh:mm.
+    let mut rest = &s[19..];
+    let mut ms = 0;
+    if let Some(f) = rest.strip_prefix('.') {
+        let digits = f.bytes().take_while(u8::is_ascii_digit).count();
+        ms = format!("{:0<3}", &f[..digits.min(3)]).parse::<i64>().ok()?;
+        rest = &f[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) && &o[3..4] == ":" => {
+            let v = o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60;
+            if o.starts_with('-') { -v } else { v }
+        }
+        _ => return None,
+    };
+    // Days from civil (H. Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + hh * 3600 + mm * 60 + ss - offset) * 1000 + ms)
+}
+
+/// The line chapters start under in a description, and YouTube's description limit.
+const CHAPTERS_HEAD: &str = "Chapters:\n0:00 ";
+const MAX_DESCRIPTION_CHARS: usize = 5000;
+
+/// `description` with `chapters` at its end, under "Chapters:". Chapters put there before
+/// (that line followed by a 0:00 one, and the timed lines after) go; all else is kept.
+pub(crate) fn with_chapters(description: &str, chapters: &str) -> String {
+    let at =
+        description.match_indices(CHAPTERS_HEAD).map(|(i, _)| i).find(|&i| i == 0 || description[..i].ends_with('\n'));
+    let timed = |line: &str| {
+        line.split_once(' ').is_some_and(|(t, _)| t.contains(':') && t.bytes().all(|b| b.is_ascii_digit() || b == b':'))
+    };
+    let (before, after) = match at {
+        Some(at) => {
+            let mut end = at;
+            for (i, line) in description[at..].split_inclusive('\n').enumerate() {
+                if i > 0 && !timed(line) {
+                    break;
+                }
+                end += line.len();
+            }
+            (&description[..at], &description[end..])
+        }
+        None => (description, ""),
+    };
+    let mut parts: Vec<String> =
+        [before.trim(), after.trim()].into_iter().filter(|p| !p.is_empty()).map(String::from).collect();
+    parts.push(format!("Chapters:\n{}", chapters.trim_end()));
+    parts.join("\n\n")
 }
 
 /// Unix ms as `2026-10-24T10:30:00Z` (UTC; days-to-civil from H. Hinnant's date algorithms).

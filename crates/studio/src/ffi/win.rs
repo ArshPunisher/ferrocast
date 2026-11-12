@@ -46,7 +46,6 @@ type InputFn = Box<dyn Fn(Input)>;
 /// What the window procedure reads: set when the view is made, dropped after the window goes.
 #[derive(Default)]
 struct State {
-    resize: Cell<Option<(*const super::Api, *mut super::ObsDisplay)>>,
     input: RefCell<Option<InputFn>>,
     /// 0x00BBGGRR (GDI's COLORREF).
     backdrop: Cell<u32>,
@@ -347,25 +346,14 @@ impl ChildView {
         self.state.origin.set((dx, dy));
         // SAFETY: moves this live window; HWND_TOP keeps it over the webview.
         unsafe { SetWindowPos(self.hwnd, HWND_TOP, dx, dy, dw, dh, SWP_NOACTIVATE) };
-        if let Some((api, display)) = self.state.resize.get() {
-            // SAFETY: set by `resize_with` from a live Preview, which calls `remove` (clearing
-            // it) before the display and the Api go.
-            unsafe { &*api }.obs_display_resize(display, dw as u32, dh as u32);
-        }
     }
 
     pub fn remove(&self) {
-        self.state.resize.set(None);
         if let Ok(mut cb) = self.state.input.try_borrow_mut() {
             *cb = None;
         }
         // SAFETY: destroys this module's own window (once: ChildView isn't Clone).
         unsafe { DestroyWindow(self.hwnd) };
-    }
-
-    /// Resizes `display` with the view. `remove` lets go.
-    pub fn resize_with(&self, api: *const super::Api, display: *mut super::ObsDisplay) {
-        self.state.resize.set(Some((api, display)));
     }
 
     /// The colour under the picture (0xAABBGGRR, as libobs takes it).
@@ -578,7 +566,7 @@ pub mod projector {
                 }
                 TRUE as LRESULT
             }
-            // libobs draws all of it.
+            // Ferrocore draws all of it.
             WM_ERASEBKGND => 1,
             WM_NCDESTROY => {
                 // SAFETY: clears the pointer before Win drops the State it points to.

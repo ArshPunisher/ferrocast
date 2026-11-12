@@ -22,6 +22,7 @@ use tokio::time::timeout;
 use crate::conn::{self, READ_BUF};
 use crate::flv;
 use crate::hub::{Frame, Hub, Live, Subscription};
+use crate::links;
 use crate::target::Target;
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
@@ -54,6 +55,9 @@ pub struct Destination {
     pub retry: Retry,
     /// Gets the stream's extra audio tracks (Twitch's VOD track); others get only the main one.
     pub extra_audio: bool,
+    /// Gets the stream's extra video tracks (Twitch Enhanced Broadcasting's other qualities);
+    /// others get only the main picture.
+    pub extra_video: bool,
 }
 
 impl std::fmt::Debug for Destination {
@@ -93,14 +97,34 @@ pub struct Health {
     pub kbps: u32,
     /// Packets skipped because this destination fell behind (counted per stream).
     pub dropped: u64,
+    /// Bytes sent since this destination started (for callers that work out their own rate).
+    #[serde(skip)]
+    pub sent: u64,
+    /// How the network to it is doing (direct destinations, once connected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
+    /// The connection it moved to after the usual one failed ("iPhone USB"); none: the usual.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     /// When the current state began (ms since the Unix epoch).
     pub since_ms: u64,
 }
 
 impl Health {
     fn new(state: PushState) -> Self {
-        Self { state, kbps: 0, dropped: 0, since_ms: now_ms() }
+        Self { state, kbps: 0, dropped: 0, sent: 0, link: None, via: None, since_ms: now_ms() }
     }
+}
+
+/// The network to a destination over the last few seconds, as its sender measures it.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, serde::Deserialize)]
+pub struct Link {
+    /// The round trip (ping), in milliseconds.
+    pub rtt_ms: u32,
+    /// Of the packets sent, the share the network lost (most come back resent), in percent.
+    pub lost_pct: f32,
+    /// Of the packets sent, the share sent again, in percent.
+    pub resent_pct: f32,
 }
 
 /// Why a try failed, in words.
@@ -126,18 +150,34 @@ pub enum PushError {
     Broken(String),
 }
 
+impl PushError {
+    /// The network failed (not the server saying no): another connection may do better.
+    fn is_network(&self) -> bool {
+        matches!(self, Self::Unreachable(_) | Self::Slow(_) | Self::Closed(_) | Self::Stalled(_) | Self::Broken(_))
+    }
+}
+
+/// Whether a destination may move to another connection: not one on this computer or network.
+fn may_move(t: &Target) -> bool {
+    match t.host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => !(ip.is_loopback() || ip.is_private() || ip.is_link_local()),
+        Ok(std::net::IpAddr::V6(ip)) => !ip.is_loopback(),
+        Err(_) => t.host != "localhost" && !t.host.ends_with(".local"),
+    }
+}
+
 /// How a session ended without an error.
 #[derive(Debug, PartialEq, Eq)]
-enum Ended {
+pub(crate) enum Ended {
     /// OBS stopped streaming.
     StreamEnded,
     /// Asked to stop.
     Stopped,
 }
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-type Stream = Pin<Box<dyn Io>>;
+pub(crate) type Stream = Pin<Box<dyn Io>>;
 
 /// Runs one destination until `stop` turns true. Health is sent on `health`.
 pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
@@ -155,11 +195,13 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         };
         let still_on = |l: &Live| l.on && l.stream == stream;
         let mut attempt = 0u32;
+        // The connection used: the system's default until that fails, then the next one.
+        let mut via: Option<links::Network> = None;
         loop {
             set_state(&health, PushState::Connecting);
             let outcome = tokio::select! {
                 _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, &hub, &health, stream) => r,
+                r = session(&dest, &hub, &health, stream, via.as_ref()) => r,
             };
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
@@ -176,7 +218,10 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     }
                     attempt = attempt.saturating_add(1);
                     let wait = backoff(attempt, &dest.retry);
-                    tracing::info!(dest = %dest.id, attempt, error = %err, "golive: destination failed, retrying");
+                    if err.is_network() && may_move(&dest.target) {
+                        via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
+                    }
+                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), "golive: destination failed, retrying");
                     set_state(
                         &health,
                         PushState::Reconnecting {
@@ -195,11 +240,12 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         }
         done = stream;
         set_state(&health, PushState::Waiting);
+        health.send_modify(|h| h.via = None);
     }
     set_state(&health, PushState::Stopped);
 }
 
-fn set_state(health: &watch::Sender<Health>, state: PushState) {
+pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
     health.send_modify(|h| {
         if h.state != state {
             h.state = state;
@@ -217,16 +263,20 @@ pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
     base.mul_f64(jitter)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-async fn connect(t: &Target) -> Result<Stream, PushError> {
+/// Connects to `t`, over `via` when given (else the system's default way).
+pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
-    let tcp = timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port)))
-        .await
-        .map_err(|_| PushError::Slow(host.clone()))?
-        .map_err(|_| PushError::Unreachable(host.clone()))?;
+    let tcp = match (via, t.pin) {
+        (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
+        (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
+        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
+    }
+    .map_err(|_| PushError::Slow(host.clone()))?
+    .map_err(|_| PushError::Unreachable(host.clone()))?;
     let _ = tcp.set_nodelay(true);
     if !t.tls {
         return Ok(Box::pin(tcp));
@@ -251,8 +301,18 @@ async fn session(
     hub: &Hub,
     health: &watch::Sender<Health>,
     stream: u64,
+    via: Option<&links::Network>,
 ) -> Result<Ended, PushError> {
-    let mut p = Publisher::open(&dest.target, &dest.key).await?;
+    let mut p = Publisher::open(&dest.target, &dest.key, via).await?;
+    // Its name asks the system (a quick command): off the async threads.
+    let label = match via {
+        Some(n) => {
+            let name = n.name.clone();
+            Some(tokio::task::spawn_blocking(move || links::label(&name)).await.unwrap_or_else(|_| n.name.clone()))
+        }
+        None => None,
+    };
+    health.send_modify(|h| h.via = label);
 
     // Headers first, then packets from the next keyframe, timestamps from zero.
     let Subscription { live, headers, mut rx } = hub.subscribe();
@@ -271,6 +331,12 @@ async fn session(
     if let Some(a) = headers.audio {
         let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
         p.send(r).await?;
+    }
+    if dest.extra_video {
+        for (_, v) in headers.extra_video {
+            let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
+            p.send(r).await?;
+        }
     }
     if dest.extra_audio {
         for (_, a) in headers.extra_audio {
@@ -299,7 +365,12 @@ async fn session(
                     Frame::Metadata(m) => p.client.publish_metadata(&m),
                     // Codec headers always go through; other packets wait for a real keyframe.
                     Frame::Video { ts, data, key } => {
-                        if !flv::video_is_header(&data) {
+                        let extra = flv::video_extra_track(&data);
+                        if extra.is_some() && !dest.extra_video {
+                            continue;
+                        }
+                        let header = flv::video_is_header(&data) || extra.is_some_and(|(_, h)| h);
+                        if !header {
                             if waiting_for_key && !key {
                                 continue;
                             }
@@ -331,7 +402,10 @@ async fn session(
         if window.0.elapsed() >= HEALTH_EVERY {
             let secs = window.0.elapsed().as_secs_f64();
             let kbps = ((p.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
-            health.send_modify(|h| h.kbps = kbps);
+            health.send_modify(|h| {
+                h.kbps = kbps;
+                h.sent += p.sent - window.1;
+            });
             window = (Instant::now(), p.sent);
         }
     }
@@ -356,9 +430,9 @@ pub(crate) struct Publisher {
 
 impl Publisher {
     /// Connects, shakes hands, connects to the app and asks to publish with `key`.
-    pub(crate) async fn open(t: &Target, key: &str) -> Result<Self, PushError> {
+    pub(crate) async fn open(t: &Target, key: &str, via: Option<&links::Network>) -> Result<Self, PushError> {
         let host = t.host.clone();
-        let mut s = connect(t).await?;
+        let mut s = connect(t, via).await?;
         let rest = timeout(STEP_DEADLINE, conn::handshake(&mut s, PeerType::Client))
             .await
             .map_err(|_| PushError::Slow(host.clone()))?
@@ -479,5 +553,34 @@ impl Publisher {
             }
             *pending = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
         }
+    }
+}
+
+#[cfg(test)]
+mod via_tests {
+    use super::*;
+
+    /// A real server over a chosen connection: FERROCAST_VIA (a connection's name) and
+    /// FERROCAST_RTMP (an rtmp:// address with its key path), e.g. a local MediaMTX.
+    #[tokio::test]
+    #[ignore = "needs an RTMP server and a second connection"]
+    async fn publishes_over_the_connection_asked() {
+        let (Ok(via), Ok(url)) = (std::env::var("FERROCAST_VIA"), std::env::var("FERROCAST_RTMP")) else { return };
+        let net = links::networks().into_iter().find(|n| n.name == via).expect("no such connection");
+        let t = Target::parse(&url).unwrap();
+        let p = Publisher::open(&t, "test", Some(&net)).await.unwrap();
+        drop(p);
+        println!("published over {} ({})", links::label(&net.name), net.ip);
+    }
+
+    #[test]
+    fn only_far_servers_and_network_failures_move() {
+        let t = |u: &str| Target::parse(u).unwrap();
+        assert!(may_move(&t("rtmp://live.twitch.tv/app")));
+        assert!(!may_move(&t("rtmp://127.0.0.1/live")));
+        assert!(!may_move(&t("rtmp://192.168.1.9/live")));
+        assert!(!may_move(&t("rtmp://localhost/live")));
+        assert!(PushError::Unreachable("x".into()).is_network());
+        assert!(!PushError::KeyRefused("x".into()).is_network());
     }
 }

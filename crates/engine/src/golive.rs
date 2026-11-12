@@ -79,6 +79,10 @@ pub struct DestinationConfig {
     /// one: for a platform whose route is slow, or that takes less. The main picture only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// Twitch Enhanced Broadcasting (docs/plan/TWITCH-EB.md): the Studio encodes the qualities
+    /// Twitch asks for and sends them all to Twitch in one stream. Twitch, main picture only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced: bool,
 }
 
 impl DestinationConfig {
@@ -92,7 +96,7 @@ impl DestinationConfig {
 /// forwarder: "srt", "rist" or "whip".
 pub fn direct_kind(url: &str) -> Option<&'static str> {
     let u = url.trim().to_ascii_lowercase();
-    if u.starts_with("srt://") {
+    if u.starts_with("srt://") || u.starts_with("srtla://") {
         Some("srt")
     } else if u.starts_with("rist://") {
         Some("rist")
@@ -143,6 +147,10 @@ pub struct GoLiveConfig {
     /// Advanced mode's settings (A2.5): defaults that work for most people.
     #[serde(default)]
     pub advanced: Advanced,
+    /// Auto quality: the Studio's stream lowers its bitrate when it can't get out, and goes
+    /// back up when it can. On unless the streamer turns it off.
+    #[serde(default = "on")]
+    pub auto_quality: bool,
 }
 
 /// Go live's Advanced settings (board items 2B and 3).
@@ -178,13 +186,25 @@ pub struct DestAdvanced {
     pub server: Option<String>,
     pub first_retry_s: u32,
     pub max_retry_s: u32,
+    /// Another destination that sends instead while this one can't (an SRT server's RTMP
+    /// twin): it waits on standby, starts after `BACKUP_AFTER` of failing, and stops once this
+    /// one is back for as long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
+    /// A WebRTC (WHIP) server: the Studio's lighter stream goes beside the full one as a second
+    /// layer (simulcast), for a server that gives each viewer the one that fits.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub simulcast: bool,
 }
 
 impl Default for DestAdvanced {
     fn default() -> Self {
-        Self { server: None, first_retry_s: 1, max_retry_s: 30 }
+        Self { server: None, first_retry_s: 1, max_retry_s: 30, backup: None, simulcast: false }
     }
 }
+
+/// How long a destination fails before its backup sends, and is back before the backup stops.
+const BACKUP_AFTER: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 impl Advanced {
     /// Messages name the field.
@@ -215,6 +235,27 @@ impl Advanced {
             }
             if a.max_retry_s < a.first_retry_s || a.max_retry_s > 600 {
                 return Err(format!("per.{id}.max_retry_s: at least the first wait, at most 600 seconds."));
+            }
+            if a.simulcast && d.url.as_deref().and_then(direct_kind) != Some("whip") {
+                return Err(format!("per.{id}.simulcast: only a WebRTC (WHIP) server takes simulcast."));
+            }
+            if let Some(b) = &a.backup {
+                let backup = destinations
+                    .iter()
+                    .find(|x| &x.id == b)
+                    .ok_or_else(|| format!("per.{id}.backup: no such destination."))?;
+                if b == id {
+                    return Err(format!("per.{id}.backup: a destination can't back itself up."));
+                }
+                if backup.canvas != d.canvas {
+                    return Err(format!("per.{id}.backup: the backup sends the same picture (main or vertical)."));
+                }
+                if self.per.get(b).is_some_and(|x| x.backup.is_some()) {
+                    return Err(format!("per.{id}.backup: that one has a backup of its own; pick another."));
+                }
+                if self.per.iter().any(|(other, x)| other != id && x.backup.as_ref() == Some(b)) {
+                    return Err(format!("per.{id}.backup: that one already backs up another destination."));
+                }
             }
         }
         Ok(())
@@ -266,6 +307,7 @@ impl Default for GoLiveConfig {
             enabled: false,
             canvas: Canvas::Main,
             light: false,
+            enhanced: false,
         };
         Self {
             destinations: vec![
@@ -279,6 +321,7 @@ impl Default for GoLiveConfig {
             vertical_source: VerticalSource::Canvas,
             cut: CutConfig::default(),
             advanced: Advanced::default(),
+            auto_quality: true,
         }
     }
 }
@@ -326,6 +369,8 @@ pub struct GoLiveView {
     pub cut: CutView,
     /// Advanced mode's settings (A2.5).
     pub advanced: Advanced,
+    /// Auto quality is on.
+    pub auto_quality: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -421,6 +466,19 @@ pub struct DestinationView {
     /// Takes the Studio's lighter stream (left out when not).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub light: bool,
+    /// Twitch Enhanced Broadcasting is on for it (left out when not).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enhanced: bool,
+    /// On the lighter stream for now: its route fell behind while the others kept up. It tries
+    /// the full stream again by itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lighter_for_route: bool,
+    /// A backup sending now, instead of this destination (its name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_for: Option<String>,
+    /// A backup on standby: it sends only while this destination (its name) can't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby_for: Option<String>,
 }
 
 /// Go live's runtime state, one per engine.
@@ -454,6 +512,24 @@ pub(crate) struct GoLive {
     ingest_task: Mutex<Option<(watch::Sender<bool>, tokio::task::JoinHandle<()>)>>,
     /// Fetching ffmpeg: progress or why it failed (`None`: not fetching).
     ffmpeg_fetch: Mutex<Option<crate::ffmpeg_get::FfmpegState>>,
+    /// Backups: since when each destination with one has been failing (or back), and those
+    /// failing long enough that their backup sends.
+    backup: Mutex<BackupState>,
+    /// Quality per destination: the ones moved to the lighter stream because their own route
+    /// couldn't keep up while the others could.
+    quality: Mutex<ferrocast_golive::quality::Quality>,
+    /// Pre-flight's last Test connection per destination, and when.
+    tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
+    /// Twitch Enhanced Broadcasting's plan for the stream on now (None: a normal stream).
+    pub(crate) enhanced: Mutex<Option<ferrocast_golive::twitch_eb::Plan>>,
+}
+
+#[derive(Debug, Default)]
+struct BackupState {
+    /// When a destination with a backup last changed between sending and not.
+    since: HashMap<String, (bool, std::time::Instant)>,
+    /// Destinations whose backup is sending for them.
+    failing: std::collections::HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -483,6 +559,10 @@ impl Default for GoLive {
             data_dir: Mutex::new(None),
             ingest_task: Mutex::new(None),
             ffmpeg_fetch: Mutex::new(None),
+            backup: Mutex::new(BackupState::default()),
+            quality: Mutex::new(Default::default()),
+            tested: Mutex::new(HashMap::new()),
+            enhanced: Mutex::new(None),
         }
     }
 }
@@ -493,6 +573,17 @@ struct Running {
     health: watch::Receiver<Health>,
     /// Sending the lighter stream (it moves when that starts or stops).
     light: bool,
+}
+
+/// Twitch Enhanced Broadcasting's plan for the Studio stream on now (None: none).
+pub(crate) fn lock_enhanced(e: &Engine) -> std::sync::MutexGuard<'_, Option<ferrocast_golive::twitch_eb::Plan>> {
+    lock(&e.golive().enhanced)
+}
+
+/// The destination `id` backs up, if any.
+fn backs_up<'a>(cfg: &'a GoLiveConfig, id: &str) -> Option<&'a DestinationConfig> {
+    let (primary, _) = cfg.advanced.per.iter().find(|(_, a)| a.backup.as_deref() == Some(id))?;
+    cfg.destinations.iter().find(|d| &d.id == primary)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -739,7 +830,23 @@ impl Engine {
     /// Whether a destination takes the lighter stream now: it wants it and the Studio sends it.
     /// Until then (or streaming from OBS, which has no lighter copy) it takes the full one.
     fn on_light(&self, d: &DestinationConfig) -> bool {
-        d.wants_light() && self.golive().lhub.live().borrow().on
+        self.wants_light_now(d) && self.golive().lhub.live().borrow().on
+    }
+
+    /// Takes the lighter stream: set so, or moved there for a slow route (RTMP only: SRT,
+    /// RIST and WebRTC go from the Studio's own stream).
+    pub(crate) fn wants_light_now(&self, d: &DestinationConfig) -> bool {
+        d.wants_light()
+            || (d.canvas == Canvas::Main
+                && d.url.as_deref().and_then(direct_kind).is_none()
+                && lock(&self.golive().quality).is_light(&d.id))
+    }
+
+    /// A WebRTC server set to simulcast (the lighter stream as its second layer).
+    pub(crate) fn simulcast(&self, d: &DestinationConfig) -> bool {
+        d.canvas == Canvas::Main
+            && d.url.as_deref().and_then(direct_kind) == Some("whip")
+            && self.golive_config().advanced.per.get(&d.id).is_some_and(|a| a.simulcast)
     }
 
     /// The stream a destination takes: the lighter one, the vertical one or the main one.
@@ -776,6 +883,7 @@ impl Engine {
         let paused = lock(&g.paused);
         let blocked = lock(&g.blocked);
         let st = self.state();
+        let failing = lock(&g.backup).failing.clone();
         let destinations = cfg
             .destinations
             .iter()
@@ -813,6 +921,10 @@ impl Engine {
                     },
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
+                    enhanced: d.enhanced,
+                    lighter_for_route: !d.wants_light() && self.on_light(d),
+                    backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
+                    standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                 }
             })
             .collect();
@@ -828,6 +940,7 @@ impl Engine {
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
             advanced: cfg.advanced.clone(),
+            auto_quality: cfg.auto_quality,
             cut: CutView {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
@@ -992,6 +1105,26 @@ impl Engine {
         )
     }
 
+    /// Auto quality on or off.
+    pub async fn set_golive_auto_quality(&self, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        cfg.auto_quality = on;
+        self.save_golive(cfg.clone()).await?;
+        if !on {
+            self.auto_quality_off().await;
+        }
+        Ok(cfg)
+    }
+
+    /// Trouble getting the stream out: packets the platforms' senders skipped (all told) and
+    /// whether upload protection has one paused.
+    pub(crate) fn golive_trouble(&self) -> (u64, bool) {
+        let g = self.golive();
+        let dropped = lock(&g.running).values().map(|r| r.health.borrow().dropped).sum();
+        (dropped, !lock(&g.paused).is_empty())
+    }
+
     /// "I use it on purpose": hides the Aitum Multistream setup note.
     pub async fn set_golive_aitum_ok(&self, ok: bool) -> Result<GoLiveConfig, EngineError> {
         let _one_at_a_time = self.config_lock().await;
@@ -1083,6 +1216,90 @@ impl Engine {
         Ok(cfg)
     }
 
+    /// Twitch Enhanced Broadcasting for the Studio stream about to start (`out` its size,
+    /// `fps`): Twitch's plan is fetched and kept for Twitch's destination → the other
+    /// qualities for the Studio to encode (width, height, kbps), and a note in words when it
+    /// was wanted but can't be (the stream then goes out as usual).
+    pub(crate) async fn enhanced_tracks(
+        &self,
+        out: (u32, u32),
+        fps: u32,
+        vod: bool,
+    ) -> (Vec<(u32, u32, u32)>, Option<String>) {
+        use ferrocast_golive::twitch_eb;
+        *lock(&self.golive().enhanced) = None;
+        let wanted = self
+            .golive_config()
+            .destinations
+            .iter()
+            .any(|d| d.enabled && d.enhanced && d.kind == Service::Twitch && d.canvas == Canvas::Main);
+        if !wanted {
+            return (Vec::new(), None);
+        }
+        let off = |why: String| (Vec::new(), Some(format!("Enhanced Broadcasting is off for this stream: {why}")));
+        let Some(c) = platform_of(Service::Twitch).and_then(|p| self.connector(p)) else {
+            return off("connect Twitch in Settings, Accounts.".into());
+        };
+        let key = match c.ingest().await {
+            Ok(i) => i.key,
+            Err(e) => return off(format!("Twitch's stream key couldn't be read ({e}).")),
+        };
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let ask = twitch_eb::Ask {
+            stream_key: key,
+            version: env!("CARGO_PKG_VERSION").into(),
+            codecs: vec!["h264".into()],
+            width: out.0,
+            height: out.1,
+            canvas_width: out.0,
+            canvas_height: out.1,
+            fps: (fps.max(1), 1),
+            vod_track_audio: vod,
+            max_bitrate_kbps: None,
+            max_tracks: Some(twitch_eb::MAX_TRACKS),
+            audio_rate: 48_000,
+            audio_channels: 2,
+            capabilities: serde_json::json!({
+                "cpu": { "logical_cores": cores, "physical_cores": cores },
+                "system": { "name": std::env::consts::OS, "bits": 64, "arm": cfg!(target_arch = "aarch64") },
+            }),
+        };
+        let client = reqwest::Client::new();
+        match twitch_eb::fetch(&client, &ask).await {
+            Ok(plan) => {
+                // The main picture is track 0; Twitch's smaller ones follow (even sides, a few).
+                let tracks: Vec<(u32, u32, u32)> = plan
+                    .encodes
+                    .iter()
+                    .filter(|e| e.height < out.1 && e.width % 2 == 0 && e.height % 2 == 0)
+                    .map(|e| (e.width, e.height, e.kbps().max(300)))
+                    .take(4)
+                    .collect();
+                tracing::info!(config = %plan.config_id, qualities = tracks.len() + 1, "Twitch Enhanced Broadcasting");
+                let note = plan.warning.clone().map(|w| format!("Twitch says: {w}"));
+                *lock(&self.golive().enhanced) = Some(plan);
+                (tracks, note)
+            }
+            Err(e) => off(format!("{e}.")),
+        }
+    }
+
+    /// Turns Twitch Enhanced Broadcasting on or off for destination `id` (Twitch, main picture).
+    /// It takes effect the next time the Studio starts streaming.
+    pub async fn set_golive_enhanced(&self, id: &str, on: bool) -> Result<GoLiveConfig, EngineError> {
+        let _one_at_a_time = self.config_lock().await;
+        let mut cfg = self.golive_config();
+        let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
+        if on && (d.kind != Service::Twitch || d.canvas != Canvas::Main) {
+            return Err(EngineError::Invalid("enhanced: Twitch's main picture only.".into()));
+        }
+        if d.enhanced != on {
+            d.enhanced = on;
+            self.save_golive(cfg.clone()).await?;
+        }
+        Ok(cfg)
+    }
+
     /// Adds a custom destination: a name, an `rtmp://` or `rtmps://` server, and its key
     /// (kept in the secret store). It starts ticked.
     pub async fn add_golive_destination(
@@ -1106,7 +1323,7 @@ impl Engine {
                     || direct_host(u).is_none_or(|h| h.contains('@'))
                 {
                     return Err(EngineError::Invalid(
-                        "url: a whole address like srt://host:port, rist://host:port or https://host/whip, without a user name.".into(),
+                        "url: a whole address like srt://host:port, srtla://host:port, rist://host:port or https://host/whip, without a user name.".into(),
                     ));
                 }
                 if canvas != Canvas::Main {
@@ -1146,6 +1363,7 @@ impl Engine {
             enabled: true,
             canvas,
             light: false,
+            enhanced: false,
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
@@ -1156,6 +1374,141 @@ impl Engine {
 
     /// Removes a custom destination and its key. The three platforms can't be removed, only
     /// switched off.
+    /// "Test connection" on a destination: tries its server as the stream would (a platform's
+    /// RTMP server; a server of your own with its saved key) and says how it went.
+    pub async fn golive_test(&self, id: &str) -> Result<ferrocast_golive::reach::Reach, EngineError> {
+        let d = self
+            .golive_config()
+            .destinations
+            .into_iter()
+            .find(|d| d.id == id)
+            .ok_or(EngineError::NotFound("destination"))?;
+        if d.kind == Service::Custom {
+            let url = d.url.clone().unwrap_or_default();
+            let key =
+                self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
+            return Ok(ferrocast_golive::reach::reach(&url, &key).await);
+        }
+        // YouTube's vertical stream is made when it's first needed, not for a test (it costs
+        // quota): its server is YouTube's own.
+        if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
+            if self.connector(Platform::Youtube).is_none() {
+                return Ok(ferrocast_golive::reach::Reach {
+                    ok: false,
+                    rtt_ms: None,
+                    message: "Connect YouTube in Settings, Accounts first.".into(),
+                    srt_latency_ms: None,
+                });
+            }
+            return Ok(ferrocast_golive::reach::reach(YOUTUBE_INGEST, "").await);
+        }
+        match self.resolve(&d).await {
+            Ok(dest) => {
+                let t = &dest.target;
+                let url = format!("{}://{}:{}/{}", if t.tls { "rtmps" } else { "rtmp" }, t.host, t.port, t.app);
+                Ok(ferrocast_golive::reach::reach(&url, "").await)
+            }
+            Err(why) => {
+                Ok(ferrocast_golive::reach::Reach { ok: false, rtt_ms: None, message: why, srt_latency_ms: None })
+            }
+        }
+    }
+
+    /// Each running destination (its name) and whether it's sending now, for the live watch.
+    pub(crate) fn golive_sending(&self) -> Vec<(String, bool)> {
+        let cfg = self.golive_config();
+        lock(&self.golive().running)
+            .iter()
+            .filter_map(|(id, r)| {
+                let d = cfg.destinations.iter().find(|d| &d.id == id)?;
+                Some((dest_name(d), r.health.borrow().state == PushState::Live))
+            })
+            .collect()
+    }
+
+    /// This computer's network connections, for RIST's `via=` (two at once).
+    pub fn golive_networks(&self) -> Vec<ferrocast_golive::links::Network> {
+        ferrocast_golive::links::networks()
+    }
+
+    /// Pre-flight's Go live checks: each ticked destination tried (as Test connection; the
+    /// answers kept a minute, so a pre-flight shown again doesn't reach every server again), and
+    /// the last upload check's verdict when it doesn't fit.
+    pub(crate) async fn golive_preflight(&self) -> Vec<ferrocast_core::show::Check> {
+        use ferrocast_core::show::{Check, CheckStatus, Fix};
+        use ferrocast_golive::reach::Reach;
+        let g = self.golive();
+        let cfg = self.golive_config();
+        // Ticked ones, and the backups that may send for them (ticked or not).
+        let ticked: Vec<DestinationConfig> = cfg
+            .destinations
+            .iter()
+            .filter(|d| d.enabled || backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+            .cloned()
+            .collect();
+        let mut checks = Vec::new();
+        let fresh = |at: &std::time::Instant| at.elapsed() < std::time::Duration::from_secs(60);
+        let stale: Vec<DestinationConfig> = {
+            let tested = lock(&g.tested);
+            ticked.iter().filter(|d| !tested.get(&d.id).is_some_and(|(at, _)| fresh(at))).cloned().collect()
+        };
+        let results = futures_util::future::join_all(stale.iter().map(|d| async move {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(8), self.golive_test(&d.id)).await;
+            (d.id.clone(), r)
+        }))
+        .await;
+        for (id, r) in results {
+            // A test that couldn't finish is said too, not left out (nor an older answer kept).
+            let reach = match r {
+                Ok(Ok(reach)) => reach,
+                Ok(Err(e)) => {
+                    Reach { ok: false, rtt_ms: None, message: format!("Couldn't test it: {e}"), srt_latency_ms: None }
+                }
+                Err(_) => Reach {
+                    ok: false,
+                    rtt_ms: None,
+                    message: "Its server took too long to answer.".into(),
+                    srt_latency_ms: None,
+                },
+            };
+            lock(&g.tested).insert(id, (std::time::Instant::now(), reach));
+        }
+        let tested = lock(&g.tested).clone();
+        for d in &ticked {
+            let name = dest_name(d);
+            let Some((_, r)) = tested.get(&d.id).filter(|(at, _)| fresh(at)) else { continue };
+            let (status, detail) =
+                if r.ok { (CheckStatus::Ok, r.message.clone()) } else { (CheckStatus::Fail, r.message.clone()) };
+            let fix = (!r.ok).then(|| Fix { label: "Go live".into(), href: "#/studio/golive".into() });
+            checks.push(Check::new(&format!("dest:{}", d.id), &name, status, detail, fix));
+        }
+        if let Some(u) = lock(&g.upload).clone()
+            && !u.verdict.fits
+            && !ticked.is_empty()
+        {
+            checks.push(Check::new(
+                "upload",
+                "Upload",
+                CheckStatus::Warn,
+                u.verdict.message.clone(),
+                Some(Fix { label: "Test upload".into(), href: "#/studio/golive".into() }),
+            ));
+        }
+        checks
+    }
+
+    /// "Test connection" in the add dialog, before the server is saved.
+    pub async fn golive_test_address(
+        &self,
+        url: &str,
+        key: &str,
+    ) -> Result<ferrocast_golive::reach::Reach, EngineError> {
+        if url.trim().is_empty() || url.len() > 2048 || key.len() > 512 {
+            return Err(EngineError::Invalid("url: an address up to 2048 letters; key: up to 512.".into()));
+        }
+        Ok(ferrocast_golive::reach::reach(url, key).await)
+    }
+
     pub async fn remove_golive_destination(&self, id: &str) -> Result<(), EngineError> {
         let one_at_a_time = self.config_lock().await;
         let mut cfg = self.golive_config();
@@ -1166,8 +1519,14 @@ impl Engine {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
         cfg.destinations.remove(i);
-        // Its Advanced settings go with it, so a saved set never names a missing destination.
+        // Its Advanced settings go with it, so a saved set never names a missing destination
+        // (nor one that backed something up).
         cfg.advanced.per.remove(id);
+        for a in cfg.advanced.per.values_mut() {
+            if a.backup.as_deref() == Some(id) {
+                a.backup = None;
+            }
+        }
         if cfg.advanced.rules.first_to_pause.as_deref() == Some(id) {
             cfg.advanced.rules.first_to_pause = None;
         }
@@ -1179,6 +1538,8 @@ impl Engine {
     }
 
     async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
+        // A changed server (or any change) is tried again rather than trusting an old answer.
+        lock(&self.golive().tested).clear();
         save_setting(self, CONFIG_KEY, &cfg).await?;
         *self.golive().cfg.write().unwrap_or_else(|p| p.into_inner()) = cfg;
         self.send_golive();
@@ -1249,14 +1610,9 @@ impl Engine {
             .try_lock()
             .map_err(|_| EngineError::TooMany("An upload check or OBS change is already running.".into()))?;
         let cfg = self.golive_config();
+        // Nothing ticked still measures the upload (Cloudflare's speed test): Set up for me
+        // asks before any platform is picked, and the verdict says to turn one on.
         let ticked: Vec<DestinationConfig> = cfg.destinations.into_iter().filter(|d| d.enabled).collect();
-        if ticked.is_empty() {
-            return Err(refused(
-                "golive_none",
-                "No platform is ticked.",
-                "Tick at least one platform, then check again.",
-            ));
-        }
         let stats = self.golive().hub.stats();
         // The stream as it is now, else as it was last time, else a 1080p60 plan.
         let last = self.golive().last_kbps.load(std::sync::atomic::Ordering::Relaxed);
@@ -1295,6 +1651,7 @@ impl Engine {
                             key: String::new(),
                             retry: Default::default(),
                             extra_audio: false,
+                            extra_video: false,
                         })
                         .map_err(|e| e.to_string()),
                     None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
@@ -1394,6 +1751,14 @@ impl Engine {
                 (url, key)
             }
         };
+        // Twitch Enhanced Broadcasting: to the address Twitch's plan gave, with every quality.
+        let plan = (d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main)
+            .then(|| lock(&self.golive().enhanced).clone())
+            .flatten();
+        let (url, key, extra_video) = match plan.as_ref().and_then(|p| p.url.rsplit_once('/')) {
+            Some((server, k)) => (server.to_string(), k.to_string(), true),
+            None => (url, key, false),
+        };
         let target = Target::parse(&url).map_err(|e| e.to_string())?;
         Ok(Destination {
             id: d.id.clone(),
@@ -1402,6 +1767,7 @@ impl Engine {
             retry: self.golive_config().advanced.retry(&d.id),
             // Twitch's VOD track: only Twitch knows what to do with an extra audio track.
             extra_audio: d.kind == Service::Twitch,
+            extra_video,
         })
     }
 
@@ -1416,8 +1782,14 @@ impl Engine {
             Canvas::Main => main_on || (d.wants_light() && light_on),
             Canvas::Vertical => vertical_on,
         };
-        let want: Vec<DestinationConfig> =
-            self.golive_config().destinations.into_iter().filter(|d| d.enabled && on(d)).collect();
+        let cfg = self.golive_config();
+        let failing = lock(&g.backup).failing.clone();
+        // A backup sends while the one it backs up fails, and waits otherwise.
+        let sends = |d: &DestinationConfig| match backs_up(&cfg, &d.id) {
+            Some(p) if p.enabled => failing.contains(&p.id),
+            _ => d.enabled,
+        };
+        let want: Vec<DestinationConfig> = cfg.destinations.iter().filter(|d| sends(d) && on(d)).cloned().collect();
         // One whose stream changed (the lighter one started or stopped) starts again on the other.
         for d in &want {
             let moved = lock(&g.running).get(&d.id).is_some_and(|r| r.light != self.on_light(d));
@@ -1436,6 +1808,9 @@ impl Engine {
         lock(&g.paused).retain(|id, _| wanted(id));
         if !main_on && !vertical_on {
             lock(&g.protector).reset();
+            // The next stream starts with every destination given its own chance again.
+            *lock(&g.backup) = BackupState::default();
+            lock(&g.quality).reset();
         }
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
@@ -1568,8 +1943,15 @@ impl Engine {
         match self.resolve(d).await {
             Ok(dest) => {
                 lock(&g.blocked).remove(&d.id);
-                let (health_tx, health) =
-                    watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+                let (health_tx, health) = watch::channel(Health {
+                    state: PushState::Waiting,
+                    kbps: 0,
+                    dropped: 0,
+                    sent: 0,
+                    link: None,
+                    via: None,
+                    since_ms: 0,
+                });
                 let (stop, stop_rx) = watch::channel(false);
                 tokio::spawn(ferrocast_golive::push::run(dest, self.hub_of(d).clone(), health_tx, stop_rx));
                 lock(&g.running).insert(d.id.clone(), Running { stop, health, light: self.on_light(d) });
@@ -1586,8 +1968,13 @@ impl Engine {
     async fn start_direct(&self, d: &DestinationConfig, url: String) {
         let g = self.golive();
         let key = self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
+        let simulcast = self.simulcast(d);
+        if simulcast {
+            // Its second layer, the lighter stream, starts first.
+            self.studio_sync_light().await;
+        }
         let started = match self.studio_host() {
-            Ok(host) => host.direct_start(d.id.clone(), url, key).await.map(|()| host),
+            Ok(host) => host.direct_start(d.id.clone(), url, key, simulcast).await.map(|()| host),
             Err(_) => Err(String::new()),
         };
         let host = match started {
@@ -1606,8 +1993,15 @@ impl Engine {
         };
         lock(&g.blocked).remove(&d.id);
         let now_ms = || u64::try_from(now().0).unwrap_or(0);
-        let (health_tx, health) =
-            watch::channel(Health { state: PushState::Connecting, kbps: 0, dropped: 0, since_ms: now_ms() });
+        let (health_tx, health) = watch::channel(Health {
+            state: PushState::Connecting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: now_ms(),
+        });
         let (stop, mut stop_rx) = watch::channel(false);
         let id = d.id.clone();
         tokio::spawn(async move {
@@ -1633,7 +2027,9 @@ impl Engine {
                     PushState::Reconnecting {
                         attempt: 0,
                         retry_in_ms: 0,
-                        reason: "The server dropped the connection; trying again.".into(),
+                        reason: st["reason"]
+                            .as_str()
+                            .map_or_else(|| "The server dropped the connection; trying again.".into(), String::from),
                     }
                 } else if st["active"].as_bool().unwrap_or(false) {
                     PushState::Live
@@ -1647,6 +2043,7 @@ impl Engine {
                     h.state = state;
                     h.kbps = kbps;
                     h.dropped = st["dropped"].as_u64().unwrap_or(0);
+                    h.link = serde_json::from_value(st["link"].clone()).ok();
                 });
             }
             let _ = host.direct_stop(id).await;
@@ -1707,10 +2104,123 @@ impl Engine {
             state: PushState::Paused { until_ms: now_ms + left, reason },
             kbps: 0,
             dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
             since_ms: now_ms,
         };
         lock(&g.paused).insert(id, health);
         self.send_golive();
+    }
+
+    /// One second of backups while live: a destination that can't send for `BACKUP_AFTER`
+    /// hands over to its backup, and takes back once it's sent for as long.
+    async fn backup_tick(&self) {
+        let g = self.golive();
+        let cfg = self.golive_config();
+        let now = std::time::Instant::now();
+        let mut changed = Vec::new();
+        {
+            let running = lock(&g.running);
+            let blocked = lock(&g.blocked);
+            let mut b = lock(&g.backup);
+            let primaries: Vec<&String> =
+                cfg.advanced.per.iter().filter(|(_, a)| a.backup.is_some()).map(|(id, _)| id).collect();
+            b.since.retain(|id, _| primaries.contains(&id));
+            for id in primaries {
+                let Some(d) = cfg.destinations.iter().find(|d| &d.id == id).filter(|d| d.enabled) else {
+                    if b.failing.remove(id) {
+                        changed.push((id.clone(), false));
+                    }
+                    continue;
+                };
+                let sending = running.get(id).is_some_and(|r| r.health.borrow().state == PushState::Live);
+                // Running or not, one that can't start is failing too.
+                let trying = running.contains_key(id) || blocked.contains_key(id);
+                if !trying {
+                    continue;
+                }
+                let since = match b.since.get(id) {
+                    Some((was, at)) if *was == sending => *at,
+                    _ => {
+                        b.since.insert(id.clone(), (sending, now));
+                        now
+                    }
+                };
+                let long = now.duration_since(since) >= BACKUP_AFTER;
+                let failing = b.failing.contains(id);
+                if !sending && long && !failing {
+                    tracing::info!(dest = %d.id, "Go live: a destination can't send, its backup takes over");
+                    b.failing.insert(id.clone());
+                    changed.push((id.clone(), true));
+                } else if sending && long && failing {
+                    tracing::info!(dest = %d.id, "Go live: a destination is back, its backup stops");
+                    b.failing.remove(id);
+                    changed.push((id.clone(), false));
+                }
+            }
+        }
+        if !changed.is_empty() {
+            self.reconcile().await;
+        }
+    }
+
+    /// One second of quality per destination: one that falls behind alone (others keep up, so
+    /// it's its route, not the upload) takes the lighter stream, and tries the full one again
+    /// later. OBS can only lower every destination at once.
+    async fn quality_tick(&self) {
+        use ferrocast_golive::protect::Sample;
+        use ferrocast_golive::quality::Move;
+        let g = self.golive();
+        // Only the Ferrocast Studio makes a lighter stream (OBS sends one): with none to move
+        // to, nothing moves.
+        let studio = match self.studio_host() {
+            Ok(h) => h.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null()),
+            Err(_) => false,
+        };
+        if !studio {
+            return;
+        }
+        let cfg = self.golive_config();
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        let want_kbps = g.hub.stats().kbps;
+        // RTMP destinations on the main picture's full stream (SRT, RIST and WebRTC go from the
+        // Studio's own stream and can't move).
+        let movable = |id: &str| {
+            cfg.destinations
+                .iter()
+                .any(|d| d.id == id && d.canvas == Canvas::Main && d.url.as_deref().and_then(direct_kind).is_none())
+        };
+        let healths: Vec<(String, Health)> = lock(&g.running)
+            .iter()
+            .filter(|(id, r)| !r.light && movable(id))
+            .map(|(id, r)| (id.clone(), r.health.borrow().clone()))
+            .filter(|(_, h)| h.state == PushState::Live)
+            .collect();
+        let samples: Vec<Sample<'_>> = healths
+            .iter()
+            .map(|(id, h)| Sample {
+                id,
+                kbps: h.kbps,
+                want_kbps,
+                dropped: h.dropped,
+                live_ms: now_ms.saturating_sub(h.since_ms),
+            })
+            .collect();
+        let moves = lock(&g.quality).tick(std::time::Instant::now(), &samples, cfg.advanced.rules.slow_pct);
+        for m in &moves {
+            match m {
+                Move::Lighter(id, wait) => {
+                    tracing::info!(dest = %id, wait_s = wait.as_secs(), "Go live: a slow route takes the lighter stream");
+                }
+                Move::Full(id) => tracing::info!(dest = %id, "Go live: trying the full stream again"),
+            }
+        }
+        if !moves.is_empty() {
+            // The Studio's lighter stream starts (or stops) to match, then each moves.
+            self.studio_sync_light().await;
+            self.reconcile().await;
+        }
     }
 
     /// One second of upload protection while live.
@@ -1722,17 +2232,19 @@ impl Engine {
             return;
         }
         let now_ms = u64::try_from(now().0).unwrap_or(0);
-        let healths: Vec<(String, Health)> =
-            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone())).collect();
+        let healths: Vec<(String, Health, bool)> =
+            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone(), r.light)).collect();
         let canvas_of = |id: &str| cfg.destinations.iter().find(|d| d.id == id).map(|d| d.canvas).unwrap_or_default();
-        let (main_kbps, vertical_kbps) = (g.hub.stats().kbps, g.vhub.stats().kbps);
+        let (main_kbps, vertical_kbps, light_kbps) = (g.hub.stats().kbps, g.vhub.stats().kbps, g.lhub.stats().kbps);
         let samples: Vec<Sample<'_>> = healths
             .iter()
-            .filter(|(_, h)| h.state == PushState::Live)
-            .map(|(id, h)| Sample {
+            .filter(|(_, h, _)| h.state == PushState::Live)
+            .map(|(id, h, light)| Sample {
                 id,
                 kbps: h.kbps,
+                // Measured against the stream it sends: the lighter one is meant to be less.
                 want_kbps: match canvas_of(id) {
+                    Canvas::Main if *light => light_kbps,
                     Canvas::Main => main_kbps,
                     Canvas::Vertical => vertical_kbps,
                 },
@@ -1832,6 +2344,8 @@ pub(crate) async fn run(engine: Engine) {
         if k > 0 {
             g.last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
         }
+        engine.backup_tick().await;
+        engine.quality_tick().await;
         engine.protect_tick().await;
         engine.send_golive();
     }

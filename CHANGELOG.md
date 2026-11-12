@@ -5,6 +5,126 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.2.1
+
+Your own sound plugins, Studio Mode as OBS has it, and groups that work properly.
+
+- **VST sound plugins**: add your EQ, compressor or noise gate to a mic (Add a filter › VST
+  plugin). Each runs on its own, so a plugin that crashes can't take Ferrocast with it. On a
+  Mac for now.
+- **Plugin catalog** (Settings › Plugins): install effects from Ferrocast's signed list in one
+  click. The page is tidier too.
+- **Studio Mode**: change a scene on the left while viewers still see the right, then send it
+  on air with the bar between the two pictures.
+- **Twitch Enhanced Broadcasting**: Go live › Twitch › Enhanced Broadcasting sends Twitch the
+  lower qualities from your PC, so viewers can pick 720p or 480p straight away.
+- **Groups work like OBS's**: put sources in a group and out again without them moving or
+  vanishing, resize a source inside a group, hear it in the mixer, and undo any of it.
+  Duplicate, Center, Fit and Duplicate scene all work on grouped sources.
+- **The Show tab** is one tidy column: what to fix before you go live, how the stream starts,
+  then Breaks, Scene control, Clips and Captions.
+- **Clearer buttons**: muted and "hear it" are solid in the mixer, the remove question is a small
+  card, and the group menu lists your groups as folders.
+- **Screens and cameras**: Add a source shows each screen's picture, and cameras can open at the
+  size and frame rate you pick.
+- **Fixes**: Set up for me works before you've picked a platform; the canvas no longer goes
+  blank when a scene has an empty group; Screenshot works on any source; follows that came in
+  while you were disconnected still show up.
+
+## 3.1.0
+
+Popular OBS plugins, built in, and plugins you can add safely.
+
+- **Instant replay in a scene**: add Instant replay to a scene; each replay you save plays
+  there, the scene goes on air and comes back when the clip ends.
+- **When X, do Y** (Settings › Automations): when someone follows, raids, subs, tips, redeems a
+  reward, types a chat command, or the stream starts or ends, switch scenes, show or hide a
+  source, turn a filter on or off, save the replay, record or say something in chat.
+- **Top layer over every scene**: a scene's menu, "Show over every scene", for a logo or frame.
+- **New sources**: Countdown ("Starting in 4:59"), Sound bars that move with the music, Web
+  text (a number from any web address, like a viewer count), Keys on screen (your keys and
+  mouse buttons while you play), and Copy of a source.
+- **New filters**: Freeze, and Effects: CRT, Pixelate, Vignette, Colour split, Glitch, Wave,
+  Old film and Night vision.
+- **Plugins** (Settings › Plugins): effects, logic that answers events, and panels with
+  buttons. They can't read your files, keys or accounts, and do only what they list when you
+  add them.
+
+## 3.0.6
+
+- Settings are easier to read: each page is a short list, one setting per row with a line
+  saying what it does. Settings that need another one show only once it's on.
+- Selected tabs, scenes and sources are now Ferrocast blue instead of grey.
+- First-time setup is shorter: it ends after connecting your accounts. Pick a look and add the
+  overlay any time in Overlays.
+- A steadier frame rate when your Mac is busy or Ferrocast is in the background.
+- If the browser doesn't open when you sign in, click "Finish in browser" to open it again.
+
+## 3.0.5
+
+- On a Mac, Ferrocast keeps its place in the Dock when it updates. Before, an update could leave
+  your pinned icon behind and open Ferrocast as a second icon.
+- A plan change shows without restarting: Pro given to you, or bought on the website, appears
+  when you come back to the window (and within a few minutes while it's open).
+- Pro given to you for good says it never ends.
+
+## 3.0.4
+
+- Quitting Ferrocast with the Studio running no longer ends in a crash: the Studio now closes
+  first, so the Mac doesn't show a "quit unexpectedly" report and the next start doesn't think
+  Ferrocast stopped by accident.
+
+## 3.0.3
+
+A security update for the database Ferrocast keeps your chat, alerts and settings in: it now uses
+a SQLite with a fix for a memory bug (CVE-2026-119375). Nothing else changes; 3.0.2's new filters
+and settings are all here.
+
+## 3.0.2
+
+Easier source settings and filters, and fixes from your first days with 3.0.
+
+- Screen capture on a Mac is now three buttons: Whole screen, One window or One app. Only the
+  list you need shows, so a window capture no longer shows a Display and an App list that did
+  nothing.
+- Show Cursor works: switched off, the mouse arrow stays out of your stream and recordings.
+- Crop is a box you drag on the source's own picture, with the four edges as numbers underneath.
+  The outline on the canvas now follows the crop.
+- Filters are compact: one line per setting, values in percent, the main settings first and the
+  rest under More. Reset and More sit in each filter's header.
+- Green screen: pick Green, Blue, or click any colour on your picture. Each colour starts at a
+  strength that keeps black, white and greys, and Ferrocast warns you if you push it past that.
+- Recording quality shows how big a minute and an hour of recording will be, what it uses on your
+  computer and when to choose it. Save to shows your real folder.
+- Removing a filter asks with a clear red Remove button.
+
+## 3.0.1
+
+Ferrocast now has its own engine. The Studio no longer uses any part of OBS: Ferrocast draws,
+encodes, streams and records everything itself, so it's lighter on your computer and the download
+is smaller.
+
+- Windows gets its own capture for screens, windows and games, and can take one app's sound on
+  its own. Two-graphics-card laptops draw on the fast card.
+- A new Windows setup that installs without asking for admin.
+- Add a source opens straight away and lists your cameras, screens and windows at once, as tiles
+  or a list. If nothing is plugged in, it says so and what to try.
+- New sources: Application Capture on a Mac, slideshows and video playlists, NDI in and out,
+  shader effects, and screens and cameras on Linux, with a Linux virtual camera.
+- More ways to go live: SRT, RIST, WebRTC (WHIP) and SRTLA, which sends over all your internet
+  connections at once. Test connection checks a server before you go live.
+- Steadier streams:
+  - each destination can have a backup;
+  - a failing stream moves to another connection;
+  - auto quality lowers the bitrate when your upload struggles;
+  - a health score sits in the status bar.
+- While live, Ferrocast warns you when your mic goes silent, a camera goes black or freezes, or
+  a platform stops getting your stream, and the warning stays until it's fixed. It can also switch to BRB by itself when your camera goes black.
+- The privacy guard keeps chosen apps out of a screen capture.
+- Steady loudness, and music that dips under your voice.
+- Moments become YouTube chapters in your video's description.
+- Stats show your busiest sources and name a capture that shows nothing.
+
 ## 2.3.0
 
 - The Studio works without OBS installed, on Mac and now on Windows too: Ferrocast brings OBS's

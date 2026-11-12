@@ -72,7 +72,7 @@ fn zerr(e: impl std::fmt::Display) -> StoreError {
 
 fn table_json(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Value>> {
     let mut st = conn.prepare(&format!("SELECT * FROM {table}"))?;
-    let cols: Vec<String> = st.column_names().iter().map(|c| c.to_string()).collect();
+    let cols: Vec<String> = st.column_names().map(str::to_string).collect();
     let rows = st.query_map([], |r| {
         let mut obj = Map::new();
         for (i, c) in cols.iter().enumerate() {

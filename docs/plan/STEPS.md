@@ -32,14 +32,15 @@ Each step is one focused commit (or a few) and names its test. Tick only when th
 - [x] 3.1 Tauri app: single window → local dashboard, tray menu, global hotkey, single instance — R-56
 - [x] 3.2 Headless mode `ferrocast --headless`
 - [x] 3.3 OBS adapter: connect, supervisor, one-click "Add to OBS" (browser source in current scene) — test against fake OBS
-- [ ] 3.4 Autostart, window state, notifications
+- [x] 3.4 Autostart, window state, notifications (tauri autostart with "Launch at login", window-state plugin restores each window, notifications plugin; checked 11 Nov)
 
 ## P4 Twitch
 - [x] 4.1 Device-code sign-in, keychain storage, proactive refresh, one re-auth banner — R-45, R-22
 - [x] 4.2 EventSub WebSocket session: welcome, keepalive watchdog, reconnect handoff, revocation — R-18, R-21 — test against fake EventSub
 - [x] 4.3 Payload mapping for chat, follow, subs, gifts, cheers, raids, redemptions, moderation, stream — fixtures
 - [x] 4.4 Helix: send chat (rate budget, expiry), ban/timeout, delete, chat settings — R-19, R-20
-- [ ] 4.5 Backfill after a gap (followers, subs) marked `Backfill`
+- [x] 4.5 Backfill after a gap: followers, marked `Backfill` (11 Nov: Twitch follows after an EventSub reconnect, from Helix, `eventsub.rs` `backfilled`)
+- [ ] 4.5b Backfill subs after a gap: not possible yet (Helix lists current subs without when they subscribed; YouTube and Kick have no such list)
 
 ## P5 YouTube
 - [x] 5.1 Sign-in (loopback PKCE), find the active live chat

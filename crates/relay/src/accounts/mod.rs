@@ -87,14 +87,12 @@ impl AccountsConfig {
     }
 }
 
-type Limits = HashMap<(&'static str, String), (i64, u32)>;
-
 /// Accounts' in-memory parts: settings, Google's keys, rate limits.
 #[derive(Debug, Default)]
 pub(crate) struct Runtime {
     pub(crate) cfg: AccountsConfig,
     keys: google::KeyCache,
-    limits: Mutex<Limits>,
+    limits: Mutex<crate::remote::limits::Limits>,
 }
 
 impl Runtime {
@@ -102,23 +100,13 @@ impl Runtime {
         Runtime { cfg, ..Default::default() }
     }
 
-    /// Counts one try against `max` per `window_ms` (fixed windows); `Err(seconds to wait)`.
+    /// Counts one try against `max` per `window_ms`; `Err(seconds to wait)`. A token bucket
+    /// (`remote::limits`): `max` at once, then they come back evenly. Fixed windows reset at
+    /// their edge, so 3 sign-in emails per 15 minutes became 6 within seconds across one (and
+    /// the test of it failed when CI ran it on a quarter hour, 8 Nov 2026).
     pub(crate) fn take(&self, kind: &'static str, key: &str, max: u32, window_ms: i64) -> Result<(), i64> {
-        let now = now_ms();
-        let window = now.div_euclid(window_ms.max(1));
-        let mut m = self.limits.lock().unwrap_or_else(|p| p.into_inner());
-        if m.len() > 20_000 {
-            m.retain(|_, (w, _)| *w >= window - 1);
-        }
-        let e = m.entry((kind, key.to_string())).or_insert((window, 0));
-        if e.0 != window {
-            *e = (window, 0);
-        }
-        if e.1 >= max {
-            return Err(((window + 1) * window_ms - now).div_euclid(1000).max(1));
-        }
-        e.1 += 1;
-        Ok(())
+        let mut l = self.limits.lock().unwrap_or_else(|p| p.into_inner());
+        l.take(kind, key, max, window_ms, now_ms()).map_err(|wait| i64::try_from(wait).unwrap_or(i64::MAX))
     }
 }
 

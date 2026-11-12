@@ -105,6 +105,101 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/v1/guests/invites", post(create_invite))
         .route("/v1/guests/invites/{token}", delete(delete_invite))
         .route("/g/v1/offer", post(offer))
+        .route("/g/v1/ice", post(ice))
+}
+
+/// The STUN server every call gets (the guest's browser learns its own public address).
+const STUN: &str = "stun:stun.cloudflare.com:3478";
+/// How long a guest's TURN credentials last (a long show is covered; they're for this call).
+const TURN_TTL_S: u64 = 4 * 3600;
+
+/// Cloudflare TURN's key, as the relay's `RELAY_TURN_KEY_ID` and `RELAY_TURN_KEY_TOKEN` give it
+/// (Cloudflare dashboard › Realtime › TURN; free tier). None: guests get STUN only, which is
+/// enough unless both sides are behind strict networks.
+fn turn_key() -> Option<(String, String)> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    Some((env("RELAY_TURN_KEY_ID")?, env("RELAY_TURN_KEY_TOKEN")?))
+}
+
+/// Cloudflare's answer as a list of ICE servers: `generate-ice-servers` gives an array,
+/// the older `generate` one object.
+pub(crate) fn ice_servers_of(v: &Value) -> Vec<Value> {
+    match v.get("iceServers") {
+        Some(Value::Array(a)) => a.iter().filter(|s| s.get("urls").is_some()).cloned().collect(),
+        Some(o @ Value::Object(_)) if o.get("urls").is_some() => vec![o.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Short-lived TURN servers for one call from Cloudflare (5 s at most).
+async fn turn_servers(http: &reqwest::Client, id: &str, token: &str) -> Result<Vec<Value>, String> {
+    let base = std::env::var("RELAY_TURN_API_URL").unwrap_or_else(|_| "https://rtc.live.cloudflare.com".into());
+    let url = format!("{}/v1/turn/keys/{id}/credentials/generate-ice-servers", base.trim_end_matches('/'));
+    let res = http
+        .post(url)
+        .bearer_auth(token)
+        .json(&json!({ "ttl": TURN_TTL_S }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+    let v: Value = res.json().await.map_err(|e| e.without_url().to_string())?;
+    let servers = ice_servers_of(&v);
+    if servers.is_empty() { Err("no servers in the answer".into()) } else { Ok(servers) }
+}
+
+/// `POST /g/v1/ice` `{token}` → `{iceServers}` for a guest's browser: STUN, and TURN for this
+/// call when the relay has a TURN key (so two strict networks still connect).
+async fn ice(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    if !on_remote_host(&st, &headers) {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "There's nothing here."));
+    }
+    let now = now_ms();
+    let ip = ip_key(client_ip(peer, &headers));
+    if let Err(wait) = lock(&st.guests.limits).take("guest_ice_ip", &ip, 20, 60_000, now) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "Too many tries from here.")
+            .hint(format!("Try again in {wait} s."))
+            .header(axum::http::header::RETRY_AFTER, wait.to_string()));
+    }
+    let v: Value = serde_json::from_slice(&body).map_err(|_| bad("That wasn't a guest's request."))?;
+    let token =
+        v["token"].as_str().filter(|t| !t.is_empty() && t.len() <= 64).ok_or_else(|| bad("The link is incomplete."))?;
+    let live: bool = st
+        .db
+        .c()
+        .query_row("SELECT 1 FROM guest_invites WHERE hash = ?1 AND expires_at > ?2", params![hash(token), now], |_| {
+            Ok(true)
+        })
+        .optional()
+        .map_err(ApiError::db)?
+        .unwrap_or(false);
+    if !live {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "invite_ended", "This guest link has ended.")
+            .hint("Ask the streamer for a new link."));
+    }
+    // Per link too: a leaked one can't mint TURN credentials from many addresses (CodeRabbit).
+    if let Err(wait) = lock(&st.guests.limits).take("guest_ice_invite", token, 30, 600_000, now) {
+        return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "This link has been tried a lot.")
+            .hint(format!("Try again in {wait} s."))
+            .header(axum::http::header::RETRY_AFTER, wait.to_string()));
+    }
+    let mut servers = vec![json!({ "urls": STUN })];
+    if let Some((id, key)) = turn_key() {
+        match turn_servers(&st.http, &id, &key).await {
+            Ok(mut t) => servers.append(&mut t),
+            // STUN still works for most networks; the key never shows in the log.
+            Err(e) => tracing::warn!(error = %e, "no TURN servers for a guest"),
+        }
+    }
+    Ok(axum::Json(json!({ "iceServers": servers })).into_response())
 }
 
 /// `POST /v1/guests/invites` → `{token, url, expires_at}`.

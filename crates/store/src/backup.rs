@@ -65,14 +65,23 @@ pub fn snapshot(conn: &Connection, dir: &Path, label: &str) -> Result<PathBuf> {
     let path = backups.join(&name);
     let _ = std::fs::remove_file(&tmp);
     conn.execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()]).map_err(|e| StoreError::Backup(e.to_string()))?;
-    rename_patiently(&tmp, &path).map_err(|e| StoreError::Backup(e.to_string()))?;
-    // Which version took it, for "restore previous" after an update. Losing this file only
-    // loses the label, never the backup, so a failure is logged, not returned.
+    // Which version took it, for "restore previous" after an update: written before the backup
+    // shows, so a list never sees it without its version (CI saw that race, 10 Nov). Losing
+    // this file only loses the label, never the backup, so a failure is logged, not returned.
     let meta = Meta { version: env!("CARGO_PKG_VERSION").to_string() };
     let meta_path = path.with_extension("json");
+    // Never over another backup (or its label): two in the same millisecond with one label.
+    if path.exists() || meta_path.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(StoreError::Backup(format!("a backup named {name} is already there; try again")));
+    }
     if let Err(e) = serde_json::to_vec(&meta).map_err(std::io::Error::other).and_then(|b| std::fs::write(&meta_path, b))
     {
         tracing::warn!(error = %e, "couldn't write the backup's version");
+    }
+    if let Err(e) = rename_patiently(&tmp, &path) {
+        let _ = std::fs::remove_file(&meta_path);
+        return Err(StoreError::Backup(e.to_string()));
     }
     rotate(&backups)?;
     Ok(path)

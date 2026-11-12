@@ -105,6 +105,10 @@ ssh "$host" "sudo install -m 644 -o $owner -g $owner /dev/stdin $dir/docker-comp
   printf 'RELAY_REMOTE_ALIASES=%s\n' "$(value RELAY_REMOTE_ALIASES)"
   printf 'RELAY_DASHBOARD_DIR=/dashboard/current\n'
   printf 'RELAY_OVERLAYS_DIR=/overlays/current\n'
+  # Guest cameras through TURN (Cloudflare Realtime › TURN, free tier): set both in
+  # ../secrets/relay.env; empty leaves guests on STUN only.
+  printf 'RELAY_TURN_KEY_ID=%s\n' "$(value RELAY_TURN_KEY_ID)"
+  printf 'RELAY_TURN_KEY_TOKEN=%s\n' "$(value RELAY_TURN_KEY_TOKEN)"
   printf 'KICK_CLIENT_ID=%s\n' "${KICK_CLIENT_ID:-}"
   printf 'KICK_CLIENT_SECRET=%s\n' "${KICK_CLIENT_SECRET:-}"
   printf 'RUST_LOG=info\n'

@@ -20,6 +20,7 @@ pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
 pub(crate) mod game_scenes;
+pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
 pub(crate) mod rig;
@@ -80,6 +81,18 @@ pub(crate) struct Studio {
     pub brb_from: Mutex<Option<String>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
+    /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
+    /// one loop.
+    pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
+    pub live_watching: std::sync::atomic::AtomicBool,
+    /// Cameras black now that put the show on BRB by itself (it comes back when none is).
+    pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
+    /// The stream's health now (None while it isn't live) and its memory.
+    pub live_health: Mutex<(ferrocast_core::health::HealthMeter, Option<ferrocast_core::health::Health>)>,
+    /// Auto quality's state for the stream now.
+    pub auto_quality: Mutex<ferrocast_core::auto_quality::AutoQuality>,
+    /// The scene on air while the Studio streams (a change is a chapter marker).
+    pub scene_now: Mutex<Option<String>>,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
     pub autoreplies: autoreplies::AutoReplies,
     /// Event rules running now (by their place in the list).
