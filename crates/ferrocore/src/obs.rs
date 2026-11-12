@@ -538,7 +538,9 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                     // The display picked (by number), else the first (OBS keeps a display's UUID).
                     let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
                     let display = n("display").or_else(first).unwrap_or(0);
-                    (SourceKind::Screen { display, sound: false, hide: with_own_hide(hide, s), cursor }, false)
+                    // With what the Mac plays (Ferrocast's own sound left out), as OBS's Display
+                    // Capture: switched from Window to Screen it went silent (owner, 12 Nov).
+                    (SourceKind::Screen { display, sound: true, hide: with_own_hide(hide, s), cursor }, true)
                 }
                 // Application Capture: one app's windows (its bundle id) on a display.
                 (2, _) => {
@@ -548,7 +550,8 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                     if app.is_empty() {
                         return Err("an Application Capture with no app picked".into());
                     }
-                    (SourceKind::App { display, app, sound: false, cursor }, false)
+                    // With the app's sound, as OBS's Application Capture.
+                    (SourceKind::App { display, app, sound: true, cursor }, true)
                 }
                 _ => return Err("an unknown screen capture method".into()),
             }
@@ -838,6 +841,10 @@ fn heard(kind: &SourceKind) -> bool {
         SourceKind::Window { .. } | SourceKind::DesktopSound => true,
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         SourceKind::AppSound(_) => true,
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        SourceKind::Screen { sound, .. } => *sound,
+        #[cfg(target_os = "macos")]
+        SourceKind::App { sound, .. } => *sound,
         _ => false,
     }
 }
@@ -1360,8 +1367,22 @@ mod tests {
         );
         assert_eq!(
             kind(json!({ "type": 2, "display": 1, "application": "com.google.Chrome", "show_cursor": false })),
-            Ok(SourceKind::App { display: 1, app: "com.google.Chrome".into(), sound: false, cursor: false })
+            Ok(SourceKind::App { display: 1, app: "com.google.Chrome".into(), sound: true, cursor: false })
         );
+    }
+
+    /// Every method of a Mac screen capture brings its sound, as OBS's: a window its app's,
+    /// an app its own, a screen what the Mac plays (owner, 12 Nov: switched from Window to
+    /// Screen, the source went silent).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_screen_capture_is_heard_whatever_it_shows() {
+        let heard = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.1);
+        assert_eq!(heard(json!({ "type": 1, "window": 7 })), Ok(true));
+        assert_eq!(heard(json!({ "type": 0, "display": 1 })), Ok(true));
+        assert_eq!(heard(json!({ "type": 2, "display": 1, "application": "com.google.Chrome" })), Ok(true));
+        let screen = kind_from("screen_capture", &json!({ "type": 0, "display": 1 }), (1920, 1080), &[]).map(|k| k.0);
+        assert!(matches!(screen, Ok(SourceKind::Screen { sound: true, .. })), "{screen:?}");
     }
 
     #[test]
