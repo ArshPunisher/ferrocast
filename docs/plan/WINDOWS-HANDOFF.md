@@ -327,8 +327,12 @@ How the engine runs a frame (all systems):
   - Unplugging a USB mic mid-recording: the watchdog restarts it.
 - **Remove background / noise removal:** Remove background is RVM via tract, Strong noise is
   DeepFilterNet (release builds with `--features deepfilter`). Check CPU at 1080p30.
-- **Not on Windows yet:** the virtual camera (needs a signed camera driver: owner said no paid
-  signing), so don't promise it.
+- **Virtual camera (12 Nov, built, untested on a real PC):** no driver and no signing needed
+  (the old note here was wrong). `docs/plan/VIRTUAL-CAMERA-WINDOWS.md`: a DirectShow camera
+  registered for the user (no admin), and on Windows 11 the camera for every app after one UAC
+  prompt. CI's `camera` job (windows-smoke.yml) checks it end to end. On the PC: turn it on,
+  pick "Ferrocast Camera" in Zoom, Discord, Chrome, Teams and Windows Camera; then "Camera in
+  every app" and check again (Windows may add "Windows Virtual Camera" to its name). The Store version can't (its registry is the package's own).
 - **Installer / Store:**
   - NSIS installer with branded images.
   - Smart App Control can block a new unsigned build the first time (`WINDOWS-NEXT.md`).

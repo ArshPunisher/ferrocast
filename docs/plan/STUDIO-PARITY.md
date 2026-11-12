@@ -130,7 +130,7 @@ Phase: **P1** = 2.1 preview, **P2** = daily driver (2.2), **P3** = later. ✅ al
   *Better: a backup recording while live, and chapter markers from stream events (raids,
   big tips).*
 - ✅ Replay buffer and "Clip that" (Studio, today through OBS). In the Studio itself too (26 Oct: seconds, size, format, tracks, Save replay, shortcuts).
-- [~] P2 Virtual camera (scene, source or program output): built through OBS's own (26 Oct). Windows: OBS's registered camera. macOS: OBS's camera extension can only be turned on by OBS.app, so it refuses from Ferrocast; our own needs an Apple Developer account (NEEDS-FROM-YOU 4). Remux dialog (done 26 Oct).
+- [~] P2 Virtual camera (scene, source or program output): built through OBS's own (26 Oct). Windows: Ferrocast Camera of its own (12 Nov: DirectShow for the user, Windows 11's for every app; docs/plan/VIRTUAL-CAMERA-WINDOWS.md). macOS: OBS's camera extension can only be turned on by OBS.app, so it refuses from Ferrocast; our own needs an Apple Developer account (NEEDS-FROM-YOU 4). Remux dialog (done 26 Oct).
 
 ### App
 - [x] P1 Profiles and scene collections: new, duplicate, rename, remove, import, export.
