@@ -372,10 +372,15 @@ fn alone_scene(name: &str) -> String {
 
 /// Shows a scene, or a source alone, for a Source Record → the scene to draw and the size: a
 /// scene at `canvas`; a source at its own size (waited for up to 2 s while it starts; `canvas`
-/// if it has none by then), even-sided for the encoder.
+/// if it has none by then), exactly (a recording crops it to even); a group at its box.
 pub(crate) fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Result<(String, u32, u32), StudioError> {
     if engine.scene_names().iter().any(|s| s == name) {
         return Ok((name.to_string(), canvas.0, canvas.1));
+    }
+    // A group is a scene of its own inside the engine, its sources placed in its box: drawn
+    // at the box's size it's the group alone (owner, 12 Nov: a group's screenshot failed).
+    if let Some((w, h)) = engine.group_size(name) {
+        return Ok((name.to_string(), w, h));
     }
     let fail = || StudioError::Failed(format!("Ferrocast's own engine can't show \"{name}\" on its own yet."));
     let started = std::time::Instant::now();
@@ -386,7 +391,9 @@ pub(crate) fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Res
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let (w, h) = size.map_or(canvas, |(w, h)| ((w.max(2) & !1), (h.max(2) & !1)));
+    // Its own pixels exactly (a screenshot of it is 1:1): rounded to even, a 1917-wide window
+    // was scaled a pixel wider and blurred (owner, 12 Nov). A recording crops to even instead.
+    let (w, h) = size.map_or(canvas, |(w, h)| (w.max(1), h.max(1)));
     let (w, h) = if (w, h) == (0, 0) { canvas } else { (w, h) };
     let item = ferrocore::engine::SceneItem::new(
         id,
@@ -591,7 +598,9 @@ impl OwnStream {
         };
         if let Some(name) = solo {
             let (scene, w, h) = show_alone(engine, name, (config.width, config.height))?;
-            (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w, h, None);
+            // The encoders' NV12 wants even sides: an odd last row or column is left out,
+            // the picture never scaled for it.
+            (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w.max(2) & !1, h.max(2) & !1, None);
             let mut seen = shared.seen();
             if !seen.alone.iter().any(|n| n == name) {
                 seen.alone.push(name.to_string());

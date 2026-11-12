@@ -1366,6 +1366,20 @@ impl Engine {
         }
     }
 
+    /// A group's box (its own size, its sources placed inside it), when `name` is a group
+    /// some scene shows and it isn't empty.
+    pub fn group_size(&self, name: &str) -> Option<(u32, u32)> {
+        let st = self.lock();
+        if !st.groups.iter().any(|g| g == name) {
+            return None;
+        }
+        st.scenes
+            .values()
+            .flatten()
+            .find_map(|i| (i.scene.as_deref() == Some(name)).then_some(i.group).flatten())
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
     /// The scenes there are (groups left out).
     pub fn scene_names(&self) -> Vec<String> {
         let st = self.lock();

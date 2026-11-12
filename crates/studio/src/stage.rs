@@ -159,8 +159,24 @@ fn ok_or<T>(v: Option<T>) -> Result<T, StudioError> {
     v.ok_or_else(|| fail("Pick the sources to group first."))
 }
 
-/// A new item as OBS saves one: its own size at the top left, shown.
+/// A new item as OBS saves one: its own size at the top left, shown. Screens, windows and web
+/// pages get bicubic scaling (OBS's default is none, bilinear): their text stays sharp when the
+/// item is made bigger or smaller (Fit to screen is), and it costs nothing at their own size.
 fn new_item(source: &Value, id: i64) -> Value {
+    let sharp = matches!(
+        kind_of(source),
+        "screen_capture"
+            | "display_capture"
+            | "window_capture"
+            | "monitor_capture"
+            | "xshm_input"
+            | "xcomposite_input"
+            | "pipewire-screen-capture-source"
+            | "pipewire-desktop-capture-source"
+            | "pipewire-window-capture-source"
+            | "browser_source"
+            | "ferrocast_web_text"
+    );
     json!({
         "name": name_of(source),
         "source_uuid": source.get("uuid").cloned().unwrap_or(Value::Null),
@@ -175,7 +191,7 @@ fn new_item(source: &Value, id: i64) -> Value {
         "bounds_align": 0,
         "bounds": { "x": 0.0, "y": 0.0 },
         "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0,
-        "scale_filter": "disable",
+        "scale_filter": if sharp { "bicubic" } else { "disable" },
         "blend_method": "default",
         "blend_type": "normal",
         "group_item_backup": false,
@@ -4684,6 +4700,107 @@ mod tests {
         for f in [&first, &second, &saved] {
             assert!(std::fs::metadata(f).is_ok_and(|m| m.len() > 1000), "{} was written", f.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn screens_windows_and_pages_scale_sharply() {
+        // Their text stays sharp when Fit to screen makes them bigger or smaller.
+        for kind in ["screen_capture", "window_capture", "monitor_capture", "browser_source"] {
+            let it = new_item(&json!({ "id": kind, "name": "S" }), 1);
+            assert_eq!(it["scale_filter"], "bicubic", "{kind}");
+        }
+        // The rest as OBS adds them.
+        let it = new_item(&json!({ "id": "color_source_v3", "name": "C" }), 1);
+        assert_eq!(it["scale_filter"], "disable");
+    }
+
+    #[test]
+    fn a_source_of_odd_size_is_screenshot_pixel_for_pixel() {
+        // Owner's OBS comparison, 12 Nov: a 1917-wide window's screenshot came out 1918 wide,
+        // scaled, its text blurred. Odd sides are kept; a recording of it alone crops to even.
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocast-odd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // One-pixel black and white stripes: any scaling greys them.
+        let (w, h) = (401u32, 301u32);
+        let px: Vec<u8> = (0..w * h).flat_map(|i| if i % w % 2 == 0 { [0, 0, 0, 255] } else { [255; 4] }).collect();
+        let file = dir.join("stripes.png");
+        ok(write_png(&file, &px, (w, h)));
+        ok(s.add_source("Main", "image_source", "Stripes", &json!({ "file": file.to_string_lossy() }), false));
+        let mut shot = None;
+        for _ in 0..40 {
+            if let Ok(r) = s.screenshot_pixels("Stripes")
+                && r.1 == (w, h)
+            {
+                shot = Some(r.0);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let shot = shot.unwrap_or_else(|| panic!("a screenshot at its own size, {w}x{h}"));
+        let row = (h / 2 * w) as usize;
+        let worst = (10..w as usize - 10)
+            .map(|x| (i32::from(shot[(row + x) * 4]) - i32::from(shot[(row + x + 1) * 4])).abs())
+            .min()
+            .unwrap_or(0);
+        assert!(worst > 250, "every stripe black or white, none greyed: {worst}");
+        // Recorded on its own: even sides for the encoder, by leaving the last column out.
+        let plan = RecordPlan {
+            folder: dir.clone(),
+            format: "mkv".into(),
+            encode: crate::EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc"),
+            ..RecordPlan::default()
+        };
+        let rec = ok(s.record(&plan, Some("Stripes")));
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert!(rec.last_error().is_none(), "{:?}", rec.last_error());
+        drop(rec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_group_is_screenshot_on_its_own_at_its_box() {
+        // Owner, 12 Nov: a group's Screenshot said the engine "can't show it on its own yet".
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocast-groupshot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (w, h) = (121u32, 81u32);
+        let px: Vec<u8> = (0..w * h).flat_map(|i| if i % w % 2 == 0 { [0, 0, 0, 255] } else { [255; 4] }).collect();
+        let file = dir.join("stripes.png");
+        ok(write_png(&file, &px, (w, h)));
+        let item =
+            ok(s.add_source("Main", "image_source", "Stripes", &json!({ "file": file.to_string_lossy() }), false));
+        // Grouped once the picture has its size, so the group's box is the picture's.
+        for _ in 0..40 {
+            if s.screenshot_pixels("Stripes").is_ok_and(|r| r.1 == (w, h)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        ok(s.group_together("Main", &[item.id], "Pair"));
+        let mut shot = None;
+        for _ in 0..40 {
+            if let Ok(r) = s.screenshot_pixels("Pair") {
+                shot = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (px, size) = shot.unwrap_or_else(|| panic!("a screenshot of the group"));
+        assert_eq!(size, (w, h), "the group's own box");
+        let row = (h / 2 * w) as usize;
+        let worst = (10..w as usize - 10)
+            .map(|x| (i32::from(px[(row + x) * 4]) - i32::from(px[(row + x + 1) * 4])).abs())
+            .min()
+            .unwrap_or(0);
+        assert!(worst > 250, "its sources drawn 1:1 inside it: {worst}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
