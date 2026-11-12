@@ -652,6 +652,25 @@ mod tests {
     }
 
     #[test]
+    fn a_canvas_shown_smaller_is_averaged_not_picked_from() {
+        // Owner, 12 Nov: a 2560 canvas in a ~1100 view looked less clear than OBS's. Shown
+        // 2.3 times smaller, one-pixel stripes must turn an even grey (every canvas pixel
+        // counted), not a moiré of black and white picked by one sample each.
+        let Ok(gpu) = Compositor::new() else { return };
+        let (cw, ch) = (460u32, 260u32);
+        let px: Vec<u8> = (0..cw * ch).flat_map(|i| if i % cw % 2 == 0 { [0, 0, 0, 255] } else { [255; 4] }).collect();
+        let pic = Picture { width: cw, height: ch, rgba: px, premultiplied: true };
+        let scene = Scene { width: cw, height: ch, items: vec![Item::picture(pic, Placement::default())] };
+        let look = PreviewLook { background: [0.0, 0.0, 0.0, 1.0], margin: 0.0, ..Default::default() };
+        let (vw, vh) = (200usize, 113usize);
+        let out =
+            gpu.render_preview(vw as u32, vh as u32, Shown::Scene(&scene), &look).unwrap_or_else(|e| panic!("{e}"));
+        let row: Vec<u8> = (20..vw - 20).map(|x| out[((vh / 2) * vw + x) * 4]).collect();
+        let (lo, hi) = (row.iter().min().copied().unwrap_or(0), row.iter().max().copied().unwrap_or(255));
+        assert!(hi - lo < 40 && (100..=160).contains(&lo), "an even grey, {lo} to {hi}");
+    }
+
+    #[test]
     fn guides_run_from_each_side_to_the_canvas_edge() {
         // A 80x50 box at (40, 20) on a 160x90 canvas: 40 left, 40 right, 20 above, 20 below.
         let corners = [(40.0, 20.0), (120.0, 20.0), (120.0, 70.0), (40.0, 70.0)];
