@@ -776,7 +776,7 @@ pub struct StudioSettings {
     pub record_folder_default: String,
     /// "mp4" or "mov" (both crash-safe).
     pub record_format: String,
-    /// "stream" (same as the stream), "high" (near-lossless), "lossless".
+    /// "stream" (same as the stream), "high" (near-lossless, the default), "lossless".
     pub record_quality: String,
     pub reconnect: bool,
     pub reconnect_every_s: u32,
@@ -879,7 +879,10 @@ impl Default for StudioSettings {
             record_folder: None,
             record_folder_default: String::new(),
             record_format: "mp4".into(),
-            record_quality: "stream".into(),
+            // A recording is a file here, not held to a platform's bitrate cap: constant
+            // quality spends bits where the picture needs them (a 6000 kbps "same as stream"
+            // at 1440p60 was blurry next to OBS, owner 12 Nov).
+            record_quality: "high".into(),
             reconnect: true,
             reconnect_every_s: 2,
             reconnect_tries: 25,
