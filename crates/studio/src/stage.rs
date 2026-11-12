@@ -1302,6 +1302,19 @@ impl Stage {
             [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom].map(|c| c.max(0) as u32),
         );
         if t.bounds != "none" {
+            // A box of another shape than the picture's (a side handle with the preview's
+            // frame lock open) stretches it: Fit, Fill and the rest would keep the picture's
+            // shape inside the new box, so the drag did nothing (owner's recording, 12 Nov).
+            // The picture's shape as Fit keeps it: its own scale counts (libobs's bounds do).
+            let (sx, sy) = (t.scale_x.abs(), t.scale_y.abs());
+            let other_shape = cw > 0 && ch > 0 && h > 0.0 && sx > 0.0 && sy > 0.0 && {
+                let (box_aspect, picture) = (w / h, cw as f32 * sx / (ch as f32 * sy));
+                (box_aspect / picture - 1.0).abs() > 0.005
+            };
+            if other_shape && t.bounds != "stretch" {
+                t.bounds = "stretch".into();
+                t.bounds_alignment = 0;
+            }
             (t.bounds_width, t.bounds_height) = (w, h);
         } else if cw > 0 && ch > 0 {
             (t.scale_x, t.scale_y) = (w / cw as f32 * t.scale_x.signum(), h / ch as f32 * t.scale_y.signum());
@@ -4398,6 +4411,30 @@ mod tests {
         assert_eq!(s.current(), "Three", "the first scene goes on air instead");
         ok(s.remove_scene("Main"));
         assert!(s.remove_scene("Three").is_err(), "one scene is always kept");
+    }
+
+    #[test]
+    fn a_fitted_source_stretches_from_a_side_handle() {
+        // Owner's recording, 12 Nov: with the frame lock open, pulling a side handle of a
+        // source added with Fit only grew or shrank it, its shape kept.
+        let s = stage();
+        let it = ok(s.add_source("Main", "color_source_v3", "Wide", &json!({ "width": 1600, "height": 900 }), true));
+        assert_eq!(ok(s.transform("Main", it.id)).bounds, "fit");
+        // Same shape (a corner, or the lock on): still Fit.
+        ok(s.set_item_box("Main", it.id, 0.0, 0.0, 800.0, 450.0));
+        assert_eq!(ok(s.transform("Main", it.id)).bounds, "fit");
+        // Wider: the picture is that wide, not fitted back into its shape.
+        let wide = ok(s.set_item_box("Main", it.id, 0.0, 0.0, 1200.0, 450.0));
+        assert_eq!(wide.frame, [1200.0, 0.0, 0.0, 450.0, 0.0, 0.0], "stretched to the box");
+        assert_eq!(ok(s.transform("Main", it.id)).bounds, "stretch");
+        // A fitted source scaled twice as wide (CodeRabbit, 12 Nov): its shape is 32:9, so a
+        // 32:9 box keeps it fitted.
+        let wide = ok(s.add_source("Main", "color_source_v3", "Twice", &json!({ "width": 1600, "height": 900 }), true));
+        let mut t = ok(s.transform("Main", wide.id));
+        (t.scale_x, t.scale_y) = (2.0, 1.0);
+        ok(s.set_transform("Main", wide.id, &t));
+        ok(s.set_item_box("Main", wide.id, 0.0, 0.0, 800.0, 225.0));
+        assert_eq!(ok(s.transform("Main", wide.id)).bounds, "fit");
     }
 
     #[test]
