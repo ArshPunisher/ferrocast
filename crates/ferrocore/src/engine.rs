@@ -18,8 +18,8 @@ use crate::source::image::ImageSource;
 use crate::source::text::{TextRenderer, TextStyle};
 use crate::video::{Frame, VideoConfig};
 use crate::{
-    AvError, Blend, Compositor, Content, Effect, Filter, Item, Nv12, Picture, Placement, Scene, Transition,
-    TransitionKind,
+    AvError, Blend, Compositor, Content, Effect, Filter, Item, Nv12, PendingNv12, Picture, Placement, Scene,
+    Transition, TransitionKind,
 };
 
 /// A camera to open: its device, and the size and frame rate to ask it for (its own when
@@ -598,6 +598,8 @@ struct State {
     error: Option<String>,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
+    /// Frames drawn and on their way back from the card, oldest first (`deliver`).
+    in_flight: std::collections::VecDeque<InFlight>,
     /// Cameras just taken out, still running for [`PARK_NS`]: one added again meanwhile (Undo,
     /// a rename, the same camera added back) comes back at once instead of being opened again,
     /// which takes seconds on Windows. What each was, and when it was parked.
@@ -719,6 +721,7 @@ impl Engine {
             stats: Stats::default(),
             error: None,
             previews: HashMap::new(),
+            in_flight: std::collections::VecDeque::new(),
             parked: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1615,6 +1618,9 @@ impl Engine {
         {
             return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
         }
+        // Frames drawn for the old scene go out first: matched by canvas, they'd be dropped
+        // once it names the new one, while their sound still went (review).
+        deliver(&mut st, &self.gpu, true);
         let (.., canvas) = st
             .outputs
             .iter_mut()
@@ -1747,12 +1753,12 @@ impl Engine {
 
     /// A chapter mark in an output's recording here (named, or "Chapter n").
     pub fn chapter_output(&self, id: u64, name: &str) -> Result<(), AvError> {
-        self.with_output(id, |pipe| pipe.chapter(name))
+        self.with_output_flushed(id, |pipe| pipe.chapter(name))
     }
 
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
     pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
-        self.with_output(id, |pipe| {
+        self.with_output_flushed(id, |pipe| {
             pipe.pause(on, now_ns());
             Ok(())
         })
@@ -1760,7 +1766,7 @@ impl Engine {
 
     /// Goes on recording into a new file at `path` from the next frame ("Split recording").
     pub fn split_output(&self, id: u64, path: &std::path::Path) -> Result<(), AvError> {
-        self.with_output(id, |pipe| pipe.split(path))
+        self.with_output_flushed(id, |pipe| pipe.split(path))
     }
 
     /// An output's recording now.
@@ -1771,7 +1777,27 @@ impl Engine {
     }
 
     fn with_output<T>(&self, id: u64, f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>) -> Result<T, AvError> {
+        Self::on_output(&mut self.lock(), id, f)
+    }
+
+    /// As [`Self::with_output`], after the frames still on the card went in: a pause, split or
+    /// chapter lands after every frame drawn before it (a frame delivered after a resume would
+    /// carry a time from before it, and the file's time would go backwards).
+    fn with_output_flushed<T>(
+        &self,
+        id: u64,
+        f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>,
+    ) -> Result<T, AvError> {
         let mut st = self.lock();
+        deliver(&mut st, &self.gpu, true);
+        Self::on_output(&mut st, id, f)
+    }
+
+    fn on_output<T>(
+        st: &mut State,
+        id: u64,
+        f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>,
+    ) -> Result<T, AvError> {
         let (_, pipe, ..) = st
             .outputs
             .iter_mut()
@@ -2796,6 +2822,98 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
     }
 }
 
+/// Frames a canvas waits for at most before the loop waits for the card: two (33 ms at 60
+/// fps), as OBS keeps its staging surfaces.
+pub(crate) const IN_FLIGHT: usize = 2;
+
+/// One frame time's work on its way out: its pictures coming back from the card, its sound, and
+/// the outputs and taps there were then (one started later doesn't get this frame's sound
+/// without its picture).
+struct InFlight {
+    ts: u64,
+    blocks: Vec<crate::mix::Block>,
+    outputs: Vec<u64>,
+    taps: Vec<u64>,
+    drawn: Vec<(Canvas, Result<PendingNv12, String>)>,
+}
+
+/// Hands the frames that came back to their outputs and taps, oldest first: those ready, and
+/// any past [`IN_FLIGHT`] (waiting for the card); every one with `flush`.
+fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
+    let _ = gpu.device.poll(wgpu::PollType::Poll);
+    while let Some(front) = st.in_flight.front() {
+        let ready = front.drawn.iter().all(|(_, f)| f.as_ref().map_or(true, PendingNv12::ready));
+        if !(ready || flush || st.in_flight.len() > IN_FLIGHT) {
+            break;
+        }
+        let Some(e) = st.in_flight.pop_front() else { break };
+        let InFlight { ts, blocks, outputs, taps, drawn } = e;
+        let drawn: Vec<(Canvas, Result<Nv12, String>)> = drawn
+            .into_iter()
+            .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
+            .collect();
+        let mut failed = None;
+        for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
+            if !outputs.contains(id) {
+                continue;
+            }
+            let mut tags = Vec::new();
+            if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
+                match frame {
+                    Ok(f) => {
+                        let w = canvas.width as usize;
+                        match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
+                            Ok(t) => tags = t,
+                            Err(e) => failed = Some(e.to_string()),
+                        }
+                    }
+                    Err(e) => failed = Some(e.clone()),
+                }
+                for (i, &(w, h, _)) in canvas.video_tracks.iter().enumerate() {
+                    let c = canvas.track(w, h);
+                    if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
+                        let s = w as usize;
+                        match pipe.video_track(i, Frame::Nv12 { y: &f.y, y_stride: s, uv: &f.uv, uv_stride: s }, ts) {
+                            Ok(t) => tags.extend(t),
+                            Err(e) => failed = Some(e.to_string()),
+                        }
+                    }
+                }
+            }
+            for b in &blocks {
+                match pipe.audio(&b.tracks[canvas.track], b.ts_ns) {
+                    Ok(t) => tags.extend(t),
+                    Err(e) => failed = Some(e.to_string()),
+                }
+                for (i, t) in canvas.more_tracks.iter().enumerate() {
+                    match pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
+                        Ok(t) => tags.extend(t),
+                        Err(e) => failed = Some(e.to_string()),
+                    }
+                }
+            }
+            if let OutputKind::Stream(send) = kind {
+                for t in tags {
+                    send(t);
+                }
+            }
+        }
+        if failed.is_some() {
+            st.error = failed;
+        }
+        // A tap's picture that failed to draw is left out (the camera repeats its last one); it
+        // doesn't stop the outputs.
+        for (id, canvas, sink) in st.taps.iter_mut() {
+            if !taps.contains(id) {
+                continue;
+            }
+            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas) {
+                sink(f, ts);
+            }
+        }
+    }
+}
+
 /// What a panic said.
 fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
     p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str)).unwrap_or("a fault")
@@ -2980,10 +3098,11 @@ fn frame(
         st.moving = None;
     }
     if !st.outputs.is_empty() || !st.taps.is_empty() {
-        // Each distinct canvas drawn once this frame (if it takes this one), then every output
-        // on it encodes the same pixels, and every tap gets them.
+        // Each distinct canvas drawn once this frame (if it takes this one). The card reads them
+        // back while the next frames are drawn (`deliver`): waiting for it here stalled the loop
+        // whenever a game kept the card busy (owner, 15 Nov: 35 of 60 fps, 46% skipped).
         let index = st.stats.frames;
-        let mut drawn: Vec<(Canvas, Result<Nv12, String>)> = Vec::new();
+        let mut drawn: Vec<(Canvas, Result<PendingNv12, String>)> = Vec::new();
         for canvas in st.outputs.iter().map(|(.., c)| c).chain(st.taps.iter().map(|(_, c, _)| c)) {
             if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
                 continue;
@@ -2999,87 +3118,45 @@ fn frame(
                 }
             };
             let frame = match draw {
-                Draw::Scene(s) => gpu.render_nv12(&s),
-                Draw::Moving(t) => gpu.render_transition_nv12(&t),
+                Draw::Scene(s) => gpu.begin_nv12(&s),
+                Draw::Moving(t) => gpu.begin_transition_nv12(&t),
             };
             drawn.push((canvas.clone(), frame.map_err(|e| e.to_string())));
         }
         // Each extra quality's picture (Twitch Enhanced Broadcasting), drawn once like the rest.
+        let mut extra = Vec::new();
         for (.., canvas) in &st.outputs {
             if !index.is_multiple_of(u64::from(canvas.every)) {
                 continue;
             }
             for &(w, h, _) in &canvas.video_tracks {
                 let c = canvas.track(w, h);
-                if drawn.iter().any(|(d, _)| *d == c) {
+                if drawn.iter().chain(extra.iter()).any(|(d, _)| *d == c) {
                     continue;
                 }
                 let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
                 let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
-                    Draw::Scene(s) => gpu.render_nv12(&scaled(s, w, h, Filter::Bicubic)),
+                    Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, Filter::Bicubic)),
                     Draw::Moving(mut t) => {
                         t.from = scaled(t.from, w, h, Filter::Bicubic);
                         t.to = scaled(t.to, w, h, Filter::Bicubic);
-                        gpu.render_transition_nv12(&t)
+                        gpu.begin_transition_nv12(&t)
                     }
                 };
-                drawn.push((c, frame.map_err(|e| e.to_string())));
+                extra.push((c, frame.map_err(|e| e.to_string())));
             }
         }
-        let mut failed = None;
-        for (_, pipe, kind, canvas) in st.outputs.iter_mut() {
-            let mut tags = Vec::new();
-            if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
-                match frame {
-                    Ok(f) => {
-                        let w = canvas.width as usize;
-                        match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
-                            Ok(t) => tags = t,
-                            Err(e) => failed = Some(e.to_string()),
-                        }
-                    }
-                    Err(e) => failed = Some(e.clone()),
-                }
-                for (i, &(w, h, _)) in canvas.video_tracks.iter().enumerate() {
-                    let c = canvas.track(w, h);
-                    if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
-                        let s = w as usize;
-                        match pipe.video_track(i, Frame::Nv12 { y: &f.y, y_stride: s, uv: &f.uv, uv_stride: s }, ts) {
-                            Ok(t) => tags.extend(t),
-                            Err(e) => failed = Some(e.to_string()),
-                        }
-                    }
-                }
-            }
-            for b in &blocks {
-                match pipe.audio(&b.tracks[canvas.track], b.ts_ns) {
-                    Ok(t) => tags.extend(t),
-                    Err(e) => failed = Some(e.to_string()),
-                }
-                for (i, t) in canvas.more_tracks.iter().enumerate() {
-                    match pipe.audio_extra(i, &b.tracks[*t], b.ts_ns) {
-                        Ok(t) => tags.extend(t),
-                        Err(e) => failed = Some(e.to_string()),
-                    }
-                }
-            }
-            if let OutputKind::Stream(send) = kind {
-                for t in tags {
-                    send(t);
-                }
-            }
-        }
-        if failed.is_some() {
-            st.error = failed;
-        }
-        // A tap's picture that failed to draw is left out (the camera repeats its last one); it
-        // doesn't stop the outputs.
-        for (_, canvas, sink) in st.taps.iter_mut() {
-            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas) {
-                sink(f, ts);
-            }
-        }
+        drawn.extend(extra);
+        let entry = InFlight {
+            ts,
+            blocks,
+            outputs: st.outputs.iter().map(|(id, ..)| *id).collect(),
+            taps: st.taps.iter().map(|(id, ..)| *id).collect(),
+            drawn,
+        };
+        st.in_flight.push_back(entry);
     }
+    deliver(&mut st, gpu, false);
     let ms = started.elapsed().as_secs_f32() * 1000.0;
     st.stats.frames += 1;
     st.stats.frame_ms = ms;
@@ -3823,6 +3900,17 @@ mod tests {
         // The pause left no gap: about 3 s in the first file, not 5.
         assert!((2.6..3.6).contains(&a), "first file {a:.2} s");
         assert!((1.6..2.5).contains(&b), "second file {b:.2} s, from 0");
+        // Frames still on the card at the pause went in before it: the picture's time only goes
+        // forward through the resume (they came after it, with times from before, 17 Nov review).
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=dts_time", "-of", "csv=p=0"])
+            .arg(&one)
+            .output()
+            .unwrap_or_else(|x| panic!("{x}"));
+        let times: Vec<f64> =
+            String::from_utf8_lossy(&probe.stdout).lines().filter_map(|l| l.trim_matches(',').parse().ok()).collect();
+        assert!(times.len() > 60, "{} frames", times.len());
+        assert!(times.windows(2).all(|w| w[1] > w[0]), "the time went back: {times:?}");
     }
 
     #[test]

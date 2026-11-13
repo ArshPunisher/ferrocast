@@ -136,14 +136,44 @@ struct Rig {
     read: [(wgpu::Buffer, u32); 2],
 }
 
+/// How a frame's readback is going: planes mapped so far (two when done) and whether any failed.
+#[derive(Debug, Default)]
+struct Readback {
+    mapped: std::sync::atomic::AtomicU8,
+    failed: AtomicBool,
+}
+
+/// An NV12 frame on its way back from the card ([`Compositor::begin_nv12`]).
+#[derive(Debug)]
+pub struct PendingNv12 {
+    rig: Rig,
+    state: Arc<Readback>,
+    /// Its own work on the card: waiting for it doesn't wait for frames drawn after it.
+    done_at: wgpu::SubmissionIndex,
+}
+
+impl PendingNv12 {
+    /// The card is done and the frame can be taken without waiting (after a `poll`).
+    pub fn ready(&self) -> bool {
+        self.state.failed.load(Ordering::Acquire) || self.state.mapped.load(Ordering::Acquire) >= 2
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.rig.canvas.width, self.rig.canvas.height)
+    }
+}
+
 impl std::fmt::Debug for Rig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Rig({}x{})", self.canvas.width, self.canvas.height)
     }
 }
 
-/// Rigs kept at most (each size an output draws at has its own).
-const RIGS: usize = 6;
+/// Rigs kept at most. Each size an output draws at needs one per frame on the card plus the one
+/// being drawn ([`crate::engine::IN_FLIGHT`] + 1); this covers four sizes (main, two Twitch
+/// Enhanced Broadcasting qualities and a vertical or virtual-camera canvas) without remaking
+/// textures every frame.
+const RIGS: usize = 4 * (crate::engine::IN_FLIGHT + 1) + 2;
 
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
@@ -236,9 +266,9 @@ struct Quad<'a> {
 impl Compositor {
     /// Sends work to the card. Every submit goes through here, so none lands while a window
     /// surface is being configured (see `configure`).
-    pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(&self, work: I) {
+    pub(crate) fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(&self, work: I) -> wgpu::SubmissionIndex {
         let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.queue.submit(work);
+        self.queue.submit(work)
     }
 
     /// Configures a window surface (the preview's). wgpu waits for the card to be idle first
@@ -1692,9 +1722,17 @@ impl Compositor {
         }
     }
 
-    /// Converts a drawn canvas (the rig's) to NV12 and reads it back; the rig is kept for the
-    /// next frame unless the readback failed.
-    fn nv12_out(&self, mut enc: wgpu::CommandEncoder, rig: Rig) -> Result<Nv12, AvError> {
+    /// Converts a drawn canvas (the rig's) to NV12 and reads it back, waiting for the card;
+    /// the rig is kept for the next frame unless the readback failed.
+    fn nv12_out(&self, enc: wgpu::CommandEncoder, rig: Rig) -> Result<Nv12, AvError> {
+        let pending = self.nv12_begin(enc, rig);
+        self.nv12_finish(pending)
+    }
+
+    /// Converts a drawn canvas (the rig's) to NV12 and starts reading it back, without waiting:
+    /// [`Self::nv12_finish`] takes it once [`PendingNv12::ready`] (OBS's staging surfaces: the
+    /// frame loop doesn't stall on the card while a game keeps it busy).
+    fn nv12_begin(&self, mut enc: wgpu::CommandEncoder, rig: Rig) -> PendingNv12 {
         let (w, h) = (rig.canvas.width, rig.canvas.height);
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("nv12"),
@@ -1724,10 +1762,64 @@ impl Compositor {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let mut planes = self.read_planes(
-            enc,
-            &[(&rig.y, w, h, 1, Some(&rig.read[0].0)), (&rig.uv, w / 2, h / 2, 2, Some(&rig.read[1].0))],
-        )?;
+        for ((buf, padded), (plane, pw, ph, bpp)) in
+            rig.read.iter().zip([(&rig.y, w, h, 1u32), (&rig.uv, w / 2, h / 2, 2)])
+        {
+            debug_assert!(*padded >= pw * bpp);
+            enc.copy_texture_to_buffer(
+                plane.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(*padded),
+                        rows_per_image: Some(ph),
+                    },
+                },
+                wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+            );
+        }
+        let done_at = self.submit([enc.finish()]);
+        let state = Arc::new(Readback::default());
+        for (buf, _) in &rig.read {
+            let state = state.clone();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                if r.is_err() {
+                    state.failed.store(true, Ordering::Release);
+                }
+                state.mapped.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        PendingNv12 { rig, state, done_at }
+    }
+
+    /// The NV12 frame `p` read back: at once when [`PendingNv12::ready`], else after waiting for
+    /// the card. Its rig goes back for the next frames.
+    fn nv12_finish(&self, p: PendingNv12) -> Result<Nv12, AvError> {
+        let PendingNv12 { rig, state, done_at } = p;
+        if !(state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) >= 2) {
+            self.device
+                .poll(wgpu::PollType::Wait { submission_index: Some(done_at), timeout: None })
+                .map_err(|e| AvError::Readback(e.to_string()))?;
+        }
+        if state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) < 2 {
+            // Mapped halfway or not at all: this rig is let go (a new one is made).
+            drop(rig);
+            return Err(AvError::Readback("the card couldn't hand the frame back".into()));
+        }
+        let (w, h) = (rig.canvas.width, rig.canvas.height);
+        let mut planes = Vec::with_capacity(2);
+        for ((buf, padded), (row, rows)) in rig.read.iter().zip([(w, h), (w, h / 2)]) {
+            let data = buf.slice(..).get_mapped_range().map_err(|e| AvError::Readback(e.to_string()))?;
+            let mut px = Vec::with_capacity((row * rows) as usize);
+            for y in 0..rows as usize {
+                let start = y * *padded as usize;
+                px.extend_from_slice(&data[start..start + row as usize]);
+            }
+            drop(data);
+            buf.unmap();
+            planes.push(px);
+        }
         let uv = planes.pop().unwrap_or_default();
         let y = planes.pop().unwrap_or_default();
         let mut rigs = self.rigs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1737,6 +1829,40 @@ impl Compositor {
         }
         rigs.push(rig);
         Ok(Nv12 { width: w, height: h, y, uv })
+    }
+
+    /// Draws a scene and starts reading it back as NV12, without waiting for the card.
+    pub fn begin_nv12(&self, scene: &Scene) -> Result<PendingNv12, AvError> {
+        let (w, h) = (scene.width, scene.height);
+        check_size(w, h)?;
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return Err(AvError::BadSize(w, h));
+        }
+        self.validate(&scene.items)?;
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let rig = self.rig(w, h);
+        self.clear(&mut enc, &rig.canvas);
+        self.draw_items(&mut enc, &rig.canvas, &scene.items, &Affine::IDENTITY)?;
+        Ok(self.nv12_begin(enc, rig))
+    }
+
+    /// A transition's frame, the same way.
+    pub fn begin_transition_nv12(&self, tr: &Transition) -> Result<PendingNv12, AvError> {
+        let (w, h) = (tr.from.width, tr.from.height);
+        check_size(w, h)?;
+        if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return Err(AvError::BadSize(w, h));
+        }
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let rig = self.rig(w, h);
+        self.clear(&mut enc, &rig.canvas);
+        self.transition_into(&mut enc, &rig.canvas, tr)?;
+        Ok(self.nv12_begin(enc, rig))
+    }
+
+    /// A frame begun with [`Self::begin_nv12`], read back (waiting for the card if it isn't done).
+    pub fn finish_nv12(&self, p: PendingNv12) -> Result<Nv12, AvError> {
+        self.nv12_finish(p)
     }
 
     /// Sends a picture to its texture through a buffer of ours that stays mapped between frames.

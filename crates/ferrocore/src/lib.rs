@@ -64,8 +64,8 @@ pub mod source;
 mod transform;
 pub mod video;
 
-pub use compose::Compositor;
 pub use compose::bt709_limited;
+pub use compose::{Compositor, PendingNv12};
 pub use transform::{Affine, BOTTOM, Bounds, LEFT, Placement, RIGHT, TOP, cropped, draw_transform, output_scale};
 
 /// Reads a file a collection names, safely: a plain file only (never a device or a pipe, which
