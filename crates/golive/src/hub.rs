@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
-use rml_rtmp::sessions::StreamMetadata;
+pub use rml_rtmp::sessions::StreamMetadata;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
@@ -147,6 +147,20 @@ impl Hub {
         st.stats.fps = m.video_frame_rate;
         st.headers.metadata = Some(m.clone());
         let _ = self.tx.send(Frame::Metadata(m));
+    }
+
+    /// Changes the kept metadata (a stream whose picture changed while live) for destinations
+    /// that join or rejoin from now on. Those already sending aren't sent it again: they get
+    /// the new codec header and a keyframe, as a stream changing resolution sends.
+    pub fn metadata_changed(&self, f: impl FnOnce(&mut StreamMetadata)) {
+        let mut st = self.lock();
+        let Some(old) = st.headers.metadata.as_deref() else { return };
+        let mut m = old.clone();
+        f(&mut m);
+        st.stats.width = m.video_width;
+        st.stats.height = m.video_height;
+        st.stats.fps = m.video_frame_rate;
+        st.headers.metadata = Some(Arc::new(m));
     }
 
     /// An FLV video tag body (a codec header, or a frame) at `ts` milliseconds.

@@ -304,6 +304,51 @@ async fn a_late_destination_gets_the_headers_and_starts_at_a_keyframe() {
     assert_eq!(next(&mut got).await, Got::Video(33, Bytes::from_static(INTER)));
 }
 
+/// The Studio feeds its hub itself (no OBS): its `onMetaData` goes first too, as OBS's does.
+/// Kick hung up every few seconds on a stream without one (15 Nov).
+#[tokio::test]
+async fn a_stream_made_here_sends_its_metadata_before_anything() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.video_frame_rate = Some(60.0);
+    w.hub.metadata(m);
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    assert_eq!(w.hub.stats().width, Some(1920));
+
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, destination(dport, "k"));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    assert_eq!(next(&mut got).await, Got::Meta);
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+}
+
+/// A picture changed while live (Optimize): a platform rejoining after it is told the new size,
+/// not the one the stream began with.
+#[tokio::test]
+async fn metadata_changed_reaches_those_who_join_later() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.audio_sample_rate = Some(48_000);
+    w.hub.metadata(m);
+    w.hub.metadata_changed(|m| {
+        m.video_width = Some(1280);
+        m.video_height = Some(720);
+    });
+    assert_eq!(w.hub.stats().width, Some(1280));
+    let kept = w.hub.subscribe().headers.metadata.unwrap();
+    assert_eq!((kept.video_width, kept.video_height, kept.audio_sample_rate), (Some(1280), Some(720), Some(48_000)));
+}
+
 #[tokio::test]
 async fn the_wrong_stream_key_or_app_is_refused() {
     let w = world().await;

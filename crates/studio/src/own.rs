@@ -615,6 +615,9 @@ impl OwnStream {
         if streaming && !vertical && solo.is_none() {
             out.video_tracks = video_tracks.to_vec();
         }
+        if streaming {
+            hub.metadata(metadata_of(&video, &audio, out.width, out.height, config.fps));
+        }
         let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
         if vertical {
             shared.seen().vertical.push(output);
@@ -851,20 +854,41 @@ impl OwnStream {
     }
 }
 
-/// Go live's sender to the server, when streaming: its runtime, health and stop.
-#[allow(clippy::type_complexity)]
-fn sender(
-    send_to: Option<Send<'_>>,
-    target: Option<Target>,
-    hub: &Arc<Hub>,
-) -> Result<
-    (
-        Option<tokio::runtime::Runtime>,
-        Option<tokio::sync::watch::Receiver<Health>>,
-        Option<tokio::sync::watch::Sender<bool>>,
-    ),
-    String,
-> {
+/// The stream's `onMetaData`, as OBS sends it before any packet: size, frame rate, codecs and
+/// rates. Kick (Amazon IVS) hung up every few seconds on a stream without it (owner, 15 Nov),
+/// where the same platform took OBS's stream through Go live.
+fn metadata_of(
+    video: &VideoConfig,
+    audio: &AudioConfig,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> ferrocast_golive::hub::StreamMetadata {
+    let mut m = ferrocast_golive::hub::StreamMetadata::new();
+    m.video_width = Some(width);
+    m.video_height = Some(height);
+    // FLV's codec ids: 7 is H.264 (AVC); HEVC goes as 12, the id OBS and FFmpeg use.
+    m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
+    m.video_frame_rate = Some(fps as f32);
+    m.video_bitrate_kbps = Some(video.bitrate_kbps);
+    // 10 is AAC.
+    m.audio_codec_id = Some(10);
+    m.audio_bitrate_kbps = Some(audio.bitrate_kbps);
+    m.audio_sample_rate = Some(audio.sample_rate);
+    m.audio_channels = Some(audio.channels);
+    m.audio_is_stereo = Some(audio.channels >= 2);
+    m.encoder = Some(format!("Ferrocast {}", env!("CARGO_PKG_VERSION")));
+    m
+}
+
+/// The sender's runtime, its health and its stop switch (none when nothing is sent).
+type Sender = (
+    Option<tokio::runtime::Runtime>,
+    Option<tokio::sync::watch::Receiver<Health>>,
+    Option<tokio::sync::watch::Sender<bool>>,
+);
+
+fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> Result<Sender, String> {
     let (Some(d), Some(target)) = (send_to, target) else { return Ok((None, None, None)) };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -945,6 +969,21 @@ mod tests {
             own_encoder: true,
             video_tracks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_stream_says_what_it_is_like_obs() {
+        let e = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        let video = video_config(&e, 1920, 1080, 60);
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
+        let m = metadata_of(&video, &audio, 1920, 1080, 60);
+        assert_eq!((m.video_width, m.video_height, m.video_frame_rate), (Some(1920), Some(1080), Some(60.0)));
+        assert_eq!((m.video_codec_id, m.audio_codec_id), (Some(7), Some(10)), "H.264 and AAC");
+        assert_eq!((m.audio_sample_rate, m.audio_channels, m.audio_is_stereo), (Some(48_000), Some(2), Some(true)));
+        assert_eq!(m.video_bitrate_kbps, Some(video.bitrate_kbps));
+        assert!(m.encoder.unwrap().starts_with("Ferrocast "));
+        let hevc = video_config(&EncodeSettings::with_encoder("hevc"), 1920, 1080, 60);
+        assert_eq!(metadata_of(&hevc, &audio, 1920, 1080, 60).video_codec_id, Some(12));
     }
 
     #[test]
