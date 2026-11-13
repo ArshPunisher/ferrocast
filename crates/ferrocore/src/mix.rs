@@ -25,6 +25,9 @@ const MAX_GAP_NS: u64 = 2_000_000_000;
 const MAX_LATENCY_NS: u64 = 1_000_000_000;
 /// Room added over the lateness seen when the mixer waits longer.
 const LATENCY_ROOM_NS: u64 = 20_000_000;
+/// After this long with sound on time, the mixer waits only as long as the latest sound in it
+/// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
+const SHRINK_AFTER_NS: u64 = 20_000_000_000;
 /// A source never holds more than this much sound waiting (a stalled mixer can't grow memory).
 const MAX_QUEUE_SECS: usize = 5;
 /// Input frames the resampler takes at a time.
@@ -111,6 +114,14 @@ impl std::fmt::Debug for Source {
 pub struct Mixer {
     rate: u32,
     latency_ns: u64,
+    /// The wait it started with: it never goes under this.
+    floor_ns: u64,
+    /// The wait the last `mix_until` used: lateness is measured against it, so a burst of late
+    /// pieces asks for the wait once, not once each (15 Nov: 40 ms grew to a second in 2 s).
+    mixed_with_ns: u64,
+    /// The latest any sound came since `window_ns` (ns after its time), and when that began.
+    worst_late_ns: u64,
+    window_ns: Option<u64>,
     sources: BTreeMap<u64, Source>,
     /// The next block's start; set by the first `mix_until`.
     next_ns: Option<u64>,
@@ -181,6 +192,10 @@ impl Mixer {
         Self {
             rate,
             latency_ns,
+            floor_ns: latency_ns,
+            mixed_with_ns: latency_ns,
+            worst_late_ns: 0,
+            window_ns: None,
             sources: BTreeMap::new(),
             next_ns: None,
             taps: Vec::new(),
@@ -294,18 +309,23 @@ impl Mixer {
         // source that's always this late (ScreenCaptureKit hands sound over 20-40 ms after it
         // plays, and the engine takes it once a frame) every piece lost its start, a break
         // several times a second. As libobs does, the mixer waits that much longer from now on
-        // (never less again; at most a second).
-        if let Some(next) = self.next_ns
-            && ts < next
-            && self.latency_ns < MAX_LATENCY_NS
-        {
-            let was = self.latency_ns;
-            self.latency_ns = (was + (next - ts) + LATENCY_ROOM_NS).min(MAX_LATENCY_NS);
-            tracing::info!(
-                from_ms = was / 1_000_000,
-                to_ms = self.latency_ns / 1_000_000,
-                "sound came late: the mixer waits longer for it"
-            );
+        // (at most a second). How late it came is measured from the last mix: the blocks up to
+        // `next` were made `mixed_with_ns` behind the clock.
+        if let Some(next) = self.next_ns {
+            let late = (next + self.mixed_with_ns).saturating_sub(ts);
+            self.worst_late_ns = self.worst_late_ns.max(late);
+            let needed = (late + LATENCY_ROOM_NS).min(MAX_LATENCY_NS);
+            if ts < next && needed > self.latency_ns {
+                let was = self.latency_ns;
+                self.latency_ns = needed;
+                // A calm stretch starts again from here before it may wait less.
+                self.window_ns = None;
+                tracing::info!(
+                    from_ms = was / 1_000_000,
+                    to_ms = self.latency_ns / 1_000_000,
+                    "sound came late: the mixer waits longer for it"
+                );
+            }
         }
         let Some(src) = self.sources.get_mut(&id) else { return };
         // Where this sound would continue what's queued: jitter is smoothed over; a gap ahead
@@ -396,8 +416,10 @@ impl Mixer {
 
     /// Every block that ends `latency` before `now_ns`. The first call starts the clock there.
     pub fn mix_until(&mut self, now_ns: u64) -> Vec<Block> {
+        self.maybe_wait_less(now_ns);
         let until = now_ns.saturating_sub(self.latency_ns);
         let step = block_ns(self.rate);
+        let started = self.next_ns.is_some();
         let mut next = *self.next_ns.get_or_insert(until.saturating_sub(step));
         let mut out = Vec::new();
         while next + step <= until {
@@ -405,8 +427,34 @@ impl Mixer {
             // Exact frame counts, so blocks never drift from the sample clock.
             next += step;
         }
+        // The wait `next` was reached with: only a mix that moved it (or started it) changes
+        // that, else a raised wait would count the next late piece as later still (review).
+        if !started || !out.is_empty() {
+            self.mixed_with_ns = self.latency_ns;
+        }
         self.next_ns = Some(next);
         out
+    }
+
+    /// After a calm stretch, the wait comes down to what the sound in it needed: nothing is lost
+    /// (what's waiting is mixed sooner), and the stream's sound stops lagging after a moment of
+    /// trouble (libobs never comes back down).
+    fn maybe_wait_less(&mut self, now_ns: u64) {
+        let since = *self.window_ns.get_or_insert(now_ns);
+        if now_ns.saturating_sub(since) < SHRINK_AFTER_NS {
+            return;
+        }
+        let target = (self.worst_late_ns + 2 * LATENCY_ROOM_NS + block_ns(self.rate)).max(self.floor_ns);
+        if self.latency_ns > target + LATENCY_ROOM_NS / 2 {
+            tracing::info!(
+                from_ms = self.latency_ns / 1_000_000,
+                to_ms = target / 1_000_000,
+                "sound has come on time: the mixer waits less"
+            );
+            self.latency_ns = target;
+        }
+        self.worst_late_ns = 0;
+        self.window_ns = Some(now_ns);
     }
 
     fn mix_block(&mut self, start: u64) -> Block {
@@ -644,6 +692,88 @@ mod tests {
         let breaks = tone.windows(2).filter(|w| (w[1] - w[0]).abs() > lim).count();
         assert!(tone.len() > rate as usize * 3, "{} frames out", tone.len());
         assert_eq!(breaks, 0, "breaks in the tone; latency now {} ms", m.latency_ns() / 1_000_000);
+    }
+
+    /// A 440 Hz tone in 20 ms pieces, each arriving when `arrives(start, end)` (ns) says, mixed
+    /// once a 30 fps frame for `secs` → the first channel of what came out, and the wait after.
+    fn tone_through(secs: u64, arrives: impl Fn(u64, u64) -> u64) -> (Vec<f32>, Mixer) {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let piece = 960usize;
+        let (mut made, mut out, mut now) = (0usize, Vec::new(), t0);
+        while now < t0 + secs * 1_000_000_000 {
+            now += 1_000_000_000 / 30;
+            loop {
+                let start_ns = t0 + made as u64 * 1_000_000_000 / u64::from(rate);
+                let end_ns = start_ns + piece as u64 * 1_000_000_000 / u64::from(rate);
+                if arrives(start_ns - t0, end_ns) > now {
+                    break;
+                }
+                let pcm: Vec<f32> = (made..made + piece)
+                    .flat_map(|i| {
+                        let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                        [v, v]
+                    })
+                    .collect();
+                m.push(1, &pcm, 2, rate, start_ns);
+                made += piece;
+            }
+            for b in m.mix_until(now) {
+                out.extend(b.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        (out, m)
+    }
+
+    /// Sound held up 300 ms (the strong noise removal falling behind, 15 Nov) and then handed
+    /// over all at once: the mixer waits about that much longer, once. It grew to a second
+    /// before, each late piece adding its lateness on top of the last one's.
+    #[test]
+    fn a_burst_of_late_sound_raises_the_wait_once() {
+        let stall = 3_000_000_000..3_300_000_000u64;
+        let (_, m) = tone_through(5, |start, end| {
+            if stall.contains(&start) { 10_000_000_000 + stall.end + 20_000_000 } else { end + 20_000_000 }
+        });
+        let ms = m.latency_ns() / 1_000_000;
+        assert!((300..=420).contains(&ms), "waits {ms} ms");
+    }
+
+    /// A late piece raises the wait; a mix that then makes nothing (the clock hasn't reached the
+    /// new wait yet) mustn't make the next late piece look later still: the wait stays put.
+    #[test]
+    fn a_mix_that_makes_nothing_doesnt_raise_the_wait_again() {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let piece: Vec<f32> = vec![0.1; 960 * 2];
+        m.push(1, &piece, 2, rate, t0 - 340_000_000);
+        let raised = m.latency_ns();
+        assert!(raised > 300_000_000, "the late piece raised the wait: {raised}");
+        assert!(m.mix_until(t0 + 33_000_000).is_empty(), "nothing to mix yet");
+        m.push(1, &piece, 2, rate, t0 - 320_000_000);
+        assert_eq!(m.latency_ns(), raised, "a piece no later than the first one changes nothing");
+    }
+
+    /// After a calm stretch the wait comes back down to what the sound needs (never under where
+    /// it started), and the tone goes on whole through the change.
+    #[test]
+    fn after_a_calm_stretch_the_wait_comes_back_down() {
+        let stall = 3_000_000_000..3_300_000_000u64;
+        let (out, m) = tone_through(50, |start, end| {
+            if stall.contains(&start) { 10_000_000_000 + stall.end + 20_000_000 } else { end + 20_000_000 }
+        });
+        let ms = m.latency_ns() / 1_000_000;
+        assert!((40..=120).contains(&ms), "waits {ms} ms");
+        // From 5 s on (after the stall's lost start), no break: shrinking loses nothing.
+        let from = 48_000 * 5;
+        let tone = &out[from..out.len() - 4096];
+        let lim = 0.5 * std::f32::consts::TAU * 440.0 / 48_000.0 * 1.5;
+        let breaks = tone.windows(2).filter(|w| (w[1] - w[0]).abs() > lim).count();
+        assert_eq!(breaks, 0);
     }
 
     use super::*;
