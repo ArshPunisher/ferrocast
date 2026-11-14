@@ -107,6 +107,13 @@ struct Held {
     /// The vertical item following a face, and which run of the loop moves it.
     follow: Option<ferrocast_studio::FaceFollow>,
     follow_run: u64,
+    /// Auto quality's share of the set bitrate on the stream now (None: all of it).
+    live_pct: Option<u8>,
+}
+
+/// `kbps` at auto quality's share `pct` (the floor a stream never goes under: 300).
+fn at_pct(kbps: u32, pct: Option<u8>) -> u32 {
+    pct.map_or(kbps, |p| (kbps * u32::from(p.clamp(10, 100)) / 100).max(300))
 }
 
 /// Instant replay in a scene (OBS's Replay Source, built in), on the app's tick: a replay
@@ -330,6 +337,58 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
         } else {
             Default::default()
         },
+    }
+}
+
+/// The canvas to `canvas` (its size or frame rate), the previews made again for it.
+fn apply_canvas(app: &tauri::AppHandle, h: &mut Held, canvas: Canvas) -> Result<(), String> {
+    // Refused while live or recording: nothing is saved then. The previews
+    // must let go of the old engine first: each holds it, so with one still
+    // alive the change was refused as "streaming or recording" when nothing
+    // was. They're dropped here, and made again below either way.
+    let had = (h.preview.is_some(), h.program_view.is_some(), h.vertical.view.is_some());
+    h.preview = None;
+    h.program_view = None;
+    h.vertical.view = None;
+    h.projectors.clear();
+    // They send the old engine's picture: stopped (turned on again by hand).
+    h.ndi = None;
+    h.virtualcam = None;
+    let c = h.collection.as_mut().ok_or(STOPPED)?;
+    let changed = c.set_canvas(canvas);
+    // Made again (at the new size when it changed).
+    if had.0 {
+        let _ = make_preview(app, h);
+    }
+    if had.1 {
+        let _ = make_program_view(app, h);
+    }
+    if had.2 {
+        let _ = make_vertical_view(app, h);
+    }
+    changed.map_err(|e| e.to_string())
+}
+
+/// A frame rate changed while live waited for the stream to end: the canvas takes it once
+/// nothing that draws from it runs (called when a stream, recording or replay buffer stops, and
+/// before a stream starts). The virtual camera and NDI would be stopped by it, so while one is
+/// on it waits longer (the next stream still goes out at the chosen rate, see `stream_start`).
+fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held) {
+    let Some(s) = h.settings.clone() else { return };
+    let want = Canvas { width: s.width, height: s.height, fps: s.fps };
+    if h.collection.as_ref().is_none_or(|c| c.canvas() == want) {
+        return;
+    }
+    let busy = h.stream.as_ref().is_some_and(|st| st.stats().active)
+        || h.record.as_ref().is_some_and(|r| r.0.stats().active)
+        || h.replay.as_ref().is_some_and(|r| r.active())
+        || h.ndi.is_some()
+        || h.virtualcam.is_some();
+    if busy {
+        return;
+    }
+    if let Err(e) = apply_canvas(app, h, want) {
+        tracing::warn!(error = %e, "the frame rate chosen while live couldn't be applied after the stream");
     }
 }
 
@@ -1962,36 +2021,17 @@ impl StudioHost for DesktopStudio {
         let note = self
             .on_main(move |h| {
                 let mut notes: Vec<String> = Vec::new();
+                // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
+                // stream on air at once (owner, 15 Nov: "I have to end and stream again").
+                let live = h.stream.as_ref().is_some_and(|st| st.stats().active);
                 if let Some(c) = h.collection.as_mut() {
                     let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-                    if canvas != c.canvas() {
-                        // Refused while live or recording: nothing is saved then. The previews
-                        // must let go of the old engine first: each holds it, so with one still
-                        // alive the change was refused as "streaming or recording" when nothing
-                        // was. They're dropped here, and made again below either way.
-                        let had = (h.preview.is_some(), h.program_view.is_some(), h.vertical.view.is_some());
-                        h.preview = None;
-                        h.program_view = None;
-                        h.vertical.view = None;
-                        h.projectors.clear();
-                        // They send the old engine's picture: stopped (turned on again by hand).
-                        h.ndi = None;
-                        h.virtualcam = None;
-                        let c = h.collection.as_mut().ok_or(STOPPED)?;
-                        let changed = c.set_canvas(canvas);
-                        // Made again (at the new size when it changed).
-                        if had.0 {
-                            let _ = make_preview(&app, h);
-                        }
-                        if had.1 {
-                            let _ = make_program_view(&app, h);
-                        }
-                        if had.2 {
-                            let _ = make_vertical_view(&app, h);
-                        }
-                        if let Err(e) = changed {
-                            return Err(e.to_string());
-                        }
+                    let now = c.canvas();
+                    // Only the frame rate, while live: the stream takes it below; the canvas
+                    // follows when the stream ends (`apply_waiting_canvas`).
+                    let rate_only = live && (canvas.width, canvas.height) == (now.width, now.height);
+                    if canvas != now && !rate_only {
+                        apply_canvas(&app, h, canvas)?;
                     }
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
@@ -2000,13 +2040,38 @@ impl StudioHost for DesktopStudio {
                     }
                     c.set_true_peak(s.true_peak);
                 }
-                // A new bitrate reaches the stream on air at once; the encoder, its size and the
-                // rest wait for the next start.
-                let was_kbps = h.settings.as_ref().map(|o| o.video_kbps);
+                // The stream on air takes a new encoder, size or frame rate at once, without
+                // stopping; a new bitrate alone just changes the bitrate.
+                let was = h.settings.clone();
+                // What changed besides the bitrate: the encoder, its options, the size, the rate.
+                let shape_changed = was.as_ref().is_some_and(|o| {
+                    let (mut a, mut b) = (encode_of(o), encode_of(&s));
+                    a.video_kbps = 0;
+                    b.video_kbps = 0;
+                    a != b || o.fps != s.fps
+                });
+                // At auto quality's share, as the stream was (a full bitrate here, then the
+                // next step up from 70% would have lowered it).
+                let kbps = at_pct(s.video_kbps, h.live_pct);
+                let reshaped = match h.stream.as_ref() {
+                    Some(st) if live && shape_changed => {
+                        match st.reshape(&EncodeSettings { video_kbps: kbps, ..encode_of(&s) }, s.fps) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                notes.push(format!("{e} The next stream uses the new settings."));
+                                false
+                            }
+                        }
+                    }
+                    _ => false,
+                };
+                let was_kbps = was.as_ref().map(|o| o.video_kbps);
                 if was_kbps.is_some_and(|k| k != s.video_kbps) {
-                    // The vertical picture's stream uses the same bitrate (CodeRabbit).
-                    for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
-                        st.set_video_kbps(s.video_kbps);
+                    // The vertical picture's stream uses the same bitrate (CodeRabbit); the main
+                    // one has it already when it was reshaped.
+                    let main = if reshaped { None } else { h.stream.as_mut() };
+                    for st in [main, h.vstream.as_mut()].into_iter().flatten() {
+                        st.set_video_kbps(kbps);
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
@@ -2091,6 +2156,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn record(&self, on: bool) -> Result<Value, String> {
+        let app = self.app.clone();
         self.on_main(move |h| {
             if !on {
                 // Waits for the file to be finished; MKV, FLV and TS then become MP4 too.
@@ -2112,6 +2178,7 @@ impl StudioHost for DesktopStudio {
                         }
                     }
                 }
+                apply_waiting_canvas(&app, h);
                 return Ok(Value::Null);
             }
             if let Some(r) = h.record.as_ref().filter(|r| r.0.stats().active) {
@@ -2284,9 +2351,11 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn replay(&self, on: bool) -> Result<Value, String> {
+        let app = self.app.clone();
         self.on_main(move |h| {
             if !on {
                 h.replay = None;
+                apply_waiting_canvas(&app, h);
                 return Ok(json!({ "active": false }));
             }
             if h.replay.as_ref().is_some_and(|r| r.active()) {
@@ -2329,9 +2398,12 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn virtual_camera(&self, on: bool, source: Option<String>) -> Result<Value, String> {
+        let app = self.app.clone();
         self.on_main(move |h| {
             h.virtualcam = None;
             if !on {
+                // A frame rate chosen while it ran can be applied now (review).
+                apply_waiting_canvas(&app, h);
                 return Ok(json!({ "active": false }));
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -2393,9 +2465,12 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, String> {
+        let app = self.app.clone();
         self.on_main(move |h| {
             h.ndi = None;
             if !on {
+                // A frame rate chosen while it ran can be applied now (review).
+                apply_waiting_canvas(&app, h);
                 return Ok(json!({ "active": false, "name": null }));
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -2577,7 +2652,8 @@ impl StudioHost for DesktopStudio {
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
         self.on_main(move |h| {
             let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
-            let kbps = (set * u32::from(pct.clamp(10, 100)) / 100).max(300);
+            h.live_pct = (pct < 100).then_some(pct);
+            let kbps = at_pct(set, h.live_pct);
             for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
                 st.set_video_kbps(kbps);
             }
@@ -3026,6 +3102,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+        let app = self.app.clone();
         self.on_main(move |h| {
             h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
@@ -3033,6 +3110,9 @@ impl StudioHost for DesktopStudio {
             }
             // A stopped or failed one goes first: one output at a time.
             h.stream = None;
+            h.live_pct = None;
+            // A frame rate chosen during the last stream, still waiting.
+            apply_waiting_canvas(&app, h);
             let s = h.settings.clone().unwrap_or_default();
             let mut settings = stream_settings(&s);
             settings.video_tracks = tracks;
@@ -3041,6 +3121,13 @@ impl StudioHost for DesktopStudio {
             // the reason (libobs no longer stands in).
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let stream = c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?;
+            // The canvas still at another rate (the virtual camera kept it): the stream goes out
+            // at the chosen one anyway.
+            if c.canvas().fps != s.fps
+                && let Err(e) = stream.reshape(&settings.encode, s.fps)
+            {
+                tracing::warn!(error = %e, fps = s.fps, "the stream went out at the canvas's frame rate");
+            }
             let v = stats_of(&stream);
             h.stream = Some(stream);
             Ok(v)
@@ -3049,10 +3136,12 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stream_stop(&self) -> Result<(), String> {
-        self.on_main(|h| {
+        let app = self.app.clone();
+        self.on_main(move |h| {
             h.vstream = None;
             h.lstream = None;
             h.stream = None;
+            apply_waiting_canvas(&app, h);
         })
         .await
     }

@@ -3530,6 +3530,11 @@ impl StageOutput {
         self.own.set_video_kbps(kbps);
     }
 
+    /// A new encoder, output size and frame rate while live, without stopping (Optimize).
+    pub fn reshape(&self, e: &crate::EncodeSettings, fps: u32) -> Result<(), StudioError> {
+        self.own.reshape(e, fps)
+    }
+
     /// The file a recording writes now (empty for a stream).
     pub fn path(&self) -> &Path {
         self.path.as_deref().unwrap_or(Path::new(""))

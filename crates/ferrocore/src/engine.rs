@@ -1807,9 +1807,70 @@ impl Engine {
     }
 
     /// Stops an output: what's in its encoders is sent and a recording is closed.
+    /// A stream going out changes its picture without stopping: its size (drawn from the same
+    /// canvas, scaled), how often it takes a frame (`every`: 2 is half the engine's rate) and its
+    /// encoder. The clock and the sound go on; the platforms get the new picture's header and a
+    /// keyframe, as from a stream whose resolution changed. Streams only (a file can't change
+    /// halfway).
+    pub fn reshape_output(
+        &self,
+        id: u64,
+        width: u32,
+        height: u32,
+        every: u32,
+        video: VideoConfig,
+    ) -> Result<(), AvError> {
+        if every == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) || width == 0 || height == 0 {
+            return Err(AvError::Source("a stream's picture needs even sides and a rate divisor of 1 or more".into()));
+        }
+        let refuse = |st: &State| -> Result<(), AvError> {
+            let (_, pipe, kind, canvas) =
+                st.outputs.iter().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
+            if !matches!(kind, OutputKind::Stream(_)) {
+                return Err(AvError::Source("only a stream's picture can change while it runs".into()));
+            }
+            // Twitch Enhanced Broadcasting's qualities were handed out for this size and rate;
+            // their encoders would keep the old rate while frames came at the new one.
+            if !canvas.video_tracks.is_empty() || pipe.video_tracks() > 0 {
+                return Err(AvError::Source(
+                    "a stream sending several qualities (Twitch Enhanced Broadcasting) can't change its picture while live"
+                        .into(),
+                ));
+            }
+            Ok(())
+        };
+        refuse(&self.lock())?;
+        // Opened before taking the engine's lock: drawing, previews and recordings go on meanwhile.
+        let next = crate::video::VideoEncoder::new(video)?;
+        let mut st = self.lock();
+        refuse(&st)?;
+        // Frames drawn at the old size go out first.
+        deliver(&mut st, &self.gpu, true);
+        let config = self.config;
+        let (_, pipe, kind, canvas) =
+            st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
+        let tags = pipe.set_video(next)?;
+        if let OutputKind::Stream(send) = kind {
+            for t in tags {
+                send(t);
+            }
+        }
+        // Drawn at what it was drawn from (the canvas, or its own scene's size), then scaled.
+        let from = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
+        let from = if canvas.scene.is_none() { (config.width, config.height) } else { from };
+        canvas.scaled_from = ((width, height) != from).then_some((from.0, from.1, Filter::Bicubic));
+        canvas.width = width;
+        canvas.height = height;
+        canvas.every = every;
+        tracing::info!(width, height, every, kbps = video.bitrate_kbps, "a stream's picture changed while live");
+        Ok(())
+    }
+
     pub fn stop_output(&self, id: u64) -> Result<(), AvError> {
         let taken = {
             let mut st = self.lock();
+            // Its last frames still on the card go into it first.
+            deliver(&mut st, &self.gpu, true);
             st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at))
         };
         if let Some((_, pipe, mut kind, _)) = taken {
@@ -3237,6 +3298,103 @@ mod tests {
         let share = missed as f64 * 100.0 / (drawn + missed).max(1) as f64;
         eprintln!("pacing over {secs} s at 60 fps: {drawn} drawn, {missed} missed ({share:.2}%)");
         assert!(share < 1.0, "{missed} of {} frame times missed", drawn + missed);
+    }
+
+    /// Frames are read back from the card while the next ones are drawn: a stopped output still
+    /// gets the ones on their way (a recording keeps its last frames), its pictures come in
+    /// time order, and sound keeps flowing with them.
+    #[test]
+    fn frames_still_on_the_card_reach_an_output_that_stops() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let tags: Arc<Mutex<Vec<(bool, u32)>>> = Arc::default();
+        let sink = {
+            let tags = tags.clone();
+            move |t: Tag| {
+                let v = match t {
+                    Tag::Video { ms, .. } => (true, ms),
+                    Tag::Audio { ms, .. } => (false, ms),
+                };
+                tags.lock().unwrap_or_else(|p| p.into_inner()).push(v);
+            }
+        };
+        let out = e.start_output(OutputKind::Stream(Box::new(sink))).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1500));
+        let drawn_before_stop = e.stats().frames;
+        e.stop_output(out).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.lock().in_flight.is_empty(), "nothing left on the way");
+        let tags = tags.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let video: Vec<u32> = tags.iter().filter(|(v, _)| *v).map(|(_, ms)| *ms).collect();
+        let audio = tags.iter().filter(|(v, _)| !*v).count();
+        // About 1.5 s at 30 fps; the frames made before the stop all came out (the encoder's
+        // header and a frame or two of its own delay aside).
+        assert!(video.len() >= 40, "{} video tags", video.len());
+        assert!(video.len() as u64 + 3 >= drawn_before_stop.min(45), "{} of {drawn_before_stop}", video.len());
+        assert!(video.windows(2).all(|w| w[0] <= w[1]), "in time order: {video:?}");
+        assert!(audio > 20, "sound came too: {audio}");
+    }
+
+    /// Optimize while live: a stream's picture goes from the canvas at full rate to a smaller
+    /// one at half the rate without stopping. A new header comes where the stream is (never
+    /// back at 0), time only goes forward, and frames come half as often after.
+    #[test]
+    fn a_live_stream_changes_its_picture_without_stopping() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        type Tags = Arc<Mutex<Vec<(u32, Vec<u8>)>>>;
+        let tags: Tags = Arc::default();
+        let sink = {
+            let tags = tags.clone();
+            move |t: Tag| {
+                if let Tag::Video { ms, body } = t {
+                    tags.lock().unwrap_or_else(|p| p.into_inner()).push((ms, body));
+                }
+            }
+        };
+        let out = e.start_output(OutputKind::Stream(Box::new(sink))).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        let video = VideoConfig {
+            codec: crate::video::VideoCodec::H264,
+            input: crate::video::PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 15,
+            fps_den: 1,
+            bitrate_kbps: 800,
+            rate: crate::video::RateControl::Cbr,
+            keyframe_secs: 1,
+            software: false,
+        };
+        e.reshape_output(out, 320, 180, 2, video).unwrap_or_else(|x| panic!("{x}"));
+        let switched_at = tags.lock().unwrap_or_else(|p| p.into_inner()).len();
+        std::thread::sleep(Duration::from_millis(1500));
+        e.stop_output(out).unwrap_or_else(|x| panic!("{x}"));
+        let tags = tags.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        // AVC sequence headers: 0x17 then 0x00.
+        let headers: Vec<u32> =
+            tags.iter().filter(|(_, b)| b.get(..2) == Some(&[0x17, 0x00])).map(|(ms, _)| *ms).collect();
+        assert_eq!(headers.len(), 2, "one header at the start, one when the picture changed: {headers:?}");
+        assert!(headers[1] >= 1000, "the second header is where the stream is, not 0: {}", headers[1]);
+        let times: Vec<u32> = tags.iter().map(|(ms, _)| *ms).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "time only goes forward: {times:?}");
+        // After the change: about 15 frames a second, not 30.
+        let after: Vec<u32> =
+            tags[switched_at..].iter().filter(|(_, b)| b.get(1) == Some(&1)).map(|(ms, _)| *ms).collect();
+        let gaps: Vec<u32> = after.windows(2).map(|w| w[1] - w[0]).collect();
+        let typical = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
+        assert!((55..=80).contains(&typical), "a frame about every 66 ms after: {gaps:?}");
+        // A recording refuses.
+        let rec = std::env::temp_dir().join(format!("ferrocast-reshape-{}.mp4", std::process::id()));
+        let r = e.start_output(OutputKind::Record(rec.clone())).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.reshape_output(r, 320, 180, 2, video).is_err());
+        let _ = e.stop_output(r);
+        let _ = std::fs::remove_file(rec);
     }
 
     /// A capture that can't open says so to whoever added it, and isn't kept (macOS and Linux:

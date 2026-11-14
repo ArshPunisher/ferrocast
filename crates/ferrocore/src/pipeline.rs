@@ -350,6 +350,24 @@ impl Pipeline {
         self.video.set_kbps(kbps)
     }
 
+    /// A new picture from the next frame on (size, frame rate, encoder), on a stream that goes
+    /// on: the old encoder's last frames come out first, then the new one's header and a
+    /// keyframe. The clock and the sound carry on, so the platforms see one stream whose picture
+    /// changed (Optimize while live; owner, 15 Nov: "I have to end and stream again"). Streams
+    /// only: a file can't change its picture halfway. `next` is opened by the caller (opening a
+    /// hardware encoder can take a few hundred ms; nothing else should wait on it).
+    pub fn set_video(&mut self, next: VideoEncoder) -> Result<Vec<Tag>, AvError> {
+        if self.recording.is_some() || self.replay.is_some() {
+            return Err(AvError::Encoder("a recording's picture can't change while it records".into()));
+        }
+        let packets = self.video.flush()?;
+        let tags = self.video_out(packets)?;
+        self.video = next;
+        self.sent_video_header = false;
+        self.key_next = true;
+        Ok(tags)
+    }
+
     /// A frame at `ts_ns`. The first one is a keyframe and starts the clock.
     pub fn video(&mut self, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         if self.paused_at.is_some() {
@@ -568,12 +586,14 @@ impl Pipeline {
         let codec = self.video.config().codec;
         let mut tags = Vec::new();
         for p in packets {
+            let (ms, body) = flv::video_tag(codec, &p, 0);
             if !self.sent_video_header {
                 let Some(h) = self.video.header() else { continue };
                 self.sent_video_header = true;
-                tags.push(Tag::Video { ms: 0, body: flv::video_header(codec, &h) });
+                // At its first frame's time: 0 when the stream starts, and where the stream is
+                // when a new picture takes over (`set_video`) so time never goes back.
+                tags.push(Tag::Video { ms, body: flv::video_header(codec, &h) });
             }
-            let (ms, body) = flv::video_tag(codec, &p, 0);
             tags.push(Tag::Video { ms, body });
             self.record_video(&p);
         }

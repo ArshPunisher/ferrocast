@@ -638,6 +638,39 @@ impl OwnStream {
         })
     }
 
+    /// Optimize while live: the stream on air takes `e`'s encoder, bitrate and output size, at
+    /// `fps` (the canvas's rate or a whole fraction of it), without stopping. The vertical
+    /// picture's stream and a source shown alone keep theirs.
+    pub(crate) fn reshape(&self, e: &EncodeSettings, fps: u32) -> Result<(), StudioError> {
+        let fail = |m: &str| StudioError::Failed(m.to_string());
+        let d = self.drawn.as_ref().ok_or_else(|| fail("This stream can't change while it's live."))?;
+        if d.solo.is_some() || d.shared.seen().vertical.contains(&d.output) {
+            return Err(fail("Only the main picture's stream changes while it's live."));
+        }
+        let config = d.shared.engine.config();
+        let fps = fps.clamp(1, config.fps);
+        if !config.fps.is_multiple_of(fps) {
+            return Err(fail("While live, the frame rate can only go to a whole part of the canvas's (60 → 30)."));
+        }
+        let (w, h) = e.scale.map_or((config.width, config.height), |(w, h)| (w.max(2) & !1, h.max(2) & !1));
+        let video = video_config(e, w, h, fps);
+        d.shared
+            .engine
+            .reshape_output(d.output, w, h, config.fps / fps, video)
+            .map_err(|e| StudioError::Failed(format!("The stream couldn't change while live: {e}")))?;
+        // A platform that reconnects from now on is told the new picture, not the old one.
+        if let Some(hub) = &self.hub {
+            hub.metadata_changed(|m| {
+                m.video_width = Some(w);
+                m.video_height = Some(h);
+                m.video_frame_rate = Some(fps as f32);
+                m.video_bitrate_kbps = Some(video.bitrate_kbps);
+                m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
+            });
+        }
+        Ok(())
+    }
+
     /// A new video bitrate while live (the stream doctor's lighter one, a manual change).
     pub(crate) fn set_video_kbps(&self, kbps: u32) {
         match &self.drawn {
