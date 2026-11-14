@@ -29,6 +29,8 @@ struct Fake {
     markers: Mutex<Vec<String>>,
     /// Thumbnails taken: (bytes, mime). Only a YouTube fake takes them.
     thumbs: Mutex<Vec<(usize, String)>>,
+    /// What its category search finds, most watched first (none: "<q> result").
+    categories: Vec<(&'static str, &'static str)>,
 }
 
 impl Fake {
@@ -88,6 +90,13 @@ impl Connector for Fake {
         Ok(())
     }
     async fn search_categories(&self, q: &str) -> ferrocast_connector::Result<Vec<CategoryHit>> {
+        if !self.categories.is_empty() {
+            return Ok(self
+                .categories
+                .iter()
+                .map(|(id, name)| CategoryHit { id: (*id).into(), name: (*name).into(), image_url: None })
+                .collect());
+        }
         Ok(vec![CategoryHit { id: "1".into(), name: format!("{q} result"), image_url: None }])
     }
     async fn create_marker(&self, d: &str) -> ferrocast_connector::Result<()> {
@@ -412,6 +421,76 @@ async fn watch_time_counts_chatters_while_live() {
 }
 
 // ---------------------------------------------------------------- stream info
+
+/// A category typed ("Warzone") goes to each platform as its own ("Call of Duty: Warzone", by
+/// its id); YouTube shows Gaming; the preview says the same before anything is sent. Owner,
+/// 15 Nov: Twitch and Kick refused "Warzone" and YouTube showed Fortnite.
+#[tokio::test]
+async fn a_typed_category_becomes_each_platforms_own() {
+    use ferrocast_core::stream_info::Category;
+    let (e, _d) = engine().await;
+    let found = [("33214", "Warzone 2100"), ("512710", "Call of Duty: Warzone"), ("9", "Warzone Tips")];
+    // Most watched first, as Twitch and Kick list them.
+    let ordered = vec![found[1], found[0], found[2]];
+    let tw = Arc::new(Fake { platform: Some(Platform::Twitch), categories: ordered.clone(), ..Default::default() });
+    let kick = Arc::new(Fake { platform: Some(Platform::Kick), categories: ordered, ..Default::default() });
+    let yt = Fake::new(Platform::Youtube);
+    for c in [tw.clone(), kick.clone(), yt.clone()] {
+        e.register_connector(c);
+    }
+    let shown = e.categories_as("warzone").await.unwrap();
+    let name = |p: Platform| shown.iter().find(|x| x.platform == p).and_then(|x| x.name.clone());
+    assert_eq!(name(Platform::Twitch).as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(name(Platform::Kick).as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(name(Platform::Youtube).as_deref(), Some("Gaming"));
+    assert!(
+        shown
+            .iter()
+            .find(|x| x.platform == Platform::Youtube)
+            .unwrap()
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("YouTube Studio")
+    );
+
+    let info = StreamInfo {
+        title: Some("Death Has a Play Button".into()),
+        category: Some(Category { name: "Warzone".into(), ids: Default::default() }),
+        ..Default::default()
+    };
+    let r = e.apply_stream_info(info, None, None).await.unwrap();
+    assert_eq!(r.failed, 0, "{:?}", r.results);
+    let line = |p: Platform| r.results.iter().find(|x| x.platform == p).unwrap().clone();
+    assert_eq!(line(Platform::Twitch).category.as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(line(Platform::Youtube).category.as_deref(), Some("Gaming"));
+    assert_eq!(tw.infos.lock().unwrap()[0].category.as_ref().unwrap().ids.twitch.as_deref(), Some("512710"));
+    assert_eq!(kick.infos.lock().unwrap()[0].category.as_ref().unwrap().ids.kick.as_deref(), Some("512710"));
+    // Nothing like it: said before sending, and the platform refuses it as before.
+    let none =
+        Arc::new(Fake { platform: Some(Platform::Twitch), categories: vec![("1", "Fortnite")], ..Default::default() });
+    e.register_connector(none);
+    let shown = e.categories_as("Warzone").await.unwrap();
+    let tw_line = shown.iter().find(|x| x.platform == Platform::Twitch).unwrap();
+    assert!(tw_line.name.is_none() && tw_line.note.as_deref().unwrap().contains("no category called"));
+    assert!(matches!(e.categories_as("  ").await, Err(crate::EngineError::Invalid(_))));
+}
+
+#[test]
+fn the_best_category_is_exact_then_most_watched_with_every_word() {
+    use super::stream_info::best_category;
+    let hit = |name: &str| CategoryHit { id: name.into(), name: name.into(), image_url: None };
+    let hits = [hit("Call of Duty: Warzone"), hit("Warzone 2100"), hit("Valorant")];
+    let best = |q: &str| best_category(q, &hits).map(|h| h.name.as_str());
+    assert_eq!(best("warzone"), Some("Call of Duty: Warzone"), "most watched first, not the shortest");
+    assert_eq!(best("WARZONE 2100"), Some("Warzone 2100"), "an exact name wins");
+    assert_eq!(best("call of duty warzone"), Some("Call of Duty: Warzone"), "punctuation aside");
+    assert_eq!(best("valo"), None, "part of a word isn't enough");
+    assert_eq!(best("  "), None);
+    assert_eq!(best("Minecraft"), None);
+    assert_eq!(best("of"), None, "a small word alone picks nothing");
+    assert_eq!(best("the"), None);
+}
 
 #[tokio::test]
 async fn stream_info_reports_each_platform_and_keeps_history() {

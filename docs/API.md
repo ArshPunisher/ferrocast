@@ -766,6 +766,7 @@ type HistoryEntry = { info: StreamInfo; at: number; results: PlatformResult[] }
 | GET | `/api/v1/stream-info` | → `StreamInfoView` |
 | POST | `/api/v1/stream-info/apply` | `{ info, platforms?: Platform[] }` (default: every connected one) → **200** all took it, **207** some did, **422** `stream_info_failed` none did; every answer carries `{ results: PlatformResult[], ok, failed }`. 400 for a bad field or platform, 422 `no_platforms` when nothing is connected |
 | GET | `/api/v1/stream-info/categories?platform=twitch&q=valo` | → `{ platform, items: { id, name, image_url }[] }` (YouTube: its video categories). 400 without `q`, 422 when that platform isn't connected |
+| GET | `/api/v1/stream-info/categories/as?q=warzone` | → `{ items: { platform, name, note }[] }`, one per connected platform: its own name for a category typed rather than picked (its exact name, else its search's first hit holding every word typed: "Warzone" is "Call of Duty: Warzone"); `name` null with a `note` when it has none; YouTube is always "Gaming" with a note (its API can't name a game). Pushing stream info resolves a typed category the same way, and each result carries `category`: what the platform shows now. 400 without `q` |
 | POST | `/api/v1/stream-info/presets` | `{ name, info }` → 201 `Preset`; 409 name taken |
 | PUT / DELETE | `/api/v1/stream-info/presets/{id}` | `Preset` → `Preset`; → 204. 404 `preset_not_found` |
 

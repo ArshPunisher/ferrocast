@@ -162,6 +162,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/stream-info", get(stream_info))
         .route("/stream-info/apply", post(apply_stream_info))
         .route("/stream-info/categories", get(categories))
+        .route("/stream-info/categories/as", get(categories_as))
         .route("/stream-info/presets", post(create_preset))
         .route("/stream-info/presets/{id}", put(update_preset).delete(delete_preset))
         // show
@@ -343,6 +344,15 @@ async fn categories(State(app): State<AppState>, Query(q): Query<HashMap<String,
     let p = super::platform(q.get("platform").map(String::as_str).unwrap_or(""))?;
     let query = q.get("q").cloned().unwrap_or_default();
     Ok(Json(json!({ "platform": p, "items": app.engine.search_categories(p, &query).await? })))
+}
+
+/// What each connected platform would show for a category typed in the form.
+async fn categories_as(
+    State(app): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Json<Value>> {
+    let typed = q.get("q").cloned().unwrap_or_default();
+    Ok(Json(json!({ "items": app.engine.categories_as(&typed).await? })))
 }
 
 async fn create_preset(State(app): State<AppState>, Body(p): Body<Preset>) -> ApiResult<Response> {
