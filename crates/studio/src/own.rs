@@ -730,6 +730,10 @@ impl OwnStream {
 
     pub(crate) fn stats(&self) -> StreamStats {
         let state = self.health.as_ref().map(|h| h.borrow().state.clone());
+        // Dropped, as OBS means it: what the network side couldn't send. Frames drawn late are
+        // the engine's own count (its `lagged`); counted here too, they read as "your upload
+        // can't keep up" and auto quality lowered the bitrate for them (owner, 15 Nov).
+        let sent_dropped = self.health.as_ref().map_or(0, |h| h.borrow().dropped);
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
@@ -737,7 +741,7 @@ impl OwnStream {
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
-                dropped: s.skipped.saturating_sub(d.from.1).min(u64::from(u32::MAX)) as u32,
+                dropped: sent_dropped.min(u64::from(u32::MAX)) as u32,
                 link: None,
                 reason: None,
             };

@@ -2067,6 +2067,13 @@ impl Engine {
         if let (Some(o), Some(h)) = (v.as_object_mut(), health) {
             o.insert("health".into(), serde_json::json!(h));
         }
+        // The upload itself struggling (most platforms behind at once): the status bar says
+        // so, and not when only the drawing is slow or one platform has trouble of its own.
+        let struggling =
+            self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(crate::now().0);
+        if let Some(s) = v.get_mut("stream").and_then(Value::as_object_mut) {
+            s.insert("upload_struggling".into(), Value::Bool(struggling));
+        }
         Ok(v)
     }
 

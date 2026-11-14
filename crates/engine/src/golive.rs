@@ -1125,6 +1125,25 @@ impl Engine {
         (dropped, !lock(&g.paused).is_empty())
     }
 
+    /// Each platform Go live runs: whether it is live, what it skipped and for how long (auto quality
+    /// judges the upload by them together).
+    pub(crate) fn golive_senders(&self) -> Vec<ferrocast_core::auto_quality::Dest> {
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        lock(&self.golive().running)
+            .iter()
+            .map(|(id, r)| {
+                let h = r.health.borrow();
+                let live = h.state == PushState::Live;
+                ferrocast_core::auto_quality::Dest {
+                    id: id.clone(),
+                    dropped: h.dropped,
+                    live_ms: if live { now_ms.saturating_sub(h.since_ms) } else { 0 },
+                    live,
+                }
+            })
+            .collect()
+    }
+
     /// "I use it on purpose": hides the Aitum Multistream setup note.
     pub async fn set_golive_aitum_ok(&self, ok: bool) -> Result<GoLiveConfig, EngineError> {
         let _one_at_a_time = self.config_lock().await;

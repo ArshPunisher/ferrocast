@@ -76,14 +76,21 @@ impl Engine {
     /// Auto quality: trouble getting the stream out lowers its bitrate a step, calm raises it
     /// back (when Go live's switch is on).
     pub(crate) async fn auto_quality_tick(&self) {
-        if !self.golive_config().auto_quality {
-            return;
-        }
         let Ok(host) = self.studio_host() else { return };
-        let enc = host.stream_stats().await.ok().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
-        let (net, paused) = self.golive_trouble();
-        let s = ferrocast_core::auto_quality::Signals { net_dropped: net, enc_dropped: enc, paused };
-        let changed = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).tick(now().0, s);
+        // The Studio's own sender's skipped packets (not frames drawn late: a lower bitrate
+        // doesn't help those).
+        let feed_dropped = host.stream_stats().await.ok().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
+        let (_, paused) = self.golive_trouble();
+        let s = ferrocast_core::auto_quality::Signals { dests: self.golive_senders(), feed_dropped, paused };
+        let changed = {
+            let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+            // Switched off, it still watches: the status bar says when the upload struggles.
+            if !self.golive_config().auto_quality {
+                aq.observe(now().0, s);
+                return;
+            }
+            aq.tick(now().0, s)
+        };
         let Some(pct) = changed else { return };
         if let Err(e) = host.set_live_quality(pct).await {
             tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
@@ -131,7 +138,7 @@ impl Engine {
     pub(crate) async fn auto_quality_off(&self) {
         let lowered = {
             let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut *aq).pct() < 100
+            aq.back_to_full()
         };
         if !lowered {
             return;
