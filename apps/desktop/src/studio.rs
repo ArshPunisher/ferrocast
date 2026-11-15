@@ -1081,9 +1081,10 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::Items { scene } => v(to_json!(c.items(&scene)?)),
         A::AddSource { scene, source, fit } => {
-            let item = c.add_source(&scene, &source.kind, &source.name, &source.settings, fit)?;
-            let settings = c.settings(&source.name)?;
-            v(to_json!(json!({ "item": item, "settings": settings })))
+            // `reused`: a camera or capture card already used here, shown again (never opened twice).
+            let (item, reused) = c.add_source_or_reuse(&scene, &source.kind, &source.name, &source.settings, fit)?;
+            let settings = c.settings(&item.name)?;
+            v(to_json!(json!({ "item": item, "settings": settings, "reused": reused })))
         }
         A::AddExisting { scene, name } => v(to_json!(json!({ "item": c.add_existing(&scene, &name)? }))),
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),

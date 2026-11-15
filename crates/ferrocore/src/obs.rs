@@ -859,6 +859,23 @@ fn heard(kind: &SourceKind) -> bool {
     }
 }
 
+/// The device a camera or capture card source opens (kind and settings as OBS saves them), as
+/// compared: Windows' DirectShow ids are "Name:path" and OBS writes a colon in the name as
+/// "#3A", so they're matched on the path, any case. None for any other kind, or none picked.
+pub fn camera_device(kind: &str, settings: &Value) -> Option<String> {
+    let key = match kind {
+        "av_capture_input" | "av_capture_input_v2" | "macos-avcapture" | "macos-avcapture-fast" => "device",
+        "dshow_input" => "video_device_id",
+        "v4l2_input" => "device_id",
+        _ => return None,
+    };
+    let id = settings.get(key).and_then(Value::as_str).filter(|d| !d.is_empty())?.replace("#3A", ":");
+    Some(match id.rsplit_once(':') {
+        Some((_, path)) if path.contains('\\') || path.contains('?') => path.to_lowercase(),
+        _ => id,
+    })
+}
+
 /// [`import`], with `before` giving what each source (by name) was running as: a capture
 /// waiting for its pick keeps that.
 pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Option<SourceKind>) -> Imported {
@@ -890,6 +907,8 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     // Source Clone (Exeldro's plugin, built in): its name, the source or scene it shows,
     // whether that one's filters come along, and its own filters.
     let mut clones: Vec<(String, String, bool, Vec<crate::Effect>)> = Vec::new();
+    // Each camera or capture card opened, by device, and the source that opens it.
+    let mut devices: Vec<(String, String)> = Vec::new();
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -966,6 +985,16 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 out.skipped.push(format!("{name}: the filter {kind}"));
             }
         }
+        // A device another source already opens is shown as a copy of that one (its picture,
+        // this one's own filters): opened twice, a capture card stopped for both and wouldn't
+        // open again (17 Nov). Same webcam twice in an OBS collection, or brought back by undo.
+        let device = camera_device(id, &settings);
+        if let Some(dev) = &device
+            && let Some((_, first)) = devices.iter().find(|(d, _)| d == dev)
+        {
+            clones.push((name, first.clone(), false, effects));
+            continue;
+        }
         if id == "ferrocast_clone" || id == "source-clone" {
             let target = settings.get("clone").and_then(Value::as_str).unwrap_or_default().to_string();
             let with_filters = settings.get("filters").and_then(Value::as_bool).unwrap_or(true);
@@ -983,6 +1012,11 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         });
         match kind {
             Ok((kind, has_sound)) => {
+                // Opened: a later source on this device shows this one (one that couldn't be
+                // made leaves the device to the next).
+                if let Some(dev) = device {
+                    devices.push((dev, name.clone()));
+                }
                 let flags = s.get("flags").and_then(Value::as_u64).unwrap_or(0);
                 let sound = has_sound.then(|| SourceSettings {
                     volume: f(s, "volume", 1.0),
@@ -1317,6 +1351,42 @@ mod tests {
         let items = main_items(&im);
         assert_eq!(items[0].effects.len(), 1);
         assert!(matches!(items[0].effects[0], crate::Effect::Border { .. }));
+    }
+
+    /// The same webcam or capture card twice (an OBS collection, or a source undo brought back):
+    /// opened once, the second shows the first's picture with its own filters (17 Nov: opened
+    /// twice, a capture card stopped for both).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn one_device_in_two_sources_opens_once() {
+        let edge = json!([{ "id": "ferrocast_border", "name": "Edge", "settings": { "width": 4 } }]);
+        let cams = json!([
+            { "id": "av_capture_input_v2", "name": "Card", "settings": { "device": "card-1" } },
+            { "id": "macos-avcapture", "name": "Card again", "settings": { "device": "card-1" }, "filters": edge },
+            { "id": "av_capture_input_v2", "name": "Phone", "settings": { "device": "phone" } }
+        ]);
+        let im = with_clones(cams, &["Card", "Card again", "Phone"]);
+        let opened = im.sources.iter().filter(|s| matches!(s.kind, SourceKind::Camera(_))).count();
+        assert_eq!(opened, 2, "card once, phone once");
+        assert!(!im.sources.iter().any(|s| s.name == "Card again"), "no source of its own");
+        let items = main_items(&im);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].source, items[1].source, "the first one's picture");
+        assert_ne!(items[0].source, items[2].source);
+        assert!(matches!(items[1].effects.as_slice(), [crate::Effect::Border { .. }]), "its own filters only");
+    }
+
+    #[test]
+    fn windows_device_ids_match_as_obs_writes_them() {
+        let id = |v: &str| camera_device("dshow_input", &json!({ "video_device_id": v }));
+        let a = id("USB2 Video:\\\\?\\usb#vid_534d&pid_2109&mi_00#7&1b2c#{65e8773d}\\global");
+        let b = id("USB2 Video#3A HD:\\\\?\\USB#VID_534D&PID_2109&MI_00#7&1B2C#{65E8773D}\\GLOBAL");
+        assert!(a.is_some());
+        assert_eq!(a, b);
+        let mac = camera_device("av_capture_input_v2", &json!({ "device": "0x3120000345f2131" }));
+        assert_eq!(mac.as_deref(), Some("0x3120000345f2131"));
+        assert_eq!(camera_device("image_source", &json!({ "device": "x" })), None);
+        assert_eq!(camera_device("av_capture_input_v2", &json!({ "device": "" })), None);
     }
 
     #[test]

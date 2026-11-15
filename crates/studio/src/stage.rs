@@ -198,6 +198,12 @@ fn new_item(source: &Value, id: i64) -> Value {
     })
 }
 
+/// Cameras and capture cards: a picture only. Their sound is a device of its own (a capture
+/// card's "USB2 Digital Audio"), with a row of its own in the mixer: theirs showed a second,
+/// silent row (owner, 17 Nov; OBS shows one), and Sound bars mustn't listen to them.
+const PICTURE_ONLY_DEVICES: [&str; 6] =
+    ["av_capture_input", "av_capture_input_v2", "macos-avcapture", "macos-avcapture-fast", "dshow_input", "v4l2_input"];
+
 impl Stage {
     /// A collection with one empty scene, on air.
     pub fn new(canvas: Canvas, first_scene: &str) -> Result<Self, StudioError> {
@@ -457,6 +463,24 @@ impl Stage {
                 }
             }
         }
+    }
+
+    /// The source already showing the camera or capture card that `kind` and `settings` would
+    /// open, if one does (any of the camera kinds, the same device).
+    fn using_device(&self, kind: &str, settings: &Value) -> Option<String> {
+        let want = ferrocore::obs::camera_device(kind, settings)?;
+        self.sources_list().into_iter().find_map(|s| {
+            let dev = ferrocore::obs::camera_device(kind_of(&s), s.get("settings")?)?;
+            (dev == want).then(|| name_of(&s).to_string())
+        })
+    }
+
+    /// Whether `scene` shows the source `name` (in a group too).
+    fn shows(&self, scene: &str, name: &str) -> bool {
+        fn has(items: &[ItemInfo], name: &str) -> bool {
+            items.iter().any(|i| i.name == name || has(&i.children, name))
+        }
+        self.items(scene).is_ok_and(|l| has(&l, name))
     }
 
     fn sources_list(&self) -> Vec<Value> {
@@ -926,7 +950,8 @@ impl Stage {
                     | "ferrocast_visualizer"
                     | "ferrocast_web_text"
                     | "ferrocast_inputs"
-            );
+            )
+            && !PICTURE_ONLY_DEVICES.contains(&kind.as_str());
         // A group's sources, top first, each framed on the canvas through the group.
         let children = if kind == "group" && expand {
             self.scene_items(&name)
@@ -1163,7 +1188,37 @@ impl Stage {
         settings: &Value,
         fit: bool,
     ) -> Result<ItemInfo, StudioError> {
+        self.add_source_or_reuse(scene, kind, name, settings, fit).map(|(i, _)| i)
+    }
+
+    /// [`Self::add_source`], and whether it showed a source already there (a camera or capture
+    /// card already used: its settings are that source's, not the ones given).
+    pub fn add_source_or_reuse(
+        &self,
+        scene: &str,
+        kind: &str,
+        name: &str,
+        settings: &Value,
+        fit: bool,
+    ) -> Result<(ItemInfo, bool), StudioError> {
         self.scene_items(scene)?;
+        // A camera or capture card already used here: that source again, never the device
+        // opened twice. A capture card can't be: both stopped sending and it wouldn't open
+        // again ("isn't connected") until one was removed (owner, 17 Nov: added as a Capture
+        // card, then again as a Camera).
+        if let Some(have) = self.using_device(kind, settings) {
+            if self.shows(scene, &have) {
+                return Err(fail(format!("This device is already in this scene, as \"{have}\".")));
+            }
+            // One switched off would never show here: it's asked for, so it's on again.
+            self.with_source(&have, |s| s["enabled"] = json!(true))?;
+            let mut info = self.add_existing(scene, &have)?;
+            if fit {
+                self.edit_item(scene, info.id, ItemEdit::Fit)?;
+                info = self.info_of(&self.item(scene, info.id)?);
+            }
+            return Ok((info, true));
+        }
         self.name_free(name)?;
         // The kind's defaults, under what was given.
         let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
@@ -1184,7 +1239,7 @@ impl Stage {
             self.edit_item(scene, info.id, ItemEdit::Fit)?;
             info = self.info_of(&self.item(scene, info.id)?);
         }
-        Ok(info)
+        Ok((info, false))
     }
 
     /// Shows a source already made (in another scene) in `scene` too.
@@ -1630,7 +1685,7 @@ impl Stage {
                             | "slideshow"
                             | "slideshow_v2"
                             | "image_slide_show"
-                    )
+                    ) && !PICTURE_ONLY_DEVICES.contains(&kind_of(x))
                 })
                 .map(|x| name_of(x).to_string())
                 .collect();
@@ -5176,6 +5231,36 @@ mod tests {
         ok(s.with_filters("Back", |l| l.iter_mut().for_each(|f| f["settings"] = json!({ "left": 28 }))));
         let crop = ok(s.filter_settings("Back", "Crop"));
         assert_eq!((crop["left"].as_i64(), crop["relative"].as_bool()), (Some(28), Some(true)));
+    }
+
+    /// A capture card added again (as a Camera, or in another scene) is the same source: the
+    /// device is never opened twice (17 Nov: both copies stopped and the card wouldn't reopen).
+    #[test]
+    fn a_camera_already_used_is_the_same_source_again() {
+        let s = stage();
+        ok(s.add_scene("Other"));
+        let dev = json!({ "device": "no-such-card" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Card", &dev, false));
+        // Again as a Camera in another scene: "Card" there too, one source.
+        let again = ok(s.add_source("Other", "macos-avcapture", "Camera", &dev, false));
+        assert_eq!(again.name, "Card");
+        assert_eq!(s.sources().iter().filter(|x| x.kind.contains("capture")).count(), 1);
+        // In the same scene twice: said, not added.
+        assert!(s.add_source("Main", "av_capture_input_v2", "Card 2", &dev, false).is_err());
+        // Another device is a source of its own.
+        ok(s.add_source("Main", "av_capture_input_v2", "Phone", &json!({ "device": "phone" }), false));
+        assert_eq!(s.sources().len(), 2);
+        // The add says when it reused one (by the flag, not the name).
+        let (_, reused) =
+            ok(s.add_source_or_reuse("Other", "av_capture_input_v2", "Phone", &json!({ "device": "phone" }), false));
+        assert!(reused, "the same name, still a reuse");
+        assert_eq!(s.sources().len(), 2);
+        // A copy (pasted or duplicated) is a source of its own: the engine shows it as a copy of
+        // the first one's picture, never opening the device twice (ferrocore::obs's import).
+        ok(s.paste_copy("Main", "Card"));
+        let card = ok(s.items("Main")).into_iter().find(|i| i.name == "Card").map(|i| i.id).unwrap_or_default();
+        ok(s.edit_item("Main", card, ItemEdit::Duplicate));
+        assert_eq!(s.sources().len(), 4);
     }
 
     #[test]
