@@ -2559,6 +2559,16 @@ fn failed(message: String) -> EngineError {
     if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
     }
+    // The message already says what to do; scenes and sources share one set of names.
+    if message.contains("is taken: pick another name") {
+        return refused(409, "studio_name_taken", message, "Scenes and sources share one set of names.");
+    }
+    if message.contains("already has a filter called") {
+        return refused(409, "studio_name_taken", message, "Each filter on a source needs its own name.");
+    }
+    if message.contains("already in this scene") {
+        return refused(409, "studio_already_here", message, "Pick it in the Sources list instead.");
+    }
     if message.contains("isn't here yet") {
         return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
     }
@@ -2590,12 +2600,7 @@ fn failed(message: String) -> EngineError {
     if message.contains("at least one scene") {
         return refused(409, "studio_last_scene", message, "Add another scene first.");
     }
-    refused(
-        422,
-        "studio_failed",
-        message,
-        "Check the settings and try again. If it keeps failing, reinstall Ferrocast.",
-    )
+    refused(422, "studio_failed", message, "Check the settings and try again.")
 }
 
 /// Where a secret value written after a marker ends.
@@ -3219,6 +3224,9 @@ mod tests {
             ("There's already a scene collection called \"Show\".", "studio_name_taken"),
             ("\"Show\" is in use now.", "studio_in_use"),
             ("There's no profile with that id.", "studio_no_such"),
+            ("\"Main\" is taken: pick another name.", "studio_name_taken"),
+            ("\"Cam\" already has a filter called \"Crop\".", "studio_name_taken"),
+            ("This device is already in this scene, as \"Cam\".", "studio_already_here"),
         ] {
             assert!(matches!(failed(m.into()), EngineError::Refused { code: c, .. } if c == code), "{m}");
         }
