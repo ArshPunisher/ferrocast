@@ -94,6 +94,16 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             area: [n("area_x", 25.0), n("area_y", 25.0), n("area_w", 50.0), n("area_h", 50.0)],
         },
         "ferrocast_look" => Effect::Look { look: n("look", 0.0) as u32, strength: n("strength", 100.0) },
+        "ferrocast_adjust" => Effect::Adjust {
+            exposure: n("exposure", 0.0),
+            contrast: n("contrast", 0.0),
+            highlights: n("highlights", 0.0),
+            shadows: n("shadows", 0.0),
+            saturation: n("saturation", 0.0),
+            vibrance: n("vibrance", 0.0),
+            temperature: n("temperature", 0.0),
+            tint: n("tint", 0.0),
+        },
         "chroma_key_filter_v2" => Effect::ChromaKey {
             key: key_of(&[("green", 0x00FF00), ("blue", 0xFF9900), ("magenta", 0xFF00FF)], 0x00FF00),
             similarity: n("similarity", 400.0),

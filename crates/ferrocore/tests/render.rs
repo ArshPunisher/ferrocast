@@ -297,3 +297,130 @@ fn a_shader_effect_of_ones_own_runs_and_a_broken_one_is_left_out() {
         assert_eq!(at(&px, 20, 10, 10), [255, 0, 0, 255]);
     }
 }
+
+/// One pixel of `rgb` through `effect` → the pixel out.
+fn through(c: &Compositor, rgb: [u8; 3], effect: ferrocore::Effect) -> [u8; 4] {
+    let mut it = item(Picture::solid(4, 4, [rgb[0], rgb[1], rgb[2], 255]), Placement::default());
+    it.effects = vec![effect];
+    let px = c.render(&Scene { width: 4, height: 4, items: vec![it] }).unwrap_or_default();
+    at(&px, 4, 2, 2)
+}
+
+fn adjust() -> ferrocore::Effect {
+    ferrocore::Effect::Adjust {
+        exposure: 0.0,
+        contrast: 0.0,
+        highlights: 0.0,
+        shadows: 0.0,
+        saturation: 0.0,
+        vibrance: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
+    }
+}
+
+fn with(f: impl FnOnce(&mut [f32; 8])) -> ferrocore::Effect {
+    let mut v = [0.0f32; 8];
+    f(&mut v);
+    ferrocore::Effect::Adjust {
+        exposure: v[0],
+        contrast: v[1],
+        highlights: v[2],
+        shadows: v[3],
+        saturation: v[4],
+        vibrance: v[5],
+        temperature: v[6],
+        tint: v[7],
+    }
+}
+
+fn near(a: [u8; 4], b: [u8; 3], by: u8) -> bool {
+    (0..3).all(|i| a[i].abs_diff(b[i]) <= by)
+}
+
+/// Adjust at 0 leaves a picture as it is (a photo app's sliders in the middle).
+#[test]
+fn adjust_at_zero_changes_nothing() {
+    let Some(c) = gpu() else { return };
+    for rgb in [[0, 0, 0], [255, 255, 255], [200, 120, 40], [30, 90, 200], [128, 128, 128]] {
+        let got = through(&c, rgb, adjust());
+        assert!(near(got, rgb, 2), "{rgb:?} came out {got:?}");
+    }
+}
+
+/// Each slider does what its name says, the way a photo app's does.
+#[test]
+fn adjust_sliders_do_what_they_say() {
+    let Some(c) = gpu() else { return };
+    let grey = [118, 118, 118];
+    // Exposure: one stop is twice the light (sRGB 118 → about 161).
+    let up = through(&c, grey, with(|v| v[0] = 1.0));
+    assert!((155..=167).contains(&up[0]), "{up:?}");
+    // Contrast: dark goes darker and light lighter; mid-grey stays; nothing clips.
+    let (dark, light, mid) = ([60, 60, 60], [190, 190, 190], [128, 128, 128]);
+    let more = |rgb| through(&c, rgb, with(|v| v[1] = 60.0));
+    assert!(more(dark)[0] < 56 && more(light)[0] > 194, "{:?} {:?}", more(dark), more(light));
+    assert!(near(more(mid), [128, 128, 128], 4), "{:?}", more(mid));
+    assert!(more([250, 250, 250])[0] < 255 && more([6, 6, 6])[0] > 0, "an S-curve, not a clip");
+    let less = through(&c, dark, with(|v| v[1] = -60.0));
+    assert!(less[0] > 64, "less contrast lifts the dark: {less:?}");
+    // Shadows lift dark parts and leave light ones; highlights pull light parts back.
+    let lifted = through(&c, [40, 40, 40], with(|v| v[3] = 80.0));
+    assert!(lifted[0] > 50, "{lifted:?}");
+    assert!(near(through(&c, [235, 235, 235], with(|v| v[3] = 80.0)), [235, 235, 235], 3));
+    let back = through(&c, [235, 235, 235], with(|v| v[2] = -80.0));
+    assert!(back[0] < 228, "{back:?}");
+    assert!(near(through(&c, [30, 30, 30], with(|v| v[2] = -80.0)), [30, 30, 30], 3));
+    // Saturation: -100 is grey; more pulls the colours apart, hue kept.
+    let orange = [200, 120, 40];
+    let g = through(&c, orange, with(|v| v[4] = -100.0));
+    assert!(g[0].abs_diff(g[1]) <= 2 && g[1].abs_diff(g[2]) <= 2, "grey: {g:?}");
+    let s = through(&c, orange, with(|v| v[4] = 50.0));
+    assert!(s[0] > orange[0] && s[2] < orange[2] && s[0] > s[1] && s[1] > s[2], "{s:?}");
+    // Vibrance moves a dull colour more than a vivid one.
+    let dull = [140, 120, 110];
+    let vivid = [230, 60, 20];
+    let spread = |p: [u8; 4]| i32::from(p[0]) - i32::from(p[2]);
+    let dull_gain = spread(through(&c, dull, with(|v| v[5] = 80.0))) - spread([dull[0], 0, dull[2], 0]);
+    let vivid_gain = spread(through(&c, vivid, with(|v| v[5] = 80.0))) - spread([vivid[0], 0, vivid[2], 0]);
+    assert!(dull_gain > 0 && dull_gain * 2 > vivid_gain.max(0), "dull {dull_gain}, vivid {vivid_gain}");
+    // Temperature: warmer is redder and less blue; cooler the other way. Tint + is magenta.
+    let warm = through(&c, grey, with(|v| v[6] = 60.0));
+    assert!(warm[0] > warm[2] + 10, "{warm:?}");
+    let cool = through(&c, grey, with(|v| v[6] = -60.0));
+    assert!(cool[2] > cool[0] + 10, "{cool:?}");
+    let magenta = through(&c, grey, with(|v| v[7] = 60.0));
+    assert!(magenta[1] + 6 < magenta[0], "{magenta:?}");
+}
+
+/// OBS's Color Correction: contrast turns round mid-grey (the setting plus one, as OBS's v2).
+/// Before, it only scaled everything: more contrast just brightened the picture.
+#[test]
+fn color_correction_contrast_turns_round_mid_grey() {
+    let Some(c) = gpu() else { return };
+    let cc = |contrast: f32| ferrocore::Effect::ColorCorrection {
+        gamma: 0.0,
+        contrast,
+        brightness: 0.0,
+        saturation: 0.0,
+        hue_shift: 0.0,
+        opacity: 1.0,
+        multiply: 0x00FF_FFFF,
+        add: 0,
+    };
+    let dark = through(&c, [60, 60, 60], cc(0.5));
+    let light = through(&c, [220, 220, 220], cc(0.5));
+    assert!(dark[0] < 60, "darks go darker: {dark:?}");
+    assert!(light[0] > 220, "lights go lighter: {light:?}");
+    assert!(near(through(&c, [150, 150, 150], cc(0.0)), [150, 150, 150], 2), "0 changes nothing");
+}
+
+/// Lifting the shadows on near-black camera noise brightens it as grey, not as a coloured
+/// speck (the brightness ratio is capped there).
+#[test]
+fn adjust_lifts_dark_noise_as_grey() {
+    let Some(c) = gpu() else { return };
+    let got = through(&c, [3, 0, 0], with(|v| v[3] = 100.0));
+    let spread = got[0].max(got[1]).max(got[2]) - got[0].min(got[1]).min(got[2]);
+    assert!(spread <= 24, "a dark speck stays near grey: {got:?}");
+}

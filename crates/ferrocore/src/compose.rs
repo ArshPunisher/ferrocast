@@ -1054,6 +1054,22 @@ impl Compositor {
                     [0.0; 4],
                 ),
                 Effect::Look { look, strength } => ("fs_look", [*look as f32, *strength, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                Effect::Adjust { exposure, contrast, highlights, shadows, saturation, vibrance, temperature, tint } => {
+                    let pct = |v: f32| v.clamp(-100.0, 100.0) / 100.0;
+                    q = [pct(*temperature), pct(*tint), 0.0, 0.0];
+                    (
+                        "fs_adjust",
+                        [
+                            exposure.clamp(-3.0, 3.0),
+                            pct(*contrast),
+                            pct(*highlights),
+                            pct(*shadows),
+                            pct(*saturation),
+                            pct(*vibrance),
+                        ],
+                        [0.0; 4],
+                    )
+                }
                 Effect::ChromaKey { key, similarity, smoothness, spill, opacity, contrast, brightness, gamma } => {
                     let k = [f32::from(key[0]) / 255.0, f32::from(key[1]) / 255.0, f32::from(key[2]) / 255.0, 1.0];
                     let dot = |v: [f32; 4]| k[0] * v[0] + k[1] * v[1] + k[2] * v[2] + k[3] * v[3];
@@ -2167,8 +2183,12 @@ fn color_correction_matrix(
     multiply: u32,
     add: u32,
 ) -> [f32; 16] {
-    let c = obs_contrast(contrast);
-    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    // color-correction-filter.c (v2): the setting plus one, round mid-grey (the `(1 - c) / 2`
+    // row). Ours took the keys' contrast curve and no middle: "contrast" only brightened or
+    // darkened everything (owner, 15 Nov).
+    let c = contrast + 1.0;
+    let mid = (1.0 - c) / 2.0;
+    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [mid, mid, mid, 1.0]];
     let bright: M4 =
         [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [brightness, brightness, brightness, 1.0]];
     let s = saturation + 1.0;

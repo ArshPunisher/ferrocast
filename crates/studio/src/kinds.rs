@@ -149,8 +149,9 @@ pub fn kinds() -> Kinds {
         inputs,
         filters: vec![
             kind("chroma_key_filter_v2", "Chroma Key"),
-            kind("color_key_filter_v2", "Color Key"),
-            kind("color_filter_v2", "Color Correction"),
+            kind("color_key_filter_v2", "Colour Key"),
+            kind("ferrocast_adjust", "Adjust"),
+            kind("color_filter_v2", "Colour Correction"),
             kind("luma_key_filter_v2", "Luma Key"),
             kind("sharpness_filter_v2", "Sharpen"),
             kind("crop_filter", "Crop/Pad"),
@@ -684,6 +685,17 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("brightness", "Brightness", "float").range(-1.0, 1.0, 0.0001).slider(),
             opt("gamma", "Gamma", "float").range(-1.0, 1.0, 0.01).slider(),
         ],
+        // A photo app's sliders: 0 in the middle leaves the picture as it is.
+        "ferrocast_adjust" => vec![
+            opt("exposure", "Exposure", "float").range(-3.0, 3.0, 0.05).slider().unit(" EV"),
+            opt("contrast", "Contrast", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("highlights", "Highlights", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("shadows", "Shadows", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("saturation", "Saturation", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("vibrance", "Vibrance", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("temperature", "Temperature", "int").range(-100.0, 100.0, 1.0).slider(),
+            opt("tint", "Tint", "int").range(-100.0, 100.0, 1.0).slider(),
+        ],
         "color_filter" | "color_filter_v2" => vec![
             opt("gamma", "Gamma", "float").range(-3.0, 3.0, 0.01).slider(),
             opt("contrast", "Contrast", "float").range(-4.0, 4.0, 0.01).slider(),
@@ -872,6 +884,10 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "color_key_filter" | "color_key_filter_v2" => {
             json!({ "key_color_type": "green", "similarity": 80, "smoothness": 50, "opacity": 1.0, "contrast": 0.0, "brightness": 0.0, "gamma": 0.0 })
         }
+        "ferrocast_adjust" => json!({
+            "exposure": 0.0, "contrast": 0, "highlights": 0, "shadows": 0,
+            "saturation": 0, "vibrance": 0, "temperature": 0, "tint": 0,
+        }),
         "color_filter" | "color_filter_v2" => {
             json!({ "gamma": 0.0, "contrast": 0.0, "brightness": 0.0, "saturation": 0.0, "hue_shift": 0.0, "opacity": 1.0, "color_multiply": 0x00FF_FFFFu32, "color_add": 0 })
         }

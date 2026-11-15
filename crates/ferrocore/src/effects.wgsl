@@ -473,3 +473,49 @@ fn fs_scroll(i: Out) -> @location(0) vec4<f32> {
     let bottom = mix(texel(p + vec2<i32>(0, 1), size, wrap), texel(p + vec2<i32>(1, 1), size, wrap), t.x);
     return mix(top, bottom, t.y);
 }
+
+// Ferrocast's Adjust (lib.rs `Effect::Adjust`), on linear light: p0 exposure in stops; p1
+// contrast, p2 highlights, p3 shadows, p4 saturation, p5 vibrance, q.x temperature, q.y tint,
+// each -1 to 1 with 0 leaving the picture alone.
+fn luma709(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+@fragment
+fn fs_adjust(i: Out) -> @location(0) vec4<f32> {
+    let px = textureSampleLevel(image, pick, i.uv, 0.0);
+    if px.a <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    var rgb = max(px.rgb / px.a, vec3<f32>(0.0));
+    // White balance as gains on linear light, brightness kept: warmer is more red and less
+    // blue, a positive tint is magenta (less green).
+    let gains = vec3<f32>(1.0 + 0.3 * f.q.x, 1.0 - 0.25 * f.q.y, 1.0 - 0.3 * f.q.x);
+    rgb = rgb * gains / max(luma709(gains), 0.001);
+    // Exposure: stops, as a camera's.
+    rgb = rgb * exp2(f.p0);
+    // The rest on a perceptual scale (about what the eye sees as even steps).
+    var v = pow(rgb, vec3<f32>(1.0 / 2.2));
+    let l0 = luma709(v);
+    var l = clamp(l0, 0.0, 1.0);
+    // Shadows and highlights: each moves only its own end, smoothly (a positive shadow lifts the
+    // dark parts, a negative highlight brings the bright parts back).
+    let dark = 1.0 - smoothstep(0.0, 0.6, l);
+    let bright = smoothstep(0.4, 1.0, l);
+    l = l + f.p3 * 0.35 * dark * (1.0 - l) + f.p2 * 0.35 * bright * select(l, 1.0 - l, f.p2 > 0.0);
+    // Contrast: an S-curve round mid-grey (more) or a flatter line (less); never clips.
+    let s_curve = l * l * (3.0 - 2.0 * l);
+    l = select(mix(0.5, l, 1.0 + 0.75 * f.p1), mix(l, s_curve, f.p1), f.p1 > 0.0);
+    l = clamp(l, 0.0, 1.0);
+    // The new brightness on the old colour, hue kept; on near-black (camera noise) the ratio is
+    // capped and the rest added as grey, so lifting the shadows can't blow noise up into colour.
+    let ratio = min(l / max(l0, 0.0001), min(1.0 + 10.0 * l0, 4.0));
+    v = v * ratio + vec3<f32>(max(l - l0 * ratio, 0.0));
+    // Saturation round each pixel's own grey; vibrance more on dull colours than vivid ones.
+    let grey = luma709(v);
+    let vivid = clamp(max(v.r, max(v.g, v.b)) - min(v.r, min(v.g, v.b)), 0.0, 1.0);
+    let amount = 1.0 + f.p4 + f.p5 * (1.0 - vivid);
+    v = mix(vec3<f32>(grey), v, max(amount, 0.0));
+    rgb = pow(clamp(v, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+    return vec4<f32>(rgb * px.a, px.a);
+}

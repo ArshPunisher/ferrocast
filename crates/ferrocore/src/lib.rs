@@ -224,6 +224,21 @@ pub enum Effect {
         look: u32,
         strength: f32,
     },
+    /// Ferrocast's Adjust, as a photo app's sliders (owner, 15 Nov: "like a proper photo app"):
+    /// exposure in stops (-3 to 3); the rest -100 to 100, 0 leaving it as it is. Worked in
+    /// linear light (white balance and exposure) and on a perceptual curve (the rest), each
+    /// keeping colours' hue: contrast is an S-curve round mid-grey that never clips, highlights
+    /// and shadows move only their own part, vibrance lifts dull colours more than bright ones.
+    Adjust {
+        exposure: f32,
+        contrast: f32,
+        highlights: f32,
+        shadows: f32,
+        saturation: f32,
+        vibrance: f32,
+        temperature: f32,
+        tint: f32,
+    },
     /// OBS's Chroma Key (its settings as OBS keeps them: similarity, smoothness and spill 1 to
     /// 1000, contrast, brightness and gamma -1 to 1, opacity 0 to 1; the key colour as RGB).
     ChromaKey {
@@ -346,6 +361,7 @@ impl Effect {
         matches!(
             self,
             Self::ChromaKey { .. }
+                | Self::Adjust { .. }
                 | Self::ColorCorrection { .. }
                 | Self::ColorKey { .. }
                 | Self::LumaKey { .. }
