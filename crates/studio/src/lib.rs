@@ -129,6 +129,10 @@ pub struct OptionInfo {
     /// "modified" callbacks: a Window Capture has no use for the Display list).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shown_when: Option<ShownWhen>,
+    /// What a new one starts at (the kind's defaults): what a double-click puts a slider
+    /// back to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 /// The option and values an option is shown for.

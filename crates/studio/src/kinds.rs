@@ -94,7 +94,7 @@ fn kind(id: &str, name: &str) -> Kind {
 /// Every kind our engine runs on this computer.
 pub fn kinds() -> Kinds {
     let mut inputs = vec![
-        kind("color_source_v3", "Color Source"),
+        kind("color_source_v3", "Colour"),
         kind("image_source", "Image"),
         kind("text_ft2_source_v2", "Text"),
         kind("slideshow", "Image Slide Show"),
@@ -192,7 +192,7 @@ pub fn kinds() -> Kinds {
             kind("fade_transition", "Fade"),
             kind("swipe_transition", "Swipe"),
             kind("slide_transition", "Slide"),
-            kind("fade_to_color_transition", "Fade to Color"),
+            kind("fade_to_color_transition", "Fade to Colour"),
             kind("wipe_transition", "Luma Wipe"),
             kind("obs_stinger_transition", "Stinger"),
             kind("ferrocast_move", "Move"),
@@ -234,6 +234,7 @@ fn opt(key: &str, label: &str, kind: &'static str) -> OptionInfo {
         text_type: "",
         monospace: false,
         shown_when: None,
+        default: None,
     }
 }
 
@@ -245,6 +246,11 @@ impl OptionInfo {
 
     fn slider(mut self) -> Self {
         self.slider = true;
+        self
+    }
+
+    fn hint(mut self, help: &str) -> Self {
+        self.help = help.into();
         self
     }
 
@@ -422,11 +428,22 @@ const IMAGES: &str = "Image Files (*.bmp *.tga *.png *.jpeg *.jpg *.jxr *.gif *.
 const MEDIA: &str =
     "Media Files (*.mp4 *.m4v *.mov *.mkv *.ts *.webm *.mp3 *.aac *.wav *.m4a *.flac *.ogg);;All Files (*.*)";
 
-/// A source's or filter's settings form; None for a kind our engine doesn't run.
+/// A source's or filter's settings form, each option with what it starts at; None for a kind
+/// our engine doesn't run.
 pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
+    let mut opts = form(kind)?;
+    if let Some(d) = defaults(kind) {
+        for o in &mut opts {
+            o.default = d.get(&o.key).cloned();
+        }
+    }
+    Some(opts)
+}
+
+fn form(kind: &str) -> Option<Vec<OptionInfo>> {
     Some(match kind {
         "color_source" | "color_source_v2" | "color_source_v3" => vec![
-            opt("color", "Color", "color_alpha"),
+            opt("color", "Colour", "color_alpha"),
             opt("width", "Width", "int").range(0.0, 16384.0, 1.0),
             opt("height", "Height", "int").range(0.0, 16384.0, 1.0),
         ],
@@ -443,7 +460,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("bars", "Bars", "int").range(8.0, 64.0, 1.0).slider(),
             opt("width", "Width", "int").range(16.0, 3840.0, 1.0),
             opt("height", "Height", "int").range(8.0, 2160.0, 1.0),
-            opt("color", "Color", "color_alpha"),
+            opt("color", "Colour", "color_alpha"),
             opt("mirror", "From the middle", "bool"),
         ],
         "ferrocast_inputs" => {
@@ -467,9 +484,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("words", "Text ({} is the value)", "text"),
             opt("every", "Every", "int").range(5.0, 3600.0, 1.0).unit("s"),
             opt("font", "Font", "font"),
-            opt("color1", "Color", "color_alpha"),
+            opt("color1", "Colour", "color_alpha"),
             opt("outline", "Outline", "bool"),
-            opt("drop_shadow", "Drop Shadow", "bool"),
+            opt("drop_shadow", "Shadow", "bool"),
         ],
         "ferrocast_countdown" => {
             let set_time = [json!("for")];
@@ -482,9 +499,9 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 opt("before", "Before the time", "text"),
                 opt("end", "When it ends", "text"),
                 opt("font", "Font", "font"),
-                opt("color1", "Color", "color_alpha"),
+                opt("color1", "Colour", "color_alpha"),
                 opt("outline", "Outline", "bool"),
-                opt("drop_shadow", "Drop Shadow", "bool"),
+                opt("drop_shadow", "Shadow", "bool"),
             ]
         }
         // Its file is set by the app each time a replay is saved.
@@ -508,51 +525,51 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             let own = [json!("custom")];
             vec![
                 opt("preset", "Effect", "list").choices(&as_refs(&presets)),
-                opt("shader_file", "Shader File", "path")
+                opt("shader_file", "Shader file", "path")
                     .file("WGSL Shaders (*.wgsl);;All Files (*.*)")
                     .when("preset", &own),
-                opt("shader_text", "Or Write One Here", "text").multiline().mono().when("preset", &own),
+                opt("shader_text", "Or type one here", "text").multiline().mono().when("preset", &own),
                 opt("param1", "Strength", "float").range(0.0, 1.0, 0.01).slider(),
                 opt("param2", "Size or speed", "float").range(0.0, 1.0, 0.01).slider(),
-                opt("param3", "Slider 3", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
-                opt("param4", "Slider 4", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
+                opt("param3", "Setting 3", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
+                opt("param4", "Setting 4", "float").range(0.0, 1.0, 0.01).slider().when("preset", &own),
             ]
         }
         "slideshow" | "slideshow_v2" | "image_slide_show" => vec![
-            opt("files", "Image Files", "editable_list").files(IMAGES),
-            opt("slide_time", "Time Between Slides", "int").range(50.0, 3_600_000.0, 50.0).unit(" ms"),
+            opt("files", "Images", "editable_list").files(IMAGES),
+            opt("slide_time", "Each slide for", "int").range(50.0, 3_600_000.0, 50.0).unit(" ms"),
             opt("transition", "Transition", "list").choices(&[("Fade", json!("fade")), ("Cut", json!("cut"))]),
-            opt("transition_speed", "Transition Speed", "int")
+            opt("transition_speed", "Transition length", "int")
                 .range(0.0, 3600000.0, 50.0)
                 .unit(" ms")
                 .when("transition", &[json!("fade")]),
             opt("loop", "Loop", "bool"),
-            opt("randomize", "Randomize Playback", "bool"),
+            opt("randomize", "Shuffle", "bool"),
         ],
         "vlc_source" => vec![
             opt("playlist", "Playlist", "editable_list").files(MEDIA_FILES),
-            opt("loop", "Loop Playlist", "bool"),
+            opt("loop", "Loop", "bool"),
             opt("shuffle", "Shuffle playlist", "bool"),
         ],
         "image_source" => vec![
-            opt("file", "Image File", "path").file(IMAGES),
-            opt("unload", "Unload image when not showing", "bool"),
-            opt("linear_alpha", "Apply alpha in linear space", "bool"),
+            opt("file", "Image", "path").file(IMAGES),
+            opt("unload", "Free memory when hidden", "bool"),
+            opt("linear_alpha", "Blend edges in linear light", "bool"),
         ],
         "text_ft2_source" | "text_ft2_source_v2" => vec![
             opt("font", "Font", "font"),
             opt("text", "Text", "text").multiline().when("from_file", &[json!(false)]),
             opt("from_file", "Read from file", "bool"),
-            opt("text_file", "Text File (UTF-8 or UTF-16)", "path")
+            opt("text_file", "Text file", "path")
                 .file("Text Files (*.txt);;All Files (*.*)")
                 .when("from_file", &[json!(true)]),
-            opt("antialiasing", "Antialiasing", "bool"),
-            opt("color1", "Color 1", "color_alpha"),
-            opt("color2", "Color 2", "color_alpha"),
+            opt("antialiasing", "Smooth edges", "bool"),
+            opt("color1", "First colour", "color_alpha"),
+            opt("color2", "Second colour", "color_alpha"),
             opt("outline", "Outline", "bool"),
-            opt("drop_shadow", "Drop Shadow", "bool"),
-            opt("custom_width", "Custom text width", "int").range(0.0, 4096.0, 1.0),
-            opt("word_wrap", "Word Wrap", "bool"),
+            opt("drop_shadow", "Shadow", "bool"),
+            opt("custom_width", "Text box width", "int").range(0.0, 4096.0, 1.0),
+            opt("word_wrap", "Wrap lines", "bool"),
             opt("align", "Align", "list").choices(&[
                 ("Left", json!("left")),
                 ("Centre", json!("center")),
@@ -562,18 +579,18 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("bk_opacity", "Background opacity", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
         ],
         "ffmpeg_source" => vec![
-            opt("is_local_file", "Local File", "bool"),
-            opt("local_file", "Local File", "path").file(MEDIA),
+            opt("is_local_file", "From a file on this computer", "bool"),
+            opt("local_file", "File", "path").file(MEDIA),
             opt("looping", "Loop", "bool"),
-            opt("restart_on_activate", "Restart playback when source becomes active", "bool"),
-            opt("close_when_inactive", "Close file when inactive", "bool"),
+            opt("restart_on_activate", "Start over when shown", "bool"),
+            opt("close_when_inactive", "Let go of the file when hidden", "bool"),
             opt("speed_percent", "Speed", "int").range(1.0, 200.0, 1.0).slider().unit("%"),
         ],
         "screen_capture" => {
-            let mut v = vec![opt("type", "Method", "list").choices(&[
-                ("Display Capture", json!(0)),
-                ("Window Capture", json!(1)),
-                ("Application Capture", json!(2)),
+            let mut v = vec![opt("type", "What to capture", "list").choices(&[
+                ("A whole screen", json!(0)),
+                ("One window", json!(1)),
+                ("One app", json!(2)),
             ])];
             #[cfg(target_os = "macos")]
             if let Ok((displays, windows)) = ferrocore::screen::shareable() {
@@ -594,7 +611,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             v.push(
                 opt("application", "Application", "list").choices(&as_refs(&app_choices())).when("type", &[json!(2)]),
             );
-            v.push(opt("show_cursor", "Show Cursor", "bool"));
+            v.push(opt("show_cursor", "Show cursor", "bool"));
             // Apps this display capture leaves out (bundle ids), as Privacy does for all.
             #[cfg(target_os = "macos")]
             v.push(opt("exclude_apps", "Leave out", "editable_list").when("type", &[json!(0)]));
@@ -621,8 +638,8 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         "sck_audio_capture" | "coreaudio_output_capture" => {
             #[allow(unused_mut)]
             let mut v = vec![
-                opt("type", "Method", "list")
-                    .choices(&[("Desktop Audio Capture", json!(0)), ("Application Audio Capture", json!(1))]),
+                opt("type", "What to capture", "list")
+                    .choices(&[("All the computer’s sound", json!(0)), ("One app’s sound", json!(1))]),
             ];
             #[cfg(target_os = "macos")]
             v.push(
@@ -640,10 +657,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                     displays.iter().map(|x| (format!("Display {} ({}x{})", x.id + 1, x.width, x.height), json!(x.id))),
                 );
             }
-            vec![
-                opt("monitor", "Display", "list").choices(&as_refs(&d)),
-                opt("capture_cursor", "Capture Cursor", "bool"),
-            ]
+            vec![opt("monitor", "Display", "list").choices(&as_refs(&d)), opt("capture_cursor", "Show cursor", "bool")]
         }
         "window_capture" => {
             #[allow(unused_mut)]
@@ -652,7 +666,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             if let Ok((_, windows)) = ferrocore::screen::shareable() {
                 w.extend(windows.iter().map(|x| (format!("[{}] {}", x.app, x.title), json!(x.id))));
             }
-            vec![opt("window", "Window", "list").choices(&as_refs(&w)), opt("cursor", "Capture Cursor", "bool")]
+            vec![opt("window", "Window", "list").choices(&as_refs(&w)), opt("cursor", "Show cursor", "bool")]
         }
         "dshow_input" => {
             #[allow(unused_mut)]
@@ -673,7 +687,7 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                     displays.iter().map(|x| (format!("Display {} ({}x{})", x.id + 1, x.width, x.height), json!(x.id))),
                 );
             }
-            vec![opt("screen", "Screen", "list").choices(&as_refs(&d)), opt("show_cursor", "Capture Cursor", "bool")]
+            vec![opt("screen", "Screen", "list").choices(&as_refs(&d)), opt("show_cursor", "Show cursor", "bool")]
         }
         "v4l2_input" => {
             #[allow(unused_mut)]
@@ -716,15 +730,15 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             vec![opt("device_id", "Device", "list").choices(&[("Default", json!("default"))])]
         }
         "browser_source" | "ferrocast_web" => vec![
-            opt("is_local_file", "Local file", "bool"),
-            opt("local_file", "Local file", "path")
+            opt("is_local_file", "From a file on this computer", "bool"),
+            opt("local_file", "File", "path")
                 .file("HTML Files (*.html *.htm);;All Files (*.*)")
                 .when("is_local_file", &[json!(true)]),
-            opt("url", "URL", "text").when("is_local_file", &[json!(false)]),
+            opt("url", "Address", "text").when("is_local_file", &[json!(false)]),
             opt("width", "Width", "int").range(1.0, 8192.0, 1.0),
             opt("height", "Height", "int").range(1.0, 8192.0, 1.0),
-            opt("fps", "FPS", "int").range(1.0, 60.0, 1.0),
-            opt("css", "Custom CSS", "text").multiline(),
+            opt("fps", "Frame rate", "int").range(1.0, 60.0, 1.0),
+            opt("css", "Your own CSS", "text").multiline(),
         ],
         // Transitions.
         "swipe_transition" | "slide_transition" => {
@@ -735,13 +749,13 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
                 ("Down", json!("down")),
             ])];
             if kind == "swipe_transition" {
-                v.push(opt("swipe_in", "Swipe In", "bool"));
+                v.push(opt("swipe_in", "Swipe in", "bool"));
             }
             v
         }
         "fade_to_color_transition" => vec![
-            opt("color", "Color", "color"),
-            opt("switch_point", "Peak Color Point", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
+            opt("color", "Colour", "color"),
+            opt("switch_point", "Fully coloured at", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
         ],
         "wipe_transition" => vec![
             opt("luma_image", "Image", "path").file("Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*.*)"),
@@ -749,37 +763,37 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("luma_invert", "Invert", "bool"),
         ],
         "obs_stinger_transition" => vec![
-            opt("path", "Video File", "path").file("Video Files (*.mp4 *.mov *.webm *.mkv);;All Files (*.*)"),
-            opt("transition_point_type", "Transition Point Type", "list")
+            opt("path", "Video", "path").file("Video Files (*.mp4 *.mov *.webm *.mkv);;All Files (*.*)"),
+            opt("transition_point_type", "Switch scenes at", "list")
                 .choices(&[("Time (milliseconds)", json!(0)), ("Frame", json!(1))]),
-            opt("transition_point", "Transition Point", "int").range(0.0, 60_000.0, 1.0),
+            opt("transition_point", "Switch point", "int").range(0.0, 60_000.0, 1.0),
         ],
         // Filters.
         "chroma_key_filter" | "chroma_key_filter_v2" => vec![
-            opt("key_color_type", "Key Color Type", "list").choices(&[
+            opt("key_color_type", "Key colour", "list").choices(&[
                 ("Green", json!("green")),
                 ("Blue", json!("blue")),
                 ("Magenta", json!("magenta")),
                 ("Custom", json!("custom")),
             ]),
-            opt("key_color", "Key Color", "color").when("key_color_type", &[json!("custom")]),
+            opt("key_color", "Your colour", "color").when("key_color_type", &[json!("custom")]),
             opt("similarity", "Similarity", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("smoothness", "Smoothness", "int").range(1.0, 1000.0, 1.0).slider(),
-            opt("spill", "Key Color Spill Reduction", "int").range(1.0, 1000.0, 1.0).slider(),
+            opt("spill", "Spill reduction", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("opacity", "Opacity", "float").range(0.0, 1.0, 0.0001).slider(),
             opt("contrast", "Contrast", "float").range(-4.0, 4.0, 0.01).slider(),
             opt("brightness", "Brightness", "float").range(-1.0, 1.0, 0.0001).slider(),
             opt("gamma", "Gamma", "float").range(-1.0, 1.0, 0.01).slider(),
         ],
         "color_key_filter" | "color_key_filter_v2" => vec![
-            opt("key_color_type", "Key Color Type", "list").choices(&[
+            opt("key_color_type", "Key colour", "list").choices(&[
                 ("Green", json!("green")),
                 ("Blue", json!("blue")),
                 ("Red", json!("red")),
                 ("Magenta", json!("magenta")),
                 ("Custom", json!("custom")),
             ]),
-            opt("key_color", "Key Color", "color").when("key_color_type", &[json!("custom")]),
+            opt("key_color", "Your colour", "color").when("key_color_type", &[json!("custom")]),
             opt("similarity", "Similarity", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("smoothness", "Smoothness", "int").range(1.0, 1000.0, 1.0).slider(),
             opt("opacity", "Opacity", "float").range(0.0, 1.0, 0.0001).slider(),
@@ -803,22 +817,22 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("contrast", "Contrast", "float").range(-4.0, 4.0, 0.01).slider(),
             opt("brightness", "Brightness", "float").range(-1.0, 1.0, 0.0001).slider(),
             opt("saturation", "Saturation", "float").range(-1.0, 5.0, 0.01).slider(),
-            opt("hue_shift", "Hue Shift", "float").range(-180.0, 180.0, 0.01).slider(),
+            opt("hue_shift", "Hue", "float").range(-180.0, 180.0, 0.01).slider(),
             opt("opacity", "Opacity", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("color_multiply", "Color Multiply", "color"),
-            opt("color_add", "Color Add", "color"),
+            opt("color_multiply", "Multiply by colour", "color"),
+            opt("color_add", "Add colour", "color"),
         ],
         "luma_key_filter" | "luma_key_filter_v2" => vec![
-            opt("luma_max", "Luma Max", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("luma_max_smooth", "Luma Max Smooth", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("luma_min", "Luma Min", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("luma_min_smooth", "Luma Min Smooth", "float").range(0.0, 1.0, 0.0001).slider(),
+            opt("luma_max", "Brightest kept", "float").range(0.0, 1.0, 0.0001).slider(),
+            opt("luma_max_smooth", "Bright edge softness", "float").range(0.0, 1.0, 0.0001).slider(),
+            opt("luma_min", "Darkest kept", "float").range(0.0, 1.0, 0.0001).slider(),
+            opt("luma_min_smooth", "Dark edge softness", "float").range(0.0, 1.0, 0.0001).slider(),
         ],
         "sharpness_filter" | "sharpness_filter_v2" => {
             vec![opt("sharpness", "Sharpness", "float").range(0.0, 1.0, 0.01).slider()]
         }
         "crop_filter" => vec![
-            opt("relative", "Relative", "bool"),
+            opt("relative", "Trim each edge", "bool"),
             opt("left", "Left", "int").range(-8192.0, 8192.0, 1.0),
             opt("top", "Top", "int").range(-8192.0, 8192.0, 1.0),
             // Relative trims all four edges; otherwise it keeps a box of a width and height.
@@ -829,56 +843,61 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         ],
         "mask_filter" | "mask_filter_v2" => vec![
             opt("type", "Type", "list").choices(&[
-                ("Alpha Mask (Alpha Channel)", json!("mask_alpha_filter.effect")),
-                ("Alpha Mask (Color Channel)", json!("mask_color_filter.effect")),
-                ("Blend (Multiply)", json!("blend_mul_filter.effect")),
-                ("Blend (Addition)", json!("blend_add_filter.effect")),
-                ("Blend (Subtraction)", json!("blend_sub_filter.effect")),
+                ("Cut out by its transparency", json!("mask_alpha_filter.effect")),
+                ("Cut out by its brightness", json!("mask_color_filter.effect")),
+                ("Darken (multiply)", json!("blend_mul_filter.effect")),
+                ("Lighten (add)", json!("blend_add_filter.effect")),
+                ("Subtract", json!("blend_sub_filter.effect")),
             ]),
-            opt("image_path", "Path", "path").file(IMAGES),
-            opt("color", "Color", "color"),
+            opt("image_path", "Image", "path").file(IMAGES),
+            opt("color", "Colour", "color"),
             opt("opacity", "Opacity", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("stretch", "Stretch Image (discard image aspect ratio)", "bool"),
+            opt("stretch", "Stretch to fill", "bool"),
         ],
         "clut_filter" => vec![
-            opt("image_path", "Path", "path").file("Image or cube files (*.png *.cube);;All Files (*.*)"),
+            opt("image_path", "Image", "path").file("Image or cube files (*.png *.cube);;All Files (*.*)"),
             opt("clut_amount", "Amount", "float").range(0.0, 1.0, 0.0001).slider(),
-            opt("passthrough_alpha", "Passthrough Alpha", "bool"),
+            opt("passthrough_alpha", "Keep transparency", "bool"),
         ],
         "scroll_filter" => vec![
-            opt("speed_x", "Horizontal Speed", "float").range(-500.0, 500.0, 1.0).slider(),
-            opt("speed_y", "Vertical Speed", "float").range(-500.0, 500.0, 1.0).slider(),
-            opt("limit_cx", "Limit Width", "bool"),
+            opt("speed_x", "Sideways", "float").range(-500.0, 500.0, 1.0).slider().unit(" px/s"),
+            opt("speed_y", "Up or down", "float").range(-500.0, 500.0, 1.0).slider().unit(" px/s"),
+            opt("limit_cx", "Limit width", "bool"),
             opt("cx", "Width", "int").range(1.0, 8192.0, 1.0).when("limit_cx", &[json!(true)]),
-            opt("limit_cy", "Limit Height", "bool"),
+            opt("limit_cy", "Limit height", "bool"),
             opt("cy", "Height", "int").range(1.0, 8192.0, 1.0).when("limit_cy", &[json!(true)]),
             opt("loop", "Loop", "bool"),
         ],
         "gain_filter" => vec![opt("db", "Gain", "float").range(-30.0, 30.0, 0.1).slider().unit(" dB")],
         "noise_gate_filter" => vec![
-            opt("close_threshold", "Close Threshold", "float").range(-96.0, 0.0, 0.1).slider().unit(" dB"),
-            opt("open_threshold", "Open Threshold", "float").range(-96.0, 0.0, 0.1).slider().unit(" dB"),
-            opt("attack_time", "Attack Time", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
-            opt("hold_time", "Hold Time", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
-            opt("release_time", "Release Time", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
+            opt("close_threshold", "Close below", "float").range(-96.0, 0.0, 0.1).slider().unit(" dB"),
+            opt("open_threshold", "Open above", "float").range(-96.0, 0.0, 0.1).slider().unit(" dB"),
+            opt("attack_time", "Attack", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
+            opt("hold_time", "Hold", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
+            opt("release_time", "Release", "int").range(0.0, 10000.0, 1.0).unit(" ms"),
         ],
         "compressor_filter" => vec![
             opt("ratio", "Ratio", "float").range(1.0, 32.0, 0.5).slider().unit(":1"),
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("attack_time", "Attack", "int").range(1.0, 500.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
-            opt("output_gain", "Output Gain", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
         ],
         "limiter_filter" => vec![
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
         ],
         "expander_filter" | "upward_compressor_filter" => vec![
-            opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1"),
+            // OBS's ranges: an expander's ratio is 1 to 20, an upward compressor's 0 to 1.
+            if kind == "upward_compressor_filter" {
+                opt("ratio", "Ratio", "float").range(0.0, 1.0, 0.01).slider().unit(":1")
+            } else {
+                opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1")
+            },
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("attack_time", "Attack", "int").range(1.0, 100.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
-            opt("output_gain", "Output Gain", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
         ],
         "basic_eq_filter" => vec![
             opt("low", "Low", "float").range(-20.0, 20.0, 0.1).slider().unit(" dB"),
@@ -895,23 +914,55 @@ pub fn options(kind: &str) -> Option<Vec<OptionInfo>> {
         // Picked from the plugins found (`GET …/vst/plugins`); its state is the plugin's own.
         "ferrocast_vst" => Vec::new(),
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
-            vec![opt("suppress_level", "Suppression Level", "int").range(-60.0, 0.0, 1.0).slider().unit(" dB")]
+            vec![opt("suppress_level", "How much", "int").range(-60.0, 0.0, 1.0).slider().unit(" dB")]
         }
         "ferrocast_rounded_corners" => {
             vec![opt("radius", "Radius", "int").range(0.0, 1000.0, 1.0).slider().unit(" px")]
         }
         "ferrocast_border" => vec![
             opt("width", "Width", "int").range(0.0, 200.0, 1.0).slider().unit(" px"),
-            opt("color", "Color", "color_alpha"),
+            opt("color", "Colour", "color_alpha"),
             opt("radius", "Radius", "int").range(0.0, 1000.0, 1.0).slider().unit(" px"),
         ],
         "ferrocast_shadow" => vec![
-            opt("x", "Offset X", "int").range(-200.0, 200.0, 1.0).unit(" px"),
-            opt("y", "Offset Y", "int").range(-200.0, 200.0, 1.0).unit(" px"),
+            opt("x", "Move right", "int").range(-200.0, 200.0, 1.0).unit(" px"),
+            opt("y", "Move down", "int").range(-200.0, 200.0, 1.0).unit(" px"),
             opt("blur", "Blur", "int").range(0.0, 200.0, 1.0).slider().unit(" px"),
-            opt("color", "Color", "color_alpha"),
+            opt("color", "Colour", "color_alpha"),
+            opt("outside", "Keep its size", "bool")
+                .hint("On: the shadow spills outside its box. Off: the picture shrinks to make room."),
         ],
-        "ferrocast_shape" | "ferrocast_blur_area" | "ferrocast_look" => Vec::new(),
+        "ferrocast_shape" => vec![
+            opt("shape", "Shape", "list").choices(&[
+                ("Circle", json!(0)),
+                ("Hexagon", json!(1)),
+                ("Diamond", json!(2)),
+                ("Star", json!(3)),
+                ("Heart", json!(4)),
+            ]),
+            opt("feather", "Soft edge", "int").range(0.0, 200.0, 1.0).slider().unit(" px"),
+            opt("stretch", "Stretch to fill", "bool"),
+        ],
+        "ferrocast_blur_area" => vec![
+            opt("mode", "Hide it with", "list").choices(&[("Blur", json!(0)), ("Pixels", json!(1))]),
+            opt("strength", "Strength", "int").range(1.0, 200.0, 1.0).slider().unit(" px"),
+            opt("area_x", "From the left", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
+            opt("area_y", "From the top", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
+            opt("area_w", "Width", "int").range(1.0, 100.0, 1.0).slider().unit("%"),
+            opt("area_h", "Height", "int").range(1.0, 100.0, 1.0).slider().unit("%"),
+        ],
+        "ferrocast_look" => vec![
+            opt("look", "Look", "list").choices(&[
+                ("Warm", json!(0)),
+                ("Cool", json!(1)),
+                ("Teal and orange", json!(2)),
+                ("Black and white", json!(3)),
+                ("Vintage", json!(4)),
+                ("Punchy", json!(5)),
+                ("Soft fade", json!(6)),
+            ]),
+            opt("strength", "Strength", "int").range(0.0, 100.0, 1.0).slider().unit("%"),
+        ],
         _ => return None,
     })
 }
@@ -1033,7 +1084,11 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ferrocast_rounded_corners" => json!({ "radius": 24 }),
         "ferrocast_border" => json!({ "width": 6, "color": 0xFFFF_FFFFu32, "radius": 0 }),
         "ferrocast_shadow" => json!({ "x": 0, "y": 8, "blur": 24, "color": 0x8000_0000u32 }),
-        "ferrocast_shape" | "ferrocast_blur_area" | "ferrocast_look" => json!({}),
+        "ferrocast_shape" => json!({ "shape": 0, "feather": 0, "stretch": false }),
+        "ferrocast_blur_area" => {
+            json!({ "mode": 0, "strength": 48, "area_x": 25, "area_y": 25, "area_w": 50, "area_h": 50 })
+        }
+        "ferrocast_look" => json!({ "look": 0, "strength": 100 }),
         _ => return None,
     })
 }
@@ -1139,7 +1194,9 @@ mod tests {
             for o in options(id).unwrap_or_default() {
                 assert!(
                     d.get(&o.key).is_some()
-                        || matches!(o.key.as_str(), "text_file" | "display" | "window" | "key_color" | "from_file"),
+                        // A shadow's `outside` is set when one is added, not a default: an older
+                        // one without it keeps fitting into its box.
+                        || matches!(o.key.as_str(), "text_file" | "display" | "window" | "key_color" | "from_file" | "outside"),
                     "{id}: {} has a default",
                     o.key
                 );

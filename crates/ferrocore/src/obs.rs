@@ -285,7 +285,8 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
             }
         }
         "upward_compressor_filter" => AudioEffect::UpwardCompressor {
-            ratio: n("ratio", 0.5),
+            // OBS takes 0 to 1 here; more boosts quiet sound past clipping.
+            ratio: n("ratio", 0.5).clamp(0.0, 1.0),
             threshold_db: n("threshold", -20.0),
             attack_ms: n("attack_time", 10.0),
             release_ms: n("release_time", 50.0),

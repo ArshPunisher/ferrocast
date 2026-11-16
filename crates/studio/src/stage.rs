@@ -2639,7 +2639,7 @@ impl Stage {
     /// Files sources and filters use that aren't there any more (OBS's Missing Files).
     pub fn missing_files(&self) -> Vec<crate::collection::MissingFile> {
         const KEYS: [(&str, &str); 4] =
-            [("file", "Image File"), ("local_file", "Local File"), ("image_path", "Path"), ("text_file", "Text File")];
+            [("file", "Image"), ("local_file", "File"), ("image_path", "Image"), ("text_file", "Text file")];
         let mut out = Vec::new();
         let mut check = |s: &Value, parent: Option<&str>| {
             for (k, label) in KEYS {
