@@ -1692,6 +1692,28 @@ impl Stage {
             o.choices = std::iter::once("Sound on air".to_string()).chain(heard.iter().cloned()).collect();
             o.values = std::iter::once(json!("")).chain(heard.into_iter().map(Value::from)).collect();
         }
+        // A camera or capture card: only the sizes and rates it really has (a USB card offered
+        // 4K sent a squeezed 1920×2160).
+        #[cfg(target_os = "macos")]
+        if let Some(id) = ferrocore::obs::camera_device(kind_of(&s), &s["settings"]) {
+            let modes = ferrocore::camera::modes(&id);
+            if !modes.is_empty() {
+                let size = s
+                    .pointer("/settings/resolution")
+                    .and_then(Value::as_str)
+                    .and_then(|r| r.split_once('x'))
+                    .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+                let fps = s.pointer("/settings/fps").and_then(Value::as_u64).unwrap_or(0);
+                let own = ferrocore::camera::own_size(&id);
+                let (sizes, rates) = crate::kinds::real_size_rate(&modes, size, fps, own);
+                for (key, list) in [("resolution", sizes), ("fps", rates)] {
+                    if let Some(o) = opts.iter_mut().find(|o| o.key == key) {
+                        o.choices = list.iter().map(|(l, _)| l.clone()).collect();
+                        o.values = list.into_iter().map(|(_, v)| v).collect();
+                    }
+                }
+            }
+        }
         // A clone picks from this collection: every other source, then the scenes.
         if kind_of(&s) == "ferrocast_clone"
             && let Some(o) = opts.iter_mut().find(|o| o.key == "clone")
@@ -1715,6 +1737,22 @@ impl Stage {
             }
             for (k, v) in new {
                 s["settings"][k] = v.clone();
+            }
+            // A camera's new size that can't reach its saved frame rate gets the best rate it
+            // can, so the form never says 50 while the card sends 30.
+            #[cfg(target_os = "macos")]
+            if new.contains_key("resolution")
+                && !new.contains_key("fps")
+                && let Some(id) = ferrocore::obs::camera_device(kind_of(s), &s["settings"])
+            {
+                let size = s["settings"]["resolution"]
+                    .as_str()
+                    .and_then(|r| r.split_once('x'))
+                    .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+                let fps = s["settings"]["fps"].as_u64().unwrap_or(0);
+                if let Some(to) = crate::kinds::reachable_rate(&ferrocore::camera::modes(&id), size, fps) {
+                    s["settings"]["fps"] = json!(to);
+                }
             }
         })
     }

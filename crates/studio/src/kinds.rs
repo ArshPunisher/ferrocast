@@ -303,7 +303,95 @@ fn camera_size_rate() -> [OptionInfo; 2] {
     ]
 }
 
-/// The running apps with a window or sound to capture, by name (their bundle ids kept).
+/// The rate to switch to when a camera's `size` can't reach the saved `fps`: the highest of the
+/// usual rates it does (0, its own, if none). None when nothing needs to change.
+pub fn reachable_rate(modes: &[(u32, u32, f64)], size: Option<(u32, u32)>, fps: u64) -> Option<u64> {
+    let (w, h) = size?;
+    let top = modes.iter().filter(|m| m.0 == w && m.1 == h).map(|m| m.2).fold(0.0, f64::max);
+    if fps == 0 || top <= 0.0 || fps as f64 <= top + 0.5 {
+        return None;
+    }
+    Some([120u64, 60, 50, 30, 25, 24].into_iter().find(|&r| r as f64 <= top + 0.5).unwrap_or(0))
+}
+
+/// A list's choices: each label and the value it saves.
+pub type Choices = Vec<(String, Value)>;
+
+/// A camera's Size and Frame rate lists from the modes it really has (width, height, top
+/// rate), so a capture card that sends at most 2560×1440 isn't offered 4K: its sizes, biggest
+/// first, and the usual rates the picked size (any, when none is) reaches. "Its own" first in
+/// both; a saved choice it doesn't list stays, so nothing changes under anyone.
+pub fn real_size_rate(
+    modes: &[(u32, u32, f64)],
+    size: Option<(u32, u32)>,
+    saved_fps: u64,
+    own: Option<(u32, u32)>,
+) -> (Choices, Choices) {
+    // 16:9 first, tallest first (the sizes people stream at), then the other usual shapes by
+    // size; none taller than 4:3 or wider than 2:1 (a card's 1920×2160 comes out squeezed).
+    let wide = |w: u32, h: u32| (f64::from(w) / f64::from(h) / (16.0 / 9.0) - 1.0).abs() <= 0.02;
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for m in modes {
+        let r = f64::from(m.0) / f64::from(m.1.max(1));
+        if m.0 >= 320 && (4.0 / 3.0 - 0.01..=2.0).contains(&r) && !sizes.contains(&(m.0, m.1)) {
+            sizes.push((m.0, m.1));
+        }
+    }
+    sizes.sort_by_key(|&(w, h)| (!wide(w, h), std::cmp::Reverse(u64::from(w) * u64::from(h)), std::cmp::Reverse(w)));
+    sizes.truncate(10);
+    if let Some(s) = size
+        && !sizes.contains(&s)
+    {
+        sizes.push(s);
+    }
+    let size_list = std::iter::once(("Its own".to_string(), json!("")))
+        .chain(sizes.iter().map(|(w, h)| (format!("{w}×{h}"), json!(format!("{w}x{h}")))))
+        .collect();
+    let top = modes.iter().filter(|m| size.is_none_or(|(w, h)| m.0 == w && m.1 == h)).map(|m| m.2).fold(0.0, f64::max);
+    let reach = |r: u64| r as f64 <= top + 0.5;
+    let mut rates: Vec<u64> = [24u64, 25, 30, 50, 60, 120].into_iter().filter(|&r| reach(r)).collect();
+    if saved_fps > 0 && !rates.contains(&saved_fps) {
+        rates.push(saved_fps);
+        rates.sort_unstable();
+    }
+    // With no size picked, a rate its own size doesn't reach says which size it takes (the
+    // biggest 16:9 mode that reaches it: 60 may mean 1360×768), as the camera picks.
+    let reaches_at = |(w, h): (u32, u32), r: u64| modes.iter().any(|m| m.0 == w && m.1 == h && m.2 + 0.5 >= r as f64);
+    let biggest = |r: u64| {
+        if let Some(o) = own
+            && reaches_at(o, r)
+        {
+            return Some(o);
+        }
+        modes
+            .iter()
+            .filter(|m| wide(m.0, m.1) && m.2 + 0.5 >= r as f64)
+            .max_by_key(|m| u64::from(m.0) * u64::from(m.1))
+            .map(|m| (m.0, m.1))
+    };
+    let full = own.or_else(|| biggest(0));
+    // A saved rate this size can't reach says what it gets instead.
+    let rate_list = std::iter::once(("Its own".to_string(), json!(0)))
+        .chain(rates.into_iter().map(|r| {
+            let label = if !reach(r) && top > 0.0 {
+                format!("{r} (this size goes to {})", top.round())
+            } else if size.is_none()
+                && let Some((w, h)) = biggest(r)
+                && Some((w, h)) != full
+            {
+                format!("{r} · {w}×{h}")
+            } else {
+                r.to_string()
+            };
+            (label, json!(r))
+        }))
+        .collect();
+    (size_list, rate_list)
+}
+
+/// The running apps with a window or sound to capture, by name (their bundle ids kept): the
+/// ones in the Dock, not macOS's helpers (loginwindow, WindowManager, "AutoFill (Google
+/// Chrome)"), which have nothing to capture.
 #[cfg(target_os = "macos")]
 fn app_choices() -> Vec<(String, Value)> {
     use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
@@ -962,6 +1050,59 @@ fn display_label(i: usize, d: &ferrocore::screen::Display, names: &std::collecti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_camera_is_offered_only_the_modes_it_has() {
+        // The owner's USB card: 2560×1440 at 30 at most, 1360×768 at 60, no 1080p60.
+        let card = [
+            (2560, 1440, 30.0),
+            (1920, 1080, 30.0),
+            (1360, 768, 60.0),
+            (1280, 720, 60.0),
+            (640, 480, 60.0),
+            (160, 120, 30.0),
+        ];
+        let (sizes, rates) = real_size_rate(&card, None, 0, None);
+        let labels: Vec<&str> = sizes.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Its own", "2560×1440", "1920×1080", "1360×768", "1280×720", "640×480"]);
+        assert_eq!(sizes[1].1, json!("2560x1440"));
+        // 16:9 first by size, then the rest; no squeezed or very wide modes.
+        let odd = [
+            (1920, 2160, 30.0),
+            (2560, 1600, 30.0),
+            (1280, 720, 60.0),
+            (1280, 1024, 60.0),
+            (4096, 1080, 30.0),
+            (1280, 720, 30.0),
+        ];
+        let (odd_sizes, _) = real_size_rate(&odd, None, 0, None);
+        let labels: Vec<&str> = odd_sizes.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Its own", "1280×720", "2560×1600"], "5:4 and 4096×1080 left out");
+        let labels: Vec<&str> = rates.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Its own", "24", "25", "30", "50 · 1360×768", "60 · 1360×768"], "smaller to reach it");
+        let rates: Vec<Value> = rates.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(rates, [json!(0), json!(24), json!(25), json!(30), json!(50), json!(60)]);
+        // 1080p only goes to 30 on it.
+        let (_, at) = real_size_rate(&card, Some((1920, 1080)), 0, None);
+        assert_eq!(at.last().map(|(_, v)| v.clone()), Some(json!(30)));
+        // A saved 4K and 60 it can't do stay listed.
+        let (sizes, at) = real_size_rate(&card, Some((3840, 2160)), 60, None);
+        assert!(sizes.iter().any(|(_, v)| v == "3840x2160"));
+        assert!(at.iter().any(|(_, v)| *v == json!(60)));
+        // A new size that can't reach the saved rate takes the best it can.
+        // Its own 1080p: rates it reaches there stay plain; 60 says where it goes.
+        let (_, at) = real_size_rate(&card, None, 0, Some((1920, 1080)));
+        let labels: Vec<&str> = at.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Its own", "24", "25", "30", "50 · 1360×768", "60 · 1360×768"]);
+        assert_eq!(reachable_rate(&card, Some((2560, 1440)), 50), Some(30));
+        assert_eq!(reachable_rate(&card, Some((1280, 720)), 50), None);
+        assert_eq!(reachable_rate(&card, None, 60), None);
+        assert_eq!(reachable_rate(&card, Some((2560, 1440)), 0), None);
+        // 1440p goes to 30 here: a saved 50 says so.
+        let (_, at) = real_size_rate(&card, Some((2560, 1440)), 50, None);
+        assert!(at.iter().any(|(l, v)| *v == json!(50) && l == "50 (this size goes to 30)"));
+    }
+
     use super::*;
 
     /// An option shown only for some values of another names one in its own form, with values

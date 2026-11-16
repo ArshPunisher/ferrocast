@@ -178,15 +178,93 @@ fn open(id: &str, video: bool) -> Result<Retained<AVCaptureDeviceInput>, AvError
     }
 }
 
+/// The sizes and top frame rates a camera (by its unique id) has: what its Size and Frame rate
+/// lists offer, so a capture card isn't offered a 4K it can't send. Empty when it isn't
+/// connected.
+pub fn modes(id: &str) -> Vec<(u32, u32, f64)> {
+    // SAFETY: looking a device up by id and reading its formats; nothing is set.
+    unsafe {
+        let Some(device) = AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(id)) else { return Vec::new() };
+        device
+            .formats()
+            .iter()
+            .map(|f| {
+                let d = CMVideoFormatDescriptionGetDimensions(&f.formatDescription());
+                let top = f.videoSupportedFrameRateRanges().iter().map(|r| r.maxFrameRate()).fold(0.0, f64::max);
+                (u32::try_from(d.width).unwrap_or(0), u32::try_from(d.height).unwrap_or(0), top)
+            })
+            .filter(|m| m.0 > 0 && m.1 > 0)
+            .collect()
+    }
+}
+
+/// Each camera's own size (its format before Ferrocast first changed it), by unique id: what
+/// "Its own" means for the rest of the run (AVFoundation keeps the last format set).
+/// Each camera's own size, by unique id.
+type OwnModes = std::collections::HashMap<String, (u32, u32)>;
+static OWN: std::sync::Mutex<Option<OwnModes>> = std::sync::Mutex::new(None);
+
+/// The camera's own size: noted the first time it's asked, before anything is set.
+/// The camera's own size: noted the first time it's asked, before anything is set. ("Its own"
+/// with nothing asked needs no help: the session's preset puts the camera's own mode back.)
+fn own_of(device: &AVCaptureDevice) -> Option<(u32, u32)> {
+    // SAFETY: reading the device's id and its active format.
+    let (id, now) = unsafe {
+        let d = CMVideoFormatDescriptionGetDimensions(&device.activeFormat().formatDescription());
+        (device.uniqueID().to_string(), (u32::try_from(d.width).ok()?, u32::try_from(d.height).ok()?))
+    };
+    if now.0 == 0 || now.1 == 0 {
+        return None;
+    }
+    let mut all = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    Some(*all.get_or_insert_with(Default::default).entry(id).or_insert(now))
+}
+
+/// A camera's own size (by unique id), as [`own_of`]; None when it isn't connected.
+pub fn own_size(id: &str) -> Option<(u32, u32)> {
+    // SAFETY: looking a device up by id.
+    let device = unsafe { AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(id)) }?;
+    own_of(&device)
+}
+
 /// The camera format to use for a size and frame rate asked: among `formats` (width, height,
 /// highest frame rate), the asked size that reaches the frame rate; else the asked size at its
 /// best rate; else the nearest size at or under it. None when nothing was asked, or no format.
-pub fn pick_format(formats: &[(u32, u32, f64)], size: Option<(u32, u32)>, fps: Option<u32>) -> Option<usize> {
+/// The asked size's shape comes before all that (16:9 when only a rate is asked): capture
+/// cards list odd modes like 1920×2160 or 1280×1024, which come out squeezed or cropped.
+pub fn pick_format(
+    formats: &[(u32, u32, f64)],
+    size: Option<(u32, u32)>,
+    fps: Option<u32>,
+    own: Option<(u32, u32)>,
+) -> Option<usize> {
     if size.is_none() && fps.is_none() {
         return None;
     }
+    // Only a rate asked: its own size when that reaches it ("Its own" with 30 kept a card's
+    // 1080p, not 1440p it only upscales to; review, 18 Nov).
+    if size.is_none()
+        && let Some((w, h)) = own
+    {
+        let want = f64::from(fps.unwrap_or(0));
+        let best = formats
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.0 == w && f.1 == h && f.2 + 0.01 >= want)
+            .max_by(|a, b| a.1.2.total_cmp(&b.1.2))
+            .map(|(i, _)| i);
+        if best.is_some() {
+            return best;
+        }
+    }
     let want_fps = f64::from(fps.unwrap_or(0));
     let area = |(w, h): (u32, u32)| u64::from(w) * u64::from(h);
+    // Within 2% of the shape asked.
+    let (aw, ah) = size.unwrap_or((16, 9));
+    let shaped = |f: &(u32, u32, f64)| {
+        let (a, b) = (f64::from(f.0) * f64::from(ah), f64::from(f.1) * f64::from(aw));
+        b > 0.0 && (a / b - 1.0).abs() <= 0.02
+    };
     // Closer in size first (never over it when a size was asked), then reaching the frame rate,
     // then the higher rate.
     formats
@@ -204,7 +282,7 @@ pub fn pick_format(formats: &[(u32, u32, f64)], size: Option<(u32, u32)>, fps: O
                 Some(_) => (size_of(a).cmp(&size_of(b)), reaches(a).cmp(&reaches(b))),
                 None => (reaches(a).cmp(&reaches(b)), size_of(a).cmp(&size_of(b))),
             };
-            first.then(second).then(a.2.total_cmp(&b.2))
+            shaped(a).cmp(&shaped(b)).then(first).then(second).then(a.2.total_cmp(&b.2))
         })
         .map(|(i, _)| i)
 }
@@ -228,7 +306,8 @@ fn configure(device: &AVCaptureDevice, spec: &CameraSpec) {
             .collect();
         (formats, list)
     };
-    let Some(i) = pick_format(&list, spec.size, spec.fps) else { return };
+    let own = own_of(device);
+    let Some(i) = pick_format(&list, spec.size, spec.fps, own) else { return };
     let Some(format) = formats.iter().nth(i) else { return };
     tracing::info!(
         asked = ?(spec.size, spec.fps),
@@ -414,31 +493,67 @@ mod tests {
 
     #[test]
     fn nothing_asked_keeps_the_cameras_own() {
-        assert_eq!(pick_format(&CAM, None, None), None);
+        assert_eq!(pick_format(&CAM, None, None, None), None);
     }
 
     #[test]
     fn the_asked_size_at_the_asked_rate() {
-        assert_eq!(pick_format(&CAM, Some((1280, 720)), Some(60)), Some(2));
-        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(30)), Some(3));
+        assert_eq!(pick_format(&CAM, Some((1280, 720)), Some(60), None), Some(2));
+        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(30), None), Some(3));
     }
 
     #[test]
     fn a_rate_it_cant_reach_still_gets_the_size() {
         // 1080p only goes to 30: the size wins, at its best rate.
-        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(60)), Some(3));
+        assert_eq!(pick_format(&CAM, Some((1920, 1080)), Some(60), None), Some(3));
     }
 
     #[test]
     fn a_size_it_doesnt_have_gets_the_nearest_under_it() {
-        assert_eq!(pick_format(&CAM, Some((1600, 900)), None), Some(2));
-        assert_eq!(pick_format(&CAM, Some((320, 240)), None), None);
+        assert_eq!(pick_format(&CAM, Some((1600, 900)), None, None), Some(2));
+        assert_eq!(pick_format(&CAM, Some((320, 240)), None, None), None);
     }
 
     #[test]
     fn only_a_rate_picks_the_biggest_that_reaches_it() {
-        assert_eq!(pick_format(&CAM, None, Some(60)), Some(2));
+        assert_eq!(pick_format(&CAM, None, Some(60), None), Some(2));
         // 30 is reached by 1080p, the biggest that does (4K only goes to 15).
-        assert_eq!(pick_format(&CAM, None, Some(30)), Some(3));
+        assert_eq!(pick_format(&CAM, None, Some(30), None), Some(3));
+    }
+
+    // Odd modes like a USB capture card's (the owner's, 17 Nov: 4K picked 1920×2160, squeezed,
+    // and 60 alone 1280×1024, cropped). Made-up lists around those; the real card has no
+    // 1080p60 and now gets 2560×1440 at 30 and 1360×768 at 60.
+    const CARD: [(u32, u32, f64); 6] = [
+        (1920, 2160, 30.0),
+        (1920, 1080, 30.0),
+        (1280, 1024, 60.0),
+        (1280, 720, 60.0),
+        (1920, 1080, 60.0),
+        (640, 480, 60.0),
+    ];
+
+    #[test]
+    fn the_shape_asked_comes_before_a_bigger_odd_mode() {
+        assert_eq!(pick_format(&CARD, Some((3840, 2160)), Some(30), None), Some(4));
+        assert_eq!(pick_format(&CARD, None, Some(60), None), Some(4));
+        let usb2 = &CARD[..4];
+        assert_eq!(pick_format(usb2, Some((3840, 2160)), Some(30), None), Some(1));
+        assert_eq!(pick_format(usb2, None, Some(60), None), Some(3));
+        // No mode of that shape: the old rules still pick one.
+        assert_eq!(pick_format(&[(1280, 1024, 60.0)], None, Some(60), None), Some(0));
+    }
+
+    /// "Its own" means the size the camera had: a rate it reaches there keeps it, one it
+    /// doesn't moves to the biggest 16:9 that does.
+    #[test]
+    fn its_own_size_is_kept_when_it_reaches_the_rate() {
+        let own = Some((1920, 1080));
+        assert_eq!(pick_format(&CARD, None, Some(30), own), Some(4), "1080p's best mode reaching 30");
+        let usb2 = &CARD[..4];
+        assert_eq!(pick_format(usb2, None, Some(30), own), Some(1));
+        assert_eq!(pick_format(usb2, None, Some(60), own), Some(3), "1080p doesn't reach 60 here");
+        assert_eq!(pick_format(usb2, None, None, own), None, "nothing asked: the session's preset keeps its own");
+        assert_eq!(pick_format(usb2, Some((1280, 720)), Some(30), own), Some(3), "a size asked wins");
     }
 }
