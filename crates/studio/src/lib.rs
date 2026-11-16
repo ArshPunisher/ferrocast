@@ -569,7 +569,7 @@ pub fn front_app() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
-        ws.frontmostApplication().and_then(|a| a.localizedName()).map(|n| n.to_string())
+        ws.frontmostApplication().and_then(|a| a.localizedName()).map(|n| ferrocore::obs::app_name(&n.to_string()))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -584,12 +584,15 @@ pub fn running_apps() -> Vec<String> {
     {
         use objc2_app_kit::NSApplicationActivationPolicy;
         let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
-        let me = objc2_app_kit::NSRunningApplication::currentApplication().localizedName().map(|n| n.to_string());
+        let me = objc2_app_kit::NSRunningApplication::currentApplication()
+            .localizedName()
+            .map(|n| ferrocore::obs::app_name(&n.to_string()));
         let mut names: Vec<String> = ws
             .runningApplications()
             .iter()
             .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
-            .filter_map(|a| a.localizedName().map(|n| n.to_string()))
+            .filter_map(|a| a.localizedName().map(|n| ferrocore::obs::app_name(&n.to_string())))
+            .filter(|n| !n.is_empty())
             .filter(|n| Some(n) != me.as_ref())
             .collect();
         names.sort_by_key(|n| n.to_lowercase());

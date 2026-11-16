@@ -2533,7 +2533,8 @@ impl Stage {
         }
         let mut apps: Vec<String> = Vec::new();
         for a in &list {
-            let a = a.as_str().map(str::trim).unwrap_or_default();
+            let a = ferrocore::obs::app_name(a.as_str().unwrap_or_default());
+            let a = a.as_str();
             if a.is_empty() || a.len() > 200 || a.chars().any(char::is_control) {
                 return Err(fail("hide_apps: app names or bundle ids."));
             }
@@ -4360,11 +4361,11 @@ mod tests {
         let s = stage();
         let mac = cfg!(target_os = "macos");
         assert_eq!(s.privacy(), json!({ "hide_notifications": true, "hide_apps": [], "supported": mac }));
-        s.set_privacy(&json!({ "hide_notifications": false, "hide_apps": ["Mail", " com.hnc.Discord ", "mail"] }))
+        s.set_privacy(&json!({ "hide_notifications": false, "hide_apps": ["Mail", " com.hnc.Discord ", "mail", "\u{200E}WhatsApp", "WhatsApp"] }))
             .unwrap();
-        let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord"], "supported": mac });
+        let kept = json!({ "hide_notifications": false, "hide_apps": ["Mail", "com.hnc.Discord", "WhatsApp"], "supported": mac });
         assert_eq!(s.privacy(), kept);
-        assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord"]);
+        assert_eq!(ferrocore::obs::privacy_hide(&s.doc.borrow()), vec!["Mail", "com.hnc.Discord", "WhatsApp"]);
         let many: Vec<String> = (0..33).map(|i| format!("App {i}")).collect();
         for b in [json!({ "hide_apps": [""] }), json!({ "hide_apps": [1] }), json!({ "hide_apps": many })] {
             assert!(s.set_privacy(&b).is_err(), "{b}");

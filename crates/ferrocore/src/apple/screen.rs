@@ -59,7 +59,11 @@ const PRIVACY_EVERY: Duration = Duration::from_millis(500);
 
 /// Whether `hide` (bundle ids or app names, any case) names this app.
 fn hides(hide: &[String], bundle: &str, name: &str) -> bool {
-    hide.iter().any(|h| h.eq_ignore_ascii_case(bundle) || (!name.is_empty() && h.eq_ignore_ascii_case(name)))
+    let name = crate::obs::app_name(name);
+    hide.iter().any(|h| {
+        let h = crate::obs::app_name(h);
+        h.eq_ignore_ascii_case(bundle) || (!name.is_empty() && h.to_lowercase() == name.to_lowercase())
+    })
 }
 
 /// The running apps `hide` names, and their process ids (to see when that changes).
@@ -207,7 +211,7 @@ pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
             .filter_map(|w| {
                 let title = w.title()?.to_string();
                 let owner = w.owningApplication()?;
-                let app = owner.applicationName().to_string();
+                let app = crate::obs::app_name(&owner.applicationName().to_string());
                 if title.trim().is_empty() || app.trim().is_empty() || owner.processID() == me {
                     return None;
                 }
@@ -228,7 +232,10 @@ pub fn apps() -> Result<Vec<App>, AvError> {
     let mut apps: Vec<App> = unsafe {
         c.applications()
             .iter()
-            .map(|a| App { id: a.bundleIdentifier().to_string(), name: a.applicationName().to_string() })
+            .map(|a| App {
+                id: a.bundleIdentifier().to_string(),
+                name: crate::obs::app_name(&a.applicationName().to_string()),
+            })
             .filter(|a| !a.id.is_empty())
             .collect()
     };
@@ -853,6 +860,14 @@ mod tests {
         assert!(hides(&hide, "com.apple.mail", "Mail"));
         assert!(!hides(&hide, "com.tinyspeck.slackmacgap", "Slack"));
         assert!(!hides(&["".into()], "com.apple.x", ""));
+    }
+
+    #[test]
+    fn an_app_whose_name_has_invisible_marks_is_still_found() {
+        // WhatsApp names itself U+200E then "WhatsApp"; the owner picks "WhatsApp".
+        assert!(hides(&["WhatsApp".into()], "net.whatsapp.WhatsApp", "\u{200E}WhatsApp"));
+        assert!(hides(&["\u{200E}whatsapp ".into()], "x.y", "WhatsApp"));
+        assert!(!hides(&["\u{200E}".into()], "x.y", "\u{200E}"));
     }
 
     #[test]

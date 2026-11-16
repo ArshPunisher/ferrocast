@@ -311,6 +311,18 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
 /// macOS's notification banners (and Notification Center, and the desktop's widgets), by bundle id.
 pub const NOTIFICATIONS: &str = "com.apple.notificationcenterui";
 
+/// An app's name without the invisible marks some apps put in it (WhatsApp's is U+200E then
+/// "WhatsApp"), trimmed: what names are shown and matched by, so "WhatsApp" finds it.
+pub fn app_name(name: &str) -> String {
+    name.chars()
+        .filter(
+            |c| !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'),
+        )
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// What a display capture leaves out, from the document's `ferrocast.privacy`: notifications
 /// (unless `hide_notifications` is false) and the apps in `hide_apps`.
 pub fn privacy_hide(doc: &Value) -> Vec<String> {

@@ -306,7 +306,21 @@ fn camera_size_rate() -> [OptionInfo; 2] {
 /// The running apps with a window or sound to capture, by name (their bundle ids kept).
 #[cfg(target_os = "macos")]
 fn app_choices() -> Vec<(String, Value)> {
-    ferrocore::screen::apps().map(|l| l.into_iter().map(|a| (a.name, json!(a.id))).collect()).unwrap_or_default()
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+    let docked: std::collections::HashSet<String> = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular)
+        .filter_map(|a| a.bundleIdentifier().map(|b| b.to_string()))
+        .collect();
+    ferrocore::screen::apps()
+        .map(|l| {
+            l.into_iter()
+                .filter(|a| docked.is_empty() || docked.contains(&a.id))
+                .map(|a| (a.name, json!(a.id)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Owned choices as the borrowed pairs `choices` takes.
