@@ -256,6 +256,10 @@ pub struct SourceUse {
     pub name: String,
     pub kind: String,
     pub scenes: Vec<String>,
+    /// A Mac screen capture's mode (0 a screen, 1 a window, 2 an app): what "use one you
+    /// already have" offers for a screen or a window. None for other kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<u64>,
 }
 
 /// A filter on a source, in order.

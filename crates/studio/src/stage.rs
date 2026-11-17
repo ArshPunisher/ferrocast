@@ -1635,7 +1635,9 @@ impl Stage {
                     })
                     .map(|sc| name_of(sc).to_string())
                     .collect();
-                SourceUse { kind: kind_of(s).to_string(), name, scenes }
+                let capture = (kind_of(s) == "screen_capture")
+                    .then(|| s.pointer("/settings/type").and_then(Value::as_u64).unwrap_or(0));
+                SourceUse { kind: kind_of(s).to_string(), name, scenes, capture }
             })
             .collect()
     }
