@@ -866,14 +866,16 @@ impl Stage {
         }
         let s = self.source(source).unwrap_or(Value::Null);
         let filters = s.get("filters").and_then(Value::as_array).cloned().unwrap_or_default();
-        filters
+        let effects: Vec<ferrocore::Effect> = filters
             .iter()
             .filter(|f| f.get("enabled").and_then(Value::as_bool) != Some(false))
             .filter_map(|f| {
                 let set = with_defaults(f);
                 ferrocore::obs::effect_from(kind_of(f), &set)
             })
-            .fold((w, h), |(w, h), e| e.out_size(w, h))
+            .collect();
+        // As the engine places it: a shadow drawn outside the box doesn't count.
+        ferrocore::Effect::placed_size(&effects, w, h)
     }
 
     /// The source's own picture size, before its filters, once our engine has one (else what
@@ -1872,6 +1874,11 @@ impl Stage {
             return Err(fail(format!("\"{name}\" already has a filter called \"{filter}\".")));
         }
         let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
+        // A new shadow spills past the box and the picture keeps its size. Not a default: an
+        // older one (without the key) keeps fitting into its box, as it always has.
+        if kind == "ferrocast_shadow" {
+            set["outside"] = json!(true);
+        }
         if let (Some(base), Some(given)) = (set.as_object_mut(), settings.as_object()) {
             for (k, v) in given {
                 base.insert(k.clone(), v.clone());
@@ -4392,6 +4399,20 @@ mod tests {
         // Off again.
         s.set_audio_care(&json!({})).unwrap();
         assert_eq!(s.audio_care(), json!({ "ducking": null, "loudness_lufs": null }));
+    }
+
+    /// A new shadow spills past the box: the item keeps its size (and its frame, the outline
+    /// and handles the preview draws). An older one, not outside, grows it as before.
+    #[test]
+    fn a_new_shadow_leaves_the_items_box_alone() {
+        let s = stage();
+        ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 200, "height": 100 }), false));
+        assert_eq!(s.size_of("C"), (200, 100));
+        s.add_filter("C", "ferrocast_shadow", "Shadow", &json!({ "blur": 30, "y": 0 }))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.size_of("C"), (200, 100), "outside: the box is the picture's");
+        s.update_filter("C", "Shadow", &json!({ "outside": false })).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.size_of("C"), (260, 160), "inside: grown by the shadow on every side");
     }
 
     #[test]

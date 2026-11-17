@@ -874,7 +874,20 @@ impl Compositor {
         if cw == 0 || ch == 0 {
             return Ok(());
         }
-        let m = draw_transform(p, w, h).then(parent);
+        // A shadow drawn outside the box: placed as the picture without it, the shadow around
+        // (as much of it as is left after the filters; `Effect::placed_size` uses the same).
+        let base = match &item.content {
+            Content::Picture(p) => (p.width, p.height),
+            Content::Uploaded { width, height, .. } => (*width, *height),
+            Content::Scene(s) => (s.width, s.height),
+            Content::Group { width, height, .. } => (*width, *height),
+        };
+        let [l, t, r, b] = Effect::outside_sides(&item.effects, base.0, base.1);
+        let m = if l + r + t + b > 0 && w > l + r && h > t + b {
+            Affine::translate(-(l as f32), -(t as f32)).then(&draw_transform(p, w - l - r, h - t - b)).then(parent)
+        } else {
+            draw_transform(p, w, h).then(parent)
+        };
         let texrender = p.crop.iter().any(|c| *c > 0)
             || item.filter != Filter::Disable
             || item.srgb_off
@@ -1044,7 +1057,7 @@ impl Compositor {
                 }
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
-                Effect::Shadow { rgba, blur, x, y } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], *rgba),
+                Effect::Shadow { rgba, blur, x, y, .. } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], *rgba),
                 Effect::Shape { shape, feather, stretch } => {
                     ("fs_shape", [*shape as f32, *feather, if *stretch { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], [0.0; 4])
                 }

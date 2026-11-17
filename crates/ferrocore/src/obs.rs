@@ -82,6 +82,7 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             blur: n("blur", 24.0),
             x: n("x", 0.0),
             y: n("y", 12.0),
+            outside: s.get("outside").and_then(Value::as_bool).unwrap_or(false),
         },
         "ferrocast_shape" => Effect::Shape {
             shape: n("shape", 0.0) as u32,

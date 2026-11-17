@@ -2035,7 +2035,8 @@ fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) 
         let (w, h) = match (&it.scene, it.group) {
             (Some(_), Some(size)) => size,
             (Some(_), None) => canvas,
-            (None, _) => st.sources.get(&it.source)?.size.map(|(w, h, _)| (w, h))?,
+            // Placed by its size after its filters, as it's drawn (a crop or a shadow).
+            (None, _) => st.sources.get(&it.source)?.size.map(|(w, h, _)| Effect::placed_size(&it.effects, w, h))?,
         };
         let a = crate::transform::draw_transform(&placement, w, h);
         let (cw, ch) = crate::transform::cropped(w, h, placement.crop);
@@ -3947,6 +3948,32 @@ mod tests {
         assert_eq!(corners(&e), [(300.0, 100.0), (500.0, 100.0), (500.0, 200.0), (300.0, 200.0)]);
         assert!(!e.set_item_placement("Main", 8, Placement::default()), "no such item: the long way");
         assert!(!e.set_item_placement("Other", 7, Placement::default()));
+    }
+
+    /// An outside Shadow spills past the box: the outline is the picture's own box, where it's
+    /// drawn, moved or not; an older one (not outside) is outlined with its shadow's room.
+    #[test]
+    fn an_outside_shadow_leaves_the_outline_on_the_picture() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 100, height: 50, rgba: [200, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let marks = crate::preview::Marks {
+            scene: None,
+            picked: Some(("Main".into(), vec![7])),
+            colors: vec![[1.0, 0.0, 0.0, 1.0]],
+        };
+        let corners = |e: &Engine, outside: bool, at: (f32, f32)| {
+            let mut it = SceneItem::new(1, Placement { x: at.0, y: at.1, ..Default::default() });
+            it.item_id = 7;
+            it.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 0.5], blur: 10.0, x: 0.0, y: 0.0, outside }];
+            e.set_scene("Main", vec![it]);
+            e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+            let st = e.lock();
+            outlines(&st, &marks, (640, 360), now_ns())[0].corners
+        };
+        assert_eq!(corners(&e, true, (10.0, 20.0)), [(10.0, 20.0), (110.0, 20.0), (110.0, 70.0), (10.0, 70.0)]);
+        assert_eq!(corners(&e, true, (300.0, 100.0)), [(300.0, 100.0), (400.0, 100.0), (400.0, 150.0), (300.0, 150.0)]);
+        assert_eq!(corners(&e, false, (10.0, 20.0))[2], (130.0, 90.0), "grown by 10 on every side");
     }
 
     /// A source picked inside a group is outlined on the canvas, through its group, with

@@ -205,6 +205,9 @@ pub enum Effect {
         blur: f32,
         x: f32,
         y: f32,
+        /// The shadow spills past the item's box and the picture keeps its size (new filters);
+        /// off, the grown picture is fitted into the box, so the picture shrinks (as before).
+        outside: bool,
     },
     /// 0 circle, 1 hexagon, 2 diamond, 3 star, 4 heart.
     Shape {
@@ -371,6 +374,46 @@ impl Effect {
                 | Self::Lut { .. }
                 | Self::Scroll { .. }
         )
+    }
+
+    /// How far what draws outside the box (an outside Shadow) still reaches past the picture
+    /// after all of `effects`, on each side (left, top, right, bottom), from the picture's size
+    /// `w`×`h` before them: a later Crop takes off what it cuts (review: a 10 px shadow, then a
+    /// 10 px crop, is back to the picture alone).
+    pub fn outside_sides(effects: &[Effect], w: u32, h: u32) -> [u32; 4] {
+        let (mut w, mut h) = (i64::from(w), i64::from(h));
+        let mut sides = [0i64; 4];
+        for e in effects {
+            let (nw, nh) = e.out_size(w as u32, h as u32);
+            let (nw, nh) = (i64::from(nw), i64::from(nh));
+            match e {
+                Self::Shadow { outside: true, .. } => {
+                    for s in &mut sides {
+                        *s += i64::from(e.pad());
+                    }
+                }
+                Self::Crop { left, top, .. } => {
+                    let (l, t) = (i64::from(*left), i64::from(*top));
+                    for (s, cut) in sides.iter_mut().zip([l, t, w - l - nw, h - t - nh]) {
+                        *s = (*s - cut.max(0)).max(0);
+                    }
+                }
+                // A scroll's own size: what's outside is no longer at its edges.
+                Self::Scroll { width, height, .. } if width.is_some() || height.is_some() => sides = [0; 4],
+                _ => {}
+            }
+            (w, h) = (nw, nh);
+        }
+        sides.map(|s| u32::try_from(s).unwrap_or(0))
+    }
+
+    /// The size an item is placed by, from its picture's size `w`×`h` before `effects`: what
+    /// they make of it, less what draws outside the box (an outside Shadow). The drawing, the
+    /// preview's outlines and the item's frame all use this, so they can't drift apart.
+    pub fn placed_size(effects: &[Effect], w: u32, h: u32) -> (u32, u32) {
+        let (ow, oh) = effects.iter().fold((w, h), |(w, h), e| e.out_size(w, h));
+        let [l, t, r, b] = Self::outside_sides(effects, w, h);
+        if l + r + t + b > 0 && ow > l + r && oh > t + b { (ow - l - r, oh - t - b) } else { (ow, oh) }
     }
 
     /// How far it draws past the picture on every side, in pixels.
@@ -570,4 +613,34 @@ pub struct Scene {
     pub width: u32,
     pub height: u32,
     pub items: Vec<Item>,
+}
+
+#[cfg(test)]
+mod placed {
+    use super::Effect;
+
+    fn shadow(outside: bool) -> Effect {
+        Effect::Shadow { rgba: [0.0, 0.0, 0.0, 0.5], blur: 10.0, x: 0.0, y: 0.0, outside }
+    }
+
+    fn crop(n: i32) -> Effect {
+        Effect::Crop { left: n, top: n, right: n, bottom: n, size: None }
+    }
+
+    /// An outside shadow keeps the item's box; a crop after it that cuts the shadow off takes
+    /// it out of the reckoning too, so the picture isn't shrunk and moved for padding gone.
+    #[test]
+    fn what_reaches_outside_is_counted_after_every_filter() {
+        assert_eq!(Effect::placed_size(&[shadow(true)], 100, 100), (100, 100));
+        assert_eq!(Effect::outside_sides(&[shadow(true)], 100, 100), [10; 4]);
+        assert_eq!(Effect::placed_size(&[shadow(false)], 100, 100), (120, 120));
+        // Shadow then a 10 px crop: back to the picture alone, nothing outside.
+        assert_eq!(Effect::outside_sides(&[shadow(true), crop(10)], 100, 100), [0; 4]);
+        assert_eq!(Effect::placed_size(&[shadow(true), crop(10)], 100, 100), (100, 100));
+        // A 4 px crop leaves 6 px of shadow outside on each side.
+        assert_eq!(Effect::outside_sides(&[shadow(true), crop(4)], 100, 100), [6; 4]);
+        assert_eq!(Effect::placed_size(&[shadow(true), crop(4)], 100, 100), (100, 100));
+        // A crop into the picture after the shadow: all of the shadow goes, the box shrinks.
+        assert_eq!(Effect::placed_size(&[shadow(true), crop(20)], 100, 100), (80, 80));
+    }
 }
