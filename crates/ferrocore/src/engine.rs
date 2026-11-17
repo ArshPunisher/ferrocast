@@ -1950,6 +1950,38 @@ impl Engine {
         self.gpu.render(&Scene { width: w, height: h, items: vec![item] }).ok()
     }
 
+    /// One source's picture with its filters (as any of its items in a scene has them; a
+    /// source's filters are the same wherever it's shown), scaled to `size`, RGBA: the drawer's
+    /// "with filters" look. As [`Self::snapshot_source_at`] when it's in no scene.
+    pub fn snapshot_source_filtered(&self, id: u64, size: (u32, u32)) -> Option<Vec<u8>> {
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let item = {
+            let mut st = self.lock();
+            send_pending(&mut st, &self.gpu);
+            st.sources.get(&id)?.size?;
+            let effects = st
+                .scenes
+                .values()
+                .flatten()
+                .find(|i| i.source == id && i.scene.is_none())
+                .map(|i| i.effects.clone())
+                .unwrap_or_default();
+            let mut one = SceneItem::new(
+                id,
+                Placement {
+                    bounds: crate::Bounds::Fit,
+                    bounds_width: w as f32,
+                    bounds_height: h as f32,
+                    ..Default::default()
+                },
+            );
+            one.filter = Filter::Bilinear;
+            one.effects = effects;
+            item_of(&st, &one, 0, (w, h))?
+        };
+        self.gpu.render(&Scene { width: w, height: h, items: vec![item] }).ok()
+    }
+
     /// The scene on air drawn now, RGBA (a preview or a screenshot).
     pub fn snapshot(&self) -> Result<Vec<u8>, AvError> {
         let frame = {
@@ -4505,6 +4537,59 @@ mod tests {
         one.effects = effects;
         let two = SceneItem::new(2, Placement { x: 320.0, ..Placement::default() });
         e.set_scene("Main", vec![one, two]);
+    }
+
+    /// A shadow drawn outside the box leaves the picture its size; an older one (not outside)
+    /// is fitted into the box with the picture, which shrinks.
+    #[test]
+    fn a_shadow_outside_keeps_the_picture_its_size() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        let corner = |outside: bool| {
+            let mut it = SceneItem::new(
+                1,
+                Placement {
+                    x: 100.0,
+                    y: 100.0,
+                    bounds: crate::Bounds::Fit,
+                    bounds_width: 320.0,
+                    bounds_height: 180.0,
+                    ..Placement::default()
+                },
+            );
+            it.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 0.0], blur: 40.0, x: 0.0, y: 0.0, outside }];
+            e.set_scene("Main", vec![it]);
+            e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+            e.fed(1).unwrap_or_else(|| panic!("fed")).picture(Picture::solid(64, 36, [255, 0, 0, 255]));
+            std::thread::sleep(Duration::from_millis(150));
+            let px = e.snapshot().unwrap_or_default();
+            // Just inside the box's top-left corner (canvas 640 wide).
+            let at = 4 * (103 * 640 + 103);
+            px[at..at + 4].to_vec()
+        };
+        assert_eq!(corner(true)[0], 255, "the picture fills its box");
+        assert!(corner(false)[0] < 128, "fitted with its shadow, it starts further in");
+    }
+
+    /// The drawer's "with filters" picture has the source's filters on; the plain one doesn't.
+    #[test]
+    fn a_source_picture_with_its_filters() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        }
+        // Black and white, fully.
+        freeze_scene(&e, vec![Effect::Look { look: 3, strength: 100.0 }]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        e.fed(1).unwrap_or_else(|| panic!("fed")).picture(Picture::solid(64, 36, [220, 30, 30, 255]));
+        std::thread::sleep(Duration::from_millis(150));
+        let plain = e.snapshot_source_at(1, (16, 9)).unwrap_or_default();
+        let with = e.snapshot_source_filtered(1, (16, 9)).unwrap_or_default();
+        let at = 4 * (4 * 16 + 8);
+        assert!(plain[at] > 150 && plain[at + 1] < 80, "plain is red: {:?}", &plain[at..at + 4]);
+        let (r, g, b) = (i32::from(with[at]), i32::from(with[at + 1]), i32::from(with[at + 2]));
+        assert!((r - g).abs() < 12 && (g - b).abs() < 12, "grey with its filter: {r} {g} {b}");
+        assert!(e.snapshot_source_filtered(9, (16, 9)).is_none(), "no such source");
     }
 
     #[test]

@@ -1006,7 +1006,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::SourceStatus { .. } | A::ScreenStill { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
             Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
         }
-        A::SourcePicture { name, width } => Ok(match c.source_picture_pixels(&name, width)? {
+        A::SourcePicture { name, width, filters } => Ok(match c.source_picture_pixels(&name, width, filters)? {
             Some((px, w, h, (sw, sh))) => {
                 json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
             }
@@ -1747,6 +1747,31 @@ impl StudioHost for DesktopStudio {
             #[cfg(target_os = "macos")]
             {
                 use ferrocore::screen::{Target, still};
+                type Kept = std::collections::HashMap<(bool, u32, u32), (std::time::Instant, Option<String>)>;
+                // Each still starts a ScreenCaptureKit stream: two at a time (a window list of
+                // 30 asked at once ran over their time and kept their icons), and one taken
+                // in the last seconds is given again (the dialog opened again).
+                static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+                static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+                const KEEP: std::time::Duration = std::time::Duration::from_secs(5);
+                let key = (window, id, width);
+                let kept = |k| {
+                    KEPT.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_default()
+                        .get(&k)
+                        .filter(|(at, _)| at.elapsed() < KEEP)
+                        .map(|(_, i)| i.clone())
+                };
+                if let Some(image) = kept(key) {
+                    return Ok(json!({ "image": image }));
+                }
+                let _turn =
+                    TURNS.get_or_init(|| tokio::sync::Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
+                // Taken by another ask while this one waited its turn.
+                if let Some(image) = kept(key) {
+                    return Ok(json!({ "image": image }));
+                }
                 let target = if window { Target::Window(id) } else { Target::Display(id) };
                 let image = tokio::task::spawn_blocking(move || {
                     still(target, width)
@@ -1755,6 +1780,10 @@ impl StudioHost for DesktopStudio {
                 })
                 .await
                 .map_err(|e| e.to_string())?;
+                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let all = all.get_or_insert_default();
+                all.retain(|_, (at, _)| at.elapsed() < KEEP);
+                all.insert(key, (std::time::Instant::now(), image.clone()));
                 return Ok(json!({ "image": image }));
             }
             #[cfg(not(target_os = "macos"))]
@@ -1792,6 +1821,21 @@ impl StudioHost for DesktopStudio {
                         .await
                         .map_err(|e| e.to_string())?;
                     json!({ "page": { "ok": r.is_ok(), "error": r.err() } })
+                }
+                // An app capture: the displays the app shows windows on, so the drawer can say
+                // when it has none on the one picked (the picture is then empty).
+                #[cfg(target_os = "macos")]
+                "screen_capture" if settings.get("type").and_then(Value::as_u64) == Some(2) => {
+                    let app = text("application");
+                    if app.is_empty() {
+                        json!({})
+                    } else {
+                        let on = tokio::task::spawn_blocking(move || ferrocore::screen::app_displays(&app))
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .unwrap_or_default();
+                        json!({ "app_on": on })
+                    }
                 }
                 _ => json!({}),
             });
@@ -1851,12 +1895,12 @@ impl StudioHost for DesktopStudio {
         // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
         // milliseconds there, and the scene grid asks for one every few seconds).
         // A source's own picture (the crop editor's): the same, without its filters.
-        if let StudioAct::SourcePicture { name, width } = &act {
-            let (n, w) = (name.clone(), *width);
+        if let StudioAct::SourcePicture { name, width, filters } = &act {
+            let (n, w, f) = (name.clone(), *width, *filters);
             let got = self
                 .on_main(move |h| -> Result<_, String> {
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    c.source_picture_pixels(&n, w).map_err(|e| e.to_string())
+                    c.source_picture_pixels(&n, w, f).map_err(|e| e.to_string())
                 })
                 .await??;
             let Some((px, pw, ph, (sw, sh))) = got else { return Ok(json!({ "image": null })) };

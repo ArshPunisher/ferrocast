@@ -1989,6 +1989,7 @@ impl Stage {
         &self,
         name: &str,
         width: u32,
+        filters: bool,
     ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
         self.source(name)?;
         let e = self.engine()?;
@@ -2005,7 +2006,12 @@ impl Stage {
             h = 640;
         }
         let (w, h) = (w as u32, h as u32);
-        Ok(e.engine.snapshot_source_at(id, (w, h)).map(|px| (px, w, h, (sw, sh))))
+        let px = if filters {
+            e.engine.snapshot_source_filtered(id, (w, h))
+        } else {
+            e.engine.snapshot_source_at(id, (w, h))
+        };
+        Ok(px.map(|px| (px, w, h, (sw, sh))))
     }
 
     /// A scene's picture `width` wide as RGBA pixels (with its height): the drawing, which needs

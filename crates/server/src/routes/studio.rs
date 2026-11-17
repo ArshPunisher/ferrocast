@@ -1176,14 +1176,23 @@ async fn engine_vst_act(
     act(&app, StudioAct::Vst { name, filter, what: b.what }).await
 }
 
-/// `GET …/sources/{name}/picture?w=256` → `{ image, width, height }`: the source's own picture
-/// now, before its filters (the crop editor and filter previews draw on it).
+/// `GET …/sources/{name}/picture?w=256[&filters=true]` → `{ image, width, height }`: the
+/// source's own picture now, before its filters (the crop editor and filter previews draw on
+/// it), or with them (the drawer's result).
 async fn engine_source_picture(
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Query(q): Query<ThumbQuery>,
+    Query(q): Query<PictureQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::SourcePicture { name, width: q.w }).await
+    act(&app, StudioAct::SourcePicture { name, width: q.w, filters: q.filters }).await
+}
+
+#[derive(Deserialize)]
+struct PictureQuery {
+    #[serde(default = "thumb_width")]
+    w: u32,
+    #[serde(default)]
+    filters: bool,
 }
 
 #[derive(Deserialize)]

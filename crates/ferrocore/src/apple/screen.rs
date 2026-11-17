@@ -244,6 +244,41 @@ pub fn apps() -> Result<Vec<App>, AvError> {
     Ok(apps)
 }
 
+/// The displays an app (by bundle id, any case) has windows showing on now, by the middle of
+/// each window: an app capture of another display shows nothing, and this says where to look.
+pub fn app_displays(bundle: &str) -> Result<Vec<u32>, AvError> {
+    let c = content()?;
+    // SAFETY: reading properties of the live content's displays and windows.
+    unsafe {
+        let displays: Vec<(u32, objc2_core_foundation::CGRect)> =
+            c.displays().iter().map(|d| (d.displayID(), d.frame())).collect();
+        let mut out: Vec<u32> = c
+            .windows()
+            .iter()
+            .filter(|w| w.windowLayer() == 0 && w.isOnScreen())
+            .filter(|w| {
+                w.owningApplication().is_some_and(|a| a.bundleIdentifier().to_string().eq_ignore_ascii_case(bundle))
+            })
+            .filter_map(|w| {
+                let f = w.frame();
+                let (x, y) = (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
+                displays
+                    .iter()
+                    .find(|(_, d)| {
+                        x >= d.origin.x
+                            && x < d.origin.x + d.size.width
+                            && y >= d.origin.y
+                            && y < d.origin.y + d.size.height
+                    })
+                    .map(|(id, _)| *id)
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+}
+
 /// What the stream's output keeps: the newest frame and how many came, and the sound
 /// (interleaved stereo float at 48 kHz, each piece with its host time) when it's captured.
 #[derive(Debug, Default)]

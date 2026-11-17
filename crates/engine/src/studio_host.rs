@@ -1498,6 +1498,9 @@ pub enum StudioAct {
     SourcePicture {
         name: String,
         width: u32,
+        /// With its filters on (the drawer's result), as it shows in a scene.
+        #[serde(default)]
+        filters: bool,
     },
     /// How a source is doing, for its drawer → `{ web_text?: { at_ms, value, error } | null }`
     /// for a Web text (its last read), `{ page?: { ok, error } }` for a Browser source on the
@@ -1794,7 +1797,7 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::Thumbnail { scene: name, width } | A::SourcePicture { name, width } => {
+            A::Thumbnail { scene: name, width } | A::SourcePicture { name, width, .. } => {
                 check_source_name(name)?;
                 if !(64..=640).contains(width) {
                     return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
