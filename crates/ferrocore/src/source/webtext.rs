@@ -38,8 +38,27 @@ pub fn set_fetcher(f: Fetcher) {
 }
 
 fn fetch(url: &str) -> Result<String, String> {
+    address_ok(url)?;
     let f = *FETCHER.read().unwrap_or_else(|e| e.into_inner());
     f.ok_or_else(|| "this app can't read web addresses".to_string())?(url)
+}
+
+/// Why `url` can't be read before asking anyone (the web client's own words, "builder error",
+/// say nothing): none yet (a new source starts at "https://"), or not a web address.
+fn address_ok(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    // "HTTPS://" (a phone's capital) is still one.
+    let scheme = |p: &str| u.get(..p.len()).filter(|s| s.eq_ignore_ascii_case(p)).map(|_| &u[p.len()..]);
+    let rest = scheme("https://").or_else(|| scheme("http://"));
+    match rest {
+        Some(r) if r.trim_start_matches('/').is_empty() => Err("add an address to read from".into()),
+        None if u.is_empty() => Err("add an address to read from".into()),
+        None => Err("that isn't a web address (it starts with https://)".into()),
+        Some(r) if r.starts_with(['/', ':', '?', '#']) || r.contains(char::is_whitespace) => {
+            Err("that isn't a web address (it starts with https://)".into())
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// Whether an address answers (a page a Browser source would show): Ok, or why not ("404",
@@ -194,6 +213,24 @@ mod tests {
         assert_eq!(pick("\"quoted\"", "").as_deref(), Some("quoted"));
         // Long replies are cut.
         assert_eq!(pick(&"x".repeat(10_000), "").map(|s| s.chars().count()), Some(MOST));
+    }
+
+    #[test]
+    fn an_empty_or_odd_address_says_why_before_reading() {
+        for (u, why) in [
+            ("", "add an address"),
+            ("https://", "add an address"),
+            ("  http:// ", "add an address"),
+            ("example.com", "isn't a web address"),
+            ("https:// x.com", "isn't a web address"),
+            ("ftp://x.com", "isn't a web address"),
+        ] {
+            assert!(address_ok(u).unwrap_err().contains(why), "{u}");
+        }
+        assert!(address_ok("https://api.example.com/x?a=1").is_ok());
+        assert!(address_ok("http://127.0.0.1:8080/v").is_ok());
+        assert!(address_ok("HTTPS://Example.com").is_ok());
+        assert!(address_ok("Https://").unwrap_err().contains("add an address"));
     }
 
     #[test]
