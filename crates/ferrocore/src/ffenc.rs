@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::AvError;
@@ -222,6 +222,22 @@ impl Proc {
         Ok(())
     }
 
+    /// As [`Self::write`], but never waits: false when FFmpeg is a whole queue behind (the frame
+    /// is left out). The frame loop waited here, with the engine's lock held, whenever a software
+    /// encoder couldn't keep up: the preview froze, the sound wasn't mixed and every other
+    /// output stalled with it.
+    fn try_write(&mut self, bytes: Vec<u8>) -> Result<bool, AvError> {
+        let w = self.stdin.as_ref().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
+        if self.broken.load(Ordering::Acquire) {
+            return Err(self.died());
+        }
+        match w.try_send(bytes) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => Err(self.died()),
+        }
+    }
+
     /// Ends FFmpeg's input once what's queued is written.
     fn close_input(&mut self) {
         self.stdin = None;
@@ -277,6 +293,9 @@ pub(crate) struct Video {
     next: Option<Proc>,
     /// The parameter sets to put in front of the next keyframe (the header changed).
     inline: Option<Vec<u8>>,
+    /// Frames left out because the encoder was behind (OBS's "skipped frames due to encoding
+    /// lag").
+    pub(crate) skipped: u64,
 }
 
 impl std::fmt::Debug for Video {
@@ -306,6 +325,7 @@ impl Video {
             cfg: *cfg,
             next: None,
             inline: None,
+            skipped: 0,
         })
     }
 
@@ -500,8 +520,16 @@ impl Video {
             }
             self.inline = old_header;
         }
-        self.times.push_back(pts_us);
-        self.proc.write(raw)?;
+        // Each packet gets its time from `times` in order, so a frame left out is just missing:
+        // nothing after it moves.
+        if self.proc.try_write(raw)? {
+            self.times.push_back(pts_us);
+        } else {
+            self.skipped += 1;
+            if self.skipped.is_power_of_two() {
+                tracing::warn!(encoder = %self.name, skipped = self.skipped, "the encoder is behind: frames left out");
+            }
+        }
         out.extend(self.take(self.proc.tags.try_iter().collect()));
         Ok(out)
     }
@@ -645,5 +673,34 @@ mod tests {
         // A stream keeps its steady bitrate.
         let cbr = args(&cfg(RateControl::Cbr), "h264_nvenc");
         assert!(has(&cbr, ["-b:v", "6000k"]) && has(&cbr, ["-rc", "cbr"]));
+    }
+
+    /// FFmpeg a whole queue behind (here: reading one frame a second) never holds the caller up:
+    /// frames are left out instead (the frame loop waited, with the engine's lock held).
+    #[test]
+    fn a_slow_encoder_never_holds_the_frame_loop() {
+        if ffmpeg().is_none() {
+            return;
+        }
+        let args: Vec<String> = [
+            "-re", "-f", "rawvideo", "-pix_fmt", "nv12", "-s", "64x64", "-r", "1", "-i", "pipe:0", "-f", "flv",
+            "pipe:1",
+        ]
+        .map(String::from)
+        .to_vec();
+        let chunk = 64 * 64 * 3 / 2;
+        let Ok(mut p) = Proc::spawn(&args, chunk) else { return };
+        let t = std::time::Instant::now();
+        let mut left_out = 0;
+        for _ in 0..300 {
+            if !p.try_write(vec![0u8; chunk]).unwrap_or(true) {
+                left_out += 1;
+            }
+        }
+        let took = t.elapsed();
+        eprintln!("{left_out} of 300 left out, in {took:?}");
+        assert!(took < std::time::Duration::from_secs(1), "never waited: {took:?}");
+        assert!(left_out > 100, "frames left out instead: {left_out}");
+        let _ = p.child.kill();
     }
 }
