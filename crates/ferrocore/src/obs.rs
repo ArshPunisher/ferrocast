@@ -999,6 +999,26 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 out.skipped.push(format!("{name}: the filter {kind}"));
             }
         }
+        // Noise removal twice (OBS's Noise Suppression, which runs the strong one here, and
+        // Strong noise removal on the same mic): run once, at the stronger setting. Two in a
+        // row cleaned no more and held the voice back twice as long, and the whole mix waited
+        // for it (165 ms, 18 Nov).
+        let strongest = sound_effects
+            .iter()
+            .filter_map(|e| if let AudioEffect::Denoise { strength } = e { Some(*strength) } else { None })
+            .max();
+        if let Some(most) = strongest {
+            let mut kept = false;
+            sound_effects.retain_mut(|e| match e {
+                AudioEffect::Denoise { strength } if !kept => {
+                    kept = true;
+                    *strength = most;
+                    true
+                }
+                AudioEffect::Denoise { .. } => false,
+                _ => true,
+            });
+        }
         // A device another source already opens is shown as a copy of that one (its picture,
         // this one's own filters): opened twice, a capture card stopped for both and wouldn't
         // open again (17 Nov). Same webcam twice in an OBS collection, or brought back by undo.
@@ -1617,5 +1637,22 @@ mod tests {
         let main = &got.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default();
         assert_eq!(main.len(), 1, "the backup copy is left out");
         assert_eq!((main[0].scene.as_deref(), main[0].group), (Some("Pair"), Some((120, 80))));
+    }
+
+    /// Noise removal twice on one mic runs once, at the stronger setting.
+    #[test]
+    fn noise_removal_twice_runs_once() {
+        let doc = serde_json::json!({ "sources": [
+            { "id": "coreaudio_input_capture", "name": "Mic", "settings": { "device_id": "default" },
+              "filters": [
+                { "id": "noise_suppress_filter_v2", "name": "A", "settings": { "method": "denoiser" } },
+                { "id": "gain_filter", "name": "G", "settings": { "db": 3.0 } },
+                { "id": "ferrocast_deepfilter", "name": "B", "settings": { "strength": 40 } } ] },
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } } ] });
+        let got = import(&doc, (1920, 1080));
+        let Some(mic) = got.sources.iter().find(|s| s.name == "Mic") else { return };
+        let denoise: Vec<_> = mic.sound_effects.iter().filter(|e| matches!(e, AudioEffect::Denoise { .. })).collect();
+        assert_eq!(denoise.len(), 1, "{:?}", mic.sound_effects);
+        assert_eq!(mic.sound_effects.len(), 2, "the gain stays");
     }
 }
