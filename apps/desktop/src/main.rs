@@ -11,6 +11,9 @@
 // Debug builds of the whole app are big enough that macOS's linker notes its unwind table can't
 // be compact ("__eh_frame section too large"): harmless, and CI turns warnings into errors.
 #![allow(linker_messages)]
+// Proving a drawing job Send goes deep through wgpu's types (pictures drawn off the
+// window's thread).
+#![recursion_limit = "256"]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

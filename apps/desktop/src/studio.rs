@@ -1899,33 +1899,40 @@ impl StudioHost for DesktopStudio {
         // A source's own picture (the crop editor's): the same, without its filters.
         if let StudioAct::SourcePicture { name, width, filters } = &act {
             let (n, w, f) = (name.clone(), *width, *filters);
-            let got = self
+            // Only what's needed is read on the main thread; the drawing, the read back from the
+            // graphics card and the PNG happen off it (they held the window up each time).
+            let job = self
                 .on_main(move |h| -> Result<_, String> {
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    c.source_picture_pixels(&n, w, f).map_err(|e| e.to_string())
+                    c.source_picture_job(&n, w, f).map_err(|e| e.to_string())
                 })
                 .await??;
-            let Some((px, pw, ph, (sw, sh))) = got else { return Ok(json!({ "image": null })) };
+            let Some(job) = job else { return Ok(json!({ "image": null })) };
             let name = name.clone();
-            let image = tokio::task::spawn_blocking(move || ferrocast_studio::png_data_url(&px, pw, ph, &name))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let got = tokio::task::spawn_blocking(move || {
+                job().map(|(px, pw, ph, size)| ferrocast_studio::png_data_url(&px, pw, ph, &name).map(|i| (i, size)))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let Some(made) = got else { return Ok(json!({ "image": null })) };
+            let (image, (sw, sh)) = made.map_err(|e| e.to_string())?;
             return Ok(json!({ "image": image, "width": sw, "height": sh }));
         }
         if let StudioAct::Thumbnail { scene, width } = &act {
             let (s, w) = (scene.clone(), *width);
-            let (px, pw, ph) = self
+            let job = self
                 .on_main(move |h| -> Result<_, String> {
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    c.thumbnail_pixels(&s, w).map_err(|e| e.to_string())
+                    c.thumbnail_job(&s, w).map_err(|e| e.to_string())
                 })
                 .await??;
             let scene = scene.clone();
-            let image = tokio::task::spawn_blocking(move || ferrocast_studio::png_data_url(&px, pw, ph, &scene))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let image = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let (px, pw, ph) = job().map_err(|e| e.to_string())?;
+                ferrocast_studio::png_data_url(&px, pw, ph, &scene).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
             return Ok(json!({ "image": image }));
         }
         if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {

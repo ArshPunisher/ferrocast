@@ -2003,6 +2003,21 @@ impl Stage {
         width: u32,
         filters: bool,
     ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.source_picture_job(name, width, filters)?.and_then(|job| job()))
+    }
+
+    /// [`Self::source_picture_pixels`] in two: what's needed is read here (on the window's
+    /// thread), and the drawing and reading back off the graphics card is the job, for any
+    /// thread: done on the window's thread it held the window up each time (the drawer and the
+    /// Scenes grid ask every few seconds).
+    #[allow(clippy::type_complexity)]
+    pub fn source_picture_job(
+        &self,
+        name: &str,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
         self.source(name)?;
         let e = self.engine()?;
         let Some((id, Some((sw, sh)))) = e.engine.source_named(name) else { return Ok(None) };
@@ -2018,27 +2033,41 @@ impl Stage {
             h = 640;
         }
         let (w, h) = (w as u32, h as u32);
-        let px = if filters {
-            e.engine.snapshot_source_filtered(id, (w, h))
-        } else {
-            e.engine.snapshot_source_at(id, (w, h))
-        };
-        Ok(px.map(|px| (px, w, h, (sw, sh))))
+        Ok(Some(move || {
+            let px = if filters {
+                e.engine.snapshot_source_filtered(id, (w, h))
+            } else {
+                e.engine.snapshot_source_at(id, (w, h))
+            };
+            px.map(|px| (px, w, h, (sw, sh)))
+        }))
     }
 
-    /// A scene's picture `width` wide as RGBA pixels (with its height): the drawing, which needs
-    /// this thread; turning it into a PNG ([`png_data_url`]) can happen elsewhere.
+    /// A scene's picture `width` wide as RGBA pixels (with its height).
     pub fn thumbnail_pixels(&self, scene: &str, width: u32) -> Result<(Vec<u8>, u32, u32), StudioError> {
+        self.thumbnail_job(scene, width)?()
+    }
+
+    /// [`Self::thumbnail_pixels`] in two, as [`Self::source_picture_job`].
+    #[allow(clippy::type_complexity)]
+    pub fn thumbnail_job(
+        &self,
+        scene: &str,
+        width: u32,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, u32, u32), StudioError> + Send + 'static + use<>, StudioError> {
         self.scene_index(scene)?;
         let (cw, ch) = (self.canvas.width.max(1), self.canvas.height.max(1));
         let w = width.clamp(64, 640);
         let h = ((u64::from(w) * u64::from(ch)) / u64::from(cw)).max(1) as u32;
-        let px = self
-            .engine()?
-            .engine
-            .snapshot_scene_at(scene, (cw, ch), (w, h))
-            .map_err(|e| fail(format!("\"{scene}\" couldn't be drawn: {e}")))?;
-        Ok((px, w, h))
+        let e = self.engine()?;
+        let scene = scene.to_string();
+        Ok(move || {
+            let px = e
+                .engine
+                .snapshot_scene_at(&scene, (cw, ch), (w, h))
+                .map_err(|x| fail(format!("\"{scene}\" couldn't be drawn: {x}")))?;
+            Ok((px, w, h))
+        })
     }
 
     // ------------------------------------------------------------------ outputs
@@ -2431,6 +2460,14 @@ impl Stage {
         // only outputs count (and started again if the size can't change).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.cutouts.borrow_mut().clear();
+        // A picture being drawn for the Scenes grid or the drawer holds the engine a moment
+        // (off the window's thread): waited for, briefly.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while self.engine.borrow().as_ref().is_some_and(|e| Arc::strong_count(e) > 1)
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if let Some(n) = self.engine.borrow().as_ref().map(Arc::strong_count).filter(|n| *n > 1) {
             tracing::warn!(holders = n - 1, "the picture size can't change: something still uses the engine");
             self.sync_pages();
