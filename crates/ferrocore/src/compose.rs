@@ -986,7 +986,13 @@ impl Compositor {
         let mut cur = self.target(w.max(1), h.max(1), wgpu::TextureUsages::empty());
         self.clear(enc, &cur);
         // The picture goes in as the first filter reads it: linear for OBS's, raw for ours.
-        let first_linear = item.effects.first().is_some_and(Effect::linear);
+        // Each filter runs in linear light (OBS's v2 kinds always; Ferrocast's own when the item
+        // mixes in linear light, as pictures, cameras and colours do), so the picture stays
+        // premultiplied in one way through the chain: ours premultiplied in gamma and then drawn
+        // as linear came out darker on anything see-through, and the order of filters changed
+        // the result (peer, 18 Nov).
+        let in_linear = |e: &Effect| e.linear() || (item.linear && !matches!(e, Effect::Custom { .. }));
+        let first_linear = item.effects.first().is_some_and(in_linear);
         let base = if first_linear { LINEAR } else { GAMMA };
         match &item.content {
             Content::Picture(p) => {
@@ -1046,7 +1052,11 @@ impl Compositor {
             check_size(ow, oh)?;
             let next = self.target(ow, oh, wgpu::TextureUsages::empty());
             self.clear(enc, &next);
-            let lin = e.linear();
+            let lin = in_linear(e);
+            // A colour picked (straight sRGB) is mixed as the picture is: in linear light there.
+            let picked = |c: &[f32; 4]| {
+                if lin { [srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]), c[3]] } else { *c }
+            };
             let (mut q, mut r, mut m) = ([0f32; 4], [0f32; 4], [0f32; 16]);
             let mut second: Option<wgpu::Texture> = None;
             let mut cube: Option<wgpu::Texture> = None;
@@ -1056,8 +1066,10 @@ impl Compositor {
                     ("fx_fs", [*elapsed_ms as f32 / 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
-                Effect::Border { width, rgba, radius } => ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], *rgba),
-                Effect::Shadow { rgba, blur, x, y, .. } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], *rgba),
+                Effect::Border { width, rgba, radius } => {
+                    ("fs_border", [*width, *radius, 0.0, 0.0, 0.0, 0.0], picked(rgba))
+                }
+                Effect::Shadow { rgba, blur, x, y, .. } => ("fs_shadow", [*blur, *x, *y, 0.0, 0.0, 0.0], picked(rgba)),
                 Effect::Shape { shape, feather, stretch } => {
                     ("fs_shape", [*shape as f32, *feather, if *stretch { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], [0.0; 4])
                 }
@@ -1066,7 +1078,9 @@ impl Compositor {
                     [if *pixelate { 1.0 } else { 0.0 }, *strength, area[0], area[1], area[2], area[3]],
                     [0.0; 4],
                 ),
-                Effect::Look { look, strength } => ("fs_look", [*look as f32, *strength, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
+                Effect::Look { look, strength } => {
+                    ("fs_look", [*look as f32, *strength, if lin { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], [0.0; 4])
+                }
                 Effect::Adjust { exposure, contrast, highlights, shadows, saturation, vibrance, temperature, tint } => {
                     let pct = |v: f32| v.clamp(-100.0, 100.0) / 100.0;
                     q = [pct(*temperature), pct(*tint), 0.0, 0.0];
@@ -2387,6 +2401,64 @@ mod mask_tests {
         assert!((x - 0.5).abs() < 1e-6 && y == 0.0, "{x} {y}");
         assert_eq!(scroll_offset(0.25, 0.0, 6_000, false).0, 1.0, "not looping: it's gone");
         assert!((scroll_offset(-0.25, 0.0, 2_000, true).0 + 0.5).abs() < 1e-6, "backwards keeps going");
+    }
+
+    /// A half see-through picture through each of Ferrocast's own filters, set to change
+    /// nothing, comes out as it went in. They multiplied by alpha a second time: anything
+    /// see-through came out about 3x darker (a dark ring round rounded corners under a shadow,
+    /// black fringes round a keyed person; the peer's probe, 18 Nov).
+    #[test]
+    fn see_through_pictures_keep_their_colour_through_our_filters() {
+        use crate::{Blend, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene};
+        let Ok(c) = Compositor::new() else { return };
+        let (w, h) = (32u32, 32u32);
+        let pic =
+            Picture { width: w, height: h, rgba: [200u8, 100, 50, 128].repeat((w * h) as usize), premultiplied: false };
+        for linear in [false, true] {
+            let draw = |effects: Vec<Effect>| {
+                let item = Item {
+                    content: Content::Picture(pic.clone()),
+                    effects,
+                    placement: Placement::default(),
+                    filter: Filter::Disable,
+                    blend: Blend::Normal,
+                    srgb_off: false,
+                    linear,
+                    opacity: 1.0,
+                };
+                let px = c.render(&Scene { width: w, height: h, items: vec![item] }).unwrap_or_else(|e| panic!("{e}"));
+                // The middle pixel.
+                let at = ((h / 2 * w + w / 2) * 4) as usize;
+                [px[at], px[at + 1], px[at + 2], px[at + 3]]
+            };
+            let plain = draw(Vec::new());
+            let none = [0.0f32; 4];
+            for (name, e) in [
+                ("rounded corners", Effect::RoundedCorners { radius: 0.0 }),
+                ("border", Effect::Border { width: 0.0, rgba: [1.0, 1.0, 1.0, 1.0], radius: 0.0 }),
+                ("shadow", Effect::Shadow { rgba: none, blur: 0.0, x: 0.0, y: 0.0, outside: false }),
+                ("shape", Effect::Shape { shape: 0, feather: 1.0, stretch: true }),
+                (
+                    "blur area elsewhere",
+                    Effect::BlurArea { pixelate: false, strength: 8.0, area: [0.0, 0.0, 10.0, 10.0] },
+                ),
+                ("blur area here", Effect::BlurArea { pixelate: false, strength: 4.0, area: [0.0, 0.0, 100.0, 100.0] }),
+                ("look at 0%", Effect::Look { look: 0, strength: 0.0 }),
+            ] {
+                let got = draw(vec![e]);
+                let close = got.iter().zip(&plain).all(|(a, b)| a.abs_diff(*b) <= 2);
+                assert!(close, "{name} (linear {linear}): {got:?}, without it {plain:?}");
+            }
+            // Two in a row too.
+            let two = draw(vec![Effect::RoundedCorners { radius: 0.0 }, Effect::Look { look: 1, strength: 0.0 }]);
+            assert!(two.iter().zip(&plain).all(|(a, b)| a.abs_diff(*b) <= 2), "two filters: {two:?}, {plain:?}");
+            // Ours and OBS's in either order give the same.
+            let a = draw(vec![Effect::RoundedCorners { radius: 0.0 }, Effect::Sharpen { sharpness: 0.0 }]);
+            let b = draw(vec![Effect::Sharpen { sharpness: 0.0 }, Effect::RoundedCorners { radius: 0.0 }]);
+            if linear {
+                assert!(a.iter().zip(&b).all(|(x, y)| x.abs_diff(*y) <= 2), "the order doesn't matter: {a:?} {b:?}");
+            }
+        }
     }
 
     #[test]

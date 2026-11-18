@@ -52,8 +52,13 @@ fn fx_vs(@builtin(vertex_index) i: u32) -> FxOut {
 }
 
 fn pic(uv: vec2<f32>) -> vec4<f32> {
-    // Read as Ferrocast's own filters read it (straight, as libobs hands filters a picture).
-    return textureSampleLevel(image, pick, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+    // Straight colour, as libobs hands filters a picture (it's kept premultiplied: taken apart
+    // here, else anything see-through came out darker, peer 18 Nov).
+    let t = textureSampleLevel(image, pick, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+    if t.a > 0.0 {
+        return vec4<f32>(t.rgb / t.a, t.a);
+    }
+    return vec4<f32>(0.0);
 }
 
 fn size() -> vec2<f32> { return f.size; }

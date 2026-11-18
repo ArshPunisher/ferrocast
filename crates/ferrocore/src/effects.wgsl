@@ -52,6 +52,9 @@ fn src_px(uv: vec2<f32>) -> vec2<f32> {
     return uv * f.out_size - vec2<f32>(f.pad, f.pad);
 }
 
+// What the picture has here, premultiplied (as every filter's picture is kept): a filter that
+// works on colours takes `unpremultiplied` of it; one that only masks or averages keeps it as
+// it is. Multiplying by alpha again darkened anything see-through about 3x (18 Nov).
 fn src_at(px: vec2<f32>) -> vec4<f32> {
     let uv = px / f.size;
     let inside = step(0.0, uv.x) * step(0.0, uv.y) * step(uv.x, 1.0) * step(uv.y, 1.0);
@@ -70,14 +73,14 @@ fn fs_rounded(i: Out) -> @location(0) vec4<f32> {
     let c = src_at(p);
     let h = f.size * 0.5;
     let d = rbox(p, h, min(f.p0, min(h.x, h.y)));
-    return premultiplied(vec4<f32>(c.rgb, c.a * saturate(0.5 - d)));
+    return c * saturate(0.5 - d);
 }
 
 // Border: p0 width, color, p1 radius.
 @fragment
 fn fs_border(i: Out) -> @location(0) vec4<f32> {
     let p = src_px(i.uv);
-    let c = src_at(p);
+    let c = unpremultiplied(src_at(p));
     let h = f.size * 0.5;
     let d = rbox(p, h, min(f.p1, min(h.x, h.y)));
     let shape = saturate(0.5 - d);
@@ -103,9 +106,9 @@ fn fs_shadow(i: Out) -> @location(0) vec4<f32> {
         total += w;
     }
     let sa = acc / total * f.color.a;
-    let a = c.a + sa * (1.0 - c.a);
-    let rgb = (c.rgb * c.a + f.color.rgb * sa * (1.0 - c.a)) / max(a, 0.0001);
-    return premultiplied(vec4<f32>(rgb, a));
+    // The picture over its shadow, premultiplied.
+    let behind = sa * (1.0 - c.a);
+    return vec4<f32>(c.rgb + f.color.rgb * behind, c.a + behind);
 }
 
 fn sd_hexagon(p_in: vec2<f32>) -> f32 {
@@ -167,7 +170,7 @@ fn fs_shape(i: Out) -> @location(0) vec4<f32> {
         d = sd_heart(vec2<f32>(n.x * 0.6, (1.0 - n.y) * 0.55)) / 0.58;
     }
     let edge = max(f.p1, 1.0);
-    return premultiplied(vec4<f32>(c.rgb, c.a * saturate(0.5 - d * s / edge)));
+    return c * saturate(0.5 - d * s / edge);
 }
 
 // Blur or pixelate an area: p0 mode, p1 strength, p2..p5 area x, y, w, h (percent).
@@ -179,11 +182,11 @@ fn fs_blur_area(i: Out) -> @location(0) vec4<f32> {
     let hi = lo + vec2<f32>(f.p4, f.p5) * 0.01 * f.size;
     let inside = step(lo.x, p.x) * step(lo.y, p.y) * step(p.x, hi.x) * step(p.y, hi.y);
     if inside < 0.5 {
-        return premultiplied(c);
+        return c;
     }
     if f.p0 > 0.5 {
         let block = max(f.p1, 1.0);
-        return premultiplied(src_at((floor(p / block) + 0.5) * block));
+        return src_at((floor(p / block) + 0.5) * block);
     }
     var acc = vec4<f32>(0.0);
     for (var n = 0; n < 64; n++) {
@@ -191,15 +194,20 @@ fn fs_blur_area(i: Out) -> @location(0) vec4<f32> {
         let ang = f32(n) * 2.39996323;
         acc += src_at(clamp(p + vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p1), vec2<f32>(0.0, 0.0), f.size - 1.0));
     }
-    return premultiplied(acc / 64.0);
+    // Averaged premultiplied: see-through edges blur without dark fringes.
+    return acc / 64.0;
 }
 
 // Colour look: p0 look, p1 strength (percent).
 @fragment
 fn fs_look(i: Out) -> @location(0) vec4<f32> {
     let p = src_px(i.uv);
-    let c = src_at(p);
-    let x = c.rgb;
+    let c = unpremultiplied(src_at(p));
+    // The looks are made for sRGB values: in linear light (p2), worked on as sRGB and back.
+    var x = c.rgb;
+    if f.p2 > 0.5 {
+        x = srgb_nonlinear3(saturate(x));
+    }
     let l = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
     let ll = vec3<f32>(l, l, l);
     var g = x;
@@ -220,7 +228,11 @@ fn fs_look(i: Out) -> @location(0) vec4<f32> {
     } else {
         g = mix(ll, x, 0.8) * 0.85 + 0.1;
     }
-    return premultiplied(vec4<f32>(mix(x, saturate(g), f.p1 * 0.01), c.a));
+    var out = mix(x, saturate(g), f.p1 * 0.01);
+    if f.p2 > 0.5 {
+        out = srgb_linear3(out);
+    }
+    return premultiplied(vec4<f32>(out, c.a));
 }
 
 // ---- OBS's own filters (plugins/obs-filters/data), run in linear light like their v2 kinds ----
@@ -319,8 +331,16 @@ fn fs_color_key(i: Out) -> @location(0) vec4<f32> {
 fn fs_luma_key(i: Out) -> @location(0) vec4<f32> {
     var rgba = unpremultiplied(textureSampleLevel(image, pick, i.uv, 0.0));
     let l = dot(rgba.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let lo = smoothstep(f.r.y, f.r.y + f.r.w, l);
-    let hi = 1.0 - smoothstep(f.r.x - f.r.z, f.r.x, l);
+    // A softness of 0 is a hard edge (smoothstep with equal edges is undefined: on Metal it
+    // keyed out pure black at OBS's defaults).
+    var lo = step(f.r.y, l);
+    if f.r.w > 0.0 {
+        lo = smoothstep(f.r.y, f.r.y + f.r.w, l);
+    }
+    var hi = step(l, f.r.x);
+    if f.r.z > 0.0 {
+        hi = 1.0 - smoothstep(f.r.x - f.r.z, f.r.x, l);
+    }
     rgba.a *= lo * hi;
     return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
 }
@@ -386,16 +406,25 @@ fn fs_cutout(i: Out) -> @location(0) vec4<f32> {
     let e = max(f.p1, 0.01);
     let k = smoothstep(0.5 - e, 0.5 + e, m);
     if f.p0 < 0.5 {
-        return premultiplied(vec4<f32>(c.rgb, c.a * k));
+        return c * k;
     }
-    // Blur behind the person: the background's own pixels only, softly.
+    // Blur behind the person: the background's own pixels only, softly (each sample weighed by
+    // how much it's background, so the person doesn't bleed into a glow round them).
     var acc = vec4<f32>(0.0);
+    var weight = 0.0;
     for (var n = 0; n < 48; n++) {
         let t = (f32(n) + 0.5) / 48.0;
         let ang = f32(n) * 2.39996323;
-        acc += src_at(clamp(p + vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p2), vec2<f32>(0.0, 0.0), f.size - 1.0));
+        let q = clamp(p + vec2<f32>(cos(ang), sin(ang)) * (sqrt(t) * f.p2), vec2<f32>(0.0, 0.0), f.size - 1.0);
+        let w = 1.0 - smoothstep(0.5 - e, 0.5 + e, textureSampleLevel(second, pick, q / f.size, 0.0).r);
+        acc += src_at(q) * w;
+        weight += w;
     }
-    return premultiplied(mix(acc / 48.0, c, k));
+    var back = c;
+    if weight > 0.001 {
+        back = acc / weight;
+    }
+    return mix(back, c, k);
 }
 
 fn srgb_nonlinear(u: f32) -> f32 {
@@ -403,6 +432,17 @@ fn srgb_nonlinear(u: f32) -> f32 {
         return 12.92 * u;
     }
     return 1.055 * pow(u, 1.0 / 2.4) - 0.055;
+}
+
+fn srgb_linear(u: f32) -> f32 {
+    if u <= 0.04045 {
+        return u / 12.92;
+    }
+    return pow((u + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_linear3(v: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(srgb_linear(v.r), srgb_linear(v.g), srgb_linear(v.b));
 }
 
 fn srgb_nonlinear3(v: vec3<f32>) -> vec3<f32> {
