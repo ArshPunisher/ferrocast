@@ -75,11 +75,27 @@ impl Default for SourceSettings {
     }
 }
 
-/// A source's levels over the last block, per channel (left, right), in dBFS (-inf is silence).
+/// A source's levels per channel (left, right), in dBFS (-inf is silence): over the last block
+/// (what the ducker hears), or over [`METER_BLOCKS`] for a meter ([`Mixer::levels`]).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Levels {
     pub peak: [f32; 2],
     pub rms: [f32; 2],
+    /// The highest the sound came in at, before its filters and its fader (a noise gate's
+    /// threshold is set against this: the meter after the gate shows nothing while it's shut).
+    pub input_peak: [f32; 2],
+}
+
+/// Blocks a meter reads over (about 300 ms): a meter read ten times a second saw one block in
+/// five, so peaks between reads never showed and the bars jumped (18 Nov).
+pub const METER_BLOCKS: usize = 14;
+
+/// One block's linear measures, kept for meters.
+#[derive(Debug, Clone, Copy, Default)]
+struct Measured {
+    peak: [f32; 2],
+    sq: [f32; 2],
+    input: [f32; 2],
 }
 
 /// One mixed block: its start time and each track's interleaved stereo frames.
@@ -101,6 +117,41 @@ struct Source {
     /// Its filters, in order (after mono and balance, before volume, as OBS runs them).
     filters: Vec<AudioFilter>,
     levels: Levels,
+    /// The last [`METER_BLOCKS`] blocks' measures, newest last.
+    recent: VecDeque<Measured>,
+    /// True peak's oversampling memory (the last samples of each side).
+    tp: [[f32; TP_TAPS]; 2],
+}
+
+/// Taps of each phase of the true-peak oversampler.
+const TP_TAPS: usize = 12;
+
+/// The 4x oversampler's phases (a windowed sinc, as ITU-R BS.1770's true peak asks): phase k
+/// gives the point k/4 of the way past the newest-but-five sample.
+fn tp_phases() -> &'static [[f32; TP_TAPS]; 4] {
+    static P: std::sync::OnceLock<[[f32; TP_TAPS]; 4]> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let mut p = [[0f32; TP_TAPS]; 4];
+        let mid = (TP_TAPS / 2 - 1) as f32;
+        let half = (TP_TAPS / 2) as f32;
+        for (k, ph) in p.iter_mut().enumerate() {
+            let frac = k as f32 / 4.0;
+            let mut sum = 0.0;
+            for (j, c) in ph.iter_mut().enumerate() {
+                let x = j as f32 - mid - frac;
+                let sinc =
+                    if x.abs() < 1e-6 { 1.0 } else { (std::f32::consts::PI * x).sin() / (std::f32::consts::PI * x) };
+                // A Hann window centred on the point asked for (peer: it sat half a tap off).
+                let w = if x.abs() < half { 0.5 + 0.5 * (std::f32::consts::PI * x / half).cos() } else { 0.0 };
+                *c = sinc * w;
+                sum += *c;
+            }
+            for c in ph.iter_mut() {
+                *c /= sum;
+            }
+        }
+        p
+    })
 }
 
 impl std::fmt::Debug for Source {
@@ -131,7 +182,18 @@ pub struct Mixer {
     ducker: Option<crate::level::Ducker>,
     loudness: Option<Vec<crate::level::Loudness>>,
     loudness_target: Option<f32>,
+    /// Meters read true peak (between samples) instead of sample peak (OBS's Peak Meter Type).
+    true_peak: bool,
+    /// Low latency sound (Settings): the wait starts at 20 ms and never goes past 60 ms plus
+    /// what a source's filters hold its sound back by (a late device's sound is cut instead).
+    low_latency: bool,
+    /// The wait it starts with in the usual mode.
+    usual_floor_ns: u64,
 }
+
+/// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
+const LOW_FLOOR_NS: u64 = 20_000_000;
+const LOW_CAP_NS: u64 = 60_000_000;
 
 /// One source's sound as it comes in (mono, the mixer's rate, before its volume and filters),
 /// for something that listens (live captions). At most `TAP_SECONDS` are kept unread; nothing
@@ -202,7 +264,43 @@ impl Mixer {
             ducker: None,
             loudness: None,
             loudness_target: None,
+            true_peak: false,
+            low_latency: false,
+            usual_floor_ns: latency_ns,
         }
+    }
+
+    /// Low latency sound on or off (applies at once: the wait goes to its new start).
+    pub fn set_low_latency(&mut self, on: bool) {
+        if on == self.low_latency {
+            return;
+        }
+        self.low_latency = on;
+        self.floor_ns = if on { LOW_FLOOR_NS.min(self.usual_floor_ns) } else { self.usual_floor_ns };
+        let held = self.held_most_ns();
+        self.latency_ns = (self.floor_ns + held).min(self.cap_ns());
+        self.window_ns = None;
+    }
+
+    /// The most any source's filters hold its sound back (ns).
+    fn held_most_ns(&self) -> u64 {
+        let frames = self
+            .sources
+            .values()
+            .map(|s| s.filters.iter().map(AudioFilter::latency_frames).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        frames as u64 * 1_000_000_000 / u64::from(self.rate)
+    }
+
+    /// The most the mixer waits.
+    fn cap_ns(&self) -> u64 {
+        if self.low_latency { (LOW_CAP_NS + self.held_most_ns()).min(MAX_LATENCY_NS) } else { MAX_LATENCY_NS }
+    }
+
+    /// Meters read true peak (4x oversampled, between samples) or sample peak.
+    pub fn set_true_peak(&mut self, on: bool) {
+        self.true_peak = on;
     }
 
     pub fn rate(&self) -> u32 {
@@ -236,28 +334,63 @@ impl Mixer {
                         resampler: None,
                         filters: Vec::new(),
                         levels: Levels::default(),
+                        recent: VecDeque::new(),
+                        tp: [[0.0; TP_TAPS]; 2],
                     },
                 );
             }
         }
     }
 
-    /// A source's filters, in order (replacing any before; their memory starts fresh).
+    /// A source's filters, in order (replacing any before). Every edit of the collection sets
+    /// them all again: a filter whose settings didn't change keeps running as it was (its
+    /// envelope, the noise removal's model, a VST's helper), one of the same kind with new
+    /// settings takes them and keeps what it remembers (a slider dragged on a gate or a
+    /// compressor made it anew each step: a click each time), and only the rest are made new.
     pub fn set_effects(&mut self, id: u64, effects: &[AudioEffect]) {
         let rate = self.rate;
-        if let Some(s) = self.sources.get_mut(&id) {
-            // A filter whose settings didn't change keeps running as it was (its envelope, the
-            // noise removal's model, a VST's helper): every edit of the collection sets them all.
-            let mut old: Vec<Option<AudioFilter>> = std::mem::take(&mut s.filters).into_iter().map(Some).collect();
-            s.filters = effects
-                .iter()
-                .map(|e| {
-                    old.iter_mut()
-                        .find(|o| o.as_ref().is_some_and(|f| f.effect == *e))
-                        .and_then(Option::take)
-                        .unwrap_or_else(|| AudioFilter::new(*e, rate))
-                })
-                .collect();
+        let Some(s) = self.sources.get_mut(&id) else { return };
+        let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
+        let before = held(&s.filters);
+        let mut old: Vec<Option<AudioFilter>> = std::mem::take(&mut s.filters).into_iter().map(Some).collect();
+        // The same settings first, so a moved filter is found as it was…
+        let mut made: Vec<Option<AudioFilter>> = effects
+            .iter()
+            .map(|e| old.iter_mut().find(|o| o.as_ref().is_some_and(|f| f.effect == *e)).and_then(Option::take))
+            .collect();
+        // …then one of the same kind takes the new settings…
+        for (slot, e) in made.iter_mut().zip(effects) {
+            if slot.is_some() {
+                continue;
+            }
+            for o in old.iter_mut() {
+                if let Some(f) = o.as_mut()
+                    && f.retune(*e)
+                {
+                    *slot = o.take();
+                    break;
+                }
+            }
+        }
+        // …and the rest are made.
+        s.filters =
+            made.into_iter().zip(effects).map(|(f, e)| f.unwrap_or_else(|| AudioFilter::new(*e, rate))).collect();
+        // A filter that holds the sound back (the strong noise removal) files the source's sound
+        // that much earlier: the mixer waits that much longer at once, rather than finding the
+        // sound late and cutting its start.
+        // Each source is held back by its own filters only: the wait covers the most any one
+        // needs (its usual wait plus that), not the sum of them all.
+        let now = held(&s.filters);
+        let need = (self.floor_ns + now as u64 * 1_000_000_000 / u64::from(rate)).min(self.cap_ns());
+        if now > before && need > self.latency_ns {
+            let was = self.latency_ns;
+            self.latency_ns = need;
+            self.window_ns = None;
+            tracing::info!(
+                from_ms = was / 1_000_000,
+                to_ms = self.latency_ns / 1_000_000,
+                "a filter holds sound back: the mixer waits longer for it"
+            );
         }
     }
 
@@ -285,8 +418,27 @@ impl Mixer {
         self.loudness = target_lufs.map(|t| (0..TRACKS).map(|_| crate::level::Loudness::new(t, self.rate)).collect());
     }
 
+    /// A source's levels for a meter: the highest peak and the RMS over the last
+    /// [`METER_BLOCKS`] blocks (every reader sees the same; nothing is reset by reading).
     pub fn levels(&self, id: u64) -> Option<Levels> {
-        self.sources.get(&id).map(|s| s.levels)
+        let s = self.sources.get(&id)?;
+        if s.recent.is_empty() {
+            return Some(s.levels);
+        }
+        let n = s.recent.len() as f32 * BLOCK as f32;
+        let mut m = Measured::default();
+        for r in &s.recent {
+            for c in 0..2 {
+                m.peak[c] = m.peak[c].max(r.peak[c]);
+                m.input[c] = m.input[c].max(r.input[c]);
+                m.sq[c] += r.sq[c];
+            }
+        }
+        Some(Levels {
+            peak: m.peak.map(db),
+            rms: [db((m.sq[0] / n).sqrt()), db((m.sq[1] / n).sqrt())],
+            input_peak: m.input.map(db),
+        })
     }
 
     /// A source's sound: `channels` interleaved (1 or 2; more are folded to their first two) at
@@ -314,7 +466,7 @@ impl Mixer {
         if let Some(next) = self.next_ns {
             let late = (next + self.mixed_with_ns).saturating_sub(ts);
             self.worst_late_ns = self.worst_late_ns.max(late);
-            let needed = (late + LATENCY_ROOM_NS).min(MAX_LATENCY_NS);
+            let needed = (late + LATENCY_ROOM_NS).min(self.cap_ns());
             if ts < next && needed > self.latency_ns {
                 let was = self.latency_ns;
                 self.latency_ns = needed;
@@ -490,6 +642,11 @@ impl Mixer {
                     }
                 }
             }
+            let mut input = [0f32; 2];
+            for f in buf.as_chunks::<2>().0 {
+                input[0] = input[0].max(f[0].abs());
+                input[1] = input[1].max(f[1].abs());
+            }
             let s = src.settings;
             let (gl, gr) = if (s.balance - 0.5).abs() > 0.01 {
                 let b = s.balance.clamp(0.0, 1.0);
@@ -537,10 +694,32 @@ impl Mixer {
                     sq[c] += f[c] * f[c];
                 }
             }
+            // Between samples too, for meters only (the ducker hears sample peaks: turning true
+            // peak on mustn't change when music ducks; CodeRabbit).
+            let mut shown = peak;
+            if self.true_peak {
+                let phases = tp_phases();
+                for f in buf.as_chunks::<2>().0 {
+                    for c in 0..2 {
+                        let h = &mut src.tp[c];
+                        h.rotate_left(1);
+                        h[TP_TAPS - 1] = f[c];
+                        for ph in phases {
+                            let v: f32 = ph.iter().zip(h.iter()).map(|(a, b)| a * b).sum();
+                            shown[c] = shown[c].max(v.abs());
+                        }
+                    }
+                }
+            }
             src.levels = Levels {
                 peak: [db(peak[0]), db(peak[1])],
                 rms: [db((sq[0] / BLOCK as f32).sqrt()), db((sq[1] / BLOCK as f32).sqrt())],
+                input_peak: input.map(db),
             };
+            src.recent.push_back(Measured { peak: shown, sq, input });
+            if src.recent.len() > METER_BLOCKS {
+                src.recent.pop_front();
+            }
             if s.monitoring != Monitoring::Off {
                 for (o, v) in monitor.iter_mut().zip(&buf) {
                     *o += v;
@@ -603,6 +782,94 @@ mod tests {
         m.set_effects(1, &[AudioEffect::Plugin { slot: 901 }]);
         assert_eq!(MADE.load(Ordering::SeqCst), 2, "another plugin: made");
     }
+    /// True peak finds the peak between samples: a full-scale sine at a quarter of the rate,
+    /// sampled half-way between its peaks (every sample ±0.707), reads about 0 dBTP, its sample
+    /// peak -3 dB.
+    #[test]
+    fn true_peak_sees_between_samples() {
+        let sine: Vec<f32> = (0..4800)
+            .flat_map(|i| {
+                let v = (std::f32::consts::FRAC_PI_2 * i as f32 + std::f32::consts::FRAC_PI_4).sin();
+                [v, v]
+            })
+            .collect();
+        let read = |tp: bool| {
+            let mut m = Mixer::new(48_000, 0);
+            m.set(1, SourceSettings::default());
+            m.set_true_peak(tp);
+            let _ = m.mix_until(1_000_000_000);
+            m.push(1, &sine, 2, 48_000, 1_000_000_000);
+            let _ = m.mix_until(1_100_000_000);
+            m.levels(1).map(|l| l.peak[0]).unwrap_or(f32::NEG_INFINITY)
+        };
+        let sample = read(false);
+        assert!((sample + 3.0).abs() < 0.2, "sample peak about -3 dB: {sample}");
+        let tp = read(true);
+        assert!(tp.abs() < 0.5, "true peak about 0 dB: {tp}");
+    }
+
+    /// Low latency sound: the wait starts at 20 ms and a late device can't push it past 60 ms
+    /// (its late start is cut instead); off again, the usual wait.
+    #[test]
+    fn low_latency_keeps_the_wait_short() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings::default());
+        m.set_low_latency(true);
+        assert_eq!(m.latency_ns(), 20_000_000);
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        // A piece half a second late.
+        m.push(1, &[0.1; 960], 2, 48_000, t0 - 500_000_000);
+        assert_eq!(m.latency_ns(), 60_000_000, "capped");
+        m.set_low_latency(false);
+        assert_eq!(m.latency_ns(), 40_000_000, "the usual start again");
+    }
+
+    /// A filter whose settings change keeps running (its state, a plugin's helper), and a
+    /// filter that holds sound back makes the mixer wait that much longer at once.
+    #[test]
+    fn a_changed_filter_keeps_running_and_its_delay_is_waited_for() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static MADE: AtomicU32 = AtomicU32::new(0);
+        #[derive(Debug)]
+        struct Slow;
+        impl crate::afx::SoundPlugin for Slow {
+            fn process(&mut self, _ch: [&mut [f32]; 2]) -> bool {
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                4800
+            }
+            fn retune(&mut self, _e: &AudioEffect) -> bool {
+                true
+            }
+        }
+        fn make(_strength: u32) -> Option<Box<dyn crate::afx::SoundPlugin>> {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(Slow))
+        }
+        crate::afx::set_denoiser(make);
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let made = MADE.load(Ordering::SeqCst);
+        m.set_effects(1, &[AudioEffect::Denoise { strength: 100 }, AudioEffect::Gain { db: 0.0 }]);
+        if MADE.load(Ordering::SeqCst) == made {
+            // Another test set the app's denoiser first (it's set once): nothing to check here.
+            return;
+        }
+        assert_eq!(m.latency_ns(), 140_000_000, "40 ms + the filter's 100 ms, at once");
+        // Another source with the same filter: the wait covers either, not both added up.
+        m.set(2, SourceSettings::default());
+        m.set_effects(2, &[AudioEffect::Denoise { strength: 100 }]);
+        assert_eq!(m.latency_ns(), 140_000_000, "the most one source needs");
+        let made = MADE.load(Ordering::SeqCst);
+        for s in [90, 80, 70] {
+            m.set_effects(1, &[AudioEffect::Denoise { strength: s }, AudioEffect::Gain { db: -3.0 }]);
+        }
+        assert_eq!(MADE.load(Ordering::SeqCst), made, "no new model for a new strength");
+        assert_eq!(m.latency_ns(), 140_000_000, "the same delay: no more waiting");
+    }
+
     /// A filter that holds sound back (as the strong noise removal does, 40 ms) is made up
     /// for: a click filed at a moment comes out at that moment, not the filter's delay later.
     #[test]

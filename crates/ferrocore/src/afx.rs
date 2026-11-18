@@ -23,6 +23,18 @@ pub trait SoundPlugin: Send + std::fmt::Debug {
     fn latency_frames(&self) -> usize {
         0
     }
+
+    /// Takes new settings for the same filter (a strength) and keeps running: true. False: it
+    /// can't, and a new one is made.
+    fn retune(&mut self, _effect: &AudioEffect) -> bool {
+        false
+    }
+
+    /// When it gives up: the sound it took in and hasn't given back yet (left, right; as long
+    /// as its delay), so what plays after it goes on from there with nothing lost.
+    fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
+        None
+    }
 }
 
 /// Makes the strong noise removal at a strength (1 to 100), when the app has one.
@@ -195,6 +207,9 @@ pub struct AudioFilter {
     // Light noise removal: the noise floor it hears (RMS) and the gain now.
     floor: f32,
     nr_gain: f32,
+    /// After a plugin that held the sound back gave way (the strong noise removal too slow
+    /// here): the sound is held back as long still, so the source doesn't jump in time.
+    delay: Option<[std::collections::VecDeque<f32>; 2]>,
 }
 
 /// libobs's compressor `gain_coefficient`.
@@ -225,7 +240,33 @@ impl AudioFilter {
             },
             floor: 0.0,
             nr_gain: 1.0,
+            delay: None,
         }
+    }
+
+    /// Takes `effect`'s settings when it's the same kind of filter, keeping what it remembers
+    /// (a gate stays open, a compressor's envelope, the EQ's filters, the noise removal's model):
+    /// a slider dragged on a filter used to make it anew every step, a click or a pump each time.
+    /// False: another kind (or another VST, or a plugin that can't take them): make a new one.
+    pub fn retune(&mut self, effect: AudioEffect) -> bool {
+        if std::mem::discriminant(&self.effect) != std::mem::discriminant(&effect) {
+            return false;
+        }
+        if let (AudioEffect::Plugin { slot: a }, AudioEffect::Plugin { slot: b }) = (self.effect, effect)
+            && a != b
+        {
+            return false;
+        }
+        if self.effect == effect {
+            return true;
+        }
+        if let Some(p) = self.plugin.as_mut()
+            && !p.retune(&effect)
+        {
+            return false;
+        }
+        self.effect = effect;
+        true
     }
 
     /// A filter that is just `plugin` (tests: a plugin of their own, not the app's).
@@ -238,7 +279,11 @@ impl AudioFilter {
 
     /// How late this filter's sound comes out, in frames (a plugin's; the engine's own add none).
     pub fn latency_frames(&self) -> usize {
-        self.plugin.as_ref().map_or(0, |p| p.latency_frames())
+        match (&self.plugin, &self.delay) {
+            (Some(p), _) => p.latency_frames(),
+            (None, Some(h)) => h[0].len(),
+            (None, None) => 0,
+        }
     }
 
     /// Filters a block in place (both sides the same length).
@@ -255,8 +300,38 @@ impl AudioFilter {
                 return;
             }
             tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
-            self.plugin = None;
+            let mut gone = self.plugin.take();
+            let late = gone.as_ref().map_or(0, |p| p.latency_frames());
+            if late > 0 {
+                // What it still held plays first (silence only for what it never had).
+                let kept = gone.as_mut().and_then(|p| p.hand_over());
+                let line = |c: usize| {
+                    let mut q: std::collections::VecDeque<f32> =
+                        kept.as_ref().map(|k| k[c].iter().copied().collect()).unwrap_or_default();
+                    while q.len() < late {
+                        q.push_front(0.0);
+                    }
+                    while q.len() > late {
+                        q.pop_front();
+                    }
+                    q
+                };
+                self.delay = Some([line(0), line(1)]);
+            }
         }
+        self.run_own(l, r, n, rate);
+        if let Some(h) = self.delay.as_mut() {
+            for (c, x) in [&mut *l, &mut *r].into_iter().enumerate() {
+                for v in x[..n].iter_mut() {
+                    h[c].push_back(*v);
+                    *v = h[c].pop_front().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+
+    /// The engine's own filters (and the light noise removal).
+    fn run_own(&mut self, l: &mut [f32], r: &mut [f32], n: usize, rate: f32) {
         match self.effect {
             // No VST host in this app, or not running yet: the sound passes as it is.
             AudioEffect::Plugin { .. } => {}
@@ -273,7 +348,10 @@ impl AudioFilter {
             }
             AudioEffect::NoiseGate { open_db, close_db, attack_ms, hold_ms, release_ms } => {
                 let open = db_to_mul(open_db);
-                let close = db_to_mul(close_db);
+                // Closing at or above where it opens never closes (the level never falls: the
+                // gate stuck open, as in OBS): the More form allows it, so it closes at least
+                // 3 dB under where it opens (how fast it falls follows that gap).
+                let close = db_to_mul(close_db.min(open_db - 3.0));
                 let attack_rate = 1.0 / (attack_ms / 1000.0 * rate);
                 let release_rate = 1.0 / (release_ms / 1000.0 * rate);
                 let decay_rate = (open - close) / ((1.0 / 75.0) * rate);
@@ -365,8 +443,18 @@ impl AudioFilter {
         }
         let rms = (l.iter().chain(r.iter()).map(|v| v * v).sum::<f32>() / (2 * n) as f32).sqrt();
         let secs = n as f32 / self.rate;
-        // Down at once to anything quieter; up 3 dB a second (a louder room is learnt).
-        self.floor = if self.floor <= 0.0 || rms < self.floor { rms } else { self.floor * db_to_mul(3.0 * secs) };
+        // Down at once to anything quieter; up 3 dB a second (a louder room is learnt). Digital
+        // silence (a gate shut before it, a muted device) says nothing about the room: it isn't
+        // learnt, and the floor starts at a quiet room's (-60 dBFS), so a voice coming after
+        // silence isn't taken for the noise (it was turned down 12-24 dB; peer, 18 Nov).
+        const SILENCE: f32 = 3.2e-5; // -90 dBFS
+        const START: f32 = 1e-3; // -60 dBFS
+        if self.floor <= 0.0 {
+            self.floor = START;
+        }
+        if rms >= SILENCE {
+            self.floor = if rms < self.floor { rms } else { self.floor * db_to_mul(3.0 * secs) };
+        }
         let depth = 24.0 * strength.clamp(1, 100) as f32 / 100.0;
         // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly.
         let over = mul_to_db(rms.max(1e-9) / self.floor.max(1e-9));
@@ -500,6 +588,142 @@ mod tests {
 
     fn rms(x: &[f32]) -> f32 {
         (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+    }
+
+    /// A gate's threshold dragged while someone talks: the gate stays open (it was made anew
+    /// each step, so it shut and faded back in 25 ms: the mic chopped, 18 Nov).
+    #[test]
+    fn a_retuned_gate_stays_open() {
+        let gate = |open_db: f32| AudioEffect::NoiseGate {
+            open_db,
+            close_db: open_db - 6.0,
+            attack_ms: 25.0,
+            hold_ms: 200.0,
+            release_ms: 150.0,
+        };
+        let mut f = AudioFilter::new(gate(-26.0), RATE);
+        let talk = |len: usize| -> Vec<f32> { (0..len).map(|i| (i as f32 * 0.05).sin() * 0.5).collect() };
+        for _ in 0..20 {
+            let (mut l, mut r) = (talk(1024), talk(1024));
+            f.process([&mut l, &mut r]);
+        }
+        assert!(f.retune(gate(-30.0)), "the same kind takes the new settings");
+        let (mut l, mut r) = (talk(1024), talk(1024));
+        let input = l.clone();
+        f.process([&mut l, &mut r]);
+        assert!((rms(&l) - rms(&input)).abs() < 1e-4, "still open: no dip, no fade in");
+        // Another kind: not taken.
+        assert!(!f.retune(AudioEffect::Gain { db: 0.0 }));
+    }
+
+    /// A plugin that holds the sound back and then gives up: the light noise removal takes
+    /// over with the same delay, so the source doesn't jump in time.
+    #[test]
+    fn giving_up_keeps_the_delay() {
+        #[derive(Debug)]
+        struct Late(usize);
+        impl SoundPlugin for Late {
+            fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
+                false
+            }
+            fn latency_frames(&self) -> usize {
+                self.0
+            }
+        }
+        let mut f = AudioFilter::with_plugin(Box::new(Late(2944)), RATE);
+        f.effect = AudioEffect::Denoise { strength: 100 };
+        assert_eq!(f.latency_frames(), 2944);
+        let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+        f.process([&mut l, &mut r]);
+        assert_eq!(f.latency_frames(), 2944, "the same delay after it gave way");
+        assert!(l.iter().all(|v| *v == 0.0), "held back: the first block is still on its way");
+    }
+
+    /// A plugin that holds the sound back and gives up mid-stream hands over what it still
+    /// held: the sound goes on exactly where it was, nothing lost or played twice (the peer's
+    /// S1: 61 ms dropped and 61 ms of silence).
+    #[test]
+    fn giving_up_mid_stream_loses_nothing() {
+        #[derive(Debug)]
+        struct QuitsAfter(usize, [std::collections::VecDeque<f32>; 2]);
+        impl SoundPlugin for QuitsAfter {
+            fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+                if self.0 == 0 {
+                    return false;
+                }
+                self.0 -= 1;
+                for (c, x) in ch.into_iter().enumerate() {
+                    for v in x.iter_mut() {
+                        self.1[c].push_back(*v);
+                        *v = self.1[c].pop_front().unwrap_or(0.0);
+                    }
+                }
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                self.1[0].len()
+            }
+            fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
+                Some([self.1[0].drain(..).collect(), self.1[1].drain(..).collect()])
+            }
+        }
+        let late = 2944;
+        let zeros = || std::iter::repeat_n(0.0f32, late).collect::<std::collections::VecDeque<f32>>();
+        let mut f = AudioFilter::with_plugin(Box::new(QuitsAfter(5, [zeros(), zeros()])), RATE);
+        // As the light noise removal at its lightest, so the count passes nearly as it is.
+        f.effect = AudioEffect::Gain { db: 0.0 };
+        let mut out = Vec::new();
+        for b in 0..12 {
+            let mut l: Vec<f32> = (0..1024).map(|i| (b * 1024 + i) as f32).collect();
+            let mut r = l.clone();
+            f.process([&mut l, &mut r]);
+            out.extend(l);
+        }
+        for (i, v) in out.iter().enumerate().skip(late) {
+            assert_eq!(*v, (i - late) as f32, "sample {i}: nothing lost, nothing twice");
+        }
+    }
+
+    /// A voice after digital silence (a gate before it, a muted mic) passes as it is: it was
+    /// taken for the noise floor and turned down 12-24 dB.
+    #[test]
+    fn a_voice_after_silence_is_not_the_noise() {
+        let mut f = AudioFilter::new(AudioEffect::Denoise { strength: 100 }, RATE);
+        f.plugin = None;
+        for _ in 0..47 {
+            let (mut l, mut r) = (vec![0.0f32; 1024], vec![0.0f32; 1024]);
+            f.process([&mut l, &mut r]);
+        }
+        let voice: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.07).sin() * 0.2).collect();
+        let mut last = 0.0;
+        for _ in 0..20 {
+            let (mut l, mut r) = (voice.clone(), voice.clone());
+            f.process([&mut l, &mut r]);
+            last = rms(&l);
+        }
+        assert!(last > rms(&voice) * 0.9, "the voice passes: {last} of {}", rms(&voice));
+    }
+
+    /// A gate set to close above where it opens still closes.
+    #[test]
+    fn a_gate_set_backwards_still_closes() {
+        let gate = AudioEffect::NoiseGate {
+            open_db: -40.0,
+            close_db: -20.0,
+            attack_ms: 25.0,
+            hold_ms: 10.0,
+            release_ms: 50.0,
+        };
+        let mut f = AudioFilter::new(gate, RATE);
+        let (mut l, mut r) = (vec![0.5f32; 4800], vec![0.5f32; 4800]);
+        f.process([&mut l, &mut r]);
+        let mut out = Vec::new();
+        for _ in 0..150 {
+            let (mut l, mut r) = (vec![0.001f32; 1024], vec![0.001f32; 1024]);
+            f.process([&mut l, &mut r]);
+            out = l;
+        }
+        assert!(out.iter().all(|v| v.abs() < 1e-4), "shut on quiet sound");
     }
 
     /// A slow plugin that gives up, as the strong noise removal does on a slow computer.

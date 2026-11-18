@@ -1122,6 +1122,16 @@ impl Engine {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, settings);
     }
 
+    /// Low latency sound (Settings): the mixer waits at most 60 ms past its filters' delay.
+    pub fn set_low_latency(&self, on: bool) {
+        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_low_latency(on);
+    }
+
+    /// Meters read true peak (4x oversampled) or sample peak.
+    pub fn set_true_peak(&self, on: bool) {
+        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_true_peak(on);
+    }
+
     /// Music quieter while the voices talk (None: off).
     pub fn set_ducking(&self, ducking: Option<crate::level::Ducking>) {
         self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_ducking(ducking);
@@ -2867,6 +2877,13 @@ fn on_time() {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn on_time() {}
+
+/// Raises the calling thread to the frame loop's priority (macOS: "user interactive"; Windows:
+/// high, out of power throttling): for a thread the sound depends on, such as a filter's own
+/// worker, so a busy computer wakes it in time.
+pub fn raise_this_thread() {
+    on_time();
+}
 
 /// The frame loop.
 fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
