@@ -48,6 +48,10 @@ pub struct Stage {
     // Read only where monitoring plays (macOS, Windows); Linux keeps it for the next build.
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     monitor_device: RefCell<Option<String>>,
+    /// Meters read true peak (Settings).
+    true_peak: std::cell::Cell<bool>,
+    /// Low latency sound (Settings).
+    low_latency: std::cell::Cell<bool>,
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
     /// Web page sources, each a page rendered for our engine, with the settings it opened with.
@@ -222,6 +226,8 @@ impl Stage {
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
             monitor_device: RefCell::new(None),
+            true_peak: std::cell::Cell::new(false),
+            low_latency: std::cell::Cell::new(false),
             engine: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
@@ -249,6 +255,8 @@ impl Stage {
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
             monitor_device: RefCell::new(None),
+            true_peak: std::cell::Cell::new(false),
+            low_latency: std::cell::Cell::new(false),
             engine: RefCell::new(None),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             pages: RefCell::default(),
@@ -293,6 +301,8 @@ impl Stage {
         if let Err(e) = shared.engine.set_monitoring(true, self.monitor_device.borrow().as_deref()) {
             tracing::warn!("monitoring couldn't start: {e}");
         }
+        shared.engine.set_true_peak(self.true_peak.get());
+        shared.engine.set_low_latency(self.low_latency.get());
         *self.engine.borrow_mut() = Some(shared.clone());
         self.sync_pages();
         Ok(shared)
@@ -2506,7 +2516,14 @@ impl Stage {
                 // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
                 // the page read as 0 dB, a full red meter the moment the sound stopped.
                 let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
-                Some((n.clone(), crate::collection::LevelInfo { peak: floor(l.peak), magnitude: floor(l.rms) }))
+                Some((
+                    n.clone(),
+                    crate::collection::LevelInfo {
+                        peak: floor(l.peak),
+                        magnitude: floor(l.rms),
+                        input_peak: floor(l.input_peak),
+                    },
+                ))
             })
             .collect()
     }
@@ -3505,9 +3522,23 @@ impl Stage {
         }
     }
 
-    // libobs's housekeeping, which our engine doesn't need: kept so the app calls the same.
+    /// Low latency sound (Settings); kept for every engine made.
+    pub fn set_low_latency(&self, on: bool) {
+        self.low_latency.set(on);
+        if let Some(e) = self.engine.borrow().as_ref() {
+            e.engine.set_low_latency(on);
+        }
+    }
 
-    pub fn set_true_peak(&self, _on: bool) {}
+    /// Meters read true peak (between samples) or sample peak; kept for every engine made.
+    pub fn set_true_peak(&self, on: bool) {
+        self.true_peak.set(on);
+        if let Some(e) = self.engine.borrow().as_ref() {
+            e.engine.set_true_peak(on);
+        }
+    }
+
+    // libobs's housekeeping, which our engine doesn't need: kept so the app calls the same.
 
     /// A Move transition under way: our engine plays it itself.
     pub fn moving(&self) -> bool {

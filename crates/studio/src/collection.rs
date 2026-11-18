@@ -275,6 +275,9 @@ pub struct FilterInfo {
 pub struct LevelInfo {
     pub peak: [f32; 2],
     pub magnitude: [f32; 2],
+    /// The highest the sound came in at, before its filters and fader (a gate's threshold
+    /// is set against it).
+    pub input_peak: [f32; 2],
 }
 
 /// How the picture goes from one scene to the next.

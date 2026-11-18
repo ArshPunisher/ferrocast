@@ -523,6 +523,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
         Ok(c) => {
             save(&c, to);
             c.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
+            c.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(c);
             refresh_projectors(h);
             sync_views(h);
@@ -1540,6 +1541,7 @@ impl StudioHost for DesktopStudio {
             }
             save(&collection, &file);
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
+            collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
             write_session(session_now(h).as_ref());
             // The first Start after a crash says what was on, for the engine to put back.
@@ -2084,6 +2086,7 @@ impl StudioHost for DesktopStudio {
                         notes.push(format!("{name} can't play sound; the system's device is used."));
                     }
                     c.set_true_peak(s.true_peak);
+                    c.set_low_latency(s.low_latency_audio);
                 }
                 // The stream on air takes a new encoder, size or frame rate at once, without
                 // stopping; a new bitrate alone just changes the bitrate.
