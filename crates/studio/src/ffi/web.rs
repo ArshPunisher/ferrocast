@@ -35,6 +35,24 @@ struct Shared {
     fps: AtomicU32,
     /// Our engine's source the page's picture and sound go to.
     out: Mutex<Option<ferrocore::engine::Feed>>,
+    /// The copier thread's inbox: snapshots are turned into pixels there, not on the main
+    /// thread (8 MB a 1080p frame: the app's own window stuttered while a page showed). One
+    /// waits at most; a newer one while it's busy is let go.
+    copier: Mutex<Option<std::sync::mpsc::SyncSender<Snap>>>,
+}
+
+/// A snapshot's CGImage, held (+1) until it's copied; immutable, so any thread may read it.
+struct Snap(*mut c_void);
+
+// SAFETY: a CGImage is immutable and CoreGraphics allows reading it from any thread; this
+// holds its own reference.
+unsafe impl Send for Snap {}
+
+impl Drop for Snap {
+    fn drop(&mut self) {
+        // SAFETY: the reference this holds, released once.
+        unsafe { cg::CGImageRelease(self.0) }
+    }
 }
 
 /// The off-screen window and its web view. Main thread only.
@@ -411,41 +429,58 @@ pub(crate) enum Do {
     Reload,
 }
 
-/// Copies a snapshot into the frame: drawn into a BGRA buffer of the source's size, then
-/// un-premultiplied (OBS's default draw takes straight alpha).
+/// Hands a snapshot to the copier (main thread: only the CGImage is taken here).
 fn copy(img: &NSImage, shared: &Shared) {
-    let (w, h) = (shared.w.load(Ordering::Relaxed), shared.h.load(Ordering::Relaxed));
-    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
-    // SAFETY: CoreGraphics C calls with a buffer of exactly w*h*4 bytes and stride w*4; the
-    // CGImage comes from a live NSImage during this call and is only borrowed.
-    unsafe {
+    // SAFETY: the NSImage is live for this call; the CGImage it gives is retained (+1) before
+    // it leaves, so it outlives the NSImage.
+    let cg_image = unsafe {
         let cg: *mut c_void = msg_send![img, CGImageForProposedRect: std::ptr::null_mut::<NSRect>(), context: std::ptr::null_mut::<AnyObject>(), hints: std::ptr::null_mut::<AnyObject>()];
         if cg.is_null() {
             return;
         }
-        let cs = cg::CGColorSpaceCreateDeviceRGB();
-        let ctx = cg::CGBitmapContextCreate(
-            buf.as_mut_ptr().cast(),
-            w as usize,
-            h as usize,
-            8,
-            (w as usize) * 4,
-            cs,
-            cg::PREMULTIPLIED_FIRST | cg::BYTE_ORDER_32_LITTLE,
-        );
-        if !ctx.is_null() {
-            let r = cg::CGRect { x: 0.0, y: 0.0, w: f64::from(w), h: f64::from(h) };
-            cg::CGContextDrawImage(ctx, r, cg);
-            cg::CGContextRelease(ctx);
-        }
-        cg::CGColorSpaceRelease(cs);
+        Snap(cg::CGImageRetain(cg))
+    };
+    if let Some(tx) = shared.copier.lock().ok().and_then(|c| c.clone()) {
+        // Busy with the last one: this one is let go (the next snapshot is newer anyway).
+        let _ = tx.try_send(cg_image);
     }
-    // Our engine takes it as it is: premultiplied, RGBA.
-    if let Some(out) = shared.out.lock().ok().and_then(|o| o.clone()) {
-        for px in buf.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
+}
+
+/// The copier: each snapshot drawn into an RGBA buffer of the source's size (CoreGraphics
+/// writes our engine's order itself: no pass swapping every pixel), premultiplied as WebKit
+/// gives it, and handed to the feed. Ends when the page goes.
+fn copier(rx: std::sync::mpsc::Receiver<Snap>, shared: std::sync::Weak<Shared>) {
+    while let Ok(snap) = rx.recv() {
+        let Some(shared) = shared.upgrade() else { break };
+        if !shared.alive.load(Ordering::Acquire) {
+            break;
         }
-        out.picture(ferrocore::Picture { width: w, height: h, rgba: buf, premultiplied: true });
+        let (w, h) = (shared.w.load(Ordering::Relaxed), shared.h.load(Ordering::Relaxed));
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        // SAFETY: CoreGraphics C calls with a buffer of exactly w*h*4 bytes and stride w*4;
+        // the CGImage is held by `snap` for the whole call.
+        unsafe {
+            let cs = cg::CGColorSpaceCreateDeviceRGB();
+            let ctx = cg::CGBitmapContextCreate(
+                buf.as_mut_ptr().cast(),
+                w as usize,
+                h as usize,
+                8,
+                (w as usize) * 4,
+                cs,
+                cg::PREMULTIPLIED_LAST | cg::BYTE_ORDER_32_BIG,
+            );
+            if !ctx.is_null() {
+                let r = cg::CGRect { x: 0.0, y: 0.0, w: f64::from(w), h: f64::from(h) };
+                cg::CGContextDrawImage(ctx, r, snap.0);
+                cg::CGContextRelease(ctx);
+            }
+            cg::CGColorSpaceRelease(cs);
+        }
+        drop(snap);
+        if let Some(out) = shared.out.lock().ok().and_then(|o| o.clone()) {
+            out.picture(ferrocore::Picture { width: w, height: h, rgba: buf, premultiplied: true });
+        }
     }
 }
 
@@ -518,7 +553,14 @@ impl FedPage {
             h: AtomicU32::new(h.max(1)),
             fps: AtomicU32::new(fps.clamp(1, 60)),
             out: Mutex::new(Some(feed)),
+            copier: Mutex::new(None),
         });
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let weak = Arc::downgrade(&shared);
+        std::thread::Builder::new().name("ferrocast-web-copy".into()).spawn(move || copier(rx, weak)).ok()?;
+        if let Ok(mut c) = shared.copier.lock() {
+            *c = Some(tx);
+        }
         let page: PageSlot = Arc::new(Mutex::new(None));
         let p = open(mtm, &page, &shared, url, w.max(1), h.max(1), css)?;
         if let Ok(mut slot) = page.lock() {
@@ -575,6 +617,10 @@ impl Drop for FedPage {
         if let Ok(mut o) = self.shared.out.lock() {
             *o = None;
         }
+        // The copier ends once its inbox closes.
+        if let Ok(mut c) = self.shared.copier.lock() {
+            *c = None;
+        }
         if let Ok(mut p) = self.page.lock()
             && let Some(OnMain(mut p)) = p.take()
         {
@@ -603,9 +649,9 @@ mod cg {
         pub w: f64,
         pub h: f64,
     }
-    /// kCGImageAlphaPremultipliedFirst and kCGBitmapByteOrder32Little: BGRA in memory.
-    pub const PREMULTIPLIED_FIRST: u32 = 2;
-    pub const BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
+    /// kCGImageAlphaPremultipliedLast and kCGBitmapByteOrder32Big: RGBA in memory.
+    pub const PREMULTIPLIED_LAST: u32 = 1;
+    pub const BYTE_ORDER_32_BIG: u32 = 4 << 12;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -622,5 +668,7 @@ mod cg {
         ) -> *mut c_void;
         pub fn CGContextDrawImage(c: *mut c_void, rect: CGRect, image: *mut c_void);
         pub fn CGContextRelease(c: *mut c_void);
+        pub fn CGImageRetain(image: *mut c_void) -> *mut c_void;
+        pub fn CGImageRelease(image: *mut c_void);
     }
 }
