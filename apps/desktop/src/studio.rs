@@ -2084,8 +2084,27 @@ impl StudioHost for DesktopStudio {
                     // Only the frame rate, while live: the stream takes it below; the canvas
                     // follows when the stream ends (`apply_waiting_canvas`).
                     let rate_only = live && (canvas.width, canvas.height) == (now.width, now.height);
+                    // Something draws from the picture (a recording, the replay buffer, NDI, the
+                    // virtual camera, a stream at another size): the new size waits for it to
+                    // stop, and the rest of the settings are saved now. Before, the virtual
+                    // camera and NDI were turned off first and then the change was refused, and
+                    // the whole save with it (peer, 18 Nov).
+                    let busy = live
+                        || h.record.as_ref().is_some_and(|r| r.0.stats().active)
+                        || h.replay.as_ref().is_some_and(|r| r.active())
+                        || h.ndi.is_some()
+                        || h.virtualcam.is_some();
                     if canvas != now && !rate_only {
-                        apply_canvas(&app, h, canvas)?;
+                        if busy {
+                            notes.push(
+                                "The new picture size and frame rate apply once streaming, recording, the replay buffer, NDI and the virtual camera are off."
+                                    .into(),
+                            );
+                        } else {
+                            apply_canvas(&app, h, canvas)?;
+                        }
+                    } else if rate_only && canvas.fps > now.fps {
+                        notes.push(format!("The stream goes up to {} fps after it ends; it can't go above the picture's rate while live.", canvas.fps));
                     }
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
@@ -2103,6 +2122,10 @@ impl StudioHost for DesktopStudio {
                     let (mut a, mut b) = (encode_of(o), encode_of(&s));
                     a.video_kbps = 0;
                     b.video_kbps = 0;
+                    // The sound's bitrate isn't changed live (a new video encoder for it was a
+                    // hiccup for nothing): it's for the next stream.
+                    a.audio_kbps = 0;
+                    b.audio_kbps = 0;
                     a != b || o.fps != s.fps
                 });
                 // At auto quality's share, as the stream was (a full bitrate here, then the
@@ -2120,6 +2143,9 @@ impl StudioHost for DesktopStudio {
                     }
                     _ => false,
                 };
+                if live && was.as_ref().is_some_and(|o| o.audio_kbps != s.audio_kbps) {
+                    notes.push("The new sound bitrate is used from the next stream.".into());
+                }
                 let was_kbps = was.as_ref().map(|o| o.video_kbps);
                 if was_kbps.is_some_and(|k| k != s.video_kbps) {
                     // The vertical picture's stream uses the same bitrate (CodeRabbit); the main
