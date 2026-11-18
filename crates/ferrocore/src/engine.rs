@@ -585,6 +585,19 @@ struct State {
     /// Sources a collection brought, by name: their id here and what they are (kept running
     /// when the collection is opened again unchanged).
     opened: HashMap<String, (u64, SourceKind)>,
+    /// Sources the last load couldn't open (a camera unplugged…), by name, with the id their
+    /// items were given: an edit that leaves them as they were needs no full load again.
+    missing: HashMap<String, (u64, SourceKind, String)>,
+    /// When the last full load was: sources that couldn't open are tried again by a full load
+    /// at most this often ([`MISSING_RETRY`]), not on every slider step.
+    loaded_at: Option<Instant>,
+    /// The collection's own scenes and groups at the last load, top layer and global sources (by
+    /// name): an edit that keeps them all is applied in place ([`Engine::apply_same_sources`]).
+    loaded: Option<Loaded>,
+    /// Scenes a full load took out while a transition or stinger still played from them: kept
+    /// until it ends (Studio Mode's copy on air left the collection right after its fade
+    /// started, and an edit then cut the fade off).
+    lingering: Vec<String>,
     outputs: Vec<(u64, Pipeline, OutputKind, Canvas)>,
     next_output: u64,
     /// Pictures handed out as drawn, not encoded (the virtual camera): id, canvas, sink.
@@ -604,6 +617,22 @@ struct State {
     /// a rename, the same camera added back) comes back at once instead of being opened again,
     /// which takes seconds on Windows. What each was, and when it was parked.
     parked: Vec<(SourceKind, Live, u64)>,
+}
+
+/// How often an edit applied in place lets a full load try again the sources that couldn't
+/// open.
+const MISSING_RETRY: Duration = Duration::from_secs(5);
+
+/// What a collection's load put in: compared with an edited collection to see whether only
+/// settings changed.
+#[derive(Debug, Clone, PartialEq)]
+struct Loaded {
+    scenes: Vec<String>,
+    groups: Vec<String>,
+    top: Option<String>,
+    globals: Vec<String>,
+    /// The scene the collection had on air (an edit in place leaves what's on air alone).
+    current: Option<String>,
 }
 
 /// How a preview looks, and what it shows (its window is with its own thread).
@@ -711,6 +740,10 @@ impl Engine {
             groups: Vec::new(),
             globals: std::collections::HashSet::new(),
             opened: HashMap::new(),
+            missing: HashMap::new(),
+            loaded_at: None,
+            loaded: None,
+            lingering: Vec::new(),
             outputs: Vec::new(),
             next_output: 1,
             taps: Vec::new(),
@@ -1163,6 +1196,11 @@ impl Engine {
     }
 
     /// A scene's items, bottom first (replacing what it had).
+    /// A scene's items as the engine has them (None: no such scene).
+    pub fn scene(&self, name: &str) -> Option<Vec<SceneItem>> {
+        self.lock().scenes.get(name).cloned()
+    }
+
     pub fn set_scene(&self, name: &str, items: Vec<SceneItem>) {
         self.lock().scenes.insert(name.to_string(), items);
     }
@@ -1184,7 +1222,8 @@ impl Engine {
         // (owner's recording, 10 Nov).
         let (keep, handed, ids) = {
             let st = self.lock();
-            let mut next = st.sources.keys().max().map_or(1, |m| m + 1);
+            // Ids the engine keeps for itself (the stinger's video) aren't counted from.
+            let mut next = st.sources.keys().filter(|id| **id != STINGER).max().map_or(1, |m| m + 1);
             let mut ids: HashMap<u64, u64> = HashMap::new();
             let mut keep: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut handed: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -1211,9 +1250,23 @@ impl Engine {
             }
             (keep, handed, ids)
         };
-        let old: Vec<u64> =
-            self.lock().sources.keys().copied().filter(|id| !keep.contains(id) && !handed.contains(id)).collect();
-        for id in old {
+        // Sources gone or changed are let go first (a camera parked: its device is free for
+        // the new one); a stinger under way plays on.
+        type Marked = Vec<(u64, bool)>;
+        let (old_devices, old_rest): (Marked, Marked) = {
+            let st = self.lock();
+            st.sources
+                .iter()
+                .filter(|(id, _)| !keep.contains(*id) && !handed.contains(*id) && **id != STINGER)
+                .map(|(id, src)| (*id, src.kind.as_ref().is_some_and(one_at_a_time)))
+                .partition(|(_, device)| *device)
+        };
+        let old_devices: Vec<u64> = old_devices.into_iter().map(|(id, _)| id).collect();
+        let old_rest: Vec<u64> = old_rest.into_iter().map(|(id, _)| id).collect();
+        // A device (camera, microphone) is let go before it's opened again (two sessions on one
+        // device give no picture); the rest go once the new collection is in, so a changed
+        // text or picture doesn't blink out meanwhile.
+        for id in old_devices {
             self.remove_source(id);
         }
         let to = |id: u64| ids.get(&id).copied().unwrap_or(id);
@@ -1227,18 +1280,16 @@ impl Engine {
                 }
             }
         }
-        {
-            // A fresh start: nothing on air, every scene's clock unset.
-            let mut st = self.lock();
-            st.scenes.clear();
-            st.started.clear();
-            st.on_air = None;
-            st.moving = None;
-            st.top = imported.top_layer.clone();
-            st.groups = imported.groups;
-            st.globals.clear();
-            st.opened.clear();
-        }
+        let loaded = Loaded {
+            scenes: imported.scenes.iter().map(|(n, _)| n.clone()).collect(),
+            groups: imported.groups.clone(),
+            top: imported.top_layer.clone(),
+            globals: imported.sources.iter().filter(|s| s.global).map(|s| s.name.clone()).collect(),
+            current: imported.current.clone(),
+        };
+        // New sources opened, and every source's sound set, while the scenes on air go on
+        // drawing (nothing shows a new source until the scenes are swapped in below).
+        let (mut opened, mut missing, mut globals) = (HashMap::new(), HashMap::new(), std::collections::HashSet::new());
         for mut s in imported.sources {
             s.id = to(s.id);
             let started = if keep.contains(&s.id) { Ok(()) } else { self.set_source(s.id, s.kind.clone()) };
@@ -1248,23 +1299,178 @@ impl Engine {
                         self.set_sound(s.id, sound);
                         self.set_sound_effects(s.id, &s.sound_effects);
                     }
-                    self.lock().opened.insert(s.name.clone(), (s.id, s.kind));
+                    opened.insert(s.name.clone(), (s.id, s.kind));
                 }
-                Err(e) => skipped.push(format!("{}: {e}", s.name)),
+                Err(e) => {
+                    let why = format!("{}: {e}", s.name);
+                    skipped.push(why.clone());
+                    missing.insert(s.name.clone(), (s.id, s.kind, why));
+                }
             }
             if s.global {
-                self.set_global(s.id, true);
+                globals.insert(s.id);
             }
         }
-        for (name, items) in imported.scenes {
-            self.set_scene(&name, items);
+        {
+            // Everything at once, in one lock: no frame is ever drawn (or heard) between the old
+            // collection and the new one. A full load used to clear the scenes, take the scene
+            // off air and put it back in many steps: a frame could go out black and every
+            // source's sound in it was thrown away (half a second of a video's, 18 Nov), and
+            // the scene's clock and any transition started over.
+            let mut st = self.lock();
+            let was_loaded = st.loaded.take();
+            let ours: Vec<String> = was_loaded.as_ref().map(|l| l.scenes.clone()).unwrap_or_default();
+            // Scenes of the engine's own (fade to black, a source recorded alone, Studio Mode's
+            // copy on air) aren't in the collection: they stay.
+            let new_names: std::collections::HashSet<String> = imported.scenes.iter().map(|(n, _)| n.clone()).collect();
+            // A scene a transition or stinger still plays from stays until it ends.
+            let mut playing: Vec<String> = st.moving.iter().map(|(from, ..)| from.clone()).collect();
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            playing.extend(st.stinger.iter().map(|(from, ..)| from.clone()));
+            let mut lingering = std::mem::take(&mut st.lingering);
+            // One back in the collection (an undo mid-fade) is the collection's again.
+            lingering.retain(|n| !new_names.contains(n));
+            for p in &playing {
+                if ours.contains(p) && !new_names.contains(p) && !lingering.contains(p) {
+                    lingering.push(p.clone());
+                }
+            }
+            st.scenes.retain(|name, _| {
+                (!ours.contains(name) || lingering.contains(name)) && !imported.groups.contains(name)
+            });
+            st.lingering = lingering;
+            for (name, items) in imported.scenes {
+                st.scenes.insert(name, items);
+            }
+            let names: std::collections::HashSet<String> = st.scenes.keys().cloned().collect();
+            st.started.retain(|name, _| names.contains(name));
+            // The collection's own pick of what's on air changed (another collection, an undo):
+            // that goes on air. Otherwise what's on air stays, with its clock, unless it's gone.
+            let picked = loaded.current.clone().filter(|c| names.contains(c));
+            let changed = was_loaded.as_ref().is_none_or(|l| l.current != loaded.current);
+            let stays = st.on_air.as_ref().is_some_and(|n| names.contains(n));
+            // A scene of the engine's own on air (fade to black, a copy in Studio Mode) is never
+            // replaced by a load: the real scene flashed on stream over black (peer, 18 Nov).
+            let own_on_air = stays && st.on_air.as_ref().is_some_and(|n| !new_names.contains(n));
+            if (changed && !own_on_air) || !stays {
+                let to_air = picked.or_else(|| loaded.scenes.iter().find(|n| !imported.groups.contains(n)).cloned());
+                if st.on_air != to_air {
+                    st.on_air = to_air.clone();
+                    st.moving = None;
+                    if let Some(n) = to_air {
+                        st.started.insert(n, now_ns());
+                    }
+                }
+            }
+            if st.moving.as_ref().is_some_and(|(from, ..)| !names.contains(from)) {
+                st.moving = None;
+            }
+            st.top = imported.top_layer;
+            st.groups = imported.groups;
+            st.globals = globals;
+            st.opened = opened;
+            st.missing = missing;
+            st.loaded = Some(loaded);
+            st.loaded_at = Some(Instant::now());
+        }
+        for id in old_rest {
+            self.remove_source(id);
         }
         self.load_audio_care(doc);
-        let first = self.scene_names().into_iter().next();
-        if let Some(cur) = imported.current.or(first) {
-            let _ = self.go(&cur);
-        }
         skipped
+    }
+
+    /// Applies an edited collection in place when it has the same sources (by name and kind),
+    /// scenes, groups, top layer and global sources as the one loaded: each scene's items
+    /// (moves, filters, visibility…) and each source's sound settings and sound filters change,
+    /// nothing else. No source is opened or closed, the scene on air stays on air with its
+    /// clock, a transition or stinger goes on, and no frame is drawn without its scene (a full
+    /// [`Self::load_obs`] clears all that for a moment: a slider dragged while live broke the
+    /// sound and could flash black, 18 Nov). None: more changed, and nothing was touched (the
+    /// caller loads it in full). Some: what couldn't come over, as `load_obs` says.
+    pub fn apply_same_sources(&self, doc: &serde_json::Value) -> Option<Vec<String>> {
+        let before: HashMap<String, SourceKind> = {
+            let st = self.lock();
+            st.loaded.as_ref()?;
+            // A source that couldn't open (a camera unplugged) is tried again by a full load
+            // now and then, as every edit's full load used to.
+            // So is one that opened late and failed then (a file that took a moment and turned
+            // out broken): it's gone from the sources, though it was opened (CodeRabbit).
+            let gone = st.opened.values().any(|(id, _)| !st.sources.contains_key(id));
+            if (!st.missing.is_empty() || gone) && st.loaded_at.is_none_or(|t| t.elapsed() >= MISSING_RETRY) {
+                return None;
+            }
+            st.opened
+                .iter()
+                .map(|(n, (_, k))| (n.clone(), k.clone()))
+                .chain(st.missing.iter().map(|(n, (_, k, _))| (n.clone(), k.clone())))
+                .collect()
+        };
+        // Read outside the lock: the frame loop keeps going meanwhile.
+        let imported =
+            crate::obs::import_with(doc, (self.config.width, self.config.height), &|n| before.get(n).cloned());
+        let loaded = Loaded {
+            scenes: imported.scenes.iter().map(|(n, _)| n.clone()).collect(),
+            groups: imported.groups.clone(),
+            top: imported.top_layer.clone(),
+            globals: imported.sources.iter().filter(|s| s.global).map(|s| s.name.clone()).collect(),
+            current: imported.current.clone(),
+        };
+        let mut st = self.lock();
+        let same =
+            st.loaded.as_ref().is_some_and(|l| Loaded { current: loaded.current.clone(), ..l.clone() } == loaded);
+        if !same || imported.sources.len() != st.opened.len() + st.missing.len() {
+            return None;
+        }
+        // Every source the same one by name and kind; its id here (the imported ids are the
+        // order the document lists them in).
+        let mut ids: HashMap<u64, u64> = HashMap::new();
+        for src in &imported.sources {
+            let here = st
+                .opened
+                .get(&src.name)
+                .map(|(id, k)| (id, k))
+                .or_else(|| st.missing.get(&src.name).map(|(id, k, _)| (id, k)));
+            match here {
+                Some((id, kind)) if kind == &src.kind => {
+                    ids.insert(src.id, *id);
+                }
+                _ => return None,
+            }
+        }
+        let to = |id: u64| ids.get(&id).copied().unwrap_or(id);
+        for (name, mut items) in imported.scenes {
+            for it in &mut items {
+                it.source = to(it.source);
+                for e in &mut it.effects {
+                    if let Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } = e {
+                        *image = to(*image);
+                    }
+                }
+            }
+            // Unchanged scenes are left as they are (cheap to compare, and nothing is redrawn
+            // for them).
+            if st.scenes.get(&name) != Some(&items) {
+                st.scenes.insert(name, items);
+            }
+        }
+        if let Some(l) = st.loaded.as_mut() {
+            l.current = loaded.current;
+        }
+        let running: std::collections::HashSet<String> = st.opened.keys().cloned().collect();
+        // Why each that couldn't open didn't, as the full load said.
+        let mut skipped = imported.skipped;
+        skipped.extend(st.missing.values().map(|(.., why)| why.clone()));
+        drop(st);
+        for s in imported.sources {
+            if let Some(sound) = s.sound.filter(|_| running.contains(&s.name)) {
+                let id = to(s.id);
+                self.set_sound(id, sound);
+                self.set_sound_effects(id, &s.sound_effects);
+            }
+        }
+        self.load_audio_care(doc);
+        Some(skipped)
     }
 
     /// Ferrocast's own sound care in the document (`ferrocast.audio`): ducking (`ducking`:
@@ -1413,6 +1619,13 @@ impl Engine {
         if from.as_deref() != Some(name) {
             st.started.insert(name.to_string(), now);
         }
+        // A switch made here is the collection's own pick now (a later load doesn't count it
+        // as a change and switch over whatever is on air then, such as black).
+        if let Some(l) = st.loaded.as_mut()
+            && l.scenes.iter().any(|s| s == name)
+        {
+            l.current = Some(name.to_string());
+        }
         st.moving = match from {
             Some(f) if kind != TransitionKind::Cut && ms > 0 && f != name => Some((f, kind, now, ms * 1_000_000)),
             _ => None,
@@ -1439,6 +1652,11 @@ impl Engine {
         let mut st = self.lock();
         st.sources.insert(STINGER, Src::new(Live::Media(m), None, None));
         let from = st.on_air.replace(name.to_string()).unwrap_or_default();
+        if let Some(l) = st.loaded.as_mut()
+            && l.scenes.iter().any(|s| s == name)
+        {
+            l.current = Some(name.to_string());
+        }
         st.started.insert(name.to_string(), now + cut_ms * 1_000_000);
         st.moving = None;
         // The media's first frame shows about 100 ms after it opens.
@@ -1617,6 +1835,11 @@ impl Engine {
             && !st.scenes.contains_key(name)
         {
             return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
+        }
+        // The same scene: nothing to change (every edit sets it again; flushing would wait
+        // for the card each time).
+        if st.outputs.iter().any(|(i, .., c)| *i == id && c.scene == scene) {
+            return Ok(());
         }
         // Frames drawn for the old scene go out first: matched by canvas, they'd be dropped
         // once it names the new one, while their sound still went (review).
@@ -2692,6 +2915,16 @@ pub(crate) fn open_video(path: &std::path::Path, looping: bool) -> Result<crate:
     return crate::media::Media::open_for_card(path, looping);
 }
 
+/// A source whose device takes one user at a time: closed before it's opened again.
+fn one_at_a_time(kind: &SourceKind) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    if matches!(kind, SourceKind::Camera(_) | SourceKind::Microphone(_)) {
+        return true;
+    }
+    let _ = kind;
+    false
+}
+
 /// Sources the watchdog can start again: captures (a file or a picture doesn't stop by itself).
 /// A screen capture changing method or what it shows (Screen, Window, App): the old one keeps
 /// showing until the new one opens. Not cameras (two sessions on one device give no picture).
@@ -3191,6 +3424,18 @@ fn frame(
     if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
         st.moving = None;
     }
+    if !st.lingering.is_empty() {
+        let mut playing: Vec<String> = st.moving.iter().map(|(from, ..)| from.clone()).collect();
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        playing.extend(st.stinger.iter().map(|(from, ..)| from.clone()));
+        playing.extend(st.on_air.clone());
+        let gone: Vec<String> = st.lingering.iter().filter(|n| !playing.contains(n)).cloned().collect();
+        for n in gone {
+            st.scenes.remove(&n);
+            st.started.remove(&n);
+            st.lingering.retain(|l| *l != n);
+        }
+    }
     if !st.outputs.is_empty() || !st.taps.is_empty() {
         // Each distinct canvas drawn once this frame (if it takes this one). The card reads them
         // back while the next frames are drawn (`deliver`): waiting for it here stalled the loop
@@ -3678,6 +3923,172 @@ mod tests {
         let px = e.snapshot_scene("Main").unwrap_or_else(|x| panic!("{x}"));
         let at = (10 * 640 + 110) * 4;
         assert_eq!(&px[at..at + 4], &[0, 255, 0, 255], "the new box, where it moved");
+    }
+
+    /// A collection edited with the same sources (a move, a filter's setting) is applied in
+    /// place: the same sources keep running, the scene on air stays on air with its clock, and
+    /// at no moment is nothing on air (a full load clears it for a moment: a slider dragged
+    /// while live broke the sound, 18 Nov).
+    #[test]
+    fn settings_only_edits_apply_in_place() {
+        let Some(e) = engine() else { return };
+        let doc = |x: f64, radius: u32, extra: bool| {
+            let mut sources = vec![
+                serde_json::json!({ "id": "color_source", "name": "Back", "settings": { "color": 0xFF00_00FFu32 } }),
+                serde_json::json!({ "id": "color_source", "name": "Box",
+                    "settings": { "color": 0xFFFF_0000u32, "width": 64, "height": 64 },
+                    "filters": [{ "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": radius } }] }),
+                serde_json::json!({ "id": "ffmpeg_source", "name": "Gone", "settings": { "local_file": "/no/such/clip.mp4" } }),
+                serde_json::json!({ "id": "scene", "name": "Main", "settings": { "items": [
+                    { "name": "Back" }, { "name": "Box", "pos": { "x": x, "y": 0.0 } }, { "name": "Gone" } ] } }),
+            ];
+            if extra {
+                sources.push(
+                    serde_json::json!({ "id": "color_source", "name": "New", "settings": { "color": 0xFF00_FF00u32 } }),
+                );
+            }
+            serde_json::json!({ "current_program_scene": "Main", "sources": sources })
+        };
+        let skipped = e.load_obs(&doc(0.0, 4, false));
+        assert_eq!(skipped.len(), 1, "the missing file is said: {skipped:?}");
+        let ids = |e: &Engine| {
+            let st = e.lock();
+            let id = |n: &str| st.opened.get(n).map(|(i, _)| *i);
+            (id("Back"), id("Box"))
+        };
+        let before = ids(&e);
+        let started = e.lock().started.get("Main").copied();
+        // Something watches the whole time: Main is on air with its items at every moment.
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty = Arc::new(AtomicU64::new(0));
+        let watcher = {
+            let (state, stop, empty) = (e.state.clone(), stop.clone(), empty.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.on_air.as_deref() != Some("Main") || st.scenes.get("Main").is_none_or(Vec::is_empty) {
+                        empty.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        for i in 0..200 {
+            let r = e.apply_same_sources(&doc(f64::from(i), 4 + i % 30, false));
+            assert!(r.is_some(), "the same sources: applied in place");
+        }
+        stop.store(true, Ordering::Release);
+        let _ = watcher.join();
+        assert_eq!(empty.load(Ordering::Relaxed), 0, "never nothing on air");
+        assert_eq!(ids(&e), before, "the same sources keep running");
+        assert_eq!(e.lock().started.get("Main").copied(), started, "the scene's clock goes on");
+        {
+            let st = e.lock();
+            let items = &st.scenes["Main"];
+            let bx = items.iter().find(|it| Some(it.source) == before.1).unwrap_or_else(|| panic!("the box"));
+            assert_eq!(bx.placement.x, 199.0, "the last move");
+            assert_eq!(bx.effects, vec![Effect::RoundedCorners { radius: 23.0 }], "the last setting");
+        }
+        // A new source: not applied here, nothing touched (the caller loads it in full).
+        assert!(e.apply_same_sources(&doc(5.0, 4, true)).is_none());
+        assert_eq!(
+            e.lock().scenes["Main"].iter().find(|it| Some(it.source) == before.1).map(|it| it.placement.x),
+            Some(199.0)
+        );
+        // A scene of the engine's own on air (fade to black) stays on air through an edit.
+        e.set_scene("black", Vec::new());
+        e.go("black").unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.apply_same_sources(&doc(7.0, 4, false)).is_some());
+        assert_eq!(e.lock().on_air.as_deref(), Some("black"));
+        assert!(e.lock().scenes.contains_key("black"), "the engine's own scene is kept");
+    }
+
+    /// A full load (a source added or removed) swaps the collection in at once: nothing is
+    /// ever off air in between, the scene on air keeps its clock, the engine's own scenes (fade
+    /// to black) stay, a stinger's video plays on and new ids never run into its id; a
+    /// collection whose own scene on air changed puts that one on air.
+    #[test]
+    fn a_full_load_swaps_in_at_once() {
+        let Some(e) = engine() else { return };
+        let doc = |extra: bool, current: &str| {
+            let mut sources = vec![
+                serde_json::json!({ "id": "color_source", "name": "Back", "settings": { "color": 0xFF00_00FFu32 } }),
+                serde_json::json!({ "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Back" }] } }),
+                serde_json::json!({ "id": "scene", "name": "Other", "settings": { "items": [{ "name": "Back" }] } }),
+            ];
+            if extra {
+                sources.push(
+                    serde_json::json!({ "id": "color_source", "name": "New", "settings": { "color": 0xFF00_FF00u32 } }),
+                );
+            }
+            serde_json::json!({ "current_program_scene": current, "sources": sources })
+        };
+        e.load_obs(&doc(false, "Main"));
+        let started = e.lock().started.get("Main").copied();
+        assert!(started.is_some());
+        // The stinger's video, as `go_stinger` adds it.
+        e.set_source(STINGER, SourceKind::Color { width: 8, height: 8, rgba: [1, 2, 3, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty = Arc::new(AtomicU64::new(0));
+        let watcher = {
+            let (state, stop, empty) = (e.state.clone(), stop.clone(), empty.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.on_air.as_deref() != Some("Main") || st.scenes.get("Main").is_none_or(Vec::is_empty) {
+                        empty.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        for i in 0..100 {
+            e.load_obs(&doc(i % 2 == 0, "Main"));
+        }
+        stop.store(true, Ordering::Release);
+        let _ = watcher.join();
+        assert_eq!(empty.load(Ordering::Relaxed), 0, "never nothing on air");
+        assert_eq!(e.lock().started.get("Main").copied(), started, "the scene's clock goes on");
+        assert!(e.lock().sources.contains_key(&STINGER), "the stinger plays on");
+        assert!(e.lock().sources.keys().all(|id| *id < 1000 || *id == STINGER), "ids count on from the collection's");
+        // Fade to black (a scene of the engine's own) stays on air through full loads.
+        e.set_scene("black", Vec::new());
+        e.go("black").unwrap_or_else(|x| panic!("{x}"));
+        e.load_obs(&doc(true, "Main"));
+        assert_eq!(e.lock().on_air.as_deref(), Some("black"));
+        // A switch made with `go`, then black, then a load: black stays (the switch isn't
+        // taken for the collection's own change; peer's R3).
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        e.go("black").unwrap_or_else(|x| panic!("{x}"));
+        e.load_obs(&doc(false, "Other"));
+        assert_eq!(e.lock().on_air.as_deref(), Some("black"), "black stays on air");
+        // Another collection's own pick goes on air (when black isn't on).
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        e.load_obs(&doc(true, "Main"));
+        e.load_obs(&doc(false, "Other"));
+        assert_eq!(e.lock().on_air.as_deref(), Some("Other"));
+        // A fade from a scene the load takes out plays to its end, then the scene goes.
+        let with_third = serde_json::json!({ "current_program_scene": "Other", "sources": [
+            { "id": "color_source", "name": "Back", "settings": { "color": 0xFF00_00FFu32 } },
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Back" }] } },
+            { "id": "scene", "name": "Other", "settings": { "items": [{ "name": "Back" }] } },
+            { "id": "scene", "name": "Copy", "settings": { "items": [{ "name": "Back" }] } } ] });
+        e.load_obs(&with_third);
+        e.go("Copy").unwrap_or_else(|x| panic!("{x}"));
+        e.go_with("Main", TransitionKind::Fade, 400).unwrap_or_else(|x| panic!("{x}"));
+        e.load_obs(&doc(false, "Main"));
+        assert!(e.lock().moving.is_some(), "the fade goes on");
+        assert!(e.lock().scenes.contains_key("Copy"), "from the scene it started from");
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(e.lock().moving.is_none());
+        assert!(!e.lock().scenes.contains_key("Copy"), "then that scene goes");
+        // Taken out mid-fade and put back (an undo) before it ends: it stays.
+        e.load_obs(&with_third);
+        e.go("Copy").unwrap_or_else(|x| panic!("{x}"));
+        e.go_with("Main", TransitionKind::Fade, 400).unwrap_or_else(|x| panic!("{x}"));
+        e.load_obs(&doc(false, "Main"));
+        e.load_obs(&with_third);
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(e.lock().scenes.contains_key("Copy"), "back in the collection: kept");
     }
 
     #[test]

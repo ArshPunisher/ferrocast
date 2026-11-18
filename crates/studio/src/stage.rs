@@ -596,7 +596,7 @@ impl Stage {
     /// Opens the scenes again in the engine as they are (a plugin's effect came or went).
     pub fn refresh(&self) {
         if let Some(e) = self.engine.borrow().as_ref() {
-            e.reopen(&self.doc.borrow());
+            e.reopen_with(&self.doc.borrow(), true);
         }
     }
 

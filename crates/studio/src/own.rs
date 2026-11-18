@@ -237,9 +237,31 @@ impl Shared {
     /// Opens `doc` again now, whatever changed (the scene store calls it after each edit;
     /// unchanged sources keep running).
     pub(crate) fn reopen(&self, doc: &serde_json::Value) {
+        self.reopen_with(doc, false);
+    }
+
+    /// As [`Self::reopen`]; `full` opens it all again even when only settings changed (Refresh:
+    /// sources that couldn't open are tried again).
+    pub(crate) fn reopen_with(&self, doc: &serde_json::Value, full: bool) {
         let drawn = engine_doc(doc);
         let doc: &serde_json::Value = &drawn;
         let mut seen = self.seen();
+        // Only settings changed (a slider, a filter, a move): applied in place, nothing taken
+        // off air. The black scene, scenes recorded alone and the vertical picture's outputs
+        // are the engine's own and stay as they are.
+        if let Some(skipped) = (!full).then(|| self.engine.apply_same_sources(doc)).flatten() {
+            for s in skipped.iter().filter(|s| !seen.skipped.contains(s)) {
+                tracing::warn!("Ferrocast's own engine left this out: {s}");
+            }
+            seen.skipped = skipped;
+            seen.shown = without_on_air(doc);
+            seen.on_air = doc.get("current_program_scene").and_then(serde_json::Value::as_str).map(String::from);
+            let on = vertical_on_air(doc);
+            for id in &seen.vertical {
+                let _ = self.engine.set_output_scene(*id, on.clone());
+            }
+            return;
+        }
         let skipped = self.engine.load_obs(doc);
         // What an edit just left out says why (a shader effect that doesn't compile…).
         for s in skipped.iter().filter(|s| !seen.skipped.contains(s)) {
@@ -247,7 +269,7 @@ impl Shared {
         }
         seen.skipped = skipped;
         for name in seen.alone.clone() {
-            if let Err(e) = show_alone(&self.engine, &name, (0, 0)) {
+            if let Err(e) = keep_alone_scene(&self.engine, &name) {
                 tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
             }
         }
@@ -407,6 +429,51 @@ pub(crate) fn show_alone(engine: &Engine, name: &str, canvas: (u32, u32)) -> Res
     let scene = alone_scene(name);
     engine.set_scene(&scene, vec![item]);
     Ok((scene, w, h))
+}
+
+/// A source recorded alone, after the collection was opened again: its scene (the engine's
+/// own, kept through the load) points at the source as it is now. Never waits: this runs on the
+/// window's thread with every edit, and waiting for a picture that isn't there (a camera
+/// unplugged) froze the window two seconds each time.
+fn keep_alone_scene(engine: &Engine, name: &str) -> Result<(), StudioError> {
+    if engine.scene_names().iter().any(|s| s == name) || engine.group_size(name).is_some() {
+        return Ok(());
+    }
+    let (id, _) = engine
+        .source_named(name)
+        .ok_or_else(|| StudioError::Failed(format!("Ferrocast's own engine can't show \"{name}\" on its own yet.")))?;
+    let scene = alone_scene(name);
+    match engine.scene(&scene) {
+        Some(items) if items.iter().all(|it| it.source == id) => Ok(()),
+        // The source was opened anew: the same place, the new one.
+        Some(mut items) => {
+            for it in &mut items {
+                it.source = id;
+            }
+            engine.set_scene(&scene, items);
+            Ok(())
+        }
+        None => show_alone_now(engine, name),
+    }
+}
+
+/// As [`show_alone`], without waiting for the source's size (the canvas's until it has one).
+fn show_alone_now(engine: &Engine, name: &str) -> Result<(), StudioError> {
+    let (id, size) = engine
+        .source_named(name)
+        .ok_or_else(|| StudioError::Failed(format!("Ferrocast's own engine can't show \"{name}\" on its own yet.")))?;
+    let (w, h) = size.unwrap_or((engine.config().width, engine.config().height));
+    let item = ferrocore::engine::SceneItem::new(
+        id,
+        ferrocore::Placement {
+            bounds: ferrocore::Bounds::Fit,
+            bounds_width: w.max(1) as f32,
+            bounds_height: h.max(1) as f32,
+            ..Default::default()
+        },
+    );
+    engine.set_scene(&alone_scene(name), vec![item]);
+    Ok(())
 }
 
 /// The vertical picture's scene on air in a saved collection.
