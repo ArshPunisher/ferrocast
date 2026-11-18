@@ -5,6 +5,35 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.3.0
+
+A smoother stream, sharper pictures, and filters you can see as you set them.
+
+- **Smoother streams**: Ferrocast hands finished frames to the encoder while it draws the next
+  ones, so a busy graphics card no longer drops frames. The status bar warns only when your
+  upload really struggles, and Auto quality steps down only when most of your platforms do.
+- **Optimize while live**: change the frame rate or quality mid-stream; viewers keep watching.
+- **Kick stays connected**: Ferrocast now tells Kick what it sends before the first frame.
+- **Categories**: when you type a game, Stream info shows what Twitch, YouTube and Kick will each
+  pick, before you go live.
+- **Adjust colour**: a new filter with exposure, contrast, highlights, shadows, saturation and
+  warmth, like a photo app. OBS's colour correction contrast now matches OBS.
+- **See your filters**: the Filters tab shows the picture with its filters; hold Before to
+  compare. Sliders change the picture as you drag, and a double-click puts one back.
+- **Filters that work properly**: Shape lets you pick a circle, hexagon, diamond, star or heart;
+  Blur or pixelate an area has a box you drag over the picture; Colour look has its looks. A
+  new shadow spills outside its source instead of shrinking it.
+- **Capture cards**: a card's Size and Frame rate lists show only what it really sends, and it's
+  never opened twice (adding it again uses the one you have). Its sound is one tap away.
+- **Screens and apps**: the drawer shows each screen's picture; an app capture says when the app
+  has no windows on that screen, with a button to switch; "Hide these apps" finds WhatsApp.
+- **Sharper**: Mac windows are captured at their exact size, screens look crisp in the preview,
+  and recordings use high quality by default. Screen and app captures on a Mac carry their sound.
+- **Windows virtual camera**: send your scene, or one source, to Zoom, Meet, Discord and other
+  apps as "Ferrocast Camera".
+- **Fixes**: a fitted source stretches from a side handle; the resize cursor stays over the Mac
+  preview; ⌘Z updates an open drawer; scenes added elsewhere show up; clearer names everywhere.
+
 ## 3.2.1
 
 Your own sound plugins, Studio Mode as OBS has it, and groups that work properly.
