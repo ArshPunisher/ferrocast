@@ -294,8 +294,18 @@ mod win {
                 }
             }
             let stream = stream.ok_or("no stream from the source")?;
+            // The size the source streams at: with no frames yet when it was made (as under the
+            // frame server), 1920×1080, which the source scales Ferrocast's picture into.
+            let size = stream
+                .GetStreamDescriptor()
+                .and_then(|sd| sd.GetMediaTypeHandler())
+                .and_then(|h| h.GetCurrentMediaType())
+                .and_then(|t| t.GetUINT64(&MF_MT_FRAME_SIZE))
+                .map_err(e)?;
+            let (sw, sh) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
             let mut got = None;
-            for _ in 0..30 {
+            let mut seen = (0, 0);
+            for _ in 0..100 {
                 stream.RequestSample(None).map_err(e)?;
                 let ev = stream.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)).map_err(e)?;
                 if ev.GetType().map_err(e)? == MEMediaSample.0 as u32 {
@@ -307,8 +317,11 @@ mod win {
                     buf.Lock(&mut p, None, Some(&mut len)).map_err(e)?;
                     let y = std::slice::from_raw_parts(p, len as usize).to_vec();
                     buf.Unlock().map_err(e)?;
-                    // The source's first type is Ferrocast's own size (1280×720 here).
-                    let (l, r) = halves(&y, W as usize, H as usize);
+                    if y.len() < sw * sh {
+                        return Err(format!("a sample of {} bytes for {sw}x{sh}", y.len()));
+                    }
+                    let (l, r) = halves(&y, sw, sh);
+                    seen = (l, r);
                     if near(l, BRIGHT) && near(r, DARK) {
                         got = Some(s.cast().map_err(e)?);
                         break;
@@ -319,7 +332,8 @@ mod win {
             }
             let _ = source.Stop();
             let _ = source.Shutdown();
-            got.map(|_| ()).ok_or_else(|| "the source never gave the picture".into())
+            got.map(|_| ())
+                .ok_or_else(|| format!("the source never gave the picture ({sw}x{sh}, last {}/{})", seen.0, seen.1))
         }
     }
 
