@@ -595,7 +595,7 @@ mod tests {
             let w = ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
             b0 = 0.99886 * b0 + w * 0.0555179;
             b1 = 0.99332 * b1 + w * 0.0750759;
-            b2 = 0.96900 * b2 + w * 0.1538520;
+            b2 = 0.969_00 * b2 + w * 0.153_852;
             b3 = 0.86650 * b3 + w * 0.3104856;
             b4 = 0.55000 * b4 + w * 0.5329522;
             b5 = -0.7616 * b5 - w * 0.0168980;
@@ -699,7 +699,7 @@ mod tests {
         let mut pause_at_99 = 0.0f32;
         let mut pause_at_100 = 0.0f32;
         for strength in [20u32, 40, 65, 80, 99, 100] {
-            let mut d = Denoiser::new(1, strength).expect("model starts");
+            let Ok(mut d) = Denoiser::new(1, strength) else { panic!("model starts") };
             let lat = d.latency();
             let mut padded = input.clone();
             padded.resize(total + lat + 1024, 0.0);
@@ -992,11 +992,12 @@ mod tests {
     #[test]
     fn slow_startup_never_triggers_gave_up_and_engages_in_phase() {
         use ferrocore::afx::SoundPlugin as _;
-        let mut p = Plugin::start_with(65, READY_WITHIN, |_| {
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, |_| {
             std::thread::sleep(std::time::Duration::from_millis(800));
             Ok(MockEngine::new(0.25, None))
-        })
-        .expect("worker spawns");
+        }) else {
+            panic!("worker spawns");
+        };
         let mut tail_rms = Vec::new();
         for b in 0..65 {
             let mut l = vec![0.4f32; 1024];
@@ -1018,11 +1019,12 @@ mod tests {
     #[test]
     fn failed_init_leaves_zero_latency_and_no_handover() {
         use ferrocore::afx::SoundPlugin as _;
-        let mut p = Plugin::start_with::<MockEngine, _>(65, READY_WITHIN, |_| {
+        let Ok(mut p) = Plugin::start_with::<MockEngine, _>(65, READY_WITHIN, |_| {
             std::thread::sleep(std::time::Duration::from_millis(30));
             Err("simulated model load failure".into())
-        })
-        .expect("worker spawns");
+        }) else {
+            panic!("worker spawns");
+        };
         let mut gave_up = false;
         for _ in 0..10 {
             let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
@@ -1042,10 +1044,11 @@ mod tests {
     #[test]
     fn brief_cpu_stall_drops_oldest_and_recovers() {
         use ferrocore::afx::SoundPlugin as _;
-        let mut p = Plugin::start_with(65, READY_WITHIN, |_| {
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, |_| {
             Ok(MockEngine::new(0.25, Some((10, std::time::Duration::from_millis(160)))))
-        })
-        .expect("worker spawns");
+        }) else {
+            panic!("worker spawns");
+        };
         let mut recovered = Vec::new();
         for b in 0..45 {
             let (mut l, mut r) = (vec![0.4f32; 1024], vec![0.4f32; 1024]);
