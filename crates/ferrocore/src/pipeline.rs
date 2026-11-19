@@ -12,7 +12,7 @@ use crate::AvError;
 use crate::audio::{AudioConfig, AudioEncoder, AudioPacket};
 use crate::flv;
 use crate::mkv::MkvWriter;
-use crate::mp4::{AudioTrack, Mp4Writer, VideoTrack};
+use crate::mp4::{AudioTrack, Flavor, Mp4Writer, VideoTrack};
 use crate::video::{Frame, VideoConfig, VideoEncoder, VideoPacket};
 
 /// An FLV tag body for the stream, with its time in milliseconds.
@@ -44,7 +44,7 @@ pub struct Pipeline {
     key_next: bool,
     /// A new file to go on in at the next keyframe ("Split recording").
     /// Its path too: removed when nothing was written to it (stopped before its keyframe).
-    split_to: Option<(File, bool, std::path::PathBuf)>,
+    split_to: Option<(File, Kind, std::path::PathBuf)>,
     /// The replay buffer's memory, when this output is one.
     replay: Option<Replay>,
     /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
@@ -138,7 +138,7 @@ impl ReplayClip {
         let fail =
             |e: std::io::Error| AvError::Encoder(format!("the replay couldn't be written at {} ({e})", path.display()));
         let file = BufWriter::new(File::create(path).map_err(fail)?);
-        let mut w = Writer::new(file, is_mkv(path), self.video, vec![self.audio; self.tracks]).map_err(fail)?;
+        let mut w = Writer::new(file, kind_of(path), self.video, vec![self.audio; self.tracks]).map_err(fail)?;
         // In time order, as a recording receives them.
         let mut sound = self.sound.into_iter().peekable();
         for v in &self.packets {
@@ -150,7 +150,7 @@ impl ReplayClip {
         for (t, a) in sound {
             w.audio(t, &a).map_err(fail)?;
         }
-        w.finish().map_err(fail)
+        w.finish().map_err(|u| fail(u.cut()))
     }
 
     /// Seconds of picture in the clip.
@@ -167,7 +167,7 @@ enum Recording {
     /// Waiting for the encoder's codec header (after the first frame).
     Waiting {
         file: BufWriter<File>,
-        mkv: bool,
+        kind: Kind,
         /// Sound that came before the header, with its track.
         held: Vec<(usize, AudioPacket)>,
     },
@@ -256,11 +256,11 @@ enum Writer {
 }
 
 impl Writer {
-    fn new(file: BufWriter<File>, mkv: bool, v: VideoTrack, a: Vec<AudioTrack>) -> std::io::Result<Self> {
-        Ok(if mkv {
-            Self::Mkv(MkvWriter::with_tracks(file, Some(v), a)?)
-        } else {
-            Self::Mp4(Mp4Writer::with_tracks(file, Some(v), a)?)
+    fn new(file: BufWriter<File>, kind: Kind, v: VideoTrack, a: Vec<AudioTrack>) -> std::io::Result<Self> {
+        Ok(match kind {
+            Kind::Mkv => Self::Mkv(MkvWriter::with_tracks(file, Some(v), a)?),
+            Kind::Mov => Self::Mp4(Mp4Writer::with_flavor(file, Some(v), a, Flavor::Mov)?),
+            Kind::Mp4 => Self::Mp4(Mp4Writer::with_tracks(file, Some(v), a)?),
         })
     }
 
@@ -300,17 +300,48 @@ impl Writer {
         }
     }
 
-    fn finish(self) -> std::io::Result<()> {
+    /// Makes the file a regular MP4, MOV or MKV (see `Mp4Writer::finalize`). On a failure the file
+    /// is as it was, and the failure keeps the file for cutting back.
+    fn finish(self) -> Result<(), Unfinished> {
+        let unfinished =
+            |f: crate::mp4::FinishFailed<BufWriter<File>>| Unfinished { error: f.error, file: f.out, whole: f.whole };
         match self {
-            Self::Mp4(w) => w.finish_with_chapters().map(drop),
-            Self::Mkv(w) => w.finish_with_chapters().map(drop),
+            Self::Mp4(w) => w.finalize().map(drop).map_err(unfinished),
+            Self::Mkv(w) => w.finalize().map(drop).map_err(unfinished),
         }
     }
 }
 
-/// Whether a recording at `path` is written as MKV (by its name).
-fn is_mkv(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mkv"))
+/// A file that couldn't be finished: why, the file, and where its last whole piece ends.
+struct Unfinished {
+    error: std::io::Error,
+    file: BufWriter<File>,
+    whole: u64,
+}
+
+impl Unfinished {
+    /// Cuts the file back to its last whole piece (so it plays as it was, open-ended) and gives
+    /// the error.
+    fn cut(self) -> std::io::Error {
+        salvage(self.file, self.whole);
+        self.error
+    }
+}
+
+/// What a recording's file is, by its name: MKV, MOV (QuickTime) or MP4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Mp4,
+    Mov,
+    Mkv,
+}
+
+fn kind_of(path: &Path) -> Kind {
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("mkv") => Kind::Mkv,
+        Some("mov") => Kind::Mov,
+        _ => Kind::Mp4,
+    }
 }
 
 impl Pipeline {
@@ -332,7 +363,7 @@ impl Pipeline {
                 let f = File::create(p).map_err(|e| {
                     AvError::Encoder(format!("the recording can't be written at {} ({e})", p.display()))
                 })?;
-                Some(Recording::Waiting { file: BufWriter::new(f), mkv: is_mkv(p), held: Vec::new() })
+                Some(Recording::Waiting { file: BufWriter::new(f), kind: kind_of(p), held: Vec::new() })
             }
             None => None,
         };
@@ -376,7 +407,7 @@ impl Pipeline {
         let f = File::create(path)
             .map_err(|e| AvError::Encoder(format!("the recording can't be written at {} ({e})", path.display())))?;
         self.recording = None;
-        self.split_to = Some((f, is_mkv(path), path.to_path_buf()));
+        self.split_to = Some((f, kind_of(path), path.to_path_buf()));
         self.key_next = true;
         // A recording before it on this output may have stopped paused: this one starts afresh.
         self.rec_cuts.clear();
@@ -390,7 +421,7 @@ impl Pipeline {
         self.drop_pending_file();
         match self.recording.take() {
             Some(Recording::On(w)) => {
-                w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))
+                w.finish().map_err(|u| AvError::Encoder(format!("the recording couldn't be finished ({})", u.cut())))
             }
             _ => Ok(()),
         }
@@ -551,7 +582,7 @@ impl Pipeline {
         }
         let f = File::create(path)
             .map_err(|e| AvError::Encoder(format!("the next file can't be written at {} ({e})", path.display())))?;
-        self.split_to = Some((f, is_mkv(path), path.to_path_buf()));
+        self.split_to = Some((f, kind_of(path), path.to_path_buf()));
         self.key_next = true;
         Ok(())
     }
@@ -772,7 +803,7 @@ impl Pipeline {
         self.drop_pending_file();
         let finished = match self.recording.take() {
             Some(Recording::On(w)) => {
-                w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))
+                w.finish().map_err(|u| AvError::Encoder(format!("the recording couldn't be finished ({})", u.cut())))
             }
             _ => Ok(()),
         };
@@ -930,18 +961,19 @@ impl Pipeline {
             && let Some(next) = self.split_to.take()
         {
             if let Some(Recording::On(w)) = self.recording.take()
-                && let Err(e) = w.finish()
+                && let Err(u) = w.finish()
             {
+                let e = u.cut();
                 let problem = RecordProblem::from_io(&e);
                 tracing::error!(error = %e, reason = %problem.reason, "the recording couldn't be finished at a split");
                 self.recording = Some(Recording::Failed(problem));
                 Self::forget_empty(&next.2);
                 return;
             }
-            self.recording = Some(Recording::Waiting { file: BufWriter::new(next.0), mkv: next.1, held: Vec::new() });
+            self.recording = Some(Recording::Waiting { file: BufWriter::new(next.0), kind: next.1, held: Vec::new() });
         }
         let rec = match self.recording.take() {
-            Some(Recording::Waiting { file, mkv, held }) => match header {
+            Some(Recording::Waiting { file, kind, held }) => match header {
                 Some(config) => {
                     let v = VideoTrack { codec: cfg.codec, width: cfg.width, height: cfg.height, config };
                     let a = AudioTrack {
@@ -952,7 +984,7 @@ impl Pipeline {
                     };
                     // Every track the same shape (the extra encoders share the first's settings).
                     let tracks = vec![a; 1 + self.extra.len()];
-                    match Writer::new(file, mkv, v, tracks) {
+                    match Writer::new(file, kind, v, tracks) {
                         Ok(mut w) => {
                             let wrote = w.video(p).and_then(|()| held.iter().try_for_each(|(t, a)| w.audio(*t, a)));
                             match wrote {
@@ -967,7 +999,7 @@ impl Pipeline {
                         }
                     }
                 }
-                None => Recording::Waiting { file, mkv, held },
+                None => Recording::Waiting { file, kind, held },
             },
             Some(Recording::On(mut w)) => match w.video(p) {
                 Ok(()) => Recording::On(w),
@@ -1032,7 +1064,7 @@ impl Pipeline {
     /// Records into `file` (tests: a file that fails when it is told to).
     #[cfg(test)]
     fn record_into(&mut self, file: File) {
-        self.recording = Some(Recording::Waiting { file: BufWriter::new(file), mkv: false, held: Vec::new() });
+        self.recording = Some(Recording::Waiting { file: BufWriter::new(file), kind: Kind::Mp4, held: Vec::new() });
     }
 }
 

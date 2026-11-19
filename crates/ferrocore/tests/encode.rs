@@ -248,6 +248,145 @@ fn mp4_recording_survives_a_crash() {
     }
 }
 
+/// A finished recording is a regular file (M7-03), read by ffprobe and decoded by ffmpeg: MP4 and
+/// MOV have their header at the end with the real length and tables, every sound track is
+/// enabled, a MOV has QuickTime's brand, an MKV has its duration and an index; each decodes
+/// without a complaint, seeks, and has every frame.
+#[test]
+fn a_finished_recording_is_a_regular_file() {
+    if !encodes() {
+        return;
+    }
+    use ferrocore::mkv::MkvWriter;
+    use ferrocore::mp4::{Flavor, Mp4Writer};
+    use std::io::Cursor;
+    if Command::new("ffprobe").arg("-version").output().is_err() {
+        eprintln!("skipped: no ffprobe");
+        return;
+    }
+    let (video, audio, vpk, apk) = encoded(150);
+    let tracks = vec![audio.clone(), audio];
+    let feed = |video_in: &mut dyn FnMut(&ferrocore::video::VideoPacket),
+                audio_in: &mut dyn FnMut(usize, &ferrocore::audio::AudioPacket)| {
+        // By time, the picture first at a tie, as they arrive live.
+        let (mut vi, mut ai) = (0, 0);
+        while vi < vpk.len() || ai < apk.len() {
+            if ai >= apk.len() || (vi < vpk.len() && vpk[vi].dts_us <= apk[ai].pts_us) {
+                video_in(&vpk[vi]);
+                vi += 1;
+            } else {
+                audio_in(0, &apk[ai]);
+                audio_in(1, &apk[ai]);
+                ai += 1;
+            }
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("ferrocore-finished-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+    let mut files = Vec::new();
+    for (name, flavor) in [("a.mp4", Flavor::Mp4), ("a.mov", Flavor::Mov)] {
+        let mut w = Mp4Writer::with_flavor(Cursor::new(Vec::new()), Some(video.clone()), tracks.clone(), flavor)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let w = std::cell::RefCell::new(&mut w);
+        feed(&mut |v| w.borrow_mut().video(v).unwrap_or_else(|e| panic!("{e}")), &mut |t, a| {
+            w.borrow_mut().audio_on(t, a).unwrap_or_else(|e| panic!("{e}"))
+        });
+        w.borrow_mut().chapter("Mid");
+        let bytes = std::mem::replace(
+            *w.borrow_mut(),
+            Mp4Writer::new(Cursor::new(Vec::new()), None, Some(tracks[0].clone())).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .finalize()
+        .unwrap_or_else(|e| panic!("{}", e.error))
+        .into_inner();
+        std::fs::write(dir.join(name), bytes).unwrap_or_else(|e| panic!("{e}"));
+        files.push(name);
+    }
+    {
+        let mut w = MkvWriter::with_tracks(Cursor::new(Vec::new()), Some(video.clone()), tracks.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let w = std::cell::RefCell::new(&mut w);
+        feed(&mut |v| w.borrow_mut().video(v).unwrap_or_else(|e| panic!("{e}")), &mut |t, a| {
+            w.borrow_mut().audio_on(t, a).unwrap_or_else(|e| panic!("{e}"))
+        });
+        let bytes = std::mem::replace(
+            *w.borrow_mut(),
+            MkvWriter::new(Cursor::new(Vec::new()), None, Some(tracks[0].clone())).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .finalize()
+        .unwrap_or_else(|e| panic!("{}", e.error))
+        .into_inner();
+        std::fs::write(dir.join("a.mkv"), bytes).unwrap_or_else(|e| panic!("{e}"));
+        files.push("a.mkv");
+    }
+    for name in files {
+        let f = dir.join(name);
+        let say = |args: &[&str]| -> String {
+            let o = Command::new("ffprobe")
+                .args(["-v", "error"])
+                .args(args)
+                .arg(&f)
+                .output()
+                .unwrap_or_else(|e| panic!("{e}"));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        // The length is in the header: about 5 s.
+        let dur: f64 = say(&["-show_entries", "format=duration", "-of", "csv=p=0"]).parse().unwrap_or(0.0);
+        assert!((4.5..5.5).contains(&dur), "{name}: duration {dur}");
+        // Picture and both sound tracks, every frame.
+        let frames = say(&["-count_frames", "-show_entries", "stream=codec_type,nb_read_frames", "-of", "csv=p=0"]);
+        let n = apk.len();
+        assert_eq!(frames.replace('\n', " "), format!("video,150 audio,{n} audio,{n}"), "{name}");
+        // Every sound track plays for an editor: enabled (the default disposition is the first's, in MP4).
+        let kinds = say(&["-show_entries", "stream=codec_type", "-of", "csv=p=0"]);
+        assert_eq!(kinds.matches("audio").count(), 2, "{name}: {kinds}");
+        // No complaint decoding it all.
+        let o = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&f)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(o.status.success() && o.stderr.is_empty(), "{name}: {}", String::from_utf8_lossy(&o.stderr));
+        // And it seeks: a picture from 3 s in.
+        let o = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", "3", "-i"])
+            .arg(&f)
+            .args(["-frames:v", "1", "-f", "null", "-"])
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(o.status.success() && o.stderr.is_empty(), "{name} seeking: {}", String::from_utf8_lossy(&o.stderr));
+        let brand = say(&["-show_entries", "format_tags=major_brand", "-of", "csv=p=0"]);
+        match name {
+            "a.mov" => assert_eq!(brand, "qt", "{name}: the QuickTime brand"),
+            "a.mp4" => assert!(brand.starts_with("iso"), "{name}: {brand}"),
+            _ => {}
+        }
+        if name != "a.mkv" {
+            // The top-level boxes: a header at the end, no fragment headers left.
+            let bytes = std::fs::read(&f).unwrap_or_else(|e| panic!("{e}"));
+            let (mut at, mut kinds) = (0usize, Vec::new());
+            while at + 8 <= bytes.len() {
+                let size = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
+                kinds.push(String::from_utf8_lossy(&bytes[at + 4..at + 8]).to_string());
+                at += size.max(8);
+            }
+            assert_eq!(kinds.last().map(String::as_str), Some("moov"), "{name}: {kinds:?}");
+            assert!(!kinds.iter().any(|k| k == "moof"), "{name}: {kinds:?}");
+            assert_eq!(kinds.iter().filter(|k| *k == "moov").count(), 1, "{name}");
+        }
+        if name == "a.mkv" {
+            // The index and the seek table are in the file (the open-ended one had neither).
+            let bytes = std::fs::read(&f).unwrap_or_else(|e| panic!("{e}"));
+            let has = |id: &[u8]| bytes.windows(id.len()).any(|w| w == id);
+            assert!(has(&[0x1C, 0x53, 0xBB, 0x6B]), "{name}: Cues");
+            assert!(has(&[0x11, 0x4D, 0x9B, 0x74]), "{name}: SeekHead");
+            assert!(has(&[0x44, 0x89, 0x88]), "{name}: Duration");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Chapter marks (OBS's "Add Chapter Marker") in an MP4 and an MKV, as ffprobe reads them:
 /// named where asked, "Chapter n" where not, at the time they were added.
 #[test]
