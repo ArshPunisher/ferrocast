@@ -110,11 +110,8 @@ unsafe fn apps_filter(
 ) -> Result<(Retained<SCContentFilter>, Vec<i32>), AvError> {
     // SAFETY: building a filter from the live content's display and apps.
     unsafe {
-        let d: Retained<SCDisplay> = c
-            .displays()
-            .iter()
-            .find(|d| d.displayID() == id)
-            .ok_or_else(|| AvError::Source(format!("display {id} isn't connected")))?;
+        let d: Retained<SCDisplay> =
+            c.displays().iter().find(|d| d.displayID() == id).ok_or_else(|| AvError::Source(gone_display(id)))?;
         let none: Retained<NSArray<SCWindow>> = NSArray::new();
         let (apps, pids) = hidden_apps(c, names);
         let filter = if only {
@@ -199,20 +196,54 @@ unsafe extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> super::CFTypeRef;
+    fn CGWindowListCreateDescriptionFromArray(windows: super::CFTypeRef) -> super::CFTypeRef;
+    static kCGWindowOwnerName: super::CFStringRef;
 }
 
-/// Whether window `id` is still open (minimized or on another space counts), from the window
-/// server's list: quick, and no screen recording permission needed.
+/// Who owns window `id` now: `Some(Some(app))` while it's open (minimized, on another Space or
+/// in a full-screen one counts: ScreenCaptureKit's list and the window server's "this window"
+/// query both leave those out, 19 Nov), `Some(None)` once it's closed, None when the window
+/// server can't be asked. A window number can come back for another app's window after a
+/// restart, so its app is what says it's the same one.
+pub fn window_owner(id: u32) -> Option<Option<String>> {
+    // An array of window numbers held as the values themselves (no callbacks), as the window
+    // server takes them.
+    let ids = [id as usize as *const std::ffi::c_void];
+    // SAFETY: one plain value; the array returned is +1 (Owned releases it).
+    let ask = super::Owned::new(unsafe { super::CFArrayCreate(std::ptr::null(), ids.as_ptr(), 1, std::ptr::null()) })?;
+    // SAFETY: a live array of window numbers; the descriptions returned are +1, or null.
+    let list = super::Owned::new(unsafe { CGWindowListCreateDescriptionFromArray(ask.0) })?;
+    // SAFETY: a live CFArray of CFDictionaries it owns (not retained here).
+    unsafe {
+        if super::CFArrayGetCount(list.0) == 0 {
+            return Some(None);
+        }
+        let info = super::CFArrayGetValueAtIndex(list.0, 0);
+        let name = super::CFDictionaryGetValue(info, kCGWindowOwnerName.cast());
+        if name.is_null() {
+            return Some(Some(String::new()));
+        }
+        let mut buf = [0 as std::ffi::c_char; 512];
+        let ok = CFStringGetCString(name, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) != 0;
+        let text =
+            if ok { std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned() } else { String::new() };
+        Some(Some(crate::obs::app_name(&text)))
+    }
+}
+
+/// Whether window `id` is still open (minimized or on another Space counts). Not known: taken
+/// as open (never a restart loop on a failed question).
 fn window_exists(id: u32) -> bool {
-    /// kCGWindowListOptionIncludingWindow: just that window, when it's there.
-    const INCLUDING_WINDOW: u32 = 1 << 3;
-    // SAFETY: a plain query; the array returned is +1 (Owned releases it), or null.
-    match super::Owned::new(unsafe { CGWindowListCopyWindowInfo(INCLUDING_WINDOW, id) }) {
-        // SAFETY: a live CFArray.
-        Some(list) => (unsafe { super::CFArrayGetCount(list.0) }) > 0,
-        // No answer: taken as open (never a restart loop on a failed query).
-        None => true,
+    window_owner(id).is_none_or(|o| o.is_some())
+}
+
+/// Why display `id` can't be captured: number 0 is the engine's "its display (by UUID) isn't
+/// connected".
+fn gone_display(id: u32) -> String {
+    if id == 0 {
+        "its display isn't connected (plug it in, or pick the display again)".into()
+    } else {
+        format!("display {id} isn't connected")
     }
 }
 
@@ -775,11 +806,13 @@ impl ScreenCapture {
                     f
                 }
                 Target::Window(id) => {
-                    let w: Retained<SCWindow> = c
-                        .windows()
-                        .iter()
-                        .find(|w| w.windowID() == id)
-                        .ok_or_else(|| AvError::Source(format!("window {id} is gone")))?;
+                    let w: Retained<SCWindow> = c.windows().iter().find(|w| w.windowID() == id).ok_or_else(|| {
+                        AvError::Source(if id == 0 {
+                            "its window is closed (open it, or pick the window again)".into()
+                        } else {
+                            format!("window {id} is gone")
+                        })
+                    })?;
                     SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w)
                 }
             };
@@ -989,7 +1022,11 @@ mod tests {
             && let Some(w) = windows.first()
         {
             assert!(window_exists(w.id), "{w:?}");
+            // Its owner as the window server names it is the app the window list names: how a
+            // saved window is told to be still the same app's.
+            assert_eq!(window_owner(w.id), Some(Some(w.app.clone())), "{w:?}");
         }
+        assert_eq!(window_owner(0xFFFF_FFF0), Some(None));
     }
 
     #[test]

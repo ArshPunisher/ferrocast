@@ -49,7 +49,7 @@ unsafe extern "C" {
     pub(crate) fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
     pub(crate) fn CFArrayGetCount(array: CFTypeRef) -> isize;
     static kCFTypeArrayCallBacks: CFDictionaryValueCallBacks;
-    fn CFArrayCreate(
+    pub(crate) fn CFArrayCreate(
         alloc: CFAllocatorRef,
         values: *const CFTypeRef,
         n: isize,

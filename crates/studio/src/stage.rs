@@ -1239,7 +1239,7 @@ impl Stage {
                 base.insert(k.clone(), v.clone());
             }
         }
-        remember_capture(kind, &mut set);
+        remember_capture(kind, &mut set, true);
         let source = json!({
             "id": kind, "versioned_id": kind, "name": name, "uuid": uuid(),
             "settings": set,
@@ -1755,7 +1755,7 @@ impl Stage {
             }
             if ["window", "display", "type"].iter().any(|k| new.contains_key(*k)) {
                 let kind = kind_of(s).to_string();
-                remember_capture(&kind, &mut s["settings"]);
+                remember_capture(&kind, &mut s["settings"], new.contains_key("window"));
             }
             // A camera's new size that can't reach its saved frame rate gets the best rate it
             // can, so the form never says 50 while the card sends 30.
@@ -4437,7 +4437,10 @@ fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
 /// "window_name"; a game or browser gets a new window number each time it opens), and on a
 /// Mac the display's UUID (OBS's "display_uuid"; a display's number changes when it's plugged
 /// back in or the Mac restarts).
-fn remember_capture(kind: &str, set: &mut Value) {
+///
+/// `picked`: a window was picked now. Otherwise (only the method changed) a window's names stay
+/// as they are, even when its saved number isn't open any more: they're how it's found again.
+fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
     if !matches!(kind, "screen_capture" | "display_capture" | "window_capture" | "game_capture") {
         return;
     }
@@ -4445,6 +4448,9 @@ fn remember_capture(kind: &str, set: &mut Value) {
     let window = set.get("window").and_then(Value::as_u64).map(|w| w as u32);
     let is_window = (kind != "screen_capture" && kind != "display_capture") || ty == 1;
     if is_window && let Some(id) = window {
+        if !picked {
+            return;
+        }
         // Names of a window picked before never find this one's app.
         if let Some(o) = set.as_object_mut() {
             o.remove("owner_name");
@@ -4482,15 +4488,19 @@ mod tests {
         #[cfg(target_os = "macos")]
         if let Some(&d) = ferrocore::screen::shareable().ok().and_then(|(ds, _)| ds.first().map(|x| x.id)).as_ref() {
             let mut set = json!({ "type": 0, "display": d });
-            remember_capture("screen_capture", &mut set);
+            remember_capture("screen_capture", &mut set, true);
             assert_eq!(set["display_uuid"].as_str(), ferrocore::screen::display_uuid(d).as_deref());
         }
         let mut set = json!({ "type": 1, "window": 0xFFFF_FFF0u32, "owner_name": "Old", "window_name": "Old" });
-        remember_capture("screen_capture", &mut set);
+        remember_capture("screen_capture", &mut set, true);
         assert!(set.get("owner_name").is_none() && set.get("window_name").is_none(), "{set}");
+        // Only the method changed: a window's names stay, though its number isn't open now.
+        let mut set = json!({ "type": 1, "window": 0xFFFF_FFF0u32, "owner_name": "Game", "window_name": "Game" });
+        remember_capture("screen_capture", &mut set, false);
+        assert_eq!(set["owner_name"], "Game");
         // Not a screen capture: left as it is.
         let mut other = json!({ "window": 3, "owner_name": "Keep" });
-        remember_capture("image_source", &mut other);
+        remember_capture("image_source", &mut other, true);
         assert_eq!(other["owner_name"], "Keep");
     }
 

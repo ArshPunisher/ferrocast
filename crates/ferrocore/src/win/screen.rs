@@ -9,8 +9,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    WS_CHILD, WS_EX_TOOLWINDOW,
+    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, WS_CHILD, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
@@ -79,6 +79,18 @@ fn monitor_handles() -> Vec<(HMONITOR, (i32, i32, u32, u32))> {
 }
 
 /// The exe name of the process that owns `hwnd` ("chrome").
+/// Who owns window `id` now (its program's name): `Some(None)` once it's closed. A window on
+/// another virtual desktop, or minimized, still counts (the window list leaves those out). A
+/// handle can come back for another program's window, so its program says it's the same one.
+pub fn window_owner(id: u32) -> Option<Option<String>> {
+    let hwnd = HWND(id as usize as *mut _);
+    // SAFETY: IsWindow only looks the handle up.
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Some(None);
+    }
+    Some(Some(app_of(hwnd)))
+}
+
 fn app_of(hwnd: HWND) -> String {
     let mut pid = 0u32;
     // SAFETY: a window handle from EnumWindows; `pid` is ours.

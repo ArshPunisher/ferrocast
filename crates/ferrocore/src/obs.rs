@@ -414,19 +414,18 @@ fn camera_spec(s: &Value, key: &str) -> crate::engine::CameraSpec {
     }
 }
 
-/// A Mac Display or Application Capture's display now: the one picked, found by its UUID
-/// ("display_uuid", as OBS keeps it) when its number changed; the first when none was picked.
-/// Err when the picked display isn't connected (the source is left out, and says why).
+/// A Mac Display or Application Capture's display: the number picked and the display's UUID
+/// ("display_uuid", as OBS keeps it; OBS 30 may keep only that), found when it opens: by
+/// UUID when the number changed, and a display that isn't connected fails to open there and
+/// is tried again, so a screen plugged back in comes back by itself. Neither kept: the first.
 #[cfg(target_os = "macos")]
-fn display_of(s: &Value) -> Result<u32, String> {
-    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
+fn display_of(s: &Value) -> (u32, Option<String>) {
+    let uuid = s.get("display_uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
     match s.get("display").and_then(Value::as_u64).map(|v| v as u32) {
-        Some(saved) => {
-            let uuid = s.get("display_uuid").and_then(Value::as_str);
-            crate::screen::display_now(saved, uuid)
-                .ok_or_else(|| "its display isn't connected (pick the display again)".to_string())
-        }
-        None => Ok(first().unwrap_or(0)),
+        Some(n) => (n, uuid),
+        // Only its UUID: a number none has, so it's found by the UUID alone.
+        None if uuid.is_some() => (0, uuid),
+        None => (crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id)).unwrap_or(0), None),
     }
 }
 
@@ -582,20 +581,20 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 (0, _) => {
                     // The display picked (found again by its UUID when its number changed), else
                     // the first.
-                    let display = display_of(s)?;
+                    let (display, uuid) = display_of(s);
                     // With what the Mac plays (Ferrocast's own sound left out), as OBS's Display
                     // Capture: switched from Window to Screen it went silent (owner, 12 Nov).
-                    (SourceKind::Screen { display, sound: true, hide: with_own_hide(hide, s), cursor }, true)
+                    (SourceKind::Screen { display, uuid, sound: true, hide: with_own_hide(hide, s), cursor }, true)
                 }
                 // Application Capture: one app's windows (its bundle id) on a display.
                 (2, _) => {
-                    let display = display_of(s)?;
+                    let (display, uuid) = display_of(s);
                     let app = text_of("application");
                     if app.is_empty() {
                         return Err("an Application Capture with no app picked".into());
                     }
                     // With the app's sound, as OBS's Application Capture.
-                    (SourceKind::App { display, app, sound: true, cursor }, true)
+                    (SourceKind::App { display, uuid, app, sound: true, cursor }, true)
                 }
                 _ => return Err("an unknown screen capture method".into()),
             }
@@ -637,7 +636,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             // ("monitor"): the place, else the first.
             let display = s.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
             let cursor = cursor_on(s, "capture_cursor");
-            (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
+            (SourceKind::Screen { display, uuid: None, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "windows")]
         "window_capture" | "game_capture" => {
@@ -707,7 +706,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         "xshm_input" | "xshm_input_v2" => {
             let display = s.get("screen").and_then(Value::as_u64).unwrap_or(0) as u32;
             let cursor = cursor_on(s, "show_cursor");
-            (SourceKind::Screen { display, sound: false, hide: hide.to_vec(), cursor }, false)
+            (SourceKind::Screen { display, uuid: None, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "linux")]
         "v4l2_input" => (SourceKind::Camera(camera_spec(s, "device_id")), false),
@@ -1188,7 +1187,7 @@ mod tests {
                 { "id": "scene", "name": "Main", "settings": { "items": [ { "name": "Desk" } ] } }
             ]
         });
-        let was = SourceKind::Screen { display: 3, sound: false, hide: Vec::new(), cursor: true };
+        let was = SourceKind::Screen { display: 3, uuid: None, sound: false, hide: Vec::new(), cursor: true };
         let got = super::import_with(&doc, (640, 360), &|n| (n == "Desk").then(|| was.clone()));
         assert!(got.skipped.is_empty(), "{:?}", got.skipped);
         assert_eq!(got.sources.len(), 1);
@@ -1516,25 +1515,24 @@ mod tests {
         let Some(&d) = crate::screen::active_displays().first() else { return };
         assert_eq!(
             kind(json!({ "type": 2, "display": d, "application": "com.google.Chrome", "show_cursor": false })),
-            Ok(SourceKind::App { display: d, app: "com.google.Chrome".into(), sound: true, cursor: false })
+            Ok(SourceKind::App { display: d, uuid: None, app: "com.google.Chrome".into(), sound: true, cursor: false })
         );
     }
 
-    /// A Display Capture finds its screen by UUID after its number changed (owner's Mac, 19
-    /// Nov: saved as display 1, the screens now 3 and 2, the source silently left out), and a
-    /// screen that isn't connected is never swapped for another.
+    /// A Display Capture keeps its display's UUID, found when it opens (owner's Mac, 19 Nov:
+    /// saved as display 1, the screens now 3 and 2); OBS 30 may keep only the UUID; one whose
+    /// screen isn't connected stays in the scene (tried again), never dropped at import.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_display_capture_follows_its_screen_by_uuid() {
-        let Some(&d) = crate::screen::active_displays().first() else { return };
-        let Some(uuid) = crate::screen::display_uuid(d) else { return };
+    fn a_display_capture_keeps_its_screens_uuid() {
         let kind = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.0);
-        assert!(matches!(
-            kind(json!({ "type": 0, "display": 9999, "display_uuid": uuid })),
-            Ok(SourceKind::Screen { display, .. }) if display == d
-        ));
-        let gone = kind(json!({ "type": 0, "display": d, "display_uuid": "00000000-0000-0000-0000-000000000000" }));
-        assert!(gone.is_err_and(|e| e.contains("isn't connected")));
+        let uuid = |k: Result<SourceKind, String>| match k {
+            Ok(SourceKind::Screen { display, uuid, .. }) => (display, uuid),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(uuid(kind(json!({ "type": 0, "display": 9, "display_uuid": "AAA" }))), (9, Some("AAA".into())));
+        assert_eq!(uuid(kind(json!({ "type": 0, "display_uuid": "AAA" }))), (0, Some("AAA".into())));
+        assert_eq!(uuid(kind(json!({ "type": 0, "display": 9 }))), (9, None));
     }
 
     /// Every method of a Mac screen capture brings its sound, as OBS's: a window its app's,

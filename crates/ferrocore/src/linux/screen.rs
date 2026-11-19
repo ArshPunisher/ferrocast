@@ -55,6 +55,12 @@ fn monitors() -> Vec<(i32, i32, u32, u32)> {
     parse_monitors(&super::output_of("xrandr", &["--listmonitors"]))
 }
 
+/// Who owns window `id` now: not known on Linux (windows aren't listed yet), so a saved window
+/// is always taken as it is.
+pub fn window_owner(_id: u32) -> Option<Option<String>> {
+    None
+}
+
 /// What can be captured now: the displays (windows aren't listed on Linux yet).
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     let displays =

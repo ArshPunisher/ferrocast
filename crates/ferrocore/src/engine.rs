@@ -81,6 +81,9 @@ pub enum SourceKind {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Screen {
         display: u32,
+        /// The display's UUID (a Mac's): found by it when it opens, as its number changes
+        /// when it's plugged back in or the Mac restarts.
+        uuid: Option<String>,
         sound: bool,
         hide: Vec<String>,
         /// The mouse pointer drawn in the picture (OBS's Show Cursor / Capture Cursor).
@@ -101,6 +104,7 @@ pub enum SourceKind {
     #[cfg(target_os = "macos")]
     App {
         display: u32,
+        uuid: Option<String>,
         app: String,
         sound: bool,
         cursor: bool,
@@ -2992,41 +2996,67 @@ fn is_capture(kind: &SourceKind) -> bool {
     false
 }
 
-/// The window to capture now: `id` while it's still there, else the window of the same app
-/// with the same title, else that app's only window (games and browsers get a new window
-/// number every time they open). Never one of several windows by a guess: a browser's other
-/// window could be someone's mail on air. `id` as it was when none fits (the capture then
-/// says it's gone, and the watchdog tries again later).
+/// The window to capture now. `id` while that window is open and still its app's (minimized,
+/// on another Space or desktop counts; a number can come back for another app's window after
+/// a restart). Else the app's open window with the same title (a game or browser opened again
+/// gets a new number). Never a window of that app with another title: Chrome reopened on
+/// someone's mail would go on air. When none fits, a number no window has (the capture then
+/// says it's gone, and the watchdog tries again later). Saved before the app was noted:
+/// `id` as it is.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn window_now(id: u32, app: &str, title: &str) -> u32 {
     if app.is_empty() {
         return id;
     }
-    match crate::screen::shareable() {
-        Ok((_, windows)) => {
-            let list: Vec<(u32, &str, &str)> =
-                windows.iter().map(|w| (w.id, w.app.as_str(), w.title.as_str())).collect();
-            let now = pick_window(id, app, title, &list);
-            if now != id {
-                tracing::info!(was = id, now, app, "a window came back with a new number: captured again");
-            }
+    match crate::screen::window_owner(id) {
+        // Can't be asked: as it is.
+        None => return id,
+        Some(Some(owner)) if owner.eq_ignore_ascii_case(app) => return id,
+        Some(_) => {}
+    }
+    let found = crate::screen::shareable().ok().and_then(|(_, windows)| {
+        let list: Vec<(u32, &str, &str)> = windows.iter().map(|w| (w.id, w.app.as_str(), w.title.as_str())).collect();
+        pick_window(app, title, &list)
+    });
+    match found {
+        Some(now) => {
+            tracing::info!(was = id, now, app, "a window came back with a new number: captured again");
             now
         }
-        Err(_) => id,
+        None => GONE_WINDOW,
     }
 }
 
-/// [`window_now`]'s choice from a window list of (number, app, title).
-fn pick_window(id: u32, app: &str, title: &str, windows: &[(u32, &str, &str)]) -> u32 {
-    if windows.iter().any(|w| w.0 == id) || app.is_empty() {
-        return id;
+/// The display a Display or Application Capture opens on now (a Mac's found by its UUID; a
+/// display that isn't connected fails to open, and the watchdog tries again, so a screen
+/// plugged back in comes back by itself). Elsewhere displays are numbered by place.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn display_now(display: u32, uuid: Option<&str>) -> u32 {
+    #[cfg(target_os = "macos")]
+    return crate::screen::display_now(display, uuid).unwrap_or(GONE_DISPLAY);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = uuid;
+        display
     }
-    let same_app: Vec<&(u32, &str, &str)> = windows.iter().filter(|w| w.1.eq_ignore_ascii_case(app)).collect();
-    match same_app.iter().find(|w| !title.is_empty() && w.2 == title) {
-        Some(w) => w.0,
-        None if same_app.len() == 1 => same_app[0].0,
-        None => id,
+}
+
+/// A display number none has: opening it says it isn't connected.
+#[cfg(target_os = "macos")]
+const GONE_DISPLAY: u32 = 0;
+
+/// A window number no window has (macOS and Windows never hand out 0): opening it says the
+/// window is gone.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+const GONE_WINDOW: u32 = 0;
+
+/// [`window_now`]'s choice from a window list of (number, app, title): the app's window with
+/// that title.
+fn pick_window(app: &str, title: &str, windows: &[(u32, &str, &str)]) -> Option<u32> {
+    if app.is_empty() || title.is_empty() {
+        return None;
     }
+    windows.iter().find(|w| w.1.eq_ignore_ascii_case(app) && w.2 == title).map(|w| w.0)
 }
 
 /// Starts a capture (None: `kind` isn't one).
@@ -3034,8 +3064,8 @@ fn pick_window(id: u32, app: &str, title: &str, windows: &[(u32, &str, &str)]) -
 fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
     use crate::screen::{ScreenCapture, Target};
     Some(match kind {
-        SourceKind::Screen { display, sound, hide, cursor } => ScreenCapture::start_with(
-            Target::Display(*display),
+        SourceKind::Screen { display, uuid, sound, hide, cursor } => ScreenCapture::start_with(
+            Target::Display(display_now(*display, uuid.as_deref())),
             config.width,
             config.height,
             config.fps,
@@ -3072,10 +3102,16 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
             .and_then(|d| ScreenCapture::start_with(Target::Display(d), 2, 2, 1, false, true, &[]))
             .map(Live::Screen),
         #[cfg(target_os = "macos")]
-        SourceKind::App { display, app, sound, cursor } => {
-            ScreenCapture::start_app(*display, app, config.width, config.height, config.fps, *cursor, *sound)
-                .map(Live::Screen)
-        }
+        SourceKind::App { display, uuid, app, sound, cursor } => ScreenCapture::start_app(
+            display_now(*display, uuid.as_deref()),
+            app,
+            config.width,
+            config.height,
+            config.fps,
+            *cursor,
+            *sound,
+        )
+        .map(Live::Screen),
         #[cfg(target_os = "macos")]
         SourceKind::AppSound(app) => crate::screen::shareable()
             .and_then(|s| {
@@ -3586,18 +3622,16 @@ mod tests {
 
     #[test]
     fn a_window_whose_app_opened_again_is_found_by_its_app_and_title() {
-        let list = [(40, "Google Chrome", "Docs"), (41, "Google Chrome", "Stream - YouTube"), (50, "Game", "Game")];
-        // Still there: kept.
-        assert_eq!(pick_window(41, "Google Chrome", "Stream - YouTube", &list), 41);
-        // Gone: the same app's window with the same title, else its only window.
-        assert_eq!(pick_window(7, "Google Chrome", "Stream - YouTube", &list), 41);
-        assert_eq!(pick_window(9, "Game", "", &list), 50);
-        assert_eq!(pick_window(9, "Game", "Menu", &list), 50);
-        // Several windows, none with its title: none guessed (another could be private).
-        assert_eq!(pick_window(7, "google chrome", "Another tab", &list), 7);
-        // Nothing to go on, or the app isn't open: the old number (the capture says it's gone).
-        assert_eq!(pick_window(7, "", "Docs", &list), 7);
-        assert_eq!(pick_window(7, "Discord", "Docs", &list), 7);
+        let list = [(40, "Google Chrome", "Mail"), (41, "Google Chrome", "Stream - YouTube"), (50, "Game", "Game")];
+        assert_eq!(pick_window("Google Chrome", "Stream - YouTube", &list), Some(41));
+        assert_eq!(pick_window("game", "Game", &list), Some(50));
+        // Another title of the same app is never taken, even as its only window (19 Nov,
+        // projects-60: Chrome reopened on someone's mail would go on air).
+        assert_eq!(pick_window("Google Chrome", "Another tab", &list), None);
+        assert_eq!(pick_window("Game", "Menu", &list), None);
+        // Nothing to go on, or the app isn't open.
+        assert_eq!(pick_window("", "Mail", &list), None);
+        assert_eq!(pick_window("Discord", "Mail", &list), None);
     }
 
     fn engine() -> Option<Engine> {
@@ -4256,7 +4290,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]
     fn only_screen_captures_hand_over() {
-        let screen = SourceKind::Screen { display: 1, sound: false, hide: Vec::new(), cursor: true };
+        let screen = SourceKind::Screen { display: 1, uuid: None, sound: false, hide: Vec::new(), cursor: true };
         let window = SourceKind::Window { id: 4, cursor: true, app: String::new(), title: String::new() };
         assert!(hands_over(&screen, &window));
         assert!(hands_over(&window, &screen));
