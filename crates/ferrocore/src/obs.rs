@@ -354,19 +354,20 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
                 None if rnnoise => return Some(AudioEffect::Denoise { strength: DEFAULT_DENOISE_STRENGTH }),
                 None => 30.0,
             };
-            let max_strength = if rnnoise { f64::from(RNNOISE_MAX_STRENGTH) } else { 100.0 };
-            let strength = (level / 60.0 * max_strength).round().clamp(1.0, max_strength) as u32;
-            AudioEffect::Denoise { strength }
+            // 0.6 dB a step, as it always was: OBS's -30 dB is strength 50 (30 dB), what a saved
+            // scene meant. RNNoise ignores the level in OBS: it is held to what RNNoise takes off.
+            let level = if rnnoise { level.min(24.0) } else { level };
+            AudioEffect::Denoise { strength: (level / 0.6).round().clamp(1.0, 100.0) as u32 }
         }
         _ => return None,
     })
 }
 
-/// Default denoiser strength (65 → 19.5 dB attenuation limit): natural voice clarity on par with
-/// OBS's RNNoise.
-const DEFAULT_DENOISE_STRENGTH: u32 = 65;
-/// Ceiling for RNNoise-mode `noise_suppress_filter_v2` (80 → 24 dB, matching RNNoise).
-const RNNOISE_MAX_STRENGTH: u32 = 80;
+/// Default denoiser strength: 40, 24 dB (what RNNoise takes off), gentle on the voice. (A strength
+/// means the same dB as it always did: 0.6 a step up to 50, then 0.1.)
+const DEFAULT_DENOISE_STRENGTH: u32 = 40;
+/// What an OBS RNNoise or NVIDIA setting at its fullest takes off here: 40, 24 dB.
+const RNNOISE_MAX_STRENGTH: u32 = 40;
 
 /// A source kind the engine plays, from OBS's id and settings; Err with what it is otherwise.
 /// macOS's notification banners (and Notification Center, and the desktop's widgets), by bundle id.
@@ -1289,10 +1290,10 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
 #[cfg(test)]
 mod tests {
 
-    /// OBS's RNNoise stays gentle (up to strength 80 = 24 dB, defaulting to 65 = 19.5 dB when
-    /// OBS omitted `suppress_level`); Speex uses the full 1..=100 (up to 30 dB) range; every
-    /// integer position on the `-60..0 dB` slider maps monotonically with no dead zone, and 0 dB
-    /// bypasses the filter completely (zero delay, not reported as skipped).
+    /// OBS's RNNoise stays gentle (held to 24 dB, strength 40: it ignores the level in OBS, and 48
+    /// dB of it made a voice muffled, 19 Nov); Speex keeps its level at 0.6 dB a step, as every
+    /// saved scene has always meant (-30 dB is strength 50, 30 dB); 0 dB turns it off completely
+    /// (zero delay, not reported as skipped). Nothing a saved scene says changes meaning.
     #[test]
     fn obs_rnnoise_stays_gentle_and_speex_keeps_its_level() {
         use super::{AudioEffect, audio_effect_from};
@@ -1303,17 +1304,16 @@ mod tests {
             Some(AudioEffect::Denoise { strength }) => strength,
             other => panic!("{other:?}"),
         };
-        assert_eq!(at("rnnoise", -60), 80, "24 dB max for RNNoise");
-        assert_eq!(at("rnnoise", -48), 64, "19.2 dB: owner's 19 Nov scene stays crystal clear");
-        assert_eq!(at("rnnoise", -30), 40, "12 dB");
-        assert_eq!(at("rnnoise", -12), 16, "4.8 dB");
-        assert_eq!(at("speex", -60), 100, "30 dB max for Speex");
-        assert_eq!(at("speex", -48), 80, "24 dB");
-        assert_eq!(at("speex", -30), 50, "15 dB");
-        // Omitted suppress_level on RNNoise (OBS default / Clean mic) uses the 19.5 dB default.
+        assert_eq!(at("rnnoise", -48), 40, "24 dB");
+        assert_eq!(at("rnnoise", -12), 20, "less than that stays");
+        assert_eq!(at("speex", -48), 80);
+        assert_eq!(at("speex", -30), 50, "30 dB, as saved");
+        assert_eq!(at("speex", -12), 20);
+        assert_eq!(at("speex", -60), 100);
+        // Omitted suppress_level on RNNoise (OBS hides it): the default, 24 dB.
         assert_eq!(
             audio_effect_from("noise_suppress_filter_v2", &serde_json::json!({ "method": "rnnoise" })),
-            Some(AudioEffect::Denoise { strength: 65 })
+            Some(AudioEffect::Denoise { strength: 40 })
         );
         // 0 dB turns noise suppression off completely (no filter, no 82.7 ms delay).
         assert_eq!(
@@ -1324,27 +1324,29 @@ mod tests {
             None
         );
         assert_eq!(audio_effect_from("ferrocast_deepfilter", &serde_json::json!({ "strength": 0 })), None);
+        // A saved strength is taken as it is; a missing one is the default.
+        assert_eq!(
+            audio_effect_from("ferrocast_deepfilter", &serde_json::json!({ "strength": 50 })),
+            Some(AudioEffect::Denoise { strength: 50 })
+        );
         assert_eq!(
             audio_effect_from("ferrocast_deepfilter", &serde_json::json!({})),
-            Some(AudioEffect::Denoise { strength: 65 }),
-            "default DeepFilterNet strength is 65 (19.5 dB), not 100"
+            Some(AudioEffect::Denoise { strength: 40 })
         );
-        // Every integer step from -1 to -60 dB maps strictly monotonically with no dead zone.
-        for method in ["rnnoise", "speex"] {
-            let mut prev = 0u32;
-            for db in 1..=60 {
-                let s = at(method, -db);
-                assert!(s > prev, "{method}: -{db} dB mapped to {s}, same as previous {prev} (dead zone)");
-                prev = s;
-            }
+        // Speex: every integer step from -1 to -60 dB maps strictly monotonically (no dead zone).
+        let mut prev = 0u32;
+        for db in 1..=60 {
+            let s = at("speex", -db);
+            assert!(s > prev, "speex: -{db} dB mapped to {s}, same as previous {prev}");
+            prev = s;
         }
-        // No method saved: the older filter is Speex (full range), v2 is RNNoise (gentle).
+        // No method saved: the older filter is Speex (its level kept), v2 RNNoise (CodeRabbit).
         let none = |kind: &str| match audio_effect_from(kind, &serde_json::json!({ "suppress_level": -48 })) {
             Some(AudioEffect::Denoise { strength }) => strength,
             other => panic!("{other:?}"),
         };
         assert_eq!(none("noise_suppress_filter"), 80);
-        assert_eq!(none("noise_suppress_filter_v2"), 64);
+        assert_eq!(none("noise_suppress_filter_v2"), 40);
         // Bypassed 0 dB filter is not reported in `skipped`.
         let doc = serde_json::json!({ "sources": [
             { "id": "color_source", "name": "S", "settings": {},

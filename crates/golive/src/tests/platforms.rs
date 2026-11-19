@@ -348,8 +348,9 @@ async fn a_hopeless_link_is_paused_and_the_good_one_never_notices(frame: usize) 
         }
     }
     let paused_after = paused_after.expect("upload protection paused the destination that can't keep up");
-    // Within a bounded time: the write deadline (10 s) plus the rule's few seconds of trouble.
-    assert!(paused_after <= 20, "it took {paused_after} s to be paused");
+    // Within a bounded time: warm-up, 3 s of rate to judge, 4 s of trouble (about 7 to 9 s). It
+    // used to take the 10 s write deadline more at 2 Mbit/s, when the rate looked fine until then.
+    assert!(paused_after <= 12, "it took {paused_after} s to be paused");
 
     // Nothing more is sent to it once paused; what it was handed overall is bounded (the OS
     // buffers and one retry's burst), not growing with the stream.
@@ -393,4 +394,29 @@ fn sample<'a>(id: &'a str, h: &Health, want_kbps: u32, now_ms: u64) -> crate::pr
         dropped: h.dropped,
         live_ms: now_ms.saturating_sub(h.since_ms),
     }
+}
+
+/// A destination that stopped reading blocks its writes for up to the 10 s write deadline. Its
+/// rate is reported as it happens, so within about two seconds it reads 0 while it is still
+/// "Live" (the state changes only at the deadline), and upload protection can see it.
+#[tokio::test]
+async fn a_stalled_writer_reports_no_rate_within_a_couple_of_seconds() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_stalls(l, "k").await;
+    let mut dest = start(&w, destination_with(dport, "kick", 200, 4000));
+    let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let sent = Arc::new(AtomicU64::new(0));
+    let feeder = feed(obs, 20 * 1024, Duration::from_millis(33), sent.clone());
+    state_is(&mut dest, |s| *s == PushState::Live).await;
+    // The kernel's buffers take a few hundred kilobytes first: it shows a rate.
+    let filling = timeout(Duration::from_secs(5), dest.wait_for(|h| h.kbps > 500)).await.is_ok();
+    assert!(filling, "the buffers filled at some rate");
+    // Then nothing is taken: 0, and still Live, within a few seconds (the deadline is 10).
+    let got = timeout(Duration::from_secs(4), dest.wait_for(|h| h.kbps == 0 && h.sent > 100_000)).await.is_ok();
+    let h = dest.borrow().clone();
+    assert!(got, "no rate reported while its writes are blocked: {h:?}");
+    assert_eq!(h.state, PushState::Live, "still within the write deadline");
+    feeder.abort();
 }

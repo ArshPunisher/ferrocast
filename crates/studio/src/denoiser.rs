@@ -9,15 +9,18 @@ use std::collections::VecDeque;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray15::Array2;
 
-/// Maximum attenuation limit (dB) at strength 100: caps DeepFilterNet so it never hits its
-/// unlimited (>=100 dB) hard-zeroing cliff that eats soft voice tails and consonants (M2-01).
-const MAX_ATTEN_DB: f32 = 30.0;
+/// What strength 100 gives: DeepFilterNet's own "no limit" (100 dB and up) zeroes the soft ends of
+/// words (a -180 dB cliff at 100), so the top of the scale is held to this (M2-01).
+const MAX_ATTEN_DB: f32 = 35.0;
 
-/// How much quieter noise may get at a strength (1 to 100): smooth 0.3 dB per step up to
-/// [`MAX_ATTEN_DB`] (30 dB), with no jump between 99 and 100.
+/// How much quieter noise may get at a strength (1 to 100): 0.6 dB a step up to 50 (30 dB), as
+/// it always was, so every saved strength up to 50 means what it meant; above that 0.1 dB a
+/// step up to [`MAX_ATTEN_DB`], so a saved 100 (which used to mean "no limit") is the strongest
+/// removal that still leaves a voice whole, with no jump between 99 and 100.
 fn atten_db(strength: u32) -> f32 {
-    // 0.3 dB a step, worked in whole numbers (50 is 15.0 dB, 65 is 19.5 dB, 80 is 24.0 dB, 100 is 30.0 dB).
-    let db = (strength.clamp(1, 100) * 3) as f32 / 10.0;
+    let s = strength.clamp(1, 100);
+    // Worked in whole numbers (50 is exactly 30 dB).
+    let db = if s <= 50 { (s * 6) as f32 / 10.0 } else { 30.0 + (s - 50) as f32 / 10.0 };
     db.min(MAX_ATTEN_DB)
 }
 
@@ -818,13 +821,16 @@ mod tests {
 
     #[test]
     fn strength_maps_to_a_limit() {
-        assert_eq!(atten_db(100), 30.0, "capped smoothly at 30 dB, never unlimited 100 dB");
-        assert_eq!(atten_db(99), 29.7);
-        assert!((atten_db(100) - atten_db(99)).abs() < 1.0, "no 99→100 attenuation cliff");
-        assert_eq!(atten_db(80), 24.0);
-        assert_eq!(atten_db(65), 19.5);
-        assert_eq!(atten_db(50), 15.0);
-        assert_eq!(atten_db(0), 0.3);
+        // What every saved strength up to 50 has always meant (0.6 dB a step).
+        assert_eq!(atten_db(50), 30.0);
+        assert_eq!(atten_db(40), 24.0);
+        assert_eq!(atten_db(33), 19.8);
+        assert_eq!(atten_db(0), 0.6, "0 is read as 1");
+        // The top is capped, never "unlimited" (100 dB), and has no cliff.
+        assert_eq!(atten_db(100), 35.0);
+        assert_eq!(atten_db(99), 34.9);
+        assert_eq!(atten_db(65), 31.5);
+        assert!((atten_db(100) - atten_db(99)).abs() < 0.2, "no 99 to 100 attenuation cliff");
         for s in 2..=100 {
             assert!(atten_db(s) > atten_db(s - 1), "strictly monotonic at {s}");
         }

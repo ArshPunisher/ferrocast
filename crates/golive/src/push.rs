@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rml_rtmp::handshake::PeerType;
@@ -381,7 +382,8 @@ async fn session(
     let mut base: Option<u32> = None;
     let mut started = false;
     let mut video_drop = VideoDrop::default();
-    let mut window = (Instant::now(), p.sent);
+    let progress = p.progress.clone();
+    let mut window = (Instant::now(), progress.load(Ordering::Relaxed));
     loop {
         tokio::select! {
             frame = rx.recv() => {
@@ -456,7 +458,18 @@ async fn session(
                     }
                 };
                 if let Some(r) = outbound {
-                    p.send(r).await?;
+                    // While the write goes on (a destination that stopped reading blocks it for
+                    // up to the write deadline) the rate is still reported each second: 0 when
+                    // the kernel takes nothing, so upload protection sees it at once.
+                    let send = p.send(r);
+                    tokio::pin!(send);
+                    loop {
+                        let left = HEALTH_EVERY.saturating_sub(window.0.elapsed()).max(Duration::from_millis(50));
+                        tokio::select! {
+                            done = &mut send => { done?; break; }
+                            _ = tokio::time::sleep(left) => report_rate(health, &mut window, progress.load(Ordering::Relaxed)),
+                        }
+                    }
                 }
             }
             // Only the read races the next packet (a read can be dropped safely); the answer
@@ -466,16 +479,24 @@ async fn session(
                 p.answer(n).await?;
             }
         }
-        if window.0.elapsed() >= HEALTH_EVERY {
-            let secs = window.0.elapsed().as_secs_f64();
-            let kbps = ((p.sent - window.1) as f64 * 8.0 / 1000.0 / secs) as u32;
-            health.send_modify(|h| {
-                h.kbps = kbps;
-                h.sent += p.sent - window.1;
-            });
-            window = (Instant::now(), p.sent);
-        }
+        report_rate(health, &mut window, progress.load(Ordering::Relaxed));
     }
+}
+
+/// Once a second: what the destination took in that time, as kilobits a second, and the bytes
+/// counted since the last report. (`window`: when it started and the count then.)
+fn report_rate(health: &watch::Sender<Health>, window: &mut (Instant, u64), now_sent: u64) {
+    let secs = window.0.elapsed().as_secs_f64();
+    if secs < HEALTH_EVERY.as_secs_f64() {
+        return;
+    }
+    let took = now_sent.saturating_sub(window.1);
+    let kbps = (took as f64 * 8.0 / 1000.0 / secs) as u32;
+    health.send_modify(|h| {
+        h.kbps = kbps;
+        h.sent += took;
+    });
+    *window = (Instant::now(), now_sent);
 }
 
 /// How far `ts` lags behind `newest` in stream milliseconds, handling `u32` wrap (~49.7 days).
@@ -620,6 +641,9 @@ pub(crate) struct Publisher {
     buf: Vec<u8>,
     /// Bytes written since the connection opened.
     pub(crate) sent: u64,
+    /// The same count, kept up to date while a write is still going on (as the kernel takes the
+    /// bytes), so a destination whose writes block can be seen to be getting nothing.
+    progress: Arc<AtomicU64>,
 }
 
 impl Publisher {
@@ -639,7 +663,7 @@ impl Publisher {
         cfg.tc_url = Some(t.tc_url.clone());
         cfg.flash_version = "FMLE/3.0 (compatible; FMSc/1.0)".to_string();
         let (client, first) = ClientSession::new(cfg).map_err(|_| PushError::NotRtmp(host.clone()))?;
-        let mut p = Self { client, s, host, buf: vec![0u8; READ_BUF], sent: 0 };
+        let mut p = Self { client, s, host, buf: vec![0u8; READ_BUF], sent: 0, progress: Arc::default() };
         p.results(first).await?;
         let mut pending = p.client.handle_input(&rest).map_err(|_| p.not_rtmp())?;
 
@@ -699,10 +723,23 @@ impl Publisher {
     }
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), PushError> {
-        timeout(WRITE_DEADLINE, self.s.write_all(bytes))
-            .await
-            .map_err(|_| PushError::Stalled(self.host.clone()))?
-            .map_err(|_| PushError::Broken(self.host.clone()))?;
+        // The whole write has the deadline, but the bytes the kernel takes are counted as they go.
+        let (s, progress) = (&mut self.s, &self.progress);
+        let wrote = timeout(WRITE_DEADLINE, async {
+            let mut at = 0;
+            while at < bytes.len() {
+                let n = s.write(&bytes[at..]).await?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                at += n;
+                progress.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            std::io::Result::Ok(())
+        })
+        .await
+        .map_err(|_| PushError::Stalled(self.host.clone()))?;
+        wrote.map_err(|_| PushError::Broken(self.host.clone()))?;
         self.sent += bytes.len() as u64;
         Ok(())
     }
