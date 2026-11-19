@@ -42,6 +42,9 @@ pub struct EngineSettings {
     /// The streamer's main currency (ISO 4217), e.g. for the TTS minimum. Defaults from the
     /// computer's region.
     pub currency: String,
+    /// Who can watch a YouTube broadcast Ferrocast makes (main and vertical): `public`,
+    /// `unlisted` or `private`. Public unless chosen, as before.
+    pub youtube_privacy: String,
 }
 
 impl Default for EngineSettings {
@@ -60,6 +63,7 @@ impl Default for EngineSettings {
             close_to_tray: true,
             language: "en".into(),
             currency: currency_for_locale(sys_locale::get_locale().as_deref().unwrap_or("")).into(),
+            youtube_privacy: "public".into(),
         }
     }
 }
@@ -120,6 +124,7 @@ impl EngineSettings {
         };
         one_of("theme", &self.theme, &["system", "dark", "light"])?;
         one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
+        one_of("youtube_privacy", &self.youtube_privacy, &["public", "unlisted", "private"])?;
         if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err("currency: a three-letter code like INR or USD.".into());
         }
