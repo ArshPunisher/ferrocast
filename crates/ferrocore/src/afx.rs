@@ -252,15 +252,31 @@ pub struct AudioFilter {
     /// True once `plugin` has processed at least one block (failed init leaves this false so
     /// we never install a permanent handover delay line around `light_denoise`).
     plugin_ran: bool,
-    // Light noise removal: the noise floor it hears (RMS), steady-noise candidate, and current gain.
+    // Light noise removal: the noise floor it hears (RMS), how long and at what level the sound
+    // has been steady, the voice detector's history, and the current gain.
     floor: f32,
     nr_steady_rms: f32,
     nr_steady_s: f32,
     nr_gain: f32,
+    /// The last 40 ms as the voice detector reads it (8 kHz, mono, pre-emphasised), and the
+    /// part of the next sample still being averaged.
+    nr_hist: std::collections::VecDeque<f32>,
+    nr_dec: (f32, u32, f32),
+    /// Seconds left of "a voice is speaking": a voice's blocks (and the breaths between its
+    /// syllables) are never turned down, and never taken for the noise.
+    nr_voice_s: f32,
+    /// The detector's pitch (in samples at 8 kHz) and for how long it has held the same one: a
+    /// hum does for seconds, a voice never.
+    nr_pitch: (usize, f32),
+    /// The level the pitch has held at (RMS, smoothed): a hum doesn't move, a voice does.
+    nr_pitch_rms: f32,
     /// After a plugin that held the sound back gave way (the strong noise removal too slow
     /// here): the sound is held back as long still, so the source doesn't jump in time.
     delay: Option<[std::collections::VecDeque<f32>; 2]>,
 }
+
+/// Samples (at 8 kHz) the voice detector looks at: 40 ms.
+const VOICE_WINDOW: usize = 320;
 
 /// libobs's compressor `gain_coefficient` (guards non-positive/non-finite times so negative
 /// imported parameters never produce `exp(+inf)` / `NaN`, M2-07).
@@ -297,6 +313,11 @@ impl AudioFilter {
             nr_steady_rms: 0.0,
             nr_steady_s: 0.0,
             nr_gain: 1.0,
+            nr_hist: std::collections::VecDeque::with_capacity(VOICE_WINDOW + 1),
+            nr_dec: (0.0, 0, 0.0),
+            nr_voice_s: 0.0,
+            nr_pitch: (0, 0.0),
+            nr_pitch_rms: 0.0,
             delay: None,
         }
     }
@@ -497,6 +518,77 @@ impl AudioFilter {
         }
     }
 
+    /// Whether the block has a voice in it: a pitch (80 to 330 Hz) that repeats, by how alike the
+    /// last 40 ms is to itself one period later. Noise and a fan don't repeat; a vowel does.
+    /// Read at 8 kHz, mono, with the lows taken down so a lowpassed hiss doesn't look alike. A
+    /// pitch that stays the same, at the same level, for two seconds is a hum (100 or 120 Hz of
+    /// mains), not a voice, whose pitch and level move.
+    fn hears_a_voice(&mut self, l: &[f32], r: &[f32], rms: f32) -> bool {
+        let secs = l.len() as f32 / self.rate;
+        let found = self.pitch_of(l, r);
+        let Some((lag, strength)) = found else {
+            self.nr_pitch = (0, 0.0);
+            return false;
+        };
+        let level_moved = self.nr_pitch_rms <= 0.0 || mul_to_db(rms / self.nr_pitch_rms).abs() > 1.0;
+        if strength > 0.6 && lag.abs_diff(self.nr_pitch.0) <= 1 && !level_moved {
+            self.nr_pitch.1 += secs;
+        } else {
+            self.nr_pitch.1 = 0.0;
+        }
+        self.nr_pitch.0 = lag;
+        self.nr_pitch_rms = if self.nr_pitch_rms <= 0.0 || level_moved {
+            rms
+        } else {
+            self.nr_pitch_rms + (rms - self.nr_pitch_rms) * (secs * 3.0).min(1.0)
+        };
+        self.nr_pitch.1 < 2.0
+    }
+
+    /// The repeating pitch in the last 40 ms, if there is one: its period (samples at 8 kHz) and
+    /// how alike it repeats (0 to 1).
+    fn pitch_of(&mut self, l: &[f32], r: &[f32]) -> Option<(usize, f32)> {
+        let every = ((self.rate / 8000.0).round() as u32).max(1);
+        let (mut acc, mut count, mut prev) = self.nr_dec;
+        for (a, b) in l.iter().zip(r) {
+            acc += 0.5 * (a + b);
+            count += 1;
+            if count == every {
+                let x = acc / every as f32;
+                self.nr_hist.push_back(x - 0.9 * prev);
+                prev = x;
+                acc = 0.0;
+                count = 0;
+                while self.nr_hist.len() > VOICE_WINDOW {
+                    self.nr_hist.pop_front();
+                }
+            }
+        }
+        self.nr_dec = (acc, count, prev);
+        if self.nr_hist.len() < VOICE_WINDOW {
+            return None;
+        }
+        let x: Vec<f32> = self.nr_hist.iter().copied().collect();
+        let mut alike = [0.0f32; 97];
+        // 3 to 12 ms: 330 down to 83 Hz at 8 kHz.
+        for (lag, slot) in alike.iter_mut().enumerate().skip(24) {
+            let (mut num, mut e1, mut e2) = (0.0f32, 0.0f32, 0.0f32);
+            for i in 0..VOICE_WINDOW - lag {
+                num += x[i] * x[i + lag];
+                e1 += x[i] * x[i];
+                e2 += x[i + lag] * x[i + lag];
+            }
+            let denom = (e1 * e2).sqrt();
+            if denom > 1e-12 {
+                *slot = num / denom;
+            }
+        }
+        let best = alike.iter().copied().fold(0.0f32, f32::max);
+        // The first period that repeats nearly as well as the best (not its doubles).
+        let lag = (24..=96).find(|l| alike[*l] >= 0.95 * best)?;
+        (best > 0.5).then_some((lag, best))
+    }
+
     /// Light noise removal, for any computer: it tracks the background room noise floor (frozen
     /// during speech so continuous talking is never ducked) and turns down what stays near the
     /// floor (hiss, hum, a fan between words) by up to 24 dB at strength 100; a voice above it
@@ -513,45 +605,63 @@ impl AudioFilter {
         // after silence isn't taken for the noise (peer, 18 Nov).
         const SILENCE: f32 = 3.2e-5; // -90 dBFS
         const START: f32 = 1e-3; // -60 dBFS
-        // Hard ceiling on background floor (-36 dBFS): continuous speech above this never pulls
-        // the floor upward and never gets ducked mid-sentence (M2-01).
-        const MAX_FLOOR: f32 = 0.015_848_932; // -36 dBFS
-        const STEADY_HOLD_S: f32 = 0.25;
+        // The loudest room noise it will take for the room (-30 dBFS).
+        const MAX_FLOOR: f32 = 0.031_622_776;
+        // How long a sound must hold still (within 6 dB of itself) before it is learnt as the
+        // room: a fan does; a voice never holds that still, and its voiced blocks don't count.
+        const STEADY_HOLD_S: f32 = 0.5;
+        // A voice keeps the gain open this long after it was last heard (a consonant, the
+        // breath between two words).
+        const VOICE_HOLD_S: f32 = 0.2;
         if self.floor <= 0.0 {
             self.floor = START;
         }
+        let voiced = rms >= SILENCE && self.hears_a_voice(l, r, rms);
+        if voiced {
+            self.nr_voice_s = VOICE_HOLD_S;
+        } else {
+            self.nr_voice_s = (self.nr_voice_s - secs).max(0.0);
+        }
+        let voice_now = self.nr_voice_s > 0.0;
         if rms >= SILENCE {
             if rms < self.floor {
+                // Down at once to anything quieter: that is the room.
                 self.floor = rms;
                 self.nr_steady_rms = rms;
                 self.nr_steady_s = 0.0;
+            } else if voice_now {
+                // A voice is speaking: the floor stays where it was (never rises to meet it).
+                self.nr_steady_rms = 0.0;
+                self.nr_steady_s = 0.0;
             } else if rms <= MAX_FLOOR {
-                let over_floor = mul_to_db(rms / self.floor.max(1e-9));
+                // Not a voice: noise or a room. Steady means within 6 dB of what it has been (the level of
+                // a few milliseconds of noise wanders by that much).
                 let steady_diff =
                     if self.nr_steady_rms > 0.0 { mul_to_db(rms / self.nr_steady_rms).abs() } else { f32::INFINITY };
-                if steady_diff <= 4.5 {
+                if steady_diff <= 6.0 {
                     self.nr_steady_s = (self.nr_steady_s + secs).min(STEADY_HOLD_S + 1.0);
-                    self.nr_steady_rms += (rms - self.nr_steady_rms) * (secs * 3.0).min(1.0);
+                    self.nr_steady_rms += (rms - self.nr_steady_rms) * (secs * 4.0).min(1.0);
                 } else {
                     self.nr_steady_rms = rms;
                     self.nr_steady_s = 0.0;
                 }
-                if over_floor <= 6.0 {
+                if self.nr_steady_s >= STEADY_HOLD_S {
+                    // A fan turned on, or the room got louder: learnt within a few seconds.
+                    self.floor = (self.floor * db_to_mul(20.0 * secs)).min(self.nr_steady_rms).max(self.floor);
+                } else if mul_to_db(rms / self.floor.max(1e-9)) <= 6.0 {
+                    // Slowly rising room noise.
                     self.floor = (self.floor * db_to_mul(3.0 * secs)).min(rms);
-                } else if self.nr_steady_s >= STEADY_HOLD_S {
-                    // Steady room noise above the initial -60 dBFS guess (or a fan turning on).
-                    self.floor = (self.floor * db_to_mul(18.0 * secs)).min(rms).min(MAX_FLOOR);
                 }
             } else {
-                // Active speech above background noise ceiling: freeze the floor completely.
                 self.nr_steady_rms = 0.0;
                 self.nr_steady_s = 0.0;
             }
         }
         let depth = 24.0 * strength.clamp(1, 100) as f32 / 100.0;
-        // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly.
+        // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly. A
+        // voice is never turned down, whatever its level or the room's.
         let over = mul_to_db(rms.max(1e-9) / self.floor.max(1e-9));
-        let target = db_to_mul(-depth * (1.0 - ((over - 6.0) / 6.0).clamp(0.0, 1.0)));
+        let target = if voice_now { 1.0 } else { db_to_mul(-depth * (1.0 - ((over - 6.0) / 6.0).clamp(0.0, 1.0))) };
         // Opens in 5 ms (a word's start isn't clipped), closes in 120 ms.
         let open = 1.0 - coefficient(self.rate, 0.005);
         let close = 1.0 - coefficient(self.rate, 0.120);
@@ -883,7 +993,10 @@ mod tests {
     #[test]
     fn light_noise_removal_quiets_the_room_not_the_voice() {
         // A fan's hiss (-50 dBFS), then a voice over it (-12 dBFS), then the fan alone again.
-        let hiss: Vec<f32> = (0..RATE as usize).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.0055).collect();
+        // (Noise that doesn't repeat: the first version of this used a hiss with a 20 ms period,
+        // which a voice detector rightly takes for a voice.)
+        let mut seed = 21u32;
+        let hiss = pink_noise(RATE as usize, db_to_mul(-50.0), &mut seed);
         let voice: Vec<f32> = sine(220.0, 0.35, 1.0).iter().zip(&hiss).map(|(v, h)| v + h).collect();
         let input: Vec<f32> = hiss.iter().chain(&voice).chain(&hiss).copied().collect();
         let out = run(AudioEffect::Denoise { strength: 100 }, &input);
@@ -978,7 +1091,7 @@ mod tests {
         let mut seed = 42u32;
         let noise_rms = db_to_mul(-45.0);
         let speech_rms = db_to_mul(-18.0);
-        let noise = pink_noise(18 * r, noise_rms, &mut seed);
+        let noise = pink_noise(21 * r, noise_rms, &mut seed);
         let speech = voiced_speech(15 * r, speech_rms);
         let mut input = noise.clone();
         for i in 0..(15 * r) {
@@ -994,7 +1107,7 @@ mod tests {
             }
             let early = mul_to_db(rms(&l[2 * r..5 * r]) / rms(&input[2 * r..5 * r]));
             let late = mul_to_db(rms(&l[12 * r..15 * r]) / rms(&input[12 * r..15 * r]));
-            let pause_after = mul_to_db(rms(&l[17 * r..18 * r]) / rms(&noise[17 * r..18 * r]));
+            let pause_after = mul_to_db(rms(&l[20 * r..21 * r]) / rms(&noise[20 * r..21 * r]));
             let mut w_min = f32::INFINITY;
             let mut w_max = f32::NEG_INFINITY;
             for sec in 2..15 {
@@ -1017,6 +1130,149 @@ mod tests {
             prev_pause_nr = pause_after;
         }
         assert!(prev_pause_nr < -20.0, "strength=100 pause noise reduced by >20 dB: {prev_pause_nr:+.2} dB");
+    }
+
+    /// Harmonic "speech": a pitch (with vibrato), formants, syllables at 3.5 Hz. `f0` is the
+    /// voice's pitch; `deep` is how far the syllables dip (0.35: a little, 0.8: words nearly apart).
+    fn speech_of(n: usize, target_rms: f32, f0_base: f64, deep: f64) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut phase = 0.0f64;
+        let rate = f64::from(RATE);
+        for i in 0..n {
+            let t = i as f64 / rate;
+            let f0 = f0_base + 0.09 * f0_base * (std::f64::consts::TAU * 0.65 * t).sin();
+            phase += std::f64::consts::TAU * f0 / rate;
+            let f1 = 550.0 + 150.0 * (std::f64::consts::TAU * 0.9 * t).sin();
+            let f2 = 1650.0 + 350.0 * (std::f64::consts::TAU * 0.7 * t).cos();
+            let mut s = 0.0f64;
+            for k in 1..=24 {
+                let fk = f0 * f64::from(k);
+                let g1 = 1.0 / ((fk - f1).powi(2) + 45.0f64.powi(2)).sqrt();
+                let g2 = 0.6 / ((fk - f2).powi(2) + 65.0f64.powi(2)).sqrt();
+                s += (phase * f64::from(k)).sin() * (g1 + g2) / f64::from(k).powf(0.5);
+            }
+            let syll = 1.0 - deep * (0.5 - 0.5 * (std::f64::consts::TAU * 3.5 * t).cos());
+            out.push((s * syll) as f32);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    /// A mains hum (`hz` is 50 or 60, or a rectified 100 or 120) with its harmonics, at `target_rms`.
+    fn hum(n: usize, hz: f32, target_rms: f32) -> Vec<f32> {
+        let mut out: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                (1..=6).map(|h| (std::f32::consts::TAU * hz * h as f32 * t).sin() / h as f32).sum::<f32>()
+            })
+            .collect();
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    fn through_light(input: &[f32], strength: u32) -> Vec<f32> {
+        let mut f = AudioFilter::new(AudioEffect::Denoise { strength }, RATE);
+        f.plugin = None;
+        let (mut l, mut rr) = (input.to_vec(), input.to_vec());
+        for (a, b) in l.chunks_mut(1024).zip(rr.chunks_mut(1024)) {
+            f.process([a, b]);
+        }
+        l
+    }
+
+    /// M2-01 (S16): speech is never ducked, at any level, over any room noise it is above; the
+    /// noise between words still goes down. Speech at -50 to -12 dBFS over pink noise at -60 and
+    /// -45 dBFS, a deep and a shallow voice, a syllable pattern with deep and shallow dips, at strength
+    /// 100 and 50: the speech stays within 1 dB, the noise after it falls (at least 10 dB at 100,
+    /// 5 dB at 50). (The first version of this filter ducked a -40 dBFS voice by 20 dB in a
+    /// second, and the "frozen floor" fix only held above -36 dBFS.)
+    #[test]
+    fn light_denoise_never_ducks_speech_at_any_level_and_still_quiets_the_noise() {
+        let r = RATE as usize;
+        let mut worst: Vec<String> = Vec::new();
+        for noise_db in [-60.0f32, -45.0] {
+            for speech_db in [-50.0f32, -44.0, -40.0, -30.0, -20.0, -12.0] {
+                if speech_db < noise_db - 1.0 {
+                    continue;
+                }
+                for (f0, deep) in [(110.0, 0.35), (210.0, 0.35), (130.0, 0.7)] {
+                    let mut seed = 7u32;
+                    // 4 s of the room, 10 s of speech over it, 3 s of the room again.
+                    let noise = pink_noise(17 * r, db_to_mul(noise_db), &mut seed);
+                    let speech = speech_of(10 * r, db_to_mul(speech_db), f0, deep);
+                    let mut input = noise.clone();
+                    for i in 0..10 * r {
+                        input[4 * r + i] += speech[i];
+                    }
+                    for strength in [100u32, 50] {
+                        let out = through_light(&input, strength);
+                        // The speech, from its second second to the end: never more than 1 dB
+                        // down, in any second (no pumping), and the pause after it quieter.
+                        let mut worst_sec = f32::INFINITY;
+                        for sec in 5..14 {
+                            let g = mul_to_db(rms(&out[sec * r..(sec + 1) * r]) / rms(&input[sec * r..(sec + 1) * r]));
+                            worst_sec = worst_sec.min(g);
+                        }
+                        let pause = mul_to_db(rms(&out[16 * r..17 * r]) / rms(&noise[16 * r..17 * r]));
+                        let need = if strength == 100 { -10.0 } else { -5.0 };
+                        if worst_sec < -1.0 || pause > need {
+                            worst.push(format!(
+                                "speech {speech_db} over noise {noise_db}, f0 {f0}, deep {deep}, strength {strength}: speech {worst_sec:+.1} dB, pause {pause:+.1} dB"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(worst.is_empty(), "{} cases:\n{}", worst.len(), worst.join("\n"));
+    }
+
+    /// A fan (or a hum) that turns on in the middle of a stream is learnt in a few seconds, not
+    /// by eating the voice over it: the voice keeps its level (1 dB) through the change and the
+    /// noise between the words after it goes down by 10 dB.
+    #[test]
+    fn a_fan_turning_on_mid_stream_is_learnt_without_eating_speech() {
+        let r = RATE as usize;
+        for (name, make) in [
+            (
+                "a pink fan",
+                Box::new(|n: usize, seed: &mut u32| pink_noise(n, db_to_mul(-45.0), seed))
+                    as Box<dyn Fn(usize, &mut u32) -> Vec<f32>>,
+            ),
+            ("a 60 Hz hum", Box::new(|n: usize, _: &mut u32| hum(n, 60.0, db_to_mul(-45.0)))),
+            ("a 100 Hz hum", Box::new(|n: usize, _: &mut u32| hum(n, 100.0, db_to_mul(-45.0)))),
+            ("a 120 Hz hum", Box::new(|n: usize, _: &mut u32| hum(n, 120.0, db_to_mul(-45.0)))),
+        ] {
+            let mut seed = 11u32;
+            // 4 s of a quiet room, then the noise for 20 s; speech at -30 dBFS from 2 s to 18 s.
+            let room = pink_noise(28 * r, db_to_mul(-62.0), &mut seed);
+            let fan = make(24 * r, &mut seed);
+            let speech = speech_of(16 * r, db_to_mul(-40.0), 130.0, 0.7);
+            let mut input = room.clone();
+            for i in 0..24 * r {
+                input[4 * r + i] += fan[i];
+            }
+            for i in 0..16 * r {
+                input[2 * r + i] += speech[i];
+            }
+            let out = through_light(&input, 100);
+            // The voice through the turn-on and after it (seconds 3..18 against what went in).
+            for sec in 3..18 {
+                let g = mul_to_db(rms(&out[sec * r..(sec + 1) * r]) / rms(&input[sec * r..(sec + 1) * r]));
+                assert!(g > -1.0, "{name}: the voice was down {g:+.1} dB in second {sec}");
+            }
+            // After the speech ends (at 18 s): the noise is down by 10 dB from 24 s on (a hum's
+            // never-changing pitch takes two seconds to be told from a voice, then it is learnt).
+            let fan_only = &input[24 * r..28 * r];
+            let cleaned = mul_to_db(rms(&out[24 * r..28 * r]) / rms(fan_only));
+            assert!(cleaned < -10.0, "{name}: the noise after the speech is down only {cleaned:+.1} dB");
+        }
     }
 
     #[test]
