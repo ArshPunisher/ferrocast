@@ -524,7 +524,7 @@ async fn a_refused_batch_is_retried_one_by_one_and_blocked_roles_warn_once() {
     })
     .await
     .unwrap();
-    assert!(frame.contains("Server Settings"), "{frame}");
+    assert!(frame.contains("perk roles"), "{frame}");
 }
 
 #[tokio::test]

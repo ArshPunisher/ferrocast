@@ -55,7 +55,7 @@ pub enum YoutubeError {
     SignInNeeded,
     #[error("{0}")]
     SignIn(String),
-    #[error("YouTube's daily limit for Ferrocast is used up; chat comes back after midnight Pacific time")]
+    #[error("YouTube's daily chat limit is used up; it resets after midnight Pacific time")]
     QuotaExceeded,
     #[error("YouTube refused: {0}")]
     Refused(String),

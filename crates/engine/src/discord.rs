@@ -160,7 +160,7 @@ impl Engine {
                     &Notice {
                         key: Some("discord".into()),
                         level: NoticeLevel::Warn,
-                        message: format!("The Discord go-live post didn't go out. {}", f.error),
+                        message: format!("The Discord go-live post failed: {}", f.error),
                         action: Some(crate::frames::NoticeAction {
                             label: "Discord settings".into(),
                             href: "#/settings/discord".into(),

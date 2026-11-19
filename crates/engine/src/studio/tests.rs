@@ -771,7 +771,7 @@ async fn with_obs_closed_the_preflight_says_so_and_steps_fail_cleanly() {
     let run = e.start_show(true).await.unwrap();
     let scene = run.steps.iter().find(|s| s.id == "starting_scene").unwrap();
     assert_eq!(scene.status, "failed");
-    assert!(scene.detail.contains("The Studio isn't started"), "{}", scene.detail);
+    assert!(scene.detail.contains("Studio isn't started"), "{}", scene.detail);
     assert_eq!(run.steps.iter().find(|s| s.id == "discord").unwrap().status, "skipped");
     assert!(e.patch_show_config(json!({ "countdown_s": 5 }).as_object().unwrap()).await.is_err());
     assert!(e.patch_show_config(json!({ "preset_id": "ghost" }).as_object().unwrap()).await.is_err());
@@ -1013,7 +1013,8 @@ async fn the_streams_health_is_scored_while_live() {
     e.health_tick().await;
     let h = e.studio_stats().await.unwrap()["health"].clone();
     assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(80), Some("good")));
-    assert!(h["reason"].as_str().unwrap().contains("late"));
+    let reason = h["reason"].as_str().unwrap();
+    assert!(reason.contains("busy") || reason.contains("keep up"), "{reason}");
 }
 
 #[tokio::test]
@@ -1400,7 +1401,7 @@ async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
     let run = e.start_show(true).await.unwrap();
     let live = run.steps.iter().find(|s| s.id == "live_scene").unwrap_or_else(|| panic!("{:?}", run.steps));
     assert_eq!(live.status, "skipped", "{live:?}");
-    assert!(live.detail.contains("has nothing in it"), "{live:?}");
+    assert!(live.detail.contains("is empty"), "{live:?}");
     assert_eq!(*studio.current.lock().unwrap(), "Starting", "the scene on air stays");
     // The stream stops some other way (the Studio stopped): a new show may start.
     *studio.streaming.lock().unwrap() = false;
@@ -1542,7 +1543,7 @@ async fn the_preflight_hears_a_silent_mic_and_sees_a_black_camera() {
     let check = |pf: &crate::studio::show::Preflight, id: &str| pf.checks.iter().find(|c| c.id == id).cloned().unwrap();
     let mic = check(&pf, "mic:Mic");
     assert_eq!(mic.status, ferrocast_core::show::CheckStatus::Warn);
-    assert!(mic.detail.contains("no sound comes in"), "{mic:?}");
+    assert!(mic.detail.contains("silent"), "{mic:?}");
     let cam = check(&pf, "cam:Camera");
     assert_eq!(cam.status, ferrocast_core::show::CheckStatus::Fail);
     assert!(cam.detail.contains("black"), "{cam:?}");

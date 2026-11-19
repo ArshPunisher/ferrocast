@@ -83,7 +83,7 @@ impl Engine {
                     let message = if after == "sign_in_needed" {
                         format!("{name} needs you to sign in again.")
                     } else {
-                        format!("{name} needs more permissions to keep everything working.")
+                        format!("{name} needs more permissions.")
                     };
                     self.send_live(LiveFrame::new(
                         "notice",

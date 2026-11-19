@@ -722,7 +722,7 @@ impl Engine {
             return Err(refused(
                 "golive_streaming",
                 "A stream is coming in right now.",
-                "Stop streaming in OBS first; the key changes between streams.",
+                "Stop streaming first; the key changes between streams.",
             ));
         }
         let ingest = lock(&g.ingest).clone();
@@ -1255,7 +1255,7 @@ impl Engine {
         if !wanted {
             return (Vec::new(), None);
         }
-        let off = |why: String| (Vec::new(), Some(format!("Enhanced Broadcasting is off for this stream: {why}")));
+        let off = |why: String| (Vec::new(), Some(format!("Enhanced Broadcasting is off: {why}")));
         let Some(c) = platform_of(Service::Twitch).and_then(|p| self.connector(p)) else {
             return off("connect Twitch in Settings, Accounts.".into());
         };
@@ -1727,12 +1727,9 @@ impl Engine {
         if !unreachable.is_empty() {
             let names = unreachable.join(", ");
             verdict.message = if needs.is_empty() {
-                format!(
-                    "Your upload is {}. Ferrocast couldn't reach {names}, so nothing was counted yet.",
-                    probe::mbps(upload)
-                )
+                format!("Your upload is {}. {names} couldn't be reached, so nothing was counted.", probe::mbps(upload))
             } else {
-                format!("{} {names} couldn't be reached and isn't counted.", verdict.message)
+                format!("{} {names} couldn't be reached, not counted.", verdict.message)
             };
         }
         let check = UploadCheck { at: now().0, measured_by: measured_by.into(), verdict, rows };
@@ -1754,11 +1751,9 @@ impl Engine {
                 match got {
                     Ok(i) => (own_server.unwrap_or(i.url), i.key),
                     Err(ferrocast_connector::ConnectorError::MissingScope { .. }) => {
-                        return Err(format!(
-                            "{p} needs one more permission to stream: reconnect {p} in Settings, Accounts."
-                        ));
+                        return Err(format!("{p} needs one more permission: reconnect it in Settings, Accounts."));
                     }
-                    Err(e) => return Err(format!("Couldn't get the stream key from {p}: {e}")),
+                    Err(e) => return Err(format!("Couldn't get {p}'s stream key: {e}")),
                 }
             }
             None => {
@@ -2000,8 +1995,7 @@ impl Engine {
             Ok(h) => h,
             Err(why) => {
                 let reason = if why.is_empty() || why.contains("isn't streaming") {
-                    "SRT, RIST and WebRTC go straight from the Ferrocast Studio: go live with the Ferrocast picture."
-                        .to_string()
+                    "SRT, RIST and WebRTC go out from Studio: go live there.".to_string()
                 } else {
                     format!("Couldn't start: {why}")
                 };
@@ -2118,7 +2112,7 @@ impl Engine {
             .map(|u| u.saturating_duration_since(std::time::Instant::now()).as_millis() as u64)
             .unwrap_or(0);
         tracing::info!(dest = %id, "Go live: upload protection paused a destination");
-        let reason = format!("Your upload dipped, so this paused to keep {top} smooth. It comes back by itself.");
+        let reason = format!("Paused to keep {top} smooth; it comes back by itself.");
         let health = Health {
             state: PushState::Paused { until_ms: now_ms + left, reason },
             kbps: 0,

@@ -305,7 +305,7 @@ impl Engine {
         self.notice(
             "update",
             NoticeLevel::Info,
-            &format!("Ferrocast {version} is ready. Restart Ferrocast when it suits you to finish the update."),
+            &format!("Ferrocast {version} is ready: restart to finish the update."),
         );
     }
 
