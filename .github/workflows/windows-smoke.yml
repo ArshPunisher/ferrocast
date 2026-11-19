@@ -135,6 +135,10 @@ jobs:
             Write-Host "== $k"; Get-ItemProperty $k -ErrorAction SilentlyContinue | Format-List
           }
           Get-Service FrameServer, FrameServerMonitor -ErrorAction SilentlyContinue | Format-Table Name, Status, StartType
+          # The software device a virtual camera makes, if it was made at all (projects-60).
+          Get-PnpDevice -PresentOnly:$false -ErrorAction SilentlyContinue |
+            Where-Object { $_.InstanceId -like 'SWD\VCAMDEVAPI*' -or $_.Class -in 'Camera', 'Image' -or $_.FriendlyName -like '*Ferrocast*' } |
+            Format-Table Status, Class, FriendlyName, InstanceId -AutoSize
           Get-WinEvent -ListLog '*FrameServer*' -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "== $($_.LogName)"
             Get-WinEvent -LogName $_.LogName -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message

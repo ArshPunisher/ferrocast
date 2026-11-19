@@ -405,6 +405,8 @@ mod win {
     fn read_every_app_camera() -> R<()> {
         let e = |x: windows::core::Error| x.to_string();
         let until = Instant::now() + Duration::from_secs(20);
+        // Every camera name seen, for a failure to show (19 Nov: "wasn't listed", nothing more).
+        let mut seen: Vec<String> = Vec::new();
         // SAFETY: plain Media Foundation calls; the device list is freed below.
         unsafe {
             loop {
@@ -424,7 +426,12 @@ mod win {
                     if d.GetString(&MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &mut buf, Some(&mut len)).is_err() {
                         continue;
                     }
-                    if String::from_utf16_lossy(&buf[..len as usize]) != FRIENDLY_NAME {
+                    let listed = String::from_utf16_lossy(&buf[..len as usize]);
+                    if !seen.contains(&listed) {
+                        seen.push(listed.clone());
+                    }
+                    // Windows may add " (Windows Virtual Camera)" to a virtual camera's name.
+                    if !listed.starts_with(FRIENDLY_NAME) {
                         continue;
                     }
                     let source: IMFMediaSource = d.ActivateObject().map_err(e)?;
@@ -466,7 +473,7 @@ mod win {
                     return Err("Windows 11's camera never gave the picture".into());
                 }
                 if Instant::now() > until {
-                    return Err("Windows 11's camera wasn't listed".into());
+                    return Err(format!("Windows 11's camera wasn't listed (cameras seen: {seen:?})"));
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
