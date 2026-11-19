@@ -2016,6 +2016,45 @@ impl Engine {
         self.with_output_flushed(id, |pipe| pipe.split(path))
     }
 
+    /// Starts recording into `path` on running output `id`, from its own encoders (at its next
+    /// keyframe; the file plays from 0): a recording "Same as stream" sharing the stream's
+    /// encode, where the Mac's one video encoder can't do two at 4K60 (19 Nov: 31 of 60 fps).
+    pub fn record_on(&self, id: u64, path: &std::path::Path) -> Result<(), AvError> {
+        self.with_output_flushed(id, |pipe| pipe.start_recording(path))
+    }
+
+    /// Ends output `id`'s recording, its file finished; the output goes on (its stream).
+    pub fn record_off(&self, id: u64) -> Result<(), AvError> {
+        self.with_output_flushed(id, Pipeline::end_recording)
+    }
+
+    /// A stream joins running output `id` (a recording "Same as stream" that started first):
+    /// its tags go to `send` from the output's next keyframe, timed from there.
+    pub fn stream_on(&self, id: u64, send: Box<dyn FnMut(Tag) + Send>) -> Result<(), AvError> {
+        let mut st = self.lock();
+        let (_, pipe, kind, _) =
+            st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
+        if !matches!(kind, OutputKind::Record(_)) {
+            return Err(AvError::Source("only a recording can take a stream on".into()));
+        }
+        pipe.begin_stream()?;
+        *kind = OutputKind::Stream(send);
+        Ok(())
+    }
+
+    /// The stream leaves output `id`, which goes on as a recording (its file and encoders
+    /// kept): the stream ended while a recording sharing its encode goes on.
+    pub fn stream_off(&self, id: u64) -> Result<(), AvError> {
+        let mut st = self.lock();
+        let (_, pipe, kind, _) =
+            st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
+        if !pipe.recording() {
+            return Err(AvError::Source("the output has no recording to go on with".into()));
+        }
+        *kind = OutputKind::Record(PathBuf::new());
+        Ok(())
+    }
+
     /// An output's recording now.
     pub fn output_record_state(&self, id: u64) -> Result<RecordState, AvError> {
         self.with_output(id, |pipe| {
@@ -4676,6 +4715,103 @@ mod tests {
             String::from_utf8_lossy(&probe.stdout).lines().filter_map(|l| l.trim_matches(',').parse().ok()).collect();
         assert!(times.len() > 60, "{} frames", times.len());
         assert!(times.windows(2).all(|w| w[1] > w[0]), "the time went back: {times:?}");
+    }
+
+    fn has_ffprobe() -> bool {
+        std::process::Command::new("ffprobe").arg("-version").output().is_ok_and(|o| o.status.success())
+    }
+
+    /// What a stream sent: (video?, ms, keyframe?, codec header?).
+    type Sent = Arc<Mutex<Vec<(bool, u32, bool, bool)>>>;
+    fn sink_into(sent: &Sent) -> Box<dyn FnMut(Tag) + Send> {
+        let sent = sent.clone();
+        Box::new(move |t: Tag| {
+            let v = match t {
+                // FLV video: the frame type in the top nibble (1 key), then AVC packet type
+                // (0 the sequence header).
+                Tag::Video { ms, body } => {
+                    (true, ms, body.first().is_some_and(|b| b >> 4 == 1), body.get(1) == Some(&0))
+                }
+                Tag::Audio { ms, body } => (false, ms, false, body.get(1) == Some(&0)),
+            };
+            sent.lock().unwrap_or_else(|p| p.into_inner()).push(v);
+        })
+    }
+
+    fn shared_scene(e: &Engine) {
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 90, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Tone { hz: 440.0, every_ms: 500, beep_ms: 100 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_global(2, true);
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    /// A recording "Same as stream" joins the running stream's encode (one encode, 19 Nov: the
+    /// Mac's one encoder made 31 of 60 fps doing two at 4K60): the file plays from 0 with
+    /// picture and sound, and the stream never stops sending.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_recording_joins_a_running_streams_encode() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let sent: Sent = Arc::default();
+        let id = e.start_output(OutputKind::Stream(sink_into(&sent))).unwrap_or_else(|x| panic!("{x}"));
+        let file = std::env::temp_dir().join(format!("ferrocore-joined-{}.mp4", std::process::id()));
+        std::thread::sleep(Duration::from_millis(1500));
+        e.record_on(id, &file).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.record_on(id, &file).is_err(), "one recording at a time");
+        std::thread::sleep(Duration::from_millis(2000));
+        e.record_off(id).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(500));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.error(), None);
+        let video: Vec<u32> =
+            sent.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|t| t.0).map(|t| t.1).collect();
+        assert!(video.len() > 100, "the stream went on throughout: {} video tags", video.len());
+        assert!(video.windows(2).all(|w| w[1] >= w[0]), "the stream's time never went back");
+        if !has_ffprobe() {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        }
+        let (secs, av) = probed(&file).unwrap_or_else(|| panic!("ffprobe couldn't read {}", file.display()));
+        assert!(av, "the file has picture and sound");
+        assert!((1.5..2.6).contains(&secs), "about 2 s, from 0: {secs:.2}");
+        let _ = std::fs::remove_file(file);
+    }
+
+    /// A stream joins a running recording's encode: it opens with the codec headers and a
+    /// keyframe at 0, no sound from before it; when it leaves, the recording goes on.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_stream_joins_a_running_recordings_encode() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let file = std::env::temp_dir().join(format!("ferrocore-joined-rec-{}.mp4", std::process::id()));
+        let id = e.start_output(OutputKind::Record(file.clone())).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1500));
+        let sent: Sent = Arc::default();
+        e.stream_on(id, sink_into(&sent)).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.stream_on(id, sink_into(&sent)).is_err(), "one stream at a time");
+        std::thread::sleep(Duration::from_millis(1500));
+        e.stream_off(id).unwrap_or_else(|x| panic!("{x}"));
+        let at_off = sent.lock().unwrap_or_else(|p| p.into_inner()).len();
+        std::thread::sleep(Duration::from_millis(1000));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let sent = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(sent.len(), at_off, "nothing sent after the stream left");
+        let video: Vec<_> = sent.iter().filter(|t| t.0).collect();
+        assert!(video.len() > 40, "{} video tags", video.len());
+        assert!(video[0].3, "the stream opens with the video header: {:?}", &video[..2]);
+        assert!(video[1].2 && video[1].1 < 50, "then a keyframe at 0: {:?}", video[1]);
+        assert!(sent.iter().filter(|t| !t.0 && !t.3).all(|t| t.1 < 10_000), "no sound timed from before the stream");
+        if !has_ffprobe() {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        }
+        let (secs, av) = probed(&file).unwrap_or_else(|| panic!("ffprobe couldn't read {}", file.display()));
+        assert!(av && (3.4..4.6).contains(&secs), "the recording went on throughout: {secs:.2} s");
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

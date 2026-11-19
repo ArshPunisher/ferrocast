@@ -52,6 +52,10 @@ pub struct Pipeline {
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each its encoder, and whether its header went out.
     video_tracks: Vec<(VideoEncoder, bool)>,
+    /// A stream that joined a running output (`begin_stream`): nothing goes out before its first
+    /// keyframe, whose decode time is its 0 (sound from before it is left out).
+    stream_from_us: i64,
+    stream_waits_key: bool,
 }
 
 /// The last seconds of encoded picture and sound, kept from a keyframe on (OBS's replay buffer).
@@ -252,7 +256,66 @@ impl Pipeline {
             stream_extra: false,
             sent_extra_headers: Vec::new(),
             video_tracks: Vec::new(),
+            stream_from_us: 0,
+            stream_waits_key: false,
         })
+    }
+
+    /// Starts recording into `path` on this running output, at its next frame (a keyframe),
+    /// from its own encoders: a recording "Same as stream" beside the stream it shares them
+    /// with (one encode, where the Mac's one encoder can't do two at 4K60). The file plays from
+    /// 0. Err when it records already or keeps a replay.
+    pub fn start_recording(&mut self, path: &Path) -> Result<(), AvError> {
+        if self.replay.is_some() {
+            return Err(AvError::Encoder("a replay buffer can't record a file too".into()));
+        }
+        if matches!(self.recording, Some(Recording::On(_) | Recording::Waiting { .. })) || self.split_to.is_some() {
+            return Err(AvError::Encoder("this output records already".into()));
+        }
+        let f = File::create(path)
+            .map_err(|e| AvError::Encoder(format!("the recording can't be written at {} ({e})", path.display())))?;
+        self.recording = None;
+        self.split_to = Some((f, is_mkv(path)));
+        self.key_next = true;
+        Ok(())
+    }
+
+    /// Ends this output's recording (its file finished); its encoders and stream go on.
+    pub fn end_recording(&mut self) -> Result<(), AvError> {
+        self.split_to = None;
+        match self.recording.take() {
+            Some(Recording::On(w)) => {
+                w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether it writes a file now (or waits for its first frame to).
+    pub fn recording(&self) -> bool {
+        matches!(self.recording, Some(Recording::On(_) | Recording::Waiting { .. })) || self.split_to.is_some()
+    }
+
+    /// A stream joins this running output (a recording "Same as stream" that started first):
+    /// its tags start with the codec headers at the next keyframe, which is its time 0. A
+    /// keyframe is asked for (FFmpeg's encoders can't be asked: their next one, 2 s at most
+    /// with a keyframe interval set).
+    pub fn begin_stream(&mut self) -> Result<(), AvError> {
+        // Its extra sound or video tracks would go out without their headers and on the old
+        // clock (CodeRabbit): an output with them isn't joined (the Studio shares only track 1).
+        if !self.extra.is_empty() || !self.video_tracks.is_empty() {
+            return Err(AvError::Encoder("a stream joins only an output with one sound track and one picture".into()));
+        }
+        self.sent_video_header = false;
+        self.sent_audio_header = false;
+        self.stream_waits_key = true;
+        self.key_next = true;
+        Ok(())
+    }
+
+    /// Whether a stream that joined still waits for its first keyframe.
+    pub fn stream_waits_key(&self) -> bool {
+        self.stream_waits_key
     }
 
     /// Which encoder its pictures go through ("h264_nvenc", "VideoToolbox", "libx264"…).
@@ -457,13 +520,15 @@ impl Pipeline {
     fn audio_encode(&mut self, pcm: &[f32]) -> Result<Vec<Tag>, AvError> {
         let offset = self.audio_offset_us.unwrap_or(0);
         let mut tags = Vec::new();
-        if !self.sent_audio_header {
+        if !self.sent_audio_header && !self.stream_waits_key {
             self.sent_audio_header = true;
             tags.push(Tag::Audio { ms: 0, body: flv::audio_header(&self.audio.header()) });
         }
         for mut p in self.audio.encode(pcm)? {
             p.pts_us += offset;
-            tags.push(Tag::Audio { ms: (p.pts_us / 1000) as u32, body: flv::audio_tag(&p.data) });
+            if !self.stream_waits_key && p.pts_us >= self.stream_from_us {
+                tags.push(Tag::Audio { ms: self.stream_ms(p.pts_us), body: flv::audio_tag(&p.data) });
+            }
             self.record_audio(0, p);
         }
         Ok(tags)
@@ -542,7 +607,9 @@ impl Pipeline {
         let offset = self.audio_offset_us.unwrap_or(0);
         for mut p in self.audio.flush()? {
             p.pts_us += offset;
-            tags.push(Tag::Audio { ms: (p.pts_us / 1000) as u32, body: flv::audio_tag(&p.data) });
+            if !self.stream_waits_key && p.pts_us >= self.stream_from_us {
+                tags.push(Tag::Audio { ms: self.stream_ms(p.pts_us), body: flv::audio_tag(&p.data) });
+            }
             self.record_audio(0, p);
         }
         for i in 0..self.extra.len() {
@@ -588,11 +655,26 @@ impl Pipeline {
         matches!(self.recording, Some(Recording::Failed))
     }
 
+    /// A time on the output's clock (µs) as the stream's tag time (ms).
+    fn stream_ms(&self, us: i64) -> u32 {
+        ((us - self.stream_from_us).max(0) / 1000) as u32
+    }
+
     fn video_out(&mut self, packets: Vec<VideoPacket>) -> Result<Vec<Tag>, AvError> {
         let codec = self.video.config().codec;
         let mut tags = Vec::new();
         for p in packets {
-            let (ms, body) = flv::video_tag(codec, &p, 0);
+            // A stream that joined goes out from its first keyframe, timed from its decode time
+            // (the encoder's frames still under way come out as P-frames first: left out).
+            if self.stream_waits_key {
+                if !p.key {
+                    self.record_video(&p);
+                    continue;
+                }
+                self.stream_waits_key = false;
+                self.stream_from_us = p.dts_us;
+            }
+            let (ms, body) = flv::video_tag(codec, &p, self.stream_from_us);
             if !self.sent_video_header {
                 let Some(h) = self.video.header() else { continue };
                 self.sent_video_header = true;
