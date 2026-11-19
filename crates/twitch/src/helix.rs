@@ -50,6 +50,13 @@ impl Helix {
             }
             let res = req.send().await.map_err(TwitchError::network)?;
             if res.status().as_u16() == 401 && attempt == 0 {
+                // A missing scope is also a 401: refreshing wouldn't help, and each refresh spends
+                // Twitch's single-use refresh token (agy's M10 scan). Only an expired token is
+                // refreshed.
+                let err = TwitchError::from_response(res).await;
+                if matches!(err, TwitchError::MissingScope(_)) {
+                    return Err(err);
+                }
                 token = self.auth.refresh_after_401(&token).await?;
                 continue;
             }

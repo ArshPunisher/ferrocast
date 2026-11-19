@@ -342,6 +342,33 @@ async fn an_old_sign_in_without_the_broadcast_scope_says_reconnect() {
     let unknown = connector_for(&ep, vec![]);
     let err = unknown.update_stream_info(&info).await.unwrap_err();
     assert!(matches!(err, ConnectorError::MissingScope { .. }), "{err:?}");
+    // And it never spent the single-use refresh token on it (a missing scope isn't an expiry).
+    assert_eq!(st.lock().unwrap().refreshes, 0, "a missing scope must not refresh the sign-in");
+}
+
+/// Saving the refreshed tokens failed (a keychain hiccup): they're still used, so the next
+/// refresh doesn't present the refresh token Twitch already retired.
+#[tokio::test]
+async fn a_refresh_whose_save_fails_keeps_the_new_tokens() {
+    let (st, ep) = fake().await;
+    st.lock().unwrap().fail_next_with_401 = true;
+    let tokens = Tokens {
+        access_token: "access-0".into(),
+        refresh_token: "refresh-0".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    let auth = Arc::new(Auth::new(
+        http_client(),
+        ep.clone(),
+        "client".into(),
+        tokens,
+        Arc::new(|_: &Tokens| Err("the keychain is locked".to_string())),
+    ));
+    let helix = Helix::new(auth.clone());
+    assert_eq!(helix.me().await.unwrap().id, "111", "the call still goes through");
+    assert_eq!(st.lock().unwrap().refreshes, 1);
+    assert_ne!(auth.access().await.unwrap(), "access-0", "the fresh access token is the one in use");
 }
 
 #[tokio::test]

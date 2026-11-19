@@ -58,8 +58,12 @@ impl Auth {
 
     async fn refresh_locked(&self, current: &Tokens) -> Result<Tokens, TwitchError> {
         let fresh = auth::refresh(&self.http, &self.ep, &self.client_id, &current.refresh_token).await?;
-        (self.on_tokens)(&fresh)
-            .map_err(|e| TwitchError::Refused(format!("couldn't save the new Twitch sign-in: {e}")))?;
+        // Twitch has already retired the old refresh token: the new tokens are kept even when
+        // saving them failed (a keychain hiccup), else the very next refresh would sign out for
+        // good. Saving is tried again at the next refresh.
+        if let Err(e) = (self.on_tokens)(&fresh) {
+            tracing::error!(error = %e, "couldn't save the new Twitch sign-in; it's kept for this session");
+        }
         tracing::info!("Twitch sign-in refreshed");
         Ok(fresh)
     }
