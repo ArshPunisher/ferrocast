@@ -419,6 +419,15 @@ struct Also {
 /// "Same as stream" shares the stream's encode (`can_share`, whose reason is given when it
 /// can't). `level`: ok under 90%, limit up to 100% (4K30 × 2 held its 30, 19 Nov), over past
 /// it (frames drop: 4K60 × 2 made 31 of 60).
+/// The lighter stream's size: 720 high at the canvas's shape (even sizes); None: the canvas
+/// itself, when it's no taller.
+fn light_size(width: u32, height: u32) -> Option<(u32, u32)> {
+    (height > 720).then(|| {
+        let w = (u64::from(width) * 720 / u64::from(height.max(1))) as u32;
+        (w & !1, 720)
+    })
+}
+
 fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value {
     let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
     let canvas = mpx(s.width, s.height);
@@ -433,7 +442,8 @@ fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value 
     let mut stream_mpx = stream.encode.scale.map_or(canvas, |(w, h)| mpx(w, h));
     stream_mpx += stream.video_tracks.iter().map(|&(w, h, _)| mpx(w, h)).sum::<f64>();
     if also.light {
-        stream_mpx += mpx(1280, 720);
+        let (w, h) = light_size(s.width, s.height).unwrap_or((s.width, s.height));
+        stream_mpx += mpx(w, h);
     }
     if !hardware(&stream.encode.video_encoder) {
         stream_mpx = 0.0;
@@ -3221,7 +3231,15 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn encode_budget(&self, draft: Option<Value>, enhanced: bool, light: bool) -> Result<Value, String> {
-        let (saved, replay) = self.on_main(|h| (h.settings.clone().unwrap_or_default(), h.replay.is_some())).await?;
+        let data = self.data.clone();
+        // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
+        // (one that failed isn't an encode; CodeRabbit).
+        let (saved, replay) = self
+            .on_main(move |h| {
+                let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+                (s, h.replay.as_ref().is_some_and(|r| r.active()))
+            })
+            .await?;
         let s = match draft {
             Some(d) => serde_json::from_value::<StudioSettings>(d).map_err(|e| format!("settings: {e}"))?,
             None => saved,
@@ -3415,10 +3433,7 @@ impl StudioHost for DesktopStudio {
             let mut settings = stream_settings(&s);
             // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
             let canvas = studio.canvas();
-            settings.encode.scale = (canvas.height > 720).then(|| {
-                let w = (u64::from(canvas.width) * 720 / u64::from(canvas.height.max(1))) as u32;
-                (w & !1, 720)
-            });
+            settings.encode.scale = light_size(canvas.width, canvas.height);
             settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
             settings.vod_track = None;
             tracing::info!(kbps = settings.encode.video_kbps, "the Studio's lighter stream starts into Go live");
@@ -3638,6 +3653,17 @@ mod caption_tests {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    /// The lighter stream counts at the size it really goes out at (CodeRabbit: a 3840×1080
+    /// canvas goes out at 2560×720, not 1280×720; one no taller than 720 at its own size).
+    #[test]
+    fn the_lighter_stream_counts_at_its_real_size() {
+        assert_eq!(light_size(3840, 2160), Some((1280, 720)));
+        assert_eq!(light_size(3840, 1080), Some((2560, 720)));
+        assert_eq!(light_size(1080, 1920), Some((404, 720)));
+        assert_eq!(light_size(1280, 720), None);
+        assert_eq!(light_size(854, 480), None);
+    }
 
     /// The encoder budget from today's M4 numbers (19 Nov): 4K60 streamed and recorded at High
     /// is over (31 of 60 fps), "Same as stream" shares one encode (at the limit, holding 60),

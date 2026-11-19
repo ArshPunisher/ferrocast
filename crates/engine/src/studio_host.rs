@@ -2414,6 +2414,12 @@ impl Engine {
     }
 
     pub async fn studio_encode_budget(&self, draft: Option<Value>) -> Result<Value, EngineError> {
+        // Settings that couldn't be saved get the field's error, not a budget (CodeRabbit).
+        if let Some(d) = &draft {
+            let s: StudioSettings =
+                serde_json::from_value(d.clone()).map_err(|e| EngineError::Invalid(format!("settings: {e}")))?;
+            s.check()?;
+        }
         let config = self.golive_config();
         let on = || config.destinations.iter().filter(|d| d.enabled);
         let enhanced = on().any(|d| d.enhanced);
