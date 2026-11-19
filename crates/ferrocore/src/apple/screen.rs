@@ -181,6 +181,90 @@ pub fn still(target: Target, width: u32) -> Result<Picture, AvError> {
     Err(AvError::Source("the screen gave no picture in time".into()))
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+}
+
+#[link(name = "ColorSync", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> super::CFTypeRef;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFUUIDCreateString(alloc: super::CFAllocatorRef, uuid: super::CFTypeRef) -> super::CFStringRef;
+    fn CFStringGetCString(s: super::CFStringRef, buf: *mut std::ffi::c_char, size: isize, encoding: u32) -> u8;
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> super::CFTypeRef;
+}
+
+/// Whether window `id` is still open (minimized or on another space counts), from the window
+/// server's list: quick, and no screen recording permission needed.
+fn window_exists(id: u32) -> bool {
+    /// kCGWindowListOptionIncludingWindow: just that window, when it's there.
+    const INCLUDING_WINDOW: u32 = 1 << 3;
+    // SAFETY: a plain query; the array returned is +1 (Owned releases it), or null.
+    match super::Owned::new(unsafe { CGWindowListCopyWindowInfo(INCLUDING_WINDOW, id) }) {
+        // SAFETY: a live CFArray.
+        Some(list) => (unsafe { super::CFArrayGetCount(list.0) }) > 0,
+        // No answer: taken as open (never a restart loop on a failed query).
+        None => true,
+    }
+}
+
+/// The displays connected now, by number (CoreGraphics', the same as ScreenCaptureKit's).
+pub(crate) fn active_displays() -> Vec<u32> {
+    let mut ids = [0u32; 32];
+    let mut n = 0u32;
+    // SAFETY: the array and count are ours; at most 32 are written.
+    if unsafe { CGGetActiveDisplayList(32, ids.as_mut_ptr(), &raw mut n) } != 0 {
+        return Vec::new();
+    }
+    ids[..(n as usize).min(32)].to_vec()
+}
+
+/// A display's UUID, which stays the same when its number changes (unplugged and plugged
+/// back, switched off and on, the Mac restarted with the screens in another order), as OBS
+/// keeps it ("display_uuid"). None for a display that isn't connected.
+pub fn display_uuid(id: u32) -> Option<String> {
+    // SAFETY: a plain lookup; the UUID returned is +1 (Owned releases it).
+    let uuid = super::Owned::new(unsafe { CGDisplayCreateUUIDFromDisplayID(id) })?;
+    // SAFETY: a live CFUUID; the string returned is +1 (Owned releases it).
+    let text = super::Owned::new(unsafe { CFUUIDCreateString(std::ptr::null(), uuid.0) })?;
+    let mut buf = [0 as std::ffi::c_char; 64];
+    // SAFETY: the buffer and its size are ours; UTF-8 (kCFStringEncodingUTF8).
+    if unsafe { CFStringGetCString(text.0, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) } == 0 {
+        return None;
+    }
+    // SAFETY: CFStringGetCString wrote a NUL-terminated string into `buf`.
+    Some(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
+}
+
+/// The display a saved Display Capture means now: the one with its UUID; saved before UUIDs
+/// were kept, its number while that's connected, else the only display when there's one.
+/// None when it can't be told (its UUID not connected, or several displays and none with its
+/// number): never another screen on air by a guess.
+pub fn display_now(saved: u32, uuid: Option<&str>) -> Option<u32> {
+    let now: Vec<(u32, Option<String>)> = active_displays().into_iter().map(|d| (d, display_uuid(d))).collect();
+    pick_display(saved, uuid, &now)
+}
+
+/// [`display_now`]'s choice from the displays connected (number, UUID).
+fn pick_display(saved: u32, uuid: Option<&str>, now: &[(u32, Option<String>)]) -> Option<u32> {
+    if let Some(u) = uuid.filter(|u| !u.is_empty()) {
+        return now.iter().find(|d| d.1.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(u))).map(|d| d.0);
+    }
+    match now {
+        _ if now.iter().any(|d| d.0 == saved) => Some(saved),
+        [only] => Some(only.0),
+        _ => None,
+    }
+}
+
 /// What can be captured now: displays, and apps' own windows that are on screen and have a title.
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
     let c = content()?;
@@ -595,6 +679,8 @@ pub struct ScreenCapture {
     shared: Arc<Shared>,
     /// Tells the thread that keeps apps out (when there is one) to stop.
     privacy: Option<Arc<AtomicBool>>,
+    /// The window captured (a Window Capture): its closing ends the capture.
+    window: Option<u32>,
 }
 
 /// The stream, handed to the thread that keeps apps out.
@@ -785,7 +871,11 @@ impl ScreenCapture {
                 }
                 _ => None,
             };
-            Ok(Self { stream, output, _queue: queue, shared, privacy })
+            let window = match target {
+                Target::Window(id) => Some(id),
+                Target::Display(_) => None,
+            };
+            Ok(Self { stream, output, _queue: queue, shared, privacy, window })
         }
     }
 
@@ -810,9 +900,12 @@ impl ScreenCapture {
         self.shared.frames.load(Ordering::Relaxed)
     }
 
-    /// Why it ended, if it did (ScreenCaptureKit's stream doesn't end by itself here).
+    /// Why it ended, if it did: a captured window that closed (its app quit). ScreenCaptureKit
+    /// then just sends nothing, as for a window that doesn't change, so the watchdog never
+    /// opened it again, and the app's new window (found by its app and title) never came back.
     pub fn ended(&self) -> Option<String> {
-        None
+        let id = self.window?;
+        (!window_exists(id)).then(|| format!("its window ({id}) closed"))
     }
 }
 
@@ -887,6 +980,32 @@ impl Drop for ScreenCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_that_isnt_there_reads_as_closed() {
+        assert!(!window_exists(0xFFFF_FFF0), "no such window");
+        // A window that is open: the first in the window server's list, when there is one.
+        if let Ok((_, windows)) = shareable()
+            && let Some(w) = windows.first()
+        {
+            assert!(window_exists(w.id), "{w:?}");
+        }
+    }
+
+    #[test]
+    fn a_display_is_found_by_its_uuid_when_its_number_changed() {
+        let now = [(3, Some("AAA".to_string())), (2, Some("BBB".to_string()))];
+        // Its UUID wins over its old number, which may be another screen's now.
+        assert_eq!(pick_display(1, Some("aaa"), &now), Some(3));
+        assert_eq!(pick_display(2, Some("AAA"), &now), Some(3));
+        // Its screen isn't connected: nothing, never the other screen.
+        assert_eq!(pick_display(3, Some("CCC"), &now), None);
+        // Saved before UUIDs: its number while connected, else only a lone display.
+        assert_eq!(pick_display(2, None, &now), Some(2));
+        assert_eq!(pick_display(1, None, &now), None);
+        assert_eq!(pick_display(1, None, &[(5, None)]), Some(5));
+        assert_eq!(pick_display(1, Some(""), &[(5, None)]), Some(5));
+    }
 
     #[test]
     fn apps_are_named_by_bundle_id_or_name_in_any_case() {

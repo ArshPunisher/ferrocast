@@ -86,12 +86,15 @@ pub enum SourceKind {
         /// The mouse pointer drawn in the picture (OBS's Show Cursor / Capture Cursor).
         cursor: bool,
     },
-    /// One window (macOS), by its window number, as it looks wherever it is; with `cursor`,
-    /// the mouse pointer drawn in it.
+    /// One window, by its window number, as it looks wherever it is; with `cursor`, the mouse
+    /// pointer drawn in it. `app` and `title` (as the window list names them; empty when not
+    /// known) find it again once its number is gone: the app quit and opened again.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Window {
         id: u32,
         cursor: bool,
+        app: String,
+        title: String,
     },
     /// One app's windows on a display (macOS, OBS's Application Capture), by bundle id or
     /// name; with `sound`, its sound too.
@@ -2985,6 +2988,43 @@ fn is_capture(kind: &SourceKind) -> bool {
     false
 }
 
+/// The window to capture now: `id` while it's still there, else the window of the same app
+/// with the same title, else that app's only window (games and browsers get a new window
+/// number every time they open). Never one of several windows by a guess: a browser's other
+/// window could be someone's mail on air. `id` as it was when none fits (the capture then
+/// says it's gone, and the watchdog tries again later).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn window_now(id: u32, app: &str, title: &str) -> u32 {
+    if app.is_empty() {
+        return id;
+    }
+    match crate::screen::shareable() {
+        Ok((_, windows)) => {
+            let list: Vec<(u32, &str, &str)> =
+                windows.iter().map(|w| (w.id, w.app.as_str(), w.title.as_str())).collect();
+            let now = pick_window(id, app, title, &list);
+            if now != id {
+                tracing::info!(was = id, now, app, "a window came back with a new number: captured again");
+            }
+            now
+        }
+        Err(_) => id,
+    }
+}
+
+/// [`window_now`]'s choice from a window list of (number, app, title).
+fn pick_window(id: u32, app: &str, title: &str, windows: &[(u32, &str, &str)]) -> u32 {
+    if windows.iter().any(|w| w.0 == id) || app.is_empty() {
+        return id;
+    }
+    let same_app: Vec<&(u32, &str, &str)> = windows.iter().filter(|w| w.1.eq_ignore_ascii_case(app)).collect();
+    match same_app.iter().find(|w| !title.is_empty() && w.2 == title) {
+        Some(w) => w.0,
+        None if same_app.len() == 1 => same_app[0].0,
+        None => id,
+    }
+}
+
 /// Starts a capture (None: `kind` isn't one).
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
@@ -3002,8 +3042,8 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
         .map(Live::Screen),
         // The window's app's sound comes with it (ScreenCaptureKit filters it to the window on
         // a Mac, WASAPI's process loopback hears its app on Windows); none on Linux.
-        SourceKind::Window { id, cursor } => ScreenCapture::start_with(
-            Target::Window(*id),
+        SourceKind::Window { id, cursor, app, title } => ScreenCapture::start_with(
+            Target::Window(window_now(*id, app, title)),
             config.width,
             config.height,
             config.fps,
@@ -3524,6 +3564,22 @@ mod tests {
     use super::*;
     use crate::audio::AudioConfig;
     use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    #[test]
+    fn a_window_whose_app_opened_again_is_found_by_its_app_and_title() {
+        let list = [(40, "Google Chrome", "Docs"), (41, "Google Chrome", "Stream - YouTube"), (50, "Game", "Game")];
+        // Still there: kept.
+        assert_eq!(pick_window(41, "Google Chrome", "Stream - YouTube", &list), 41);
+        // Gone: the same app's window with the same title, else its only window.
+        assert_eq!(pick_window(7, "Google Chrome", "Stream - YouTube", &list), 41);
+        assert_eq!(pick_window(9, "Game", "", &list), 50);
+        assert_eq!(pick_window(9, "Game", "Menu", &list), 50);
+        // Several windows, none with its title: none guessed (another could be private).
+        assert_eq!(pick_window(7, "google chrome", "Another tab", &list), 7);
+        // Nothing to go on, or the app isn't open: the old number (the capture says it's gone).
+        assert_eq!(pick_window(7, "", "Docs", &list), 7);
+        assert_eq!(pick_window(7, "Discord", "Docs", &list), 7);
+    }
 
     fn engine() -> Option<Engine> {
         let video = VideoConfig {
@@ -4182,7 +4238,7 @@ mod tests {
     #[test]
     fn only_screen_captures_hand_over() {
         let screen = SourceKind::Screen { display: 1, sound: false, hide: Vec::new(), cursor: true };
-        let window = SourceKind::Window { id: 4, cursor: true };
+        let window = SourceKind::Window { id: 4, cursor: true, app: String::new(), title: String::new() };
         assert!(hands_over(&screen, &window));
         assert!(hands_over(&window, &screen));
         let cam = SourceKind::Camera("a".into());
@@ -4922,7 +4978,13 @@ mod tests {
                 st.opened.insert(name.into(), (id, kind));
             };
             add(1, "Webcam", SourceKind::Camera("x".into()), None, None);
-            add(2, "Game", SourceKind::Window { id: 7, cursor: true }, None, None);
+            add(
+                2,
+                "Game",
+                SourceKind::Window { id: 7, cursor: true, app: String::new(), title: String::new() },
+                None,
+                None,
+            );
             add(3, "Opening", SourceKind::Camera("y".into()), None, Some(9));
             add(4, "Fine", SourceKind::Camera("z".into()), Some((640, 360, true)), None);
             add(5, "Off air", SourceKind::Camera("w".into()), None, None);

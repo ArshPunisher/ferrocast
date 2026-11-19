@@ -1239,6 +1239,7 @@ impl Stage {
                 base.insert(k.clone(), v.clone());
             }
         }
+        remember_capture(kind, &mut set);
         let source = json!({
             "id": kind, "versioned_id": kind, "name": name, "uuid": uuid(),
             "settings": set,
@@ -1751,6 +1752,10 @@ impl Stage {
             }
             for (k, v) in new {
                 s["settings"][k] = v.clone();
+            }
+            if ["window", "display", "type"].iter().any(|k| new.contains_key(*k)) {
+                let kind = kind_of(s).to_string();
+                remember_capture(&kind, &mut s["settings"]);
             }
             // A camera's new size that can't reach its saved frame rate gets the best rate it
             // can, so the form never says 50 while the card sends 30.
@@ -4425,9 +4430,67 @@ fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
         .unwrap_or(first)
 }
 
+/// Notes what a screen capture's window or display is, beside its number, so it's found
+/// again when the number changes: the window's app and title (OBS's "owner_name" and
+/// "window_name"; a game or browser gets a new window number each time it opens), and on a
+/// Mac the display's UUID (OBS's "display_uuid"; a display's number changes when it's plugged
+/// back in or the Mac restarts).
+fn remember_capture(kind: &str, set: &mut Value) {
+    if !matches!(kind, "screen_capture" | "display_capture" | "window_capture" | "game_capture") {
+        return;
+    }
+    let ty = set.get("type").and_then(Value::as_u64).unwrap_or(0);
+    let window = set.get("window").and_then(Value::as_u64).map(|w| w as u32);
+    let is_window = (kind != "screen_capture" && kind != "display_capture") || ty == 1;
+    if is_window && let Some(id) = window {
+        // Names of a window picked before never find this one's app.
+        if let Some(o) = set.as_object_mut() {
+            o.remove("owner_name");
+            o.remove("window_name");
+        }
+        if let Ok((_, windows)) = ferrocore::screen::shareable()
+            && let Some(w) = windows.iter().find(|w| w.id == id)
+        {
+            set["owner_name"] = json!(w.app);
+            set["window_name"] = json!(w.title);
+        }
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(d) = set.get("display").and_then(Value::as_u64) {
+        match ferrocore::screen::display_uuid(d as u32) {
+            Some(u) => set["display_uuid"] = json!(u),
+            None => {
+                if let Some(o) = set.as_object_mut() {
+                    o.remove("display_uuid");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picked display is noted by its UUID (found again when its number changes); a window's
+    /// old names go when another window is picked.
+    #[test]
+    fn a_picked_display_or_window_is_noted_by_more_than_its_number() {
+        #[cfg(target_os = "macos")]
+        if let Some(&d) = ferrocore::screen::shareable().ok().and_then(|(ds, _)| ds.first().map(|x| x.id)).as_ref() {
+            let mut set = json!({ "type": 0, "display": d });
+            remember_capture("screen_capture", &mut set);
+            assert_eq!(set["display_uuid"].as_str(), ferrocore::screen::display_uuid(d).as_deref());
+        }
+        let mut set = json!({ "type": 1, "window": 0xFFFF_FFF0u32, "owner_name": "Old", "window_name": "Old" });
+        remember_capture("screen_capture", &mut set);
+        assert!(set.get("owner_name").is_none() && set.get("window_name").is_none(), "{set}");
+        // Not a screen capture: left as it is.
+        let mut other = json!({ "window": 3, "owner_name": "Keep" });
+        remember_capture("image_source", &mut other);
+        assert_eq!(other["owner_name"], "Keep");
+    }
 
     fn stage() -> Stage {
         Stage::new(Canvas { width: 1920, height: 1080, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"))

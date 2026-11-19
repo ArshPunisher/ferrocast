@@ -414,6 +414,22 @@ fn camera_spec(s: &Value, key: &str) -> crate::engine::CameraSpec {
     }
 }
 
+/// A Mac Display or Application Capture's display now: the one picked, found by its UUID
+/// ("display_uuid", as OBS keeps it) when its number changed; the first when none was picked.
+/// Err when the picked display isn't connected (the source is left out, and says why).
+#[cfg(target_os = "macos")]
+fn display_of(s: &Value) -> Result<u32, String> {
+    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
+    match s.get("display").and_then(Value::as_u64).map(|v| v as u32) {
+        Some(saved) => {
+            let uuid = s.get("display_uuid").and_then(Value::as_str);
+            crate::screen::display_now(saved, uuid)
+                .ok_or_else(|| "its display isn't connected (pick the display again)".to_string())
+        }
+        None => Ok(first().unwrap_or(0)),
+    }
+}
+
 fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result<(SourceKind, bool), String> {
     let text_of = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     Ok(match id {
@@ -556,20 +572,24 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             match (s.get("type").and_then(Value::as_u64).unwrap_or(0), n("window")) {
                 // Window Capture, by its window number (as OBS keeps it), with its app's sound
                 // (a browser's video heard as it's shown; muted or turned down in the mixer).
-                (1, Some(w)) => (SourceKind::Window { id: w, cursor }, true),
+                // Its app and title (saved when it was picked) find it again after its app
+                // opened again with a new window number.
+                (1, Some(w)) => (
+                    SourceKind::Window { id: w, cursor, app: text_of("owner_name"), title: text_of("window_name") },
+                    true,
+                ),
                 (1, None) => return Err("a window capture with no window picked".into()),
                 (0, _) => {
-                    // The display picked (by number), else the first (OBS keeps a display's UUID).
-                    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
-                    let display = n("display").or_else(first).unwrap_or(0);
+                    // The display picked (found again by its UUID when its number changed), else
+                    // the first.
+                    let display = display_of(s)?;
                     // With what the Mac plays (Ferrocast's own sound left out), as OBS's Display
                     // Capture: switched from Window to Screen it went silent (owner, 12 Nov).
                     (SourceKind::Screen { display, sound: true, hide: with_own_hide(hide, s), cursor }, true)
                 }
                 // Application Capture: one app's windows (its bundle id) on a display.
                 (2, _) => {
-                    let first = || crate::screen::shareable().ok().and_then(|(d, _)| d.first().map(|d| d.id));
-                    let display = n("display").or_else(first).unwrap_or(0);
+                    let display = display_of(s)?;
                     let app = text_of("application");
                     if app.is_empty() {
                         return Err("an Application Capture with no app picked".into());
@@ -643,7 +663,17 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // Window Capture's switch is "cursor", Game Capture's "capture_cursor".
                 Some(w) => {
                     let cursor = cursor_on(s, if id == "game_capture" { "capture_cursor" } else { "cursor" });
-                    (SourceKind::Window { id: w, cursor }, true)
+                    // OBS's "title:class:exe" names its window too; ours keeps app and title.
+                    let (app, title) = match s.get("window") {
+                        Some(Value::String(t)) => {
+                            let mut parts = t.split(':').map(|p| p.replace("#3A", ":"));
+                            let title = parts.next().unwrap_or_default();
+                            let exe = parts.nth(1).unwrap_or_default();
+                            (exe.trim_end_matches(".exe").to_string(), title)
+                        }
+                        _ => (text_of("owner_name"), text_of("window_name")),
+                    };
+                    (SourceKind::Window { id: w, cursor, app, title }, true)
                 }
                 None => return Err("a window capture whose window isn't open".into()),
             }
@@ -1474,15 +1504,37 @@ mod tests {
     #[test]
     fn show_cursor_reaches_the_capture() {
         let kind = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.0);
-        assert_eq!(kind(json!({ "type": 1, "window": 7 })), Ok(SourceKind::Window { id: 7, cursor: true }));
+        assert_eq!(
+            kind(json!({ "type": 1, "window": 7 })),
+            Ok(SourceKind::Window { id: 7, cursor: true, app: String::new(), title: String::new() })
+        );
         assert_eq!(
             kind(json!({ "type": 1, "window": 7, "show_cursor": false })),
-            Ok(SourceKind::Window { id: 7, cursor: false })
+            Ok(SourceKind::Window { id: 7, cursor: false, app: String::new(), title: String::new() })
         );
+        // A display connected here (numbers differ from Mac to Mac); none on a Mac with no screen.
+        let Some(&d) = crate::screen::active_displays().first() else { return };
         assert_eq!(
-            kind(json!({ "type": 2, "display": 1, "application": "com.google.Chrome", "show_cursor": false })),
-            Ok(SourceKind::App { display: 1, app: "com.google.Chrome".into(), sound: true, cursor: false })
+            kind(json!({ "type": 2, "display": d, "application": "com.google.Chrome", "show_cursor": false })),
+            Ok(SourceKind::App { display: d, app: "com.google.Chrome".into(), sound: true, cursor: false })
         );
+    }
+
+    /// A Display Capture finds its screen by UUID after its number changed (owner's Mac, 19
+    /// Nov: saved as display 1, the screens now 3 and 2, the source silently left out), and a
+    /// screen that isn't connected is never swapped for another.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_display_capture_follows_its_screen_by_uuid() {
+        let Some(&d) = crate::screen::active_displays().first() else { return };
+        let Some(uuid) = crate::screen::display_uuid(d) else { return };
+        let kind = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.0);
+        assert!(matches!(
+            kind(json!({ "type": 0, "display": 9999, "display_uuid": uuid })),
+            Ok(SourceKind::Screen { display, .. }) if display == d
+        ));
+        let gone = kind(json!({ "type": 0, "display": d, "display_uuid": "00000000-0000-0000-0000-000000000000" }));
+        assert!(gone.is_err_and(|e| e.contains("isn't connected")));
     }
 
     /// Every method of a Mac screen capture brings its sound, as OBS's: a window its app's,
@@ -1493,9 +1545,10 @@ mod tests {
     fn a_screen_capture_is_heard_whatever_it_shows() {
         let heard = |set: Value| kind_from("screen_capture", &set, (1920, 1080), &[]).map(|k| k.1);
         assert_eq!(heard(json!({ "type": 1, "window": 7 })), Ok(true));
-        assert_eq!(heard(json!({ "type": 0, "display": 1 })), Ok(true));
-        assert_eq!(heard(json!({ "type": 2, "display": 1, "application": "com.google.Chrome" })), Ok(true));
-        let screen = kind_from("screen_capture", &json!({ "type": 0, "display": 1 }), (1920, 1080), &[]).map(|k| k.0);
+        let Some(&d) = crate::screen::active_displays().first() else { return };
+        assert_eq!(heard(json!({ "type": 0, "display": d })), Ok(true));
+        assert_eq!(heard(json!({ "type": 2, "display": d, "application": "com.google.Chrome" })), Ok(true));
+        let screen = kind_from("screen_capture", &json!({ "type": 0, "display": d }), (1920, 1080), &[]).map(|k| k.0);
         assert!(matches!(screen, Ok(SourceKind::Screen { sound: true, .. })), "{screen:?}");
     }
 
