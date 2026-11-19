@@ -3938,7 +3938,8 @@ mod tests {
         let audio = tags.iter().filter(|(v, _)| !*v).count();
         // About 1.5 s at 30 fps; the frames made before the stop all came out (the encoder's
         // header and a frame or two of its own delay aside).
-        assert!(video.len() >= 40, "{} video tags", video.len());
+        // (Counted against what the engine drew, not 30 a second: GitHub's Mac VM is slower.)
+        assert!(video.len() >= 10, "{} video tags", video.len());
         assert!(video.len() as u64 + 3 >= drawn_before_stop.min(45), "{} of {drawn_before_stop}", video.len());
         assert!(video.windows(2).all(|w| w[0] <= w[1]), "in time order: {video:?}");
         assert!(audio > 20, "sound came too: {audio}");
@@ -4013,6 +4014,15 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn a_capture_that_cant_open_says_so_at_once() {
         let Some(e) = engine() else { return };
+        // The system's first camera lookup in a process can take longer than the engine waits
+        // (OPEN_WAIT): such a capture is kept and tried again later, by design. Warmed first,
+        // so the check is of the answer, not of a cold start (it failed ~1 run in 3).
+        let _ = e.set_source(6, SourceKind::Camera("/no/such/camera".into()));
+        let warm = Instant::now() + Duration::from_secs(5);
+        while e.opening() > 0 && Instant::now() < warm {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        e.remove_source(6);
         let t = Instant::now();
         let r = e.set_source(7, SourceKind::Camera("/no/such/camera".into()));
         assert!(r.is_err(), "the error comes back: {r:?}");
@@ -4473,14 +4483,18 @@ mod tests {
         let small = Canvas::scaled(e.config, 320, 180);
         let half = Canvas { every: 2, ..Canvas::scaled(e.config, 160, 90) };
         let slow = Arc::new(Mutex::new(Vec::new()));
+        let from = e.stats().frames;
         let a = e.tap_frames(small, sink(&got)).unwrap_or_else(|x| panic!("{x}"));
         let b = e.tap_frames(half, sink(&slow)).unwrap_or_else(|x| panic!("{x}"));
         std::thread::sleep(Duration::from_millis(700));
+        let drawn = e.stats().frames - from;
         assert!(e.stop_tap(a) && e.stop_tap(b));
         assert!(!e.stop_tap(a), "stopped once");
         let fast = got.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let slow = slow.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert!(fast.len() >= 8, "about 30 a second: {}", fast.len());
+        // Every frame drawn meanwhile (counted against what the engine drew: GitHub's Mac VM draws
+        // a fraction of 30 a second, and a fixed "8" failed there).
+        assert!(fast.len() >= 3 && fast.len() as u64 + 3 >= drawn, "{} of {drawn} drawn", fast.len());
         assert!(fast.iter().all(|&(w, h, y, uv)| (w, h) == (320, 180) && uv == 320 * 90 && y > 200), "white, 320x180");
         assert!(!slow.is_empty() && slow.len() < fast.len(), "every other frame: {} of {}", slow.len(), fast.len());
         assert!(slow.iter().all(|&(w, h, ..)| (w, h) == (160, 90)));
