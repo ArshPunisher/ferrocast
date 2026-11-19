@@ -10,36 +10,72 @@ use crate::engine::CameraSpec;
 /// Compares elapsed time against `0.9 * interval` (like OBS's ScreenCaptureKit pacer) so
 /// 60 Hz display frames arriving with ~16 ms jitter aren't dropped after `TryGetNextFrame`,
 /// while high-refresh displays (144/240 Hz) or lower fps caps still skip redundant readbacks.
+/// When a frame is rejected near the end of a burst, `defer` / `flush_due` lets the capture
+/// materialize that final texture once the cadence window opens so a still screen never freezes
+/// one frame behind.
 #[derive(Debug, Clone)]
 pub struct WgcPacer {
     every: Duration,
     anchor: Option<Instant>,
     last_taken: Option<Instant>,
+    deferred_at: Option<Instant>,
 }
 
 impl WgcPacer {
     pub fn new(fps: u32) -> Self {
-        Self { every: Duration::from_secs_f64(1.0 / f64::from(fps.clamp(1, 240))), anchor: None, last_taken: None }
+        Self {
+            every: Duration::from_secs_f64(1.0 / f64::from(fps.clamp(1, 240))),
+            anchor: None,
+            last_taken: None,
+            deferred_at: None,
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        let Some(anchor) = self.anchor else {
+            return true;
+        };
+        if now.saturating_duration_since(anchor) < self.every.mul_f64(0.9) {
+            return false;
+        }
+        // Never accept two frames closer than half an interval apart (e.g. a burst after an OS drop).
+        !self.last_taken.is_some_and(|t| now.saturating_duration_since(t) < self.every.mul_f64(0.5))
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.anchor = Some(match self.anchor {
+            Some(anchor) if now.saturating_duration_since(anchor) < self.every.saturating_mul(2) => anchor + self.every,
+            _ => now,
+        });
+        self.last_taken = Some(now);
+        self.deferred_at = None;
     }
 
     /// Returns `true` if the newly dequeued frame at `now` should be read and kept as `latest`.
     pub fn accept(&mut self, now: Instant) -> bool {
-        let min_gap = self.every.mul_f64(0.9);
-        let Some(anchor) = self.anchor else {
-            self.anchor = Some(now);
-            self.last_taken = Some(now);
-            return true;
-        };
-        if now.saturating_duration_since(anchor) < min_gap {
+        if !self.ready(now) {
             return false;
         }
-        // Never accept two frames closer than half an interval apart (e.g. a burst after an OS drop).
-        if self.last_taken.is_some_and(|t| now.saturating_duration_since(t) < self.every.mul_f64(0.5)) {
+        self.advance(now);
+        true
+    }
+
+    /// Records that a rejected texture is held on the GPU as the newest change so far.
+    pub fn defer(&mut self, now: Instant) {
+        self.deferred_at = Some(now);
+    }
+
+    #[cfg(test)]
+    pub fn has_deferred(&self) -> bool {
+        self.deferred_at.is_some()
+    }
+
+    /// Returns `true` if a previously deferred frame is now due and should be flushed as `latest`.
+    pub fn flush_due(&mut self, now: Instant) -> bool {
+        if self.deferred_at.is_none() || !self.ready(now) {
             return false;
         }
-        let elapsed = now.saturating_duration_since(anchor);
-        self.anchor = Some(if elapsed < self.every.saturating_mul(2) { anchor + self.every } else { now });
-        self.last_taken = Some(now);
+        self.advance(now);
         true
     }
 }
@@ -70,10 +106,7 @@ pub fn pick_win_monitor(saved: u32, uuid: Option<&str>, monitors: &[WinMonitor])
             .map(|i| i as u32);
     }
     let idx = saved as usize;
-    if idx < monitors.len() {
-        return Some(saved);
-    }
-    (monitors.len() == 1).then_some(0)
+    (idx < monitors.len()).then_some(saved)
 }
 
 /// Reads OBS's Windows `monitor_capture` settings (`monitor_id` and legacy `monitor` index).
@@ -114,6 +147,25 @@ pub struct DshowOption {
     pub max_size: (u32, u32),
     pub min_fps: f64,
     pub max_fps: f64,
+}
+
+/// Outcome of querying DirectShow device capabilities (`ffmpeg -list_options true`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DshowListStatus {
+    Ok(Vec<DshowOption>),
+    TimedOut,
+    Missing,
+    Failed,
+}
+
+/// Resolves `-list_options` status: a missing device aborts fast, whereas a slow timeout or
+/// unrecognized output falls back to empty options so `dshow_attempts` still opens with defaults.
+pub fn resolve_dshow_list(status: DshowListStatus) -> Result<Vec<DshowOption>, &'static str> {
+    match status {
+        DshowListStatus::Ok(opts) => Ok(opts),
+        DshowListStatus::Missing => Err("that camera isn't connected"),
+        DshowListStatus::TimedOut | DshowListStatus::Failed => Ok(Vec::new()),
+    }
 }
 
 /// A chosen DirectShow input option and its nominal frame rate.
@@ -475,6 +527,25 @@ mod tests {
     }
 
     #[test]
+    fn wgc_pacer_flushes_trailing_rejected_frame_when_burst_ends() {
+        let base = Instant::now();
+        let ms = |m: f64| base + Duration::from_secs_f64(m / 1000.0);
+        let mut pacer = WgcPacer::new(60);
+
+        // Simulated 144 Hz burst at 60 fps canvas: frame at 0 ms accepted; 6.9 ms rejected and deferred;
+        // nothing due immediately at 10 ms; flushed once the next 60 fps slot opens at 17 ms.
+        assert!(pacer.accept(ms(0.0)));
+        assert!(!pacer.accept(ms(6.9)));
+        pacer.defer(ms(6.9));
+        assert!(pacer.has_deferred());
+        assert!(!pacer.flush_due(ms(10.0)), "too early before next canvas interval");
+        assert!(pacer.has_deferred());
+        assert!(pacer.flush_due(ms(17.0)), "final frame must flush once interval opens");
+        assert!(!pacer.has_deferred());
+        assert!(!pacer.flush_due(ms(50.0)), "deferred flag clears after flush");
+    }
+
+    #[test]
     fn win_monitor_matches_monitor_id_across_reorders_and_refuses_missing_id() {
         let m0 = WinMonitor {
             monitor_id: r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}".into(),
@@ -484,6 +555,7 @@ mod tests {
             monitor_id: r"\\?\DISPLAY#SAM0F10#5&9999&0&UID4354#{e6f07b5f}".into(),
             device_name: r"\\.\DISPLAY2".into(),
         };
+        let two = [m0.clone(), m1.clone()];
         let reordered = [m1.clone(), m0.clone()];
 
         // Saved as index 0 with m0's monitor_id: after unplug/replug swaps indices, still finds m0 at index 1.
@@ -492,9 +564,10 @@ mod tests {
         assert_eq!(pick_win_monitor(0, Some(r"\\.\DISPLAY1"), &reordered), Some(1));
         // Disconnected monitor_id returns None (never silently puts another display on air).
         assert_eq!(pick_win_monitor(0, Some(r"\\?\DISPLAY#GONE#0"), &reordered), None);
-        // Legacy scene without monitor_id keeps saved index when present, or single remaining display.
-        assert_eq!(pick_win_monitor(1, None, &reordered), Some(1));
-        assert_eq!(pick_win_monitor(1, None, std::slice::from_ref(&m0)), Some(0));
+        // Without monitor_id: [A, B] saved 1 keeps index 1, but unplugging B -> [A] must return None
+        // instead of silently putting primary display A on air.
+        assert_eq!(pick_win_monitor(1, None, &two), Some(1));
+        assert_eq!(pick_win_monitor(1, None, std::slice::from_ref(&m0)), None);
         assert_eq!(pick_win_monitor(5, None, &reordered), None);
 
         // OBS import parses monitor_id (ignoring DUMMY placeholder).
@@ -503,5 +576,12 @@ mod tests {
             (u32::MAX, Some(m0.monitor_id))
         );
         assert_eq!(parse_obs_monitor(&serde_json::json!({ "monitor_id": "DUMMY", "monitor": 1 })), (1, None));
+    }
+
+    #[test]
+    fn list_options_timeout_falls_back_to_empty_while_missing_aborts() {
+        assert_eq!(resolve_dshow_list(DshowListStatus::TimedOut), Ok(Vec::new()));
+        assert_eq!(resolve_dshow_list(DshowListStatus::Failed), Ok(Vec::new()));
+        assert_eq!(resolve_dshow_list(DshowListStatus::Missing), Err("that camera isn't connected"));
     }
 }

@@ -267,9 +267,58 @@ fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
+fn missing_display_error(i: u32) -> AvError {
+    if i == u32::MAX {
+        AvError::Source("that display isn't connected (plug it in, or pick the display again)".into())
+    } else {
+        AvError::Source(format!("display {} isn't connected (plug it in, or pick the display again)", i + 1))
+    }
+}
+
+fn start_gdi_display(entry: &MonitorEntry, max: (u32, u32), fps: u32, mouse: &str) -> Result<Live, AvError> {
+    let (x, y, w, h) = entry.rect;
+    let gdi = vec![
+        "-f".into(),
+        "gdigrab".into(),
+        "-framerate".into(),
+        fps.to_string(),
+        "-draw_mouse".into(),
+        mouse.into(),
+        "-offset_x".into(),
+        x.to_string(),
+        "-offset_y".into(),
+        y.to_string(),
+        "-video_size".into(),
+        format!("{w}x{h}"),
+        "-i".into(),
+        "desktop".into(),
+    ];
+    Live::start(&gdi, max, fps, None)
+}
+
 impl ScreenCapture {
     pub fn start(target: Target, width: u32, height: u32, fps: u32, cursor: bool) -> Result<Self, AvError> {
         Self::start_with(target, width, height, fps, cursor, false, &[])
+    }
+
+    /// Starts capturing display `(saved, uuid)` using a single `monitor_entries()` snapshot so
+    /// display resolution and handle lookup have no TOCTOU window across hotplug events.
+    pub fn start_display(
+        saved: u32,
+        uuid: Option<&str>,
+        size: (u32, u32),
+        fps: u32,
+        cursor: bool,
+        sound: bool,
+        hide: &[String],
+    ) -> Result<Self, AvError> {
+        let entries = monitor_entries();
+        let ids: Vec<WinMonitor> = entries.iter().map(|e| e.id.clone()).collect();
+        let idx = pick_win_monitor(saved, uuid, &ids);
+        let entry = idx
+            .and_then(|i| entries.into_iter().nth(i as usize))
+            .ok_or_else(|| missing_display_error(if uuid.is_some() { u32::MAX } else { saved }))?;
+        Self::start_with_target(Target::Display(idx.unwrap_or(saved)), Some(entry), size, fps, cursor, sound, hide)
     }
 
     /// Starts capturing at up to `width`×`height`, `fps` a second; with `sound`, what the
@@ -279,6 +328,24 @@ impl ScreenCapture {
         target: Target,
         width: u32,
         height: u32,
+        fps: u32,
+        cursor: bool,
+        sound: bool,
+        hide: &[String],
+    ) -> Result<Self, AvError> {
+        let display_entry = match target {
+            Target::Display(i) => {
+                Some(monitor_entries().into_iter().nth(i as usize).ok_or_else(|| missing_display_error(i))?)
+            }
+            Target::Window(_) => None,
+        };
+        Self::start_with_target(target, display_entry, (width, height), fps, cursor, sound, hide)
+    }
+
+    fn start_with_target(
+        target: Target,
+        display_entry: Option<MonitorEntry>,
+        (width, height): (u32, u32),
         fps: u32,
         cursor: bool,
         sound: bool,
@@ -312,23 +379,10 @@ impl ScreenCapture {
         }
         let (fps, mouse) = (fps.clamp(1, 120), if cursor { "1" } else { "0" });
         let max = (width.max(16), height.max(16));
-        let display_entry = match target {
-            Target::Display(i) => {
-                let err = || {
-                    if i == u32::MAX {
-                        AvError::Source("that display isn't connected".into())
-                    } else {
-                        AvError::Source(format!("display {} isn't connected", i + 1))
-                    }
-                };
-                Some(monitor_entries().into_iter().nth(i as usize).ok_or_else(err)?)
-            }
-            Target::Window(_) => None,
-        };
         // Windows' own capture first; FFmpeg's where it can't.
         let native = match (target, &display_entry) {
             (Target::Display(_), Some(entry)) => super::wgc::Wgc::display(entry.handle, max, fps, cursor),
-            (Target::Display(_), None) => Err(AvError::Source("that display isn't connected".into())),
+            (Target::Display(i), None) => Err(missing_display_error(i)),
             (Target::Window(id), _) => super::wgc::Wgc::window(HWND(id as usize as *mut _), max, fps, cursor),
         };
         match native {
@@ -336,41 +390,30 @@ impl ScreenCapture {
             Err(e) => tracing::info!(error = %e, "Windows' own capture can't: FFmpeg captures instead"),
         }
         let live = match (target, display_entry) {
-            (Target::Display(i), Some(entry)) => {
-                let dda_idx = dxgi_output_index(entry.handle).unwrap_or(i);
-                // Desktop Duplication first (the GPU's copy, fast), else GDI.
-                let dda = args(&["-f", "lavfi", "-i"])
-                    .into_iter()
-                    .chain([format!(
-                        "ddagrab=output_idx={dda_idx}:framerate={fps}:draw_mouse={mouse},hwdownload,format=bgra"
-                    )])
-                    .collect::<Vec<_>>();
-                match Live::start(&dda, max, fps, None) {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::info!(error = %e, "Desktop Duplication isn't there: GDI reads the display");
-                        let (x, y, w, h) = entry.rect;
-                        let gdi = vec![
-                            "-f".into(),
-                            "gdigrab".into(),
-                            "-framerate".into(),
-                            fps.to_string(),
-                            "-draw_mouse".into(),
-                            mouse.into(),
-                            "-offset_x".into(),
-                            x.to_string(),
-                            "-offset_y".into(),
-                            y.to_string(),
-                            "-video_size".into(),
-                            format!("{w}x{h}"),
-                            "-i".into(),
-                            "desktop".into(),
-                        ];
-                        Live::start(&gdi, max, fps, None)?
+            (Target::Display(_), Some(entry)) => match dxgi_output_index(entry.handle) {
+                Some(dda_idx) => {
+                    // Desktop Duplication first (the GPU's copy, fast), else GDI.
+                    let dda = args(&["-f", "lavfi", "-i"])
+                        .into_iter()
+                        .chain([format!(
+                            "ddagrab=output_idx={dda_idx}:framerate={fps}:draw_mouse={mouse},hwdownload,format=bgra"
+                        )])
+                        .collect::<Vec<_>>();
+                    match Live::start(&dda, max, fps, None) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            tracing::info!(error = %e, "Desktop Duplication isn't there: GDI reads the display");
+                            start_gdi_display(&entry, max, fps, mouse)?
+                        }
                     }
                 }
-            }
-            (Target::Display(_), None) => return Err(AvError::Source("that display isn't connected".into())),
+                None => {
+                    // Never guess output_idx when a monitor sits on a secondary GPU adapter.
+                    tracing::info!("display isn't on the primary DXGI adapter: GDI reads the display");
+                    start_gdi_display(&entry, max, fps, mouse)?
+                }
+            },
+            (Target::Display(i), None) => return Err(missing_display_error(i)),
             (Target::Window(id), _) => {
                 let w = windows()
                     .into_iter()

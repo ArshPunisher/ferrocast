@@ -73,6 +73,8 @@ pub struct Nv12Picture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeFail {
     Timeout,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Missing,
     Error(String),
 }
 
@@ -480,6 +482,9 @@ impl Live {
         let p = match probe_checked(&ff, input, Duration::from_secs(10)) {
             Ok(p) => p,
             Err(ProbeFail::Timeout) => return Err(OpenFail::Timeout),
+            Err(ProbeFail::Missing) => {
+                return Err(OpenFail::Missing(AvError::Source("FFmpeg couldn't open it".into())));
+            }
             Err(ProbeFail::Error(text)) => {
                 let err = AvError::Source("FFmpeg couldn't open it".into());
                 return Err(if text.contains("Could not find video device") {
