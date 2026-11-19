@@ -567,7 +567,57 @@ fn forget(data: &std::path::Path, kind: Kind, id: &str) {
     let mut lib = library::load(data);
     lib.shelf_mut(kind).list.retain(|e| e.id != id);
     library::save(data, &lib);
-    let _ = std::fs::remove_file(library::file(data, kind, id));
+    ferrocast_store::durable::remove_with_backup(&library::file(data, kind, id));
+}
+
+fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collection, ferrocast_studio::StudioError> {
+    let load_one = |path: &std::path::Path| -> Option<Result<Collection, Option<ferrocast_studio::StudioError>>> {
+        let bytes = match ferrocast_store::durable::read_patiently(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %path.display(), "couldn't read scene collection");
+                return Some(Err(None));
+            }
+        };
+        if bytes.is_empty() {
+            tracing::warn!(file = %path.display(), "scene collection file is empty");
+            return Some(Err(None));
+        }
+        let doc = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %path.display(), "a scene collection didn't read");
+                return Some(Err(None));
+            }
+        };
+        Some(Collection::load(canvas, &doc, FIRST_SCENE).map_err(Some))
+    };
+
+    if let Some(res) = load_one(file) {
+        match res {
+            Ok(c) => return Ok(c),
+            Err(schema_err) => {
+                let _ = ferrocast_store::durable::rename_patiently(file, &file.with_extension("json.unreadable"));
+                let bak = ferrocast_store::durable::backup_path(file);
+                if let Some(Ok(c)) = load_one(&bak) {
+                    tracing::warn!(file = %file.display(), "recovered scene collection from .bak");
+                    return Ok(c);
+                }
+                if let Some(e) = schema_err {
+                    return Err(e);
+                }
+                return Collection::new(canvas, FIRST_SCENE);
+            }
+        }
+    }
+
+    let bak = ferrocast_store::durable::backup_path(file);
+    if let Some(Ok(c)) = load_one(&bak) {
+        tracing::warn!(file = %file.display(), "recovered scene collection from .bak");
+        return Ok(c);
+    }
+    Collection::new(canvas, FIRST_SCENE)
 }
 
 /// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
@@ -602,16 +652,9 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     if let Some(p) = &h.preview {
         p.show_scene(None);
     }
-    // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
-    let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
-        Some(Ok(d)) => Collection::load(canvas, &d, FIRST_SCENE),
-        Some(Err(e)) => {
-            tracing::warn!(error = %e, file = %to.display(), "a scene collection didn't read; kept aside");
-            let _ = std::fs::rename(to, to.with_extension("json.unreadable"));
-            Collection::new(canvas, FIRST_SCENE)
-        }
-        None => Collection::new(canvas, FIRST_SCENE),
-    };
+    // Only a missing file (or corrupt JSON without a working `.bak`) starts fresh; valid JSON that
+    // fails collection loading restores the old collection.
+    let made = load_collection_doc(canvas, to);
     match made {
         Ok(c) => {
             save(&c, to);
@@ -632,27 +675,15 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     }
 }
 
-/// The saved settings, or the defaults (an unreadable file is left as it is).
+/// The saved settings, falling back to `.bak` when unreadable, or the defaults.
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    std::fs::read(settings_file(data))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<StudioSettings>(&b).ok())
-        .filter(|s| s.check().is_ok())
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+        .map(|l| l.value)
         .unwrap_or_default()
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {
-    let tmp = file.with_extension("json.tmp");
-    let written = serde_json::to_vec_pretty(v)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            if let Some(dir) = file.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&tmp, bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, file));
-    if let Err(e) = written {
+    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, v) {
         tracing::warn!(error = %e, file = %file.display(), "the Studio couldn't save");
     }
 }
@@ -738,9 +769,7 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
     }
     match now {
         Some(s) => save_json(file, &serde_json::to_value(s).unwrap_or(Value::Null)),
-        None => {
-            let _ = std::fs::remove_file(file);
-        }
+        None => ferrocast_store::durable::remove_with_backup(file),
     }
 }
 
@@ -748,7 +777,7 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
 pub fn end_session() {
     QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(file) = SESSION.get() {
-        let _ = std::fs::remove_file(file);
+        ferrocast_store::durable::remove_with_backup(file);
     }
 }
 
@@ -1275,19 +1304,11 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
     }
 }
 
-/// Writes the collection next to the plugins' config, whole or not at all (a new file, then
-/// renamed over the old one).
+/// Writes the collection next to the plugins' config, atomically with `.bak` backup.
 fn save(c: &Collection, file: &std::path::Path) {
     let doc = c.save(COLLECTION);
-    let tmp = file.with_extension("json.tmp");
-    // On a new install the collections folder isn't there yet (2.1 found every save failing).
-    let folder = file.parent().map_or(Ok(()), std::fs::create_dir_all);
-    let written = folder
-        .and_then(|()| serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other))
-        .and_then(|bytes| std::fs::write(&tmp, bytes))
-        .and_then(|()| std::fs::rename(&tmp, file));
-    if let Err(e) = written {
-        tracing::warn!(error = %e, "the Studio's scenes couldn't be saved");
+    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, &doc) {
+        tracing::warn!(error = %e, file = %file.display(), "the Studio's scenes couldn't be saved");
     }
 }
 
@@ -1359,16 +1380,16 @@ impl DesktopStudio {
         let _ = APP.set(app.clone());
         let file = data.join("studio").join("session.json");
         // A note left from last time: Ferrocast didn't close normally while the Studio ran.
-        if let Some(r) = std::fs::read(&file)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<ferrocast_engine::studio_host::Recovered>(&b).ok())
+        if let Some(loaded) =
+            ferrocast_store::durable::load_json_with_backup::<ferrocast_engine::studio_host::Recovered>(&file, |_| true)
         {
+            let r = loaded.value;
             tracing::warn!(?r, "Ferrocast didn't close normally last time; the next Start puts the Studio back");
             if let Ok(mut c) = CRASHED.lock() {
                 *c = Some(r);
             }
         }
-        let _ = std::fs::remove_file(&file);
+        ferrocast_store::durable::remove_with_backup(&file);
         let _ = SESSION.set(file);
         let me = DesktopStudio { app, data };
         let watcher = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
@@ -1644,19 +1665,8 @@ impl StudioHost for DesktopStudio {
             let _ = &config;
             h.renderer = "ferrocast";
             let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-            // The saved scenes, or one empty scene the first time. A file that doesn't read is
-            // kept aside (never overwritten) and the Studio starts fresh.
-            let saved = std::fs::read(&file).ok().map(|b| serde_json::from_slice::<Value>(&b));
-            let collection = match saved {
-                Some(Ok(doc)) => Collection::load(canvas, &doc, FIRST_SCENE),
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "the Studio's scenes didn't read; starting with a new set");
-                    let _ = std::fs::rename(&file, file.with_extension("json.unreadable"));
-                    Collection::new(canvas, FIRST_SCENE)
-                }
-                None => Collection::new(canvas, FIRST_SCENE),
-            }
-            .map_err(|e| e.to_string())?;
+            // The saved scenes (falling back to `.bak` if unreadable), or one empty scene the first time.
+            let collection = load_collection_doc(canvas, &file).map_err(|e| e.to_string())?;
             if let Some((name, id)) = &s.monitoring
                 && let Err(e) = collection.set_monitoring_device(name, id)
             {
@@ -2108,7 +2118,7 @@ impl StudioHost for DesktopStudio {
             // The Studio off: its scenes from the saved file, so the show, BRB and the scene
             // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
             if act == StudioAct::Scenes && h.collection.is_none() {
-                let saved = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let saved = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
                 return Ok(saved_scenes(saved.as_ref()));
             }
             if let StudioAct::Select { scene, id, frames, also, guides } = &act {
@@ -3035,8 +3045,12 @@ impl StudioHost for DesktopStudio {
                 let file = library::file(&data, kind, &id);
                 if file.exists() {
                     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                    let _ = std::fs::rename(&file, file.with_extension(format!("json.removed-{stamp}")));
+                    let _ = ferrocast_store::durable::rename_patiently(
+                        &file,
+                        &file.with_extension(format!("json.removed-{stamp}")),
+                    );
                 }
+                let _ = ferrocast_store::durable::remove_patiently(&ferrocast_store::durable::backup_path(&file));
                 library::save(&data, &lib);
                 Ok(Value::Null)
             }
@@ -3054,7 +3068,7 @@ impl StudioHost for DesktopStudio {
                     })
                     .await?;
                 }
-                let doc = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let doc = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
                 Ok(match (kind, doc) {
                     (_, Some(mut d)) => {
                         if kind == Kind::Collections
@@ -3089,11 +3103,10 @@ impl StudioHost for DesktopStudio {
                         .await?;
                     }
                     let to = library::file(&data, kind, &id);
-                    if from.exists() {
-                        if let Some(dir) = to.parent() {
-                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                        }
-                        std::fs::copy(&from, &to).map_err(|e| format!("The copy couldn't be made: {e}"))?;
+                    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Value>(&from, |_| true) {
+                        let bytes = serde_json::to_vec_pretty(&loaded.value).map_err(|e| e.to_string())?;
+                        ferrocast_store::durable::write_json_bytes(&to, &bytes)
+                            .map_err(|e| format!("The copy couldn't be made: {e}"))?;
                     }
                 }
                 lib.shelf_mut(kind).list.push(library::Entry { id: id.clone(), name });
@@ -3704,5 +3717,27 @@ mod budget_tests {
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    #[test]
+    fn truncated_settings_and_session_load_their_bak() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let settings_path = settings_file(dir.path());
+        let first = StudioSettings { width: 1280, height: 720, fps: 30, ..StudioSettings::default() };
+        let second = StudioSettings { width: 2560, height: 1440, fps: 60, ..StudioSettings::default() };
+
+        save_json(&settings_path, &serde_json::to_value(&first).unwrap_or_else(|e| panic!("{e}")));
+        save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        assert!(ferrocast_store::durable::backup_path(&settings_path).exists());
+
+        let bytes = std::fs::read(&settings_path).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&settings_path, &bytes[..bytes.len() / 2]).unwrap_or_else(|e| panic!("{e}"));
+
+        let loaded = load_settings(dir.path());
+        assert_eq!((loaded.width, loaded.height, loaded.fps), (1280, 720, 30));
+
+        // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
+        save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!((load_settings(dir.path()).width, load_settings(dir.path()).fps), (2560, 60));
     }
 }

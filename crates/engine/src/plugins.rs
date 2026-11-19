@@ -300,12 +300,15 @@ fn endless(code: &str) -> Option<&'static str> {
 
 /// Which plugins are off (`off.json`).
 fn off_list(dir: &Path) -> Vec<String> {
-    std::fs::read(dir.join("off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    ferrocast_store::durable::load_json_with_backup(&dir.join("off.json"), |_| true)
+        .map(|l| l.value)
+        .unwrap_or_default()
 }
 
 fn write_off(dir: &Path, off: &[String]) -> Result<(), EngineError> {
     let body = serde_json::to_vec(off).map_err(|e| EngineError::Internal(e.to_string()))?;
-    std::fs::write(dir.join("off.json"), body).map_err(|e| EngineError::Internal(e.to_string()))
+    ferrocast_store::durable::write_json_bytes(&dir.join("off.json"), &body)
+        .map_err(|e| EngineError::Internal(e.to_string()))
 }
 
 /// The installed plugins, by name.
