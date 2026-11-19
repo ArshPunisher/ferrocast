@@ -4,18 +4,22 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
-    IsWindowVisible, WS_CHILD, WS_EX_TOOLWINDOW,
+    EDD_GET_DEVICE_INTERFACE_NAME, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, WS_CHILD, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
 use crate::ffsrc::Live;
 use crate::sound_in::{Heal, SoundIn, Which};
+use crate::win_logic::{WinMonitor, pick_win_monitor};
 use crate::{AvError, Picture};
 
 /// A frame of the screen as BGRA, sent to the card without a colour swap.
@@ -51,31 +55,90 @@ pub enum Target {
     Window(u32),
 }
 
-/// The displays with where each sits on the desktop: (x, y, width, height).
-fn monitors() -> Vec<(i32, i32, u32, u32)> {
-    monitor_handles().into_iter().map(|(_, m)| m).collect()
+struct MonitorEntry {
+    handle: HMONITOR,
+    rect: (i32, i32, u32, u32),
+    id: WinMonitor,
 }
 
-/// The displays' handles, with where each sits.
-fn monitor_handles() -> Vec<(HMONITOR, (i32, i32, u32, u32))> {
-    type List = Vec<(HMONITOR, (i32, i32, u32, u32))>;
+/// All connected displays with their handle, desktop rect, and stable `monitor_id`.
+fn monitor_entries() -> Vec<MonitorEntry> {
     unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         // SAFETY: `data` is the Vec this call was given below, alive for EnumDisplayMonitors.
-        let list = unsafe { &mut *(data.0 as *mut List) };
-        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
-        // SAFETY: a monitor handle Windows just gave, and an info struct with its size set.
-        if unsafe { GetMonitorInfoW(m, &mut info) }.as_bool() {
-            let r = info.rcMonitor;
-            list.push((m, (r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)));
+        let list = unsafe { &mut *(data.0 as *mut Vec<MonitorEntry>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: `MONITORINFOEXW` starts with `MONITORINFO` and its `cbSize` is set to the extended struct.
+        if unsafe { GetMonitorInfoW(m, (&raw mut info).cast::<MONITORINFO>()) }.as_bool() {
+            let r = info.monitorInfo.rcMonitor;
+            let sz_len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let device_name = String::from_utf16_lossy(&info.szDevice[..sz_len]);
+            let mut dev = DISPLAY_DEVICEW { cb: size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+            // SAFETY: `info.szDevice` is null-terminated and `dev.cb` is set.
+            let got = unsafe {
+                EnumDisplayDevicesW(
+                    windows::core::PCWSTR(info.szDevice.as_ptr()),
+                    0,
+                    &raw mut dev,
+                    EDD_GET_DEVICE_INTERFACE_NAME,
+                )
+            }
+            .as_bool();
+            let monitor_id = if got {
+                let id_len = dev.DeviceID.iter().position(|&c| c == 0).unwrap_or(dev.DeviceID.len());
+                String::from_utf16_lossy(&dev.DeviceID[..id_len])
+            } else {
+                device_name.clone()
+            };
+            list.push(MonitorEntry {
+                handle: m,
+                rect: (r.left, r.top, (r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32),
+                id: WinMonitor { monitor_id, device_name },
+            });
         }
         true.into()
     }
-    let mut list: List = Vec::new();
+    let mut list: Vec<MonitorEntry> = Vec::new();
     // SAFETY: the callback reads `list` only during this call.
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut list as *mut _ as isize));
     }
     list
+}
+
+/// Stable device path (`monitor_id`) of display index `id`, if connected.
+pub fn display_uuid(id: u32) -> Option<String> {
+    let entries = monitor_entries();
+    let entry = entries.get(id as usize)?;
+    let out = if entry.id.monitor_id.is_empty() { &entry.id.device_name } else { &entry.id.monitor_id };
+    (!out.is_empty()).then(|| out.clone())
+}
+
+/// Current index of display `saved`, preferring its stable `monitor_id` (`uuid`).
+pub fn display_now(saved: u32, uuid: Option<&str>) -> Option<u32> {
+    let entries = monitor_entries();
+    let ids: Vec<WinMonitor> = entries.iter().map(|e| e.id.clone()).collect();
+    pick_win_monitor(saved, uuid, &ids)
+}
+
+fn dxgi_output_index(monitor: HMONITOR) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    // SAFETY: creates a DXGI factory to locate which output on the primary adapter owns `monitor`.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().ok()? };
+    // SAFETY: adapter 0 enumeration.
+    let adapter = unsafe { factory.EnumAdapters1(0).ok()? };
+    let mut idx = 0u32;
+    // SAFETY: output enumeration and descriptor read on adapter 0.
+    while let Ok(output) = unsafe { adapter.EnumOutputs(idx) } {
+        // SAFETY: output is valid; GetDesc reads into a stack struct.
+        if let Ok(desc) = unsafe { output.GetDesc() }
+            && desc.Monitor == monitor
+        {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
 }
 
 /// The exe name of the process that owns `hwnd` ("chrome").
@@ -168,8 +231,11 @@ fn windows() -> Vec<Window> {
 
 /// What can be captured now: displays, and the windows someone would pick.
 pub fn shareable() -> Result<(Vec<Display>, Vec<Window>), AvError> {
-    let displays =
-        monitors().iter().enumerate().map(|(i, m)| Display { id: i as u32, width: m.2, height: m.3 }).collect();
+    let displays = monitor_entries()
+        .iter()
+        .enumerate()
+        .map(|(i, m)| Display { id: i as u32, width: m.rect.2, height: m.rect.3 })
+        .collect();
     Ok((displays, windows_of(true)))
 }
 
@@ -246,35 +312,44 @@ impl ScreenCapture {
         }
         let (fps, mouse) = (fps.clamp(1, 120), if cursor { "1" } else { "0" });
         let max = (width.max(16), height.max(16));
+        let display_entry = match target {
+            Target::Display(i) => {
+                let err = || {
+                    if i == u32::MAX {
+                        AvError::Source("that display isn't connected".into())
+                    } else {
+                        AvError::Source(format!("display {} isn't connected", i + 1))
+                    }
+                };
+                Some(monitor_entries().into_iter().nth(i as usize).ok_or_else(err)?)
+            }
+            Target::Window(_) => None,
+        };
         // Windows' own capture first; FFmpeg's where it can't.
-        let native = match target {
-            Target::Display(i) => monitor_handles()
-                .get(i as usize)
-                .ok_or_else(|| AvError::Source(format!("display {} isn't connected", i + 1)))
-                .and_then(|(m, _)| super::wgc::Wgc::display(*m, max, fps, cursor)),
-            Target::Window(id) => super::wgc::Wgc::window(HWND(id as usize as *mut _), max, fps, cursor),
+        let native = match (target, &display_entry) {
+            (Target::Display(_), Some(entry)) => super::wgc::Wgc::display(entry.handle, max, fps, cursor),
+            (Target::Display(_), None) => Err(AvError::Source("that display isn't connected".into())),
+            (Target::Window(id), _) => super::wgc::Wgc::window(HWND(id as usize as *mut _), max, fps, cursor),
         };
         match native {
             Ok(w) => return Ok(ScreenCapture { live: Some(Pictures::Native(w)), sound }),
             Err(e) => tracing::info!(error = %e, "Windows' own capture can't: FFmpeg captures instead"),
         }
-        let live = match target {
-            Target::Display(i) => {
+        let live = match (target, display_entry) {
+            (Target::Display(i), Some(entry)) => {
+                let dda_idx = dxgi_output_index(entry.handle).unwrap_or(i);
                 // Desktop Duplication first (the GPU's copy, fast), else GDI.
                 let dda = args(&["-f", "lavfi", "-i"])
                     .into_iter()
                     .chain([format!(
-                        "ddagrab=output_idx={i}:framerate={fps}:draw_mouse={mouse},hwdownload,format=bgra"
+                        "ddagrab=output_idx={dda_idx}:framerate={fps}:draw_mouse={mouse},hwdownload,format=bgra"
                     )])
                     .collect::<Vec<_>>();
                 match Live::start(&dda, max, fps, None) {
                     Ok(l) => l,
                     Err(e) => {
                         tracing::info!(error = %e, "Desktop Duplication isn't there: GDI reads the display");
-                        let m = monitors();
-                        let (x, y, w, h) = *m
-                            .get(i as usize)
-                            .ok_or_else(|| AvError::Source(format!("display {} isn't connected", i + 1)))?;
+                        let (x, y, w, h) = entry.rect;
                         let gdi = vec![
                             "-f".into(),
                             "gdigrab".into(),
@@ -295,7 +370,8 @@ impl ScreenCapture {
                     }
                 }
             }
-            Target::Window(id) => {
+            (Target::Display(_), None) => return Err(AvError::Source("that display isn't connected".into())),
+            (Target::Window(id), _) => {
                 let w = windows()
                     .into_iter()
                     .find(|w| w.id == id)
