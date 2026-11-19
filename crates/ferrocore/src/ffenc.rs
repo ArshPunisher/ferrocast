@@ -364,6 +364,49 @@ fn let_go(w: std::thread::JoinHandle<()>) {
     }
 }
 
+/// An encoder at a new bitrate, started beside the one running: it is fed the same frames, and
+/// the stream changes over to it at one of its keyframes once it has shown it works.
+struct Handover {
+    proc: Proc,
+    cfg: VideoConfig,
+    /// Our times of the frames it was given and has not yet given back.
+    times: VecDeque<i64>,
+    header: Option<Vec<u8>>,
+    /// What it made, in order, waiting for the change-over.
+    ready: VecDeque<VideoPacket>,
+    /// Frames it was given.
+    fed: u64,
+    /// When it started, and how long it may take to be ready: one that never gets there is let
+    /// go (a hung encoder, a queue that never moves).
+    started: std::time::Instant,
+    max_wait: std::time::Duration,
+}
+
+/// How long after a bitrate step that failed the next one is tried.
+const STEP_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest a new encoder may take to take over before it is let go.
+const HANDOVER_MAX: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A bitrate step's encoder being started (the process starts on a thread of its own).
+type Starting = (Receiver<Result<Proc, AvError>>, VideoConfig);
+
+/// Lets go of an FFmpeg off the caller's thread: stopping one waits for the process and its
+/// input thread, and the frame loop must never wait for that.
+fn reap(proc: Proc) {
+    let spare = std::sync::Arc::new(Mutex::new(Some(proc)));
+    let moved = spare.clone();
+    let started = std::thread::Builder::new().name("ferrocast-ffenc-reaper".into()).spawn(move || {
+        let taken = moved.lock().ok().and_then(|mut p| p.take());
+        drop(taken);
+    });
+    if started.is_err() {
+        // No thread to spare: stopped here (killing it is quick).
+        let taken = spare.lock().ok().and_then(|mut p| p.take());
+        drop(taken);
+    }
+}
+
 /// H.264 through FFmpeg.
 pub(crate) struct Video {
     proc: Proc,
@@ -374,12 +417,21 @@ pub(crate) struct Video {
     height: u32,
     input: PixelFormat,
     pub(crate) name: String,
-    /// What it was made with (a new bitrate starts another like it).
+    /// What the running encoder was made with.
     cfg: VideoConfig,
-    /// An encoder at a new bitrate, started and waiting to take over at the next frame.
-    next: Option<Proc>,
-    /// The parameter sets to put in front of the next keyframe (the header changed).
-    inline: Option<Vec<u8>>,
+    /// A bitrate asked for and not yet started (a failed step waits [`STEP_RETRY`]).
+    wanted_kbps: Option<u32>,
+    retry_after: Option<std::time::Instant>,
+    /// The process for a new bitrate starting on its own thread.
+    starting: Option<Starting>,
+    /// An encoder at a new bitrate running beside this one (see [`Handover`]).
+    next: Option<Handover>,
+    /// While a change-over waits: this encoder's latest packets, held back so that what the new
+    /// one takes over from is not already gone; the time of the last it let go and of the last it
+    /// made.
+    held: VecDeque<VideoPacket>,
+    emitted_upto: Option<i64>,
+    made_upto: Option<i64>,
     /// Frames left out because the encoder was behind (OBS's "skipped frames due to encoding
     /// lag").
     pub(crate) skipped: u64,
@@ -401,34 +453,118 @@ impl Video {
         } else {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
-        Ok(Self {
-            proc: Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?,
+        Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc))
+    }
+
+    fn with_proc(proc: Proc, cfg: &VideoConfig, name: String) -> Self {
+        Self {
+            proc,
             times: VecDeque::new(),
             header: None,
             width: cfg.width,
             height: cfg.height,
             input: cfg.input,
-            name: enc,
+            name,
             cfg: *cfg,
+            wanted_kbps: None,
+            retry_after: None,
+            starting: None,
             next: None,
-            inline: None,
+            held: VecDeque::new(),
+            emitted_upto: None,
+            made_upto: None,
             skipped: 0,
-        })
+        }
     }
 
-    /// A new bitrate from the next frame: another encoder starts now (its warming up overlaps
-    /// this one's work), and takes over at the next frame, which it makes a keyframe; this one
-    /// finishes what it was given first. Nothing's lost or doubled.
+    /// A new bitrate: another encoder starts beside this one (on a thread of its own, so the
+    /// caller never waits for the process), is given the same frames, and the stream changes over
+    /// to it at one of its keyframes once it has shown that it works. If it can't start (a
+    /// hardware encoder out of sessions), the stream goes on as it was: a bitrate that couldn't be
+    /// changed is never an error of the stream.
     pub(crate) fn set_kbps(&mut self, kbps: u32) -> Result<(), AvError> {
         // A quality has no bitrate to change.
-        if matches!(self.cfg.rate, RateControl::Crf(_) | RateControl::Quality(_)) || kbps == self.cfg.bitrate_kbps {
+        if matches!(self.cfg.rate, RateControl::Crf(_) | RateControl::Quality(_)) {
             return Ok(());
+        }
+        let target = self
+            .wanted_kbps
+            .or_else(|| self.starting.as_ref().map(|s| s.1.bitrate_kbps))
+            .or_else(|| self.next.as_ref().map(|h| h.cfg.bitrate_kbps))
+            .unwrap_or(self.cfg.bitrate_kbps);
+        if kbps == target {
+            return Ok(());
+        }
+        self.wanted_kbps = Some(kbps);
+        self.start_step();
+        Ok(())
+    }
+
+    /// Starts the encoder for the bitrate asked for, unless a failed step is still being waited
+    /// out.
+    fn start_step(&mut self) {
+        let Some(kbps) = self.wanted_kbps else { return };
+        if self.retry_after.is_some_and(|t| std::time::Instant::now() < t) {
+            return;
+        }
+        self.wanted_kbps = None;
+        // An older step still under way is let go: this one is the one wanted now.
+        self.starting = None;
+        if let Some(h) = self.next.take() {
+            reap(h.proc);
+            self.release_held();
         }
         let mut cfg = self.cfg;
         cfg.bitrate_kbps = kbps;
-        self.next = Some(Proc::spawn(&args(&cfg, &self.name), frame_bytes(&cfg))?);
-        self.cfg = cfg;
-        Ok(())
+        let (tx, rx) = channel();
+        let (a, chunk) = (args(&cfg, &self.name), frame_bytes(&cfg));
+        let spawned = std::thread::Builder::new().name("ferrocast-ffenc-start".into()).spawn(move || {
+            let _ = tx.send(Proc::spawn(&a, chunk));
+        });
+        match spawned {
+            Ok(_) => self.starting = Some((rx, cfg)),
+            Err(e) => self.step_failed(&format!("its start couldn't be made ({e})")),
+        }
+    }
+
+    /// The new encoder is running: it takes frames from the next one.
+    fn begin_handover(&mut self, proc: Proc, cfg: VideoConfig) {
+        self.emitted_upto = None;
+        self.made_upto = None;
+        self.next = Some(Handover {
+            proc,
+            cfg,
+            times: VecDeque::new(),
+            header: None,
+            ready: VecDeque::new(),
+            fed: 0,
+            started: std::time::Instant::now(),
+            max_wait: HANDOVER_MAX,
+        });
+    }
+
+    /// A step that didn't work: said once, the stream stays as it was, and the next try waits.
+    fn step_failed(&mut self, why: &str) {
+        tracing::warn!(
+            encoder = %self.name,
+            kbps = self.cfg.bitrate_kbps,
+            %why,
+            "a bitrate step couldn't start another encoder: the stream stays as it was"
+        );
+        self.retry_after = Some(std::time::Instant::now() + STEP_RETRY);
+    }
+
+    /// Lets the new encoder go (it failed or timed out) and gives back what was held.
+    fn abandon(&mut self, why: &str) {
+        if let Some(h) = self.next.take() {
+            reap(h.proc);
+        }
+        self.step_failed(why);
+    }
+
+    fn release_held(&mut self) {
+        self.emitted_upto = None;
+        self.made_upto = None;
     }
 }
 
@@ -594,18 +730,46 @@ impl Video {
                 }
             }
         }
-        let mut out = Vec::new();
-        if let Some(next) = self.next.take() {
-            // The old one finishes what it has; the new one goes on from this frame.
-            let rest = self.proc.finish();
-            out.extend(self.take(rest));
-            let old_header = self.header.take();
-            self.proc = next;
-            out.extend(self.take(self.proc.tags.try_iter().collect()));
-            if self.header.is_none() {
-                self.header = old_header.clone();
+        self.encode_raw(raw, pts_us)
+    }
+
+    /// The frames' own rate, for how long a change-over may take and how much is held back.
+    fn fps(&self) -> u64 {
+        (u64::from(self.cfg.fps_num) / u64::from(self.cfg.fps_den.max(1))).max(1)
+    }
+
+    fn encode_raw(&mut self, raw: Vec<u8>, pts_us: i64) -> Result<Vec<VideoPacket>, AvError> {
+        // A bitrate step waiting out a failure is tried again; one whose process has started
+        // begins its change-over.
+        if self.starting.is_none() && self.next.is_none() {
+            self.start_step();
+        }
+        if let Some((rx, cfg)) = self.starting.take() {
+            match rx.try_recv() {
+                Ok(Ok(proc)) => self.begin_handover(proc, cfg),
+                Ok(Err(e)) => self.step_failed(&e.to_string()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.starting = Some((rx, cfg)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.step_failed("its start was lost"),
             }
-            self.inline = old_header;
+        }
+        // The new encoder is given the frame too: one that can't take it, or has stopped, is let
+        // go and the stream goes on as it was.
+        let mut failed = None;
+        if let Some(h) = self.next.as_mut() {
+            match h.proc.try_write(raw.clone()) {
+                Ok(true) => {
+                    h.times.push_back(pts_us);
+                    h.fed += 1;
+                }
+                Ok(false) => {}
+                Err(e) => failed = Some(e.to_string()),
+            }
+            if failed.is_none() && matches!(h.proc.child.try_wait(), Ok(Some(_))) {
+                failed = Some(h.proc.died().to_string());
+            }
+        }
+        if let Some(why) = failed {
+            self.abandon(&why);
         }
         // Each packet gets its time from `times` in order, so a frame left out is just missing:
         // nothing after it moves.
@@ -613,50 +777,123 @@ impl Video {
             self.times.push_back(pts_us);
         } else {
             self.skipped += 1;
+            crate::video::note_dropped(1);
             if self.skipped.is_power_of_two() {
                 tracing::warn!(encoder = %self.name, skipped = self.skipped, "the encoder is behind: frames left out");
             }
         }
-        out.extend(self.take(self.proc.tags.try_iter().collect()));
+        let made = packets(&mut self.times, &mut self.header, self.proc.tags.try_iter().collect());
+        if self.next.is_none() {
+            // Nothing is changing over (or it was let go just now): what was held goes first.
+            let mut out: Vec<VideoPacket> = self.held.drain(..).collect();
+            out.extend(made);
+            self.release_held();
+            return Ok(out);
+        }
+        self.change_over(made)
+    }
+
+    /// While a new encoder runs beside this one: this one's packets go out `hold` behind, the new
+    /// one's wait, and at the first keyframe of the new one that this one has reached and not yet
+    /// let go, the stream changes over (nothing twice, nothing lost: this one's packets before it,
+    /// the new one's from it).
+    fn change_over(&mut self, made: Vec<VideoPacket>) -> Result<Vec<VideoPacket>, AvError> {
+        let hold = (self.fps() as usize / 2).max(6);
+        let limit = (self.fps() * 10).max(100);
+        if let Some(last) = made.last() {
+            self.made_upto = Some(last.pts_us);
+        }
+        self.held.extend(made);
+        let mut out = Vec::new();
+        let mut joined: Option<Handover> = None;
+        let mut gave_up = None;
+        if let Some(h) = self.next.as_mut() {
+            let new = packets(&mut h.times, &mut h.header, h.proc.tags.try_iter().collect());
+            h.ready.extend(new);
+            // Packets before a keyframe it can still be joined at are of no use.
+            while let Some(front) = h.ready.front() {
+                if front.key && self.emitted_upto.is_none_or(|e| front.pts_us > e) {
+                    break;
+                }
+                h.ready.pop_front();
+            }
+            let reached = h.ready.front().is_some_and(|k| self.made_upto.is_some_and(|m| m >= k.pts_us));
+            if reached && h.header.is_some() {
+                joined = self.next.take();
+            } else if h.fed > limit || h.started.elapsed() > h.max_wait {
+                gave_up = Some("it didn't take over in time");
+            }
+        }
+        if let Some(mut h) = joined {
+            let key = h.ready.front().map_or(i64::MAX, |k| k.pts_us);
+            // This one's packets before the change, then it is let go (its later frames are the
+            // new one's).
+            while self.held.front().is_some_and(|p| p.pts_us < key) {
+                out.extend(self.held.pop_front());
+            }
+            self.held.clear();
+            // The new one's parameter sets go in front of its keyframe when they differ.
+            if let (Some(old), Some(new)) = (self.header.as_ref(), h.header.as_ref())
+                && old != new
+                && let Some(params) = inline_params(new)
+                && let Some(k) = h.ready.front_mut()
+            {
+                k.data.splice(0..0, params);
+            }
+            out.extend(h.ready.drain(..));
+            let old = std::mem::replace(&mut self.proc, h.proc);
+            reap(old);
+            self.times = std::mem::take(&mut h.times);
+            self.header = h.header.take().or(self.header.take());
+            self.cfg = h.cfg;
+            self.release_held();
+            self.retry_after = None;
+            return Ok(out);
+        }
+        if let Some(why) = gave_up {
+            self.abandon(why);
+        }
+        // Held back, but only so far.
+        let keep = if self.next.is_some() { hold } else { 0 };
+        while self.held.len() > keep {
+            if let Some(p) = self.held.pop_front() {
+                self.emitted_upto = Some(p.pts_us);
+                out.push(p);
+            }
+        }
         Ok(out)
     }
 
     pub(crate) fn flush(&mut self) -> Result<Vec<VideoPacket>, AvError> {
-        let tags = self.proc.finish();
-        Ok(self.take(tags))
-    }
-
-    /// FLV video tags → packets: the codec header kept, frames given our own times.
-    fn take(&mut self, tags: Vec<Tag>) -> Vec<VideoPacket> {
-        let mut out = Vec::new();
-        for (kind, _, body) in tags {
-            if kind != 9 || body.len() < 5 || body[0] & 0x0f != 7 {
-                continue;
-            }
-            match body[1] {
-                0 => {
-                    let new = body[5..].to_vec();
-                    // After a hand-over: the old header is in `inline` until the new one is
-                    // known; a different one goes in front of the next keyframe.
-                    if let Some(old) = self.inline.take() {
-                        self.inline = (old != new).then(|| inline_params(&new)).flatten();
-                    }
-                    self.header = Some(new);
-                }
-                1 => {
-                    let Some(pts) = self.times.pop_front() else { continue };
-                    let key = body[0] >> 4 == 1;
-                    let mut data = body[5..].to_vec();
-                    if key && let Some(params) = self.inline.take() {
-                        data.splice(0..0, params);
-                    }
-                    out.push(VideoPacket { pts_us: pts, dts_us: pts, key, data });
-                }
-                _ => {}
-            }
+        let mut out: Vec<VideoPacket> = self.held.drain(..).collect();
+        if let Some(h) = self.next.take() {
+            reap(h.proc);
         }
-        out
+        self.starting = None;
+        let tags = self.proc.finish();
+        out.extend(packets(&mut self.times, &mut self.header, tags));
+        Ok(out)
     }
+}
+
+/// FLV video tags → packets: the codec header kept, frames given our own times.
+fn packets(times: &mut VecDeque<i64>, header: &mut Option<Vec<u8>>, tags: Vec<Tag>) -> Vec<VideoPacket> {
+    let mut out = Vec::new();
+    for (kind, _, body) in tags {
+        if kind != 9 || body.len() < 5 || body[0] & 0x0f != 7 {
+            continue;
+        }
+        match body[1] {
+            0 => *header = Some(body[5..].to_vec()),
+            1 => {
+                let Some(pts) = times.pop_front() else { continue };
+                let key = body[0] >> 4 == 1;
+                out.push(VideoPacket { pts_us: pts, dts_us: pts, key, data: body[5..].to_vec() });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// AAC through FFmpeg (its own AAC encoder, which every FFmpeg has).
@@ -859,5 +1096,211 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(1), "never waited: {took:?}");
         assert!(left_out > 100, "frames left out instead: {left_out}");
         let _ = p.child.kill();
+    }
+
+    // A tiny stand-in for FFmpeg: reads 6-byte frames (a 2x2 NV12 picture) and writes one FLV video
+    // tag for each, the first byte of the frame as its payload; a keyframe every `gop`; the FLV
+    // header and codec header after `delay` seconds (an encoder opening); and, once its input is
+    // closed, `slow` seconds more before it ends (an encoder that takes time to close).
+    #[cfg(unix)]
+    const FAKE_ENCODER: &str = r#"gop=$1; delay=$2; slow=$3; n=0
+while :; do
+  b=$(dd bs=6 count=1 2>/dev/null | od -An -tu1 | awk '{print $1}')
+  [ -z "$b" ] && break
+  if [ $n -eq 0 ]; then
+    sleep $delay
+    printf 'FLV\001\001\000\000\000\011\000\000\000\000'
+    printf '\011\000\000\007\000\000\000\000\000\000\000\027\000\000\000\000AB\000\000\000\022'
+  fi
+  if [ $((n % gop)) -eq 0 ]; then k='\027'; else k='\047'; fi
+  printf "\011\000\000\006\000\000\000\000\000\000\000${k}\001\000\000\000\\$(printf %03o "$b")\000\000\000\021"
+  n=$((n+1))
+done
+sleep $slow"#;
+
+    #[cfg(unix)]
+    fn fake_proc(gop: u32, delay: &str, slow: &str) -> Proc {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", FAKE_ENCODER, "sh", &gop.to_string(), delay, slow]);
+        Proc::start(cmd, 6).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// An encoder that stops at once (a hardware encoder refusing another session).
+    #[cfg(unix)]
+    fn dead_proc() -> Proc {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 7"]);
+        Proc::start(cmd, 6).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[cfg(unix)]
+    fn fake_video(old: Proc) -> Video {
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (2, 2);
+        Video::with_proc(old, &c, "fake".into())
+    }
+
+    /// Frame `i` (its number is its first byte) at time `i`.
+    #[cfg(unix)]
+    fn feed(v: &mut Video, i: u8) -> Result<Vec<VideoPacket>, AvError> {
+        let (y, uv) = ([i, 0, 0, 0], [0u8, 0]);
+        v.encode(Frame::Nv12 { y: &y, y_stride: 2, uv: &uv, uv_stride: 2 }, i64::from(i))
+    }
+
+    #[cfg(unix)]
+    fn start_handover(v: &mut Video, p: Proc) {
+        let mut c = v.cfg;
+        c.bitrate_kbps = 3000;
+        v.begin_handover(p, c);
+    }
+
+    /// A bitrate step whose new encoder can't start (NVENC out of sessions) leaves the stream's
+    /// encode as it was: no error, no frame lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_encoder_that_dies_at_once_leaves_the_encode_running() {
+        let mut v = fake_video(fake_proc(4, "0", "0"));
+        let mut got = Vec::new();
+        for i in 0..10 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+        }
+        start_handover(&mut v, dead_proc());
+        for i in 10..40 {
+            match feed(&mut v, i) {
+                Ok(p) => got.extend(p),
+                Err(e) => panic!("a failed bitrate step ended the encode at frame {i}: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        got.extend(v.flush().unwrap_or_else(|e| panic!("{e}")));
+        let pts: Vec<i64> = got.iter().map(|p| p.pts_us).collect();
+        assert_eq!(pts, (0..40).collect::<Vec<i64>>(), "every frame once, in order");
+    }
+
+    /// Swapping to the new encoder never waits for the old one to close (the frame loop did,
+    /// with the engine's lock held), and the stream goes on: every frame once, in order, with a
+    /// keyframe where it changes over.
+    #[cfg(unix)]
+    #[test]
+    fn a_swap_never_waits_for_the_old_encoder_and_loses_no_frame() {
+        let mut v = fake_video(fake_proc(4, "0", "2"));
+        let mut got = Vec::new();
+        for i in 0..5 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+        }
+        start_handover(&mut v, fake_proc(4, "0", "0"));
+        let mut worst = std::time::Duration::ZERO;
+        for i in 5..60 {
+            let t = std::time::Instant::now();
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(worst < std::time::Duration::from_millis(500), "a frame waited {worst:?}");
+        got.extend(v.flush().unwrap_or_else(|e| panic!("{e}")));
+        let pts: Vec<i64> = got.iter().map(|p| p.pts_us).collect();
+        assert_eq!(pts, (0..60).collect::<Vec<i64>>(), "every frame once, in order");
+        assert!(got.iter().filter(|p| p.key).count() >= 2, "keyframes");
+    }
+
+    /// An encoder that takes its time to open (an NVENC session: a few hundred ms) takes over later,
+    /// at one of its keyframes, and the stream is whole: every frame once, in order.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_to_open_encoder_takes_over_at_a_later_keyframe() {
+        let mut v = fake_video(fake_proc(4, "0", "0"));
+        let mut got = Vec::new();
+        for i in 0..5 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+        }
+        start_handover(&mut v, fake_proc(4, "0.4", "0"));
+        for i in 5..150 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(v.next.is_none(), "it took over");
+        assert_eq!(v.cfg.bitrate_kbps, 3000, "at its bitrate");
+        got.extend(v.flush().unwrap_or_else(|e| panic!("{e}")));
+        let pts: Vec<i64> = got.iter().map(|p| p.pts_us).collect();
+        assert_eq!(pts, (0..150).collect::<Vec<i64>>(), "every frame once, in order");
+        // The change-over is at a keyframe: from the frame the new one took over at, the stream is
+        // the new one's (a keyframe every 4 of its frames).
+        let at = got.iter().position(|p| p.pts_us >= 5 && p.key).unwrap_or(0);
+        assert!(got[at].key);
+    }
+
+    /// An encoder that never gets ready (hung) is let go after its time, the stream untouched, and
+    /// what was held back is given out.
+    #[cfg(unix)]
+    #[test]
+    fn an_encoder_that_never_gets_ready_is_let_go() {
+        let mut v = fake_video(fake_proc(4, "0", "0"));
+        let mut got = Vec::new();
+        for i in 0..5 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+        }
+        start_handover(&mut v, fake_proc(4, "30", "0"));
+        if let Some(h) = v.next.as_mut() {
+            h.max_wait = std::time::Duration::from_millis(300);
+        }
+        for i in 5..60 {
+            got.extend(feed(&mut v, i).unwrap_or_else(|e| panic!("{e}")));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(v.next.is_none(), "let go");
+        assert_eq!(v.cfg.bitrate_kbps, 6000, "still the bitrate it was");
+        got.extend(v.flush().unwrap_or_else(|e| panic!("{e}")));
+        let pts: Vec<i64> = got.iter().map(|p| p.pts_us).collect();
+        assert_eq!(pts, (0..60).collect::<Vec<i64>>(), "every frame once, in order");
+    }
+
+    /// Frames an encoder leaves out because it's behind are counted where the Studio's stats read
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn frames_left_out_are_counted() {
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "exec sleep 30"]);
+        let big = 256 * 256 * 3 / 2;
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (256, 256);
+        let mut v = Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into());
+        let before = crate::video::dropped_frames();
+        for i in 0..200u8 {
+            let _ = v.encode_raw(vec![i; big], i64::from(i));
+        }
+        let after = crate::video::dropped_frames();
+        assert!(v.skipped >= 100, "{} left out", v.skipped);
+        assert!(after - before >= v.skipped, "counted: {} of {}", after - before, v.skipped);
+    }
+
+    /// With the real FFmpeg and x264: a bitrate step in the middle of a stream changes over at a
+    /// keyframe, and no frame is lost or repeated.
+    #[test]
+    fn a_real_bitrate_step_keeps_every_frame() {
+        if ffmpeg().is_none() {
+            return;
+        }
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height, c.fps_num, c.keyframe_secs, c.software, c.bitrate_kbps) = (128, 72, 30, 1, true, 800);
+        let Ok(mut v) = Video::new(&c) else { return };
+        let (w, h) = (128usize, 72usize);
+        let mut got: Vec<VideoPacket> = Vec::new();
+        for i in 0..150i64 {
+            if i == 40 {
+                v.set_kbps(400).unwrap_or_else(|e| panic!("{e}"));
+            }
+            let y: Vec<u8> = (0..w * h).map(|p| ((p + i as usize * 3) % 251) as u8).collect();
+            let uv = vec![128u8; w * h / 2];
+            let frame = Frame::Nv12 { y: &y, y_stride: w, uv: &uv, uv_stride: w };
+            got.extend(v.encode(frame, i * 33_333).unwrap_or_else(|e| panic!("frame {i}: {e}")));
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        got.extend(v.flush().unwrap_or_else(|e| panic!("{e}")));
+        let pts: Vec<i64> = got.iter().map(|p| p.pts_us).collect();
+        let want: Vec<i64> = (0..150).map(|i| i * 33_333).collect();
+        assert_eq!(pts, want, "every frame once, in order");
+        assert!(got[0].key, "starts on a keyframe");
+        assert_eq!(v.cfg.bitrate_kbps, 400, "the step happened");
     }
 }
