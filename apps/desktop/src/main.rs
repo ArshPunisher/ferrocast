@@ -175,6 +175,7 @@ fn main() {
             let shell = Arc::new(Shell::default());
             shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
             app.manage(shell.clone());
+            watch_threads(app.handle().clone());
             // A desktop with no tray, or its icon file not writable (Linux, 19 Nov: a second
             // user's start panicked on the first one's /tmp/tray-icon), runs without the tray.
             match build_tray(app.handle()) {
@@ -794,6 +795,45 @@ fn show_window(app: &AppHandle) {
         .build();
     if let Err(e) = built {
         tracing::error!(error = %e, "couldn't open the window");
+    }
+}
+
+/// Says in the log when the window's thread or the async workers stop getting to their work
+/// (5 s), and when they're back: on GitHub's Windows runner every call through the window's
+/// thread waited forever and nothing said which part was stuck (19 Nov).
+fn watch_threads(app: AppHandle) {
+    use std::sync::atomic::AtomicU64;
+    let start = std::time::Instant::now();
+    let now = move || start.elapsed().as_millis() as u64;
+    let main_seen = Arc::new(AtomicU64::new(0));
+    let async_seen = Arc::new(AtomicU64::new(0));
+    let spawned = std::thread::Builder::new().name("ferrocast-liveness".into()).spawn(move || {
+        let mut stuck = [false, false];
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let m = main_seen.clone();
+            if app.run_on_main_thread(move || m.store(now(), Ordering::Relaxed)).is_err() {
+                return;
+            }
+            let a = async_seen.clone();
+            tauri::async_runtime::spawn(async move { a.store(now(), Ordering::Relaxed) });
+            let t = now();
+            for (i, (seen, what)) in
+                [(&main_seen, "the window's thread"), (&async_seen, "the async workers")].into_iter().enumerate()
+            {
+                let quiet = t.saturating_sub(seen.load(Ordering::Relaxed));
+                if quiet > 5_000 && !stuck[i] {
+                    stuck[i] = true;
+                    tracing::warn!(seconds = quiet / 1000, "nothing ran on {what} for a while");
+                } else if quiet <= 5_000 && stuck[i] {
+                    stuck[i] = false;
+                    tracing::info!("{what}: running again");
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "the thread that watches for stalls didn't start");
     }
 }
 

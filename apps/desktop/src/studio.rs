@@ -392,6 +392,11 @@ fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held) {
     }
 }
 
+/// A Studio task the window's thread hasn't started in this long is given up on (the caller is
+/// told the window is busy); one started this late is logged.
+const MAIN_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+const MAIN_LATE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
 /// viewers get (Twitch takes up to 6000 kbps; Kick refuses over 8000, 25 Oct).
 fn stream_settings(s: &StudioSettings) -> StreamSettings {
@@ -1354,13 +1359,43 @@ impl DesktopStudio {
     }
 
     async fn on_main<T: Send + 'static>(&self, f: impl FnOnce(&mut Held) -> T + Send + 'static) -> Result<T, String> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0 waiting, 1 started, 2 given up: a task given up on never runs later (the caller was
+        // told it failed), and one that started is waited for however long it takes.
+        let state = std::sync::Arc::new(AtomicU8::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let posted = std::time::Instant::now();
+        let st = state.clone();
         self.app
             .run_on_main_thread(move || {
+                if st.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    return;
+                }
+                let late = posted.elapsed();
+                if late > MAIN_LATE {
+                    tracing::warn!(
+                        waited_ms = late.as_millis() as u64,
+                        "the window's thread took a while to get to a Studio task"
+                    );
+                }
+                let _ = started_tx.send(());
                 let out = HELD.with(|h| f(&mut h.borrow_mut()));
                 let _ = tx.send(out);
             })
             .map_err(|e| format!("The window isn't ready: {e}"))?;
+        // Started within the time, or the window is stuck: said, never a silent wait (Windows
+        // runner, 19 Nov: every call through the window's thread waited forever). A task that
+        // started may take its time (finishing a recording waits for its file).
+        if tokio::time::timeout(MAIN_START_WITHIN, started_rx).await.is_err()
+            && state.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            tracing::warn!(seconds = MAIN_START_WITHIN.as_secs(), "the window's thread didn't get to a Studio task");
+            return Err(format!(
+                "The window is busy: it didn't get to this in {} s. Try again, or restart Ferrocast if it stays stuck.",
+                MAIN_START_WITHIN.as_secs()
+            ));
+        }
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
