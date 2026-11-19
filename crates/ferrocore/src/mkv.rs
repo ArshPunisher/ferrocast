@@ -276,6 +276,12 @@ impl<W: Write> MkvWriter<W> {
         self.written
     }
 
+    /// Gives the output up without writing the cluster being gathered (a disk that can't take
+    /// it): the output, and where the last whole cluster ends (see `Mp4Writer::abandon`).
+    pub fn abandon(self) -> (W, u64) {
+        (self.out, self.written)
+    }
+
     /// Writes out the last cluster and hands the output back.
     pub fn finish(mut self) -> io::Result<W> {
         self.flush_cluster()?;
