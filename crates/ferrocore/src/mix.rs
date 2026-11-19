@@ -38,6 +38,9 @@ const DRIFT_CORRECT_S: f64 = 10.0;
 const MAX_DRIFT: f64 = 0.002;
 /// Frames faded out and in where a source's sample rate changes (2 ms at 48 kHz).
 const SWITCH_FADE: usize = 96;
+/// The most the mix catches up on in one call (about 26 MB of blocks): a longer gap is a clock
+/// jump (sleep), and the mix starts again from now. A stall of a few seconds is still mixed.
+const MAX_CATCH_UP_NS: u64 = 10_000_000_000;
 /// After this long with sound on time, the mixer waits only as long as the latest sound in it
 /// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
 const SHRINK_AFTER_NS: u64 = 20_000_000_000;
@@ -845,7 +848,7 @@ impl Mixer {
         // The clock jumped (the computer slept, a debugger held it): mixing every block of the
         // gap would allocate ~2.6 MB per second of it in one call (an hour: gigabytes, an
         // out-of-memory crash on wake; agy's M11 scan). What was queued is long past: start again.
-        if until.saturating_sub(next) > MAX_GAP_NS {
+        if until.saturating_sub(next) > MAX_CATCH_UP_NS {
             tracing::warn!(gap_ms = (until - next) / 1_000_000, "the clock jumped: the mix starts again from now");
             for src in self.sources.values_mut() {
                 src.queue.clear();
