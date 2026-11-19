@@ -99,6 +99,11 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
     }
 }
 
+/// How often the chat connection is pinged, and how long an answer may take before it's
+/// taken as dead.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn quota_pause(sink: &EventSink) {
     emit(sink, EventKind::Connector(ConnectorStatus::Disconnected { reason: YoutubeError::QuotaExceeded.to_string() }))
         .await;
@@ -111,8 +116,16 @@ pub fn backoff(attempt: u32) -> Duration {
 }
 
 async fn channel(url: &str) -> Result<Channel, String> {
-    let mut ep =
-        Endpoint::from_shared(url.to_string()).map_err(|e| e.to_string())?.connect_timeout(Duration::from_secs(10));
+    // HTTP/2 pings: a connection that died silently (Wi-Fi blip, a router dropping the idle
+    // mapping) ends the stream within ~30 s and the chat reconnects; without them it hung
+    // forever, chat quietly gone for the rest of the stream (agy's M10 scan, M10-02).
+    let mut ep = Endpoint::from_shared(url.to_string())
+        .map_err(|e| e.to_string())?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(KEEPALIVE_EVERY)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(KEEPALIVE_EVERY));
     if url.starts_with("https://") {
         ep = ep.tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?;
     }
