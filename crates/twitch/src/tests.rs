@@ -371,6 +371,47 @@ async fn a_refresh_whose_save_fails_keeps_the_new_tokens() {
     assert_ne!(auth.access().await.unwrap(), "access-0", "the fresh access token is the one in use");
 }
 
+/// The keychain was only briefly locked: the next use saves the new tokens (the app may quit
+/// long before the next refresh, and the saved refresh token is the retired one).
+#[tokio::test]
+async fn tokens_that_couldnt_be_saved_are_saved_at_the_next_use() {
+    let (st, ep) = fake().await;
+    st.lock().unwrap().fail_next_with_401 = true;
+    let tokens = Tokens {
+        access_token: "access-0".into(),
+        refresh_token: "refresh-0".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    let saved = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let (sv, at) = (saved.clone(), attempts.clone());
+    let auth = Arc::new(Auth::new(
+        http_client(),
+        ep,
+        "client".into(),
+        tokens,
+        Arc::new(move |t: &Tokens| {
+            // Locked for the first two tries.
+            if at.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err("the keychain is locked".to_string());
+            }
+            sv.lock().unwrap().push(t.refresh_token.clone());
+            Ok(())
+        }),
+    ));
+    let helix = Helix::new(auth.clone());
+    helix.me().await.unwrap();
+    assert!(saved.lock().unwrap().is_empty(), "the refresh's save failed");
+    auth.access().await.unwrap();
+    assert!(saved.lock().unwrap().is_empty(), "the second try failed too");
+    auth.access().await.unwrap();
+    assert_eq!(saved.lock().unwrap().len(), 1, "the third use saved the new tokens");
+    let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    auth.access().await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), before, "saved: no more tries");
+}
+
 #[tokio::test]
 async fn markers_and_follow_dates() {
     use ferrocast_connector::Connector;
