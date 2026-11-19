@@ -1758,7 +1758,7 @@ impl Stage {
             for (k, v) in new {
                 s["settings"][k] = v.clone();
             }
-            if ["window", "display", "type"].iter().any(|k| new.contains_key(*k)) {
+            if ["window", "display", "monitor", "type"].iter().any(|k| new.contains_key(*k)) {
                 let kind = kind_of(s).to_string();
                 remember_capture(&kind, &mut s["settings"], new.contains_key("window"));
             }
@@ -4515,6 +4515,7 @@ pub fn can_share(
     let mut stream_encode = s.encode.clone();
     stream_encode.scale = None;
     stream_encode.video_kbps = plan.encode.video_kbps;
+    stream_encode.strict_cbr = plan.encode.strict_cbr;
     if stream_encode != plan.encode {
         return Err("the recording is encoded another way than the stream".into());
     }
@@ -4549,21 +4550,20 @@ fn say_once(what: String) {
 
 /// Notes what a screen capture's window or display is, beside its number, so it's found
 /// again when the number changes: the window's app and title (OBS's "owner_name" and
-/// "window_name"; a game or browser gets a new window number each time it opens), and on a
-/// Mac the display's UUID (OBS's "display_uuid"; a display's number changes when it's plugged
-/// back in or the Mac restarts).
+/// "window_name"; a game or browser gets a new window number each time it opens), on a Mac
+/// the display's UUID ("display_uuid"), and on Windows its PnP device path ("monitor_id").
 ///
 /// `picked`: a window was picked now. Otherwise (only the method changed) a window's names stay
 /// as they are, even when its saved number isn't open any more: they're how it's found again.
 fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
-    if !matches!(kind, "screen_capture" | "display_capture" | "window_capture" | "game_capture") {
+    if !matches!(kind, "screen_capture" | "display_capture" | "monitor_capture" | "window_capture" | "game_capture") {
         return;
     }
     let ty = set.get("type").and_then(Value::as_u64).unwrap_or(0);
     let window = set.get("window").and_then(Value::as_u64).map(|w| w as u32);
-    let is_window = (kind != "screen_capture" && kind != "display_capture") || ty == 1;
+    let is_window = !matches!(kind, "screen_capture" | "display_capture" | "monitor_capture") || ty == 1;
     let Some(id) = window.filter(|_| is_window) else {
-        remember_display(set);
+        remember_display(kind, set);
         return;
     };
     if !picked {
@@ -4582,21 +4582,36 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
     }
 }
 
-/// A Mac display's UUID beside its number (elsewhere a display has none to keep).
-fn remember_display(set: &mut Value) {
-    #[cfg(target_os = "macos")]
-    if let Some(d) = set.get("display").and_then(Value::as_u64) {
-        match ferrocore::screen::display_uuid(d as u32) {
-            Some(u) => set["display_uuid"] = json!(u),
+fn remember_display_id(set: &mut Value, index_key: &str, id_key: &str, lookup: impl FnOnce(u32) -> Option<String>) {
+    if let Some(d) = set.get(index_key).and_then(Value::as_u64) {
+        match lookup(d as u32) {
+            Some(u) => set[id_key] = json!(u),
             None => {
                 if let Some(o) = set.as_object_mut() {
-                    o.remove("display_uuid");
+                    o.remove(id_key);
                 }
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = set;
+}
+
+/// Stamps or clears the OS display identifier (`display_uuid` on macOS, `monitor_id` on Windows)
+/// alongside the numeric display index.
+fn remember_display(kind: &str, set: &mut Value) {
+    match kind {
+        "monitor_capture" => {
+            #[cfg(target_os = "windows")]
+            remember_display_id(set, "monitor", "monitor_id", ferrocore::screen::display_uuid);
+            #[cfg(not(target_os = "windows"))]
+            let _ = set;
+        }
+        _ => {
+            #[cfg(target_os = "macos")]
+            remember_display_id(set, "display", "display_uuid", ferrocore::screen::display_uuid);
+            #[cfg(not(target_os = "macos"))]
+            let _ = set;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4648,6 +4663,15 @@ mod tests {
             remember_capture("screen_capture", &mut set, true);
             assert_eq!(set["display_uuid"].as_str(), ferrocore::screen::display_uuid(d).as_deref());
         }
+        // Windows `monitor_capture` stamps `monitor_id` beside `monitor` and clears it when unresolvable.
+        let mut win_set = json!({ "monitor": 1, "capture_cursor": true });
+        remember_display_id(&mut win_set, "monitor", "monitor_id", |d| {
+            assert_eq!(d, 1);
+            Some(r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}".into())
+        });
+        assert_eq!(win_set["monitor_id"], r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}");
+        remember_display_id(&mut win_set, "monitor", "monitor_id", |_| None);
+        assert!(win_set.get("monitor_id").is_none(), "{win_set}");
         let mut set = json!({ "type": 1, "window": 0xFFFF_FFF0u32, "owner_name": "Old", "window_name": "Old" });
         remember_capture("screen_capture", &mut set, true);
         assert!(set.get("owner_name").is_none() && set.get("window_name").is_none(), "{set}");

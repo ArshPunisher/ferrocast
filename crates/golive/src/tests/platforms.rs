@@ -286,7 +286,7 @@ async fn a_platform_that_stops_reading_is_called_stalled_backs_off_and_spares_th
 /// viewer feels: the newest frame the platform was given against the newest sent. Frames never
 /// given are not delay: leaving them out is how a slow platform catches up.
 #[tokio::test]
-#[ignore = "finding M3.4: on a 20 KB/s link the newest picture it has is ~7 s old (frame 16 of 230, nothing dropped); agy's skip to the newest keyframe when far behind is what makes it pass"]
+#[ignore = "finding M3.5: at 160 kbps the delay is in the OS send/receive buffers (agy's keyframe skip works but bytes already handed to the kernel can't be dropped): cap SO_SNDBUF to about half a second of the stream"]
 async fn a_slow_platform_falls_behind_alone_and_never_far() {
     const FRAME: usize = 20 * 1024;
     let w = world().await;

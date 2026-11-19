@@ -82,24 +82,41 @@ pub struct Nv12Picture {
     pub full_range: bool,
 }
 
-/// FFmpeg's description of `input` (its arguments, `-i` and all), read in at most `wait`.
-pub fn probe(ffmpeg: &Path, input: &[String], wait: Duration) -> Option<Probe> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeFail {
+    Timeout,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Missing,
+    Error(String),
+}
+
+#[derive(Debug)]
+pub(crate) enum OpenFail {
+    Timeout,
+    Missing(AvError),
+    Rejected(AvError),
+}
+
+impl OpenFail {
+    pub(crate) fn into_error(self) -> AvError {
+        match self {
+            OpenFail::Timeout => AvError::Source("FFmpeg timed out opening it".into()),
+            OpenFail::Missing(e) | OpenFail::Rejected(e) => e,
+        }
+    }
+}
+
+/// Runs `ffmpeg` with `args` and collects stderr within `wait` (killing it on timeout).
+pub(crate) fn stderr_within(ffmpeg: &Path, args: &[String], wait: Duration) -> Result<String, ProbeFail> {
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-nostdin"])
-        .args(input)
-        // One picture, and a second at most of everything else (a long file's sound would
-        // otherwise be read to its end).
-        .args(["-frames:v", "1", "-t", "1", "-f", "null", "-"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
-    let mut child = cmd.spawn().ok()?;
-    let err = child.stderr.take()?;
+    let mut child = cmd.spawn().map_err(|e| ProbeFail::Error(e.to_string()))?;
+    let err = child.stderr.take().ok_or_else(|| ProbeFail::Error("no stderr".into()))?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
@@ -110,11 +127,28 @@ pub fn probe(ffmpeg: &Path, input: &[String], wait: Duration) -> Option<Probe> {
         Ok(t) => t,
         Err(_) => {
             let _ = child.kill();
-            return None;
+            let _ = child.wait();
+            return Err(ProbeFail::Timeout);
         }
     };
     let _ = child.wait();
-    parse_probe(&text)
+    Ok(text)
+}
+
+/// FFmpeg's description of `input` (its arguments, `-i` and all), read in at most `wait`.
+pub(crate) fn probe_checked(ffmpeg: &Path, input: &[String], wait: Duration) -> Result<Probe, ProbeFail> {
+    let mut args = vec!["-hide_banner".to_string(), "-nostdin".to_string()];
+    args.extend(input.iter().cloned());
+    // One picture, and a second at most of everything else (a long file's sound would
+    // otherwise be read to its end).
+    args.extend(["-frames:v", "1", "-t", "1", "-f", "null", "-"].map(String::from));
+    let text = stderr_within(ffmpeg, &args, wait)?;
+    parse_probe(&text).ok_or(ProbeFail::Error(text))
+}
+
+/// FFmpeg's description of `input` (its arguments, `-i` and all), read in at most `wait`.
+pub fn probe(ffmpeg: &Path, input: &[String], wait: Duration) -> Option<Probe> {
+    probe_checked(ffmpeg, input, wait).ok()
 }
 
 /// Whether pictures may be decoded on the GPU (`-hwaccel auto`: D3D11/DXVA on Windows,
@@ -257,6 +291,8 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
 #[derive(Debug, Default)]
 struct Shared {
     picture: Mutex<Option<(Picture, u64)>>,
+    /// The newest NV12 picture (`Out::Nv12`) and when it came, for the card.
+    nv12: Mutex<Option<(Nv12Picture, u64)>>,
     /// Sound as it came: its samples and when it came (ns).
     sound: Mutex<VecDeque<(Vec<f32>, u64)>>,
     frames: AtomicU64,
@@ -291,6 +327,8 @@ impl Drop for Reader {
 enum Out {
     /// RGBA pictures this size.
     Pictures(u32, u32),
+    /// NV12 pictures this size (even), and their colours' matrix and range, for the card.
+    Nv12(u32, u32, bool, bool),
     /// 48 kHz stereo floats.
     Sound,
 }
@@ -303,6 +341,12 @@ impl Reader {
             Out::Pictures(w, h) => {
                 let vf = format!("scale={w}:{h}:flags=bilinear,format=rgba");
                 cmd.args(["-an", "-vf", &vf, "-r", &fps.max(1).to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", "-"]);
+            }
+            // As decoded (the GPU decoder's frames come down as NV12 already): sized, no
+            // colour change; the card turns it into RGB.
+            Out::Nv12(w, h, ..) => {
+                let vf = format!("scale={w}:{h}:flags=bilinear,format=nv12");
+                cmd.args(["-an", "-vf", &vf, "-r", &fps.max(1).to_string(), "-f", "rawvideo", "-pix_fmt", "nv12", "-"]);
             }
             Out::Sound => {
                 cmd.args(["-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "-"]);
@@ -323,13 +367,28 @@ impl Reader {
             .name("ferrocast-ffsrc".into())
             .spawn(move || {
                 match out {
-                    Out::Pictures(w, h) => {
-                        let mut buf = vec![0u8; (w * h * 4) as usize];
+                    Out::Pictures(w, h) | Out::Nv12(w, h, ..) => {
+                        let nv12 = match out {
+                            Out::Nv12(_, _, bt709, full_range) => Some((bt709, full_range)),
+                            _ => None,
+                        };
+                        let size = if nv12.is_some() { w * h * 3 / 2 } else { w * h * 4 };
+                        let mut buf = vec![0u8; size as usize];
                         while !s.stop.load(Ordering::Acquire) && stdout.read_exact(&mut buf).is_ok() {
                             let at = now_ns();
-                            let p = Picture { width: w, height: h, rgba: buf.clone(), premultiplied: false };
-                            if let Ok(mut l) = s.picture.lock() {
-                                *l = Some((p, at));
+                            match nv12 {
+                                Some((bt709, full_range)) => {
+                                    let p = Nv12Picture { width: w, height: h, data: buf.clone(), bt709, full_range };
+                                    if let Ok(mut l) = s.nv12.lock() {
+                                        *l = Some((p, at));
+                                    }
+                                }
+                                None => {
+                                    let p = Picture { width: w, height: h, rgba: buf.clone(), premultiplied: false };
+                                    if let Ok(mut l) = s.picture.lock() {
+                                        *l = Some((p, at));
+                                    }
+                                }
                             }
                             s.frames.fetch_add(1, Ordering::Relaxed);
                         }
@@ -407,13 +466,67 @@ impl Live {
     /// Starts reading `input` (FFmpeg's input arguments), pictures fitted into `max` at up to
     /// `fps`; with `sound`, its sound from `sound_input` (None: the same input).
     pub fn start(input: &[String], max: (u32, u32), fps: u32, sound_input: Option<&[String]>) -> Result<Self, AvError> {
-        let ff = ffmpeg()?;
-        let p = probe(&ff, input, Duration::from_secs(10))
-            .ok_or_else(|| AvError::Source("FFmpeg couldn't open it".into()))?;
-        let size = fit(p.size.ok_or_else(|| AvError::Source("it has no picture".into()))?, max);
-        let pictures = Reader::start(&ff, input, Out::Pictures(size.0, size.1), fps, Arc::new(Shared::default()))?;
+        Self::start_as(input, max, fps, sound_input, false).map_err(OpenFail::into_error)
+    }
+
+    /// Starts reading `input` as NV12 pictures (no CPU RGBA conversion, 2.67x smaller pipe).
+    pub fn start_nv12(
+        input: &[String],
+        max: (u32, u32),
+        fps: u32,
+        sound_input: Option<&[String]>,
+    ) -> Result<Self, AvError> {
+        Self::start_as(input, max, fps, sound_input, true).map_err(OpenFail::into_error)
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn start_nv12_checked(
+        input: &[String],
+        max: (u32, u32),
+        fps: u32,
+        sound_input: Option<&[String]>,
+    ) -> Result<Self, OpenFail> {
+        Self::start_as(input, max, fps, sound_input, true)
+    }
+
+    fn start_as(
+        input: &[String],
+        max: (u32, u32),
+        fps: u32,
+        sound_input: Option<&[String]>,
+        nv12: bool,
+    ) -> Result<Self, OpenFail> {
+        let ff = ffmpeg().map_err(OpenFail::Missing)?;
+        let p = match probe_checked(&ff, input, Duration::from_secs(10)) {
+            Ok(p) => p,
+            Err(ProbeFail::Timeout) => return Err(OpenFail::Timeout),
+            Err(ProbeFail::Missing) => {
+                return Err(OpenFail::Missing(AvError::Source("FFmpeg couldn't open it".into())));
+            }
+            Err(ProbeFail::Error(text)) => {
+                let err = AvError::Source("FFmpeg couldn't open it".into());
+                return Err(if text.contains("Could not find video device") {
+                    OpenFail::Missing(err)
+                } else {
+                    OpenFail::Rejected(err)
+                });
+            }
+        };
+        let src_size = p.size.ok_or_else(|| OpenFail::Rejected(AvError::Source("it has no picture".into())))?;
+        let size = fit(src_size, max);
+        let out_fps = if p.fps > 0 { p.fps.min(fps.max(1)) } else { fps.max(1) };
+        let out = if nv12 {
+            let bt709 = p.bt709.unwrap_or(src_size.1 >= 720);
+            Out::Nv12(size.0, size.1, bt709, p.full_range)
+        } else {
+            Out::Pictures(size.0, size.1)
+        };
+        let pictures =
+            Reader::start(&ff, input, out, out_fps, Arc::new(Shared::default())).map_err(OpenFail::Rejected)?;
         let sound = match sound_input {
-            Some(i) => Some(Reader::start(&ff, i, Out::Sound, fps, Arc::new(Shared::default()))?),
+            Some(i) => Some(
+                Reader::start(&ff, i, Out::Sound, out_fps, Arc::new(Shared::default())).map_err(OpenFail::Rejected)?,
+            ),
             None => None,
         };
         Ok(Live { pictures, sound, size })
@@ -422,6 +535,11 @@ impl Live {
     /// The newest picture and when it came (taken: None until the next one).
     pub fn take(&self) -> Option<(Picture, u64)> {
         self.pictures.shared.picture.lock().ok()?.take()
+    }
+
+    /// The newest NV12 picture and when it came (taken: None until the next one).
+    pub fn take_nv12(&self) -> Option<(Nv12Picture, u64)> {
+        self.pictures.shared.nv12.lock().ok()?.take()
     }
 
     /// Sound since the last call, oldest first.
@@ -2150,5 +2268,82 @@ mod tests {
             "right pixel must stay opaque green: {:?}",
             &p.rgba[right..right + 4]
         );
+    }
+
+    /// Live NV12 capture (`Out::Nv12`) delivers NV12 frames whose compositor render matches RGBA,
+    /// including full-range MJPEG (`yuvj420p`) input.
+    #[test]
+    fn a_live_nv12_input_matches_rgba_for_mjpeg() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let Ok(gpu) = crate::Compositor::new() else { return };
+        let dir = std::env::temp_dir().join(format!("ffsrc-mjpeg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let mjpeg = dir.join("cam.mjpeg");
+        // Solid bright green frame (0, 255, 0) + black stripe encoded as MJPEG (yuvj420p pc).
+        let ok = Command::new(ffmpeg().unwrap_or_else(|e| panic!("{e}")))
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x10C040:size=64x64:rate=30:duration=1",
+                "-c:v",
+                "mjpeg",
+                "-q:v",
+                "2",
+            ])
+            .arg(&mjpeg)
+            .status()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(ok.success());
+        let input: Vec<String> = ["-re", "-stream_loop", "-1", "-i"]
+            .into_iter()
+            .map(String::from)
+            .chain([mjpeg.display().to_string()])
+            .collect();
+        let live_rgba = Live::start(&input, (64, 64), 30, None).unwrap_or_else(|e| panic!("{e}"));
+        let live_nv12 = Live::start_nv12(&input, (64, 64), 30, None).unwrap_or_else(|e| panic!("{e}"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut pic, mut nv12) = (None, None);
+        while Instant::now() < deadline && (pic.is_none() || nv12.is_none()) {
+            if pic.is_none() {
+                pic = live_rgba.take().map(|(p, _)| p);
+            }
+            if nv12.is_none() {
+                nv12 = live_nv12.take_nv12().map(|(p, _)| p);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pic = pic.unwrap_or_else(|| panic!("expected RGBA frame"));
+        let nv12 = nv12.unwrap_or_else(|| panic!("expected NV12 frame"));
+        assert!(live_nv12.take().is_none(), "NV12 live produces no RGBA buffer");
+        assert_eq!(nv12.data.len(), 64 * 64 * 3 / 2);
+
+        gpu.upload(1, &pic).unwrap_or_else(|e| panic!("{e}"));
+        gpu.upload_nv12(2, &nv12).unwrap_or_else(|e| panic!("{e}"));
+        let render = |id: u64| {
+            let item = crate::Item {
+                content: crate::Content::Uploaded { id, width: 64, height: 64, premultiplied: false },
+                ..crate::Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), crate::Placement::default())
+            };
+            gpu.render(&crate::Scene { width: 64, height: 64, items: vec![item] }).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let px_rgba = render(1);
+        let px_nv12 = render(2);
+        let at = |px: &[u8]| [px[(32 * 64 + 32) * 4], px[(32 * 64 + 32) * 4 + 1], px[(32 * 64 + 32) * 4 + 2]];
+        let (a, b) = (at(&px_rgba), at(&px_nv12));
+        for i in 0..3 {
+            assert!(
+                a[i].abs_diff(b[i]) <= 8,
+                "RGBA {a:?} vs NV12 {b:?} (nv12 full_range={}, bt709={})",
+                nv12.full_range,
+                nv12.bt709
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

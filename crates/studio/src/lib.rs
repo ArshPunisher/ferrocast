@@ -444,6 +444,9 @@ pub struct EncodeSettings {
     pub video_kbps: u32,
     /// Varying bitrate (VBR) instead of steady (CBR).
     pub vbr: bool,
+    /// Strict 1× VBV / 1 s DataRateLimits CBR used when capped for a platform limit.
+    #[serde(default)]
+    pub strict_cbr: bool,
     /// Constant quality instead of a bitrate (recordings): 0 is lossless, 18 very high.
     pub quality: Option<u32>,
     /// Seconds between keyframes (platforms ask for 2; 0 lets the encoder pick).
@@ -466,6 +469,7 @@ impl EncodeSettings {
             video_encoder: id.into(),
             video_kbps: 6000,
             vbr: false,
+            strict_cbr: false,
             quality: None,
             keyframe_s: 2,
             profile: "high".into(),

@@ -652,11 +652,9 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         // Windows: OBS's own source kinds.
         #[cfg(target_os = "windows")]
         "monitor_capture" => {
-            // OBS 30 keeps the monitor's device path ("monitor_id"), older ones its place
-            // ("monitor"): the place, else the first.
-            let display = s.get("monitor").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let (display, uuid) = crate::win_logic::parse_obs_monitor(s);
             let cursor = cursor_on(s, "capture_cursor");
-            (SourceKind::Screen { display, uuid: None, sound: false, hide: hide.to_vec(), cursor }, false)
+            (SourceKind::Screen { display, uuid, sound: false, hide: hide.to_vec(), cursor }, false)
         }
         #[cfg(target_os = "windows")]
         "window_capture" | "game_capture" => {
@@ -1615,6 +1613,20 @@ mod tests {
         assert_eq!(uuid(kind(json!({ "type": 0, "display": 9, "display_uuid": "AAA" }))), (9, Some("AAA".into())));
         assert_eq!(uuid(kind(json!({ "type": 0, "display_uuid": "AAA" }))), (0, Some("AAA".into())));
         assert_eq!(uuid(kind(json!({ "type": 0, "display": 9 }))), (9, None));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_monitor_capture_keeps_its_monitor_id() {
+        let kind = |set: Value| kind_from("monitor_capture", &set, (1920, 1080), &[]).map(|k| k.0);
+        let got = |k: Result<SourceKind, String>| match k {
+            Ok(SourceKind::Screen { display, uuid, .. }) => (display, uuid),
+            other => panic!("{other:?}"),
+        };
+        let id = r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}";
+        assert_eq!(got(kind(json!({ "monitor": 1, "monitor_id": id }))), (1, Some(id.into())));
+        assert_eq!(got(kind(json!({ "monitor_id": id }))), (u32::MAX, Some(id.into())));
+        assert_eq!(got(kind(json!({ "monitor": 0, "monitor_id": "DUMMY" }))), (0, None));
     }
 
     /// Every method of a Mac screen capture brings its sound, as OBS's: a window its app's,

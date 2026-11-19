@@ -149,6 +149,8 @@ pub struct Feed(Arc<FeedSlot>);
 #[derive(Debug, Default)]
 struct FeedSlot {
     picture: Mutex<Option<Picture>>,
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    surface: Mutex<Option<crate::screen::Surface>>,
     /// A picture as NV12, turned into RGB on the card (a playlist's video where FFmpeg plays it).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     yuv: Mutex<Option<crate::ffsrc::Nv12Picture>>,
@@ -163,6 +165,18 @@ impl Feed {
 
     pub fn picture(&self, p: Picture) {
         *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    #[allow(dead_code)]
+    pub(crate) fn surface(&self, s: crate::screen::Surface) {
+        *self.0.surface.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    #[allow(dead_code)]
+    pub(crate) fn has_surface(&self) -> bool {
+        self.0.surface.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// The same, as NV12 for the card (no RGB made on the CPU).
@@ -664,6 +678,18 @@ enum Live {
     },
     /// Sound bars: drawn each frame from what was heard.
     Visualizer(Box<crate::source::visualizer::VisualizerLive>),
+    #[cfg(test)]
+    PanicOnDrop(#[allow(dead_code)] PanicDrop),
+}
+
+#[cfg(test)]
+struct PanicDrop;
+
+#[cfg(test)]
+impl Drop for PanicDrop {
+    fn drop(&mut self) {
+        panic!("simulated live drop panic");
+    }
 }
 
 struct Src {
@@ -675,10 +701,30 @@ struct Src {
     watch: Watch,
     /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
     pending: Option<Fresh>,
+    /// Clock time (`now_ns`) when `pending` was stored (idle hidden surfaces unpin once after [`PENDING_UNPIN_NS`]).
+    pending_since: u64,
     /// Being opened on its own thread (that open's token): the watchdog leaves it alone.
     opening: Option<u64>,
+    /// Clock time (`now_ns`) when the current reopen worker started, for [`REOPEN_TIMEOUT_NS`].
+    opening_since: u64,
     /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
     sent: u64,
+}
+
+/// How long a hidden capture may hold a pinned zero-copy surface without a newer frame before
+/// that single idle surface is converted once to a CPU picture so capture pools aren't starved.
+const PENDING_UNPIN_NS: u64 = 2_000_000_000;
+
+fn unpin_stale_pending(s: &mut Src, now: u64) {
+    if now.saturating_sub(s.pending_since) < PENDING_UNPIN_NS {
+        return;
+    }
+    if s.pending.as_ref().is_some_and(Fresh::is_pinned_surface)
+        && let Some(f) = s.pending.take()
+    {
+        s.pending = f.into_pending();
+        s.pending_since = 0;
+    }
 }
 
 /// A new picture for the card: pixels of ours, or (on a Mac) a frame of the screen as the
@@ -713,8 +759,17 @@ impl Fresh {
         }
     }
 
+    fn is_pinned_surface(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Fresh::Screen(_) => true,
+            _ => false,
+        }
+    }
+
     /// Converts any pinned zero-copy external surface into a CPU picture before parking in
     /// `Src::pending` so finite capture buffer pools aren't starved while hidden.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn into_pending(self) -> Option<Self> {
         match self {
             #[cfg(target_os = "macos")]
@@ -728,15 +783,8 @@ impl Fresh {
 
 impl Src {
     fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
-        Src {
-            live,
-            size,
-            kind,
-            watch: Watch { since: now_ns(), ..Watch::default() },
-            pending: None,
-            opening: None,
-            sent: 0,
-        }
+        let watch = Watch::for_kind(kind.as_ref(), now_ns());
+        Src { live, size, kind, watch, pending: None, pending_since: 0, opening: None, opening_since: 0, sent: 0 }
     }
 }
 
@@ -747,12 +795,45 @@ struct Watch {
     since: u64,
     tries: u32,
     next_try: u64,
+    /// True once this source has delivered at least one frame since creation or last edit.
+    ever_sent: bool,
+    /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
+    /// zero-frame attempts until USB hotplug or a user edit/retry.
+    cap_no_signal: bool,
+    /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`].
+    no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
 }
 
+impl Watch {
+    fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        let cap_no_signal = matches!(kind, Some(SourceKind::Camera(_)));
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let cap_no_signal = {
+            let _ = kind;
+            false
+        };
+        Self { since: now, cap_no_signal, ..Self::default() }
+    }
+}
+
 /// A camera or microphone with nothing new for this long has stopped.
 const STALL_NS: u64 = 5_000_000_000;
+/// Grace period for a freshly opened steady capture to deliver its first frame before restarting.
+const FIRST_FRAME_NS: u64 = 10_000_000_000;
+/// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
+const NO_SIGNAL_MAX_TRIES: u32 = 3;
+/// Hard deadline before the watchdog clears a stalled reopen worker slot.
+const REOPEN_TIMEOUT_NS: u64 = 60_000_000_000;
+/// Caps simultaneous reopen worker threads so a USB hub reset doesn't contend on every device at once.
+const MAX_PARALLEL_REOPENS: usize = 2;
+
+fn next_open_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The wait before try `n` at starting a source again: 2 s, doubling, a minute at most.
 fn backoff_ns(n: u32) -> u64 {
@@ -974,7 +1055,7 @@ impl Engine {
             let (state, mixer, stop) = (state.clone(), mixer.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("ferrocast-watchdog".into())
-                .spawn(move || watchdog(config, &state, &mixer, &stop))
+                .spawn(move || watchdog(config, state, mixer, stop))
                 .ok()
         };
         Ok(Self {
@@ -1219,8 +1300,8 @@ impl Engine {
     /// then is tried again by the watchdog (a capture) or let go (a file: the next opening of the
     /// collection tries it again).
     fn open_soon(&self, id: u64, restart: Option<SourceKind>, open: Opener) -> Result<(), AvError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        let token = next_open_token();
+        let now = now_ns();
         {
             let mut st = self.lock();
             match st.sources.get_mut(&id) {
@@ -1229,10 +1310,12 @@ impl Engine {
                 Some(src) if src.size.is_some() => {
                     src.kind = restart;
                     src.opening = Some(token);
+                    src.opening_since = now;
                 }
                 _ => {
                     let mut src = Src::new(Live::Still, None, restart);
                     src.opening = Some(token);
+                    src.opening_since = now;
                     // Whatever was there before goes after the lock (stopping it can wait).
                     let gone = st.sources.insert(id, src);
                     drop(st);
@@ -1262,7 +1345,8 @@ impl Engine {
                     // The one it took over from (when handed over) stops outside the lock.
                     leftover = Some(std::mem::replace(&mut src.live, live));
                     src.opening = None;
-                    src.watch = Watch { since: now_ns(), ..Watch::default() };
+                    src.opening_since = 0;
+                    src.watch = Watch::for_kind(src.kind.as_ref(), now_ns());
                     // Its sound into the mix (a file with sound), under the same lock so a
                     // removal can't slip in between (state, then mixer: the frame loop's order).
                     if heard || oc.is_some() || matches!(src.live, Live::Screen(_)) {
@@ -1276,6 +1360,7 @@ impl Engine {
                 }
                 (Err(e), Some(src)) => {
                     src.opening = None;
+                    src.opening_since = 0;
                     // The new one didn't open: the old one handed over stops too (the watchdog
                     // starts what was asked for, not what was there), and no stale picture.
                     leftover = Some(std::mem::replace(&mut src.live, Live::Still));
@@ -2540,9 +2625,11 @@ impl Engine {
             if let Some(src) = st.sources.get_mut(&id)
                 && !(held && src.sent > 0)
                 && let Some(f) = src.pending.take()
-                && f.send(&self.gpu, id)
             {
-                src.size = Some(f.info());
+                src.pending_since = 0;
+                if f.send(&self.gpu, id) {
+                    src.size = Some(f.info());
+                }
             }
             let (sw, sh, premultiplied) = st.sources.get(&id)?.size?;
             let mut it = Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default());
@@ -3052,12 +3139,14 @@ fn send_pending(st: &mut State, gpu: &Compositor) {
         // A frozen source keeps its picture: what came in meanwhile is dropped.
         if frozen.contains(id) && src.sent > 0 {
             src.pending = None;
+            src.pending_since = 0;
             continue;
         }
-        if let Some(f) = src.pending.take()
-            && f.send(gpu, *id)
-        {
-            src.size = Some(f.info());
+        if let Some(f) = src.pending.take() {
+            src.pending_since = 0;
+            if f.send(gpu, *id) {
+                src.size = Some(f.info());
+            }
         }
     }
 }
@@ -3444,10 +3533,11 @@ fn window_now(id: u32, app: &str, title: &str) -> u32 {
 /// display that isn't connected fails to open, and the watchdog tries again, so a screen
 /// plugged back in comes back by itself). Elsewhere displays are numbered by place.
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn display_now(display: u32, uuid: Option<&str>) -> u32 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     return crate::screen::display_now(display, uuid).unwrap_or(GONE_DISPLAY);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         let _ = uuid;
         display
@@ -3457,6 +3547,8 @@ fn display_now(display: u32, uuid: Option<&str>) -> u32 {
 /// A display number none has: opening it says it isn't connected.
 #[cfg(target_os = "macos")]
 const GONE_DISPLAY: u32 = 0;
+#[cfg(target_os = "windows")]
+const GONE_DISPLAY: u32 = u32::MAX;
 
 /// A window number no window has (macOS and Windows never hand out 0): opening it says the
 /// window is gone.
@@ -3477,6 +3569,18 @@ fn pick_window(app: &str, title: &str, windows: &[(u32, &str, &str)]) -> Option<
 fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live, AvError>> {
     use crate::screen::{ScreenCapture, Target};
     Some(match kind {
+        #[cfg(target_os = "windows")]
+        SourceKind::Screen { display, uuid, sound, hide, cursor } => ScreenCapture::start_display(
+            *display,
+            uuid.as_deref(),
+            (config.width, config.height),
+            config.fps,
+            *cursor,
+            *sound,
+            hide,
+        )
+        .map(Live::Screen),
+        #[cfg(not(target_os = "windows"))]
         SourceKind::Screen { display, uuid, sound, hide, cursor } => ScreenCapture::start_with(
             Target::Display(display_now(*display, uuid.as_deref())),
             config.width,
@@ -3555,28 +3659,45 @@ fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
         Live::Screen(c) => Some((c.frames(), false, c.ended())),
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
+        #[cfg(test)]
+        Live::PanicOnDrop(_) => Some((0, false, Some("dead".into()))),
         _ => None,
     }
 }
 
 /// Why a capture should be started again now, if it should: it faulted, isn't running (a
-/// restart that failed), ended, or (one that sends all the time) has been quiet too long.
+/// restart that failed), ended, never delivered its first frame, or (one that sends all the
+/// time) has been quiet too long.
 fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>, now: u64) -> Option<String> {
     if w.faulted {
         return Some("it faulted".into());
+    }
+    if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
+        w.no_signal = true;
+        return None;
     }
     if !running {
         return Some("it didn't start again last time".into());
     }
     let (count, steady, ended) = signs?;
+    if count > 0 {
+        w.ever_sent = true;
+        w.no_signal = false;
+    }
     if count != w.count {
         w.count = count;
         w.since = now;
         w.tries = 0;
+        w.next_try = 0;
     }
     ended.or_else(|| {
-        (steady && (count > 0 || w.tries > 0) && now.saturating_sub(w.since) > STALL_NS)
-            .then(|| "it stopped sending".into())
+        if !steady {
+            return None;
+        }
+        // Only a capture that has already produced a frame drops from 10 s first-frame grace to 5 s stall.
+        let limit = if count > 0 { STALL_NS } else { FIRST_FRAME_NS };
+        (now.saturating_sub(w.since) > limit)
+            .then(|| if count > 0 { "it stopped sending" } else { "it never sent a first frame" }.into())
     })
 }
 
@@ -3645,18 +3766,182 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
         if matches_device {
             src.watch.next_try = now;
             src.watch.tries = 0;
+            src.watch.no_signal = false;
             woke += 1;
         }
     }
     woke
 }
 
+type Reopener = Arc<dyn Fn(&SourceKind) -> Option<Result<Live, AvError>> + Send + Sync>;
+
+/// Evaluates all captures once and spawns independent restart workers (capped to
+/// [`MAX_PARALLEL_REOPENS`] concurrent opens) with a hard [`REOPEN_TIMEOUT_NS`] slot deadline.
+fn watchdog_step(
+    state: &Arc<Mutex<State>>,
+    mixer: &Arc<Mutex<Mixer>>,
+    stop: &Arc<AtomicBool>,
+    reopen: &Reopener,
+    connected: Option<&[String]>,
+    now: u64,
+) {
+    let mut todo = Vec::new();
+    let mut expired = Vec::new();
+    {
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ids) = connected {
+            apply_hotplug_reconnects(&mut st.sources, ids, now);
+        }
+        // Parked cameras not wanted back: closed (outside the lock, below).
+        let mut i = 0;
+        while i < st.parked.len() {
+            if now.saturating_sub(st.parked[i].2) >= PARK_NS {
+                expired.push(st.parked.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let mut in_flight = 0usize;
+        let mut ready: Vec<(u32, u64, String)> = Vec::new();
+        for (id, src) in st.sources.iter_mut() {
+            if src.kind.is_none() {
+                continue;
+            }
+            if src.opening.is_some() {
+                if now.saturating_sub(src.opening_since) < REOPEN_TIMEOUT_NS {
+                    in_flight += 1;
+                    continue;
+                }
+                tracing::warn!(source = *id, "watchdog reopen worker timed out after 60 s; releasing slot");
+                src.opening = None;
+                src.opening_since = 0;
+            }
+            let running = !matches!(src.live, Live::Still);
+            let live_signs = signs(&src.live);
+            let w = &mut src.watch;
+            let was_no_signal = w.no_signal;
+            let why = look(w, running, live_signs, now);
+            if !was_no_signal && w.no_signal {
+                tracing::warn!(
+                    source = *id,
+                    tries = NO_SIGNAL_MAX_TRIES,
+                    "capture didn't deliver a picture (no signal); waiting for reconnect or edit"
+                );
+            }
+            if let Some(why) = why
+                && now >= w.next_try
+            {
+                ready.push((w.tries, *id, why));
+            }
+        }
+        ready.sort_by_key(|(tries, id, _)| (*tries, *id));
+        let budget = MAX_PARALLEL_REOPENS.saturating_sub(in_flight);
+        for (_, id, why) in ready.into_iter().take(budget) {
+            let Some(src) = st.sources.get_mut(&id) else { continue };
+            let Some(kind) = src.kind.clone() else { continue };
+            let token = next_open_token();
+            let prev_tries = src.watch.tries;
+            src.watch.next_try = now + backoff_ns(prev_tries);
+            src.watch.tries = prev_tries.saturating_add(1);
+            src.watch.faulted = false;
+            src.watch.since = now;
+            src.opening = Some(token);
+            src.opening_since = now;
+            // Taken out now (a camera is let go before it's opened again), dropped on its
+            // own reopen worker outside the lock.
+            let old = std::mem::replace(&mut src.live, Live::Still);
+            todo.push((id, kind, why, old, token, prev_tries));
+        }
+    }
+    for (id, kind, why, old, token, prev_tries) in todo {
+        let (state_w, state_panic, mixer_w, stop_w, reopen_w) =
+            (state.clone(), state.clone(), mixer.clone(), stop.clone(), reopen.clone());
+        let spawned = std::thread::Builder::new().name("ferrocore-reopen".into()).spawn(move || {
+            let worker_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                drop(old);
+                if stop_w.load(Ordering::Acquire) {
+                    return;
+                }
+                let still_mine = {
+                    let st = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                    st.sources.get(&id).is_some_and(|s| s.opening == Some(token) && s.kind.as_ref() == Some(&kind))
+                };
+                if !still_mine {
+                    return;
+                }
+                tracing::warn!(source = id, %why, "the watchdog starts a source again");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reopen_w(&kind)))
+                    .unwrap_or_else(|p| {
+                        Some(Err(AvError::Source(format!("reopening it failed: {}", panic_text(&*p)))))
+                    });
+                if stop_w.load(Ordering::Acquire) {
+                    drop(outcome);
+                    return;
+                }
+                let mut leftover = None;
+                {
+                    let mut st = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(src) =
+                        st.sources.get_mut(&id).filter(|s| s.opening == Some(token) && s.kind.as_ref() == Some(&kind))
+                    else {
+                        drop(st);
+                        drop(outcome);
+                        return;
+                    };
+                    src.opening = None;
+                    src.opening_since = 0;
+                    match outcome {
+                        Some(Ok(live)) => {
+                            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                            let oc = output_capture_of(&live, src.kind.as_ref());
+                            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+                            let oc: Option<crate::mix::OutputCapture> = None;
+                            leftover = Some(std::mem::replace(&mut src.live, live));
+                            src.watch.count = 0;
+                            src.watch.since = now_ns();
+                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            st.stats.restarts += 1;
+                            mixer_w.lock().unwrap_or_else(|e| e.into_inner()).set_output_capture(id, oc);
+                        }
+                        Some(Err(e)) => {
+                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later");
+                        }
+                        None => {}
+                    }
+                }
+                drop(leftover);
+            }));
+            if let Err(p) = worker_res {
+                tracing::error!(source = id, error = %panic_text(&*p), "watchdog reopen worker panicked");
+                let mut st = state_panic.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
+                    src.opening = None;
+                    src.opening_since = 0;
+                    src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::error!(source = id, error = %e, "couldn't start watchdog reopen thread");
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
+                src.opening = None;
+                src.opening_since = 0;
+                src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+            }
+        }
+    }
+    drop(expired);
+}
+
 /// The watchdog: once a second (or right away when a device connects) it looks at every capture,
 /// and one that faulted, ended or went quiet is started again (waiting longer after each try that
 /// didn't hold).
-fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
+fn watchdog(config: EngineConfig, state: Arc<Mutex<State>>, mixer: Arc<Mutex<Mixer>>, stop: Arc<AtomicBool>) {
     let mut hotplug_seq = 0u64;
     let _ = poll_hotplug(&mut hotplug_seq);
+    let reopen: Reopener = Arc::new(move |kind| open_capture(&config, kind));
     while !stop.load(Ordering::Acquire) {
         let mut connected = None;
         for _ in 0..10 {
@@ -3669,70 +3954,7 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, st
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let now = now_ns();
-        let mut todo = Vec::new();
-        let mut expired = Vec::new();
-        {
-            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ids) = &connected {
-                apply_hotplug_reconnects(&mut st.sources, ids, now);
-            }
-            // Parked cameras not wanted back: closed (outside the lock, below).
-            let mut i = 0;
-            while i < st.parked.len() {
-                if now.saturating_sub(st.parked[i].2) >= PARK_NS {
-                    expired.push(st.parked.swap_remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            for (id, src) in st.sources.iter_mut() {
-                let Some(kind) = &src.kind else { continue };
-                if src.opening.is_some() {
-                    continue;
-                }
-                let running = !matches!(src.live, Live::Still);
-                let w = &mut src.watch;
-                let why = look(w, running, signs(&src.live), now);
-                if let Some(why) = why
-                    && now >= w.next_try
-                {
-                    w.next_try = now + backoff_ns(w.tries);
-                    w.tries += 1;
-                    w.faulted = false;
-                    w.since = now;
-                    // Taken out now (a camera is let go before it's opened again), dropped
-                    // outside the lock.
-                    let old = std::mem::replace(&mut src.live, Live::Still);
-                    todo.push((*id, kind.clone(), why, old));
-                }
-            }
-        }
-        drop(expired);
-        for (id, kind, why, old) in todo {
-            drop(old);
-            tracing::warn!(source = id, %why, "the watchdog starts a source again");
-            match open_capture(&config, &kind) {
-                Some(Ok(live)) => {
-                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(src) = st.sources.get_mut(&id).filter(|s| s.kind.as_ref() == Some(&kind)) {
-                        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-                        let oc = output_capture_of(&live, src.kind.as_ref());
-                        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-                        let oc: Option<crate::mix::OutputCapture> = None;
-                        src.live = live;
-                        src.watch.count = 0;
-                        src.watch.since = now_ns();
-                        st.stats.restarts += 1;
-                        mixer.lock().unwrap_or_else(|e| e.into_inner()).set_output_capture(id, oc);
-                    }
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later")
-                }
-                None => {}
-            }
-        }
+        watchdog_step(&state, &mixer, &stop, &reopen, connected.as_deref(), now_ns());
     }
 }
 
@@ -3904,6 +4126,7 @@ fn frame(
         if seen.contains(id)
             && let Some(f) = src.pending.take()
         {
+            src.pending_since = 0;
             uploads.push((*id, f));
         }
     }
@@ -3912,6 +4135,8 @@ fn frame(
         let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut src.live {
             // Drawn after the sound is mixed (`visualize`).
             Live::Still | Live::Visualizer(_) => {}
+            #[cfg(test)]
+            Live::PanicOnDrop(_) => {}
             Live::Image { src: img, since, last } => {
                 if img.animated() {
                     let p = img.frame_at(since.elapsed());
@@ -3969,6 +4194,10 @@ fn frame(
                 #[cfg(target_os = "macos")]
                 if let Some(s) = cap.take_surface() {
                     uploads.push((*id, Fresh::Screen(s)));
+                }
+                #[cfg(target_os = "windows")]
+                if let Some((p, _)) = cap.take_nv12() {
+                    uploads.push((*id, Fresh::Yuv(p)));
                 }
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, Fresh::Pic(p)));
@@ -4052,7 +4281,19 @@ fn frame(
             Live::Fed(feed) | Live::Series { feed, .. } => {
                 // The newest of the two kinds handed in (a playlist moves between them only at
                 // a file's start, so one is always empty then).
-                if let Some(p) = feed.0.yuv.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let fed_surface = {
+                    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+                    {
+                        feed.0.surface.lock().unwrap_or_else(|e| e.into_inner()).take().map(Fresh::Screen)
+                    }
+                    #[cfg(not(all(test, any(target_os = "macos", target_os = "windows"))))]
+                    {
+                        None::<Fresh>
+                    }
+                };
+                if let Some(f) = fed_surface {
+                    uploads.push((*id, f));
+                } else if let Some(p) = feed.0.yuv.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, Fresh::Yuv(p)));
                 } else if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, Fresh::Pic(p)));
@@ -4075,15 +4316,20 @@ fn frame(
     }
     st.stats.recovered += st_recovered;
     let frozen = frozen(&st);
+    let now = now_ns();
     for (id, f) in uploads {
         let Some(s) = st.sources.get_mut(&id) else { continue };
         // A frozen source keeps the picture it has (its first one still comes in).
         if frozen.contains(&id) && s.sent > 0 {
             s.pending = None;
+            s.pending_since = 0;
             continue;
         }
         if !seen.contains(&id) && s.size.is_some() {
-            s.pending = f.into_pending();
+            // Keep the newest frame directly in `pending`: replacing it drops the previous
+            // surface immediately (at most 1 buffer held) without a per-frame CPU pixel copy.
+            s.pending = Some(f);
+            s.pending_since = now;
             continue;
         }
         if f.send(gpu, id) {
@@ -4096,18 +4342,24 @@ fn frame(
         if let Some(s) = st.sources.get_mut(&id) {
             s.size = None;
             s.pending = None;
+            s.pending_since = 0;
         }
         gpu.forget(id);
     }
-    // Any hidden or frozen source that still holds a pinned zero-copy GPU texture copies it
-    // onto a GPU-owned texture now so CoreVideo buffer pools aren't starved while hidden/frozen.
+    // Hidden or frozen sources release any GPU-pinned zero-copy texture immediately; an idle
+    // hidden capture converts its single held surface ONCE after PENDING_UNPIN_NS so pools are
+    // never starved if updates stop altogether.
     for (id, s) in st.sources.iter_mut() {
         let keep_frozen = frozen.contains(id) && s.sent > 0;
         if keep_frozen {
             s.pending = None;
+            s.pending_since = 0;
         }
         if !seen.contains(id) || keep_frozen {
             gpu.unpin_surface(*id);
+        }
+        if !seen.contains(id) && !keep_frozen {
+            unpin_stale_pending(s, now);
         }
     }
     let blocks = mx.mix_until(now_ns());
@@ -4487,16 +4739,212 @@ mod tests {
         // Faulted, or a restart that didn't take: at once.
         assert!(look(&mut Watch { faulted: true, ..Watch::default() }, true, None, 0).is_some());
         assert!(look(&mut Watch::default(), false, None, 0).is_some());
-        // A camera that never sent isn't stuck (it may be warming up)…
+        // A camera that never sent its first frame gets a startup grace window, then restarts.
         let mut w = Watch::default();
-        assert_eq!(look(&mut w, true, Some((0, true, None)), 60 * s), None);
-        // …unless it's one the watchdog restarted; sending again resets the tries.
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 5 * s), None);
+        assert!(look(&mut w, true, Some((0, true, None)), 11 * s).is_some());
+        // A camera that never sent its first frame gets the full 10 s grace window on every retry
+        // while `count == 0`, then falls to 5 s STALL_NS once frames have flowed.
+        let mut w = Watch::default();
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 5 * s), None);
+        assert!(look(&mut w, true, Some((0, true, None)), 11 * s).is_some());
         w.tries = 2;
+        assert_eq!(
+            look(&mut w, true, Some((0, true, None)), 7 * s),
+            None,
+            "slow reconnect keeps 10 s first-frame grace"
+        );
         assert!(look(&mut w, true, Some((0, true, None)), 60 * s).is_some());
         assert_eq!(look(&mut w, true, Some((5, true, None)), 61 * s), None);
         assert_eq!(w.tries, 0);
         // Tries wait 2, 4, 8… seconds, a minute at most.
         assert_eq!((backoff_ns(0), backoff_ns(2), backoff_ns(9)), (2 * s, 8 * s, 60 * s));
+    }
+
+    #[test]
+    fn watchdog_caps_no_signal_camera_restarts_until_hotplug() {
+        let sec = 1_000_000_000;
+        let mut sources = BTreeMap::new();
+        sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera("capture-card".into()))));
+        let w = &mut sources.get_mut(&1).unwrap_or_else(|| panic!("src")).watch;
+
+        // First 3 fruitless attempts (`tries` 0, 1, 2) request reopening.
+        for tries in 0..NO_SIGNAL_MAX_TRIES {
+            w.tries = tries;
+            assert!(look(w, false, None, (tries as u64 + 1) * sec).is_some());
+        }
+        // After 3 zero-frame tries with no signal ever seen, stops auto-retrying until hotplug.
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(look(w, false, None, 10 * sec), None);
+        assert!(w.no_signal);
+
+        // Once frames flow at least once (`ever_sent`), disconnects keep retrying past 3 tries.
+        w.ever_sent = true;
+        w.no_signal = false;
+        assert!(look(w, false, None, 11 * sec).is_some());
+
+        // Reset back to never-sent exhausted state and confirm hotplug wakes it.
+        w.ever_sent = false;
+        w.no_signal = true;
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(apply_hotplug_reconnects(&mut sources, &["capture-card".into()], 20 * sec), 1);
+        let src = sources.get_mut(&1).unwrap_or_else(|| panic!("src"));
+        assert!(!src.watch.no_signal);
+        assert_eq!(src.watch.tries, 0);
+        assert!(look(&mut src.watch, false, None, 20 * sec).is_some());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_clears_stalled_reopen_worker_after_deadline() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Microphone("hung".into()))));
+        }
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        let reopen: Reopener = Arc::new(move |_| {
+            let n = attempts_c.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let _ = first_entered_tx.send(());
+                let (lk, cv) = &*gate_c;
+                let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*open {
+                    open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                }
+                Some(Ok(Live::Still))
+            } else {
+                Some(Err(AvError::Source("second worker ran".into())))
+            }
+        });
+
+        let now = now_ns();
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+        first_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.lock().sources[&1].opening.is_some());
+
+        // Before the 60 s deadline, no second worker launches.
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS - 1_000_000_000);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // At >= 60 s, the stalled slot is released and a fresh worker runs cleanly.
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let stale_token = e.lock().sources[&1].opening;
+        assert!(stale_token.is_none());
+
+        // Unblock worker 1 and confirm its stale Ok(Live) does not bump restarts or take the slot.
+        let restarts_before = e.lock().stats.restarts;
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(e.lock().stats.restarts, restarts_before);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_caps_concurrent_reopen_workers_and_recovers_from_drop_panic() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            for id in 1..=4 {
+                let live = if id == 1 { Live::PanicOnDrop(PanicDrop) } else { Live::Still };
+                st.sources.insert(id, Src::new(live, None, Some(SourceKind::Microphone(format!("mic-{id}")))));
+            }
+        }
+        let entered = Arc::new(AtomicU64::new(0));
+        let entered_c = entered.clone();
+        let reopen: Reopener = Arc::new(move |_| {
+            entered_c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(120));
+            Some(Ok(Live::Still))
+        });
+
+        let now = now_ns();
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Source 1 panicked inside `drop(old)` so its slot recovered at once (even though it never
+        // entered `reopen_w`), leaving at most MAX_PARALLEL_REOPENS (2) total launched workers on tick 1.
+        let opening_ids: Vec<u64> = {
+            let st = e.lock();
+            st.sources.iter().filter_map(|(id, s)| s.opening.map(|_| *id)).collect()
+        };
+        assert!(!opening_ids.contains(&1), "panicking drop(old) cleared opening slot immediately");
+        assert!(opening_ids.len() <= MAX_PARALLEL_REOPENS, "got {opening_ids:?}");
+        assert!(entered.load(Ordering::SeqCst) < MAX_PARALLEL_REOPENS as u64);
+
+        // Wait for remaining workers and confirm source 1 & pending sources remain recoverable on later tick.
+        std::thread::sleep(Duration::from_millis(200));
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + 10_000_000_000);
+        std::thread::sleep(Duration::from_millis(180));
+        assert!(entered.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_restarts_each_source_independently_and_honors_removal() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera("dead".into()))));
+            st.sources.insert(2, Src::new(Live::Still, None, Some(SourceKind::Microphone("mic".into()))));
+        }
+        let (dead_entered_tx, dead_entered_rx) = std::sync::mpsc::channel();
+        let dead_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (fast_done_tx, fast_done_rx) = std::sync::mpsc::channel();
+        let dead_attempts = Arc::new(AtomicU64::new(0));
+
+        let gate_c = dead_gate.clone();
+        let attempts_c = dead_attempts.clone();
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "dead" => {
+                attempts_c.fetch_add(1, Ordering::SeqCst);
+                let _ = dead_entered_tx.send(());
+                let (lk, cv) = &*gate_c;
+                let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*open {
+                    open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                }
+                Some(Ok(Live::Still))
+            }
+            SourceKind::Microphone(_) => {
+                let _ = fast_done_tx.send(());
+                Some(Ok(Live::Still))
+            }
+            _ => None,
+        });
+
+        let now = now_ns() + 1_000_000_000;
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+
+        // Source 1 is blocked inside reopen, yet Source 2 completes immediately without waiting.
+        dead_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|x| panic!("{x}"));
+        fast_done_rx.recv_timeout(Duration::from_millis(500)).unwrap_or_else(|x| panic!("fast source blocked: {x}"));
+
+        // A second watchdog tick while Source 1 is still reopening doesn't launch a duplicate reopen.
+        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + 5_000_000_000);
+        assert_eq!(dead_attempts.load(Ordering::SeqCst), 1);
+
+        // Removing Source 1 while its reopen is in flight never resurrects it when reopen finishes.
+        e.remove_source(1);
+        {
+            let (lk, cv) = &*dead_gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!e.lock().sources.contains_key(&1));
+        assert!(e.lock().sources.contains_key(&2));
     }
 
     #[test]
@@ -6424,6 +6872,105 @@ mod tests {
         assert!(
             matches!(pending, Fresh::Pic(ref p) if p.width == 32 && p.height == 16 && p.rgba[..4] == [90, 60, 30, 255])
         );
+    }
+
+    /// Active hidden captures keep the newest surface in `pending` directly without per-frame
+    /// CPU copies, release replaced `CVImageBuffer`s immediately, upload zero-copy when shown,
+    /// and convert at most once if idle past `PENDING_UNPIN_NS`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hidden_source_does_not_copy_new_surfaces_every_frame() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 64, height: 36, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Other", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+
+        let feed = e.fed(2).unwrap_or_else(|| panic!("fed source"));
+        feed.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        for _ in 0..50 {
+            if e.lock().sources[&2].pending.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(e.lock().sources[&2].pending.is_some(), "initial picture consumed while hidden");
+
+        let copies = Arc::new(AtomicU64::new(0));
+        let mut buffers = Vec::new();
+        for n in 1u8..=8 {
+            let Some(buf) = crate::apple::screen::tests::bgra_buffer(64, 36, [n * 10, 200, 30, 255]) else { return };
+            let surface = crate::screen::Surface::of(buf.clone())
+                .unwrap_or_else(|| panic!("BGRA surface"))
+                .with_copy_counter(Arc::clone(&copies));
+            buffers.push(buf);
+            feed.surface(surface);
+            for _ in 0..30 {
+                if !feed.has_surface() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!feed.has_surface(), "frame loop consumed hidden surface #{n}");
+        }
+
+        // Hidden captures must NOT call to_picture() per frame (~2 GB/s at 4K60); only the
+        // newest buffer stays pinned (earlier ones are dropped when `pending` is overwritten).
+        assert_eq!(copies.load(Ordering::Relaxed), 0, "hidden frames must not copy to CPU");
+        for old in &buffers[..buffers.len() - 1] {
+            assert_eq!(
+                crate::apple::screen::tests::buffer_retain_count(old),
+                1,
+                "replaced pending surface must release its CVImageBuffer"
+            );
+        }
+        assert_eq!(
+            crate::apple::screen::tests::buffer_retain_count(buffers.last().unwrap_or_else(|| panic!("buf"))),
+            2,
+            "newest pending surface is kept directly until shown or stale"
+        );
+        assert!(matches!(e.lock().sources[&2].pending, Some(Fresh::Screen(_))));
+
+        // Showing the hidden scene uploads the newest surface directly (zero-copy, still 0 CPU copies).
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        for _ in 0..40 {
+            if e.lock().sources[&2].pending.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 0, "reveal uploads zero-copy without CPU conversion");
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[30, 200, 80, 255], "latest hidden frame rendered");
+
+        // If a hidden source stops sending updates past PENDING_UNPIN_NS, it converts ONCE.
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let Some(idle_buf) = crate::apple::screen::tests::bgra_buffer(64, 36, [40, 50, 60, 255]) else { return };
+        let idle_surface = crate::screen::Surface::of(idle_buf.clone())
+            .unwrap_or_else(|| panic!("BGRA surface"))
+            .with_copy_counter(Arc::clone(&copies));
+        feed.surface(idle_surface);
+        for _ in 0..30 {
+            if !feed.has_surface() && e.lock().sources[&2].pending.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 0);
+        {
+            let mut st = e.lock();
+            let src = st.sources.get_mut(&2).unwrap_or_else(|| panic!("source 2"));
+            assert!(matches!(src.pending, Some(Fresh::Screen(_))));
+            let past = src.pending_since + PENDING_UNPIN_NS;
+            unpin_stale_pending(src, past);
+            unpin_stale_pending(src, past + 100);
+            assert!(matches!(src.pending, Some(Fresh::Pic(_))));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 1, "idle hidden surface converts at most once");
+        assert_eq!(crate::apple::screen::tests::buffer_retain_count(&idle_buf), 1, "idle unpin releases CVImageBuffer");
     }
 
     #[test]

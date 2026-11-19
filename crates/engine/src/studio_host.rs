@@ -10,6 +10,14 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch or Kick is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCap {
+    pub max_kbps: u32,
+    pub h264_only: bool,
+    pub keyframe_secs: u32,
+}
+
 /// What `GET /studio/engine` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StudioStatus {
@@ -251,6 +259,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// fills enough of it, else what stands out; None where nothing is found.
     async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
         Err(NOT_HERE.into())
+    }
+    /// Tells the Studio the active shared-stream ceiling imposed by enabled main destinations
+    /// (e.g. Twitch 6,000 kbps H.264 / 2 s keyframes) without altering saved user settings.
+    async fn set_stream_cap(&self, _cap: Option<StreamCap>) -> Result<(), String> {
+        Ok(())
     }
     /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
     /// set, from now on; what's saved doesn't change.
@@ -2072,9 +2085,12 @@ impl Engine {
         }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
+        let saved = host.settings().await;
+        self.note_studio_settings(&saved);
+        self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
         let (restart, detail) = one_line(restart, "Some changes apply after a restart");
-        let mut out = serde_json::json!({ "settings": host.settings().await, "restart": restart });
+        let mut out = serde_json::json!({ "settings": saved, "restart": restart });
         if let (Some(d), Some(o)) = (detail, out.as_object_mut()) {
             o.insert("restart_detail".into(), Value::String(d));
         }
@@ -2276,18 +2292,22 @@ impl Engine {
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        self.note_studio_settings(&s);
         if on {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
+            self.send_golive_pub();
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)
                 .await
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
+        self.sync_stream_cap().await;
         let (server, key) = self.golive_ingest().await?;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
@@ -2300,10 +2320,13 @@ impl Engine {
             Err(e) => {
                 if !running {
                     *crate::golive::lock_enhanced(self) = None;
+                    self.set_studio_live(false);
                 }
                 return Err(failed(e));
             }
         };
+        self.set_studio_live(true);
+        self.send_golive_pub();
         let mut also = follow_stream(host.as_ref(), true, &s).await;
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));

@@ -672,6 +672,8 @@ pub struct Surface {
     image: CFRetained<objc2_core_video::CVImageBuffer>,
     width: u32,
     height: u32,
+    #[cfg(test)]
+    copy_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 // SAFETY: a CoreVideo buffer is reference counted and the system itself passes it between its
@@ -691,7 +693,13 @@ impl Surface {
         if w == 0 || h == 0 || CVPixelBufferIsPlanar(&image) || CVPixelBufferGetPixelFormatType(&image) != BGRA {
             return None;
         }
-        Some(Self { image, width: u32::try_from(w).ok()?, height: u32::try_from(h).ok()? })
+        Some(Self {
+            image,
+            width: u32::try_from(w).ok()?,
+            height: u32::try_from(h).ok()?,
+            #[cfg(test)]
+            copy_counter: None,
+        })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -727,8 +735,19 @@ impl Surface {
         Some(f(unsafe { std::slice::from_raw_parts(base, stride * h) }, stride))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_copy_counter(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.copy_counter = Some(counter);
+        self
+    }
+
     /// The frame as an RGBA picture (a copy, for the ways that need one).
     pub fn to_picture(&self) -> Option<Picture> {
+        #[cfg(test)]
+        if let Some(c) = &self.copy_counter {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         copy_bgra(&self.image)
     }
 }

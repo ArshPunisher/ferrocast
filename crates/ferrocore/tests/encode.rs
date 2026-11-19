@@ -522,3 +522,62 @@ fn ffmpegs_bitrate_changes_on_the_run() {
     );
     assert!(out.stderr.is_empty(), "no decoding errors: {}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[test]
+fn capped_cbr_holds_peak_bitrate_under_limit_across_scene_cuts() {
+    if !encodes() {
+        return;
+    }
+    // On Apple Silicon, RateControl::Cbr (ConstantBitRate without DataRateLimits) was measured at
+    // 8,987 kbps (2 s window) / 12,564 kbps (1 s window) on this exact workload (M4-04), explaining
+    // 19 Nov's 7,011 kbps peak on Twitch. CappedCbr uses DataRateLimits to hold 2 s windows <= cap.
+    let cfg = VideoConfig {
+        codec: VideoCodec::H264,
+        input: PixelFormat::Nv12,
+        width: 1280,
+        height: 720,
+        fps_num: 60,
+        fps_den: 1,
+        bitrate_kbps: 6000,
+        rate: RateControl::CappedCbr,
+        keyframe_secs: 2,
+        software: false,
+    };
+    let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
+    let mut packets = Vec::new();
+    let stride = 1280usize;
+    let mut y = vec![0u8; 1280 * 720];
+    let uv = vec![128u8; 1280 * 360];
+    for i in 0..360u32 {
+        if i < 120 {
+            y.fill(16);
+        } else if i < 240 {
+            for (idx, p) in y.iter_mut().enumerate() {
+                let row = (idx / stride) as u32;
+                let col = (idx % stride) as u32;
+                *p = (((col.wrapping_add(i * 19)).wrapping_mul(17)) ^ (row.wrapping_mul(13))) as u8;
+            }
+        } else {
+            for (idx, p) in y.iter_mut().enumerate() {
+                *p = ((idx as u32).wrapping_mul(2_654_435_761).wrapping_add(i * 7919) >> 24) as u8;
+            }
+        }
+        packets.extend(
+            enc.encode(
+                Frame::Nv12 { y: &y, y_stride: stride, uv: &uv, uv_stride: stride },
+                i64::from(i) * 16_667,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+        );
+    }
+    packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
+    let avg_kbps = packets.iter().map(|p| p.data.len() as u64).sum::<u64>() * 8 / 6 / 1000;
+    let peak_2s = packets
+        .windows(120)
+        .map(|w| w.iter().map(|p| p.data.len() as u64).sum::<u64>() * 8 / 2 / 1000)
+        .max()
+        .unwrap_or(0);
+    assert!(avg_kbps <= 6200, "avg {avg_kbps} kbps exceeded cap");
+    assert!(peak_2s <= 6400, "2 s peak {peak_2s} kbps burst above Twitch slack (avg {avg_kbps})");
+}
