@@ -1240,6 +1240,8 @@ struct FakeStudio {
     /// The engine's frames so far (each stats call is two seconds more), and those drawn late.
     frames: Mutex<u64>,
     lagged: Mutex<u64>,
+    /// A scene with nothing in it (its source count is given only when this is set).
+    empty_scene: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -1275,10 +1277,19 @@ impl crate::studio_host::StudioHost for FakeStudio {
         use crate::studio_host::StudioAct as A;
         let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
         Ok(match act {
-            A::Scenes => json!({
-                "current": lock(&self.current),
-                "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
-            }),
+            A::Scenes => match self.empty_scene.lock().unwrap().clone() {
+                None => json!({
+                    "current": lock(&self.current),
+                    "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
+                }),
+                Some(empty) => {
+                    let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
+                        .iter()
+                        .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
+                        .collect();
+                    json!({ "current": lock(&self.current), "scenes": scenes })
+                }
+            },
             A::SetCurrent { scene } => {
                 self.acts.lock().unwrap().push(format!("scene {scene}"));
                 *self.current.lock().unwrap() = scene;
@@ -1362,6 +1373,38 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(json!({}))
     }
+}
+
+/// 19 Nov, live: the show's live scene was an empty "Main", and five minutes in the stream went
+/// black; then, after the Studio was stopped and started, Go live said "a show is already
+/// running". An empty scene is never switched to, and a show whose stream stopped is over.
+#[tokio::test]
+async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Starting".into()),
+        empty_scene: Mutex::new(Some("Live".into())),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({
+            "live_scene": "Live", "countdown_s": 0, "discord": false, "alerts_on": false, "bot_on": false,
+            "start_stream": true,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let run = e.start_show(true).await.unwrap();
+    let live = run.steps.iter().find(|s| s.id == "live_scene").unwrap_or_else(|| panic!("{:?}", run.steps));
+    assert_eq!(live.status, "skipped", "{live:?}");
+    assert!(live.detail.contains("has nothing in it"), "{live:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting", "the scene on air stays");
+    // The stream stops some other way (the Studio stopped): a new show may start.
+    *studio.streaming.lock().unwrap() = false;
+    assert!(e.start_show(true).await.is_ok(), "the old show was over");
 }
 
 #[tokio::test]

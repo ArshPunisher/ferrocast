@@ -314,6 +314,22 @@ impl Engine {
     /// Starts the show. 409 while one is running; 422 `preflight_failed` when a check
     /// failed, unless `force`.
     pub async fn start_show(&self, force: bool) -> Result<ShowRun, EngineError> {
+        // A show whose stream stopped some other way (Stop Studio, the stream dropping) is over:
+        // it no longer blocks a new one (19 Nov, live: Go live said "a show is already running"
+        // after the Studio was stopped and started). A countdown still blocks until cancelled.
+        // (Only a show that streams: one that doesn't may run with the stream off.)
+        if self.show_config().start_stream
+            && let Some(old) = self.show_run().filter(|r| matches!(r.phase, Phase::Live | Phase::Starting))
+            && let Ok(rig) = self.rig().await
+            && matches!(self.rig_streaming(&rig).await, Ok(false))
+            // Still that same show after the wait: one started meanwhile is kept (CodeRabbit).
+            && let Some(mut same) =
+                self.show_run().filter(|r| r.id == old.id && matches!(r.phase, Phase::Live | Phase::Starting))
+        {
+            same.phase = Phase::Ended;
+            same.ended_at = Some(now().0);
+            self.set_show(Some(same));
+        }
         if self.show_run().is_some_and(|r| r.phase != Phase::Ended) {
             return Err(EngineError::Conflict(
                 "A show is already running. End it first, or cancel the countdown.".into(),
@@ -489,6 +505,16 @@ impl Engine {
                 Err(e) => return Step::new(id, label, "failed", e.to_string()),
             },
         };
+        // Never onto a scene with nothing in it: the stream would go black (19 Nov, live: a
+        // show's guessed live scene "Main" was empty, and five minutes in the stream went black).
+        if self.rig_scene_items(r, scene).await == Some(0) {
+            return Step::new(
+                id,
+                label,
+                "skipped",
+                format!("\"{scene}\" has nothing in it, so the scene on air stays. Pick another in Show settings."),
+            );
+        }
         match self.rig_switch(r, scene).await {
             Ok(()) => Step::new(id, label, "done", format!("{} is on \"{scene}\".", r.title())),
             Err(e) => Step::new(id, label, "failed", e.to_string()),

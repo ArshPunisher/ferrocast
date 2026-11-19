@@ -81,6 +81,22 @@ impl Engine {
         }
     }
 
+    /// How many sources `scene` has (the Studio's; None for OBS or a scene not found).
+    pub(crate) async fn rig_scene_items(&self, rig: &Rig, scene: &str) -> Option<u64> {
+        match rig {
+            Rig::Obs(_) => None,
+            Rig::Studio => {
+                let v = self.studio_act(StudioAct::Scenes).await.ok()?;
+                v.get("scenes")?
+                    .as_array()?
+                    .iter()
+                    .find(|s| s.get("name").and_then(Value::as_str) == Some(scene))?
+                    .get("items")?
+                    .as_u64()
+            }
+        }
+    }
+
     pub(crate) async fn rig_switch(&self, rig: &Rig, scene: &str) -> Result<(), EngineError> {
         match rig {
             Rig::Obs(c) => ferrocast_obs::control::switch_scene(c, scene).await.map_err(obs_error),
