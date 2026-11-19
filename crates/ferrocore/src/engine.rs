@@ -122,11 +122,11 @@ pub enum SourceKind {
     /// A microphone (macOS), by its id.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(String),
-    /// A video or sound file (macOS), looping or once.
+    /// A video or sound file, with playback options (looping, activation lifecycle, speed, hw decode).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Media {
         path: PathBuf,
-        looping: bool,
+        options: crate::ffsrc::MediaOptions,
     },
     /// Pictures one after another (OBS's Image Slide Show).
     Slides(crate::source::series::Slides),
@@ -545,6 +545,96 @@ impl Default for EngineConfig {
     }
 }
 
+/// Lifecycle state for a local media source (`ffmpeg_source` / `ferrocast_replay` / stinger).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+struct MediaSlot {
+    path: PathBuf,
+    options: crate::ffsrc::MediaOptions,
+    /// Currently open player (`None` when closed by `close_when_inactive` or while reopening).
+    player: Option<Arc<crate::media::Media>>,
+    /// Token of an in-flight async reopen triggered on activate or explicit Play/Restart.
+    reopening: Option<u64>,
+    /// Last known duration (ns) so `media_state` reports duration even while closed.
+    duration_ns: u64,
+    /// Whether this source was active on air on the previous frame (for activate/deactivate edges).
+    was_active: bool,
+    /// Whether the GPU texture was already cleared after EOF/stop.
+    cleared: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+impl MediaSlot {
+    fn open(path: PathBuf, options: crate::ffsrc::MediaOptions, media: crate::media::Media) -> Self {
+        let duration_ns = media.duration_ns;
+        Self {
+            path,
+            options,
+            player: Some(Arc::new(media)),
+            reopening: None,
+            duration_ns,
+            was_active: false,
+            cleared: false,
+        }
+    }
+
+    fn closed(path: PathBuf, options: crate::ffsrc::MediaOptions) -> Self {
+        Self { path, options, player: None, reopening: None, duration_ns: 0, was_active: false, cleared: false }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+static REOPEN_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn next_reopen_token() -> u64 {
+    REOPEN_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn spawn_media_reopen(
+    state: Arc<Mutex<State>>,
+    mixer: Arc<Mutex<Mixer>>,
+    id: u64,
+    token: u64,
+    path: PathBuf,
+    options: crate::ffsrc::MediaOptions,
+    require_active: bool,
+) {
+    let _ = std::thread::Builder::new().name("ferrocore-media-open".into()).spawn(move || {
+        let opened = open_video_with(&path, options, false);
+        let mut leftover: Option<crate::media::Media> = None;
+        {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let still_wanted = !require_active || active(&st).contains(&id);
+            match (opened, st.sources.get_mut(&id).map(|s| &mut s.live)) {
+                (Ok(m), Some(Live::Media(slot))) if slot.reopening == Some(token) && still_wanted => {
+                    let has_audio = m.has_audio;
+                    slot.reopening = None;
+                    slot.duration_ns = m.duration_ns;
+                    slot.cleared = false;
+                    slot.player = Some(Arc::new(m));
+                    if has_audio {
+                        mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
+                    }
+                }
+                (Ok(m), Some(Live::Media(slot))) if slot.reopening == Some(token) => {
+                    slot.reopening = None;
+                    leftover = Some(m);
+                }
+                (Ok(m), _) => {
+                    leftover = Some(m);
+                }
+                (Err(e), Some(Live::Media(slot))) if slot.reopening == Some(token) => {
+                    slot.reopening = None;
+                    tracing::warn!(source = id, file = %path.display(), error = %e, "media source couldn't reopen");
+                }
+                (Err(_), _) => {}
+            }
+        }
+        drop(leftover);
+    });
+}
+
 enum Live {
     Still,
     Image {
@@ -565,7 +655,7 @@ enum Live {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(crate::camera::Capture),
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    Media(crate::media::Media),
+    Media(MediaSlot),
     Fed(Feed),
     /// Files one after another, on a worker that hands them in as a fed source would.
     Series {
@@ -597,8 +687,8 @@ enum Fresh {
     Pic(Picture),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     Screen(crate::screen::Surface),
-    /// A file's picture as FFmpeg decodes it, turned into RGB on the card (Windows, Linux).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// A file's picture as FFmpeg decodes it, turned into RGB on the card (Windows, Linux, and
+    /// macOS FFmpeg fallback for MKV/WebM).
     Yuv(crate::ffsrc::Nv12Picture),
 }
 
@@ -1001,16 +1091,29 @@ impl Engine {
                 );
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            SourceKind::Media { path, looping } => {
+            SourceKind::Media { path, options } => {
+                if options.close_when_inactive {
+                    if !path.is_file() {
+                        return Err(AvError::Source(format!("{} isn't there", path.display())));
+                    }
+                    let gone = self
+                        .lock()
+                        .sources
+                        .insert(id, Src::new(Live::Media(MediaSlot::closed(path, options)), None, None));
+                    drop(gone);
+                    self.gpu.forget(id);
+                    return Ok(());
+                }
                 // Opening a file can take a while (FFmpeg looks at it, then tries the GPU
                 // decoder): on its own thread like a capture. A missing file still says so at once.
+                let start_stopped = options.restart_on_activate;
                 return self.open_soon(
                     id,
                     None,
                     Box::new(move || {
-                        open_video(&path, looping).map(|m| {
+                        open_video_with(&path, options, start_stopped).map(|m| {
                             let heard = m.has_audio;
-                            (Live::Media(m), heard)
+                            (Live::Media(MediaSlot::open(path, options, m)), heard)
                         })
                     }),
                 );
@@ -1321,26 +1424,53 @@ impl Engine {
     }
 
     /// Plays, pauses, restarts, stops or seeks a media source (OBS's media controls).
+    /// Releases the engine's State lock before dispatching so scrubber drags never stall frames.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_control(&self, id: u64, c: crate::media::Control) -> Result<(), AvError> {
-        match self.lock().sources.get(&id).map(|s| &s.live) {
-            Some(Live::Media(m)) => {
-                m.control(c);
-                Ok(())
+        let mut reopen = None;
+        let player = {
+            let mut st = self.lock();
+            match st.sources.get_mut(&id).map(|s| &mut s.live) {
+                Some(Live::Media(slot)) => match &slot.player {
+                    Some(m) => Some(Arc::clone(m)),
+                    None => {
+                        if matches!(c, crate::media::Control::Play | crate::media::Control::Restart)
+                            && slot.reopening.is_none()
+                        {
+                            let tok = next_reopen_token();
+                            slot.reopening = Some(tok);
+                            reopen = Some((tok, slot.path.clone(), slot.options));
+                        }
+                        None
+                    }
+                },
+                _ => return Err(AvError::Source(format!("source {id} isn't a media file"))),
             }
-            _ => Err(AvError::Source(format!("source {id} isn't a media file"))),
+        };
+        if let Some(m) = player {
+            m.control(c);
+        } else if let Some((tok, path, options)) = reopen {
+            spawn_media_reopen(self.state.clone(), self.mixer.clone(), id, tok, path, options, false);
         }
+        Ok(())
     }
 
     /// A media source's state, where it is and how long it lasts (ns).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_state(&self, id: u64) -> Option<(crate::media::MediaState, u64, u64)> {
-        match self.lock().sources.get(&id).map(|s| &s.live) {
-            Some(Live::Media(m)) => {
+        let (player, cached_dur) = {
+            let st = self.lock();
+            match st.sources.get(&id).map(|s| &s.live) {
+                Some(Live::Media(slot)) => (slot.player.as_ref().map(Arc::clone), slot.duration_ns),
+                _ => return None,
+            }
+        };
+        match player {
+            Some(m) => {
                 let (state, at) = m.state();
                 Some((state, at, m.duration_ns))
             }
-            _ => None,
+            None => Some((crate::media::MediaState::Stopped, 0, cached_dur)),
         }
     }
 
@@ -1804,7 +1934,14 @@ impl Engine {
         }
         let now = now_ns();
         let mut st = self.lock();
-        st.sources.insert(STINGER, Src::new(Live::Media(m), None, None));
+        st.sources.insert(
+            STINGER,
+            Src::new(
+                Live::Media(MediaSlot::open(video.to_path_buf(), crate::ffsrc::MediaOptions::default(), m)),
+                None,
+                None,
+            ),
+        );
         let from = st.on_air.replace(name.to_string()).unwrap_or_default();
         if let Some(l) = st.loaded.as_mut()
             && l.scenes.iter().any(|s| s == name)
@@ -2776,6 +2913,31 @@ fn heard(st: &State) -> std::collections::HashSet<u64> {
     out
 }
 
+/// Sources currently active on air (program, top layer, transitions/stingers, outputs, taps,
+/// globals), matching OBS's `obs_source_active` (excludes Multiview / Studio Mode preview boxes).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn active(st: &State) -> std::collections::HashSet<u64> {
+    fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
+        let Some(items) = st.scenes.get(scene) else { return };
+        for it in items.iter().filter(|i| i.visible) {
+            match &it.scene {
+                Some(inner) if depth < MAX_NESTING => walk(st, inner, depth + 1, out),
+                Some(_) => {}
+                None => {
+                    out.insert(it.source);
+                }
+            }
+        }
+    }
+    let mut out = heard(st);
+    for (_, c, _) in &st.taps {
+        if let Some(s) = c.scene.as_deref() {
+            walk(st, s, 0, &mut out);
+        }
+    }
+    out
+}
+
 /// Sources something drawn shows now: on air, a transition's or stinger's, an output's own
 /// scene, a preview's or a multiview's, with the scenes inside them and the masks they use.
 /// Sound bars that are shown: what they heard this frame (the sound on air, or their
@@ -3127,9 +3289,9 @@ pub fn raise_this_thread() {
 /// The frame loop.
 fn run(
     config: EngineConfig,
-    state: &Mutex<State>,
+    state: &Arc<Mutex<State>>,
     gpu: &Compositor,
-    mixer: &Mutex<Mixer>,
+    mixer: &Arc<Mutex<Mixer>>,
     stop: &AtomicBool,
     seen: &Seen,
 ) {
@@ -3178,14 +3340,20 @@ fn run(
     }
 }
 
-/// A video file as its pictures are best drawn: as NV12 turned into RGB on the card where FFmpeg
-/// plays it (Windows, Linux), as RGBA where the system does (a Mac).
+/// Opens a video or audio file with full playback options (macOS AVFoundation with FFmpeg
+/// fallback; Windows/Linux FFmpeg with NV12 for opaque and RGBA for alpha).
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub(crate) fn open_video_with(
+    path: &std::path::Path,
+    options: crate::ffsrc::MediaOptions,
+    start_stopped: bool,
+) -> Result<crate::media::Media, AvError> {
+    crate::media::Media::open_with(path, options, start_stopped)
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub(crate) fn open_video(path: &std::path::Path, looping: bool) -> Result<crate::media::Media, AvError> {
-    #[cfg(target_os = "macos")]
-    return crate::media::Media::open(path, looping);
-    #[cfg(not(target_os = "macos"))]
-    return crate::media::Media::open_for_card(path, looping);
+    open_video_with(path, crate::ffsrc::MediaOptions::looping(looping), false)
 }
 
 /// A source whose device takes one user at a time: closed before it's opened again.
@@ -3695,9 +3863,9 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
 #[allow(clippy::too_many_arguments)]
 fn frame(
     config: &EngineConfig,
-    state: &Mutex<State>,
+    state: &Arc<Mutex<State>>,
     gpu: &Compositor,
-    mixer: &Mutex<Mixer>,
+    mixer: &Arc<Mutex<Mixer>>,
     ts: u64,
     behind: u64,
     started: Instant,
@@ -3711,6 +3879,8 @@ fn frame(
     // rest still has its sound taken, so it doesn't pile up.
     let heard = heard(&st);
     mx.sync_active(&heard);
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let active_set = active(&st);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some((epoch, dev_id)) = st.monitor.as_ref().and_then(|f| {
         let epoch = f.device_epoch();
@@ -3724,6 +3894,12 @@ fn frame(
     let seen = seen(&st);
     // Sources: new pictures to the GPU, new sound to the mixer.
     let mut uploads = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let mut media_clear: Vec<u64> = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let mut media_drop: Vec<Arc<crate::media::Media>> = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let mut media_reopen: Vec<(u64, u64, PathBuf, crate::ffsrc::MediaOptions)> = Vec::new();
     for (id, src) in st.sources.iter_mut() {
         if seen.contains(id)
             && let Some(f) = src.pending.take()
@@ -3807,18 +3983,69 @@ fn frame(
                 }
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            Live::Media(m) => {
-                // As NV12 for the card where FFmpeg plays it (`open_video`), else RGBA.
-                #[cfg(not(target_os = "macos"))]
-                let fresh = m.frame_nv12().map(Fresh::Yuv).or_else(|| m.frame_at(ts).map(Fresh::Pic));
-                #[cfg(target_os = "macos")]
-                let fresh = m.frame_at(ts).map(Fresh::Pic);
-                if let Some(f) = fresh {
-                    uploads.push((*id, f));
+            Live::Media(slot) => {
+                let is_active = active_set.contains(id);
+                let became_active = is_active && !slot.was_active;
+                let became_inactive = !is_active && slot.was_active;
+                slot.was_active = is_active;
+
+                if became_active {
+                    slot.cleared = false;
+                    if let Some(m) = &slot.player {
+                        if slot.options.restart_on_activate {
+                            m.control(crate::media::Control::Restart);
+                        }
+                    } else if slot.options.close_when_inactive && slot.reopening.is_none() {
+                        let tok = next_reopen_token();
+                        slot.reopening = Some(tok);
+                        media_reopen.push((*id, tok, slot.path.clone(), slot.options));
+                    }
+                } else if became_inactive {
+                    if slot.options.close_when_inactive {
+                        slot.reopening = None;
+                        if let Some(m) = slot.player.take() {
+                            media_drop.push(m);
+                        }
+                        if slot.options.clear_on_media_end {
+                            media_clear.push(*id);
+                            slot.cleared = true;
+                        }
+                    } else if slot.options.restart_on_activate
+                        && let Some(m) = &slot.player
+                    {
+                        m.control(crate::media::Control::Stop);
+                        if slot.options.clear_on_media_end {
+                            media_clear.push(*id);
+                            slot.cleared = true;
+                        }
+                    }
                 }
-                for (pcm, t) in m.take_sound() {
-                    if heard.contains(id) {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+
+                if let Some(m) = &slot.player {
+                    // NV12 for opaque FFmpeg-decoded clips (Windows/Linux, and macOS MKV fallback),
+                    // RGBA for AVFoundation clips and alpha sources (WebM VP9 stingers, ProRes 4444).
+                    let fresh = m.frame_nv12().map(Fresh::Yuv).or_else(|| m.frame_at(ts).map(Fresh::Pic));
+                    let got_frame = fresh.is_some();
+                    if let Some(f) = fresh {
+                        slot.cleared = false;
+                        uploads.push((*id, f));
+                    }
+                    for (pcm, t) in m.take_sound() {
+                        if heard.contains(id) {
+                            mx.push(*id, &pcm, 2, 48_000, t);
+                        }
+                    }
+                    // Clear texture / close decoder only after the final queued frame has been shown.
+                    if !got_frame && !slot.options.looping && m.ended() {
+                        if slot.options.clear_on_media_end && !slot.cleared {
+                            media_clear.push(*id);
+                            slot.cleared = true;
+                        }
+                        if slot.options.close_when_inactive
+                            && let Some(old) = slot.player.take()
+                        {
+                            media_drop.push(old);
+                        }
                     }
                 }
             }
@@ -3863,6 +4090,14 @@ fn frame(
             s.size = Some(f.info());
             s.sent += 1;
         }
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    for id in media_clear {
+        if let Some(s) = st.sources.get_mut(&id) {
+            s.size = None;
+            s.pending = None;
+        }
+        gpu.forget(id);
     }
     // Any hidden or frozen source that still holds a pinned zero-copy GPU texture copies it
     // onto a GPU-owned texture now so CoreVideo buffer pools aren't starved while hidden/frozen.
@@ -3979,6 +4214,19 @@ fn frame(
     // Shown before the state's lock goes: a change made right after (a split, a pause) shows
     // itself, never overwritten by this older picture (projects-60).
     *shown.lock().unwrap_or_else(|e| e.into_inner()) = Shown::of(&st);
+    drop(st);
+    // Open/close `close_when_inactive` media completely off the State lock and frame pacing path.
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        for (id, tok, path, options) in media_reopen {
+            spawn_media_reopen(state.clone(), mixer.clone(), id, tok, path, options, true);
+        }
+        if !media_drop.is_empty()
+            && std::thread::Builder::new().name("ferrocore-media-close".into()).spawn(move || drop(media_drop)).is_err()
+        {
+            tracing::debug!("dropped closed media inline after thread spawn failure");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4216,7 +4464,10 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     fn a_missing_media_file_says_so_at_once() {
         let Some(e) = engine() else { return };
-        let r = e.set_source(9, SourceKind::Media { path: "/no/such/clip.mp4".into(), looping: false });
+        let r = e.set_source(
+            9,
+            SourceKind::Media { path: "/no/such/clip.mp4".into(), options: crate::ffsrc::MediaOptions::default() },
+        );
         assert!(r.is_err(), "the error comes back: {r:?}");
         assert!(!e.lock().sources.contains_key(&9), "not kept");
     }
@@ -5423,7 +5674,8 @@ mod tests {
             return;
         }
         let Some(e) = engine() else { return };
-        e.set_source(1, SourceKind::Media { path: clip.clone(), looping: false }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(1, SourceKind::Media { path: clip.clone(), options: crate::ffsrc::MediaOptions::default() })
+            .unwrap_or_else(|x| panic!("{x}"));
         e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
         e.go("Main").unwrap_or_else(|x| panic!("{x}"));
         let id = e.start_output(OutputKind::Record(rec.clone())).unwrap_or_else(|x| panic!("{x}"));
@@ -6205,5 +6457,281 @@ mod tests {
         assert_eq!(woke, 3);
         assert_eq!(sources[&2].watch.next_try, now);
         assert_eq!(sources[&3].watch.next_try, now);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    fn test_ffmpeg() -> Option<PathBuf> {
+        let p = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.is_file())
+            .map(std::path::Path::to_path_buf)
+            .or_else(crate::ffenc::ffmpeg_path)?;
+        crate::ffenc::set_ffmpeg(&p);
+        Some(p)
+    }
+
+    /// `restart_on_activate` + `close_when_inactive`: a hidden non-looping clip stays closed
+    /// while Scene A is live (does not run to EOF in the background), opens and plays from 0 when
+    /// switched to Scene B, and closes when deactivated or finished (M8-02).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn media_restart_on_activate_and_close_when_inactive() {
+        let Some(ff) = test_ffmpeg() else { return };
+        let Some(e) = engine() else { return };
+        let clip = std::env::temp_dir().join(format!("ferrocore-m802-life-{}.mp4", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=160x90:r=30:d=0.8"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "ffmpeg made clip");
+
+        let opts = crate::ffsrc::MediaOptions {
+            looping: false,
+            restart_on_activate: true,
+            close_when_inactive: true,
+            clear_on_media_end: true,
+            speed_percent: 100,
+            hw_decode: true,
+        };
+        e.set_source(1, SourceKind::Media { path: clip.clone(), options: opts }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("A", vec![]);
+        e.set_scene("B", vec![SceneItem::new(1, Placement::default())]);
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+
+        // Stay on Scene A longer than the 0.8 s clip: decoder must never open while hidden.
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(e.media_state(1).map(|s| s.0), Some(crate::media::MediaState::Stopped));
+        {
+            let st = e.lock();
+            assert!(
+                matches!(st.sources.get(&1).map(|s| &s.live), Some(Live::Media(slot)) if slot.player.is_none()),
+                "close_when_inactive must keep player closed while hidden"
+            );
+        }
+
+        // Switch to Scene B: opens and plays red from 0 ms (engine() canvas is 640x360; clip is 160x90 at 0,0).
+        e.go("B").unwrap_or_else(|x| panic!("{x}"));
+        let mid = (40 * 640 + 40) * 4;
+        let mut saw_red = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if let Ok(px) = e.snapshot()
+                && px.get(mid).copied().unwrap_or(0) > 200
+            {
+                saw_red = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_red, "media must open and play from 0 when Scene B activates");
+
+        // Switch back to Scene A while playing: must close the decoder immediately.
+        e.go("A").unwrap_or_else(|x| panic!("{x}"));
+        let mut closed_again = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            let st = e.lock();
+            if matches!(st.sources.get(&1).map(|s| &s.live), Some(Live::Media(slot)) if slot.player.is_none()) {
+                closed_again = true;
+                break;
+            }
+            drop(st);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(closed_again, "switching away from Scene B must drop the decoder");
+
+        // Switch back to Scene B again: restarts from 0 and shows red again.
+        e.go("B").unwrap_or_else(|x| panic!("{x}"));
+        let mut saw_red_again = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if let Ok(px) = e.snapshot()
+                && px.get(mid).copied().unwrap_or(0) > 200
+            {
+                saw_red_again = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(e);
+        let _ = std::fs::remove_file(&clip);
+        assert!(saw_red_again, "re-entering Scene B must reopen and restart from 0");
+    }
+
+    /// `clear_on_media_end: true` clears the source texture at EOF; `false` holds the last frame (M8-02).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn media_clear_on_media_end_vs_hold_last_frame() {
+        let Some(ff) = test_ffmpeg() else { return };
+        let Some(e) = engine() else { return };
+        let clip = std::env::temp_dir().join(format!("ferrocore-m802-clear-{}.mp4", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x00ff00:s=160x90:r=30:d=0.5"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "ffmpeg made clip");
+
+        let mid = (40 * 640 + 40) * 4;
+        // Case 1: clear_on_media_end = true.
+        let clear_opts =
+            crate::ffsrc::MediaOptions { clear_on_media_end: true, ..crate::ffsrc::MediaOptions::default() };
+        e.set_source(1, SourceKind::Media { path: clip.clone(), options: clear_opts })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let (mut saw_green, mut cleared) = (false, false);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if let Ok(px) = e.snapshot() {
+                let g = px.get(mid + 1).copied().unwrap_or(0);
+                if g > 180 {
+                    saw_green = true;
+                } else if saw_green && g < 20 {
+                    cleared = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_green, "clip must display green while playing");
+        assert!(cleared, "clear_on_media_end=true must clear the texture at EOF");
+
+        // Case 2: clear_on_media_end = false holds the last green frame after EOF.
+        let hold_opts =
+            crate::ffsrc::MediaOptions { clear_on_media_end: false, ..crate::ffsrc::MediaOptions::default() };
+        e.set_source(2, SourceKind::Media { path: clip.clone(), options: hold_opts }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Hold", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Hold").unwrap_or_else(|x| panic!("{x}"));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            if e.media_state(2).is_some_and(|(s, ..)| s == crate::media::MediaState::Ended) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(e.media_state(2).map(|s| s.0), Some(crate::media::MediaState::Ended));
+        std::thread::sleep(Duration::from_millis(120));
+        let px = e.snapshot().unwrap_or_default();
+        drop(e);
+        let _ = std::fs::remove_file(&clip);
+        assert!(px.get(mid + 1).copied().unwrap_or(0) > 180, "clear_on_media_end=false must hold last frame");
+    }
+
+    /// `speed_percent: 200` finishes a 2 s clip in ~1 s, and `hw_decode: false` decodes on CPU (M8-02).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn media_speed_percent_and_hw_decode() {
+        let Some(ff) = test_ffmpeg() else { return };
+        let clip = std::env::temp_dir().join(format!("ferrocore-m802-speed-{}.mp4", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "ffmpeg made 2 s clip");
+
+        // hw_decode: false forces CPU decode on ffsrc.
+        let sw_opts = crate::ffsrc::MediaOptions {
+            hw_decode: false,
+            speed_percent: 200,
+            ..crate::ffsrc::MediaOptions::default()
+        };
+        let m = crate::ffsrc::Media::open_for_card_with(&clip, sw_opts, false).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!m.hw && !m.hw_active(), "hw_decode=false must stay on CPU");
+        let mut first_frame_at: Option<Instant> = None;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !m.ended() && Instant::now() < deadline {
+            if m.frame_nv12().is_some() && first_frame_at.is_none() {
+                first_frame_at = Some(Instant::now());
+            }
+            let _ = m.take_sound();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = m.ended();
+        let play_time = first_frame_at.map(|t| t.elapsed()).unwrap_or(Duration::from_secs(99));
+        drop(m);
+        let _ = std::fs::remove_file(&clip);
+        assert!(ended, "200% speed clip finished");
+        assert!(
+            play_time < Duration::from_millis(1600),
+            "2 s clip at 200% speed should finish in ~1 s, took {:?}",
+            play_time
+        );
+    }
+
+    /// A transparent VP9 WebM stinger must composite over the underlying scene with alpha intact
+    /// on both macOS (FFmpeg fallback) and Windows (RGBA instead of NV12) (M8-01).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn stinger_with_transparent_webm_preserves_alpha_underneath() {
+        let Some(ff) = test_ffmpeg() else { return };
+        let Some(e) = engine() else { return };
+        let webm = std::env::temp_dir().join(format!("ferrocore-stinger-alpha-{}.webm", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black@0.0:s=64x72:r=20:d=1.2,format=rgba",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0xff0000@1.0:s=64x72:r=20:d=1.2,format=rgba",
+                "-filter_complex",
+                "[0:v][1:v]hstack=inputs=2,format=yuva420p",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-auto-alt-ref",
+                "0",
+                "-deadline",
+                "realtime",
+            ])
+            .arg(&webm)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_file(&webm);
+            return;
+        }
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [0, 0, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 640, height: 360, rgba: [0, 255, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Blue", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Green", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Blue").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(120));
+
+        e.go_stinger("Green", &webm, 600).unwrap_or_else(|x| panic!("{x}"));
+        let left_px = (180 * 640 + 80) * 4;
+        let right_px = (180 * 640 + 560) * 4;
+        let mut verified = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if let Ok(px) = e.snapshot() {
+                let l = &px[left_px..left_px + 4];
+                let r = &px[right_px..right_px + 4];
+                // Right half covered by red stinger; left half transparent showing Blue or Green scene underneath!
+                if r[0] > 180 && r[1] < 60 && r[2] < 60 && (l[2] > 180 || l[1] > 180) && l[0] < 60 {
+                    verified = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(e);
+        let _ = std::fs::remove_file(&webm);
+        assert!(verified, "transparent WebM stinger must cover right half in red while revealing scene on left half");
     }
 }

@@ -12,5 +12,5 @@ pub mod wgc;
 
 /// Video and sound files.
 pub mod media {
-    pub use crate::ffsrc::{Control, Media, MediaState};
+    pub use crate::ffsrc::{Control, Media, MediaOptions, MediaState};
 }
