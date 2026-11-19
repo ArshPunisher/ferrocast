@@ -204,6 +204,9 @@ pub struct AudioFilter {
     eq: [EqState; 2],
     /// A filter made outside the engine (noise removal).
     plugin: Option<Box<dyn SoundPlugin>>,
+    /// True once `plugin` has processed at least one block (failed init leaves this false so
+    /// we never install a permanent handover delay line around `light_denoise`).
+    plugin_ran: bool,
     // Light noise removal: the noise floor it hears (RMS), steady-noise candidate, and current gain.
     floor: f32,
     nr_steady_rms: f32,
@@ -240,6 +243,7 @@ impl AudioFilter {
                 AudioEffect::Plugin { slot } => PLUGIN_MAKER.get().and_then(|make| make(slot, rate)),
                 _ => None,
             },
+            plugin_ran: false,
             floor: 0.0,
             nr_steady_rms: 0.0,
             nr_steady_s: 0.0,
@@ -297,6 +301,7 @@ impl AudioFilter {
         let rate = self.rate;
         if let Some(p) = self.plugin.as_mut() {
             if p.process([&mut *l, &mut *r]) {
+                self.plugin_ran = true;
                 return;
             }
             // A VST that was late or stopped: this block passes as it was; it starts itself again.
@@ -305,7 +310,9 @@ impl AudioFilter {
             }
             tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
             let mut gone = self.plugin.take();
-            let late = gone.as_ref().map_or(0, |p| p.latency_frames());
+            // Only keep a handover delay line when the plugin actually ran and delayed audio;
+            // a failed init never delayed the stream and must not leave an 82.7 ms delay behind.
+            let late = if self.plugin_ran { gone.as_ref().map_or(0, |p| p.latency_frames()) } else { 0 };
             if late > 0 {
                 // What it still held plays first (silence only for what it never had).
                 let kept = gone.as_mut().and_then(|p| p.hand_over());
@@ -649,13 +656,13 @@ mod tests {
         assert!(!f.retune(AudioEffect::Gain { db: 0.0 }));
     }
 
-    /// A plugin that holds the sound back and then gives up: the light noise removal takes
-    /// over with the same delay, so the source doesn't jump in time.
+    /// A plugin that fails immediately on block 1 (failed model init) never delayed the stream
+    /// and must NOT leave a permanent handover delay line around `light_denoise` (M2-02).
     #[test]
-    fn giving_up_keeps_the_delay() {
+    fn failed_init_leaves_zero_delay() {
         #[derive(Debug)]
-        struct Late(usize);
-        impl SoundPlugin for Late {
+        struct FailsAtInit(usize);
+        impl SoundPlugin for FailsAtInit {
             fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
                 false
             }
@@ -663,13 +670,43 @@ mod tests {
                 self.0
             }
         }
-        let mut f = AudioFilter::with_plugin(Box::new(Late(2944)), RATE);
+        let mut f = AudioFilter::with_plugin(Box::new(FailsAtInit(3968)), RATE);
+        f.effect = AudioEffect::Denoise { strength: 65 };
+        let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+        f.process([&mut l, &mut r]);
+        assert_eq!(f.latency_frames(), 0, "failed init must not leave an 82.7 ms delay");
+        assert!(rms(&l) > 0.4, "audio passes through light_denoise immediately, not silenced");
+    }
+
+    /// A plugin that actually ran and held the sound back, and then gives up mid-stream: the
+    /// light noise removal takes over with the same delay, so the source doesn't jump in time.
+    #[test]
+    fn giving_up_keeps_the_delay() {
+        #[derive(Debug)]
+        struct RunsOnceThenQuits(usize, bool);
+        impl SoundPlugin for RunsOnceThenQuits {
+            fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+                if self.1 {
+                    return false;
+                }
+                self.1 = true;
+                ch[0].fill(0.0);
+                ch[1].fill(0.0);
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                self.0
+            }
+        }
+        let mut f = AudioFilter::with_plugin(Box::new(RunsOnceThenQuits(2944, false)), RATE);
         f.effect = AudioEffect::Denoise { strength: 100 };
         assert_eq!(f.latency_frames(), 2944);
         let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
         f.process([&mut l, &mut r]);
-        assert_eq!(f.latency_frames(), 2944, "the same delay after it gave way");
-        assert!(l.iter().all(|v| *v == 0.0), "held back: the first block is still on its way");
+        let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+        f.process([&mut l, &mut r]);
+        assert_eq!(f.latency_frames(), 2944, "the same delay after it gave way mid-stream");
+        assert!(l.iter().all(|v| *v == 0.0), "held back: the handover delay stays aligned");
     }
 
     /// A plugin that holds the sound back and gives up mid-stream hands over what it still

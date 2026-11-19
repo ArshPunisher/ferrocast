@@ -40,11 +40,18 @@ impl Denoiser {
         let df = DfTract::new(DfParams::default(), &rp).map_err(|e| format!("{e:#}"))?;
         let hop = df.hop_size;
         // One block of silence first: what's handed back is always there.
-        let out = (0..channels).map(|_| std::iter::repeat_n(0.0, hop).collect()).collect();
+        let cap = hop * 4 + 1024;
+        let out = (0..channels)
+            .map(|_| {
+                let mut q = VecDeque::with_capacity(cap);
+                q.extend(std::iter::repeat_n(0.0, hop));
+                q
+            })
+            .collect();
         Ok(Denoiser {
             df,
             hop,
-            inp: (0..channels).map(|_| VecDeque::with_capacity(hop * 4)).collect(),
+            inp: (0..channels).map(|_| VecDeque::with_capacity(cap)).collect(),
             out,
             noisy: Array2::zeros((channels, hop)),
             clean: Array2::zeros((channels, hop)),
@@ -112,11 +119,26 @@ impl std::fmt::Debug for Denoiser {
     }
 }
 
-/// A stereo block, there and back, with its number.
-/// What the denoiser's thread is handed: the next block (left, right), or a new strength.
-enum Ask {
-    Block(Vec<f32>, Vec<f32>),
-    Strength(u32),
+/// Worker-side denoiser interface so tests can inject slow model loads or init failures
+/// deterministically without loading ONNX weights.
+trait WorkerEngine {
+    fn latency(&self) -> usize;
+    fn set_strength(&mut self, strength: u32);
+    fn run(&mut self, planes: &mut [&mut [f32]]);
+}
+
+impl WorkerEngine for Denoiser {
+    fn latency(&self) -> usize {
+        Denoiser::latency(self)
+    }
+
+    fn set_strength(&mut self, strength: u32) {
+        Denoiser::set_strength(self, strength);
+    }
+
+    fn run(&mut self, planes: &mut [&mut [f32]]) {
+        Denoiser::run(self, planes);
+    }
 }
 
 /// The built-in model's own delay (samples): `Denoiser::latency` once it's made, known before
@@ -127,8 +149,12 @@ const MODEL_LATENCY: usize = 1920;
 /// 18 Nov); the frame loop mixes two blocks back to back now and then (30 fps), so one block
 /// behind left the second's answer not back yet a third of the time, and it gave up.
 const PIPE: usize = 2048;
-/// The most the mixer waits for an answer that's nearly there.
-const GRACE: std::time::Duration = std::time::Duration::from_millis(2);
+/// Bounded worker inbox (3 blocks ≈ 64 ms): blocks are never queued while the model is still
+/// loading, and a transient CPU spike drops the oldest queued block instead of accumulating an
+/// unbounded backlog that permanently trips `gave_up` (M2-02).
+const MAX_INBOX: usize = 3;
+const MAX_OUTBOX: usize = 8;
+const MAX_RECYCLE: usize = 12;
 /// Samples a change to the sound as it came is eased over when there's no answer to fade from.
 const DECLICK: usize = 64;
 /// The longest the model may take to get ready before the light noise removal is used instead.
@@ -140,114 +166,253 @@ const READY_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 const JUDGE_SECS: usize = 10;
 const MOST_DRY: f32 = 0.2;
 
+/// One stereo audio block moving between `Plugin` and its worker thread, tagged with the exact
+/// stream sample index `at` of its first input sample so startup skip and drop-oldest recovery
+/// keep exact sample alignment.
+struct BlockBuf {
+    at: u64,
+    l: Vec<f32>,
+    r: Vec<f32>,
+}
+
+struct Queue {
+    inbox: VecDeque<BlockBuf>,
+    outbox: VecDeque<BlockBuf>,
+    /// Recycled stereo buffers so steady-state `process()` performs zero heap allocations.
+    recycle: Vec<(Vec<f32>, Vec<f32>)>,
+    pending_strength: Option<u32>,
+    ready: bool,
+    dead: bool,
+    closed: bool,
+}
+
+impl Queue {
+    fn new() -> Self {
+        let mut recycle = Vec::with_capacity(MAX_RECYCLE);
+        for _ in 0..6 {
+            recycle.push((Vec::with_capacity(1024), Vec::with_capacity(1024)));
+        }
+        Self {
+            inbox: VecDeque::with_capacity(MAX_INBOX),
+            outbox: VecDeque::with_capacity(MAX_OUTBOX),
+            recycle,
+            pending_strength: None,
+            ready: false,
+            dead: false,
+            closed: false,
+        }
+    }
+
+    fn take_buf(&mut self, n: usize) -> (Vec<f32>, Vec<f32>) {
+        self.recycle.pop().unwrap_or_else(|| (Vec::with_capacity(n), Vec::with_capacity(n)))
+    }
+
+    fn put_buf(&mut self, mut l: Vec<f32>, mut r: Vec<f32>) {
+        if self.recycle.len() < MAX_RECYCLE {
+            l.clear();
+            r.clear();
+            self.recycle.push((l, r));
+        }
+    }
+}
+
+struct Shared {
+    q: std::sync::Mutex<Queue>,
+    wake: std::sync::Condvar,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared").finish_non_exhaustive()
+    }
+}
+
 /// Our engine's sound filter: a stereo Denoiser on a thread of its own (the model can't move
 /// between threads, the mixer's filters do). The model is made on that thread (it takes a moment)
-/// and every block goes there in order; what comes back is played one block later. Until the
-/// model is ready, or when an answer is late, the sound plays as it came, delayed the same, so
-/// nothing is silenced and nothing moves in time; switching between the two fades over a block.
+/// without enqueuing blocks until it is ready, and every subsequent block goes through a bounded
+/// drop-oldest queue. Until the model is ready, or when an answer is late, the sound plays as it
+/// came, delayed the same, so nothing is silenced and nothing moves in time; switching between
+/// the two fades over a block. Never blocks in `process()`.
 #[derive(Debug)]
 struct Plugin {
-    to: std::sync::mpsc::Sender<Ask>,
-    from: std::sync::mpsc::Receiver<(Vec<f32>, Vec<f32>)>,
-    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The model's answers not played yet (planar), and the index of the first one.
+    shared: std::sync::Arc<Shared>,
+    /// The model's answers not played yet (planar), and the stream sample index of `wet[0][0]`.
     wet: [VecDeque<f32>; 2],
     wet_at: u64,
+    /// Earliest stream sample index from which `wet` holds valid (post-warmup) model output.
+    wet_valid_from: u64,
+    /// True once at least one block has been drained from `outbox`.
+    have_wet_stream: bool,
+    /// True once the model has actually delivered at least one usable wet block (judging starts
+    /// only after this, and failed init before this leaves zero handover delay).
+    ever_wet: bool,
     /// Samples handed out so far.
     out_at: u64,
     /// What came in, `latency` samples ago (what plays when there's no answer).
     dry: [VecDeque<f32>; 2],
+    /// Pre-allocated scratch for the current block's dry samples (zero per-block allocation).
+    dry_scratch: [Vec<f32>; 2],
     /// The last block was the model's.
     was_wet: bool,
-    /// Samples judged in this stretch, and how many of them passed dry, since the model was
-    /// ready.
+    /// Samples judged in this stretch, and how many of them passed dry, since the first wet block.
     judged: usize,
     dry_run: usize,
-    /// Too slow for this computer: the next block isn't taken.
+    /// Too slow for this computer or failed init: the next block isn't taken.
     gave_up: bool,
+    /// True if init failed or timed out before ever delivering wet audio (reports 0 latency and
+    /// no handover buffer so `light_denoise` is not stuck behind an 82.7 ms delay line).
+    failed_init: bool,
     /// The last sample handed out, each side.
     last: [f32; 2],
-    /// When it was made: a model that never gets ready gives up (its blocks would pile up).
+    /// When it was made, and how long startup may take before giving up.
     made: std::time::Instant,
+    ready_within: std::time::Duration,
     strength: u32,
+}
+
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        let mut q = self.shared.q.lock().unwrap_or_else(|e| e.into_inner());
+        q.closed = true;
+        self.shared.wake.notify_all();
+    }
 }
 
 impl Plugin {
     fn start(strength: u32) -> Result<Self, String> {
-        let (to, inbox) = std::sync::mpsc::channel::<Ask>();
-        let (outbox, from) = std::sync::mpsc::channel();
-        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let up = ready.clone();
+        Self::start_with(strength, READY_WITHIN, |s| Denoiser::new(2, s))
+    }
+
+    fn start_with<E, F>(strength: u32, ready_within: std::time::Duration, make: F) -> Result<Self, String>
+    where
+        E: WorkerEngine,
+        F: FnOnce(u32) -> Result<E, String> + Send + 'static,
+    {
+        let shared =
+            std::sync::Arc::new(Shared { q: std::sync::Mutex::new(Queue::new()), wake: std::sync::Condvar::new() });
+        let worker_shared = shared.clone();
         std::thread::Builder::new()
             .name("ferrocast-denoise".into())
             .spawn(move || {
                 // As soon as the frame loop: it waits for nothing here any more, but a model
                 // woken late leaves the sound dry.
                 ferrocore::engine::raise_this_thread();
-                let mut d = match Denoiser::new(2, strength) {
+                let mut d = match make(strength) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::warn!(error = %e, "the strong noise removal couldn't start");
+                        let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
+                        q.dead = true;
                         return;
                     }
                 };
                 if d.latency() != MODEL_LATENCY {
                     tracing::warn!(latency = d.latency(), "the noise removal's model has another delay");
                 }
-                up.store(true, std::sync::atomic::Ordering::Release);
-                // Until the filter goes (its sender with it).
-                for ask in inbox {
-                    match ask {
-                        Ask::Strength(s) => d.set_strength(s),
-                        Ask::Block(mut l, mut r) => {
-                            d.run(&mut [&mut l, &mut r]);
-                            if outbox.send((l, r)).is_err() {
-                                return;
-                            }
+                {
+                    let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
+                    q.ready = true;
+                    if q.closed {
+                        return;
+                    }
+                }
+                loop {
+                    let (new_strength, blk) = {
+                        let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
+                        while !q.closed && q.inbox.is_empty() && q.pending_strength.is_none() {
+                            q = worker_shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
                         }
+                        if q.closed {
+                            return;
+                        }
+                        (q.pending_strength.take(), q.inbox.pop_front())
+                    };
+                    if let Some(s) = new_strength {
+                        d.set_strength(s);
+                    }
+                    if let Some(mut blk) = blk {
+                        d.run(&mut [&mut blk.l, &mut blk.r]);
+                        let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
+                        if q.closed {
+                            return;
+                        }
+                        if q.outbox.len() >= MAX_OUTBOX
+                            && let Some(old) = q.outbox.pop_front()
+                        {
+                            q.put_buf(old.l, old.r);
+                        }
+                        q.outbox.push_back(blk);
                     }
                 }
             })
             .map_err(|e| e.to_string())?;
-        let silence = || std::iter::repeat_n(0.0, MODEL_LATENCY + PIPE).collect::<VecDeque<f32>>();
+        let silence = || {
+            let mut q = VecDeque::with_capacity(MODEL_LATENCY + PIPE + 1024);
+            q.extend(std::iter::repeat_n(0.0, MODEL_LATENCY + PIPE));
+            q
+        };
         Ok(Self {
-            to,
-            from,
-            ready,
-            wet: [VecDeque::new(), VecDeque::new()],
+            shared,
+            wet: [VecDeque::with_capacity(PIPE + 2048), VecDeque::with_capacity(PIPE + 2048)],
             wet_at: 0,
+            wet_valid_from: 0,
+            have_wet_stream: false,
+            ever_wet: false,
             out_at: 0,
             dry: [silence(), silence()],
+            dry_scratch: [Vec::with_capacity(1024), Vec::with_capacity(1024)],
             was_wet: false,
             judged: 0,
             dry_run: 0,
             gave_up: false,
+            failed_init: false,
             last: [0.0; 2],
             made: std::time::Instant::now(),
+            ready_within,
             strength,
         })
     }
 
-    /// Takes the answers that came back.
-    fn take(&mut self) {
-        while let Ok((l, r)) = self.from.try_recv() {
-            self.wet[0].extend(l);
-            self.wet[1].extend(r);
+    /// Takes finished blocks from `q.outbox`, keeping exact stream alignment across startup skips
+    /// and drop-oldest discontinuities, and recycles every block's buffers back into `q.recycle`.
+    fn drain_outbox(
+        q: &mut Queue,
+        wet: &mut [VecDeque<f32>; 2],
+        wet_at: &mut u64,
+        wet_valid_from: &mut u64,
+        have_wet_stream: &mut bool,
+    ) {
+        while let Some(blk) = q.outbox.pop_front() {
+            let expected = *wet_at + wet[0].len() as u64;
+            if !*have_wet_stream || blk.at != expected {
+                // First block after model load, or a block was dropped during a CPU spike:
+                // reset the wet stream to `blk.at` and hold dry until the model's `MODEL_LATENCY`
+                // overlap-add warmup flushes out, avoiding a silence dip or phase jump.
+                wet[0].clear();
+                wet[1].clear();
+                *wet_at = blk.at;
+                *wet_valid_from = blk.at + MODEL_LATENCY as u64;
+                *have_wet_stream = true;
+            }
+            wet[0].extend(blk.l.iter().copied());
+            wet[1].extend(blk.r.iter().copied());
+            q.put_buf(blk.l, blk.r);
         }
     }
 
-    /// The model's answers for samples `from..from + n` of its stream (it starts `PIPE` behind
-    /// what's played), when they're all here.
+    /// True when the model's post-warmup answers for `from..from + n` (with `from = out_at - PIPE`)
+    /// are completely available at the front of `self.wet`.
     fn wet_for(&mut self, n: usize) -> bool {
-        let from = self.out_at.saturating_sub(PIPE as u64);
+        if !self.have_wet_stream || self.out_at < PIPE as u64 {
+            return false;
+        }
+        let from = self.out_at - PIPE as u64;
         // Answers for samples already played: let go.
         let old = from.saturating_sub(self.wet_at).min(self.wet[0].len() as u64) as usize;
         self.wet[0].drain(..old);
         self.wet[1].drain(..old);
         self.wet_at += old as u64;
-        // The first `PIPE` samples have no answer (the model's stream starts later): silence.
-        let head = (PIPE as u64).saturating_sub(self.out_at).min(n as u64) as usize;
-        self.wet_at <= from + head as u64 && self.wet[0].len() + head >= n
+        from >= self.wet_valid_from && self.wet_at == from && self.wet[0].len() >= n
     }
 }
 
@@ -258,44 +423,59 @@ impl ferrocore::afx::SoundPlugin for Plugin {
         if self.gave_up {
             return false;
         }
-        // Every block goes to the model in order (its state follows the sound); a thread that's
-        // gone: the light noise removal instead.
-        if self.to.send(Ask::Block(l[..n].to_vec(), r[..n].to_vec())).is_err() {
+        // Single short lock: check worker state, enqueue only once ready (drop-oldest if full),
+        // and drain any completed wet blocks without ever sleeping inside the mixer lock.
+        let ready = {
+            let mut q = self.shared.q.lock().unwrap_or_else(|e| e.into_inner());
+            if q.dead {
+                self.failed_init = !self.ever_wet;
+                self.gave_up = true;
+                return false;
+            }
+            let ready = q.ready;
+            if ready {
+                let (mut bl, mut br) = q.take_buf(n);
+                bl.extend_from_slice(&l[..n]);
+                br.extend_from_slice(&r[..n]);
+                while q.inbox.len() >= MAX_INBOX {
+                    if let Some(old) = q.inbox.pop_front() {
+                        q.put_buf(old.l, old.r);
+                    }
+                }
+                q.inbox.push_back(BlockBuf { at: self.out_at, l: bl, r: br });
+                self.shared.wake.notify_one();
+            }
+            Self::drain_outbox(
+                &mut q,
+                &mut self.wet,
+                &mut self.wet_at,
+                &mut self.wet_valid_from,
+                &mut self.have_wet_stream,
+            );
+            ready
+        };
+        if !self.ever_wet && self.made.elapsed() > self.ready_within {
+            tracing::warn!("the strong noise removal didn't get ready: the light one takes over");
+            self.failed_init = true;
+            self.gave_up = true;
             return false;
         }
-        // The sound as it came, delayed as the model's is.
-        let mut dry = [Vec::with_capacity(n), Vec::with_capacity(n)];
+        // The sound as it came, delayed as the model's is (reuses pre-allocated scratch).
         for (c, x) in [&*l, &*r].into_iter().enumerate() {
             self.dry[c].extend(&x[..n]);
-            dry[c].extend(self.dry[c].drain(..n));
+            self.dry_scratch[c].clear();
+            self.dry_scratch[c].extend(self.dry[c].drain(..n));
         }
-        let ready = self.ready.load(std::sync::atomic::Ordering::Acquire);
-        if !ready && self.made.elapsed() > READY_WITHIN {
-            tracing::warn!("the strong noise removal didn't get ready: the light one takes over");
-            self.gave_up = true;
-        }
-        self.take();
         let mut wet = ready && self.wet_for(n);
-        if ready && !wet {
-            // Nearly there: a moment's wait, never more.
-            let until = std::time::Instant::now() + GRACE;
-            while !wet && std::time::Instant::now() < until {
-                match self.from.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
-                    Ok((a, b)) => {
-                        self.wet[0].extend(a);
-                        self.wet[1].extend(b);
-                        wet = self.wet_for(n);
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                }
-            }
+        if wet {
+            self.ever_wet = true;
         }
         // The model's answers for this block are here (`have`), and they're played (`wet`).
         let have = wet;
-        // Judged before this block plays: one that gives up fades to the sound as it came here,
-        // so the light noise removal after it starts from there (no step).
-        if ready {
+        // Judging starts only after the first wet block arrives (never penalized during slow
+        // startup or pipeline fill). One that gives up fades to dry here so `light_denoise`
+        // starts from there with no step.
+        if self.ever_wet {
             self.judged += n;
             if !wet {
                 self.dry_run += n;
@@ -313,23 +493,22 @@ impl ferrocore::afx::SoundPlugin for Plugin {
                 self.dry_run = 0;
             }
         }
-        let head = (PIPE as u64).saturating_sub(self.out_at).min(n as u64) as usize;
         for (c, x) in [&mut *l, &mut *r].into_iter().enumerate() {
             // Where the last block ended, for a change with no answer to fade from.
-            let step = self.last[c] - dry[c].first().copied().unwrap_or(0.0);
+            let step = self.last[c] - self.dry_scratch[c].first().copied().unwrap_or(0.0);
             for (i, v) in x[..n].iter_mut().enumerate() {
-                // Before the model's stream starts (`head`): nothing of it.
-                let w = if have && i >= head { self.wet[c].get(i - head).copied().unwrap_or(0.0) } else { 0.0 };
+                let w = if have { self.wet[c].get(i).copied().unwrap_or(0.0) } else { 0.0 };
+                let d = self.dry_scratch[c][i];
                 let t = i as f32 / n as f32;
                 *v = match (self.was_wet, wet, have) {
                     // A change between the two fades across the block: no step, no click.
-                    (false, true, _) => dry[c][i] + (w - dry[c][i]) * t,
-                    (true, false, true) => w + (dry[c][i] - w) * t,
+                    (false, true, _) => d + (w - d) * t,
+                    (true, false, true) => w + (d - w) * t,
                     // The answer late: the sound as it came, eased in from where the last block
                     // ended (fading from no answer at all dipped to silence; CodeRabbit).
-                    (true, false, false) => dry[c][i] + step * (1.0 - (i as f32 / DECLICK as f32)).max(0.0),
+                    (true, false, false) => d + step * (1.0 - (i as f32 / DECLICK as f32)).max(0.0),
                     (true, true, _) => w,
-                    (false, false, _) => dry[c][i],
+                    (false, false, _) => d,
                 };
             }
             if let Some(end) = x[..n].last() {
@@ -338,24 +517,34 @@ impl ferrocore::afx::SoundPlugin for Plugin {
         }
         self.out_at += n as u64;
         self.was_wet = wet;
-        // Too slow for this computer: from the next block the light one takes over, going on
-        // from what this one still holds (`hand_over`).
         true
     }
 
     fn latency_frames(&self) -> usize {
-        MODEL_LATENCY + PIPE
+        if self.failed_init {
+            return 0;
+        }
+        let dead = self.shared.q.lock().map(|q| q.dead).unwrap_or(false);
+        if dead && !self.ever_wet { 0 } else { MODEL_LATENCY + PIPE }
     }
 
     fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
+        if self.failed_init || !self.ever_wet {
+            return None;
+        }
         Some([self.dry[0].drain(..).collect(), self.dry[1].drain(..).collect()])
     }
 
     fn retune(&mut self, effect: &ferrocore::afx::AudioEffect) -> bool {
         let ferrocore::afx::AudioEffect::Denoise { strength } = *effect else { return false };
+        let mut q = self.shared.q.lock().unwrap_or_else(|e| e.into_inner());
+        if q.dead || self.gave_up {
+            return false;
+        }
         if strength != self.strength {
             self.strength = strength;
-            return self.to.send(Ask::Strength(strength.clamp(1, 100))).is_ok();
+            q.pending_strength = Some(strength.clamp(1, 100));
+            self.shared.wake.notify_one();
         }
         true
     }
@@ -759,5 +948,115 @@ mod tests {
         let first =
             outl.iter().enumerate().skip(said + 1024).find(|(_, v)| v.abs() > 0.02).map_or(usize::MAX, |(i, _)| i);
         assert!(first >= 20_000 + said - 64 && first <= 20_000 + said + 480, "came out at {first}, said {said}");
+    }
+
+    /// Deterministic fake denoiser with `MODEL_LATENCY` sample delay that halves amplitude
+    /// (distinguishable from untouched dry audio) and can simulate a one-time mid-stream stall.
+    struct MockEngine {
+        delay: [VecDeque<f32>; 2],
+        gain: f32,
+        stall_on: Option<(usize, std::time::Duration)>,
+        calls: usize,
+    }
+
+    impl MockEngine {
+        fn new(gain: f32, stall_on: Option<(usize, std::time::Duration)>) -> Self {
+            let z = || std::iter::repeat_n(0.0f32, MODEL_LATENCY).collect::<VecDeque<f32>>();
+            Self { delay: [z(), z()], gain, stall_on, calls: 0 }
+        }
+    }
+
+    impl WorkerEngine for MockEngine {
+        fn latency(&self) -> usize {
+            MODEL_LATENCY
+        }
+        fn set_strength(&mut self, _: u32) {}
+        fn run(&mut self, planes: &mut [&mut [f32]]) {
+            if let Some((at, dur)) = self.stall_on
+                && self.calls == at
+            {
+                std::thread::sleep(dur);
+            }
+            self.calls += 1;
+            for (c, p) in planes.iter_mut().take(2).enumerate() {
+                for s in p.iter_mut() {
+                    self.delay[c].push_back(*s * self.gain);
+                    *s = self.delay[c].pop_front().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+
+    /// An 800 ms model load while real-time blocks arrive must not pile up an unbounded startup
+    /// backlog or trip `gave_up`: wet output engages cleanly in exact phase once ready (M2-02).
+    #[test]
+    fn slow_startup_never_triggers_gave_up_and_engages_in_phase() {
+        use ferrocore::afx::SoundPlugin as _;
+        let mut p = Plugin::start_with(65, READY_WITHIN, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            Ok(MockEngine::new(0.25, None))
+        })
+        .expect("worker spawns");
+        let mut tail_rms = Vec::new();
+        for b in 0..65 {
+            let mut l = vec![0.4f32; 1024];
+            let mut r = vec![0.4f32; 1024];
+            assert!(p.process([&mut l, &mut r]), "block {b} must not give up");
+            if b >= 55 {
+                tail_rms.push(rms(&l));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(21));
+        }
+        assert!(!p.gave_up, "slow startup must not permanently give up");
+        assert!(p.ever_wet, "wet output engaged once model loaded");
+        let avg = tail_rms.iter().sum::<f32>() / tail_rms.len() as f32;
+        assert!((avg - 0.1).abs() < 0.01, "cleaned wet output (0.4 * 0.25 = 0.1), got {avg:.4}");
+    }
+
+    /// A model that fails to initialize (immediately or after a few startup blocks) must report
+    /// zero latency and no handover buffer so `light_denoise` is not stuck behind an 82.7 ms delay.
+    #[test]
+    fn failed_init_leaves_zero_latency_and_no_handover() {
+        use ferrocore::afx::SoundPlugin as _;
+        let mut p = Plugin::start_with::<MockEngine, _>(65, READY_WITHIN, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Err("simulated model load failure".into())
+        })
+        .expect("worker spawns");
+        let mut gave_up = false;
+        for _ in 0..10 {
+            let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+            if !p.process([&mut l, &mut r]) {
+                gave_up = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gave_up, "failed init must hand over to light_denoise");
+        assert_eq!(p.latency_frames(), 0, "failed init must report 0 latency, not 3968");
+        assert!(p.hand_over().is_none(), "failed init must not hand over a dry delay line");
+    }
+
+    /// A transient CPU stall mid-stream drops oldest queued blocks instead of building a permanent
+    /// backlog, then recovers cleanly back to wet output without giving up (M2-02).
+    #[test]
+    fn brief_cpu_stall_drops_oldest_and_recovers() {
+        use ferrocore::afx::SoundPlugin as _;
+        let mut p = Plugin::start_with(65, READY_WITHIN, |_| {
+            Ok(MockEngine::new(0.25, Some((10, std::time::Duration::from_millis(160)))))
+        })
+        .expect("worker spawns");
+        let mut recovered = Vec::new();
+        for b in 0..45 {
+            let (mut l, mut r) = (vec![0.4f32; 1024], vec![0.4f32; 1024]);
+            assert!(p.process([&mut l, &mut r]), "block {b} must not give up");
+            if b >= 35 {
+                recovered.push(rms(&l));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(21));
+        }
+        assert!(!p.gave_up, "brief stall must not trigger permanent gave_up");
+        let avg = recovered.iter().sum::<f32>() / recovered.len() as f32;
+        assert!((avg - 0.1).abs() < 0.01, "recovered cleanly back to wet (0.1), got {avg:.4}");
     }
 }
