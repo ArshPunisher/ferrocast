@@ -3824,6 +3824,16 @@ mod tests {
         assert_eq!(pick_window("Discord", "Mail", &list), None);
     }
 
+    /// Whether an output can encode here: the Mac always; elsewhere only with a working FFmpeg
+    /// H.264 encoder (GitHub's Windows runner has none: these tests failed there, not skipped).
+    fn encodes_here() -> bool {
+        let ok = cfg!(target_os = "macos") || crate::ffenc::h264_encoder().is_some();
+        if !ok {
+            eprintln!("skipped: no H.264 encoder here");
+        }
+        ok
+    }
+
     fn engine() -> Option<Engine> {
         let video = VideoConfig {
             codec: VideoCodec::H264,
@@ -3899,6 +3909,9 @@ mod tests {
     /// time order, and sound keeps flowing with them.
     #[test]
     fn frames_still_on_the_card_reach_an_output_that_stops() {
+        if !encodes_here() {
+            return;
+        }
         let Some(e) = engine() else { return };
         e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
             .unwrap_or_else(|x| panic!("{x}"));
@@ -3936,6 +3949,9 @@ mod tests {
     /// back at 0), time only goes forward, and frames come half as often after.
     #[test]
     fn a_live_stream_changes_its_picture_without_stopping() {
+        if !encodes_here() {
+            return;
+        }
         let Some(e) = engine() else { return };
         e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
             .unwrap_or_else(|x| panic!("{x}"));

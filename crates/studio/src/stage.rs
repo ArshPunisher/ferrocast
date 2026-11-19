@@ -5154,7 +5154,8 @@ mod tests {
         // Owner's OBS comparison, 12 Nov: a 1917-wide window's screenshot came out 1918 wide,
         // scaled, its text blurred. Odd sides are kept; a recording of it alone crops to even.
         let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
-        if s.engine().is_err() {
+        // It records: skipped where nothing encodes (GitHub's Windows runner has no FFmpeg H.264).
+        if s.engine().is_err() || !(cfg!(target_os = "macos") || ferrocore::ffenc::h264_encoder().is_some()) {
             return;
         }
         let dir = std::env::temp_dir().join(format!("ferrocast-odd-{}", std::process::id()));
