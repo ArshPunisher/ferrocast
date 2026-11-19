@@ -149,13 +149,13 @@ pub struct Plan {
 /// Why there's no plan, in words for the Go live screen (the stream then goes out as usual).
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EbError {
-    #[error("Twitch didn't answer about Enhanced Broadcasting ({0})")]
+    #[error("Twitch didn't answer ({0})")]
     Unreachable(String),
-    #[error("Twitch's answer about Enhanced Broadcasting couldn't be read")]
+    #[error("Twitch's answer couldn't be read")]
     Unreadable,
-    #[error("Twitch said no to Enhanced Broadcasting: {0}")]
+    #[error("Twitch said no: {0}")]
     Refused(String),
-    #[error("Twitch gave no qualities or address for Enhanced Broadcasting")]
+    #[error("Twitch gave no qualities or address")]
     Empty,
 }
 

@@ -137,12 +137,15 @@ pub fn verdict_keeping(upload_kbps: u32, needs: &[Need], free_pct: u8) -> Verdic
         )
     } else {
         let each = usable / n as u32;
-        let mut m = format!("{} need {}; you have {}.", count(n), mbps(need), mbps(upload_kbps));
+        let mut m = format!("Upload {}, {} needed.", mbps(upload_kbps), mbps(need));
         if fit_count > 0 {
-            m.push_str(&format!(" Send {} at this quality", count(fit_count).to_lowercase()));
-            m.push_str(&format!(", or all {n} at about {} each (lower the bitrate in OBS).", mbps(each)));
+            m.push_str(&format!(
+                " Send {}, or lower the bitrate to about {} each.",
+                count(fit_count).to_lowercase(),
+                mbps(each)
+            ));
         } else {
-            m.push_str(&format!(" Lower the bitrate in OBS to about {} for one platform.", mbps(usable)));
+            m.push_str(&format!(" Lower the bitrate to about {}.", mbps(usable)));
         }
         m
     };
@@ -165,17 +168,14 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
     if let Some(c) = stats.video_codec
         && !codecs.contains(&c)
     {
-        out.push(format!(
-            "{name} doesn't take {} video. Pick H.264 in OBS (Settings, Output, Video Encoder), or turn {name} off.",
-            codec_name(c)
-        ));
+        out.push(format!("{name} doesn't take {}. Switch to H.264, or turn {name} off.", codec_name(c)));
     }
     // A little slack: encoders place keyframes at the frame nearest the interval.
     if let Some(k) = stats.keyframe_interval_ms
         && k > max_keyint_ms + 250
     {
         out.push(format!(
-            "{name} needs a keyframe at least every {} s; yours come every {:.1} s. Set the keyframe interval to 2 s.",
+            "{name} needs a keyframe every {} s; yours is {:.1} s. Set it to 2 s.",
             max_keyint_ms / 1000,
             f64::from(k) / 1000.0
         ));
@@ -183,16 +183,12 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
     // The measured rate includes audio (up to about 320 kbps).
     if stats.kbps > max_kbps + 400 {
         // Kick cuts a stream over its limit (seen 25 Oct: it dropped and reconnected every 15 s at
-        // 12,000 kbps); Twitch and YouTube take it and their viewers may see it stutter.
-        let then = if s == Service::Kick {
-            "Kick cuts it off, so it keeps dropping and reconnecting"
-        } else {
-            "viewers may see it stutter"
-        };
+        // 12,000 kbps); Twitch and YouTube take it and their viewers may see it stutter. The
+        // dashboard reads "to N kbps or less" out of this to offer the fix button: keep that part.
+        let then = if s == Service::Kick { "Kick cuts it off" } else { "it may stutter" };
         out.push(format!(
-            "{name} takes up to {} of video; you're sending {}. Lower the video bitrate to {} or less, or {then}.",
+            "Over {name}'s {} limit, {then}. Lower the bitrate to {} or less.",
             kbps_text(max_kbps),
-            kbps_text(stats.kbps),
             kbps_text(max_kbps.saturating_sub(500)),
         ));
     }
@@ -253,11 +249,11 @@ mod tests {
         assert_eq!(v.fit_count, 1, "80% of 12 is 9.6: only the first 6 fits");
         assert_eq!(
             v.message,
-            "3 platforms need 18 Mbps; you have 12 Mbps. Send 1 platform at this quality, or all 3 at about 3.2 Mbps each (lower the bitrate in OBS)."
+            "Upload 12 Mbps, 18 Mbps needed. Send 1 platform, or lower the bitrate to about 3.2 Mbps each."
         );
         let v = verdict(5_000, &[need("Twitch", 6000)]);
         assert_eq!(v.fit_count, 0);
-        assert!(v.message.ends_with("Lower the bitrate in OBS to about 4.0 Mbps for one platform."), "{}", v.message);
+        assert_eq!(v.message, "Upload 5.0 Mbps, 6.0 Mbps needed. Lower the bitrate to about 4.0 Mbps.");
         assert_eq!(verdict(8_000, &[]).message, "Your upload is 8.0 Mbps. Turn on a platform to check it.");
         assert!(!verdict(0, &[need("Twitch", 1)]).fits);
     }
@@ -277,13 +273,13 @@ mod tests {
             StreamStats { video_codec: Some(VideoCodec::Hevc), keyframe_interval_ms: Some(8000), kbps: 9000, ..good };
         let t = rules(&hevc, Service::Twitch);
         assert_eq!(t.len(), 3, "{t:?}");
-        assert!(t[0].starts_with("Twitch doesn't take HEVC (H.265) video."));
-        assert!(t[1].contains("yours come every 8.0 s"));
-        assert!(t[2].contains("up to 6,000 kbps of video; you're sending 9,000 kbps"));
+        assert_eq!(t[0], "Twitch doesn't take HEVC (H.265). Switch to H.264, or turn Twitch off.");
+        assert!(t[1].contains("yours is 8.0 s"));
+        assert_eq!(t[2], "Over Twitch's 6,000 kbps limit, it may stutter. Lower the bitrate to 5,500 kbps or less.");
         // YouTube takes HEVC and 9 Mbps, but not an 8 s keyframe gap.
         let y = rules(&hevc, Service::Youtube);
         assert_eq!(y.len(), 1);
-        assert!(y[0].contains("at least every 4 s"));
+        assert_eq!(y[0], "YouTube needs a keyframe every 4 s; yours is 8.0 s. Set it to 2 s.");
         assert!(rules(&hevc, Service::Custom).is_empty());
         // Not streaming yet: nothing known, nothing said.
         assert!(rules(&StreamStats::default(), Service::Twitch).is_empty());
@@ -295,10 +291,16 @@ mod tests {
         let k = rules(&fast, Service::Kick);
         assert_eq!(k.len(), 1);
         assert!(
-            k[0].contains("Lower the video bitrate to 7,500 kbps or less") && k[0].contains("keeps dropping"),
+            k[0] == "Over Kick's 8,000 kbps limit, Kick cuts it off. Lower the bitrate to 7,500 kbps or less.",
             "{k:?}"
         );
         assert!(rules(&fast, Service::Twitch)[0].contains("stutter"));
+        // The dashboard's fix button reads the number out of these words (golive.tsx askedKbps:
+        // /to ([\d,]+) kbps or less/): they must keep that shape.
+        for r in [&k[0], &rules(&fast, Service::Twitch)[0]] {
+            let at = r.find(" to ").map(|i| &r[i + 4..]).unwrap_or_default();
+            assert!(at.contains(" kbps or less"), "{r}");
+        }
     }
 
     #[test]
