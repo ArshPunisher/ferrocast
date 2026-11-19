@@ -1,7 +1,7 @@
 //! The REST side: tokens (refreshed once at a time and saved before use), finding the
 //! live chat, sending, deleting and banning.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -15,6 +15,43 @@ use crate::{Endpoints, YoutubeError, now_ms};
 
 type OnTokens = Arc<dyn Fn(&Tokens) -> Result<(), String> + Send + Sync>;
 
+#[derive(Debug, Clone)]
+struct MadeBroadcast {
+    id: String,
+    stream_id: String,
+    at: i64,
+}
+
+#[derive(Debug, Default)]
+struct MadeSlot {
+    broadcast: Option<MadeBroadcast>,
+    /// Newly created Ferrocast stream cached briefly while YouTube's `liveStreams.list` catches
+    /// up. Always superseded once the server lists the same stream id.
+    stream: Option<(Value, i64)>,
+}
+
+impl MadeSlot {
+    fn fresh_broadcast(&self, now: i64) -> Option<&MadeBroadcast> {
+        self.broadcast.as_ref().filter(|m| now - m.at < MADE_FRESH_MS)
+    }
+
+    fn merge_fresh_stream(&self, streams: &mut Value, now: i64) {
+        let Some((s, _)) = self.stream.as_ref().filter(|(_, at)| now - at < MADE_FRESH_MS) else {
+            return;
+        };
+        let Some(sid) = s.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if let Some(items) = streams.get_mut("items").and_then(Value::as_array_mut) {
+            if !items.iter().any(|x| x.get("id").and_then(Value::as_str) == Some(sid)) {
+                items.push(s.clone());
+            }
+        } else {
+            *streams = json!({ "items": [s.clone()] });
+        }
+    }
+}
+
 pub struct Api {
     pub(crate) http: reqwest::Client,
     pub(crate) ep: Endpoints,
@@ -24,13 +61,29 @@ pub struct Api {
     /// Ban ids by banned channel, so "unban" can find the ban YouTube created.
     bans: StdMutex<HashMap<String, String>>,
     /// Finding or making the normal broadcast, one at a time (CodeRabbit): two calls at once
-    /// would each make one. Holds the one made last (id, when), which YouTube's list can be
-    /// slow to show.
-    made: Mutex<Option<(String, i64)>>,
+    /// would each make one. Holds the one made last (id, stream_id, when), which YouTube's list
+    /// can be slow to show.
+    made: Mutex<MadeSlot>,
+    /// Same serialization and short-term cache for Ferrocast's vertical stream and broadcast.
+    made_vertical: Mutex<MadeSlot>,
 }
 
-/// How long a broadcast just made is trusted while YouTube's list doesn't show it yet.
+/// How long a broadcast or stream just made is trusted while YouTube's list doesn't show it yet.
 const MADE_FRESH_MS: i64 = 10 * 60_000;
+
+/// Upcoming broadcasts scheduled further ahead than this are never auto-taken (e.g. next week's
+/// event); only active broadcasts, ones starting soon, or one the user explicitly picked.
+const UPCOMING_AHEAD_MS: i64 = 2 * 3_600_000;
+
+/// Upcoming non-default broadcasts scheduled earlier than this are treated as stale/abandoned.
+const UPCOMING_PAST_MS: i64 = 12 * 3_600_000;
+
+/// Upper bound on pages followed when paginating `liveStreams` / `liveBroadcasts` (50/page).
+const MAX_LIST_PAGES: usize = 20;
+
+/// Standard YouTube RTMPS ingest server, used as read-only reachability fallback when the channel
+/// doesn't yet have a usable RTMP stream (e.g. vertical stream not created yet, or HLS-only key).
+pub const DEFAULT_INGEST_URL: &str = "rtmps://a.rtmps.youtube.com/live2";
 
 impl fmt::Debug for Api {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,7 +107,8 @@ impl Api {
             tokens: Mutex::new(tokens),
             on_tokens,
             bans: StdMutex::new(HashMap::new()),
-            made: Mutex::new(None),
+            made: Mutex::new(MadeSlot::default()),
+            made_vertical: Mutex::new(MadeSlot::default()),
         }
     }
 
@@ -125,10 +179,61 @@ impl Api {
         })
     }
 
-    /// The live chat of the channel's active broadcast, if it's live now (1 unit).
+    /// Fetches all pages of a YouTube list endpoint (`liveStreams`, `liveBroadcasts`), up to
+    /// `max_pages` pages. Stops on missing/empty or repeated `nextPageToken`.
+    async fn list_paginated(
+        &self,
+        path: &str,
+        base_query: &[(&str, &str)],
+        max_pages: usize,
+    ) -> Result<Value, YoutubeError> {
+        let mut items: Vec<Value> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+        for _ in 0..max_pages.max(1) {
+            let mut query: Vec<(&str, &str)> = base_query.to_vec();
+            if let Some(tok) = page_token.as_deref() {
+                query.push(("pageToken", tok));
+            }
+            let v = self.call(Method::GET, path, &query, None).await?;
+            if let Some(arr) = v.get("items").and_then(Value::as_array) {
+                items.extend(arr.iter().cloned());
+            }
+            let next = v
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from);
+            match next {
+                Some(tok) if seen_tokens.insert(tok.clone()) => page_token = Some(tok),
+                _ => break,
+            }
+        }
+        Ok(json!({ "items": items }))
+    }
+
+    async fn list_streams(&self) -> Result<Value, YoutubeError> {
+        self.list_paginated(
+            "/liveStreams",
+            &[("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")],
+            MAX_LIST_PAGES,
+        )
+        .await
+    }
+
+    async fn list_broadcasts(&self, part: &str, status: &str, max_pages: usize) -> Result<Value, YoutubeError> {
+        self.list_paginated(
+            "/liveBroadcasts",
+            &[("part", part), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "50")],
+            max_pages,
+        )
+        .await
+    }
+
+    /// The live chat of the channel's active broadcast, if it's live now (1 unit/page).
     pub async fn active_live_chat(&self) -> Result<Option<String>, YoutubeError> {
-        let q = [("part", "snippet"), ("broadcastStatus", "active"), ("broadcastType", "all"), ("maxResults", "5")];
-        let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES).await?;
         Ok(v.get("items")
             .and_then(Value::as_array)
             .into_iter()
@@ -190,75 +295,124 @@ pub const VIDEO_CATEGORIES: &[(&str, &str)] = &[
 pub const MAX_TITLE_CHARS: usize = 100;
 
 impl Api {
-    /// The live broadcast, or the next scheduled one (1 unit each).
-    /// The channel's normal broadcast (live first, then the next upcoming one, never
-    /// Ferrocast's vertical one) and the vertical one, each as YouTube lists it
-    /// (snippet, status, contentDetails).
-    async fn broadcasts(&self, vertical_stream: Option<&str>) -> Result<(Option<Value>, Option<Value>), YoutubeError> {
-        let (mut main, mut vertical) = (None, None);
-        for status in ["active", "upcoming"] {
-            let q = [
-                ("part", "id,snippet,status,contentDetails"),
-                ("broadcastStatus", status),
-                ("broadcastType", "all"),
-                ("maxResults", "10"),
-            ];
-            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
-            for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
-                let bound = b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str);
-                if vertical_stream.is_some() && bound == vertical_stream {
-                    vertical.get_or_insert_with(|| b.clone());
-                } else {
-                    main.get_or_insert_with(|| b.clone());
+    /// The channel's eligible normal broadcast (active first, else an upcoming one within the
+    /// short window — never a far-ahead scheduled event — unless `selected_main` names a
+    /// user-picked broadcast) and the eligible vertical broadcast. Paginated.
+    async fn broadcasts(
+        &self,
+        vertical_streams: &HashSet<String>,
+        selected_main: Option<&str>,
+    ) -> Result<(Option<Value>, Option<Value>), YoutubeError> {
+        let now = now_ms();
+        let active = self.list_broadcasts("id,snippet,status,contentDetails", "active", MAX_LIST_PAGES).await?;
+        let upcoming = self.list_broadcasts("id,snippet,status,contentDetails", "upcoming", MAX_LIST_PAGES).await?;
+        let active_items = active.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let upcoming_items = upcoming.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        let is_vertical = |b: &Value| {
+            b.pointer("/contentDetails/boundStreamId")
+                .and_then(Value::as_str)
+                .is_some_and(|s| vertical_streams.contains(s))
+        };
+        let main = match selected_main {
+            Some(want) => {
+                let found = active_items
+                    .iter()
+                    .chain(upcoming_items.iter())
+                    .find(|b| b.get("id").and_then(Value::as_str) == Some(want))
+                    .cloned();
+                match found {
+                    Some(b) => Some(b),
+                    None => {
+                        return Err(YoutubeError::Refused(
+                            "the selected YouTube broadcast wasn't found; pick another or clear the selection".into(),
+                        ));
+                    }
                 }
             }
-        }
+            None => active_items
+                .iter()
+                .find(|b| !is_vertical(b))
+                .cloned()
+                .or_else(|| pick_best_upcoming(upcoming_items.iter().filter(|b| !is_vertical(b)), now)),
+        };
+        let vertical = active_items
+            .iter()
+            .find(|b| is_vertical(b))
+            .cloned()
+            .or_else(|| pick_best_upcoming(upcoming_items.iter().filter(|b| is_vertical(b)), now));
         Ok((main, vertical))
     }
 
-    /// Ferrocast's vertical stream's id, when it has one (liveStreams.list, 1 unit).
-    async fn vertical_stream(&self) -> Result<(Value, Option<String>), YoutubeError> {
-        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
-        let streams = self.call(Method::GET, "/liveStreams", &q, None).await?;
-        let id = vertical_id(&streams);
-        Ok((streams, id))
-    }
-
     pub async fn current_broadcast(&self) -> Result<Option<String>, YoutubeError> {
-        let (_, vertical) = self.vertical_stream().await?;
-        let (main, _) = self.broadcasts(vertical.as_deref()).await?;
+        let streams = self.list_streams().await?;
+        let vertical = vertical_ids(&streams);
+        let (main, _) = self.broadcasts(&vertical, None).await?;
         Ok(main.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)))
     }
 
-    /// The videos stream info goes to: the normal broadcast (made now, bound to the channel's
-    /// stream, when there's none: streaming needs no broadcast made by hand, owner 30 Oct) and
-    /// the vertical one when there is one.
+    /// The videos stream info goes to: the normal broadcast (made now, bound to a variable RTMP
+    /// stream when there's none eligible: streaming needs no broadcast made by hand, owner 30 Oct)
+    /// and the vertical one when there is one.
     async fn info_targets(&self) -> Result<Vec<String>, YoutubeError> {
         let mut made = self.made.lock().await;
-        let (streams, vertical) = self.vertical_stream().await?;
-        let (main, vert) = self.broadcasts(vertical.as_deref()).await?;
-        let listed = main.as_ref().and_then(|b| b.get("id").and_then(Value::as_str)).map(String::from);
-        let main_id = match listed.or_else(|| just_made(&made)) {
+        let now = now_ms();
+        let mut streams = self.list_streams().await?;
+        made.merge_fresh_stream(&mut streams, now);
+        let vertical = vertical_ids(&streams);
+        let (main, vert) = self.broadcasts(&vertical, None).await?;
+        let listed = main
+            .as_ref()
+            .and_then(|b| b.get("id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(String::from);
+        let main_id = match listed.or_else(|| made.fresh_broadcast(now).map(|m| m.id.clone())) {
             Some(id) => id,
             None => {
-                let stream = main_stream_id(&streams, vertical.as_deref(), None).ok_or_else(|| {
+                let candidate = main_stream_id(&streams, &vertical, None).ok_or_else(|| {
                     YoutubeError::Refused(
                         "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
                     )
                 })?;
+                let (stream, _, replaced) = self.ensure_good_main_stream(streams, candidate, &mut made).await?;
+                if replaced {
+                    tracing::info!("YouTube: binding new broadcast to Ferrocast's own key (variable RTMP)");
+                }
                 let id = self.make_broadcast("Live now", None, "public", &stream).await?;
-                *made = Some((id.clone(), now_ms()));
+                made.broadcast = Some(MadeBroadcast { id: id.clone(), stream_id: stream, at: now_ms() });
                 id
             }
         };
         drop(made);
         let mut ids = vec![main_id];
-        ids.extend(vert.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)));
+        let vert_id = match vert.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)) {
+            Some(id) => Some(id),
+            None => self.made_vertical.lock().await.fresh_broadcast(now_ms()).map(|m| m.id.clone()),
+        };
+        ids.extend(vert_id);
         Ok(ids)
     }
 
+    /// Binds broadcast `broadcast_id` to `stream_id` (`liveBroadcasts.bind`, 50 units), failing with
+    /// a clear one-line reason if YouTube refuses.
+    async fn bind_broadcast(&self, broadcast_id: &str, stream_id: &str) -> Result<(), YoutubeError> {
+        if broadcast_id.is_empty() || stream_id.is_empty() {
+            return Err(YoutubeError::Protocol(
+                "couldn't bind the live broadcast: missing broadcast or stream id".into(),
+            ));
+        }
+        self.call(
+            Method::POST,
+            "/liveBroadcasts/bind",
+            &[("id", broadcast_id), ("part", "id"), ("streamId", stream_id)],
+            None,
+        )
+        .await
+        .map(drop)
+        .map_err(|e| wrap_broadcast_error("couldn't bind the live broadcast", e))
+    }
+
     /// A broadcast that starts and ends with the stream, bound to `stream` → its video id
-    /// (liveBroadcasts.insert + bind, 100 units).
+    /// (liveBroadcasts.insert + bind, 100 units). Fails loudly if either step fails.
     async fn make_broadcast(
         &self,
         title: &str,
@@ -277,15 +431,13 @@ impl Api {
         });
         let b = self
             .call(Method::POST, "/liveBroadcasts", &[("part", "id,snippet,status,contentDetails")], Some(body))
-            .await?;
+            .await
+            .map_err(|e| wrap_broadcast_error("couldn't create a live broadcast", e))?;
         let bid = b.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-        self.call(
-            Method::POST,
-            "/liveBroadcasts/bind",
-            &[("id", bid.as_str()), ("part", "id"), ("streamId", stream)],
-            None,
-        )
-        .await?;
+        if bid.is_empty() {
+            return Err(YoutubeError::Protocol("YouTube created a broadcast without an id".into()));
+        }
+        self.bind_broadcast(&bid, stream).await?;
         Ok(bid)
     }
 
@@ -299,6 +451,9 @@ impl Api {
             return Ok(());
         }
         let id = b.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.is_empty() {
+            return Ok(());
+        }
         let mut cd = b.get("contentDetails").cloned().unwrap_or_else(|| json!({}));
         if let Some(o) = cd.as_object_mut() {
             // Read-only ones YouTube refuses back.
@@ -322,13 +477,11 @@ impl Api {
     }
 
     /// The broadcast that went live at `since_ms` or after (give or take 15 minutes): its video
-    /// id and when it went live, newest first; ended ones, then the live one (1 unit each).
+    /// id and when it went live, newest first; ended ones, then the live one (1 unit/page).
     pub async fn last_broadcast(&self, since_ms: i64) -> Result<Option<(String, i64)>, YoutubeError> {
         let mut best: Option<(String, i64)> = None;
-        for status in ["completed", "active"] {
-            let q =
-                [("part", "id,snippet"), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "10")];
-            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+        for (status, max_pages) in [("completed", 4), ("active", MAX_LIST_PAGES)] {
+            let v = self.list_broadcasts("id,snippet", status, max_pages).await?;
             for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
                 let (Some(id), Some(start)) = (
                     b.get("id").and_then(Value::as_str),
@@ -552,123 +705,192 @@ pub fn search_video_categories(query: &str) -> Vec<ferrocast_connector::Category
 }
 
 impl Api {
-    /// Go live everywhere: the stream key and secure server for this channel, never pasted.
-    /// The key bound to the live (or next scheduled) broadcast wins, then the channel's
-    /// default key, then the first one (liveBroadcasts + liveStreams, 1 unit each).
-    pub async fn ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
-        let mut made = self.made.lock().await;
-        let (streams, vertical) = self.vertical_stream().await?;
-        // Ferrocast's own vertical stream (and its broadcast) is never the normal one.
-        let (main, _) = self.broadcasts(vertical.as_deref()).await?;
-        let bound = main.as_ref().and_then(|b| b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str));
-        let mut stream = main_stream_id(&streams, vertical.as_deref(), bound).ok_or_else(|| {
+    /// Read-only ingest server lookup for Test connection, Pre-flight and Upload check.
+    /// Strictly GET-only: never creates, binds or mutates broadcasts or stream keys on YouTube.
+    pub async fn peek_ingest(&self) -> Result<String, YoutubeError> {
+        let streams = self.list_streams().await?;
+        let vertical = vertical_ids(&streams);
+        let candidate = main_stream_id(&streams, &vertical, None).ok_or_else(|| {
             YoutubeError::Refused(
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })?;
-        let mut streams = streams;
-        // A key set to one resolution (an old "1080p" key) caps the stream there whatever is
-        // sent (19 Nov, live: 1440p went out as 1080p on an old vertical key). Ferrocast's own
-        // key, any resolution, is used instead, and the broadcast bound to it (as OBS's YouTube
-        // sign-in makes its own stream).
-        // Not while a broadcast made a moment ago (bound to the old key) isn't listed yet.
-        if fixed_resolution(&streams, &stream) && just_made(&made).is_none() {
-            match self.own_stream(&streams).await {
-                Ok((id, list)) => {
-                    let bound_ok = match &main {
-                        Some(b) if !is_live(b) => {
-                            let bid = b.get("id").and_then(Value::as_str).unwrap_or_default();
-                            self.call(
-                                Method::POST,
-                                "/liveBroadcasts/bind",
-                                &[("id", bid), ("part", "id"), ("streamId", id.as_str())],
-                                None,
-                            )
-                            .await
-                            .map(drop)
-                        }
-                        // Already live on the old key: it stays there (moving it would end it).
-                        Some(_) => Err(YoutubeError::Refused("the broadcast is live on its key".into())),
-                        None => Ok(()),
-                    };
-                    match bound_ok {
-                        Ok(()) => {
-                            tracing::info!("YouTube: the stream goes to Ferrocast's own key (any resolution)");
-                            stream = id;
-                            streams = list;
-                        }
-                        Err(err) => tracing::warn!(%err, "YouTube: kept the broadcast's key, set to one resolution"),
-                    }
-                }
-                Err(err) => tracing::warn!(%err, "YouTube: couldn't make Ferrocast's own key"),
+        // If the channel's existing key is non-RTMP (e.g. HLS), going live will swap it for
+        // Ferrocast's RTMP stream on YouTube's standard ingest host; test that host read-only.
+        let url = find_stream(&streams, &candidate)
+            .and_then(usable)
+            .map(|i| i.url)
+            .unwrap_or_else(|| DEFAULT_INGEST_URL.to_string());
+        Ok(url)
+    }
+
+    /// Read-only vertical ingest server lookup (GET only, zero writes on YouTube).
+    pub async fn peek_vertical_ingest(&self) -> Result<String, YoutubeError> {
+        let streams = self.list_streams().await?;
+        let url = find_good_vertical_stream(&streams)
+            .map(|(_, i)| i.url)
+            .or_else(|| {
+                streams
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.iter().find_map(usable))
+                    .map(|i| i.url)
+            })
+            .unwrap_or_else(|| DEFAULT_INGEST_URL.to_string());
+        Ok(url)
+    }
+
+    /// Go live everywhere (write path, only when actually going live): prepares the broadcast and
+    /// returns the channel's variable RTMP stream server and key.
+    pub async fn ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
+        self.ingest_for(None).await
+    }
+
+    /// Like [`Api::ingest`], optionally targeting a broadcast the user explicitly picked (even if
+    /// scheduled further ahead than the automatic window).
+    pub async fn ingest_for(
+        &self,
+        selected_broadcast: Option<&str>,
+    ) -> Result<ferrocast_connector::Ingest, YoutubeError> {
+        let mut made = self.made.lock().await;
+        let now = now_ms();
+        let mut streams = self.list_streams().await?;
+        made.merge_fresh_stream(&mut streams, now);
+        let vertical = vertical_ids(&streams);
+        // Ferrocast's own vertical streams (and their broadcasts) are never the normal one.
+        let (main, _) = self.broadcasts(&vertical, selected_broadcast).await?;
+        let fresh_made = if selected_broadcast.is_none() { made.fresh_broadcast(now).cloned() } else { None };
+        let live_now = main.as_ref().is_some_and(is_live);
+
+        let current_bound: Option<String> = main
+            .as_ref()
+            .and_then(|b| b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| if main.is_none() { fresh_made.as_ref().map(|m| m.stream_id.clone()) } else { None });
+
+        let candidate = main_stream_id(&streams, &vertical, current_bound.as_deref()).ok_or_else(|| {
+            YoutubeError::Refused(
+                "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
+            )
+        })?;
+
+        // A key with fixed resolution, fixed frame rate or non-RTMP ingestion type caps or breaks
+        // the stream (19 Nov: 1440p went out as 1080p). Always swap for Ferrocast's variable RTMP
+        // key unless the broadcast is already live on air; `just_made` never skips this check.
+        let (stream, streams, replaced) = if live_now {
+            if stream_id_needs_replacement(&streams, &candidate) {
+                tracing::warn!("YouTube: the broadcast is already live on its current key, keeping it");
             }
+            (candidate, streams, false)
+        } else {
+            self.ensure_good_main_stream(streams, candidate, &mut made).await?
+        };
+        if replaced {
+            tracing::info!("YouTube: the stream goes to Ferrocast's own key (variable resolution & fps, RTMP)");
         }
+
+        // Ensure a broadcast exists and is bound to `stream`; fail loudly instead of streaming into
+        // nothing.
         match &main {
-            // One waiting for "Go live" in YouTube Studio starts with the stream instead.
             Some(b) => {
+                let bid = b.get("id").and_then(Value::as_str).unwrap_or_default();
+                let already_bound = current_bound.as_deref() == Some(stream.as_str());
+                if !already_bound {
+                    if live_now {
+                        return Err(YoutubeError::Refused(
+                            "the live broadcast isn't bound to a usable RTMP stream".into(),
+                        ));
+                    }
+                    self.bind_broadcast(bid, &stream).await?;
+                }
                 if let Err(err) = self.start_with_the_stream(b).await {
                     tracing::warn!(%err, "YouTube: couldn't set the broadcast to start with the stream");
                 }
             }
-            // Made a moment ago (YouTube's list can be slow to show it): nothing more to do.
-            None if just_made(&made).is_some() => {}
-            // None at all: one is made, so the stream shows (no broadcast to make by hand).
-            None => match self.make_broadcast("Live now", None, "public", &stream).await {
-                Ok(id) => {
-                    tracing::info!("YouTube: made a broadcast for the stream");
-                    *made = Some((id, now_ms()));
+            None => match fresh_made {
+                Some(m) => {
+                    // Broadcast made moments ago (list may lag). If its stream was replaced or
+                    // differs, rebind it now so the stream and broadcast always match.
+                    if m.stream_id != stream {
+                        self.bind_broadcast(&m.id, &stream).await?;
+                        made.broadcast = Some(MadeBroadcast { id: m.id, stream_id: stream.clone(), at: now_ms() });
+                    }
                 }
-                Err(err) => tracing::warn!(%err, "YouTube: couldn't make a broadcast for the stream"),
+                None => {
+                    let id = self.make_broadcast("Live now", None, "public", &stream).await?;
+                    tracing::info!("YouTube: made a broadcast for the stream");
+                    made.broadcast = Some(MadeBroadcast { id, stream_id: stream.clone(), at: now_ms() });
+                }
             },
         }
         drop(made);
-        let mut items = streams;
-        if let (Some(id), Some(list)) = (&vertical, items.get_mut("items").and_then(Value::as_array_mut)) {
-            list.retain(|s| s.get("id").and_then(Value::as_str) != Some(id));
-        }
-        pick_stream(&items, Some(stream.as_str())).ok_or_else(|| {
+
+        // Return the exact stream bound to the broadcast — never fall back to a different stream.
+        find_stream(&streams, &stream).and_then(usable).ok_or_else(|| {
             YoutubeError::Refused(
-                "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
+                "the broadcast's stream key isn't usable for RTMP; check your stream in YouTube Studio".into(),
             )
         })
     }
 }
 
 impl Api {
-    /// Ferrocast's own normal stream (any resolution), made once and found again by its title
-    /// → its id and the stream list with it in (liveStreams.insert, 50 units, the first time).
-    async fn own_stream(&self, streams: &Value) -> Result<(String, Value), YoutubeError> {
+    /// Unified check+swap used by both `info_targets()` and `ingest_for()`: if `stream_id` has
+    /// fixed resolution, fixed frame rate, non-RTMP ingestion type, or missing RTMP details,
+    /// switches to Ferrocast's own variable RTMP stream.
+    async fn ensure_good_main_stream(
+        &self,
+        streams: Value,
+        stream_id: String,
+        slot: &mut MadeSlot,
+    ) -> Result<(String, Value, bool), YoutubeError> {
+        if !stream_id_needs_replacement(&streams, &stream_id) {
+            return Ok((stream_id, streams, false));
+        }
+        let (own_id, list, created) = self.own_stream(&streams).await?;
+        if let Some(v) = created {
+            slot.stream = Some((v, now_ms()));
+        }
+        Ok((own_id, list, true))
+    }
+
+    /// Ferrocast's own normal stream (variable resolution & fps, RTMP), made once and found again
+    /// by its title → its id, the stream list with it in, and the newly created item if inserted
+    /// (liveStreams.insert, 50 units, the first time).
+    async fn own_stream(&self, streams: &Value) -> Result<(String, Value, Option<Value>), YoutubeError> {
         let found = streams.get("items").and_then(Value::as_array).and_then(|i| {
             i.iter().find(|s| {
                 s.pointer("/snippet/title").and_then(Value::as_str) == Some(MAIN_STREAM_TITLE)
-                    && s.pointer("/cdn/resolution").and_then(Value::as_str) == Some("variable")
-                    && usable(s).is_some()
+                    && !stream_needs_replacement(s)
             })
         });
         if let Some(id) = found.and_then(|s| s.get("id").and_then(Value::as_str)) {
-            return Ok((id.to_string(), streams.clone()));
+            return Ok((id.to_string(), streams.clone(), None));
         }
         let body = json!({
             "snippet": { "title": MAIN_STREAM_TITLE, "description": "Ferrocast streams here, at any resolution." },
             "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable" },
             "contentDetails": { "isReusable": true },
         });
-        let made =
-            self.call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body)).await?;
-        let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-        if id.is_empty() || usable(&made).is_none() {
+        let created = self
+            .call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body))
+            .await
+            .map_err(|e| wrap_broadcast_error("couldn't create Ferrocast's stream key", e))?;
+        let id = created.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if id.is_empty() || usable(&created).is_none() {
             return Err(YoutubeError::Refused(
                 "YouTube hasn't given Ferrocast's key yet; try again in a minute".into(),
             ));
         }
-        tracing::info!("YouTube: made Ferrocast's own stream key (any resolution)");
+        tracing::info!("YouTube: made Ferrocast's own stream key (variable resolution & fps, RTMP)");
         let mut list = streams.clone();
         if let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) {
-            items.push(made);
+            items.push(created.clone());
         } else {
-            list = json!({ "items": [made] });
+            list = json!({ "items": [created.clone()] });
         }
-        Ok((id, list))
+        Ok((id, list, Some(created)))
     }
 }
 
@@ -676,66 +898,80 @@ impl Api {
     /// Go live everywhere, vertical (YouTube Shorts live): Ferrocast's own upright stream,
     /// made once ("Ferrocast vertical", reusable), and a broadcast bound to it that starts and
     /// ends with the stream, with the title and privacy of the channel's normal live.
-    /// Costs 2 units when both exist, about 150 the first time (insert stream, broadcast, bind).
+    /// Serialized like [`Api::ingest`] so concurrent calls or list lag never make duplicate
+    /// broadcasts.
     pub async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
-        let q = [("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")];
-        let streams = self.call(Method::GET, "/liveStreams", &q, None).await?;
-        let (id, ingest) = match vertical_id(&streams) {
-            Some(id) => {
-                let s = streams
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .and_then(|i| i.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id.as_str())));
-                (id, s.and_then(usable))
-            }
+        let mut made = self.made_vertical.lock().await;
+        let now = now_ms();
+        let mut streams = self.list_streams().await?;
+        made.merge_fresh_stream(&mut streams, now);
+        let mut all_vertical = vertical_ids(&streams);
+
+        let (id, ingest) = match find_good_vertical_stream(&streams) {
+            Some((id, ingest)) => (id, ingest),
             None => {
                 let body = json!({
-                    "snippet": { "title": VERTICAL_STREAM_TITLE, "description": "Ferrocast sends OBS's vertical canvas here." },
+                    "snippet": { "title": VERTICAL_STREAM_TITLE, "description": "Ferrocast sends the vertical canvas here." },
                     "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable" },
                     "contentDetails": { "isReusable": true },
                 });
-                let made = self
+                let created = self
                     .call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body))
-                    .await?;
-                let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    .await
+                    .map_err(|e| wrap_broadcast_error("couldn't create the vertical stream key", e))?;
+                let id = created.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                let Some(ingest) = usable(&created).filter(|_| !id.is_empty()) else {
+                    return Err(YoutubeError::Refused(
+                        "YouTube hasn't given the vertical stream a key yet; try again in a minute".into(),
+                    ));
+                };
                 tracing::info!("YouTube: made Ferrocast's vertical stream");
-                (id, usable(&made))
+                made.stream = Some((created, now_ms()));
+                (id, ingest)
             }
         };
-        let ingest = match (id.is_empty(), ingest) {
-            (false, Some(i)) => i,
-            _ => {
-                return Err(YoutubeError::Refused(
-                    "YouTube hasn't given the vertical stream a key yet; try again in a minute".into(),
-                ));
-            }
-        };
-        // A broadcast already bound to it, or the normal live to copy the title and privacy from.
-        let mut normal: Option<Value> = None;
-        for status in ["active", "upcoming"] {
-            let q = [
-                ("part", "id,snippet,status,contentDetails"),
-                ("broadcastStatus", status),
-                ("broadcastType", "all"),
-                ("maxResults", "10"),
-            ];
-            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
-            for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
-                let bound = b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str);
-                if bound == Some(id.as_str()) {
-                    return Ok(ingest);
+        all_vertical.insert(id.clone());
+
+        let (normal, vert) = self.broadcasts(&all_vertical, None).await?;
+        match vert {
+            Some(vb) => {
+                let live_now = is_live(&vb);
+                let bound = vb.pointer("/contentDetails/boundStreamId").and_then(Value::as_str);
+                if bound != Some(id.as_str()) {
+                    if live_now {
+                        if let Some(old) = bound.and_then(|b| find_stream(&streams, b)).and_then(usable) {
+                            tracing::warn!("YouTube: vertical broadcast is already live on its key, keeping it");
+                            return Ok(old);
+                        }
+                        return Err(YoutubeError::Refused(
+                            "the live vertical broadcast isn't bound to a usable RTMP stream".into(),
+                        ));
+                    }
+                    let bid = vb.get("id").and_then(Value::as_str).unwrap_or_default();
+                    self.bind_broadcast(bid, &id).await?;
                 }
-                if normal.is_none() {
-                    normal = Some(b.clone());
+                if let Err(err) = self.start_with_the_stream(&vb).await {
+                    tracing::warn!(%err, "YouTube: couldn't set the vertical broadcast to start with the stream");
+                }
+                return Ok(ingest);
+            }
+            None => {
+                if let Some(m) = made.fresh_broadcast(now).cloned() {
+                    if m.stream_id != id {
+                        self.bind_broadcast(&m.id, &id).await?;
+                        made.broadcast = Some(MadeBroadcast { id: m.id, stream_id: id, at: now_ms() });
+                    }
+                    return Ok(ingest);
                 }
             }
         }
+
         let title: String = normal
             .as_ref()
             .and_then(|b| b.pointer("/snippet/title").and_then(Value::as_str))
             .unwrap_or("Live now")
             .chars()
-            .take(100)
+            .take(MAX_TITLE_CHARS)
             .collect();
         let privacy = normal
             .as_ref()
@@ -744,6 +980,9 @@ impl Api {
             .to_string();
         let description = normal.as_ref().and_then(|b| b.pointer("/snippet/description").and_then(Value::as_str));
         let bid = self.make_broadcast(&title, description, &privacy, &id).await?;
+        made.broadcast = Some(MadeBroadcast { id: bid.clone(), stream_id: id, at: now_ms() });
+        drop(made);
+
         // The normal live's thumbnail too, so Shorts doesn't show YouTube's own picture (owner,
         // 30 Oct). A failure leaves YouTube's; the stream goes on.
         if let Some(url) = normal.as_ref().and_then(best_thumbnail) {
@@ -760,16 +999,60 @@ impl Api {
 /// The upright stream Ferrocast makes for YouTube Shorts live (found again by this title).
 pub const VERTICAL_STREAM_TITLE: &str = "Ferrocast vertical";
 
-/// The normal stream Ferrocast makes when the channel's key is set to one resolution.
+/// The normal stream Ferrocast makes when the channel's key is fixed or non-RTMP.
 pub const MAIN_STREAM_TITLE: &str = "Ferrocast";
 
-/// Whether stream `id` in `list` is set to one resolution (not "variable").
-fn fixed_resolution(list: &Value, id: &str) -> bool {
-    list.get("items")
-        .and_then(Value::as_array)
-        .and_then(|i| i.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id)))
-        .and_then(|s| s.pointer("/cdn/resolution").and_then(Value::as_str))
-        .is_some_and(|r| r != "variable")
+/// Single check for whether a YouTube `liveStream` key must be replaced with Ferrocast's own
+/// variable-resolution, variable-fps RTMP key. Used by both `info_targets()` and `ingest()`.
+pub(crate) fn stream_needs_replacement(s: &Value) -> bool {
+    let fixed_res = s.pointer("/cdn/resolution").and_then(Value::as_str).is_some_and(|r| r != "variable");
+    let fixed_fps = s.pointer("/cdn/frameRate").and_then(Value::as_str).is_some_and(|f| f != "variable");
+    let not_rtmp = s.pointer("/cdn/ingestionType").and_then(Value::as_str).is_some_and(|t| t != "rtmp");
+    fixed_res || fixed_fps || not_rtmp || usable(s).is_none()
+}
+
+fn find_stream<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
+    list.get("items")?.as_array()?.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn stream_id_needs_replacement(list: &Value, id: &str) -> bool {
+    find_stream(list, id).is_none_or(stream_needs_replacement)
+}
+
+/// Whether an upcoming broadcast is eligible to be taken automatically without explicit user
+/// selection: never one scheduled further ahead than [`UPCOMING_AHEAD_MS`] (2 h), and non-default
+/// ones scheduled earlier than [`UPCOMING_PAST_MS`] (12 h) ago are ignored as stale.
+pub(crate) fn is_upcoming_eligible(b: &Value, now: i64) -> bool {
+    let is_default = b.pointer("/snippet/isDefaultBroadcast").and_then(Value::as_bool) == Some(true);
+    let scheduled = b.pointer("/snippet/scheduledStartTime").and_then(Value::as_str).and_then(parse_rfc3339_ms);
+    match scheduled {
+        Some(t) if t > now + UPCOMING_AHEAD_MS => false,
+        _ if is_default => true,
+        Some(t) => t >= now - UPCOMING_PAST_MS,
+        None => true,
+    }
+}
+
+/// Picks the best eligible upcoming broadcast: explicitly scheduled near-now broadcasts first
+/// (closest to `now`), then default/unscheduled ones.
+fn pick_best_upcoming<'a>(items: impl Iterator<Item = &'a Value>, now: i64) -> Option<Value> {
+    let mut best: Option<(u8, i64, &Value)> = None;
+    for b in items {
+        if !is_upcoming_eligible(b, now) {
+            continue;
+        }
+        let is_default = b.pointer("/snippet/isDefaultBroadcast").and_then(Value::as_bool) == Some(true);
+        let scheduled = b.pointer("/snippet/scheduledStartTime").and_then(Value::as_str).and_then(parse_rfc3339_ms);
+        let key = match scheduled {
+            Some(t) if !is_default => (0u8, t.abs_diff(now).min(i64::MAX as u64) as i64),
+            Some(t) => (1u8, t.abs_diff(now).min(i64::MAX as u64) as i64),
+            None => (1u8, 0),
+        };
+        if best.as_ref().is_none_or(|(bt, bd, _)| key < (*bt, *bd)) {
+            best = Some((key.0, key.1, b));
+        }
+    }
+    best.map(|(_, _, b)| b.clone())
 }
 
 /// Whether a broadcast is on air (or about to be).
@@ -777,14 +1060,48 @@ fn is_live(b: &Value) -> bool {
     matches!(b.pointer("/status/lifeCycleStatus").and_then(Value::as_str), Some("live" | "liveStarting"))
 }
 
-/// Ferrocast's vertical stream in a liveStreams list.
-fn vertical_id(list: &Value) -> Option<String> {
-    list.get("items")?
-        .as_array()?
-        .iter()
-        .find(|s| s.pointer("/snippet/title").and_then(Value::as_str) == Some(VERTICAL_STREAM_TITLE))
-        .and_then(|s| s.get("id").and_then(Value::as_str))
-        .map(String::from)
+/// All Ferrocast vertical stream ids in a liveStreams list (so none is ever mistaken for main).
+fn vertical_ids(list: &Value) -> HashSet<String> {
+    list.get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.pointer("/snippet/title").and_then(Value::as_str) == Some(VERTICAL_STREAM_TITLE))
+        .filter_map(|s| s.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(String::from))
+        .collect()
+}
+
+/// Finds a Ferrocast vertical stream that does not need replacement.
+fn find_good_vertical_stream(list: &Value) -> Option<(String, ferrocast_connector::Ingest)> {
+    list.get("items")?.as_array()?.iter().find_map(|s| {
+        if s.pointer("/snippet/title").and_then(Value::as_str) != Some(VERTICAL_STREAM_TITLE)
+            || stream_needs_replacement(s)
+        {
+            return None;
+        }
+        let id = s.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
+        Some((id.to_string(), usable(s)?))
+    })
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn wrap_broadcast_error(action: &str, err: YoutubeError) -> YoutubeError {
+    match err {
+        YoutubeError::SignInNeeded | YoutubeError::QuotaExceeded => err,
+        YoutubeError::Network(m) => YoutubeError::Network(one_line(&m)),
+        YoutubeError::SignIn(m) => YoutubeError::SignIn(one_line(&m)),
+        YoutubeError::Refused(m) | YoutubeError::Protocol(m) => {
+            let detail = one_line(&m);
+            if detail.is_empty() {
+                YoutubeError::Refused(action.into())
+            } else {
+                YoutubeError::Refused(format!("{action}: {detail}"))
+            }
+        }
+    }
 }
 
 /// `2026-10-24T10:30:00Z` (or with `.123` and an offset) as Unix ms; None when it isn't one.
@@ -872,7 +1189,8 @@ pub(crate) fn rfc3339_utc(ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Picks the stream to send to from a liveStreams list (see [`Api::ingest`]).
+/// Picks the stream to send to from a liveStreams list (used by unit tests).
+#[cfg(test)]
 pub(crate) fn pick_stream(list: &Value, bound: Option<&str>) -> Option<ferrocast_connector::Ingest> {
     let items: Vec<&Value> = list.get("items")?.as_array()?.iter().filter(|s| usable(s).is_some()).collect();
     let id_is = |s: &Value, id: &str| s.get("id").and_then(Value::as_str) == Some(id);
@@ -882,11 +1200,6 @@ pub(crate) fn pick_stream(list: &Value, bound: Option<&str>) -> Option<ferrocast
         .or_else(|| items.iter().find(|s| default(s)))
         .or_else(|| items.first())?;
     usable(pick)
-}
-
-/// The broadcast made last, while it's fresh enough to trust that YouTube's list is behind.
-fn just_made(made: &Option<(String, i64)>) -> Option<String> {
-    made.as_ref().filter(|(_, at)| now_ms() - at < MADE_FRESH_MS).map(|(id, _)| id.clone())
 }
 
 /// Only YouTube's own image host is fetched from (https, `*.ytimg.com`), or the API's own
@@ -908,35 +1221,46 @@ fn best_thumbnail(b: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// The id of the stream the normal live goes to: the one bound to its broadcast, else the
-/// channel's default, else the first usable one; never Ferrocast's vertical stream.
-fn main_stream_id(list: &Value, vertical: Option<&str>, bound: Option<&str>) -> Option<String> {
+/// The id of the stream the normal live would use before checking whether it needs replacing:
+/// the one bound to its broadcast, else the channel's default, else the first usable RTMP one,
+/// else any non-vertical stream (so a channel with only an HLS/broken key still triggers
+/// replacement instead of failing as "no stream key"); never Ferrocast's vertical stream.
+fn main_stream_id(list: &Value, vertical: &HashSet<String>, bound: Option<&str>) -> Option<String> {
     let items: Vec<&Value> = list
         .get("items")?
         .as_array()?
         .iter()
-        .filter(|s| usable(s).is_some())
-        .filter(|s| vertical.is_none() || s.get("id").and_then(Value::as_str) != vertical)
+        .filter(|s| s.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty() && !vertical.contains(id)))
         .collect();
     let id_is = |s: &Value, id: &str| s.get("id").and_then(Value::as_str) == Some(id);
     let default = |s: &Value| s.pointer("/snippet/isDefaultStream").and_then(Value::as_bool) == Some(true);
     let pick = bound
         .and_then(|b| items.iter().find(|s| id_is(s, b)))
         .or_else(|| items.iter().find(|s| default(s)))
+        .or_else(|| items.iter().find(|s| usable(s).is_some()))
         .or_else(|| items.first())?;
     pick.get("id").and_then(Value::as_str).map(String::from)
 }
 
-/// A stream's secure address and key, if it has both.
+/// A stream's secure RTMP/RTMPS address and key, if it is an RTMP stream and has both.
 fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
+    if s.pointer("/cdn/ingestionType").and_then(Value::as_str).is_some_and(|t| t != "rtmp") {
+        return None;
+    }
     let info = s.pointer("/cdn/ingestionInfo")?;
     let key = info.get("streamName").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty())?;
     let url = info
         .get("rtmpsIngestionAddress")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|u| u.starts_with("rtmps://"))
-        .or_else(|| info.get("ingestionAddress").and_then(Value::as_str))?;
-    Some(ferrocast_connector::Ingest { url: url.trim().trim_end_matches('/').to_string(), key: key.to_string() })
+        .or_else(|| {
+            info.get("ingestionAddress")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| u.starts_with("rtmp://") || u.starts_with("rtmps://"))
+        })?;
+    Some(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key: key.to_string() })
 }
 
 #[cfg(test)]

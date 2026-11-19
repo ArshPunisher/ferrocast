@@ -608,7 +608,7 @@ async fn test_connection_tries_the_server_and_says_how_it_went() {
     let d =
         e.add_golive_destination("Mine", &format!("rtmp://127.0.0.1:{port}/live"), "k", Canvas::Main).await.unwrap();
     let r = e.golive_test(&d.id).await.unwrap();
-    assert!(r.ok && r.message.contains("reachable"), "{r:?}");
+    assert!(r.ok && r.message.contains("answered"), "{r:?}");
     // Nothing there: said, not an error.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let r = e.golive_test_address(&format!("rtmp://127.0.0.1:{closed}/live"), "").await.unwrap();
@@ -741,4 +741,213 @@ async fn enhanced_broadcasting_is_twitchs_and_says_why_when_it_cant() {
     // Off again: kept off.
     let cfg = e.set_golive_enhanced("twitch", false).await.unwrap();
     assert!(cfg.destinations.iter().all(|d| !d.enhanced));
+}
+
+/// M10-01: Test connection, Pre-flight and Upload check never POST or PUT to YouTube (no silent
+/// PUBLIC broadcasts), and a 403 on broadcast creation during real Go Live blocks the destination
+/// with a clear one-line reason instead of streaming into nothing.
+#[tokio::test]
+async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks_golive() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Obs, platform};
+    use std::sync::Mutex;
+
+    let (rtmp_port, mut rtmp_got) = platform("yt-key").await;
+    let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_b = writes.clone();
+    let writes_put = writes.clone();
+    let writes_s = writes.clone();
+    let writes_bind = writes.clone();
+    let rtmp_url = format!("rtmp://127.0.0.1:{rtmp_port}/live2");
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get({
+                let rtmp_url = rtmp_url.clone();
+                move || {
+                    let rtmp_url = rtmp_url.clone();
+                    async move {
+                        axum::Json(json!({ "items": [{
+                            "id": "s1",
+                            "snippet": { "title": "Default", "isDefaultStream": true },
+                            "cdn": {
+                                "resolution": "variable",
+                                "frameRate": "variable",
+                                "ingestionType": "rtmp",
+                                "ingestionInfo": { "streamName": "yt-key", "ingestionAddress": rtmp_url }
+                            }
+                        }] }))
+                    }
+                }
+            })
+            .post(move || {
+                let w = writes_s.clone();
+                async move {
+                    w.lock().unwrap().push("POST /liveStreams".into());
+                    (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                }
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [] })) })
+                .post(move || {
+                    let w = writes_b.clone();
+                    async move {
+                        w.lock().unwrap().push("POST /liveBroadcasts".into());
+                        (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(json!({
+                                "error": {
+                                    "message": "Live streaming is not enabled on this channel.",
+                                    "errors": [{ "reason": "liveStreamingNotEnabled" }]
+                                }
+                            })),
+                        )
+                    }
+                })
+                .put(move || {
+                    let w = writes_put.clone();
+                    async move {
+                        w.lock().unwrap().push("PUT /liveBroadcasts".into());
+                        (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                    }
+                }),
+        )
+        .route(
+            "/api/liveBroadcasts/bind",
+            axum::routing::post(move || {
+                let w = writes_bind.clone();
+                async move {
+                    w.lock().unwrap().push("POST /liveBroadcasts/bind".into());
+                    (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                }
+            }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+
+    let (e, _dir) = engine().await;
+    let ep = ferrocast_youtube::Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    let tokens = ferrocast_youtube::Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: crate::now().0 + 3_600_000,
+    };
+    let api = Arc::new(ferrocast_youtube::Api::new(
+        ferrocast_youtube::http_client(),
+        ep,
+        ferrocast_youtube::AppCredentials { client_id: "c".into(), client_secret: "s".into() },
+        tokens,
+        Arc::new(|_| Ok(())),
+    ));
+    e.register_connector(Arc::new(ferrocast_youtube::YoutubeConnector { api, live: Arc::default() }));
+
+    // Enable both YouTube main and vertical.
+    let order: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == crate::golive::YOUTUBE_VERTICAL))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    // 1. Test connection (main + vertical): succeeds with ZERO writes to YouTube.
+    let r_main = e.golive_test("youtube").await.unwrap();
+    assert!(r_main.ok, "{r_main:?}");
+    let r_vert = e.golive_test(crate::golive::YOUTUBE_VERTICAL).await.unwrap();
+    assert!(r_vert.ok, "{r_vert:?}");
+    assert!(writes.lock().unwrap().is_empty(), "golive_test wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 2. Pre-flight: passes for both with ZERO writes to YouTube.
+    let checks = e.golive_preflight().await;
+    assert_eq!(checks.iter().find(|c| c.id == "dest:youtube").unwrap().status, ferrocast_core::show::CheckStatus::Ok);
+    assert_eq!(
+        checks.iter().find(|c| c.id == format!("dest:{}", crate::golive::YOUTUBE_VERTICAL)).unwrap().status,
+        ferrocast_core::show::CheckStatus::Ok
+    );
+    assert!(writes.lock().unwrap().is_empty(), "golive_preflight wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 3. Upload check (with an offline local Twitch connector so no external network is touched):
+    // still makes ZERO writes to YouTube.
+    #[derive(Debug)]
+    struct LocalTwitch(String);
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for LocalTwitch {
+        fn platform(&self) -> Platform {
+            Platform::Twitch
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into() })
+        }
+    }
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    e.register_connector(Arc::new(LocalTwitch(format!("rtmp://127.0.0.1:{closed}/app"))));
+    let order_with_tw: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == crate::golive::YOUTUBE_VERTICAL || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(order_with_tw).await.unwrap();
+    // Fails fast on closed local Twitch port, after probing YouTube read-only.
+    let _ = e.golive_upload_check().await;
+    assert!(writes.lock().unwrap().is_empty(), "golive_upload_check wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 4. Actual Go Live: POST /liveBroadcasts returns 403 -> destination is blocked with a clear
+    // one-line reason and never spawns a forwarder or publishes RTMP into nothing.
+    let order_yt: Vec<(String, bool)> =
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(order_yt).await.unwrap();
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+    let mut blocked = None;
+    for _ in 0..100 {
+        blocked = e.golive_view().await.destinations.iter().find(|d| d.id == "youtube").and_then(|d| d.blocked.clone());
+        if blocked.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let reason = blocked.expect("403 on make_broadcast must block go-live");
+    assert!(!reason.contains('\n'), "reason must be one line: {reason:?}");
+    assert!(reason.contains("Live streaming is not enabled"), "{reason}");
+    let yt_view = e.golive_view().await.destinations.into_iter().find(|d| d.id == "youtube").unwrap();
+    assert!(yt_view.health.is_none(), "blocked destination must not start a forwarder: {yt_view:?}");
+    let published = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while let Some(g) = rtmp_got.recv().await {
+            if matches!(g, ferrocast_testkit::rtmp::Got::Publish(_)) {
+                return Some(g);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(published.is_err(), "must never publish RTMP when broadcast creation failed: {published:?}");
 }
