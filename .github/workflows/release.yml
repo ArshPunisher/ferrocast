@@ -89,11 +89,6 @@ jobs:
             args: ""
             out: target/release/bundle
     runs-on: ${{ matrix.os }}
-    env:
-      # Captions' speech engine (whisper.cpp's ggml) is built for any CPU from 2013 on (AVX2),
-      # not tuned to the build machine's (-march=native: AVX-512 there, a crash on people's
-      # older CPUs when captions run). whisper-rs-sys hands GGML_* to its cmake.
-      GGML_NATIVE: "OFF"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,6 +116,15 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+      # Captions' speech engine (whisper.cpp's ggml) is built for any PC CPU from 2013 on (AVX2;
+      # the app says so on older ones), not tuned to the build machine's (-march=native:
+      # AVX-512 there, a crash on people's older CPUs when captions run). whisper-rs-sys hands
+      # GGML_* to its cmake. Not on a Mac: its x86 half is cross-built (never native) and its
+      # ARM half would lose the dot-product code.
+      - name: Speech engine for any CPU (Windows, Linux)
+        if: matrix.name != 'macOS'
+        shell: bash
+        run: echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
       - name: Linux libraries for the desktop shell (Tauri)
         if: runner.os == 'Linux'
         run: |
