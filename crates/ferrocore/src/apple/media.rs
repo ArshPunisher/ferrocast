@@ -1,7 +1,8 @@
-//! The Media source on macOS: a video or sound file played by AVFoundation's AVAssetReader
-//! (H.264, HEVC, ProRes, AAC… whatever macOS plays, hardware-decoded), looping or once. A
-//! reader thread decodes a little ahead and stamps every frame and sound piece with the host
-//! time it plays at, from the file's own timestamps, so picture and sound stay together.
+//! The Media source on macOS: plays video or sound files via AVFoundation's AVAssetReader
+//! (H.264, HEVC, ProRes, AAC…), falling back to FFmpeg (`ffsrc`) when AVFoundation cannot open
+//! or read the container/codec (MKV, WebM/VP9+alpha, OGG/Opus/FLAC…). A reader thread decodes a
+//! little ahead and stamps every frame and sound piece with the host time it plays at, from the
+//! file's own timestamps, so picture and sound stay together.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -58,12 +59,22 @@ struct Shared {
     position: AtomicU64,
 }
 
+#[derive(Debug)]
+enum Backend {
+    Apple {
+        shared: Arc<Shared>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    },
+    /// Fallback when AVFoundation cannot open or read the container/codec (MKV, WebM/VP9+alpha,
+    /// OGG/Opus/FLAC, FLV, AVI, or explicit CPU decode).
+    Ffmpeg(crate::ffsrc::Media),
+}
+
 /// A playing file; dropping it stops.
 #[derive(Debug)]
 pub struct Media {
-    shared: Arc<Shared>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    backend: Backend,
     pub has_video: bool,
     pub has_audio: bool,
     pub duration_ns: u64,
@@ -249,6 +260,32 @@ impl Shared {
     }
 }
 
+/// Probes whether AVAssetReader can actually open and decode the first sample of `asset`.
+/// Catches containers AVFoundation recognizes structurally (e.g. MP4/MOV carrying VP9 or Opus)
+/// that fail as soon as `startReading()` or `copyNextSampleBuffer()` runs, so we fall back to FFmpeg.
+fn can_read_with_avfoundation(asset: &AVURLAsset) -> Result<(), String> {
+    let pass = open_pass(asset, 0)?;
+    let got_sample = pass.video.as_ref().and_then(|o| next(o)).is_some()
+        || (pass.video.is_none() && pass.audio.as_ref().and_then(|o| next(o)).is_some());
+    // SAFETY: `pass.reader` was created and used solely on this thread.
+    let status = unsafe { pass.reader.status() };
+    let why = if status == AVAssetReaderStatus::Failed {
+        // SAFETY: as above.
+        unsafe { pass.reader.error() }.map(|e| e.localizedDescription().to_string())
+    } else {
+        None
+    };
+    // SAFETY: as above.
+    unsafe { pass.reader.cancelReading() };
+    if status == AVAssetReaderStatus::Failed {
+        return Err(why.unwrap_or_else(|| "AVFoundation failed to read the file".into()));
+    }
+    if !got_sample {
+        return Err("AVFoundation decoded no samples".into());
+    }
+    Ok(())
+}
+
 impl Media {
     /// Opens a file and starts playing it (its first frame shows about 100 ms from now).
     pub fn open(path: &Path, looping: bool) -> Result<Self, AvError> {
@@ -256,15 +293,32 @@ impl Media {
     }
 
     /// Opens a file with full playback options; when `start_stopped` is true, stays idle at 0
-    /// until `Control::Play` or `Control::Restart`.
+    /// until `Control::Play` or `Control::Restart`. Falls back to FFmpeg (`ffsrc`) when
+    /// AVFoundation cannot open or read the container/codec (MKV, WebM/VP9+alpha, OGG/Opus…).
     pub fn open_with(path: &Path, options: MediaOptions, start_stopped: bool) -> Result<Self, AvError> {
         if !path.is_file() {
             return Err(AvError::Source(format!("{} isn't there", path.display())));
         }
+        // When software decode is explicitly requested, route through FFmpeg if available.
+        if !options.hw_decode {
+            match crate::ffsrc::Media::open_for_card_with(path, options, start_stopped) {
+                Ok(ff) => {
+                    return Ok(Self {
+                        has_video: ff.has_video,
+                        has_audio: ff.has_audio,
+                        duration_ns: ff.duration_ns,
+                        backend: Backend::Ffmpeg(ff),
+                    });
+                }
+                Err(e) => {
+                    tracing::info!(file = %path.display(), error = %e, "software FFmpeg decode unavailable, trying AVFoundation");
+                }
+            }
+        }
         let url_text = path.to_string_lossy().to_string();
-        // Probe on this thread, so a bad file says so at once.
+        // Probe on this thread, so a bad or unsupported file falls back to FFmpeg at once.
         // SAFETY: AVFoundation objects made and read on this thread.
-        let (has_video, has_audio, duration_ns) = unsafe {
+        let av_probe: Result<(bool, bool, u64), String> = unsafe {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&url_text));
             let asset = AVURLAsset::URLAssetWithURL_options(&url, None);
             #[allow(deprecated)]
@@ -277,11 +331,36 @@ impl Media {
             } else {
                 0
             };
-            (v, a, dur)
+            if !v && !a {
+                Err("no playable AVFoundation tracks".into())
+            } else {
+                can_read_with_avfoundation(&asset).map(|()| (v, a, dur))
+            }
         };
-        if !has_video && !has_audio {
-            return Err(AvError::Source(format!("{} has no picture or sound this Mac can play", path.display())));
-        }
+        let (has_video, has_audio, duration_ns) = match av_probe {
+            Ok(info) => info,
+            Err(av_why) => match crate::ffsrc::Media::open_for_card_with(path, options, start_stopped) {
+                Ok(ff) => {
+                    tracing::info!(
+                        file = %path.display(),
+                        reason = %av_why,
+                        "AVFoundation couldn't open media; playing via FFmpeg fallback"
+                    );
+                    return Ok(Self {
+                        has_video: ff.has_video,
+                        has_audio: ff.has_audio,
+                        duration_ns: ff.duration_ns,
+                        backend: Backend::Ffmpeg(ff),
+                    });
+                }
+                Err(ff_err) => {
+                    return Err(AvError::Source(format!(
+                        "{} couldn't be played ({av_why}; FFmpeg: {ff_err})",
+                        path.display()
+                    )));
+                }
+            },
+        };
         let shared = Arc::new(Shared::new(start_stopped));
         let stop = Arc::new(AtomicBool::new(false));
         let speed = options.speed();
@@ -293,102 +372,143 @@ impl Media {
                 .spawn(move || read(&url_text, looping, speed, duration_ns, start_stopped, &shared, &stop))
                 .map_err(|e| AvError::Source(format!("the media couldn't start ({e})")))?
         };
-        Ok(Self { shared, stop, thread: Some(thread), has_video, has_audio, duration_ns })
+        Ok(Self { backend: Backend::Apple { shared, stop, thread: Some(thread) }, has_video, has_audio, duration_ns })
+    }
+
+    /// True when playing through the FFmpeg fallback backend rather than AVFoundation.
+    pub fn uses_ffmpeg(&self) -> bool {
+        matches!(self.backend, Backend::Ffmpeg(_))
+    }
+
+    /// The newest NV12 picture when playing through the FFmpeg fallback on an opaque video.
+    pub fn frame_nv12(&self) -> Option<crate::ffsrc::Nv12Picture> {
+        match &self.backend {
+            Backend::Apple { .. } => None,
+            Backend::Ffmpeg(ff) => ff.frame_nv12(),
+        }
     }
 
     /// The frame to show at `now_ns` (the newest whose time has come; older ones are dropped).
     pub fn frame_at(&self, now_ns: u64) -> Option<Picture> {
-        let mut q = self.shared.frames.lock().ok()?;
-        let mut chosen = None;
-        while q.front().is_some_and(|(_, t, _)| *t <= now_ns) {
-            chosen = q.pop_front().map(|(p, _, pts)| {
-                self.shared.position.store(pts, Ordering::Relaxed);
-                p
-            });
+        match &self.backend {
+            Backend::Apple { shared, .. } => {
+                let mut q = shared.frames.lock().ok()?;
+                let mut chosen = None;
+                while q.front().is_some_and(|(_, t, _)| *t <= now_ns) {
+                    chosen = q.pop_front().map(|(p, _, pts)| {
+                        shared.position.store(pts, Ordering::Relaxed);
+                        p
+                    });
+                }
+                chosen
+            }
+            Backend::Ffmpeg(ff) => ff.frame_at(now_ns),
         }
-        chosen
     }
 
     /// Plays, pauses, restarts, stops or seeks (non-blocking; wakes the reader immediately).
     pub fn control(&self, c: Control) {
-        if let Ok(mut st) = self.shared.cmd.lock() {
-            // Coalesce back-to-back seeks so rapid scrubber drags jump straight to the latest target.
-            if matches!(c, Control::Seek(_)) && matches!(st.queue.back(), Some(Control::Seek(_))) {
-                st.queue.pop_back();
-            }
-            st.queue.push_back(c);
-            match c {
-                Control::Play | Control::Restart => {
-                    st.paused = false;
-                    st.stopped = false;
-                    st.ended = false;
-                    if matches!(c, Control::Restart) {
-                        self.shared.position.store(0, Ordering::Relaxed);
+        match &self.backend {
+            Backend::Apple { shared, .. } => {
+                if let Ok(mut st) = shared.cmd.lock() {
+                    // Coalesce back-to-back seeks so rapid scrubber drags jump straight to the latest target.
+                    if matches!(c, Control::Seek(_)) && matches!(st.queue.back(), Some(Control::Seek(_))) {
+                        st.queue.pop_back();
                     }
-                }
-                Control::Pause => {
-                    st.paused = true;
-                }
-                Control::Stop => {
-                    st.paused = true;
-                    st.stopped = true;
-                    st.ended = false;
-                    self.shared.position.store(0, Ordering::Relaxed);
-                }
-                Control::Seek(ns) => {
-                    let clamped = if self.duration_ns > 0 { ns.min(self.duration_ns) } else { ns };
-                    self.shared.position.store(clamped, Ordering::Relaxed);
-                    if st.ended {
-                        st.ended = false;
-                        st.paused = true;
+                    st.queue.push_back(c);
+                    match c {
+                        Control::Play | Control::Restart => {
+                            st.paused = false;
+                            st.stopped = false;
+                            st.ended = false;
+                            if matches!(c, Control::Restart) {
+                                shared.position.store(0, Ordering::Relaxed);
+                            }
+                        }
+                        Control::Pause => {
+                            st.paused = true;
+                        }
+                        Control::Stop => {
+                            st.paused = true;
+                            st.stopped = true;
+                            st.ended = false;
+                            shared.position.store(0, Ordering::Relaxed);
+                        }
+                        Control::Seek(ns) => {
+                            let clamped = if self.duration_ns > 0 { ns.min(self.duration_ns) } else { ns };
+                            shared.position.store(clamped, Ordering::Relaxed);
+                            if st.ended {
+                                st.ended = false;
+                                st.paused = true;
+                            }
+                        }
                     }
+                    shared.wake.notify_all();
                 }
             }
-            self.shared.wake.notify_all();
+            Backend::Ffmpeg(ff) => ff.control(c),
         }
     }
 
     /// Where it stands, and where it is in the file (ns).
     pub fn state(&self) -> (MediaState, u64) {
-        let (ended, stopped, paused) =
-            self.shared.cmd.lock().map(|st| (st.ended, st.stopped, st.paused)).unwrap_or((false, false, false));
-        let state = if ended && self.shared.finished() {
-            MediaState::Ended
-        } else if stopped {
-            MediaState::Stopped
-        } else if paused {
-            MediaState::Paused
-        } else {
-            MediaState::Playing
-        };
-        (state, self.shared.position.load(Ordering::Relaxed))
+        match &self.backend {
+            Backend::Apple { shared, .. } => {
+                let (ended, stopped, paused) =
+                    shared.cmd.lock().map(|st| (st.ended, st.stopped, st.paused)).unwrap_or((false, false, false));
+                let state = if ended && shared.finished() {
+                    MediaState::Ended
+                } else if stopped {
+                    MediaState::Stopped
+                } else if paused {
+                    MediaState::Paused
+                } else {
+                    MediaState::Playing
+                };
+                (state, shared.position.load(Ordering::Relaxed))
+            }
+            Backend::Ffmpeg(ff) => ff.state(),
+        }
     }
 
     /// Sound decoded since the last call that is about to play, each piece with the host time it
     /// plays at (what plays later waits here, where a pause or a seek can still drop it).
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
-        self.shared.sound.lock().map(|mut q| take_due(&mut q, host_ns(), SOUND_HOLD_NS)).unwrap_or_default()
+        match &self.backend {
+            Backend::Apple { shared, .. } => {
+                shared.sound.lock().map(|mut q| take_due(&mut q, host_ns(), SOUND_HOLD_NS)).unwrap_or_default()
+            }
+            Backend::Ffmpeg(ff) => ff.take_sound(),
+        }
     }
 
     /// Played to the end (not looping), or it couldn't be played (`error` says why), and
     /// everything decoded has been taken.
     pub fn ended(&self) -> bool {
-        self.shared.finished()
+        match &self.backend {
+            Backend::Apple { shared, .. } => shared.finished(),
+            Backend::Ffmpeg(ff) => ff.ended(),
+        }
     }
 
     pub fn error(&self) -> Option<String> {
-        self.shared.error.lock().ok().and_then(|e| e.clone())
+        match &self.backend {
+            Backend::Apple { shared, .. } => shared.error.lock().ok().and_then(|e| e.clone()),
+            Backend::Ffmpeg(ff) => ff.error(),
+        }
     }
 }
 
 impl Drop for Media {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Ok(_st) = self.shared.cmd.lock() {
-            self.shared.wake.notify_all();
-        }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Backend::Apple { shared, stop, thread } = &mut self.backend {
+            stop.store(true, Ordering::Release);
+            if let Ok(_st) = shared.cmd.lock() {
+                shared.wake.notify_all();
+            }
+            if let Some(t) = thread.take() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -864,5 +984,109 @@ mod tests {
         let _ = std::fs::remove_file(&f);
         eprintln!("cut-off clip: ended {ended}, said {error:?}");
         assert!(ended, "a cut-off clip is over, so a playlist moves on");
+    }
+
+    fn ensure_ffmpeg() -> Option<std::path::PathBuf> {
+        let p = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .map(Path::to_path_buf)
+            .or_else(crate::ffenc::ffmpeg_path)?;
+        crate::ffenc::set_ffmpeg(&p);
+        Some(p)
+    }
+
+    /// MKV containers (including Ferrocast's own recordings) cannot be opened by AVURLAsset on
+    /// macOS and must fall back seamlessly to `ffsrc` (M8-01).
+    #[test]
+    fn mkv_recording_falls_back_to_ffmpeg_and_plays() {
+        let Some(ff) = ensure_ffmpeg() else { return };
+        let f = std::env::temp_dir().join(format!("ferrocore-media-mkv-{}.mkv", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30:duration=1"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "ffmpeg generated MKV clip");
+        let m = Media::open(&f, false).unwrap_or_else(|e| panic!("{e}"));
+        assert!(m.uses_ffmpeg(), "MKV must route through FFmpeg fallback on macOS");
+        assert!(m.has_video && m.has_audio);
+        let started = std::time::Instant::now();
+        let (mut got_pic, mut got_snd) = (false, false);
+        while !m.ended() && started.elapsed() < Duration::from_secs(4) {
+            if m.frame_nv12().is_some() || m.frame_at(host_ns()).is_some() {
+                got_pic = true;
+            }
+            if !m.take_sound().is_empty() {
+                got_snd = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = m.ended();
+        drop(m);
+        let _ = std::fs::remove_file(&f);
+        assert!(got_pic && got_snd, "MKV fallback must produce both picture and sound");
+        assert!(ended, "MKV fallback must finish cleanly at EOF");
+    }
+
+    /// Transparent VP9 WebM stingers fail in AVURLAsset on macOS and must fall back to FFmpeg
+    /// preserving alpha=0 transparency (M8-01).
+    #[test]
+    fn webm_vp9_alpha_stinger_falls_back_and_preserves_alpha() {
+        let Some(ff) = ensure_ffmpeg() else { return };
+        let f = std::env::temp_dir().join(format!("ferrocore-media-stinger-{}.webm", std::process::id()));
+        let ok = std::process::Command::new(&ff)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black@0.0:s=32x32:r=15:d=1,format=rgba",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0xff0000@1.0:s=32x32:r=15:d=1,format=rgba",
+                "-filter_complex",
+                "[0:v][1:v]hstack=inputs=2,format=yuva420p",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-auto-alt-ref",
+                "0",
+                "-deadline",
+                "realtime",
+            ])
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_file(&f);
+            return;
+        }
+        let m = Media::open(&f, false).unwrap_or_else(|e| panic!("{e}"));
+        assert!(m.uses_ffmpeg(), "WebM must route through FFmpeg fallback on macOS");
+        let started = std::time::Instant::now();
+        let mut pic = None;
+        while started.elapsed() < Duration::from_secs(3) && pic.is_none() {
+            assert!(m.frame_nv12().is_none(), "alpha WebM must deliver RGBA, not NV12");
+            pic = m.frame_at(host_ns());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(m);
+        let _ = std::fs::remove_file(&f);
+        let p = pic.unwrap_or_else(|| panic!("expected RGBA frame from WebM fallback"));
+        let left = ((16 * 64 + 8) * 4) as usize;
+        let right = ((16 * 64 + 48) * 4) as usize;
+        assert_eq!(p.rgba[left + 3], 0, "left corner must be transparent: {:?}", &p.rgba[left..left + 4]);
+        assert!(
+            p.rgba[right + 3] > 240 && p.rgba[right] > 180,
+            "right half must be opaque red: {:?}",
+            &p.rgba[right..right + 4]
+        );
     }
 }

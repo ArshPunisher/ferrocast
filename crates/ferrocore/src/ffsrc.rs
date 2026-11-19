@@ -61,6 +61,12 @@ pub struct Probe {
     pub bt709: Option<bool>,
     /// Full range ("pc", or a yuvj format) rather than TV range (16-235).
     pub full_range: bool,
+    /// The video stream carries an alpha channel (e.g. yuva420p, rgba, bgra, ProRes 4444, or
+    /// VP8/VP9 with `alpha_mode: 1`): must stay RGBA instead of NV12.
+    pub has_alpha: bool,
+    /// Explicit input video decoder required to preserve alpha (e.g. `"libvpx-vp9"` or `"libvpx"`
+    /// for WebM VP9/VP8 with `alpha_mode: 1`, matching OBS `decode.c:mp_decode_init`).
+    pub video_decoder: Option<&'static str>,
 }
 
 /// A picture as FFmpeg's NV12 (the Y plane, then U and V interleaved at half size), and how its
@@ -148,29 +154,67 @@ fn hw_decodes(ffmpeg: &Path, input: &[String]) -> bool {
     }
 }
 
+/// Whether an FFmpeg pixel format name carries an alpha channel.
+fn pix_fmt_has_alpha(tok: &str) -> bool {
+    let base = tok.split('(').next().unwrap_or(tok);
+    base.starts_with("yuva")
+        || base.starts_with("rgba")
+        || base.starts_with("bgra")
+        || base.starts_with("argb")
+        || base.starts_with("abgr")
+        || base.starts_with("gbrap")
+        || base.starts_with("ayuv")
+        || base.starts_with("ya8")
+        || base.starts_with("ya16")
+        || base == "pal8"
+}
+
 /// The probe's facts from FFmpeg's text (the first video and audio stream).
 pub fn parse_probe(text: &str) -> Option<Probe> {
     let mut p = Probe::default();
     let mut any = false;
+    let mut in_video_stream = false;
+    let mut video_codec: Option<&str> = None;
     for line in text.lines() {
         let l = line.trim();
+        if l.starts_with("Output #") {
+            break;
+        }
+        if l.starts_with("Input #") {
+            in_video_stream = false;
+        }
         if let Some(d) = l.strip_prefix("Duration: ").and_then(|r| r.split(',').next()) {
             let parts: Vec<f64> = d.split(':').filter_map(|x| x.trim().parse().ok()).collect();
             if parts.len() == 3 {
                 p.duration_ns = ((parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]) * 1e9) as u64;
             }
         }
+        if in_video_stream
+            && !l.starts_with("Stream #")
+            && let Some((k, v)) = l.split_once(':')
+            && k.trim().eq_ignore_ascii_case("alpha_mode")
+            && v.trim() == "1"
+        {
+            p.has_alpha = true;
+            if video_codec == Some("vp9") {
+                p.video_decoder = Some("libvpx-vp9");
+            } else if video_codec == Some("vp8") {
+                p.video_decoder = Some("libvpx");
+            }
+        }
         if !l.starts_with("Stream #") {
             continue;
         }
+        in_video_stream = false;
         if l.contains("Video:") && p.size.is_none() {
             any = true;
+            in_video_stream = true;
             // The first "WxH" token after "Video:" (FFmpeg writes it as one).
-            p.size = l.split("Video:").nth(1).and_then(|rest| {
-                rest.split([' ', ',']).find_map(|tok| {
-                    let (w, h) = tok.split_once('x')?;
-                    Some((w.parse().ok()?, h.trim_end_matches(']').parse().ok()?))
-                })
+            let after = l.split("Video:").nth(1).unwrap_or_default();
+            video_codec = after.trim_start().split([' ', ',']).next();
+            p.size = after.split([' ', ',']).find_map(|tok| {
+                let (w, h) = tok.split_once('x')?;
+                Some((w.parse().ok()?, h.trim_end_matches(']').parse().ok()?))
             });
             // "…, 29.97 fps, 30 tbr, …": its own rate (else the guessed one, tbr).
             let rate =
@@ -178,7 +222,6 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
             p.fps = rate(" fps").or_else(|| rate(" tbr")).map_or(0, |f| f.ceil().clamp(0.0, 240.0) as u32);
             // "yuv420p(tv, bt709, progressive)", "yuvj420p(pc, bt470bg/bt709/unknown)": the range,
             // then the matrix (the first of matrix/primaries/transfer when they differ).
-            let after = l.split("Video:").nth(1).unwrap_or_default();
             // The pixel format's own brackets, not the codec's ("h264 (High) (avc1 / …)").
             let tags: Vec<&str> = after
                 .match_indices('(')
@@ -197,6 +240,12 @@ pub fn parse_probe(text: &str) -> Option<Probe> {
                 Some("bt470bg" | "smpte170m" | "bt601") => Some(false),
                 _ => None,
             };
+            // Check pixel format field (second comma-separated section after "Video:") for alpha formats.
+            if let Some(pix_section) = after.split(',').nth(1)
+                && pix_section.split_whitespace().any(pix_fmt_has_alpha)
+            {
+                p.has_alpha = true;
+            }
         } else if l.contains("Audio:") {
             any = true;
             p.audio = true;
@@ -830,6 +879,7 @@ struct PassSpec {
     has_audio: bool,
     size: (u32, u32),
     nv12: Option<(bool, bool)>,
+    video_decoder: Option<&'static str>,
     looping: bool,
     speed_percent: u32,
     duration_ns: u64,
@@ -838,8 +888,13 @@ struct PassSpec {
 
 fn build_pass_args(spec: &PassSpec, from_ns: u64, use_hw: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-nostdin".into()];
-    if use_hw && spec.has_video {
+    if use_hw && spec.has_video && spec.video_decoder.is_none() {
         a.extend(["-hwaccel".into(), spec.hwaccel.into()]);
+    }
+    if let Some(dec) = spec.video_decoder
+        && spec.has_video
+    {
+        a.extend(["-c:v".into(), dec.into()]);
     }
     if from_ns > 0 {
         a.extend(["-ss".into(), format!("{:.6}", from_ns as f64 / 1e9)]);
@@ -1349,14 +1404,20 @@ impl Media {
             return Err(AvError::Source(format!("{} has no picture or sound", path.display())));
         }
         let file = ["-i".to_string(), path.display().to_string()];
-        let hw = has_video && options.hw_decode && hw_decode_allowed() && (hwaccel != "auto" || hw_decodes(&ff, &file));
+        // Alpha videos stay on CPU RGBA (hardware decoders and NV12 strip alpha to opaque black).
+        let hw = has_video
+            && !p.has_alpha
+            && options.hw_decode
+            && hw_decode_allowed()
+            && (hwaccel != "auto" || hw_decodes(&ff, &file));
         if has_video && !hw {
-            tracing::info!(file = %path.display(), "the video is decoded on the CPU");
+            tracing::info!(file = %path.display(), alpha = p.has_alpha, "the video is decoded on the CPU");
         }
         let size = p.size.map_or(max, |s| fit(s, max));
         // A file that doesn't name its matrix: BT.709 from 720 lines up, BT.601 below.
-        let nv12 =
-            (for_card && has_video).then(|| (p.bt709.unwrap_or(p.size.is_some_and(|(_, h)| h >= 720)), p.full_range));
+        // Never force NV12 for sources with an alpha channel (WebM VP9 stingers, ProRes 4444, MOV alpha).
+        let nv12 = (for_card && has_video && !p.has_alpha)
+            .then(|| (p.bt709.unwrap_or(p.size.is_some_and(|(_, h)| h >= 720)), p.full_range));
         let shared = Arc::new(MediaShared::new(hw, start_stopped));
         let stop = Arc::new(AtomicBool::new(false));
         let spec = PassSpec {
@@ -1366,6 +1427,7 @@ impl Media {
             has_audio,
             size,
             nv12,
+            video_decoder: p.video_decoder,
             looping: options.looping,
             speed_percent: options.speed(),
             duration_ns: p.duration_ns,
@@ -1998,5 +2060,94 @@ mod tests {
         assert!(!sh.finished(), "frame still waiting");
         sh.frames.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert!(sh.finished());
+    }
+
+    #[test]
+    fn probe_detects_alpha_formats_and_vp9_alpha_mode() {
+        let prores =
+            "  Stream #0:0: Video: prores (4444) (ap4h / 0x68347061), yuva444p12le(tv, bt709), 1920x1080, 30 fps";
+        let p = parse_probe(prores).unwrap_or_else(|| panic!("prores probe"));
+        assert!(p.has_alpha && p.video_decoder.is_none());
+
+        let vp9_alpha = "Input #0, matroska,webm, from 'stinger.webm':\n  Duration: 00:00:01.00, start: 0.000\n  \
+            Stream #0:0(eng): Video: vp9 (Profile 0), yuv420p(tv), 1920x1080, 60 fps\n    Metadata:\n      \
+            alpha_mode      : 1\n  Stream #0:1: Audio: opus, 48000 Hz, stereo";
+        let p = parse_probe(vp9_alpha).unwrap_or_else(|| panic!("vp9 alpha probe"));
+        assert!(p.has_alpha, "VP9 alpha_mode: 1 must flag has_alpha");
+        assert_eq!(p.video_decoder, Some("libvpx-vp9"));
+        assert!(p.audio);
+
+        let vp8_alpha = "  Stream #0:0: Video: vp8, yuv420p, 320x180, 30 fps\n    Metadata:\n      alpha_mode : 1";
+        let p = parse_probe(vp8_alpha).unwrap_or_else(|| panic!("vp8 alpha probe"));
+        assert!(p.has_alpha && p.video_decoder == Some("libvpx"));
+
+        let opaque = "  Stream #0:0: Video: h264 (High), yuv420p(tv, bt709), 1920x1080, 30 fps";
+        let p = parse_probe(opaque).unwrap_or_else(|| panic!("opaque probe"));
+        assert!(!p.has_alpha && p.video_decoder.is_none());
+    }
+
+    /// On Windows/FFmpeg, opening a transparent VP9 WebM stinger via `open_for_card` must keep
+    /// RGBA (not NV12) and decode with `libvpx-vp9` so alpha=0 pixels stay transparent (M8-01).
+    #[test]
+    fn webm_vp9_with_alpha_preserves_transparency_on_card_path() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ffsrc-alpha-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("stinger.webm");
+        let ok = Command::new(ffmpeg().unwrap_or_else(|e| panic!("{e}")))
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black@0.0:s=32x32:r=15:d=1,format=rgba",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x00ff00@1.0:s=32x32:r=15:d=1,format=rgba",
+                "-filter_complex",
+                "[0:v][1:v]hstack=inputs=2,format=yuva420p",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                "yuva420p",
+                "-auto-alt-ref",
+                "0",
+                "-deadline",
+                "realtime",
+            ])
+            .arg(&file)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let m = Media::open_for_card(&file, false).unwrap_or_else(|e| panic!("{e}"));
+        let started = Instant::now();
+        let mut pic = None;
+        while started.elapsed() < Duration::from_secs(3) && pic.is_none() {
+            assert!(m.frame_nv12().is_none(), "alpha clip must not be downgraded to NV12");
+            pic = m.frame_at(0);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(m);
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = pic.unwrap_or_else(|| panic!("expected RGBA frame from VP9+alpha WebM"));
+        assert_eq!((p.width, p.height), (64, 32));
+        // Left half (x=8, y=16): transparent (alpha == 0).
+        let left = ((16 * 64 + 8) * 4) as usize;
+        // Right half (x=48, y=16): opaque green (alpha == 255, g > 200).
+        let right = ((16 * 64 + 48) * 4) as usize;
+        assert_eq!(p.rgba[left + 3], 0, "left pixel must stay transparent: {:?}", &p.rgba[left..left + 4]);
+        assert!(
+            p.rgba[right + 3] > 240 && p.rgba[right + 1] > 180,
+            "right pixel must stay opaque green: {:?}",
+            &p.rgba[right..right + 4]
+        );
     }
 }

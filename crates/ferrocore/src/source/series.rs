@@ -169,11 +169,8 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
                 };
                 played = true;
                 while !m.ended() {
-                    // NV12 for the card where FFmpeg plays it; a Mac's own player gives RGBA.
-                    #[cfg(not(target_os = "macos"))]
+                    // NV12 for opaque FFmpeg-decoded clips; RGBA for AVFoundation and alpha clips.
                     let fresh = m.frame_nv12().map(|y| feed.yuv(y)).is_some();
-                    #[cfg(target_os = "macos")]
-                    let fresh = false;
                     if !fresh && let Some(pic) = m.frame_at(now_ns()) {
                         feed.picture(pic);
                     }

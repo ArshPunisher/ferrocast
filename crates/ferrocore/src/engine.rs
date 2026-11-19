@@ -593,8 +593,8 @@ enum Fresh {
     Pic(Picture),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     Screen(crate::screen::Surface),
-    /// A file's picture as FFmpeg decodes it, turned into RGB on the card (Windows, Linux).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// A file's picture as FFmpeg decodes it, turned into RGB on the card (Windows, Linux, and
+    /// macOS FFmpeg fallback for MKV/WebM).
     Yuv(crate::ffsrc::Nv12Picture),
 }
 
@@ -3797,11 +3797,9 @@ fn frame(
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Media(m) => {
-                // As NV12 for the card where FFmpeg plays it (`open_video`), else RGBA.
-                #[cfg(not(target_os = "macos"))]
+                // NV12 for opaque FFmpeg-decoded clips (Windows/Linux, and macOS MKV fallback),
+                // RGBA for AVFoundation clips and alpha sources (WebM VP9 stingers, ProRes 4444).
                 let fresh = m.frame_nv12().map(Fresh::Yuv).or_else(|| m.frame_at(ts).map(Fresh::Pic));
-                #[cfg(target_os = "macos")]
-                let fresh = m.frame_at(ts).map(Fresh::Pic);
                 if let Some(f) = fresh {
                     uploads.push((*id, f));
                 }
