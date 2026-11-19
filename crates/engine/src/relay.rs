@@ -22,6 +22,35 @@ use crate::state::{AccountView, ConnectorView};
 use crate::{Engine, EngineError, now};
 
 pub(crate) const INSTALL: &str = "relay-install";
+
+/// What a 401 from the relay's Kick refresh means.
+#[derive(Debug, PartialEq, Eq)]
+enum Kick401 {
+    /// Kick refused the refresh token: the streamer signs in to Kick again.
+    SignInAgain,
+    /// The relay didn't recognise this install (its own credentials): registering again fixes
+    /// it, the Kick sign-in is fine. It was taken as "sign in to Kick again" (agy's M10 scan).
+    InstallForgotten,
+}
+
+fn kick_refresh_401(code: Option<&str>) -> Kick401 {
+    match code {
+        Some("sign_in_needed") => Kick401::SignInAgain,
+        _ => Kick401::InstallForgotten,
+    }
+}
+
+#[cfg(test)]
+mod kick_401_tests {
+    use super::*;
+
+    #[test]
+    fn only_kick_refusing_asks_for_a_new_sign_in() {
+        assert_eq!(kick_refresh_401(Some("sign_in_needed")), Kick401::SignInAgain);
+        assert_eq!(kick_refresh_401(Some("unauthorized")), Kick401::InstallForgotten);
+        assert_eq!(kick_refresh_401(None), Kick401::InstallForgotten);
+    }
+}
 const KICK_TOKENS: &str = "kick-tokens";
 
 impl Engine {
@@ -289,7 +318,25 @@ impl Engine {
                     .map_err(|e| KickError::Network(e.to_string()))?;
                 match res.status().as_u16() {
                     200..=299 => res.json::<KickTokens>().await.map_err(|e| KickError::Network(e.to_string())),
-                    401 => Err(KickError::SignInNeeded),
+                    401 => {
+                        let code = res
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.pointer("/error/code").and_then(|c| c.as_str()).map(String::from));
+                        match kick_refresh_401(code.as_deref()) {
+                            Kick401::SignInAgain => Err(KickError::SignInNeeded),
+                            Kick401::InstallForgotten => {
+                                // The relay no longer knows this install, not Kick refusing:
+                                // forget it so the next try registers again (as the link does),
+                                // and keep the Kick sign-in (it was never refused).
+                                let _ = engine.inner.secrets.delete(INSTALL);
+                                Err(KickError::Network(
+                                    "the relay didn't recognise this install; registering again".into(),
+                                ))
+                            }
+                        }
+                    }
                     s => Err(KickError::Refused(format!("the relay answered {s}"))),
                 }
             }) as ferrocast_kick::api::RefreshFuture
