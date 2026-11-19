@@ -2067,7 +2067,13 @@ impl Engine {
         }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
-        Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
+        // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
+        let (restart, detail) = one_line(restart, "Some changes apply after a restart");
+        let mut out = serde_json::json!({ "settings": host.settings().await, "restart": restart });
+        if let (Some(d), Some(o)) = (detail, out.as_object_mut()) {
+            o.insert("restart_detail".into(), Value::String(d));
+        }
+        Ok(out)
     }
 
     /// The Studio's stats, with the stream's health while it's live.
@@ -2303,8 +2309,13 @@ impl Engine {
         if let Some(note) = self.studio_sync_light().await {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
+        // One short line (`also`), the full words behind the page's (i) (`also_detail`).
+        let (also, detail) = one_line(also, "Part of what goes with the stream didn't start");
         if let (Some(also), Some(o)) = (also, v.as_object_mut()) {
             o.insert("also".into(), Value::String(also));
+            if let Some(d) = detail {
+                o.insert("also_detail".into(), Value::String(d));
+            }
         }
         Ok(v)
     }
@@ -2712,6 +2723,16 @@ fn web_window_check(name: &str, url: &str) -> Result<(String, String), EngineErr
 
 /// What starts and stops with the stream (OBS's "Automatically record when streaming" and its
 /// friends). The stream starts or ends either way, so what didn't follow comes back in words.
+/// A hint as one short line plus the rest: a note already short enough stays as it is; a longer
+/// one (or several joined) becomes `short`, and its full words are the detail. (The page shows
+/// the line and puts the detail behind an (i); an older page shows the line.)
+pub(crate) fn one_line(full: Option<String>, short: &str) -> (Option<String>, Option<String>) {
+    match full {
+        Some(f) if f.chars().count() > 60 => (Some(short.to_string()), Some(f)),
+        other => (other, None),
+    }
+}
+
 async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> Option<String> {
     let mut failed = Vec::new();
     if on {
@@ -2745,6 +2766,18 @@ async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hint_is_one_short_line_with_the_rest_kept_as_its_detail() {
+        assert_eq!(one_line(None, "x"), (None, None));
+        let short = "Applies after a restart.".to_string();
+        assert_eq!(one_line(Some(short.clone()), "x"), (Some(short), None));
+        let long = "The replay buffer didn't start: No disk space. The recording didn't start: busy.";
+        assert_eq!(
+            one_line(Some(long.into()), "Part didn't start"),
+            (Some("Part didn't start".into()), Some(long.into()))
+        );
+    }
 
     #[derive(Debug, Default)]
     struct Fake {
