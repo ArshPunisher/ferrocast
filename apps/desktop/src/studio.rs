@@ -402,22 +402,60 @@ fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held) {
 const MAIN_START_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
 const MAIN_LATE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Encodes beside the stream and the recording that Go live or the replay buffer add.
+#[derive(Debug, Clone, Copy, Default)]
+struct Also {
+    /// Twitch Enhanced Broadcasting is on for a ticked destination.
+    enhanced: bool,
+    /// A ticked destination takes the lighter stream (720p).
+    light: bool,
+    /// The replay buffer runs, or starts with the stream.
+    replay: bool,
+}
+
 /// What streaming and recording at once ask of the Mac's video encoder (its engines × about one
 /// 4K60 each), from the settings: the stream (at its output size), and the recording unless
 /// "Same as stream" shares the stream's encode (`can_share`, whose reason is given when it
 /// can't). `level`: ok under 90%, limit up to 100% (4K30 × 2 held its 30, 19 Nov), over past
 /// it (frames drop: 4K60 × 2 made 31 of 60).
-fn encode_budget(s: &StudioSettings, engines: Option<u32>) -> Value {
-    let canvas = f64::from(s.width) * f64::from(s.height) * f64::from(s.fps) / 1e6;
-    let stream = stream_settings(s);
-    let stream_mpx = stream.encode.scale.map_or(canvas, |(w, h)| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6);
+fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value {
+    let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
+    let canvas = mpx(s.width, s.height);
+    // Only the video encoder's own encodes count: x264 (software, Lossless) runs on the CPU.
+    let hardware = |id: &str| !id.to_ascii_lowercase().contains("x264");
+    let mut stream = stream_settings(s);
+    // Twitch Enhanced Broadcasting's qualities: Twitch's plan sets them when the stream starts;
+    // about 720p and 480p beside the main one (projects-60).
+    if also.enhanced {
+        stream.video_tracks = vec![(1280, 720, 3000), (852, 480, 1500)];
+    }
+    let mut stream_mpx = stream.encode.scale.map_or(canvas, |(w, h)| mpx(w, h));
+    stream_mpx += stream.video_tracks.iter().map(|&(w, h, _)| mpx(w, h)).sum::<f64>();
+    if also.light {
+        stream_mpx += mpx(1280, 720);
+    }
+    if !hardware(&stream.encode.video_encoder) {
+        stream_mpx = 0.0;
+    }
     let plan = ferrocast_studio::RecordPlan {
         tracks: s.record_tracks.clone(),
         encode: record_encode(s),
         ..Default::default()
     };
-    let shares = ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps);
-    let record_mpx = if shares.is_ok() { 0.0 } else { canvas };
+    let shares = ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps)
+        .map_err(|why| {
+            if stream.vod_track.is_some() {
+                format!("{why} (turn the VOD track off when you're not on Twitch)")
+            } else {
+                why
+            }
+        });
+    let record_hw = hardware(&plan.encode.video_encoder);
+    let mut record_mpx = if shares.is_ok() || !record_hw { 0.0 } else { canvas };
+    // The replay buffer is always an encode of its own (the recording's settings).
+    if also.replay && record_hw {
+        record_mpx += canvas;
+    }
     let budget = engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE);
     let level = match budget {
         None => "unknown",
@@ -426,6 +464,7 @@ fn encode_budget(s: &StudioSettings, engines: Option<u32>) -> Value {
         Some(_) => "ok",
     };
     json!({
+        "replay": also.replay,
         "budget_mpx": budget.map(|b| b.round()),
         "stream_mpx": stream_mpx.round(),
         "record_mpx": record_mpx.round(),
@@ -3175,9 +3214,14 @@ impl StudioHost for DesktopStudio {
             .map_err(|e| format!("The window didn't open: {e}"))
     }
 
-    async fn encode_budget(&self) -> Result<Value, String> {
-        let s = self.on_main(|h| h.settings.clone().unwrap_or_default()).await?;
-        Ok(encode_budget(&s, ferrocast_studio::system::video_engines()))
+    async fn encode_budget(&self, draft: Option<Value>, enhanced: bool, light: bool) -> Result<Value, String> {
+        let (saved, replay) = self.on_main(|h| (h.settings.clone().unwrap_or_default(), h.replay.is_some())).await?;
+        let s = match draft {
+            Some(d) => serde_json::from_value::<StudioSettings>(d).map_err(|e| format!("settings: {e}"))?,
+            None => saved,
+        };
+        let also = Also { enhanced, light, replay: replay || s.replay_when_streaming };
+        Ok(encode_budget(&s, ferrocast_studio::system::video_engines(), also))
     }
 
     async fn screen_access(&self) -> Result<Value, String> {
@@ -3599,21 +3643,35 @@ mod budget_tests {
             record_quality: quality.into(),
             ..StudioSettings::default()
         };
-        let level = |s: &StudioSettings| encode_budget(s, Some(1))["level"].as_str().unwrap_or("").to_string();
+        let level =
+            |s: &StudioSettings| encode_budget(s, Some(1), Also::default())["level"].as_str().unwrap_or("").to_string();
         assert_eq!(level(&at(3840, 2160, 60, "high")), "over");
         // One 4K60 encode is all one engine does (1.0x): at the limit, but holding its 60.
-        let shared = encode_budget(&at(3840, 2160, 60, "stream"), Some(1));
+        let shared = encode_budget(&at(3840, 2160, 60, "stream"), Some(1), Also::default());
         assert_eq!((shared["shared"].as_bool(), shared["level"].as_str()), (Some(true), Some("limit")), "{shared}");
         assert_eq!(level(&at(3840, 2160, 30, "high")), "limit");
         assert_eq!(level(&at(2560, 1440, 60, "high")), "ok");
         // A Max's two engines: two 4K60 encodes fill them, two 4K30 fit.
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), Some(2))["level"], "limit");
-        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), Some(2))["level"], "ok");
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None)["level"], "unknown");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), Some(2), Also::default())["level"], "limit");
+        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), Some(2), Also::default())["level"], "ok");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, Also::default())["level"], "unknown");
         let mut two = at(3840, 2160, 60, "stream");
         two.record_tracks = vec![1, 2];
-        let b = encode_budget(&two, Some(1));
+        let b = encode_budget(&two, Some(1), Also::default());
         assert_eq!(b["level"], "over");
         assert!(b["why_not_shared"].as_str().is_some_and(|w| w.contains("2 sound tracks")), "{b}");
+        // projects-60's gaps: Twitch's qualities can't share and add encodes; the replay buffer
+        // is its own encode; x264 (Lossless) isn't the video encoder's.
+        let same = at(3840, 2160, 60, "stream");
+        let eb = encode_budget(&same, Some(1), Also { enhanced: true, ..Also::default() });
+        assert_eq!((eb["shared"].as_bool(), eb["level"].as_str()), (Some(false), Some("over")), "{eb}");
+        let replay = encode_budget(&same, Some(1), Also { replay: true, ..Also::default() });
+        assert_eq!(replay["level"], "over", "{replay}");
+        let lossless = encode_budget(&at(3840, 2160, 60, "lossless"), Some(1), Also::default());
+        assert_eq!(
+            (lossless["record_mpx"].as_f64(), lossless["level"].as_str()),
+            (Some(0.0), Some("limit")),
+            "{lossless}"
+        );
     }
 }

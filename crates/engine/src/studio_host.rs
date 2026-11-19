@@ -344,8 +344,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
         Err(NOT_HERE.into())
     }
     /// What streaming and recording would ask of this computer's video encoder, against what
-    /// it does (see docs/API.md, `GET /studio/engine/encode-budget`). Elsewhere: no figure.
-    async fn encode_budget(&self) -> Result<Value, String> {
+    /// it does (see docs/API.md, `/studio/engine/encode-budget`): for `draft` settings when
+    /// given (the page asks while they're picked), else the saved ones; `enhanced` and `light`
+    /// say Go live adds Twitch's qualities or the lighter stream. Elsewhere: no figure.
+    async fn encode_budget(&self, _draft: Option<Value>, _enhanced: bool, _light: bool) -> Result<Value, String> {
         Ok(serde_json::json!({ "budget_mpx": null, "level": "unknown" }))
     }
     /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
@@ -2411,8 +2413,12 @@ impl Engine {
         self.studio_host()?.web_window(name, url).await.map_err(failed)
     }
 
-    pub async fn studio_encode_budget(&self) -> Result<Value, EngineError> {
-        self.studio_host()?.encode_budget().await.map_err(failed)
+    pub async fn studio_encode_budget(&self, draft: Option<Value>) -> Result<Value, EngineError> {
+        let config = self.golive_config();
+        let on = || config.destinations.iter().filter(|d| d.enabled);
+        let enhanced = on().any(|d| d.enhanced);
+        let light = on().any(crate::golive::DestinationConfig::wants_light);
+        self.studio_host()?.encode_budget(draft, enhanced, light).await.map_err(failed)
     }
 
     pub async fn studio_screen_access(&self) -> Result<Value, EngineError> {
