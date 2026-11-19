@@ -34,10 +34,14 @@ function SaveIcon($file, $name) {
     $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($file)
     $png = Join-Path $Out "$name.png"
     $icon.ToBitmap().Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
-    # NSIS's own icon is a blue/grey disc; ours isn't. Saved for a look; the size of the
-    # embedded icon group is checked below.
     return $png
   } catch { return $null }
+}
+# Every pixel of a saved icon, to compare two (ExtractAssociatedIcon always gives some icon).
+function Pixels($png) {
+  $b = New-Object System.Drawing.Bitmap $png
+  try { (0..($b.Height - 1) | ForEach-Object { $y = $_; 0..($b.Width - 1) | ForEach-Object { $b.GetPixel($_, $y).ToArgb() } }) -join ',' }
+  finally { $b.Dispose() }
 }
 
 # The setup's own icon (owner, 4 Nov: it showed NSIS's disc).
@@ -68,6 +72,9 @@ $cams = @(Get-ChildItem $dir -Filter 'ferrocast_camera*.dll' -ErrorAction Silent
 Check 'camera DLLs beside the program (64 and 32-bit)' ($cams.Count -ge 2) ($cams -join ', ')
 $appIcon = if (Test-Path $exe) { SaveIcon $exe 'app-icon' } else { $null }
 Check 'program has an icon' ($null -ne $appIcon) "$appIcon"
+# The setup shows the program's own icon, not NSIS's default disc (owner's PC test, 4 Nov).
+$same = $setupIcon -and $appIcon -and ((Pixels $setupIcon) -eq (Pixels $appIcon))
+Check "setup shows Ferrocast's icon" $same 'setup-icon.png and app-icon.png, pixel for pixel'
 $lnk = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter 'Ferrocast*.lnk' -ErrorAction SilentlyContinue | Select-Object -First 1
 Check 'Start menu shortcut' ($null -ne $lnk) "$($lnk.FullName)"
 if ($lnk) {
@@ -81,8 +88,13 @@ $home_ = Join-Path $Out 'home'
 New-Item -ItemType Directory -Force $home_ | Out-Null
 $env:FERROCAST_HOME = $home_
 $env:RUST_LOG = 'info'
-# Something of the user's, to be found unchanged after the uninstall.
-$sentinel = Join-Path $home_ 'keep-me.txt'
+# Something of the user's, to be found unchanged after the uninstall: in the data folder the
+# app uses when it isn't told another (main.rs data_dir: %APPDATA%\Ferrocast), which the
+# uninstaller could reach; the test's own FERROCAST_HOME it never knew about.
+$realData = Join-Path $env:APPDATA 'Ferrocast'
+New-Item -ItemType Directory -Force $realData | Out-Null
+# A name of its own: never a file of the user's on a real PC (removed after the check).
+$sentinel = Join-Path $realData ("installer-test-{0}.txt" -f [guid]::NewGuid())
 $stamp = [guid]::NewGuid().ToString()
 Set-Content -Path $sentinel -Value $stamp -NoNewline
 if (-not (Test-Path $exe)) {
@@ -120,6 +132,7 @@ if (Test-Path $un) {
   Check 'camera registration removed' (-not $cam) ''
   $kept = (Test-Path $sentinel) -and ((Get-Content -Raw $sentinel) -eq $stamp)
   Check "the user's data kept" $kept $sentinel
+  Remove-Item $sentinel -ErrorAction SilentlyContinue
 }
 
 $result | ConvertTo-Json -Depth 5 | Out-File (Join-Path $Out 'results.json')

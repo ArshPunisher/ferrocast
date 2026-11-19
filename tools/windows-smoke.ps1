@@ -211,9 +211,14 @@ $card = Select-String -Path (Join-Path $home_ 'logs\ferrocast.log') -Pattern 'dr
   Select-Object -Last 1 | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
 $result.numbers.card = $card
 $software = "$card" -match 'Basic Render Driver|WARP'
-if ($null -ne $result.numbers.engine_fps) {
+if ($null -eq $result.numbers.engine_fps) { Check 'frame rate' $false 'no numbers came from /stats while recording' }
+else {
   $rate = "$($result.numbers.engine_fps) of $Fps fps (needs $([math]::Round($MinShare * $Fps, 1))) on $card"
-  if ($software) { Note "frame rate not judged on Windows' software card: $rate" }
+  # Even there, a stalled engine (under 1 fps; 2.8-17 seen on the runner) fails.
+  if ($software) {
+    Note "frame rate not judged on Windows' software card: $rate"
+    Check 'frames keep coming' ($result.numbers.engine_fps -ge 1) $rate
+  }
   else { Check 'frame rate' ($result.numbers.engine_fps -ge $MinShare * $Fps) $rate }
 }
 
