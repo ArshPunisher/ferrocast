@@ -29,6 +29,15 @@ const LATENCY_ROOM_NS: u64 = 20_000_000;
 /// its sound comes (19 Nov: a USB capture card's sound came over a second late, the mixer
 /// waited a second for it, and every source, the mic too, came out late and broken).
 const RETIME_NS: u64 = 300_000_000;
+/// The drift average's length, the offset it must reach before a source's clock is followed
+/// (bursts and jitter average out well under it; 300 ppm reaches it in ~17 s), how fast it's
+/// brought back, and the most a source is sped up or slowed down (0.2%: no pitch anyone hears).
+const DRIFT_AVERAGE_S: f64 = 2.0;
+const FOLLOW_AFTER_NS: f64 = 5_000_000.0;
+const DRIFT_CORRECT_S: f64 = 10.0;
+const MAX_DRIFT: f64 = 0.002;
+/// Frames faded out and in where a source's sample rate changes (2 ms at 48 kHz).
+const SWITCH_FADE: usize = 96;
 /// After this long with sound on time, the mixer waits only as long as the latest sound in it
 /// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
 const SHRINK_AFTER_NS: u64 = 20_000_000_000;
@@ -128,6 +137,18 @@ struct Source {
     /// Added to its times: a source whose sound came later than [`RETIME_NS`] is timed by when
     /// it comes from then on, so it never holds the whole mix back (libobs's timing_adjust).
     adjust_ns: u64,
+    /// The offset its times were placed with last (sync offset less what its filters hold
+    /// back): a change starts its timing again, as libobs does on a sync-offset change, else a
+    /// change under the smoothing (70 ms) was smoothed away and did nothing.
+    offset_ns: Option<i64>,
+    /// How far (ns, averaged over ~2 s) its stamps run ahead of (+) or behind (-) where its
+    /// sound lands in the queue: a device clock that isn't the host's shows here as a slow
+    /// creep, which libobs lets grow to 70 ms and then cuts (a click every few minutes).
+    drift_err_ns: f64,
+    /// Played this much faster (>1: more sound made from what came) to follow its clock, once
+    /// it was seen to drift (`follows`); 1 until then.
+    ratio: f64,
+    follows: bool,
 }
 
 /// Taps of each phase of the true-peak oversampler.
@@ -255,6 +276,33 @@ fn feed_taps(
     }
 }
 
+/// A sample into -1..1, NaN made silent (Rust's clamp keeps NaN as NaN; libobs's
+/// `clamp_audio_output` checks `val == val` for the same reason).
+pub(crate) fn clip(v: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v.clamp(-1.0, 1.0) }
+}
+
+/// After the volume: an overflow to infinity (a huge gain) becomes the loudest real sample
+/// it could be, not infinity in the sum. Far above 1 on purpose: the sum is clipped later.
+fn clip_wide(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else if v.is_nan() {
+        0.0
+    } else {
+        v.signum() * 1.0e6
+    }
+}
+
+/// Makes samples that aren't finite numbers silent.
+fn finite(buf: &mut [f32]) {
+    for v in buf {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    }
+}
+
 impl Mixer {
     /// `rate` Hz stereo out; blocks are made `latency_ns` behind the clock.
     pub fn new(rate: u32, latency_ns: u64) -> Self {
@@ -327,6 +375,21 @@ impl Mixer {
         Tap(buf)
     }
 
+    /// A source's sound settings, if it's in the mix.
+    pub fn settings(&self, id: u64) -> Option<SourceSettings> {
+        self.sources.get(&id).map(|s| s.settings)
+    }
+
+    /// Puts `id` in the mix with the default settings unless it's there already (then it's
+    /// left as it is). A slow source that finished opening after its settings were loaded used
+    /// `set` with the defaults and lost them: muted came back unmuted, at full volume (found
+    /// 20 Nov in the OBS comparison).
+    pub fn ensure(&mut self, id: u64) {
+        if !self.sources.contains_key(&id) {
+            self.set(id, SourceSettings::default());
+        }
+    }
+
     /// Adds a source (or changes its settings).
     pub fn set(&mut self, id: u64, settings: SourceSettings) {
         match self.sources.get_mut(&id) {
@@ -344,6 +407,10 @@ impl Mixer {
                         recent: VecDeque::new(),
                         tp: [[0.0; TP_TAPS]; 2],
                         adjust_ns: 0,
+                        offset_ns: None,
+                        drift_err_ns: 0.0,
+                        ratio: 1.0,
+                        follows: false,
                     },
                 );
             }
@@ -357,6 +424,11 @@ impl Mixer {
     /// compressor made it anew each step: a click each time), and only the rest are made new.
     pub fn set_effects(&mut self, id: u64, effects: &[AudioEffect]) {
         let rate = self.rate;
+        // Filters set before the source is in the mix (a slow file still opening) are kept: it's
+        // put in with the defaults, its settings come when they're set (they were dropped).
+        if !effects.is_empty() {
+            self.ensure(id);
+        }
         let Some(s) = self.sources.get_mut(&id) else { return };
         let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
         let before = held(&s.filters);
@@ -465,6 +537,7 @@ impl Mixer {
             return;
         };
         let mut ts = (ts_ns as i64 + offset).max(0) as u64;
+        let mixed_to = self.next_ns;
         if let (Some(next), Some(src)) = (self.next_ns, self.sources.get_mut(&id)) {
             // Judged on the device's own time, not on the sync offset or what filters hold
             // back (those are meant: moved earlier on purpose, they aren't lateness; CodeRabbit).
@@ -516,16 +589,43 @@ impl Mixer {
             }
         }
         let Some(src) = self.sources.get_mut(&id) else { return };
+        let moved = src.offset_ns.is_some_and(|o| o != offset);
+        src.offset_ns = Some(offset);
         // Where this sound would continue what's queued: jitter is smoothed over; a gap ahead
         // (a source that went quiet, beeps scheduled apart) is filled with silence, as libobs
         // does, so nothing queued is lost; a jump back or a long jump (a seek) restarts the queue.
+        // What its resampler still holds counts at the rate it came in (not this piece's).
         let queued = src.queue.len() / 2
-            + src.resampler.as_ref().map_or(0, |(_, _, p)| p[0].len() * out_rate as usize / rate as usize);
+            + src.resampler.as_ref().map_or(0, |(r0, _, p)| p[0].len() * out_rate as usize / *r0 as usize);
+        let piece_s = (pcm.len() / channels) as f64 / f64::from(rate);
         let mut gap = 0usize;
+        let mut on_course = false;
         let at = match src.start_ns {
+            // Where it would continue is already mixed (it stalled a moment and the mix went on;
+            // what a resampler still holds counts too): placed at its own time. Smoothed back to
+            // the old spot, every piece would land in the past and lose its start, a choppy
+            // sound for good when the stall was longer than the mixer's wait (20 Nov, Neon).
+            // (Its resampler keeps running: only where the sound goes moves, so a bursty device
+            // that runs dry between bursts never has its sound broken by a reset.)
+            Some(start)
+                if mixed_to.is_some_and(|m| start + queued as u64 * 1_000_000_000 / u64::from(out_rate) < m) =>
+            {
+                let held = queued - src.queue.len() / 2;
+                src.queue.clear();
+                src.start_ns = Some(ts.saturating_sub(held as u64 * 1_000_000_000 / u64::from(out_rate)));
+                None
+            }
             Some(start) => {
                 let expected = start + queued as u64 * 1_000_000_000 / u64::from(out_rate);
-                if ts.abs_diff(expected) < SMOOTHING_NS {
+                // Its offset changed (a sync offset dialled in, a filter that holds sound back
+                // switched on): placed exactly at its new time (a gap filled or what overlaps
+                // replaced), not smoothed back to where it was, and not by clearing the queue.
+                if ts == expected || (!moved && ts.abs_diff(expected) < SMOOTHING_NS) {
+                    // On course: how far off it is feeds the drift average.
+                    let err = ts as f64 - expected as f64;
+                    let a = (piece_s / DRIFT_AVERAGE_S).min(1.0);
+                    src.drift_err_ns += (err - src.drift_err_ns) * a;
+                    on_course = true;
                     None
                 } else if ts > expected && ts - expected <= MAX_GAP_NS {
                     gap = ((ts - expected) * u64::from(rate) / 1_000_000_000) as usize;
@@ -548,6 +648,23 @@ impl Mixer {
             }
             None => Some(ts),
         };
+        if !on_course {
+            // A jump (a gap filled, a burst placed, a new start): the average starts again; the
+            // clock it follows stays (a device's drift doesn't change with a stall).
+            src.drift_err_ns = 0.0;
+        }
+        if !src.follows && src.drift_err_ns.abs() > FOLLOW_AFTER_NS {
+            src.follows = true;
+            tracing::info!(
+                source = id,
+                off_ms = src.drift_err_ns / 1e6,
+                "a source's clock drifts: the mixer follows it"
+            );
+        }
+        if src.follows {
+            // Brought back over about `DRIFT_CORRECT_S`, never faster than a hair of pitch.
+            src.ratio = (1.0 + src.drift_err_ns / 1e9 / DRIFT_CORRECT_S).clamp(1.0 - MAX_DRIFT, 1.0 + MAX_DRIFT);
+        }
         // Stereo, planar, after the silence that fills a gap.
         let frames = pcm.len() / channels;
         let (mut l, mut r) = (vec![0.0; gap], vec![0.0; gap]);
@@ -569,7 +686,51 @@ impl Mixer {
                 pending[1].clear();
             }
         }
-        if rate == out_rate {
+        // Its rate changed (a device or file at another rate now): what the old resampler still
+        // holds is played out first, not dropped (a click of ~11 ms; Sonnet's soak test, 20 Nov).
+        if src.resampler.as_ref().is_some_and(|(r0, ..)| *r0 != rate)
+            && let Some((r0, mut rs, pending)) = src.resampler.take()
+        {
+            // Its last input, then its delay line (input it took that hasn't come out yet):
+            // as many frames as went in, at the new rate.
+            let owed = rs.output_delay()
+                + ((pending[0].len() as u64 * u64::from(out_rate) + u64::from(r0) / 2) / u64::from(r0)) as usize;
+            let mut out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+            if !pending[0].is_empty()
+                && let Ok(o) = rs.process_partial(Some(&pending), None)
+            {
+                out[0].extend_from_slice(&o[0]);
+                out[1].extend_from_slice(&o[1]);
+            }
+            while out[0].len() < owed {
+                let Ok(o) = rs.process_partial(None::<&[Vec<f32>]>, None) else { break };
+                if o[0].is_empty() {
+                    break;
+                }
+                out[0].extend_from_slice(&o[0]);
+                out[1].extend_from_slice(&o[1]);
+            }
+            for (a, b) in out[0].iter().zip(&out[1]).take(owed) {
+                src.queue.push_back(*a);
+                src.queue.push_back(*b);
+            }
+            // The tail's last frames were filtered with silence for the input that never came at
+            // the old rate: no exact join exists, so the old sound fades out and the new fades in
+            // over 2 ms (a dip, not a click).
+            let n = (src.queue.len() / 2).min(SWITCH_FADE);
+            let len = src.queue.len();
+            for k in 0..n {
+                let g = k as f32 / n as f32;
+                src.queue[len - 2 * (k + 1)] *= g;
+                src.queue[len - 2 * (k + 1) + 1] *= g;
+            }
+            for (k, (a, b)) in l.iter_mut().zip(r.iter_mut()).skip(gap).take(SWITCH_FADE).enumerate() {
+                let g = k as f32 / SWITCH_FADE as f32;
+                *a *= g;
+                *b *= g;
+            }
+        }
+        if rate == out_rate && !src.follows {
             src.resampler = None;
             for (a, b) in l.iter().zip(&r) {
                 src.queue.push_back(*a);
@@ -590,6 +751,9 @@ impl Mixer {
                 }
             }
             let Some((_, rs, pending)) = &mut src.resampler else { return };
+            if src.follows {
+                let _ = rs.set_resample_ratio_relative(src.ratio, true);
+            }
             pending[0].extend_from_slice(&l);
             pending[1].extend_from_slice(&r);
             while pending[0].len() >= RESAMPLE_CHUNK {
@@ -723,20 +887,31 @@ impl Mixer {
                     f[1] *= g;
                 }
             }
+            // Not-a-number or infinite samples (a broken device, file or plugin) are made
+            // silent before and after the filters: one NaN summed into a track makes the whole
+            // mix NaN, and Rust's clamp keeps NaN as NaN (OBS clears NaN the same way,
+            // `clamp_audio_output`). Before the filters too, so one can't poison a filter's state.
+            finite(&mut buf);
             if !src.filters.is_empty() {
                 let (mut l, mut r): (Vec<f32>, Vec<f32>) = buf.as_chunks::<2>().0.iter().map(|f| (f[0], f[1])).unzip();
                 for f in &mut src.filters {
                     f.process([&mut l, &mut r]);
+                    // Between filters too: one that makes NaN mustn't poison the next one's state.
+                    finite(&mut l);
+                    finite(&mut r);
                 }
                 for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                     f[0] = l[i];
                     f[1] = r[i];
                 }
+                finite(&mut buf);
             }
             let (mut peak, mut sq) = ([0f32; 2], [0f32; 2]);
+            // A volume that isn't a number (a bad saved setting) is silence, not NaN.
+            let vol = if vol.is_finite() { vol } else { 0.0 };
             for f in buf.as_chunks_mut::<2>().0 {
-                f[0] *= vol;
-                f[1] *= vol;
+                f[0] = clip_wide(f[0] * vol);
+                f[1] = clip_wide(f[1] * vol);
                 for c in 0..2 {
                     peak[c] = peak[c].max(f[c].abs());
                     sq[c] += f[c] * f[c];
@@ -783,16 +958,18 @@ impl Mixer {
         }
         if let Some(loud) = self.loudness.as_mut() {
             for (track, l) in tracks.iter_mut().zip(loud.iter_mut()) {
+                // A sum that overflowed (huge gains) mustn't reach the loudness filters' state.
+                finite(track);
                 l.process(track);
             }
         }
         for track in &mut tracks {
             for v in track.iter_mut() {
-                *v = v.clamp(-1.0, 1.0);
+                *v = clip(*v);
             }
         }
         for v in &mut monitor {
-            *v = v.clamp(-1.0, 1.0);
+            *v = clip(*v);
         }
         Block { ts_ns: start, tracks, monitor }
     }
@@ -1401,5 +1578,139 @@ mod tests {
         let elapsed = now - 20_000_000 - first.unwrap_or(0);
         let expected = (u128::from(elapsed) * u128::from(RATE) / 1_000_000_000) as usize / BLOCK;
         assert!(made.abs_diff(expected) <= 1, "{made} blocks for {expected}");
+    }
+
+    /// A source that's added to the mix after its settings were set keeps them.
+    #[test]
+    fn a_source_that_opens_late_keeps_its_settings() {
+        let mut m = Mixer::new(48_000, 0);
+        let muted = SourceSettings { muted: true, volume: 0.25, ..SourceSettings::default() };
+        m.set(7, muted);
+        m.ensure(7);
+        assert_eq!(m.sources[&7].settings, muted, "the settings it had stay");
+        m.ensure(8);
+        assert_eq!(m.sources[&8].settings, SourceSettings::default(), "a new one gets the defaults");
+    }
+
+    /// A source sending NaN or infinity is silent in the mix; the others are still heard.
+    #[test]
+    fn a_source_sending_nan_never_breaks_the_mix() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        m.set(2, SourceSettings::default());
+        let t0 = 1_000_000_000;
+        // The mix starts at t0, so the next block is the one with the bad samples.
+        let _ = m.mix_until(t0);
+        let mut bad = vec![0.5f32; BLOCK * 2];
+        bad[10] = f32::NAN;
+        bad[11] = f32::INFINITY;
+        m.push(1, &bad, 2, 48_000, t0);
+        m.push(2, &[0.25f32; BLOCK * 2], 2, 48_000, t0);
+        let blocks = m.mix_until(t0 + block_ns(48_000));
+        let all: Vec<f32> = blocks.iter().flat_map(|b| b.tracks[0].iter().copied()).collect();
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|v| v.is_finite()), "no NaN reaches the track");
+        assert!(all.iter().any(|v| *v > 0.2), "the good source is still heard");
+    }
+
+    /// Feeds 10 ms pieces of a steady tone on time from `from` to `to` (ms), skipping
+    /// `stall` (ms range), mixing as it goes; returns the blocks mixed.
+    fn feed(m: &mut Mixer, from: u64, to: u64, stall: Option<(u64, u64)>) -> Vec<Block> {
+        let ms = 1_000_000u64;
+        let piece = [0.5f32; 480 * 2];
+        let mut out = Vec::new();
+        let mut t = from;
+        while t < to {
+            if !stall.is_some_and(|(a, b)| t >= a && t < b) {
+                m.push(1, &piece, 2, 48_000, t * ms);
+            }
+            t += 10;
+            out.extend(m.mix_until(t * ms));
+        }
+        out
+    }
+
+    /// A source that stalls longer than the mixer's wait comes back whole: after a moment,
+    /// every block has it all the way through (before 20 Nov each piece was placed back where
+    /// the stall began, already mixed, and lost its start: choppy for good).
+    #[test]
+    fn a_source_that_stalls_a_moment_comes_back_whole() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_low_latency(true);
+        m.set(1, SourceSettings::default());
+        let _ = feed(&mut m, 1_000, 3_000, None);
+        let _ = feed(&mut m, 3_000, 3_200, Some((3_000, 3_055)));
+        let after = feed(&mut m, 3_200, 5_000, None);
+        let holes: usize = after
+            .iter()
+            .skip(10)
+            .map(|b| b.tracks[0].as_chunks::<2>().0.iter().filter(|f| f[0].abs() < 0.01).count())
+            .sum();
+        assert_eq!(holes, 0, "no silent frames once it's back");
+    }
+
+    /// A sync offset under the smoothing still moves the sound (before 20 Nov it was smoothed
+    /// away and did nothing).
+    #[test]
+    fn a_small_sync_offset_moves_the_sound() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let _ = feed(&mut m, 1_000, 2_000, None);
+        let src = &m.sources[&1];
+        let end = |s: &Source| s.start_ns.unwrap_or(0) + (s.queue.len() / 2) as u64 * 1_000_000_000 / 48_000;
+        let before = end(src);
+        m.set(1, SourceSettings { sync_offset_ns: 50_000_000, ..SourceSettings::default() });
+        m.push(1, &[0.5f32; 480 * 2], 2, 48_000, 2_000_000_000);
+        let after = end(&m.sources[&1]);
+        // The piece (10 ms) now ends at its time plus the offset: the 50 ms is filled before it,
+        // nothing queued was thrown away.
+        assert!(
+            after.abs_diff(2_060_000_000) < 1_000_000_000 / 48_000,
+            "placed at its time plus the offset, to the frame: ends {after} (the queue ended at {before})"
+        );
+    }
+
+    /// A NaN burst through a stateful filter, with loudness on: the next clean block is heard
+    /// and finite (the filter and loudness states weren't poisoned); a filter that overflows
+    /// to infinity only silences its own source.
+    #[test]
+    fn nan_and_infinity_never_poison_filters_or_loudness() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set_loudness(Some(-14.0));
+        m.set(1, SourceSettings::default());
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 4.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+            }],
+        );
+        m.set(2, SourceSettings::default());
+        m.set_effects(2, &[AudioEffect::Gain { db: 1000.0 }]);
+        let t0 = 1_000_000_000;
+        let step = block_ns(48_000);
+        let _ = m.mix_until(t0);
+        let mut bad = vec![0.25f32; BLOCK * 2];
+        bad[0] = f32::NAN;
+        bad[1] = f32::INFINITY;
+        m.push(1, &bad, 2, 48_000, t0);
+        m.push(2, &[0.25f32; BLOCK * 4], 2, 48_000, t0);
+        let _ = m.mix_until(t0 + step);
+        m.push(1, &[0.25f32; BLOCK * 2], 2, 48_000, t0 + step);
+        let after = m.mix_until(t0 + 2 * step);
+        let all: Vec<f32> = after.iter().flat_map(|b| b.tracks[0].iter().chain(&b.monitor).copied()).collect();
+        assert!(!all.is_empty() && all.iter().all(|v| v.is_finite()), "finite after the burst");
+        assert!(all.iter().any(|v| v.abs() > 0.01), "the clean source is still heard");
+    }
+
+    /// Filters set while a source is still opening (not in the mix yet) aren't lost.
+    #[test]
+    fn filters_set_before_the_source_opens_are_kept() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set_effects(9, &[AudioEffect::Gain { db: -6.0 }]);
+        assert_eq!(m.sources.get(&9).map(|s| s.filters.len()), Some(1));
     }
 }

@@ -175,8 +175,8 @@ impl Loudness {
             // Down at once to fit under the ceiling, back up gently.
             let need = if peak * self.limit > CEILING { CEILING / peak } else { 1.0 };
             self.limit = if need < self.limit { need } else { self.limit + (need - self.limit) * release };
-            f[0] = (l * self.limit).clamp(-1.0, 1.0);
-            f[1] = (r * self.limit).clamp(-1.0, 1.0);
+            f[0] = crate::mix::clip(l * self.limit);
+            f[1] = crate::mix::clip(r * self.limit);
         }
     }
 }

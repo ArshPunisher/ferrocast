@@ -909,7 +909,7 @@ impl Engine {
                 (Live::Still, Some(p))
             }
             SourceKind::Tone { hz, every_ms, beep_ms } => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 (
                     Live::Tone {
                         hz,
@@ -925,7 +925,7 @@ impl Engine {
                 let live = open_capture(&self.config, &kind)
                     .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
                 if matches!(kind, SourceKind::App { sound: true, .. } | SourceKind::AppSound(_)) {
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 }
                 (live, None)
             }
@@ -933,7 +933,7 @@ impl Engine {
             SourceKind::AppSound(_) => {
                 let live = open_capture(&self.config, &kind)
                     .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 (live, None)
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -948,7 +948,7 @@ impl Engine {
                     _ => false,
                 };
                 if heard {
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 }
                 if let Some(live) = self.unpark(&kind) {
                     tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
@@ -1016,13 +1016,13 @@ impl Engine {
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Playlist(p) => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 let feed = Feed::default();
                 let worker = crate::source::series::playlist(p, feed.clone());
                 (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
             }
             SourceKind::Fed { width, height } => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                 // Clear until the first picture comes.
                 (Live::Fed(Feed::default()), Some(Picture::solid(width.max(1), height.max(1), [0, 0, 0, 0])))
             }
@@ -1123,7 +1123,7 @@ impl Engine {
                     // Its sound into the mix (a file with sound), under the same lock so a
                     // removal can't slip in between (state, then mixer: the frame loop's order).
                     if heard {
-                        mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                        mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
                     }
                     Ok(())
                 }
@@ -1153,6 +1153,9 @@ impl Engine {
             };
             if discard {
                 st.sources.remove(&id);
+                // Its slot in the mix too (state, then mixer: the frame loop's order), else
+                // settings or filters set while it opened stayed there with nothing to play.
+                mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
             }
             drop(st);
             drop(leftover);
@@ -4463,6 +4466,27 @@ mod tests {
             .unwrap_or_else(|x| panic!("{x}"));
         assert!(e.open_soon(8, None, bad).is_err());
         assert!(!e.lock().sources.contains_key(&8));
+    }
+
+    /// A source with sound that finishes opening after its settings were set keeps them: it
+    /// stays muted (it came back unmuted at full volume: muted media blasting on air; 20 Nov).
+    #[test]
+    fn a_slow_source_keeps_the_sound_settings_set_while_it_opened() {
+        let Some(e) = engine() else { return };
+        let slow: Opener = Box::new(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok((Live::Still, true))
+        });
+        e.open_soon(9, None, slow).unwrap_or_else(|x| panic!("{x}"));
+        let muted = SourceSettings { muted: true, volume: 0.1, ..SourceSettings::default() };
+        e.set_sound(9, muted);
+        let until = Instant::now() + Duration::from_secs(5);
+        while e.opening() > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(e.opening(), 0);
+        let kept = e.mixer.lock().unwrap_or_else(|p| p.into_inner()).settings(9);
+        assert_eq!(kept, Some(muted), "still muted after it opened");
     }
 
     /// The virtual camera's way: pictures handed out as NV12 at the tap's size and rate, each
