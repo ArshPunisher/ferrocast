@@ -72,7 +72,7 @@ libc = "0.2"
 objc2 = { version = "0.6", features = ["exception"] }
 block2 = "0.6"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSNotification", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "libc", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "SCShareableContent", "SCStream", "SCError"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMBase", "CMTime", "CMTimeRange", "CMFormatDescription", "CMBlockBuffer", "objc2-core-video", "objc2-core-audio-types"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std"] }

@@ -12,6 +12,9 @@
   <!-- Shown when a Studio camera or microphone source is first added (Studio, Without OBS). -->
   <key>NSCameraUsageDescription</key>
   <string>Ferrocast shows your camera on stream when you add a camera source in the Studio.</string>
+  <!-- Allow Continuity Camera (iPhone webcam) discovery on macOS 14+ via DiscoverySession. -->
+  <key>NSCameraUseContinuityCameraDeviceType</key>
+  <true/>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Ferrocast turns what you say into live captions on your stream. It all happens on this Mac.</string>
   <key>NSMicrophoneUsageDescription</key>

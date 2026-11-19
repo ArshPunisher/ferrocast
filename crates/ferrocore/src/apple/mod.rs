@@ -56,6 +56,8 @@ unsafe extern "C" {
         callbacks: *const CFDictionaryValueCallBacks,
     ) -> CFTypeRef;
     pub(crate) fn CFArrayGetValueAtIndex(array: CFTypeRef, i: isize) -> *const c_void;
+    #[cfg(test)]
+    pub(crate) fn CFGetRetainCount(cf: CFTypeRef) -> isize;
 }
 
 #[repr(C)]

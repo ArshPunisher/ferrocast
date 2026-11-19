@@ -120,8 +120,20 @@ pub struct Block {
     pub monitor: Vec<f32>,
 }
 
+/// Marks a source capturing an audio output device (e.g. Desktop Audio / Screen loopback) so
+/// the mixer can suppress self-monitoring (`OBS_SOURCE_DO_NOT_SELF_MONITOR`) and deduplicate
+/// monitored sources (`should_silence_monitored_source`) when it shares the monitoring device
+/// and does not already exclude Ferrocast's own playback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputCapture {
+    pub device: String,
+    pub excludes_self: bool,
+}
+
 struct Source {
     settings: SourceSettings,
+    output_capture: Option<OutputCapture>,
+    active: bool,
     /// Sound waiting, interleaved stereo at the mixer's rate, starting at `start_ns`.
     queue: VecDeque<f32>,
     start_ns: Option<u64>,
@@ -217,6 +229,8 @@ pub struct Mixer {
     low_latency: bool,
     /// The wait it starts with in the usual mode.
     usual_floor_ns: u64,
+    /// The active monitoring output device id (`None` when monitoring is off or disconnected).
+    monitor_device: Option<String>,
 }
 
 /// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
@@ -322,7 +336,48 @@ impl Mixer {
             true_peak: false,
             low_latency: false,
             usual_floor_ns: latency_ns,
+            monitor_device: None,
         }
+    }
+
+    /// Tells the mixer which output device monitoring currently plays on (`None` when off or
+    /// disconnected), so non-self-excluding loopback sources can avoid howling and double audio.
+    pub fn set_monitor_device(&mut self, device: Option<String>) {
+        self.monitor_device = device;
+    }
+
+    /// Marks source `id` as an audio output capture (or clears it with `None`).
+    pub fn set_output_capture(&mut self, id: u64, capture: Option<OutputCapture>) {
+        if let Some(s) = self.sources.get_mut(&id) {
+            s.output_capture = capture;
+        }
+    }
+
+    /// Updates whether source `id` is currently active/on air (`obs_source_active` parity for
+    /// deduplicating monitored sources against an output capture).
+    pub fn set_active(&mut self, id: u64, active: bool) {
+        if let Some(s) = self.sources.get_mut(&id) {
+            s.active = active;
+        }
+    }
+
+    /// Updates every source's active flag against `active` without allocating.
+    pub fn sync_active(&mut self, active: &std::collections::HashSet<u64>) {
+        for (id, s) in &mut self.sources {
+            s.active = active.contains(id);
+        }
+    }
+
+    /// Whether any active, unmuted source is routed to monitoring.
+    pub fn has_monitored(&self) -> bool {
+        let mon_dev = self.monitor_device.as_deref();
+        self.sources.values().any(|s| {
+            s.active
+                && s.settings.monitoring != Monitoring::Off
+                && !s.settings.muted
+                && s.settings.volume > 0.0
+                && !s.output_capture.as_ref().is_some_and(|oc| !oc.excludes_self && mon_dev == Some(oc.device.as_str()))
+        })
     }
 
     /// Low latency sound on or off (applies at once: the wait goes to its new start).
@@ -399,6 +454,8 @@ impl Mixer {
                     id,
                     Source {
                         settings,
+                        output_capture: None,
+                        active: true,
                         queue: VecDeque::new(),
                         start_ns: None,
                         resampler: None,
@@ -833,6 +890,23 @@ impl Mixer {
             let (from, to) = d.step(talking, BLOCK as f32 / rate as f32);
             (d.cfg.music.clone(), from, to)
         });
+        let mon_dev = self.monitor_device.as_deref();
+        // OBS `should_silence_monitored_source`: when an active, unmuted non-self-excluding output
+        // capture shares the monitoring device, suppress direct track output of other monitored
+        // sources on the tracks it covers (preventing echo / double audio).
+        let mut dup_tracks_mask = 0u8;
+        if let Some(mon) = mon_dev {
+            for s in self.sources.values() {
+                if s.active
+                    && !s.settings.muted
+                    && s.settings.volume > 0.0001
+                    && s.settings.monitoring != Monitoring::Only
+                    && s.output_capture.as_ref().is_some_and(|oc| !oc.excludes_self && oc.device == mon)
+                {
+                    dup_tracks_mask |= s.settings.tracks;
+                }
+            }
+        }
         for (id, src) in self.sources.iter_mut() {
             let mut buf = vec![0f32; BLOCK * 2];
             if let Some(s0) = src.start_ns {
@@ -943,13 +1017,19 @@ impl Mixer {
             if src.recent.len() > METER_BLOCKS {
                 src.recent.pop_front();
             }
-            if s.monitoring != Monitoring::Off {
+            // OBS `OBS_SOURCE_DO_NOT_SELF_MONITOR`: an output capture sharing the monitoring device
+            // that doesn't exclude our own playback must not feed into monitoring (feedback howl).
+            let suppress_self =
+                src.output_capture.as_ref().is_some_and(|oc| !oc.excludes_self && mon_dev == Some(oc.device.as_str()));
+            if s.monitoring != Monitoring::Off && !suppress_self {
                 for (o, v) in monitor.iter_mut().zip(&buf) {
                     *o += v;
                 }
             }
+            let effective_tracks =
+                if s.monitoring != Monitoring::Off && !suppress_self { s.tracks & !dup_tracks_mask } else { s.tracks };
             for (t, track) in tracks.iter_mut().enumerate() {
-                if s.monitoring != Monitoring::Only && s.tracks & (1 << t) != 0 {
+                if s.monitoring != Monitoring::Only && effective_tracks & (1 << t) != 0 {
                     for (o, v) in track.iter_mut().zip(&buf) {
                         *o += v;
                     }
@@ -1712,5 +1792,81 @@ mod tests {
         let mut m = Mixer::new(48_000, 0);
         m.set_effects(9, &[AudioEffect::Gain { db: -6.0 }]);
         assert_eq!(m.sources.get(&9).map(|s| s.filters.len()), Some(1));
+    }
+
+    #[test]
+    fn loopback_sharing_monitor_device_never_self_monitors_or_doubles_output() {
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings { monitoring: Monitoring::AndOutput, tracks: 0b11, ..Default::default() });
+        m.set(2, SourceSettings { monitoring: Monitoring::Only, tracks: 0b01, ..Default::default() });
+        m.set(3, SourceSettings { monitoring: Monitoring::AndOutput, tracks: 0b01, ..Default::default() });
+        m.set_monitor_device(Some("speakers".into()));
+        m.set_output_capture(3, Some(OutputCapture { device: "speakers".into(), excludes_self: false }));
+        let t0 = 1_000_000_000;
+        m.mix_until(t0);
+        m.push(1, &vec![0.2; 4096 * 2], 2, RATE, t0);
+        m.push(2, &vec![0.1; 4096 * 2], 2, RATE, t0);
+        m.push(3, &vec![0.4; 4096 * 2], 2, RATE, t0);
+        let b = &m.mix_until(t0 + ns(3072, RATE))[1];
+        // Loopback 3 must NOT appear in b.monitor (DO_NOT_SELF_MONITOR): 1 + 2 = 0.3, not 0.7.
+        assert!((b.monitor[0] - 0.3).abs() < 1e-6, "loopback excluded from monitor: {}", b.monitor[0]);
+        // Track 1 is covered by loopback 3, so monitored source 1 is silenced on track 1 (0.4, not 0.6).
+        assert!((b.tracks[0][0] - 0.4).abs() < 1e-6, "track 1 deduplicated: {}", b.tracks[0][0]);
+        // Track 2 is NOT in loopback 3's tracks, so source 1 still reaches track 2.
+        assert!((b.tracks[1][0] - 0.2).abs() < 1e-6, "track 2 kept for source 1: {}", b.tracks[1][0]);
+    }
+
+    #[test]
+    fn self_excluding_or_inactive_loopback_does_not_silence_monitored_sources() {
+        let t0 = 1_000_000_000;
+        // (1) Self-excluding loopback (macOS SCK / Windows process loopback): source 1 stays in track 1.
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings { monitoring: Monitoring::AndOutput, tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set_monitor_device(Some("speakers".into()));
+        m.set_output_capture(2, Some(OutputCapture { device: "speakers".into(), excludes_self: true }));
+        m.mix_until(t0);
+        m.push(1, &vec![0.2; 4096 * 2], 2, RATE, t0);
+        m.push(2, &vec![0.4; 4096 * 2], 2, RATE, t0);
+        let b = &m.mix_until(t0 + ns(3072, RATE))[1];
+        assert!((b.tracks[0][0] - 0.6).abs() < 1e-6, "self-excluding keeps both: {}", b.tracks[0][0]);
+
+        // (2) Muted, off-air (inactive), or different-device loopback never silences source 1.
+        for (muted, active, dev) in [(true, true, "speakers"), (false, false, "speakers"), (false, true, "headphones")]
+        {
+            let mut m = Mixer::new(RATE, 0);
+            m.set(1, SourceSettings { monitoring: Monitoring::AndOutput, tracks: 0b01, ..Default::default() });
+            m.set(2, SourceSettings { muted, tracks: 0b01, ..Default::default() });
+            m.set_monitor_device(Some("speakers".into()));
+            m.set_output_capture(2, Some(OutputCapture { device: dev.into(), excludes_self: false }));
+            m.set_active(2, active);
+            m.mix_until(t0);
+            m.push(1, &vec![0.2; 4096 * 2], 2, RATE, t0);
+            m.push(2, &vec![0.4; 4096 * 2], 2, RATE, t0);
+            let b = &m.mix_until(t0 + ns(3072, RATE))[1];
+            let want = if muted { 0.2 } else { 0.6 };
+            assert!(
+                (b.tracks[0][0] - want).abs() < 1e-6,
+                "muted={muted} active={active} dev={dev}: {}",
+                b.tracks[0][0]
+            );
+        }
+    }
+
+    #[test]
+    fn has_monitored_tracks_active_unmuted_non_suppressed_sources() {
+        let mut m = Mixer::new(RATE, 0);
+        assert!(!m.has_monitored());
+        m.set(1, SourceSettings { monitoring: Monitoring::Only, ..Default::default() });
+        assert!(m.has_monitored());
+        m.set(1, SourceSettings { monitoring: Monitoring::Only, muted: true, ..Default::default() });
+        assert!(!m.has_monitored());
+        m.set(1, SourceSettings { monitoring: Monitoring::Only, ..Default::default() });
+        m.set_monitor_device(Some("speakers".into()));
+        m.set_output_capture(1, Some(OutputCapture { device: "speakers".into(), excludes_self: false }));
+        assert!(!m.has_monitored(), "self-monitor-suppressed loopback doesn't wake monitor");
+        m.set_output_capture(1, None);
+        m.set_active(1, false);
+        assert!(!m.has_monitored(), "inactive source doesn't wake monitor");
     }
 }

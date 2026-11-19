@@ -104,6 +104,8 @@ pub struct SoundIn {
     sound: Pieces,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    excludes_self: bool,
+    device_id: Option<String>,
 }
 
 impl Drop for SoundIn {
@@ -116,34 +118,79 @@ impl Drop for SoundIn {
 }
 
 impl SoundIn {
-    /// Starts `which` (on its own thread: a stream stays where it was made).
-    pub fn start(which: Which) -> Result<Self, AvError> {
-        let sound: Pieces = Arc::default();
+    #[cfg(target_os = "windows")]
+    fn start_process_loopback(
+        name: &str,
+        sound: Pieces,
+        timeout: Duration,
+        run_fn: impl FnOnce(Arc<AtomicBool>, std::sync::mpsc::Sender<Result<(), String>>, Pieces) + Send + 'static,
+    ) -> Result<Self, AvError> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (s, st) = (sound.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run_fn(st, ready_tx, s))
+            .map_err(|e| AvError::Source(e.to_string()))?;
+        match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: true, device_id: None }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(AvError::Source(e))
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Release);
+                Err(AvError::Source("the sound device didn't answer".into()))
+            }
+        }
+    }
+
+    /// Starts `which` (on its own thread: a stream stays where it was made).
+    pub fn start(which: Which) -> Result<Self, AvError> {
+        let sound: Pieces = Arc::default();
         #[cfg(target_os = "windows")]
         if let Which::Process(pid) = which {
-            let thread = std::thread::Builder::new()
-                .name("ferrocast-app-sound".into())
-                .spawn(move || {
+            return Self::start_process_loopback(
+                "ferrocast-app-sound",
+                sound,
+                Duration::from_secs(8),
+                move |st, tx, s| {
                     let mut conv = Convert::new(2, RATE);
                     let s2 = s.clone();
-                    crate::win::app_sound::run(pid, st.clone(), ready_tx, |data| keep(&s2, conv.push(data)));
+                    crate::win::app_sound::run(pid, st.clone(), tx, |data| keep(&s2, conv.push(data)));
                     // Back while not asked to stop: the app's sound ended (it quit, or Windows
                     // let go of it). Said, so the watchdog starts it again.
                     if !st.load(Ordering::Acquire) {
                         fault(&s, "the app's sound stopped".into());
                     }
-                })
-                .map_err(|e| AvError::Source(e.to_string()))?;
-            return Self::started(sound, stop, thread, ready_rx);
+                },
+            );
         }
+        #[cfg(target_os = "windows")]
+        if matches!(which, Which::Loopback) {
+            match Self::start_process_loopback(
+                "ferrocast-desktop-sound",
+                sound.clone(),
+                Duration::from_secs(6),
+                |st, tx, s| {
+                    let mut conv = Convert::new(2, RATE);
+                    crate::win::app_sound::run_excluding_self(st, tx, |data| keep(&s, conv.push(data)));
+                },
+            ) {
+                Ok(si) => return Ok(si),
+                Err(why) => {
+                    tracing::info!(error = %why, "process-excluding desktop audio unavailable; falling back to device loopback");
+                }
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
+        let (s, st) = (sound.clone(), stop.clone());
         let thread = std::thread::Builder::new()
             .name("ferrocast-sound-in".into())
             .spawn(move || {
-                let stream = match open(&which, s) {
-                    Ok(stream) => stream,
+                let (stream, device_id) = match open(&which, s) {
+                    Ok(opened) => opened,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
@@ -153,7 +200,7 @@ impl SoundIn {
                     let _ = ready_tx.send(Err(format!("it didn't start ({e})")));
                     return;
                 }
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(device_id));
                 while !st.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -168,10 +215,10 @@ impl SoundIn {
         sound: Pieces,
         stop: Arc<AtomicBool>,
         thread: JoinHandle<()>,
-        ready_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+        ready_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
     ) -> Result<Self, AvError> {
         match ready_rx.recv_timeout(Duration::from_secs(8)) {
-            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread) }),
+            Ok(Ok(device_id)) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: false, device_id }),
             Ok(Err(e)) => Err(AvError::Source(e)),
             Err(_) => {
                 // Late: if it opens after all, it closes again at once.
@@ -179,6 +226,16 @@ impl SoundIn {
                 Err(AvError::Source("the sound device didn't answer".into()))
             }
         }
+    }
+
+    /// Whether this capture already excludes Ferrocast's own audio output.
+    pub fn excludes_self(&self) -> bool {
+        self.excludes_self
+    }
+
+    /// Resolved output device id when capturing a speaker loopback (`None` otherwise).
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 
     /// Sound since the last call, oldest first: 48 kHz stereo.
@@ -216,6 +273,8 @@ fn stops(kind: cpal::ErrorKind) -> bool {
 pub struct Heal {
     which: Which,
     heals: bool,
+    /// What the first sound was (leaves us out, its device), for while a restart is under way.
+    first: (bool, Option<String>),
     slot: Mutex<Slot>,
 }
 
@@ -233,7 +292,8 @@ struct Slot {
 
 impl Heal {
     pub fn new(sound: SoundIn, which: Which, heals: bool) -> Self {
-        Heal { which, heals, slot: Mutex::new(Slot { now: Some(sound), ..Slot::default() }) }
+        let first = (sound.excludes_self(), sound.device_id().map(str::to_string));
+        Heal { which, heals, first, slot: Mutex::new(Slot { now: Some(sound), ..Slot::default() }) }
     }
 
     /// Sound since the last call; first a look at whether it must start again.
@@ -280,6 +340,21 @@ impl Heal {
                 })
                 .ok();
         }
+    }
+
+    /// Whether it leaves out Ferrocast's own playback (process loopback that excludes us): as
+    /// the sound it has now, else as it started.
+    pub fn excludes_self(&self) -> bool {
+        self.slot.lock().ok().and_then(|s| s.now.as_ref().map(SoundIn::excludes_self)).unwrap_or(self.first.0)
+    }
+
+    /// The output device it hears, if it's a device's loopback.
+    pub fn device_id(&self) -> Option<String> {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|s| s.now.as_ref().map(|n| n.device_id().map(str::to_string)))
+            .unwrap_or_else(|| self.first.1.clone())
     }
 
     /// Pieces received since the start, across restarts.
@@ -332,8 +407,8 @@ fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
     }
 }
 
-/// The device and its stream, feeding `sound`.
-fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
+/// The device and its stream, feeding `sound` (plus resolved device id for loopback).
+fn open(which: &Which, sound: Pieces) -> Result<(cpal::Stream, Option<String>), String> {
     let host = cpal::default_host();
     let dev = match which {
         Which::Loopback => host.default_output_device().ok_or("there are no speakers to hear the computer from")?,
@@ -349,6 +424,8 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         #[cfg(target_os = "windows")]
         Which::Process(_) => return Err("one app's sound doesn't come through cpal".into()),
     };
+    let device_id =
+        matches!(which, Which::Loopback).then(|| dev.id().map(|i| i.to_string()).unwrap_or_else(|_| "default".into()));
     let cfg = match which {
         Which::Loopback => dev.default_output_config(),
         _ => dev.default_input_config(),
@@ -367,7 +444,7 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         fault(&errs, format!("it stopped ({e})"));
     };
     let config = cfg.config();
-    match cfg.sample_format() {
+    let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => dev.build_input_stream(config, move |d: &[f32], _: &_| keep(d), err, None),
         cpal::SampleFormat::I16 => dev.build_input_stream(
             config,
@@ -383,7 +460,8 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         ),
         other => return Err(format!("its sample format ({other}) isn't supported")),
     }
-    .map_err(|e| format!("it couldn't be opened ({e})"))
+    .map_err(|e| format!("it couldn't be opened ({e})"))?;
+    Ok((stream, device_id))
 }
 
 #[cfg(test)]
@@ -408,7 +486,8 @@ mod tests {
     #[test]
     fn a_device_that_stops_says_so_and_pieces_are_counted() {
         let sound: Pieces = Arc::default();
-        let s = SoundIn { sound: sound.clone(), stop: Arc::default(), thread: None };
+        let s =
+            SoundIn { sound: sound.clone(), stop: Arc::default(), thread: None, excludes_self: false, device_id: None };
         assert_eq!((s.received(), s.ended()), (0, None));
         keep(&sound, vec![vec![0.0; 2048], vec![0.0; 2048]]);
         assert_eq!(s.received(), 2);
@@ -434,7 +513,7 @@ mod tests {
     fn faulted() -> SoundIn {
         let sound: Pieces = Arc::default();
         fault(&sound, "it stopped (device not available)".into());
-        SoundIn { sound, stop: Arc::default(), thread: None }
+        SoundIn { sound, stop: Arc::default(), thread: None, excludes_self: false, device_id: None }
     }
 
     /// Beside a picture, sound that stopped starts again on its own (here: a device that isn't

@@ -30,6 +30,22 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 const STEP_DEADLINE: Duration = Duration::from_secs(10);
 /// A write that can't finish in this long means the destination stopped reading.
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// How far behind live video (in stream milliseconds) a destination may fall before it drops
+/// non-keyframe video until the next keyframe, keeping audio and codec headers intact.
+///
+/// Matches OBS's `OPT_PFRAME_DROP_THRESHOLD` (`pframe_drop_threshold_usec = 900 ms` in
+/// `plugins/obs-outputs/rtmp-stream.c`, `check_to_drop_frames` / `drop_frames`). OBS also has a
+/// 700 ms `OPT_DROP_THRESHOLD` that drops only disposable non-reference B-frames using codec-level
+/// NAL/OBU priority before escalating to all non-keyframes at 900 ms. Because `golive` forwards
+/// FLV tags without re-parsing H.264/HEVC/AV1/VP9 bitstreams, it only distinguishes keyframes from
+/// inter frames; using OBS's 900 ms threshold keeps latency under a second without breaking a GOP
+/// prematurely at 700 ms on brief jitter (whether or not the stream uses B-frames).
+const DROP_THRESHOLD_MS: u32 = 900;
+/// Minimum packets still queued behind the current packet in the destination's receiver before
+/// time-based dropping starts (at least 5 buffered packets including the current one, matching
+/// OBS's `num_packets < 5` guard in `check_to_drop_frames`). Prevents a sparse timestamp gap or
+/// brief source pause from falsely dropping frames.
+const MIN_BACKLOG_PACKETS: usize = 4;
 /// How long a destination waits before trying again: the first wait, doubling up to the
 /// longest (Advanced mode can change both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +375,8 @@ async fn session(
     }
     set_state(health, PushState::Live);
     let mut base: Option<u32> = None;
-    let mut waiting_for_key = true;
+    let mut started = false;
+    let mut video_drop = VideoDrop::default();
     let mut window = (Instant::now(), p.sent);
     loop {
         tokio::select! {
@@ -367,43 +384,57 @@ async fn session(
                 let frame = match frame {
                     Ok(f) => f,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        health.send_modify(|h| h.dropped += n);
-                        waiting_for_key = true;
+                        health.send_modify(|h| h.dropped = h.dropped.saturating_add(n));
+                        if started {
+                            video_drop.mark_all();
+                        }
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(Ended::StreamEnded),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        p.finish().await;
+                        return Ok(Ended::StreamEnded);
+                    }
                 };
-                let r = match frame {
-                    Frame::End => return Ok(Ended::StreamEnded),
-                    Frame::Metadata(m) => p.client.publish_metadata(&m),
-                    // Codec headers always go through; other packets wait for a real keyframe.
+                let outbound = match frame {
+                    Frame::End => {
+                        p.finish().await;
+                        return Ok(Ended::StreamEnded);
+                    }
+                    Frame::Metadata(m) => Some(p.client.publish_metadata(&m)),
+                    // Codec headers always go through; initial frames wait for a main keyframe,
+                    // and once live, stale non-keyframe video drops until its track's next keyframe.
                     Frame::Video { ts, data, key } => {
                         let extra = flv::video_extra_track(&data);
-                        if extra.is_some() && !dest.extra_video {
-                            continue;
-                        }
                         let header = flv::video_is_header(&data) || extra.is_some_and(|(_, h)| h);
-                        if !header {
-                            if waiting_for_key && !key {
-                                continue;
+                        let send = if extra.is_some() && !dest.extra_video {
+                            false
+                        } else if header {
+                            true
+                        } else if !started {
+                            started = key;
+                            key
+                        } else {
+                            let track = extra.map_or(0, |(t, _)| t);
+                            let track_key = if extra.is_some() { flv::video_is_keyframe(&data) } else { key };
+                            if video_drop.should_drop(track, track_key, hub.newest_video_ts(), ts, rx.len()) {
+                                health.send_modify(|h| h.dropped = h.dropped.saturating_add(1));
+                                false
+                            } else {
+                                true
                             }
-                            waiting_for_key = false;
-                        }
-                        p.client.publish_video_data(data, stamp(&mut base, ts), false)
+                        };
+                        send.then(|| p.client.publish_video_data(data, stamp(&mut base, ts), false))
                     }
                     Frame::Audio { ts, data } => {
                         let extra = flv::audio_extra_track(&data);
-                        if extra.is_some() && !dest.extra_audio {
-                            continue;
-                        }
                         let header = flv::audio_is_header(&data) || extra.is_some_and(|(_, h)| h);
-                        if waiting_for_key && !header {
-                            continue;
-                        }
-                        p.client.publish_audio_data(data, stamp(&mut base, ts), false)
+                        let send = (extra.is_none() || dest.extra_audio) && (started || header);
+                        send.then(|| p.client.publish_audio_data(data, stamp(&mut base, ts), false))
                     }
                 };
-                p.send(r).await?;
+                if let Some(r) = outbound {
+                    p.send(r).await?;
+                }
             }
             // Only the read races the next packet (a read can be dropped safely); the answer
             // is written after, so a write is never cut off halfway.
@@ -421,6 +452,54 @@ async fn session(
             });
             window = (Instant::now(), p.sent);
         }
+    }
+}
+
+/// How far `ts` lags behind `newest` in stream milliseconds, handling `u32` wrap (~49.7 days).
+/// Returns 0 if `ts` is ahead of `newest` (e.g. a timestamp reset or slightly ahead extra track).
+fn behind_ms(newest: u32, ts: u32) -> u32 {
+    let diff = newest.wrapping_sub(ts);
+    if diff < u32::MAX / 2 { diff } else { 0 }
+}
+
+/// Per-track drop gate for a live destination (port of OBS `rtmp-stream.c`
+/// `check_to_drop_frames` / `drop_frames`, extended per video track so Twitch Enhanced
+/// Broadcasting extra qualities each resume cleanly on their own keyframe).
+#[derive(Default)]
+struct VideoDrop([u64; 4]);
+
+impl VideoDrop {
+    fn is_dropping(&self, track: u8) -> bool {
+        (self.0[(track / 64) as usize] & (1u64 << (track % 64))) != 0
+    }
+
+    fn mark(&mut self, track: u8) {
+        self.0[(track / 64) as usize] |= 1u64 << (track % 64);
+    }
+
+    fn clear(&mut self, track: u8) {
+        self.0[(track / 64) as usize] &= !(1u64 << (track % 64));
+    }
+
+    fn mark_all(&mut self) {
+        self.0 = [u64::MAX; 4];
+    }
+
+    /// Whether a non-header video packet on `track` should be dropped, updating the track's
+    /// drop state. Keyframes are never dropped and end dropping for their track.
+    fn should_drop(&mut self, track: u8, key: bool, newest_ts: Option<u32>, ts: u32, queued: usize) -> bool {
+        if key {
+            self.clear(track);
+            return false;
+        }
+        if self.is_dropping(track) {
+            return true;
+        }
+        if queued >= MIN_BACKLOG_PACKETS && newest_ts.is_some_and(|newest| behind_ms(newest, ts) > DROP_THRESHOLD_MS) {
+            self.mark(track);
+            return true;
+        }
+        false
     }
 }
 
@@ -542,6 +621,17 @@ impl Publisher {
         self.results(results).await.map(|_| ())
     }
 
+    /// Cleanly closes the outbound stream (TCP FIN / TLS `close_notify`) and briefly drains
+    /// inbound bytes (e.g. an unread RTMP Ack) so dropping the socket doesn't emit a TCP RST
+    /// that discards the last in-flight packets at the server.
+    async fn finish(mut self) {
+        let _ = timeout(Duration::from_millis(500), async {
+            let _ = self.s.shutdown().await;
+            while matches!(self.s.read(&mut self.buf).await, Ok(n) if n > 0) {}
+        })
+        .await;
+    }
+
     /// Reads and answers the server until `done` picks an event (within the step deadline).
     async fn wait_for(
         &mut self,
@@ -595,5 +685,54 @@ mod via_tests {
         assert!(!may_move(&t("rtmp://localhost/live")));
         assert!(PushError::Unreachable("x".into()).is_network());
         assert!(!PushError::KeyRefused("x".into()).is_network());
+    }
+
+    #[test]
+    fn behind_ms_handles_wrap_and_backwards_resets() {
+        assert_eq!(behind_ms(1_000, 1_000), 0);
+        assert_eq!(behind_ms(1_900, 1_000), 900);
+        assert_eq!(behind_ms(1_901, 1_000), 901);
+        // Wraps cleanly across u32::MAX -> 0 (~49.7 days of stream time).
+        assert_eq!(behind_ms(100, u32::MAX - 899), 1_000);
+        assert_eq!(behind_ms(0, u32::MAX), 1);
+        // Packet ahead of newest (or timestamp reset backwards): never treated as huge lag.
+        assert_eq!(behind_ms(1_000, 1_050), 0);
+        assert_eq!(behind_ms(100, 600_000), 0);
+        assert_eq!(behind_ms(u32::MAX, 0), 0);
+    }
+
+    #[test]
+    fn video_drop_respects_threshold_backlog_keyframes_and_extra_tracks() {
+        let mut d = VideoDrop::default();
+        // At threshold (900 ms) or sparse queue (< 4 queued behind): never drops.
+        assert!(!d.should_drop(0, false, Some(1_900), 1_000, 10));
+        assert!(!d.should_drop(0, false, Some(2_500), 1_000, MIN_BACKLOG_PACKETS - 1));
+        assert!(!d.should_drop(0, false, None, 1_000, 10));
+        // Keyframes never drop even when far behind.
+        assert!(!d.should_drop(0, true, Some(5_000), 1_000, 50));
+
+        // Past threshold with enough backlog: starts dropping track 0.
+        assert!(d.should_drop(0, false, Some(1_901), 1_000, MIN_BACKLOG_PACKETS));
+        // Stays dropping track 0 even once caught up, until track 0 sees a keyframe.
+        assert!(d.should_drop(0, false, Some(1_050), 1_050, 0));
+        // Track 1 isn't affected by track 0 alone when track 1 isn't behind.
+        assert!(!d.should_drop(1, false, Some(1_050), 1_050, 0));
+        // Track 0 keyframe clears track 0; subsequent in-time inter frames pass.
+        assert!(!d.should_drop(0, true, Some(2_000), 2_000, 0));
+        assert!(!d.should_drop(0, false, Some(2_033), 2_033, 0));
+
+        // Wraps across u32::MAX -> 0 cleanly to trigger drop on track 1.
+        assert!(d.should_drop(1, false, Some(100), u32::MAX - 850, MIN_BACKLOG_PACKETS));
+        assert!(d.should_drop(1, false, Some(120), 120, 0));
+        assert!(!d.should_drop(1, true, Some(150), 150, 0));
+
+        // mark_all (after RecvError::Lagged) drops every track until its own keyframe.
+        d.mark_all();
+        assert!(d.should_drop(0, false, Some(3_000), 3_000, 0));
+        assert!(d.should_drop(2, false, Some(3_000), 3_000, 0));
+        assert!(!d.should_drop(0, true, Some(3_050), 3_050, 0));
+        assert!(!d.should_drop(0, false, Some(3_083), 3_083, 0));
+        assert!(d.should_drop(2, false, Some(3_083), 3_083, 0));
+        assert!(!d.should_drop(2, true, Some(3_100), 3_100, 0));
     }
 }
