@@ -3747,6 +3747,12 @@ impl StageOutput {
         self.own.record_stats()
     }
 
+    /// Why this recording stopped by itself (a full disk, a drive taken away): a short phrase,
+    /// and what to do with the system's own words. None while it runs, or for a stream.
+    pub fn record_problem(&self) -> Option<(String, String)> {
+        self.own.record_problem().map(|p| (p.reason, p.detail))
+    }
+
     /// Which encoder the output uses ("h264_nvenc"…), while it runs.
     pub fn encoder(&self) -> Option<String> {
         self.own.encoder()

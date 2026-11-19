@@ -23,6 +23,7 @@ pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
+pub(crate) mod record_watch;
 pub(crate) mod rig;
 pub(crate) mod rules;
 pub mod show;
@@ -84,6 +85,8 @@ pub(crate) struct Studio {
     /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
     /// one loop.
     pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
+    /// What was said about the recording now (a stop, low room), so each is said once.
+    pub record_watch: Mutex<record_watch::RecordWatch>,
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,

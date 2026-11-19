@@ -2367,6 +2367,25 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn record_stats(&self) -> Result<Value, String> {
+        self.on_main(|h| {
+            h.record.as_ref().map_or(Value::Null, |r| {
+                let mut v = record_stats(r);
+                if let Some(o) = v.as_object_mut() {
+                    // What to do about it, for behind the (i); and the room left where it writes.
+                    if let Some((_, detail)) = r.0.record_problem() {
+                        o.insert("error_detail".into(), Value::String(detail));
+                    }
+                    let folder = r.1.parent().map(PathBuf::from).unwrap_or_default();
+                    let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
+                    o.insert("disk_free_mb".into(), json!(ferrocast_studio::system::free_disk_mb(&at)));
+                }
+                v
+            })
+        })
+        .await
+    }
+
     async fn record(&self, on: bool) -> Result<Value, String> {
         let app = self.app.clone();
         tracing::info!(on, "the recording is asked to {}", if on { "start" } else { "stop" });

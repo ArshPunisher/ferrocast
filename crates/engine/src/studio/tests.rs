@@ -1243,10 +1243,15 @@ struct FakeStudio {
     lagged: Mutex<u64>,
     /// A scene with nothing in it (its source count is given only when this is set).
     empty_scene: Mutex<Option<String>>,
+    /// What the recording's stats say now (null: no recording).
+    record_now: Mutex<serde_json::Value>,
 }
 
 #[async_trait]
 impl crate::studio_host::StudioHost for FakeStudio {
+    async fn record_stats(&self) -> Result<serde_json::Value, String> {
+        Ok(self.record_now.lock().unwrap().clone())
+    }
     async fn status(&self) -> crate::studio_host::StudioStatus {
         crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
     }
@@ -1581,4 +1586,47 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
     assert_eq!(*studio.current.lock().unwrap(), "Live");
     // Asked for without a BRB scene: refused.
     assert!(e.patch_scenes_config(json!({ "brb_scene": null }).as_object().unwrap()).await.is_err());
+}
+
+/// M7-01: a recording that stops by itself (a full disk, a drive taken away) is said once on the
+/// dashboard in one line with its detail, however many times the watch looks; low room is said
+/// once before it runs out.
+#[tokio::test]
+async fn a_recording_that_stops_is_said_once_and_low_room_before_it() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let mut live = e.subscribe_live();
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    // Room running low while it runs: one warning, not one per look.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": true, "error": null,
+        "bytes": 600_000_000u64, "seconds": 60, "disk_free_mb": 1500 });
+    for _ in 0..10 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-space"), Some("warn")));
+    assert!(n[0]["detail"].as_str().unwrap().contains("recording stops and keeps what it has"), "{n:?}");
+    // The disk fills: it stopped, with the reason. One notice over many looks.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": false,
+        "error": "The recording stopped: the disk is full.", "bytes": 1_500_000_000u64, "seconds": 90,
+        "disk_free_mb": 0, "error_detail": "Free some space or choose another drive, then record again." });
+    for _ in 0..30 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-stopped"), Some("error")));
+    assert_eq!(n[0]["message"], "Recording stopped: the disk is full");
+    assert!(n[0]["detail"].as_str().unwrap().contains("Free some space"), "{n:?}");
 }
