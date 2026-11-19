@@ -633,12 +633,10 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         }
         #[cfg(target_os = "macos")]
         "coreaudio_input_capture" => {
+            // "default" stays "default": it follows the system's microphone, as in OBS (it was
+            // fixed to the first one listed, never the one picked in System Settings).
             let dev = text_of("device_id");
-            let dev = if dev.is_empty() || dev == "default" {
-                crate::camera::microphones().first().map(|d| d.id.clone()).unwrap_or_default()
-            } else {
-                dev
-            };
+            let dev = if dev.is_empty() { "default".to_string() } else { dev };
             (SourceKind::Microphone(dev), true)
         }
         // Windows: OBS's own source kinds.

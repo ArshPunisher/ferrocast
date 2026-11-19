@@ -44,6 +44,20 @@ fn list(video: bool) -> Vec<Device> {
     }
 }
 
+/// The system's microphone now (System Settings → Sound → Input), by its unique id.
+pub fn default_microphone() -> Option<String> {
+    // SAFETY: AVFoundation's constant media type; asking for the default device.
+    unsafe {
+        let kind = AVMediaTypeAudio?;
+        AVCaptureDevice::defaultDeviceWithMediaType(kind).map(|d| d.uniqueID().to_string())
+    }
+}
+
+/// Whether a microphone id means "the system's" (OBS's "default"), which follows it.
+fn is_default(id: &str) -> bool {
+    id.is_empty() || id == "default"
+}
+
 /// Cameras connected now.
 pub fn cameras() -> Vec<Device> {
     list(true)
@@ -150,6 +164,9 @@ pub struct Capture {
     _output: Retained<Output>,
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     shared: Arc<Shared>,
+    /// The device opened for "the system's microphone": when the system's changes, this one
+    /// has ended and the watchdog opens the new one (OBS's input follows the default too).
+    follows: Option<String>,
 }
 
 impl std::fmt::Debug for Capture {
@@ -393,13 +410,18 @@ impl Capture {
                 }
                 configure(&input.device(), spec);
             }
-            Ok(Self { session, _output: delegate, _queue: queue, shared })
+            Ok(Self { session, _output: delegate, _queue: queue, shared, follows: None })
         }
     }
 
     /// Starts a microphone: its sound as interleaved stereo float at 48 kHz.
     pub fn microphone(id: &str) -> Result<Self, AvError> {
-        let input = open(id, false)?;
+        let follows = if is_default(id) {
+            Some(default_microphone().ok_or_else(|| AvError::Source("there's no microphone".into()))?)
+        } else {
+            None
+        };
+        let input = open(follows.as_deref().unwrap_or(id), false)?;
         let shared = Arc::new(Shared::default());
         let delegate = Output::new(shared.clone());
         let queue = DispatchQueue::new("ferrocast.microphone", DispatchQueueAttr::SERIAL);
@@ -436,7 +458,7 @@ impl Capture {
             session.addInput(&input);
             session.addOutput(&output);
             session.startRunning();
-            Ok(Self { session, _output: delegate, _queue: queue, shared })
+            Ok(Self { session, _output: delegate, _queue: queue, shared, follows })
         }
     }
 
@@ -472,7 +494,10 @@ impl Capture {
 
     /// Why it ended, if it did (AVFoundation's session keeps running; a stall shows instead).
     pub fn ended(&self) -> Option<String> {
-        None
+        // Following the system's microphone, and it changed (headphones with a mic plugged
+        // in, another input picked in System Settings): this one is done, the new one opens.
+        let now = self.follows.as_ref().and_then(|_| default_microphone());
+        moved_on(self.follows.as_deref(), now.as_deref())
     }
 }
 
@@ -483,9 +508,27 @@ impl Drop for Capture {
     }
 }
 
+/// Why a capture following the system's microphone ended: the system's is another one now.
+/// (None when there's no system microphone: the one open stays until one comes.)
+fn moved_on(follows: Option<&str>, now: Option<&str>) -> Option<String> {
+    match (follows, now) {
+        (Some(was), Some(now)) if was != now => Some("the system's microphone changed".into()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::pick_format;
+    use super::{is_default, moved_on, pick_format};
+
+    #[test]
+    fn the_systems_microphone_is_followed() {
+        assert!(is_default("") && is_default("default") && !is_default("BuiltInMicrophoneDevice"));
+        assert_eq!(moved_on(None, Some("b")), None, "a picked mic stays");
+        assert_eq!(moved_on(Some("a"), Some("a")), None);
+        assert_eq!(moved_on(Some("a"), None), None, "no system mic now: keep what's open");
+        assert!(moved_on(Some("a"), Some("b")).is_some(), "the system's changed: open the new one");
+    }
 
     // A webcam's formats: (width, height, highest frame rate).
     const CAM: [(u32, u32, f64); 5] =
