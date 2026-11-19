@@ -474,6 +474,9 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
         let v = serde_json::from_str::<Value>(&f.text).unwrap();
         if v["type"] == "notice" {
             assert_eq!(v["data"]["key"], "panic", "panic notices replace each other on the dashboard");
+            // One short line, what it did behind its (i).
+            assert_eq!(v["data"]["message"], "Panic mode is on");
+            assert!(v["data"]["detail"].as_str().unwrap().contains("locked down"), "{v}");
         }
         kinds.push(v["type"].as_str().unwrap_or("").to_string());
     }
@@ -1753,7 +1756,8 @@ async fn a_browser_that_didnt_open_reaches_the_dashboard() {
     assert_eq!(notices[0]["key"], crate::BROWSER_NOTICE);
     assert_eq!(notices[0]["level"], "warn");
     let message = notices[0]["message"].as_str().unwrap();
-    assert!(message.contains("couldn't open your browser") && message.contains("Try again"), "{message}");
+    assert_eq!(message, "Ferrocast couldn't open your browser");
+    assert!(notices[0]["detail"].as_str().unwrap().contains("Try again"), "{:?}", notices[0]);
 }
 
 #[tokio::test]

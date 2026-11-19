@@ -554,7 +554,13 @@ impl Engine {
                             Some(format!("It stopped three times in a row ({why}); turn it off and on to try again."));
                         let name = slot.name.clone();
                         drop(r);
-                        self.plugin_notice(id, format!("{name} was paused: it stopped three times in a row ({why})."));
+                        self.plugin_notice(
+                            id,
+                            format!("{name} was paused"),
+                            format!(
+                                "It stopped three times in a row ({why}). Turn it off and on in Plugins to try again."
+                            ),
+                        );
                     }
                     return;
                 }
@@ -594,18 +600,13 @@ impl Engine {
         }
     }
 
-    fn plugin_notice(&self, id: &str, message: String) {
+    fn plugin_notice(&self, id: &str, message: String, detail: String) {
         self.send_live(crate::frames::LiveFrame::new(
             "notice",
-            &crate::frames::Notice {
-                key: Some(format!("plugin:{id}")),
-                level: crate::frames::NoticeLevel::Warn,
-                message,
-                action: Some(crate::frames::NoticeAction {
-                    label: "Plugins".into(),
-                    href: "#/settings/plugins".into(),
-                }),
-            },
+            &crate::frames::Notice::new(crate::frames::NoticeLevel::Warn, message)
+                .key(format!("plugin:{id}"))
+                .detail(detail)
+                .action("Plugins", "#/settings/plugins"),
         ));
     }
 

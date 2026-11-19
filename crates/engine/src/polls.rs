@@ -173,12 +173,9 @@ impl Engine {
         if !posted {
             self.send_live(LiveFrame::new(
                 "notice",
-                &Notice {
-                    key: Some("no-chat".into()),
-                    level: NoticeLevel::Warn,
-                    message: format!("No chat is connected, so Ferrocast couldn't {what}."),
-                    action: None,
-                },
+                &Notice::new(NoticeLevel::Warn, "No chat is connected")
+                    .key("no-chat")
+                    .detail(format!("Ferrocast couldn't {what}. Connect a platform in Settings, Accounts.")),
             ));
         }
     }

@@ -182,7 +182,12 @@ impl Engine {
             }
             "kick_connected" => {
                 if let Err(e) = self.finish_kick(payload).await {
-                    self.notice("account:kick", NoticeLevel::Error, &format!("Kick sign-in didn't finish: {e}"));
+                    self.notice_detail(
+                        "account:kick",
+                        NoticeLevel::Error,
+                        "Kick sign-in didn't finish",
+                        &e.to_string(),
+                    );
                 }
             }
             "tip" => {
@@ -254,10 +259,11 @@ impl Engine {
         let api = self.kick_api(tokens)?;
         // Events go to the app's webhook (the relay); subscribe this channel to them.
         if let Err(e) = api.subscribe_events(&user_id).await {
-            self.notice(
+            self.notice_detail(
                 "account:kick",
                 NoticeLevel::Warn,
-                &format!("Kick is connected, but subscribing to its events failed: {e}"),
+                "Kick is connected, without its events",
+                &format!("Subscribing to its events failed: {e}"),
             );
         }
         self.start_kick(api, account);
