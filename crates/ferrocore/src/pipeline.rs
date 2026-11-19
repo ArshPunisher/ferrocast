@@ -57,6 +57,19 @@ pub struct Pipeline {
     /// keyframe, whose decode time is its 0 (sound from before it is left out).
     stream_from_us: i64,
     stream_waits_key: bool,
+    /// The recording alone paused, its stream going on (they share the encode): each pause
+    /// cuts [from, to) out of the file, on the output's clock (µs; `to` None: still paused).
+    /// Picture and sound are cut by their time, not by when the encoder hands them back (it
+    /// does so a frame or two late; cut that way, the sound fell 0.35 s behind in 4 pauses).
+    rec_cuts: Vec<(i64, Option<i64>)>,
+    /// Resumed: the cut ends at the next keyframe out of the encoder (VideoToolbox makes one
+    /// when asked; FFmpeg's encoders keep their own interval, so it may be seconds later: a
+    /// frame before it needs frames from inside the cut; projects-60).
+    rec_resume: bool,
+    /// Sound that came while the cut's end wasn't known yet (resumed, no keyframe since).
+    rec_held: Vec<(usize, AudioPacket)>,
+    /// The newest frame given to the encoder (µs).
+    last_in_us: i64,
 }
 
 /// The last seconds of encoded picture and sound, kept from a keyframe on (OBS's replay buffer).
@@ -259,6 +272,10 @@ impl Pipeline {
             video_tracks: Vec::new(),
             stream_from_us: 0,
             stream_waits_key: false,
+            rec_cuts: Vec::new(),
+            rec_resume: false,
+            rec_held: Vec::new(),
+            last_in_us: 0,
         })
     }
 
@@ -278,6 +295,10 @@ impl Pipeline {
         self.recording = None;
         self.split_to = Some((f, is_mkv(path), path.to_path_buf()));
         self.key_next = true;
+        // A recording before it on this output may have stopped paused: this one starts afresh.
+        self.rec_cuts.clear();
+        self.rec_resume = false;
+        self.rec_held.clear();
         Ok(())
     }
 
@@ -301,6 +322,43 @@ impl Pipeline {
                 let _ = std::fs::remove_file(&path);
             }
         }
+    }
+
+    /// Pauses (`on`) or resumes the recording alone, its stream going on: the encode is shared,
+    /// so pausing it all would pause the stream too. The file goes on with no gap.
+    pub fn pause_recording(&mut self, on: bool) {
+        let open = self.rec_cuts.last().is_some_and(|c| c.1.is_none());
+        if on && !open {
+            // From the next frame on (every frame drawn before went in already).
+            let frame_us = 1_000_000 / i64::from(self.video.config().fps_num.max(1));
+            self.rec_cuts.push((self.last_in_us + frame_us, None));
+            self.rec_resume = false;
+        } else if on {
+            // Paused again before it went on: nothing held is needed.
+            self.rec_resume = false;
+            self.rec_held.clear();
+        } else if open && !self.rec_resume {
+            self.rec_resume = true;
+            self.key_next = true;
+        }
+    }
+
+    /// Whether the recording alone is paused (or waits to go on).
+    pub fn recording_paused(&self) -> bool {
+        self.rec_cuts.last().is_some_and(|c| c.1.is_none())
+    }
+
+    /// Where time `us` lands in the file: None inside a cut, else moved back by the cuts before.
+    fn rec_time(&self, us: i64) -> Option<i64> {
+        let mut cut = 0;
+        for &(from, to) in &self.rec_cuts {
+            match to {
+                Some(to) if us >= to => cut += to - from,
+                _ if us >= from => return None,
+                _ => {}
+            }
+        }
+        Some(us - cut)
     }
 
     /// Whether it writes a file now (or waits for its first frame to).
@@ -452,6 +510,7 @@ impl Pipeline {
         let first = !self.sent_video_header && self.video.header().is_none();
         let key = first || std::mem::take(&mut self.key_next);
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
+        self.last_in_us = pts;
         let packets = self.video.encode(frame, pts, key)?;
         self.video_out(packets)
     }
@@ -718,6 +777,41 @@ impl Pipeline {
         if let Some(r) = self.replay.as_mut() {
             r.video(p);
         }
+        // Resumed after a recording-only pause: the cut ends at the first keyframe out; frames
+        // before it aren't written (they lean on frames inside the cut).
+        let mut resumed = false;
+        if let Some(c) = self.rec_cuts.last_mut()
+            && c.1.is_none()
+            && p.pts_us >= c.0
+        {
+            if !(self.rec_resume && p.key) {
+                return;
+            }
+            c.1 = Some(p.pts_us);
+            self.rec_resume = false;
+            resumed = true;
+        }
+        self.write_video(p);
+        // The sound held meanwhile, cut by the same line, after the keyframe (in the file it
+        // went to, a split landing on it included).
+        if resumed {
+            for (track, a) in std::mem::take(&mut self.rec_held) {
+                self.record_audio(track, a);
+            }
+        }
+    }
+
+    fn write_video(&mut self, p: &VideoPacket) {
+        // The recording alone paused: frames in a cut aren't written, later ones move back.
+        let shifted;
+        let p = if self.rec_cuts.is_empty() {
+            p
+        } else {
+            let Some(at) = self.rec_time(p.pts_us) else { return };
+            let by = p.pts_us - at;
+            shifted = VideoPacket { pts_us: at, dts_us: p.dts_us - by, ..p.clone() };
+            &shifted
+        };
         let header = self.video.header();
         let cfg = *self.video.config();
         let acfg = *self.audio.config();
@@ -771,9 +865,18 @@ impl Pipeline {
         self.recording = Some(rec);
     }
 
-    fn record_audio(&mut self, track: usize, p: AudioPacket) {
+    fn record_audio(&mut self, track: usize, mut p: AudioPacket) {
         if let Some(r) = self.replay.as_mut() {
             r.audio(track, &p);
+        }
+        if !self.rec_cuts.is_empty() {
+            // Resumed, the cut's end not known yet: held until the next frame says it.
+            if self.rec_resume && self.rec_cuts.last().is_some_and(|c| c.1.is_none() && p.pts_us >= c.0) {
+                self.rec_held.push((track, p));
+                return;
+            }
+            let Some(at) = self.rec_time(p.pts_us) else { return };
+            p.pts_us = at;
         }
         match &mut self.recording {
             Some(Recording::Waiting { held, .. }) => held.push((track, p)),

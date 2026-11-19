@@ -933,14 +933,9 @@ impl OwnStream {
     /// Pauses or resumes the recording (no gap in the file).
     pub(crate) fn pause(&self, on: bool) -> Result<(), StudioError> {
         let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("This recording can't pause.".into()))?;
-        // Pausing would pause the stream too; resuming is always let through (a recording
-        // paused before a stream joined it must be able to go on; projects-60).
-        if on && Arc::strong_count(&d.lease) > 1 {
-            return Err(StudioError::Failed(
-                "Pause isn't available while the recording shares the stream's encoder (Same as stream).".into(),
-            ));
-        }
-        d.shared.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
+        // Sharing the stream's encode (Same as stream), only the file pauses: the stream goes
+        // on (the engine picks; CodeRabbit, 19 Nov: pause was refused once both had started).
+        d.shared.engine.pause_recording(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
     }
 
     /// A chapter mark in the recording here (named, or "Chapter n").

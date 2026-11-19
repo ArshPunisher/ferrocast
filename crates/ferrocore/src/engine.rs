@@ -428,7 +428,79 @@ pub struct SourceLoad {
 }
 
 /// The loop's stats and error as of its last frame (see `Engine::stats`).
-type Seen = Mutex<(Stats, Option<String>)>;
+type Seen = Mutex<Shown>;
+
+/// What readers see of the loop without waiting for it: as of its last frame.
+#[derive(Debug, Default)]
+struct Shown {
+    stats: Stats,
+    error: Option<String>,
+    /// Each output's recording and encoder.
+    outputs: Vec<(u64, RecordState, String)>,
+    /// Each opened source's load (`Engine::source_load`).
+    loads: Vec<SourceLoad>,
+    /// Captures shown with no picture, not opening: name, whether it's the screen, and since
+    /// when it's had none (`Engine::quiet_captures`).
+    quiet: Vec<(String, bool, u64)>,
+}
+
+impl Shown {
+    fn of(st: &State) -> Self {
+        Self {
+            stats: st.stats,
+            error: st.error.clone(),
+            outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
+            loads: loads_of(st),
+            quiet: quiet_of(st),
+        }
+    }
+}
+
+fn loads_of(st: &State) -> Vec<SourceLoad> {
+    let mut out: Vec<SourceLoad> = st
+        .opened
+        .iter()
+        .filter_map(|(name, (id, _))| {
+            let s = st.sources.get(id)?;
+            let (width, height) = s.size.map_or((0, 0), |(w, h, _)| (w, h));
+            Some(SourceLoad { name: name.clone(), sent: s.sent, width, height })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Captures shown somewhere with no picture yet and not opening: name, screen, since when.
+fn quiet_of(st: &State) -> Vec<(String, bool, u64)> {
+    let shown = seen(st);
+    st.opened
+        .iter()
+        .filter_map(|(name, (id, kind))| {
+            let screen = match kind {
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                SourceKind::Camera(_) => false,
+                #[cfg(target_os = "macos")]
+                SourceKind::App { .. } => true,
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                SourceKind::Screen { .. } => true,
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                SourceKind::Window { .. } => true,
+                _ => return None,
+            };
+            let s = st.sources.get(id)?;
+            (shown.contains(id) && s.size.is_none() && s.opening.is_none())
+                .then(|| (name.clone(), screen, s.watch.since))
+        })
+        .collect()
+}
+
+fn record_state(pipe: &Pipeline) -> RecordState {
+    RecordState {
+        paused: pipe.paused() || pipe.recording_paused(),
+        bytes: pipe.recorded_bytes(),
+        splitting: pipe.splitting(),
+    }
+}
 
 /// How the engine is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -1544,18 +1616,7 @@ impl Engine {
     /// Every source a collection brought, by name: pictures sent to the card so far and their
     /// size. Read twice, the difference is each one's rate (what keeps the engine busiest).
     pub fn source_load(&self) -> Vec<SourceLoad> {
-        let st = self.lock();
-        let mut out: Vec<SourceLoad> = st
-            .opened
-            .iter()
-            .filter_map(|(name, (id, _))| {
-                let s = st.sources.get(id)?;
-                let (width, height) = s.size.map_or((0, 0), |(w, h, _)| (w, h));
-                Some(SourceLoad { name: name.clone(), sent: s.sent, width, height })
-            })
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+        self.now_or_last(loads_of, |s| s.loads.clone())
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -1563,34 +1624,32 @@ impl Engine {
     /// screen (a window, a display, an app) rather than a camera. The Studio's black screen
     /// fixer says why and what to do.
     pub fn quiet_captures(&self, quiet_ns: u64) -> Vec<(String, bool)> {
-        let st = self.lock();
-        let shown = seen(&st);
         let now = now_ns();
-        let mut out: Vec<(String, bool)> = st
-            .opened
-            .iter()
-            .filter_map(|(name, (id, kind))| {
-                let screen = match kind {
-                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-                    SourceKind::Camera(_) => false,
-                    #[cfg(target_os = "macos")]
-                    SourceKind::App { .. } => true,
-                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-                    SourceKind::Screen { .. } => true,
-                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-                    SourceKind::Window { .. } => true,
-                    _ => return None,
-                };
-                let s = st.sources.get(id)?;
-                (shown.contains(id)
-                    && s.size.is_none()
-                    && s.opening.is_none()
-                    && now.saturating_sub(s.watch.since) >= quiet_ns)
-                    .then(|| (name.clone(), screen))
-            })
+        let mut out: Vec<(String, bool)> = self
+            .now_or_last(quiet_of, |s| s.quiet.clone())
+            .into_iter()
+            .filter(|(.., since)| now.saturating_sub(*since) >= quiet_ns)
+            .map(|(name, screen, _)| (name, screen))
             .collect();
         out.sort();
         out
+    }
+
+    /// `now` on the state when its lock is free; else from what the loop showed after its last
+    /// frame: read every second from the window's thread (/stats), never waiting for the frame
+    /// being made (a whole one on a slow card: 10-48 s on Windows' runner, 19 Nov).
+    fn now_or_last<T>(&self, now: impl FnOnce(&State) -> T, last: impl FnOnce(&Shown) -> T) -> T {
+        match self.state.try_lock() {
+            Ok(st) => now(&st),
+            Err(std::sync::TryLockError::Poisoned(p)) => now(&p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => last(&self.seen.lock().unwrap_or_else(|p| p.into_inner())),
+        }
+    }
+
+    /// What readers see refreshed after a change to the outputs (not only at the next frame: a
+    /// split read as not begun would be asked for again; projects-60).
+    fn show(&self, st: &State) {
+        *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Shown::of(st);
     }
 
     /// A source an opened collection brought, by name: its id, and its picture's size once
@@ -1814,6 +1873,7 @@ impl Engine {
         let id = st.next_output;
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
+        self.show(&st);
         Ok(id)
     }
 
@@ -1853,7 +1913,7 @@ impl Engine {
 
     /// Which encoder an output's pictures go through ("h264_nvenc", "VideoToolbox", "libx264").
     pub fn output_encoder(&self, id: u64) -> Option<String> {
-        self.with_output(id, |pipe| Ok(pipe.encoder())).ok()
+        self.now_or_shown(id, |pipe| Ok(pipe.encoder()), |(_, _, e)| e.clone())?.ok()
     }
 
     /// A new video bitrate for an output from now on; false when its encoder has none to change
@@ -2013,6 +2073,22 @@ impl Engine {
         self.with_output_flushed(id, |pipe| pipe.chapter(name))
     }
 
+    /// Pauses or resumes output `id`'s recording, no gap in the file: the whole output when it
+    /// only records, the file alone when a stream shares its encode (the stream goes on).
+    pub fn pause_recording(&self, id: u64, on: bool) -> Result<(), AvError> {
+        let mut st = self.lock();
+        deliver(&mut st, &self.gpu, true);
+        let (_, pipe, kind, _) =
+            st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
+        if pipe.recording_paused() || (on && matches!(kind, OutputKind::Stream(_))) {
+            pipe.pause_recording(on);
+        } else {
+            pipe.pause(on, now_ns());
+        }
+        self.show(&st);
+        Ok(())
+    }
+
     /// Pauses or resumes an output (a recording, as OBS pauses one): no gap in the file.
     pub fn pause_output(&self, id: u64, on: bool) -> Result<(), AvError> {
         self.with_output_flushed(id, |pipe| {
@@ -2042,6 +2118,8 @@ impl Engine {
     /// its tags go to `send` from the output's next keyframe, timed from there.
     pub fn stream_on(&self, id: u64, send: Box<dyn FnMut(Tag) + Send>) -> Result<(), AvError> {
         let mut st = self.lock();
+        // Frames drawn before the join go to the recording alone: the stream starts after them.
+        deliver(&mut st, &self.gpu, true);
         let (_, pipe, kind, _) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         if !matches!(kind, OutputKind::Record(_)) {
@@ -2058,22 +2136,47 @@ impl Engine {
         let mut st = self.lock();
         let (_, pipe, kind, _) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
-        if !pipe.recording() {
-            return Err(AvError::Source("the output has no recording to go on with".into()));
-        }
+        // The stream always leaves (a recording that failed, say on a full disk, mustn't keep
+        // it: the next Go live would find a stream there; CodeRabbit).
         *kind = OutputKind::Record(PathBuf::new());
+        if !pipe.recording() {
+            return Err(AvError::Source("the output had no recording left to go on with".into()));
+        }
         Ok(())
     }
 
     /// An output's recording now.
     pub fn output_record_state(&self, id: u64) -> Result<RecordState, AvError> {
-        self.with_output(id, |pipe| {
-            Ok(RecordState { paused: pipe.paused(), bytes: pipe.recorded_bytes(), splitting: pipe.splitting() })
-        })
+        if let Some(r) = self.now_or_shown(id, |pipe| Ok(record_state(pipe)), |(_, r, _)| *r) {
+            return r;
+        }
+        Err(AvError::Source("no such output".into()))
+    }
+
+    /// `now` on output `id` when the state lock is free; else what the loop showed after its
+    /// last frame (`shown`): read every second (/stats, from the window's thread), it never
+    /// waits for the frame being made (a whole one, on a slow card; Windows' runner, 19 Nov).
+    fn now_or_shown<T>(
+        &self,
+        id: u64,
+        now: impl FnOnce(&mut Pipeline) -> Result<T, AvError>,
+        shown: impl FnOnce(&(u64, RecordState, String)) -> T,
+    ) -> Option<Result<T, AvError>> {
+        match self.state.try_lock() {
+            Ok(mut st) => Some(Self::on_output(&mut st, id, now)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(Self::on_output(&mut p.into_inner(), id, now)),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+                seen.outputs.iter().find(|o| o.0 == id).map(|o| Ok(shown(o)))
+            }
+        }
     }
 
     fn with_output<T>(&self, id: u64, f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>) -> Result<T, AvError> {
-        Self::on_output(&mut self.lock(), id, f)
+        let mut st = self.lock();
+        let r = Self::on_output(&mut st, id, f);
+        self.show(&st);
+        r
     }
 
     /// As [`Self::with_output`], after the frames still on the card went in: a pause, split or
@@ -2086,7 +2189,9 @@ impl Engine {
     ) -> Result<T, AvError> {
         let mut st = self.lock();
         deliver(&mut st, &self.gpu, true);
-        Self::on_output(&mut st, id, f)
+        let r = Self::on_output(&mut st, id, f);
+        self.show(&st);
+        r
     }
 
     fn on_output<T>(
@@ -2173,7 +2278,9 @@ impl Engine {
             // Its last frames still on the card go into it first.
             deliver(&mut st, &self.gpu, true);
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
-            st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at))
+            let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
+            self.show(&st);
+            taken
         };
         if let Some((_, pipe, mut kind, _)) = taken {
             let tags = pipe.finish()?;
@@ -2189,12 +2296,12 @@ impl Engine {
 
     /// As of the loop's last frame (it never waits for the frame being made).
     pub fn stats(&self) -> Stats {
-        self.seen.lock().unwrap_or_else(|p| p.into_inner()).0
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).stats
     }
 
     /// What stopped the loop or an output, if anything did (as of its last frame).
     pub fn error(&self) -> Option<String> {
-        let own = self.seen.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
+        let own = self.seen.lock().unwrap_or_else(|p| p.into_inner()).error.clone();
         own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
@@ -2982,8 +3089,7 @@ fn run(
         let started = Instant::now();
 
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let made = frame(&config, state, gpu, mixer, ts, behind, started);
-            *seen.lock().unwrap_or_else(|e| e.into_inner()) = made;
+            frame(&config, state, gpu, mixer, ts, behind, started, seen);
             // Pictures uploaded this frame are sent even when nothing drew (no preview, no
             // output), and what the card finished with is let go: without this, Direct3D and
             // Vulkan keep it all and run out of memory in minutes.
@@ -3006,7 +3112,7 @@ fn run(
             }
             let st = &mut *state.lock().unwrap_or_else(|e| e.into_inner());
             st.stats.recovered += 1;
-            *seen.lock().unwrap_or_else(|e| e.into_inner()) = (st.stats, st.error.clone());
+            *seen.lock().unwrap_or_else(|e| e.into_inner()) = Shown::of(st);
         }
     }
 }
@@ -3438,6 +3544,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
 }
 
 /// One frame: sources taken in, sound mixed, each canvas drawn and its outputs fed.
+#[allow(clippy::too_many_arguments)]
 fn frame(
     config: &EngineConfig,
     state: &Mutex<State>,
@@ -3446,7 +3553,8 @@ fn frame(
     ts: u64,
     behind: u64,
     started: Instant,
-) -> (Stats, Option<String>) {
+    shown: &Seen,
+) {
     let rate = config.sample_rate;
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     st.stats.skipped += behind;
@@ -3691,7 +3799,9 @@ fn frame(
     st.stats.frames += 1;
     st.stats.frame_ms = ms;
     st.stats.worst_ms = st.stats.worst_ms.max(ms);
-    (st.stats, st.error.clone())
+    // Shown before the state's lock goes: a change made right after (a split, a pause) shows
+    // itself, never overwritten by this older picture (projects-60).
+    *shown.lock().unwrap_or_else(|e| e.into_inner()) = Shown::of(&st);
 }
 
 #[cfg(test)]
@@ -4811,6 +4921,147 @@ mod tests {
         let (secs, av) = probed(&file).unwrap_or_else(|| panic!("ffprobe couldn't read {}", file.display()));
         assert!(av, "the file has picture and sound");
         assert!((1.5..2.6).contains(&secs), "about 2 s, from 0: {secs:.2}");
+        let _ = std::fs::remove_file(file);
+    }
+
+    /// The recording sharing a stream's encode pauses alone: the stream goes on sending, the
+    /// file leaves the time paused out (CodeRabbit, 19 Nov: pause was refused once both ran).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_shared_recording_pauses_while_the_stream_goes_on() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let sent: Sent = Arc::default();
+        let id = e.start_output(OutputKind::Stream(sink_into(&sent))).unwrap_or_else(|x| panic!("{x}"));
+        let file = std::env::temp_dir().join(format!("ferrocore-shared-pause-{}.mp4", std::process::id()));
+        let plain = std::env::temp_dir().join(format!("ferrocore-shared-plain-{}.mp4", std::process::id()));
+        let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
+        sleep(500);
+        // One without pauses first, for how much shorter the sound ends anyway: it reaches the
+        // encoder after the picture, so its last moments miss any recording's stop.
+        e.record_on(id, &plain).unwrap_or_else(|x| panic!("{x}"));
+        sleep(2500);
+        e.record_off(id).unwrap_or_else(|x| panic!("{x}"));
+        e.record_on(id, &file).unwrap_or_else(|x| panic!("{x}"));
+        sleep(1500);
+        e.pause_recording(id, true).unwrap_or_else(|x| panic!("{x}"));
+        let before = sent.lock().unwrap_or_else(|p| p.into_inner()).len();
+        sleep(1500);
+        assert!(e.output_record_state(id).is_ok_and(|r| r.paused), "the recording shows paused");
+        let during = sent.lock().unwrap_or_else(|p| p.into_inner()).len() - before;
+        assert!(during > 60, "the stream went on while the recording paused: {during} tags");
+        e.pause_recording(id, false).unwrap_or_else(|x| panic!("{x}"));
+        sleep(1500);
+        // More pauses: the sound mustn't drift from the picture across them (projects-60).
+        for _ in 0..3 {
+            e.pause_recording(id, true).unwrap_or_else(|x| panic!("{x}"));
+            sleep(500);
+            e.pause_recording(id, false).unwrap_or_else(|x| panic!("{x}"));
+            sleep(800);
+        }
+        e.record_off(id).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.error(), None);
+        let video: Vec<u32> =
+            sent.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|t| t.0).map(|t| t.1).collect();
+        assert!(video.windows(2).all(|w| w[1] >= w[0]), "the stream's time never went back");
+        if !has_ffprobe() {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        }
+        let (secs, av) = probed(&file).unwrap_or_else(|| panic!("ffprobe couldn't read {}", file.display()));
+        assert!(av, "the file has picture and sound");
+        // 1.5 s, paused 1.5 s, 1.5 s, then 3 × (paused 0.5 s, 0.8 s): about 5.4 s, not 7.4
+        // (each resume waits up to a keyframe).
+        assert!((4.4..5.8).contains(&secs), "the pauses left out of the file: {secs:.2} s");
+        // (start, end) of the picture and the sound.
+        let ends = |f: &std::path::Path| {
+            let out = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-show_entries", "stream=codec_type,start_time,duration", "-of", "csv=p=0"])
+                .arg(f)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let of = |kind: &str| -> (f64, f64) {
+                let l = out.lines().find(|l| l.starts_with(kind)).unwrap_or_else(|| panic!("no {kind}: {out}"));
+                let v: Vec<f64> = l.split(',').skip(1).filter_map(|x| x.trim().parse().ok()).collect();
+                (v[0], v[0] + v[1])
+            };
+            (of("video"), of("audio"))
+        };
+        let ((vs, ve), (as_, ae)) = ends(&file);
+        let ((_, pve), (_, pae)) = ends(&plain);
+        assert!((vs - as_).abs() < 0.05, "sound starts with the picture: {vs:.3} {as_:.3}");
+        // Cut by time, the 4 pauses take as much sound as picture out (an AAC frame, 21 ms, at
+        // most each side of a cut); cut by when the encoder handed them back, it was 0.35 s.
+        let (short, plain_short) = (ve - ae, pve - pae);
+        assert!(
+            (short - plain_short).abs() < 0.1,
+            "the sound ends {short:.3} s before the picture after 4 pauses, {plain_short:.3} s without"
+        );
+        let _ = std::fs::remove_file(plain);
+        let gaps = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+            .arg(&file)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let mut ts: Vec<f64> = gaps.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        ts.sort_by(f64::total_cmp);
+        let worst = ts.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+        assert!(worst < 0.2, "no hole in the picture where it paused: {worst:.3} s");
+        let _ = std::fs::remove_file(file);
+    }
+
+    /// An encoder that doesn't make a keyframe when asked (FFmpeg's: x264, NVENC, QSV keep
+    /// their own interval): a shared recording paused and resumed goes on only at its next
+    /// real keyframe; frames before it lean on frames left out, and would show smeared
+    /// (projects-60). With keyframes 4 s apart, nothing after the pause is written here.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_shared_recording_resumes_only_at_a_real_keyframe() {
+        if crate::ffenc::h264_encoder().is_none() {
+            eprintln!("skipped: no FFmpeg here");
+            return;
+        }
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 640,
+            height: 360,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 2000,
+            rate: RateControl::Cbr,
+            keyframe_secs: 4,
+            software: true,
+        };
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let config = EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() };
+        let e = Engine::new(config, video, audio).unwrap_or_else(|x| panic!("{x}"));
+        shared_scene(&e);
+        let file = std::env::temp_dir().join(format!("ferrocore-x264-pause-{}.mp4", std::process::id()));
+        let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
+        // The recording from the start (the encoder's first frame, always a keyframe, starts the
+        // file; joined later, it would wait for the next one, 4 s on), the stream joining it.
+        let id = e.start_output(OutputKind::Record(file.clone())).unwrap_or_else(|x| panic!("{x}"));
+        let sent: Sent = Arc::default();
+        e.stream_on(id, sink_into(&sent)).unwrap_or_else(|x| panic!("{x}"));
+        sleep(1500);
+        e.pause_recording(id, true).unwrap_or_else(|x| panic!("{x}"));
+        sleep(500);
+        e.pause_recording(id, false).unwrap_or_else(|x| panic!("{x}"));
+        // Up to 3.5 s on the output's clock: still before its next keyframe, at 4 s.
+        sleep(1300);
+        assert!(e.output_record_state(id).is_ok_and(|r| r.paused), "still waiting for a keyframe to go on");
+        e.record_off(id).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        if !has_ffprobe() {
+            eprintln!("skipped the check: no ffprobe");
+            return;
+        }
+        let (secs, _) = probed(&file).unwrap_or_else(|| panic!("ffprobe couldn't read {}", file.display()));
+        assert!(secs < 1.8, "nothing after the pause without a keyframe: {secs:.2} s (2.8 s when written)");
         let _ = std::fs::remove_file(file);
     }
 
