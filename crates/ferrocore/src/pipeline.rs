@@ -614,6 +614,23 @@ impl Pipeline {
     }
 
     fn finish_now(mut self) -> Result<Vec<Tag>, AvError> {
+        let tags = self.flush_all();
+        // Whatever the encoders said: no empty file left waiting for a keyframe, and the file
+        // written finished, so it plays (CodeRabbit: a failed flush left both).
+        self.drop_pending_file();
+        let finished = match self.recording.take() {
+            Some(Recording::On(w)) => {
+                w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))
+            }
+            _ => Ok(()),
+        };
+        let tags = tags?;
+        finished?;
+        Ok(tags)
+    }
+
+    /// The encoders' last packets, sent and written.
+    fn flush_all(&mut self) -> Result<Vec<Tag>, AvError> {
         let packets = self.video.flush()?;
         let mut tags = self.video_out(packets)?;
         let offset = self.audio_offset_us.unwrap_or(0);
@@ -636,10 +653,6 @@ impl Pipeline {
             let (enc, sent) = &mut self.video_tracks[i];
             let packets = enc.flush()?;
             tags.extend(Self::track_tags(i, enc, sent, packets));
-        }
-        self.drop_pending_file();
-        if let Some(Recording::On(w)) = self.recording.take() {
-            w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
         }
         Ok(tags)
     }
