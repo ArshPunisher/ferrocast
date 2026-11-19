@@ -90,13 +90,19 @@ impl Default for SourceSettings {
 
 /// A source's levels per channel (left, right), in dBFS (-inf is silence): over the last block
 /// (what the ducker hears), or over [`METER_BLOCKS`] for a meter ([`Mixer::levels`]).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Levels {
     pub peak: [f32; 2],
     pub rms: [f32; 2],
     /// The highest the sound came in at, before its filters and its fader (a noise gate's
     /// threshold is set against this: the meter after the gate shows nothing while it's shut).
     pub input_peak: [f32; 2],
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Self { peak: [f32::NEG_INFINITY; 2], rms: [f32::NEG_INFINITY; 2], input_peak: [f32::NEG_INFINITY; 2] }
+    }
 }
 
 /// Blocks a meter reads over (about 300 ms): a meter read ten times a second saw one block in
