@@ -42,8 +42,6 @@ const HEALTH_EVERY: Duration = Duration::from_secs(1);
 const DEFAULT_NEED_KBPS: u32 = 6_160;
 /// The same for an upright 1080×1920 stream from OBS's vertical canvas.
 const DEFAULT_VERTICAL_NEED_KBPS: u32 = 4_660;
-/// YouTube's ingest, for the upload check of the vertical stream (resolving it would make one).
-const YOUTUBE_INGEST: &str = "rtmps://a.rtmps.youtube.com/live2";
 
 /// Which picture a destination gets: OBS's normal stream, or its vertical canvas (A2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1408,22 +1406,10 @@ impl Engine {
                 self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
             return Ok(ferrocast_golive::reach::reach(&url, &key).await);
         }
-        // YouTube's vertical stream is made when it's first needed, not for a test (it costs
-        // quota): its server is YouTube's own.
-        if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
-            if self.connector(Platform::Youtube).is_none() {
-                return Ok(ferrocast_golive::reach::Reach {
-                    ok: false,
-                    rtt_ms: None,
-                    message: "Connect YouTube in Settings, Accounts first.".into(),
-                    srt_latency_ms: None,
-                });
-            }
-            return Ok(ferrocast_golive::reach::reach(YOUTUBE_INGEST, "").await);
-        }
-        match self.resolve(&d).await {
-            Ok(dest) => {
-                let t = &dest.target;
+        // Read-only server peek: never creates, binds or mutates broadcasts/keys during a test or
+        // pre-flight (especially YouTube, where resolve() prepares a live broadcast).
+        match self.peek_target(&d).await {
+            Ok(t) => {
                 let url = format!("{}://{}:{}/{}", if t.tls { "rtmps" } else { "rtmp" }, t.host, t.port, t.app);
                 Ok(ferrocast_golive::reach::reach(&url, "").await)
             }
@@ -1660,33 +1646,25 @@ impl Engine {
                 rows.push(row);
                 continue;
             }
-            // YouTube's vertical stream is made when it's first needed, not for a check.
-            let resolved = if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
-                match self.connector(Platform::Youtube) {
-                    Some(_) => Target::parse(YOUTUBE_INGEST)
-                        .map(|target| Destination {
-                            id: d.id.clone(),
-                            target,
-                            key: String::new(),
-                            retry: Default::default(),
-                            extra_audio: false,
-                            extra_video: false,
-                        })
-                        .map_err(|e| e.to_string()),
-                    None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
-                }
-            } else {
-                self.resolve(d).await
+            // Read-only peek for platforms that don't run bandwidth-test (YouTube, Kick) so an
+            // upload check never creates or mutates YouTube broadcasts; Twitch needs its key for
+            // `?bandwidthtest=true` (read-only on Twitch).
+            let resolved: Result<(Target, Option<String>), String> = match d.kind {
+                Service::Twitch | Service::Custom => self.resolve(d).await.map(|dest| (dest.target, Some(dest.key))),
+                Service::Youtube | Service::Kick => self.peek_target(d).await.map(|t| (t, None)),
             };
             match resolved {
-                Ok(dest) => {
-                    row.server = Some(dest.target.host.clone());
-                    match probe::delay(&dest.target).await {
+                Ok((target, key)) => {
+                    row.server = Some(target.host.clone());
+                    match probe::delay(&target).await {
                         Ok(t) => row.delay_ms = Some(t.as_millis() as u32),
                         Err(e) => row.problem = Some(e.to_string()),
                     }
-                    if d.kind == Service::Twitch && twitch.is_none() {
-                        twitch = Some((dest.target.clone(), dest.key.clone()));
+                    if d.kind == Service::Twitch
+                        && twitch.is_none()
+                        && let Some(k) = key
+                    {
+                        twitch = Some((target, k));
                     }
                 }
                 Err(reason) => row.problem = Some(reason),
@@ -1740,8 +1718,29 @@ impl Engine {
         Ok(check)
     }
 
-    /// A destination's server and key: fetched from its platform, or the saved custom one.
-    /// The error is a sentence for the streamer.
+    /// Read-only ingest server lookup for Test connection, Pre-flight and Upload check.
+    /// Never creates, binds or mutates broadcasts or stream keys on any platform.
+    async fn peek_target(&self, d: &DestinationConfig) -> Result<Target, String> {
+        let url = match platform_of(d.kind) {
+            Some(p) => {
+                let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
+                let got = match d.canvas {
+                    Canvas::Main => c.peek_ingest().await,
+                    Canvas::Vertical => c.peek_vertical_ingest().await,
+                };
+                let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
+                match got {
+                    Ok(u) => own_server.unwrap_or(u),
+                    Err(e) => return Err(format_platform_error(p, e, false)),
+                }
+            }
+            None => d.url.clone().ok_or_else(|| "This server has no address.".to_string())?,
+        };
+        Target::parse(&url).map_err(|e| e.to_string())
+    }
+
+    /// A destination's server and key: fetched from its platform (write path, only when actually
+    /// going live), or the saved custom one. The error is a clear one-line reason for the streamer.
     async fn resolve(&self, d: &DestinationConfig) -> Result<Destination, String> {
         let (url, key) = match platform_of(d.kind) {
             Some(p) => {
@@ -1753,12 +1752,7 @@ impl Engine {
                 let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
                 match got {
                     Ok(i) => (own_server.unwrap_or(i.url), i.key),
-                    Err(ferrocast_connector::ConnectorError::MissingScope { .. }) => {
-                        return Err(format!(
-                            "{p} needs one more permission to stream: reconnect {p} in Settings, Accounts."
-                        ));
-                    }
-                    Err(e) => return Err(format!("Couldn't get the stream key from {p}: {e}")),
+                    Err(e) => return Err(format_platform_error(p, e, true)),
                 }
             }
             None => {
@@ -2322,6 +2316,27 @@ async fn http_upload_kbps() -> Result<u32, String> {
     let rough = send(1_000_000).await?;
     let size = ((rough * 1000.0 / 8.0) * 4.0).clamp(1_000_000.0, 25_000_000.0) as usize;
     Ok(send(size).await? as u32)
+}
+
+/// One-line error message when checking or preparing a platform destination.
+fn format_platform_error(p: Platform, err: ferrocast_connector::ConnectorError, write: bool) -> String {
+    match err {
+        ferrocast_connector::ConnectorError::MissingScope { .. } => {
+            format!("{p} needs one more permission to stream: reconnect {p} in Settings, Accounts.")
+        }
+        ferrocast_connector::ConnectorError::SignInNeeded(_) => {
+            format!("{p} needs you to sign in again in Settings, Accounts.")
+        }
+        ferrocast_connector::ConnectorError::RateLimited { .. } => {
+            format!("{p} is temporarily rate-limited; try again shortly.")
+        }
+        ferrocast_connector::ConnectorError::Refused { message, .. } if write => {
+            format!("{p} refused to start the stream: {message}")
+        }
+        ferrocast_connector::ConnectorError::Refused { message, .. } => format!("{p}: {message}"),
+        e if write => format!("Couldn't prepare {p}: {e}"),
+        e => format!("Couldn't check {p}: {e}"),
+    }
 }
 
 /// "Twitch", "a custom server": what OBS's earlier setting was, without its key.

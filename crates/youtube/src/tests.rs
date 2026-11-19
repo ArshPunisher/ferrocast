@@ -918,3 +918,488 @@ fn a_big_thumbnail_gets_time_to_upload() {
     assert!((200..=300).contains(&big), "{big}");
     assert_eq!(thumbnail_deadline(usize::MAX / 2).as_secs(), 300);
 }
+
+// ---------------------------------------------------------------- M10-01 YouTube safety & parity
+
+#[derive(Clone, Default)]
+struct ScriptedYoutube {
+    stream_pages: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    broadcast_pages: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    /// When true, newly inserted streams/broadcasts are NOT added to GET lists (simulates list lag).
+    lag_lists: bool,
+    /// Optional HTTP status + body for POST /liveBroadcasts.
+    fail_broadcast_insert: Option<(u16, serde_json::Value)>,
+    /// Optional HTTP status + body for POST /liveBroadcasts/bind.
+    fail_broadcast_bind: Option<(u16, serde_json::Value)>,
+    /// When true, page 1 returns a repeating nextPageToken to test cycle protection.
+    repeat_token: bool,
+    calls: Arc<Mutex<Vec<String>>>,
+    next_id: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn start_scripted(st: ScriptedYoutube) -> (Endpoints, Arc<Mutex<Vec<String>>>) {
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let calls = st.calls.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
+                let page_idx: usize = q.get("pageToken").and_then(|t| t.strip_prefix("sp-")).and_then(|n| n.parse().ok()).unwrap_or(0);
+                st.calls.lock().unwrap().push(format!("GET /liveStreams page={page_idx}"));
+                let pages = st.stream_pages.lock().unwrap();
+                let items = pages.get(page_idx).cloned().unwrap_or_default();
+                let mut resp = json!({ "items": items });
+                if st.repeat_token {
+                    resp["nextPageToken"] = json!("sp-0");
+                } else if page_idx + 1 < pages.len() {
+                    resp["nextPageToken"] = json!(format!("sp-{}", page_idx + 1));
+                }
+                axum::Json(resp)
+            })
+            .post(|State(st): State<ScriptedYoutube>, axum::Json(mut b): axum::Json<serde_json::Value>| async move {
+                let n = st.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("s-new-{n}");
+                st.calls.lock().unwrap().push(format!("POST /liveStreams {id}"));
+                b["id"] = json!(id);
+                b["cdn"]["ingestionInfo"] = json!({
+                    "streamName": format!("var-key-{n}"),
+                    "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2"
+                });
+                if !st.lag_lists {
+                    let mut pages = st.stream_pages.lock().unwrap();
+                    if pages.is_empty() {
+                        pages.push(vec![]);
+                    }
+                    pages[0].push(b.clone());
+                }
+                axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
+                let status = q.get("broadcastStatus").cloned().unwrap_or_default();
+                let page_idx: usize = q.get("pageToken").and_then(|t| t.strip_prefix("bp-")).and_then(|n| n.parse().ok()).unwrap_or(0);
+                st.calls.lock().unwrap().push(format!("GET /liveBroadcasts status={status} page={page_idx}"));
+                if status != "upcoming" {
+                    return axum::Json(json!({ "items": [] }));
+                }
+                let pages = st.broadcast_pages.lock().unwrap();
+                let items = pages.get(page_idx).cloned().unwrap_or_default();
+                let mut resp = json!({ "items": items });
+                if st.repeat_token {
+                    resp["nextPageToken"] = json!("bp-0");
+                } else if page_idx + 1 < pages.len() {
+                    resp["nextPageToken"] = json!(format!("bp-{}", page_idx + 1));
+                }
+                axum::Json(resp)
+            })
+            .post(|State(st): State<ScriptedYoutube>, axum::Json(mut b): axum::Json<serde_json::Value>| async move {
+                if let Some((code, body)) = &st.fail_broadcast_insert {
+                    st.calls.lock().unwrap().push(format!("POST /liveBroadcasts err={code}"));
+                    return (StatusCode::from_u16(*code).unwrap(), axum::Json(body.clone()));
+                }
+                let n = st.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("b-new-{n}");
+                let title = b.pointer("/snippet/title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let privacy = b.pointer("/status/privacyStatus").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                st.calls.lock().unwrap().push(format!("POST /liveBroadcasts {id} privacy={privacy} title={title}"));
+                b["id"] = json!(id);
+                if !st.lag_lists {
+                    let mut pages = st.broadcast_pages.lock().unwrap();
+                    if pages.is_empty() {
+                        pages.push(vec![]);
+                    }
+                    pages[0].push(b.clone());
+                }
+                (StatusCode::OK, axum::Json(b))
+            })
+            .put(|State(st): State<ScriptedYoutube>, axum::Json(b): axum::Json<serde_json::Value>| async move {
+                let id = b["id"].as_str().unwrap_or("").to_string();
+                st.calls.lock().unwrap().push(format!("PUT /liveBroadcasts {id}"));
+                axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts/bind",
+            axum::routing::post(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
+                let bid = q.get("id").cloned().unwrap_or_default();
+                let sid = q.get("streamId").cloned().unwrap_or_default();
+                if let Some((code, body)) = &st.fail_broadcast_bind {
+                    st.calls.lock().unwrap().push(format!("POST /liveBroadcasts/bind {bid}->{sid} err={code}"));
+                    return (StatusCode::from_u16(*code).unwrap(), axum::Json(body.clone()));
+                }
+                st.calls.lock().unwrap().push(format!("POST /liveBroadcasts/bind {bid}->{sid}"));
+                for page in st.broadcast_pages.lock().unwrap().iter_mut() {
+                    for b in page.iter_mut() {
+                        if b["id"] == json!(bid) {
+                            b["contentDetails"]["boundStreamId"] = json!(sid);
+                        }
+                    }
+                }
+                (StatusCode::OK, axum::Json(json!({ "id": bid })))
+            }),
+        )
+        .route(
+            "/api/videos",
+            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+                let id = q.get("id").cloned().unwrap_or_else(|| "v1".into());
+                axum::Json(json!({ "items": [{ "id": id, "snippet": { "title": "Old", "description": "", "categoryId": "20" } }] }))
+            })
+            .put(|State(st): State<ScriptedYoutube>, axum::Json(b): axum::Json<serde_json::Value>| async move {
+                let id = b["id"].as_str().unwrap_or("").to_string();
+                st.calls.lock().unwrap().push(format!("PUT /videos {id}"));
+                axum::Json(b)
+            }),
+        )
+        .with_state(st);
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    (ep, calls)
+}
+
+fn stream_item(
+    id: &str,
+    title: &str,
+    default: bool,
+    res: &str,
+    fps: &str,
+    ingest_type: &str,
+    key: &str,
+) -> serde_json::Value {
+    let info = if ingest_type == "rtmp" {
+        json!({ "streamName": key, "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" })
+    } else {
+        json!({ "ingestionAddress": "https://a.upload.youtube.com/http_upload_hls?cid=x" })
+    };
+    json!({
+        "id": id,
+        "snippet": { "title": title, "isDefaultStream": default },
+        "cdn": { "resolution": res, "frameRate": fps, "ingestionType": ingest_type, "ingestionInfo": info }
+    })
+}
+
+fn has_write_call(calls: &[String]) -> bool {
+    calls.iter().any(|c| c.starts_with("POST ") || c.starts_with("PUT "))
+}
+
+#[tokio::test]
+async fn peek_ingest_makes_zero_writes_even_with_no_broadcast_or_fixed_key() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "1080p", "30fps", "rtmp", "k1",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let api = video_api(ep);
+    assert_eq!(api.peek_ingest().await.unwrap(), "rtmps://a.rtmps.youtube.com/live2");
+    assert_eq!(api.peek_vertical_ingest().await.unwrap(), "rtmps://a.rtmps.youtube.com/live2");
+    let got = calls.lock().unwrap().clone();
+    assert!(!has_write_call(&got), "peek must never POST/PUT: {got:?}");
+}
+
+#[tokio::test]
+async fn stream_info_edit_then_go_live_within_10_min_still_swaps_a_fixed_key() {
+    use ferrocast_core::stream_info::StreamInfo;
+    // Case 1: fixed 1080p key, no broadcast yet, normal list visibility.
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1",
+            "Default",
+            true,
+            "1080p",
+            "variable",
+            "rtmp",
+            "old-1080p",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let api = video_api(ep);
+    api.update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await.unwrap();
+    let ing = api.ingest().await.unwrap();
+    assert!(ing.key.starts_with("var-key-"), "must use Ferrocast's variable key, not old-1080p: {}", ing.key);
+    let log = calls.lock().unwrap().clone();
+    assert_eq!(log.iter().filter(|c| c.starts_with("POST /liveBroadcasts ")).count(), 1, "{log:?}");
+    assert_eq!(log.iter().filter(|c| c.starts_with("POST /liveStreams ")).count(), 1, "{log:?}");
+
+    // Case 2: YouTube's lists lag (newly created broadcast isn't listed yet) AND the channel's key
+    // turns fixed between edit and Go Live — `just_made` must never skip replacing a bad key.
+    let stream_pages =
+        Arc::new(Mutex::new(vec![vec![stream_item("s1", "Default", true, "variable", "variable", "rtmp", "k-var")]]));
+    let st2 = ScriptedYoutube { stream_pages: stream_pages.clone(), lag_lists: true, ..Default::default() };
+    let (ep2, calls2) = start_scripted(st2).await;
+    let api2 = video_api(ep2);
+    api2.update_broadcast_info(&StreamInfo { title: Some("Before".into()), ..Default::default() }).await.unwrap();
+    // Key becomes fixed 1080p before Go Live (within 10 min, broadcast still unlisted).
+    stream_pages.lock().unwrap()[0][0]["cdn"]["resolution"] = json!("1080p");
+    let ing2 = api2.ingest().await.unwrap();
+    assert!(ing2.key.starts_with("var-key-"), "just_made must not suppress swap: {}", ing2.key);
+    let log2 = calls2.lock().unwrap().clone();
+    assert!(
+        log2.iter().any(|c| c.starts_with("POST /liveBroadcasts/bind b-new-1->s-new-")),
+        "must rebind just_made broadcast: {log2:?}"
+    );
+    assert_eq!(
+        log2.iter().filter(|c| c.starts_with("POST /liveBroadcasts ")).count(),
+        1,
+        "no duplicate broadcast: {log2:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_30fps_or_non_rtmp_key_gets_swapped_for_ferrocasts_variable_rtmp_key() {
+    // 30 fps fixed key with variable resolution.
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "30fps", "rtmp", "k-30fps",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b1",
+            "snippet": { "title": "Today", "scheduledStartTime": crate::api::rfc3339_utc(now_ms() + 10 * 60_000) },
+            "status": { "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s1", "enableAutoStart": true }
+        })]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let ing = video_api(ep).ingest().await.unwrap();
+    assert!(ing.key.starts_with("var-key-"), "30fps key must be swapped: {}", ing.key);
+    let log = calls.lock().unwrap().clone();
+    assert!(log.iter().any(|c| c.starts_with("POST /liveStreams ")), "{log:?}");
+    assert!(log.iter().any(|c| c.starts_with("POST /liveBroadcasts/bind b1->s-new-")), "{log:?}");
+
+    // Non-RTMP (HLS) key with variable resolution & variable fps.
+    let st_hls = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s-hls", "HLS", true, "variable", "variable", "hls", "",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b2",
+            "snippet": { "title": "Today" },
+            "status": { "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s-hls", "enableAutoStart": true }
+        })]])),
+        ..Default::default()
+    };
+    let (ep_hls, calls_hls) = start_scripted(st_hls).await;
+    let ing_hls = video_api(ep_hls).ingest().await.unwrap();
+    assert!(ing_hls.key.starts_with("var-key-"), "HLS key must be swapped: {}", ing_hls.key);
+    let log_hls = calls_hls.lock().unwrap().clone();
+    assert!(log_hls.iter().any(|c| c.starts_with("POST /liveBroadcasts/bind b2->s-new-")), "{log_hls:?}");
+}
+
+#[tokio::test]
+async fn a_next_week_broadcast_is_untouched_unless_explicitly_picked() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let next_week = crate::api::rfc3339_utc(now_ms() + 7 * 86_400_000);
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b-next-week",
+            "snippet": { "title": "Tournament Finals", "description": "Next week!", "scheduledStartTime": next_week },
+            "status": { "privacyStatus": "unlisted", "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s1", "enableAutoStart": false }
+        })]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let api = video_api(ep);
+    // Stream info edit must not touch next week's broadcast.
+    api.update_broadcast_info(&StreamInfo { title: Some("Quick stream".into()), ..Default::default() }).await.unwrap();
+    // Going live must not rebind or enable autoStart on next week's broadcast.
+    let ing = api.ingest().await.unwrap();
+    assert_eq!(ing.key, "k-main");
+    let log = calls.lock().unwrap().clone();
+    assert!(!log.iter().any(|c| c.contains("b-next-week")), "next-week broadcast must be untouched: {log:?}");
+    assert!(log.iter().any(|c| c.starts_with("POST /liveBroadcasts b-new-")), "a fresh broadcast was made: {log:?}");
+
+    // Explicitly picking next week's broadcast via ingest_for(Some(...)) DOES target it.
+    calls.lock().unwrap().clear();
+    let ing_picked = api.ingest_for(Some("b-next-week")).await.unwrap();
+    assert_eq!(ing_picked.key, "k-main");
+    let picked_log = calls.lock().unwrap().clone();
+    assert!(picked_log.contains(&"PUT /liveBroadcasts b-next-week".to_string()), "{picked_log:?}");
+
+    // Vertical ingest also ignores a next-week broadcast (does not copy its title or privacy).
+    let st_v = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b-next-week",
+            "snippet": { "title": "Tournament Finals", "scheduledStartTime": crate::api::rfc3339_utc(now_ms() + 7 * 86_400_000) },
+            "status": { "privacyStatus": "unlisted", "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s1", "enableAutoStart": false }
+        })]])),
+        ..Default::default()
+    };
+    let (ep_v, calls_v) = start_scripted(st_v).await;
+    video_api(ep_v).vertical_ingest().await.unwrap();
+    let vlog = calls_v.lock().unwrap().clone();
+    assert!(
+        vlog.iter().any(|c| c.contains("POST /liveBroadcasts ")
+            && c.contains("title=Live now")
+            && c.contains("privacy=public")),
+        "vertical must not copy next-week event: {vlog:?}"
+    );
+}
+
+#[tokio::test]
+async fn forbidden_on_make_broadcast_or_bind_returns_err_instead_of_streaming_into_nothing() {
+    // 403 quotaExceeded on make_broadcast.
+    let st_quota = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k1",
+        )]])),
+        fail_broadcast_insert: Some((
+            403,
+            json!({ "error": { "message": "Quota exceeded.", "errors": [{ "reason": "quotaExceeded" }] } }),
+        )),
+        ..Default::default()
+    };
+    let (ep, _) = start_scripted(st_quota).await;
+    assert_eq!(video_api(ep).ingest().await.unwrap_err(), YoutubeError::QuotaExceeded);
+
+    // 403 forbidden with multi-line reason on make_broadcast → single-line Err.
+    let st_403 = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k1",
+        )]])),
+        fail_broadcast_insert: Some((
+            403,
+            json!({ "error": { "message": "Live streaming\nis not enabled.", "errors": [{ "reason": "liveStreamingNotEnabled" }] } }),
+        )),
+        ..Default::default()
+    };
+    let (ep2, _) = start_scripted(st_403).await;
+    let err = video_api(ep2).ingest().await.unwrap_err().to_string();
+    assert!(!err.contains('\n'), "error must be one line: {err:?}");
+    assert!(err.contains("Live streaming is not enabled"), "{err}");
+
+    // 403 on bind → Err (never stream into an unbound key).
+    let st_bind = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k1",
+        )]])),
+        fail_broadcast_bind: Some((
+            403,
+            json!({ "error": { "message": "Cannot bind stream.", "errors": [{ "reason": "forbidden" }] } }),
+        )),
+        ..Default::default()
+    };
+    let (ep3, _) = start_scripted(st_bind).await;
+    let err3 = video_api(ep3).ingest().await.unwrap_err().to_string();
+    assert!(err3.contains("bind") && !err3.contains('\n'), "{err3}");
+}
+
+#[tokio::test]
+async fn pagination_finds_streams_and_broadcasts_on_later_pages_and_guards_vertical_duplicates() {
+    let next_week = crate::api::rfc3339_utc(now_ms() + 7 * 86_400_000);
+    let soon = crate::api::rfc3339_utc(now_ms() + 15 * 60_000);
+    // Page 1 has a fixed stream + next-week broadcast; page 2 has Ferrocast's own variable stream
+    // and today's near-now broadcast.
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![
+            vec![stream_item("s-old", "Default", true, "1080p", "30fps", "rtmp", "k-old")],
+            vec![stream_item("s-fc", crate::api::MAIN_STREAM_TITLE, false, "variable", "variable", "rtmp", "k-fc-p2")],
+        ])),
+        broadcast_pages: Arc::new(Mutex::new(vec![
+            vec![json!({
+                "id": "b-week",
+                "snippet": { "title": "Next week", "scheduledStartTime": next_week },
+                "status": { "lifeCycleStatus": "ready" },
+                "contentDetails": { "boundStreamId": "s-old", "enableAutoStart": false }
+            })],
+            vec![json!({
+                "id": "b-soon",
+                "snippet": { "title": "Today", "scheduledStartTime": soon },
+                "status": { "lifeCycleStatus": "ready" },
+                "contentDetails": { "boundStreamId": "s-old", "enableAutoStart": false }
+            })],
+        ])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let api = video_api(ep);
+    let ing = api.ingest().await.unwrap();
+    assert_eq!(ing.key, "k-fc-p2", "reused Ferrocast stream from page 2 without inserting");
+    let log = calls.lock().unwrap().clone();
+    assert!(!log.iter().any(|c| c.starts_with("POST /liveStreams")), "no duplicate stream: {log:?}");
+    assert!(log.contains(&"POST /liveBroadcasts/bind b-soon->s-fc".to_string()), "{log:?}");
+    assert!(log.contains(&"PUT /liveBroadcasts b-soon".to_string()), "{log:?}");
+    assert!(!log.iter().any(|c| c.contains("b-week")), "next-week broadcast untouched: {log:?}");
+
+    // Repeating pageToken must not infinite-loop.
+    let st_loop = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k1",
+        )]])),
+        repeat_token: true,
+        ..Default::default()
+    };
+    let (ep_loop, _) = start_scripted(st_loop).await;
+    assert_eq!(video_api(ep_loop).peek_ingest().await.unwrap(), "rtmps://a.rtmps.youtube.com/live2");
+
+    // Concurrent vertical_ingest() with lagging lists creates only ONE vertical stream and ONE
+    // vertical broadcast (no duplicates).
+    let st_vert = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k1",
+        )]])),
+        lag_lists: true,
+        ..Default::default()
+    };
+    let (ep_vert, calls_vert) = start_scripted(st_vert).await;
+    let api_vert = video_api(ep_vert);
+    let (v1, v2) = tokio::join!(api_vert.vertical_ingest(), api_vert.vertical_ingest());
+    assert_eq!(v1.unwrap().key, v2.unwrap().key);
+    let vlog = calls_vert.lock().unwrap().clone();
+    assert_eq!(vlog.iter().filter(|c| c.starts_with("POST /liveStreams ")).count(), 1, "{vlog:?}");
+    assert_eq!(vlog.iter().filter(|c| c.starts_with("POST /liveBroadcasts ")).count(), 1, "{vlog:?}");
+
+    // Existing vertical broadcast with autoStart: false gets auto-start enabled; existing unbound
+    // main broadcast gets bound instead of streaming into nothing.
+    let st_auto = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![
+            stream_item("s1", "Default", true, "variable", "variable", "rtmp", "k1"),
+            stream_item("sv1", crate::api::VERTICAL_STREAM_TITLE, false, "variable", "variable", "rtmp", "kv1"),
+        ]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![
+            json!({
+                "id": "b-unbound",
+                "snippet": { "title": "Unbound" },
+                "status": { "lifeCycleStatus": "ready" },
+                "contentDetails": { "enableAutoStart": true }
+            }),
+            json!({
+                "id": "bv-manual",
+                "snippet": { "title": "Shorts" },
+                "status": { "lifeCycleStatus": "ready" },
+                "contentDetails": { "boundStreamId": "sv1", "enableAutoStart": false }
+            }),
+        ]])),
+        ..Default::default()
+    };
+    let (ep_auto, calls_auto) = start_scripted(st_auto).await;
+    let api_auto = video_api(ep_auto);
+    assert_eq!(api_auto.ingest().await.unwrap().key, "k1");
+    assert_eq!(api_auto.vertical_ingest().await.unwrap().key, "kv1");
+    let alog = calls_auto.lock().unwrap().clone();
+    assert!(alog.contains(&"POST /liveBroadcasts/bind b-unbound->s1".to_string()), "{alog:?}");
+    assert!(alog.contains(&"PUT /liveBroadcasts bv-manual".to_string()), "{alog:?}");
+}

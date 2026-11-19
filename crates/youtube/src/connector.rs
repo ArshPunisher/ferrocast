@@ -91,6 +91,14 @@ impl Connector for YoutubeConnector {
         Ok(self.api.set_chapters(video, chapters).await?)
     }
 
+    async fn peek_ingest(&self) -> Result<String> {
+        Ok(self.api.peek_ingest().await?)
+    }
+
+    async fn peek_vertical_ingest(&self) -> Result<String> {
+        Ok(self.api.peek_vertical_ingest().await?)
+    }
+
     async fn ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.ingest().await?)
     }
