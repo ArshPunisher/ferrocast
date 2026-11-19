@@ -369,7 +369,14 @@ impl Reader {
         unsafe { self.context.Unmap(staging, 0) };
         // SAFETY: verify the D3D11 device wasn't removed mid-readback before accepting pixels.
         unsafe { self.device.GetDeviceRemovedReason()? };
-        Ok(Some(Surface { bytes: bgra, width: ow, height: oh, spare: self.spare.clone() }))
+        Ok(Some(Surface {
+            bytes: bgra,
+            width: ow,
+            height: oh,
+            spare: self.spare.clone(),
+            #[cfg(test)]
+            copy_counter: None,
+        }))
     }
 }
 
@@ -405,6 +412,8 @@ pub struct Surface {
     width: u32,
     height: u32,
     spare: Spare,
+    #[cfg(test)]
+    copy_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl std::fmt::Debug for Surface {
@@ -429,8 +438,19 @@ impl Surface {
         Some(f(&self.bytes, self.width as usize * 4))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_copy_counter(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.copy_counter = Some(counter);
+        self
+    }
+
     /// As an RGBA picture (a copy).
     pub fn to_picture(&self) -> Picture {
+        #[cfg(test)]
+        if let Some(c) = &self.copy_counter {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut rgba = vec![0u8; self.bytes.len()];
         bgra_to_rgba(&self.bytes, &mut rgba);
         Picture { width: self.width, height: self.height, rgba, premultiplied: false }

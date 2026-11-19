@@ -149,6 +149,8 @@ pub struct Feed(Arc<FeedSlot>);
 #[derive(Debug, Default)]
 struct FeedSlot {
     picture: Mutex<Option<Picture>>,
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    surface: Mutex<Option<crate::screen::Surface>>,
     /// A picture as NV12, turned into RGB on the card (a playlist's video where FFmpeg plays it).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     yuv: Mutex<Option<crate::ffsrc::Nv12Picture>>,
@@ -163,6 +165,18 @@ impl Feed {
 
     pub fn picture(&self, p: Picture) {
         *self.0.picture.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    #[allow(dead_code)]
+    pub(crate) fn surface(&self, s: crate::screen::Surface) {
+        *self.0.surface.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+    #[allow(dead_code)]
+    pub(crate) fn has_surface(&self) -> bool {
+        self.0.surface.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// The same, as NV12 for the card (no RGB made on the CPU).
@@ -581,10 +595,28 @@ struct Src {
     watch: Watch,
     /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
     pending: Option<Fresh>,
+    /// Clock time (`now_ns`) when `pending` was stored (idle hidden surfaces unpin once after [`PENDING_UNPIN_NS`]).
+    pending_since: u64,
     /// Being opened on its own thread (that open's token): the watchdog leaves it alone.
     opening: Option<u64>,
     /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
     sent: u64,
+}
+
+/// How long a hidden capture may hold a pinned zero-copy surface without a newer frame before
+/// that single idle surface is converted once to a CPU picture so capture pools aren't starved.
+const PENDING_UNPIN_NS: u64 = 2_000_000_000;
+
+fn unpin_stale_pending(s: &mut Src, now: u64) {
+    if now.saturating_sub(s.pending_since) < PENDING_UNPIN_NS {
+        return;
+    }
+    if s.pending.as_ref().is_some_and(Fresh::is_pinned_surface)
+        && let Some(f) = s.pending.take()
+    {
+        s.pending = f.into_pending();
+        s.pending_since = 0;
+    }
 }
 
 /// A new picture for the card: pixels of ours, or (on a Mac) a frame of the screen as the
@@ -619,8 +651,17 @@ impl Fresh {
         }
     }
 
+    fn is_pinned_surface(&self) -> bool {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Fresh::Screen(_) => true,
+            _ => false,
+        }
+    }
+
     /// Converts any pinned zero-copy external surface into a CPU picture before parking in
     /// `Src::pending` so finite capture buffer pools aren't starved while hidden.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn into_pending(self) -> Option<Self> {
         match self {
             #[cfg(target_os = "macos")]
@@ -640,6 +681,7 @@ impl Src {
             kind,
             watch: Watch { since: now_ns(), ..Watch::default() },
             pending: None,
+            pending_since: 0,
             opening: None,
             sent: 0,
         }
@@ -2405,9 +2447,11 @@ impl Engine {
             if let Some(src) = st.sources.get_mut(&id)
                 && !(held && src.sent > 0)
                 && let Some(f) = src.pending.take()
-                && f.send(&self.gpu, id)
             {
-                src.size = Some(f.info());
+                src.pending_since = 0;
+                if f.send(&self.gpu, id) {
+                    src.size = Some(f.info());
+                }
             }
             let (sw, sh, premultiplied) = st.sources.get(&id)?.size?;
             let mut it = Item::picture(Picture::solid(1, 1, [0, 0, 0, 0]), Placement::default());
@@ -2892,12 +2936,14 @@ fn send_pending(st: &mut State, gpu: &Compositor) {
         // A frozen source keeps its picture: what came in meanwhile is dropped.
         if frozen.contains(id) && src.sent > 0 {
             src.pending = None;
+            src.pending_since = 0;
             continue;
         }
-        if let Some(f) = src.pending.take()
-            && f.send(gpu, *id)
-        {
-            src.size = Some(f.info());
+        if let Some(f) = src.pending.take() {
+            src.pending_since = 0;
+            if f.send(gpu, *id) {
+                src.size = Some(f.info());
+            }
         }
     }
 }
@@ -3786,6 +3832,7 @@ fn frame(
         if seen.contains(id)
             && let Some(f) = src.pending.take()
         {
+            src.pending_since = 0;
             uploads.push((*id, f));
         }
     }
@@ -3884,7 +3931,19 @@ fn frame(
             Live::Fed(feed) | Live::Series { feed, .. } => {
                 // The newest of the two kinds handed in (a playlist moves between them only at
                 // a file's start, so one is always empty then).
-                if let Some(p) = feed.0.yuv.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let fed_surface = {
+                    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+                    {
+                        feed.0.surface.lock().unwrap_or_else(|e| e.into_inner()).take().map(Fresh::Screen)
+                    }
+                    #[cfg(not(all(test, any(target_os = "macos", target_os = "windows"))))]
+                    {
+                        None::<Fresh>
+                    }
+                };
+                if let Some(f) = fed_surface {
+                    uploads.push((*id, f));
+                } else if let Some(p) = feed.0.yuv.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, Fresh::Yuv(p)));
                 } else if let Some(p) = feed.0.picture.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     uploads.push((*id, Fresh::Pic(p)));
@@ -3907,15 +3966,20 @@ fn frame(
     }
     st.stats.recovered += st_recovered;
     let frozen = frozen(&st);
+    let now = now_ns();
     for (id, f) in uploads {
         let Some(s) = st.sources.get_mut(&id) else { continue };
         // A frozen source keeps the picture it has (its first one still comes in).
         if frozen.contains(&id) && s.sent > 0 {
             s.pending = None;
+            s.pending_since = 0;
             continue;
         }
         if !seen.contains(&id) && s.size.is_some() {
-            s.pending = f.into_pending();
+            // Keep the newest frame directly in `pending`: replacing it drops the previous
+            // surface immediately (at most 1 buffer held) without a per-frame CPU pixel copy.
+            s.pending = Some(f);
+            s.pending_since = now;
             continue;
         }
         if f.send(gpu, id) {
@@ -3923,15 +3987,20 @@ fn frame(
             s.sent += 1;
         }
     }
-    // Any hidden or frozen source that still holds a pinned zero-copy GPU texture copies it
-    // onto a GPU-owned texture now so CoreVideo buffer pools aren't starved while hidden/frozen.
+    // Hidden or frozen sources release any GPU-pinned zero-copy texture immediately; an idle
+    // hidden capture converts its single held surface ONCE after PENDING_UNPIN_NS so pools are
+    // never starved if updates stop altogether.
     for (id, s) in st.sources.iter_mut() {
         let keep_frozen = frozen.contains(id) && s.sent > 0;
         if keep_frozen {
             s.pending = None;
+            s.pending_since = 0;
         }
         if !seen.contains(id) || keep_frozen {
             gpu.unpin_surface(*id);
+        }
+        if !seen.contains(id) && !keep_frozen {
+            unpin_stale_pending(s, now);
         }
     }
     let blocks = mx.mix_until(now_ns());
@@ -6289,6 +6358,105 @@ mod tests {
         assert!(
             matches!(pending, Fresh::Pic(ref p) if p.width == 32 && p.height == 16 && p.rgba[..4] == [90, 60, 30, 255])
         );
+    }
+
+    /// Active hidden captures keep the newest surface in `pending` directly without per-frame
+    /// CPU copies, release replaced `CVImageBuffer`s immediately, upload zero-copy when shown,
+    /// and convert at most once if idle past `PENDING_UNPIN_NS`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hidden_source_does_not_copy_new_surfaces_every_frame() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 64, height: 36, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Other", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+
+        let feed = e.fed(2).unwrap_or_else(|| panic!("fed source"));
+        feed.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        for _ in 0..50 {
+            if e.lock().sources[&2].pending.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(e.lock().sources[&2].pending.is_some(), "initial picture consumed while hidden");
+
+        let copies = Arc::new(AtomicU64::new(0));
+        let mut buffers = Vec::new();
+        for n in 1u8..=8 {
+            let Some(buf) = crate::apple::screen::tests::bgra_buffer(64, 36, [n * 10, 200, 30, 255]) else { return };
+            let surface = crate::screen::Surface::of(buf.clone())
+                .unwrap_or_else(|| panic!("BGRA surface"))
+                .with_copy_counter(Arc::clone(&copies));
+            buffers.push(buf);
+            feed.surface(surface);
+            for _ in 0..30 {
+                if !feed.has_surface() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!feed.has_surface(), "frame loop consumed hidden surface #{n}");
+        }
+
+        // Hidden captures must NOT call to_picture() per frame (~2 GB/s at 4K60); only the
+        // newest buffer stays pinned (earlier ones are dropped when `pending` is overwritten).
+        assert_eq!(copies.load(Ordering::Relaxed), 0, "hidden frames must not copy to CPU");
+        for old in &buffers[..buffers.len() - 1] {
+            assert_eq!(
+                crate::apple::screen::tests::buffer_retain_count(old),
+                1,
+                "replaced pending surface must release its CVImageBuffer"
+            );
+        }
+        assert_eq!(
+            crate::apple::screen::tests::buffer_retain_count(buffers.last().unwrap_or_else(|| panic!("buf"))),
+            2,
+            "newest pending surface is kept directly until shown or stale"
+        );
+        assert!(matches!(e.lock().sources[&2].pending, Some(Fresh::Screen(_))));
+
+        // Showing the hidden scene uploads the newest surface directly (zero-copy, still 0 CPU copies).
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        for _ in 0..40 {
+            if e.lock().sources[&2].pending.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 0, "reveal uploads zero-copy without CPU conversion");
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[30, 200, 80, 255], "latest hidden frame rendered");
+
+        // If a hidden source stops sending updates past PENDING_UNPIN_NS, it converts ONCE.
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let Some(idle_buf) = crate::apple::screen::tests::bgra_buffer(64, 36, [40, 50, 60, 255]) else { return };
+        let idle_surface = crate::screen::Surface::of(idle_buf.clone())
+            .unwrap_or_else(|| panic!("BGRA surface"))
+            .with_copy_counter(Arc::clone(&copies));
+        feed.surface(idle_surface);
+        for _ in 0..30 {
+            if !feed.has_surface() && e.lock().sources[&2].pending.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 0);
+        {
+            let mut st = e.lock();
+            let src = st.sources.get_mut(&2).unwrap_or_else(|| panic!("source 2"));
+            assert!(matches!(src.pending, Some(Fresh::Screen(_))));
+            let past = src.pending_since + PENDING_UNPIN_NS;
+            unpin_stale_pending(src, past);
+            unpin_stale_pending(src, past + 100);
+            assert!(matches!(src.pending, Some(Fresh::Pic(_))));
+        }
+        assert_eq!(copies.load(Ordering::Relaxed), 1, "idle hidden surface converts at most once");
+        assert_eq!(crate::apple::screen::tests::buffer_retain_count(&idle_buf), 1, "idle unpin releases CVImageBuffer");
     }
 
     #[test]
