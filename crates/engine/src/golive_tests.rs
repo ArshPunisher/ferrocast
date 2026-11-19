@@ -1030,4 +1030,12 @@ async fn the_youtube_privacy_setting_reaches_the_broadcasts_ferrocast_makes() {
         api.update_broadcast_info(&info).await.unwrap();
     }
     assert_eq!(*made.lock().unwrap(), ["public", "unlisted", "private"]);
+
+    // A saved value that is none of the three (the file was edited by hand; validation only runs
+    // on a save from the dashboard) never publishes: unlisted.
+    let mut odd = e.settings();
+    odd.youtube_privacy = "friends".into();
+    e.save_settings(odd).await.unwrap();
+    e.youtube_api(tokens).unwrap().update_broadcast_info(&info).await.unwrap();
+    assert_eq!(made.lock().unwrap().last().map(String::as_str), Some("unlisted"));
 }

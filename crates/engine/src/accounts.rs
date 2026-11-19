@@ -386,10 +386,13 @@ impl Engine {
         // applies to the next one. A weak link: the Api lives inside the engine's connectors.
         let engine = Arc::downgrade(&self.inner);
         let privacy: ferrocast_youtube::PrivacySource = Arc::new(move || {
+            // A value that isn't one of the three (a hand-edited file) must not publish: unlisted.
             engine
                 .upgrade()
-                .and_then(|inner| ferrocast_youtube::Privacy::parse(&Engine { inner }.settings().youtube_privacy))
-                .unwrap_or_default()
+                .map(|inner| Engine { inner }.settings().youtube_privacy)
+                .map_or(ferrocast_youtube::Privacy::Unlisted, |v| {
+                    ferrocast_youtube::Privacy::parse(&v).unwrap_or(ferrocast_youtube::Privacy::Unlisted)
+                })
         });
         Ok(Arc::new(
             ferrocast_youtube::Api::new(
