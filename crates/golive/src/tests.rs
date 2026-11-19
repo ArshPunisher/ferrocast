@@ -731,3 +731,5 @@ async fn only_enhanced_broadcasting_gets_the_other_qualities() {
     // The other platform never sees track 1: next is the main picture.
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }
+
+mod platforms;
