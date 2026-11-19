@@ -106,12 +106,44 @@ for ($i = 0; $i -lt 90 -and -not (Test-Path $tokenFile); $i++) { Start-Sleep 1 }
 Check 'app starts' (Test-Path $tokenFile) 'it wrote its API token'
 if (-not (Test-Path $tokenFile)) { $result | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Out 'results.json'); exit 1 }
 $base, $token = (Get-Content $tokenFile -Raw).Trim().Split(' ')
-function Api($method, $path, $body) {
+# Every call is logged with its start and how long it took, and a failure with why: the stop
+# that hung (18-19 Nov) left no trace of which call waited.
+function Api($method, $path, $body, [int]$Timeout = 60) {
   $a = @{ Method = $method; Uri = "$base/api/v1/studio/engine$path"; Headers = @{ Authorization = "Bearer $token" }
-    ContentType = 'application/json'; UseBasicParsing = $true; TimeoutSec = 60 }
+    ContentType = 'application/json'; UseBasicParsing = $true; TimeoutSec = $Timeout }
   if ($null -ne $body) { $a.Body = ($body | ConvertTo-Json -Depth 6 -Compress) }
-  $r = Invoke-WebRequest @a
+  $t = Get-Date
+  try { $r = Invoke-WebRequest @a }
+  catch {
+    Write-Host ("API {0:HH:mm:ss.fff} {1} {2} FAILED after {3:N0} ms: {4}" -f $t, $method, $path, ((Get-Date) - $t).TotalMilliseconds, $_.Exception.Message)
+    throw
+  }
+  Write-Host ("API {0:HH:mm:ss.fff} {1} {2} {3:N0} ms" -f $t, $method, $path, ((Get-Date) - $t).TotalMilliseconds)
   if ($r.Content) { $r.Content | ConvertFrom-Json } else { $null }
+}
+
+# When the app stops answering: which parts still do, and every thread's stack (where it waits).
+$script:stalls = 0
+function Stall($why) {
+  Note "stalled ($why): looking at the app"
+  $plain = @{ Uri = "$base/api/v1/settings"; Headers = @{ Authorization = "Bearer $token" }; UseBasicParsing = $true; TimeoutSec = 5 }
+  try { Invoke-WebRequest @plain | Out-Null; Note 'a route without the window answers' } catch { Note "a route without the window doesn't answer: $($_.Exception.Message)" }
+  try { Api GET '/stats' $null 5 | Out-Null; Note '/stats answers' } catch { Note "/stats doesn't answer" }
+  $port = ([uri]$base).Port
+  Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Group-Object State | ForEach-Object { Note "port ${port}: $($_.Count) $($_.Name)" }
+  $pd = Join-Path $Out 'procdump64.exe'
+  if (-not (Test-Path $pd)) { try { Invoke-WebRequest https://live.sysinternals.com/procdump64.exe -OutFile $pd -UseBasicParsing } catch { } }
+  $script:stalls++
+  $dmp = Join-Path $Out "stall-$($script:stalls).dmp"
+  if (Test-Path $pd) { & $pd -accepteula -mp $app.Id $dmp | Out-Null }
+  $cdb = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+  if ((Test-Path $dmp) -and (Test-Path $cdb)) {
+    $dir = Split-Path (Resolve-Path $Exe)
+    $stacks = Join-Path $Out "stall-$($script:stalls)-stacks.txt"
+    & $cdb -z $dmp -y $dir -i $dir -c '~*kn 40; q' 2>&1 | Out-File $stacks
+    Note "thread stacks in $(Split-Path $stacks -Leaf) ($((Get-Content $stacks).Count) lines)"
+    Get-Content $stacks | Select-String -Pattern 'ferrocast|ferrocore|tokio|tao|wry' | Select-Object -First 80 | ForEach-Object { Write-Host "STACK $($_.Line)" }
+  } else { Note "no thread stacks (dump: $(Test-Path $dmp), cdb: $(Test-Path $cdb))" }
 }
 function Try-Api($what, $method, $path, $body) {
   try { $r = Api $method $path $body; Check $what $true 'ok'; $r }
@@ -183,13 +215,16 @@ for ($i = 0; $i -lt $Seconds; $i++) {
   $p.Refresh(); $now = Get-Date
   $cpu += 100 * ($p.TotalProcessorTime - $last).TotalSeconds / ($now - $t0).TotalSeconds / $cores
   $last = $p.TotalProcessorTime; $t0 = $now
-  try { $s = Api GET '/stats'; $fpsSeen += $s.engine.fps; $frameMs += $s.engine.frame_ms } catch { }
+  try { $s = Api GET '/stats'; $fpsSeen += $s.engine.fps; $frameMs += $s.engine.frame_ms } catch { Note "stats failed: $($_.Exception.Message)" }
   if ($i -eq [int]($Seconds / 2)) { Shot 'recording' }
 }
 $stats = $null
-try { $stats = Api GET '/stats' } catch { }
+try { $stats = Api GET '/stats' } catch { Note "stats before the stop failed: $($_.Exception.Message)"; if (-not $app.HasExited) { Stall 'stats before the stop' } }
 $stopped = $null
-if (-not $app.HasExited) { $stopped = Try-Api 'recording stops' POST '/record' @{ on = $false } }
+if (-not $app.HasExited) {
+  $stopped = Try-Api 'recording stops' POST '/record' @{ on = $false }
+  if ($null -eq $stopped -and -not $result.checks['recording stops'].ok -and -not $app.HasExited) { Stall 'the stop' }
+}
 
 Check 'app still running' (-not $app.HasExited) $(if ($app.HasExited) { "exit code $($app.ExitCode)" } else { "after $Seconds s of recording" })
 $avg = { param($a) if ($a.Count) { [math]::Round(($a | Measure-Object -Average).Average, 1) } else { $null } }

@@ -62,13 +62,14 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Build the app (release, with the debug token file)
+      - name: Build the app (release, with the debug token file and names for stack dumps)
         shell: bash
         env:
           FERROCAST_WEB_DIST: ${{ github.workspace }}/ferrocast-web/dist
         run: >
           cargo build --release --locked -p ferrocast-desktop
           --config 'profile.release.package.ferrocast-desktop.debug-assertions=true'
+          --config 'profile.release.debug="line-tables-only"' --config 'profile.release.strip="none"'
       - name: Smoke test
         shell: pwsh
         run: ./tools/windows-smoke.ps1 -Exe target/release/ferrocast.exe -Out smoke/run -Seconds 20 -Fps 30 -MinShare 0.3
