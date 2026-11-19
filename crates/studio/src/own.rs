@@ -51,8 +51,6 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
         Some("the vertical picture's stream")
     } else if s.vod_track.is_some_and(|t| !(2..=6).contains(&t)) {
         Some("a VOD track other than 2 to 6")
-    } else if !s.encode.extra.is_empty() {
-        Some("an encoder's own options")
     } else if is_x264(&s.encode.video_encoder) && !ferrocore::ffenc::available() {
         Some(NO_FFMPEG)
     } else if !own_codec_ok(&s.encode.video_encoder) {
@@ -64,19 +62,28 @@ pub(crate) fn unsupported(s: &StreamSettings, main_canvas: bool) -> Option<&'sta
 
 /// Why this recording can't use our encoders, or None when it can.
 pub(crate) fn unsupported_recording(plan: &RecordPlan) -> Option<&'static str> {
-    if !matches!(plan.format.as_str(), "mp4" | "fmp4" | "mkv") {
-        Some("this format (ours writes MP4 and MKV)")
-    } else if !plan.muxer.trim().is_empty() {
-        Some("custom muxer settings")
-    } else if !plan.encode.extra.is_empty() {
-        Some("an encoder's own options")
-    } else if is_x264(&plan.encode.video_encoder) && !ferrocore::ffenc::available() {
+    if is_x264(&plan.encode.video_encoder) && !ferrocore::ffenc::available() {
         Some(NO_FFMPEG)
     } else if !own_codec_ok(&plan.encode.video_encoder) {
         Some("this encoder (ours is H.264 or HEVC on the Mac's hardware)")
     } else {
         system_unsupported(&plan.encode.video_encoder)
     }
+}
+
+/// What of `encode` and `muxer` Ferrocore doesn't apply, in words (logged when an output
+/// starts): OBS's own encoder options and muxer settings were libobs's; profiles saved before
+/// Ferrocore drew everything may still carry them. Never a reason to refuse the output.
+pub(crate) fn not_applied(encode: &crate::EncodeSettings, muxer: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !encode.extra.is_empty() {
+        let keys: Vec<&str> = encode.extra.keys().map(String::as_str).collect();
+        out.push(format!("the encoder's own options ({})", keys.join(", ")));
+    }
+    if !muxer.trim().is_empty() {
+        out.push(format!("the muxer settings ({})", muxer.trim()));
+    }
+    out
 }
 
 /// The rate our encoder runs at. Constant quality is libobs's 0 (lossless) … 51 scale: x264's
@@ -1156,9 +1163,12 @@ mod tests {
         // x264 runs through FFmpeg, wherever FFmpeg is.
         assert_eq!(unsupported(&settings("obs_x264"), true).is_none(), ferrocore::ffenc::available());
         assert!(unsupported(&settings("av1_texture_amf"), true).is_some());
+        // OBS's own encoder options (a profile from before Ferrocore) don't stop a stream: they
+        // aren't applied, and the log says so.
         let mut extra = settings(hw);
         extra.encode.extra.insert("preset".into(), serde_json::json!("fast"));
-        assert!(unsupported(&extra, true).is_some());
+        assert_eq!(unsupported(&extra, true), unsupported(&settings(hw), true));
+        assert_eq!(not_applied(&extra.encode, ""), vec!["the encoder's own options (preset)".to_string()]);
         // The VOD track on a track that exists goes through ours (the Mac's encoder: it's only there).
         if cfg!(target_os = "macos") {
             assert!(unsupported(&StreamSettings { vod_track: Some(2), ..settings(hw) }, true).is_none());
@@ -1175,9 +1185,21 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(unsupported_recording(&plan), None);
         }
-        assert!(unsupported_recording(&RecordPlan { format: "flv".into(), ..plan.clone() }).is_some());
-        if cfg!(target_os = "macos") {
-            assert_eq!(unsupported_recording(&RecordPlan { format: "mkv".into(), ..plan.clone() }), None);
+        // Every format Settings ever offered records (19 Nov: MOV, FLV, TS and HLS were refused
+        // only when Record was pressed), as the file ours writes for it.
+        for (format, ext) in [
+            ("mp4", "mp4"),
+            ("fmp4", "mp4"),
+            ("mov", "mov"),
+            ("fmov", "mov"),
+            ("mkv", "mkv"),
+            ("flv", "mkv"),
+            ("ts", "mkv"),
+            ("hls", "mkv"),
+        ] {
+            let p = RecordPlan { format: format.into(), muxer: "movflags=faststart".into(), ..plan.clone() };
+            assert_eq!(unsupported_recording(&p), unsupported_recording(&plan), "{format}");
+            assert_eq!(p.extension(), ext, "{format}");
         }
         // Splitting is never why one is refused (off a Mac this held only because constant
         // quality refused every recording there).

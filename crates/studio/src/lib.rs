@@ -411,13 +411,15 @@ impl Default for RecordPlan {
 }
 
 impl RecordPlan {
-    /// The file extension the format writes.
+    /// The file extension the format writes. Ferrocore writes crash-safe MP4 (MOV the same,
+    /// named .mov) and MKV; OBS's other formats, saved before, become the nearest of those:
+    /// fragmented MP4 and MOV need no fragments (ours never loses a file), FLV, MPEG-TS and HLS
+    /// go to MKV (crash-safe too, and remuxed to MP4 when that's on).
     pub fn extension(&self) -> &str {
         match self.format.as_str() {
-            "fmp4" => "mp4",
-            "fmov" => "mov",
-            "hls" => "m3u8",
-            f => f,
+            "mov" | "fmov" => "mov",
+            "mkv" | "flv" | "ts" | "hls" => "mkv",
+            _ => "mp4",
         }
     }
 }

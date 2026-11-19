@@ -2093,6 +2093,9 @@ impl Stage {
         if let Some(why) = own::unsupported(s, true) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
+        for what in own::not_applied(&s.encode, "") {
+            tracing::warn!("the stream starts without {what}: Ferrocore's encoders don't take them");
+        }
         // Track 1 to viewers; Twitch's VOD track after it (sent as Enhanced RTMP multitrack audio).
         let tracks: Vec<u8> = std::iter::once(1).chain(s.vod_track).collect();
         let how = own::Drawing {
@@ -2121,6 +2124,9 @@ impl Stage {
     pub fn record_at(&self, path: &Path, plan: &RecordPlan, solo: Option<&str>) -> Result<StageOutput, StudioError> {
         if let Some(why) = own::unsupported_recording(plan) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
+        }
+        for what in own::not_applied(&plan.encode, &plan.muxer) {
+            tracing::warn!("the recording starts without {what}: Ferrocore doesn't take them");
         }
         let path = path.to_path_buf();
         let how = own::Drawing {
@@ -2169,11 +2175,6 @@ impl Stage {
     pub fn replay(&self, plan: &ReplayPlan) -> Result<StageOutput, StudioError> {
         if !(5..=21_600).contains(&plan.seconds) {
             return Err(fail("seconds: 5 to 21600."));
-        }
-        if !matches!(plan.format.as_str(), "mkv" | "mp4") {
-            return Err(fail(
-                "Ferrocast's own engine saves replays as MKV or MP4: pick one of those in Settings › Recording.",
-            ));
         }
         let how = own::Drawing {
             send_to: None,
