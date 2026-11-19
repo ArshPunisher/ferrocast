@@ -9,10 +9,16 @@ use std::collections::VecDeque;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray15::Array2;
 
-/// How much quieter noise may get at a strength (1 to 100): 100 is as much as it can.
+/// Maximum attenuation limit (dB) at strength 100: caps DeepFilterNet so it never hits its
+/// unlimited (>=100 dB) hard-zeroing cliff that eats soft voice tails and consonants (M2-01).
+const MAX_ATTEN_DB: f32 = 30.0;
+
+/// How much quieter noise may get at a strength (1 to 100): smooth 0.3 dB per step up to
+/// [`MAX_ATTEN_DB`] (30 dB), with no jump between 99 and 100.
 fn atten_db(strength: u32) -> f32 {
-    // 0.6 dB a step, worked in whole numbers (50 is exactly 30 dB).
-    if strength >= 100 { 100.0 } else { (strength.max(1) * 6) as f32 / 10.0 }
+    // 0.3 dB a step, worked in whole numbers (50 is 15.0 dB, 65 is 19.5 dB, 80 is 24.0 dB, 100 is 30.0 dB).
+    let db = (strength.clamp(1, 100) * 3) as f32 / 10.0;
+    db.min(MAX_ATTEN_DB)
 }
 
 /// DeepFilterNet over a stream of planar samples: blocks in, cleaned blocks out, one block late.
@@ -384,6 +390,170 @@ mod tests {
         (s.iter().map(|x| x * x).sum::<f32>() / s.len().max(1) as f32).sqrt()
     }
 
+    fn db_to_mul(db: f32) -> f32 {
+        10f32.powf(db / 20.0)
+    }
+
+    fn mul_to_db(m: f32) -> f32 {
+        20.0 * m.max(1e-9).log10()
+    }
+
+    fn pink_noise(n: usize, target_rms: f32, seed: &mut u32) -> Vec<f32> {
+        let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) = (0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let w = ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+            b0 = 0.99886 * b0 + w * 0.0555179;
+            b1 = 0.99332 * b1 + w * 0.0750759;
+            b2 = 0.96900 * b2 + w * 0.1538520;
+            b3 = 0.86650 * b3 + w * 0.3104856;
+            b4 = 0.55000 * b4 + w * 0.5329522;
+            b5 = -0.7616 * b5 - w * 0.0168980;
+            let p = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362;
+            b6 = w * 0.115926;
+            out.push(p);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    fn bandpass_voice(x: &[f32]) -> Vec<f32> {
+        // 2nd-order Butterworth HP 300 Hz + LP 3400 Hz at 48 kHz.
+        let biquad = |inp: &[f32], b: [f64; 3], a: [f64; 2]| -> Vec<f32> {
+            let (mut z0, mut z1) = (0.0f64, 0.0f64);
+            inp.iter()
+                .map(|&s| {
+                    let s = f64::from(s);
+                    let y = b[0] * s + z0;
+                    z0 = b[1] * s - a[0] * y + z1;
+                    z1 = b[2] * s - a[1] * y;
+                    y as f32
+                })
+                .collect()
+        };
+        let hp = |fc: f64| -> ([f64; 3], [f64; 2]) {
+            let k = (std::f64::consts::PI * fc / 48_000.0).tan();
+            let q = std::f64::consts::FRAC_1_SQRT_2;
+            let a0 = 1.0 + k / q + k * k;
+            ([1.0 / a0, -2.0 / a0, 1.0 / a0], [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0])
+        };
+        let lp = |fc: f64| -> ([f64; 3], [f64; 2]) {
+            let k = (std::f64::consts::PI * fc / 48_000.0).tan();
+            let q = std::f64::consts::FRAC_1_SQRT_2;
+            let a0 = 1.0 + k / q + k * k;
+            ([k * k / a0, 2.0 * k * k / a0, k * k / a0], [2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0])
+        };
+        let (hb, ha) = hp(300.0);
+        let (lb, la) = lp(3400.0);
+        biquad(&biquad(x, hb, ha), lb, la)
+    }
+
+    /// Objective speech-clarity test: synthetic voiced harmonic formant speech + pink noise
+    /// across strengths. Verifies:
+    /// 1) voice-band energy (300–3400 Hz) stays preserved at every strength;
+    /// 2) background pink noise reduction increases smoothly and monotonically with strength;
+    /// 3) no attenuation cliff between strength 99 and 100 (capped smoothly at 30 dB);
+    /// 4) no level pumping across continuous speech.
+    #[test]
+    fn speech_clarity_and_noise_reduction_across_strengths() {
+        let r = 48_000usize;
+        let make_articulated = |n: usize, target_rms: f32| -> Vec<f32> {
+            let mut out = Vec::with_capacity(n);
+            let mut phase = 0.0f64;
+            let rate = 48_000.0f64;
+            for i in 0..n {
+                let t = i as f64 / rate;
+                let f0 = 140.0
+                    + 25.0 * (std::f64::consts::TAU * 0.8 * t).sin()
+                    + 10.0 * (std::f64::consts::TAU * 2.1 * t).cos();
+                phase += std::f64::consts::TAU * f0 / rate;
+                let f1 = 520.0 + 220.0 * (std::f64::consts::TAU * 1.9 * t).sin();
+                let f2 = 1550.0 + 550.0 * (std::f64::consts::TAU * 1.4 * t).cos();
+                let f3 = 2600.0 + 300.0 * (std::f64::consts::TAU * 1.1 * t).sin();
+                let mut s = 0.0f64;
+                for k in 1..=26 {
+                    let fk = f0 * f64::from(k);
+                    let g1 = 1.0 / ((fk - f1).powi(2) + 55.0f64.powi(2)).sqrt();
+                    let g2 = 0.7 / ((fk - f2).powi(2) + 80.0f64.powi(2)).sqrt();
+                    let g3 = 0.35 / ((fk - f3).powi(2) + 110.0f64.powi(2)).sqrt();
+                    let env = (g1 + g2 + g3) / f64::from(k).powf(0.5);
+                    let phi = std::f64::consts::PI * f64::from(k * k) / 26.0;
+                    s += (phase * f64::from(k) + phi).sin() * env;
+                }
+                let cyc = (t * 3.2) % 1.0;
+                let env_t = if cyc < 0.78 { (std::f64::consts::PI * cyc / 0.78).sin().powf(0.6) } else { 0.0 };
+                out.push((s * env_t) as f32);
+            }
+            let cur = rms(&out).max(1e-9);
+            for v in &mut out {
+                *v *= target_rms / cur;
+            }
+            out
+        };
+
+        let mut seed = 42u32;
+        let total = 5 * r; // 1 s pink noise, 2.5 s speech+noise, 1.5 s pink noise
+        let noise = pink_noise(total, db_to_mul(-36.0), &mut seed);
+        let speech = make_articulated(2 * r + r / 2, db_to_mul(-28.0));
+        let mut input = noise.clone();
+        for i in 0..speech.len() {
+            input[r + i] += speech[i];
+        }
+        let sp_ref_bp = bandpass_voice(&speech[r / 4..speech.len() - r / 4]);
+        let sp_ref_rms = rms(&sp_ref_bp);
+
+        let mut prev_pause_nr = 0.0f32;
+        let mut pause_at_99 = 0.0f32;
+        let mut pause_at_100 = 0.0f32;
+        for strength in [20u32, 40, 65, 80, 99, 100] {
+            let mut d = Denoiser::new(1, strength).expect("model starts");
+            let lat = d.latency();
+            let mut padded = input.clone();
+            padded.resize(total + lat + 1024, 0.0);
+            let mut out = Vec::with_capacity(padded.len());
+            for chunk in padded.chunks(1024) {
+                let mut buf = chunk.to_vec();
+                d.run(&mut [&mut buf]);
+                out.extend_from_slice(&buf);
+            }
+            let aligned = &out[lat..lat + total];
+            let sp_out_bp = bandpass_voice(&aligned[r + r / 4..r + speech.len() - r / 4]);
+            let voice_kept_db = mul_to_db(rms(&sp_out_bp) / sp_ref_rms);
+            let pause_nr_db = mul_to_db(rms(&aligned[4 * r..5 * r]) / rms(&noise[4 * r..5 * r]));
+            // Stability across 0.5 s windows during speech (no pumping).
+            let mut w_min = f32::INFINITY;
+            let mut w_max = f32::NEG_INFINITY;
+            for w in 0..4 {
+                let a = r + r / 4 + w * (r / 2);
+                let b = a + r / 2;
+                let g = mul_to_db(rms(&bandpass_voice(&aligned[a..b])) / rms(&bandpass_voice(&speech[a - r..b - r])));
+                w_min = w_min.min(g);
+                w_max = w_max.max(g);
+            }
+            let spread = w_max - w_min;
+            assert!(voice_kept_db > -1.5, "s={strength}: voice band dropped {voice_kept_db:+.2} dB");
+            assert!(spread < 1.5, "s={strength}: speech pumped {spread:.2} dB across windows");
+            assert!(
+                pause_nr_db < prev_pause_nr,
+                "s={strength}: pause_nr {pause_nr_db:+.2} dB should tighten past {prev_pause_nr:+.2} dB"
+            );
+            if strength == 99 {
+                pause_at_99 = pause_nr_db;
+            } else if strength == 100 {
+                pause_at_100 = pause_nr_db;
+            }
+            prev_pause_nr = pause_nr_db;
+        }
+        assert!(
+            (pause_at_100 - pause_at_99).abs() < 2.0,
+            "no 99→100 cliff: s=99 gave {pause_at_99:+.2} dB vs s=100 {pause_at_100:+.2} dB"
+        );
+    }
+
     /// How late the cleaned sound comes out (in samples), found by matching it to what went in.
     fn delay_of(d: &mut Denoiser) -> usize {
         let mut seed = 3;
@@ -459,9 +629,16 @@ mod tests {
 
     #[test]
     fn strength_maps_to_a_limit() {
-        assert_eq!(atten_db(100), 100.0);
-        assert_eq!(atten_db(50), 30.0);
-        assert_eq!(atten_db(0), 0.6);
+        assert_eq!(atten_db(100), 30.0, "capped smoothly at 30 dB, never unlimited 100 dB");
+        assert_eq!(atten_db(99), 29.7);
+        assert!((atten_db(100) - atten_db(99)).abs() < 1.0, "no 99→100 attenuation cliff");
+        assert_eq!(atten_db(80), 24.0);
+        assert_eq!(atten_db(65), 19.5);
+        assert_eq!(atten_db(50), 15.0);
+        assert_eq!(atten_db(0), 0.3);
+        for s in 2..=100 {
+            assert!(atten_db(s) > atten_db(s - 1), "strictly monotonic at {s}");
+        }
     }
 
     use ferrocore::afx::{AudioEffect, AudioFilter};
@@ -554,7 +731,7 @@ mod tests {
         let mut f = AudioFilter::new(AudioEffect::Denoise { strength: 100 }, 48_000);
         let said = f.latency_frames();
         let _ = through(&mut f, 40, 1024);
-        assert!(f.retune(AudioEffect::Denoise { strength: 30 }), "taken by the running one");
+        assert!(f.retune(AudioEffect::Denoise { strength: 60 }), "taken by the running one");
         // A buzz with a sharp start, after silence: where it comes out.
         let mut outl = Vec::new();
         let mut at = 0usize;
@@ -578,7 +755,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(21));
         }
         assert_eq!(at, outl.len());
-        let first = outl.iter().position(|v| v.abs() > 0.02).unwrap_or(usize::MAX);
+        // Skip the pipeline tail of the preceding hiss before locating the buzz onset at k = 20_000.
+        let first =
+            outl.iter().enumerate().skip(said + 1024).find(|(_, v)| v.abs() > 0.02).map_or(usize::MAX, |(i, _)| i);
         assert!(first >= 20_000 + said - 64 && first <= 20_000 + said + 480, "came out at {first}, said {said}");
     }
 }

@@ -204,8 +204,10 @@ pub struct AudioFilter {
     eq: [EqState; 2],
     /// A filter made outside the engine (noise removal).
     plugin: Option<Box<dyn SoundPlugin>>,
-    // Light noise removal: the noise floor it hears (RMS) and the gain now.
+    // Light noise removal: the noise floor it hears (RMS), steady-noise candidate, and current gain.
     floor: f32,
+    nr_steady_rms: f32,
+    nr_steady_s: f32,
     nr_gain: f32,
     /// After a plugin that held the sound back gave way (the strong noise removal too slow
     /// here): the sound is held back as long still, so the source doesn't jump in time.
@@ -239,6 +241,8 @@ impl AudioFilter {
                 _ => None,
             },
             floor: 0.0,
+            nr_steady_rms: 0.0,
+            nr_steady_s: 0.0,
             nr_gain: 1.0,
             delay: None,
         }
@@ -433,9 +437,10 @@ impl AudioFilter {
         }
     }
 
-    /// Light noise removal, for any computer: it follows the noise floor (the quietest the sound
-    /// gets, rising slowly) and turns down what stays near it (hiss, hum, a fan between words)
-    /// by up to 24 dB at strength 100; a voice above it passes untouched.
+    /// Light noise removal, for any computer: it tracks the background room noise floor (frozen
+    /// during speech so continuous talking is never ducked) and turns down what stays near the
+    /// floor (hiss, hum, a fan between words) by up to 24 dB at strength 100; a voice above it
+    /// passes untouched.
     fn light_denoise(&mut self, l: &mut [f32], r: &mut [f32], strength: u32) {
         let n = l.len();
         if n == 0 {
@@ -443,17 +448,45 @@ impl AudioFilter {
         }
         let rms = (l.iter().chain(r.iter()).map(|v| v * v).sum::<f32>() / (2 * n) as f32).sqrt();
         let secs = n as f32 / self.rate;
-        // Down at once to anything quieter; up 3 dB a second (a louder room is learnt). Digital
-        // silence (a gate shut before it, a muted device) says nothing about the room: it isn't
-        // learnt, and the floor starts at a quiet room's (-60 dBFS), so a voice coming after
-        // silence isn't taken for the noise (it was turned down 12-24 dB; peer, 18 Nov).
+        // Digital silence (a gate shut before it, a muted device) says nothing about the room:
+        // it isn't learnt, and the floor starts at a quiet room's (-60 dBFS), so a voice coming
+        // after silence isn't taken for the noise (peer, 18 Nov).
         const SILENCE: f32 = 3.2e-5; // -90 dBFS
         const START: f32 = 1e-3; // -60 dBFS
+        // Hard ceiling on background floor (-36 dBFS): continuous speech above this never pulls
+        // the floor upward and never gets ducked mid-sentence (M2-01).
+        const MAX_FLOOR: f32 = 0.015_848_932; // -36 dBFS
+        const STEADY_HOLD_S: f32 = 0.25;
         if self.floor <= 0.0 {
             self.floor = START;
         }
         if rms >= SILENCE {
-            self.floor = if rms < self.floor { rms } else { self.floor * db_to_mul(3.0 * secs) };
+            if rms < self.floor {
+                self.floor = rms;
+                self.nr_steady_rms = rms;
+                self.nr_steady_s = 0.0;
+            } else if rms <= MAX_FLOOR {
+                let over_floor = mul_to_db(rms / self.floor.max(1e-9));
+                let steady_diff =
+                    if self.nr_steady_rms > 0.0 { mul_to_db(rms / self.nr_steady_rms).abs() } else { f32::INFINITY };
+                if steady_diff <= 4.5 {
+                    self.nr_steady_s = (self.nr_steady_s + secs).min(STEADY_HOLD_S + 1.0);
+                    self.nr_steady_rms += (rms - self.nr_steady_rms) * (secs * 3.0).min(1.0);
+                } else {
+                    self.nr_steady_rms = rms;
+                    self.nr_steady_s = 0.0;
+                }
+                if over_floor <= 6.0 {
+                    self.floor = (self.floor * db_to_mul(3.0 * secs)).min(rms);
+                } else if self.nr_steady_s >= STEADY_HOLD_S {
+                    // Steady room noise above the initial -60 dBFS guess (or a fan turning on).
+                    self.floor = (self.floor * db_to_mul(18.0 * secs)).min(rms).min(MAX_FLOOR);
+                }
+            } else {
+                // Active speech above background noise ceiling: freeze the floor completely.
+                self.nr_steady_rms = 0.0;
+                self.nr_steady_s = 0.0;
+            }
         }
         let depth = 24.0 * strength.clamp(1, 100) as f32 / 100.0;
         // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly.
@@ -769,6 +802,109 @@ mod tests {
 
     fn peak(v: &[f32]) -> f32 {
         v.iter().fold(0.0, |a, x| a.max(x.abs()))
+    }
+
+    fn pink_noise(n: usize, target_rms: f32, seed: &mut u32) -> Vec<f32> {
+        let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) = (0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let w = ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+            b0 = 0.99886 * b0 + w * 0.0555179;
+            b1 = 0.99332 * b1 + w * 0.0750759;
+            b2 = 0.96900 * b2 + w * 0.1538520;
+            b3 = 0.86650 * b3 + w * 0.3104856;
+            b4 = 0.55000 * b4 + w * 0.5329522;
+            b5 = -0.7616 * b5 - w * 0.0168980;
+            let p = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362;
+            b6 = w * 0.115926;
+            out.push(p);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    fn voiced_speech(n: usize, target_rms: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut phase = 0.0f64;
+        let rate = f64::from(RATE);
+        for i in 0..n {
+            let t = i as f64 / rate;
+            let f0 = 135.0 + 12.0 * (std::f64::consts::TAU * 0.65 * t).sin();
+            phase += std::f64::consts::TAU * f0 / rate;
+            let f1 = 550.0 + 150.0 * (std::f64::consts::TAU * 0.9 * t).sin();
+            let f2 = 1650.0 + 350.0 * (std::f64::consts::TAU * 0.7 * t).cos();
+            let f3 = 2650.0 + 200.0 * (std::f64::consts::TAU * 1.1 * t).sin();
+            let mut s = 0.0f64;
+            for k in 1..=24 {
+                let fk = f0 * f64::from(k);
+                let g1 = 1.0 / ((fk - f1).powi(2) + 45.0f64.powi(2)).sqrt();
+                let g2 = 0.6 / ((fk - f2).powi(2) + 65.0f64.powi(2)).sqrt();
+                let g3 = 0.3 / ((fk - f3).powi(2) + 90.0f64.powi(2)).sqrt();
+                let env = (g1 + g2 + g3) / f64::from(k).powf(0.5);
+                s += (phase * f64::from(k)).sin() * env;
+            }
+            let syll = 0.65 + 0.35 * (0.5 + 0.5 * (std::f64::consts::TAU * 3.5 * t).sin());
+            out.push((s * syll) as f32);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    /// 15 s of continuous voiced formant speech over -45 dBFS pink noise through `light_denoise`:
+    /// voice energy stays flat (no floor creep, no pumping) while pauses between words are
+    /// attenuated monotonically with strength (M2-01).
+    #[test]
+    fn light_denoise_keeps_continuous_speech_steady_without_pumping() {
+        let r = RATE as usize;
+        let mut seed = 42u32;
+        let noise_rms = db_to_mul(-45.0);
+        let speech_rms = db_to_mul(-18.0);
+        let noise = pink_noise(18 * r, noise_rms, &mut seed);
+        let speech = voiced_speech(15 * r, speech_rms);
+        let mut input = noise.clone();
+        for i in 0..(15 * r) {
+            input[r + i] += speech[i];
+        }
+        let mut prev_pause_nr = 0.0f32;
+        for strength in [25u32, 50, 75, 100] {
+            let mut f = AudioFilter::new(AudioEffect::Denoise { strength }, RATE);
+            f.plugin = None;
+            let (mut l, mut rr) = (input.clone(), input.clone());
+            for (a, b) in l.chunks_mut(1024).zip(rr.chunks_mut(1024)) {
+                f.process([a, b]);
+            }
+            let early = mul_to_db(rms(&l[2 * r..5 * r]) / rms(&input[2 * r..5 * r]));
+            let late = mul_to_db(rms(&l[12 * r..15 * r]) / rms(&input[12 * r..15 * r]));
+            let pause_after = mul_to_db(rms(&l[17 * r..18 * r]) / rms(&noise[17 * r..18 * r]));
+            let mut w_min = f32::INFINITY;
+            let mut w_max = f32::NEG_INFINITY;
+            for sec in 2..15 {
+                let g = mul_to_db(rms(&l[sec * r..(sec + 1) * r]) / rms(&input[sec * r..(sec + 1) * r]));
+                w_min = w_min.min(g);
+                w_max = w_max.max(g);
+            }
+            let drift = late - early;
+            let spread = w_max - w_min;
+            assert!(
+                drift.abs() < 0.5,
+                "strength={strength}: speech drifted {drift:+.2} dB (early {early:+.2}, late {late:+.2})"
+            );
+            assert!(spread < 1.0, "strength={strength}: speech pumped {spread:.2} dB across 13 s");
+            assert!(early > -0.5, "strength={strength}: speech attenuated {early:+.2} dB");
+            assert!(
+                pause_after < prev_pause_nr - 3.0,
+                "strength={strength}: pause_nr {pause_after:+.2} dB should strengthen past {prev_pause_nr:+.2} dB"
+            );
+            prev_pause_nr = pause_after;
+        }
+        assert!(prev_pause_nr < -20.0, "strength=100 pause noise reduced by >20 dB: {prev_pause_nr:+.2} dB");
     }
 
     #[test]
