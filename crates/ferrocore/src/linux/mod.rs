@@ -8,7 +8,7 @@ pub mod screen;
 /// Video and sound files.
 #[cfg(target_os = "linux")]
 pub mod media {
-    pub use crate::ffsrc::{Control, Media, MediaState};
+    pub use crate::ffsrc::{Control, Media, MediaOptions, MediaState};
 }
 
 /// What a command printed, or nothing when it isn't there.

@@ -475,6 +475,118 @@ pub enum MediaState {
     Ended,
 }
 
+/// Playback options for a media file (`ffmpeg_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaOptions {
+    pub looping: bool,
+    /// Restart from 0 when the source becomes active on air, and stop when hidden.
+    pub restart_on_activate: bool,
+    /// Close the file and decoder when hidden, and reopen when active again.
+    pub close_when_inactive: bool,
+    /// Clear the last picture when playback ends (or stops on deactivate).
+    pub clear_on_media_end: bool,
+    /// Playback speed in percent (1..=200, default 100).
+    pub speed_percent: u32,
+    /// Allow GPU hardware decoding (default true).
+    pub hw_decode: bool,
+}
+
+impl Default for MediaOptions {
+    fn default() -> Self {
+        Self {
+            looping: false,
+            restart_on_activate: false,
+            close_when_inactive: false,
+            clear_on_media_end: false,
+            speed_percent: 100,
+            hw_decode: true,
+        }
+    }
+}
+
+impl MediaOptions {
+    pub fn looping(looping: bool) -> Self {
+        Self { looping, ..Self::default() }
+    }
+
+    pub fn speed(self) -> u32 {
+        self.speed_percent.clamp(1, 200)
+    }
+}
+
+/// Host time (ns) at which a sample with media `pts_ns` plays, given that `base_pts_ns` plays at
+/// `base_host_ns` and playback runs at `speed_percent` (1..=200). Uses signed arithmetic so
+/// seeking past system uptime (`base_pts_ns > base_host_ns`) never underflows or freezes.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn schedule_at(base_host_ns: u64, base_pts_ns: i128, pts_ns: i128, speed_percent: u32) -> u64 {
+    let speed = i128::from(speed_percent.clamp(1, 200));
+    let delta_host = (pts_ns - base_pts_ns) * 100 / speed;
+    (i128::from(base_host_ns) + delta_host).max(0) as u64
+}
+
+/// Streaming linear resampler for interleaved stereo f32 PCM at `speed_percent` (1..=200),
+/// matching OBS's `samples_per_sec = sample_rate * speed / 100` playback-rate scaling across
+/// chunk boundaries without clicks. Passthrough at 100%.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct SpeedResampler {
+    speed_percent: u32,
+    prev: [f32; 2],
+    has_prev: bool,
+    pos: f64,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl SpeedResampler {
+    pub(crate) fn new(speed_percent: u32) -> Self {
+        Self { speed_percent: speed_percent.clamp(1, 200), prev: [0.0; 2], has_prev: false, pos: 0.0 }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.prev = [0.0; 2];
+        self.has_prev = false;
+        self.pos = 0.0;
+    }
+
+    pub(crate) fn process(&mut self, pcm: Vec<f32>) -> Vec<f32> {
+        if self.speed_percent == 100 || pcm.len() < 2 {
+            return pcm;
+        }
+        let n = pcm.len() / 2;
+        if !self.has_prev {
+            self.prev = [pcm[0], pcm[1]];
+            self.has_prev = true;
+            self.pos = 1.0;
+        }
+        let step = f64::from(self.speed_percent) / 100.0;
+        let est = ((n as f64 / step).ceil() as usize + 2) * 2;
+        let mut out = Vec::with_capacity(est);
+        let frame = |idx: usize| -> [f32; 2] {
+            if idx == 0 {
+                self.prev
+            } else {
+                let off = (idx - 1) * 2;
+                [pcm[off], pcm[off + 1]]
+            }
+        };
+        let limit = n as f64;
+        while self.pos < limit {
+            let i0 = self.pos.floor() as usize;
+            let i1 = (i0 + 1).min(n);
+            let frac = (self.pos - i0 as f64) as f32;
+            let a = frame(i0);
+            let b = frame(i1);
+            out.push(a[0] + (b[0] - a[0]) * frac);
+            out.push(a[1] + (b[1] - a[1]) * frac);
+            self.pos += step;
+        }
+        let last = (n - 1) * 2;
+        self.prev = [pcm[last], pcm[last + 1]];
+        self.pos -= limit;
+        out
+    }
+}
+
 /// The sound in `q` (pieces and where they are in the file) that plays by `now` + the hold, in
 /// order, each with its time on the pictures' clock (`start`); what plays later stays queued.
 /// Sound for a moment already shown is let go (the first pieces, held while the clock settled:
