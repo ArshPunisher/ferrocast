@@ -58,7 +58,8 @@ async fn platform_that_stalls(listener: TcpListener, key: &'static str) -> mpsc:
     rx
 }
 
-/// A platform on a slow link: after the publish it takes `bytes` every `every` and no more.
+/// A platform on a slow link: it publishes as usual, then takes `bytes` every `every` and no more,
+/// and says what it was handed (so a test can read the newest frame it got).
 async fn platform_that_is_slow(
     listener: TcpListener,
     key: &'static str,
@@ -70,36 +71,65 @@ async fn platform_that_is_slow(
         while let Ok((mut sock, _)) = listener.accept().await {
             let tx = tx.clone();
             tokio::spawn(async move {
-                let (itx, mut irx) = mpsc::unbounded_channel();
-                {
-                    let serve = serve_platform(&mut sock, key, &itx);
-                    let published = async {
-                        while let Some(g) = irx.recv().await {
-                            let done = matches!(g, Got::Publish(_));
-                            let _ = tx.send(g);
-                            if done {
-                                break;
-                            }
-                        }
-                    };
-                    tokio::select! {
-                        _ = serve => {}
-                        _ = published => {}
-                    }
-                }
-                let mut buf = vec![0u8; bytes];
-                loop {
-                    tokio::time::sleep(every).await;
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
+                let _ = serve_slowly(&mut sock, key, &tx, bytes, every).await;
                 let _ = tx.send(Got::Closed);
             });
         }
     });
     rx
+}
+
+/// `serve_platform`, but once the publish is accepted each read is at most `bytes` and waits `every`.
+async fn serve_slowly(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    bytes: usize,
+    every: Duration,
+) -> Option<()> {
+    let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
+    let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
+    let mut queue: Vec<ServerSessionResult> = first;
+    queue.extend(s.handle_input(&rest).ok()?);
+    let mut buf = vec![0u8; 65536];
+    let mut published = false;
+    loop {
+        while !queue.is_empty() {
+            for r in std::mem::take(&mut queue) {
+                match r {
+                    ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
+                    ServerSessionResult::RaisedEvent(ev) => match ev {
+                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                            queue.extend(s.accept_request(request_id).ok()?)
+                        }
+                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                            if stream_key != key {
+                                return None;
+                            }
+                            let _ = tx.send(Got::Publish(stream_key));
+                            published = true;
+                            queue.extend(s.accept_request(request_id).ok()?);
+                        }
+                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Got::Video(timestamp.value, data));
+                        }
+                        _ => {}
+                    },
+                    ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                }
+            }
+        }
+        let n = if published {
+            tokio::time::sleep(every).await;
+            sock.read(&mut buf[..bytes]).await.ok()?
+        } else {
+            sock.read(&mut buf).await.ok()?
+        };
+        if n == 0 {
+            return None;
+        }
+        queue.extend(s.handle_input(&buf[..n]).ok()?);
+    }
 }
 
 /// A fake OBS sending a stream: headers, then a frame of `size` bytes every `every`, a keyframe
@@ -113,6 +143,10 @@ fn feed(mut obs: Obs, size: usize, every: Duration, sent: Arc<AtomicU64>) -> tok
         for n in 0u64.. {
             let mut data = vec![if n % 10 == 0 { 0x17 } else { 0x27 }, 0x01, 0, 0, 0];
             data.resize(size, 0xAB);
+            // Its number, so a platform can say which frame is the newest it was given.
+            if size >= 9 {
+                data[5..9].copy_from_slice(&(n as u32).to_be_bytes());
+            }
             let Ok(r) = obs.c.publish_video_data(Bytes::from(data), RtmpTimestamp::new(ts), false) else { return };
             if obs.send(vec![r]).await.is_err() {
                 return;
@@ -248,16 +282,18 @@ async fn a_platform_that_stops_reading_is_called_stalled_backs_off_and_spares_th
 
 /// OBS drops frames when a platform falls 700 ms behind (its "drop threshold"); here a platform
 /// on a slow link may be a couple of seconds behind the live picture, no more: further behind it
-/// is showing the past, and the stream's delay grows by the minute.
+/// is showing the past, and the stream's delay grows by the minute. What is measured is what a
+/// viewer feels: the newest frame the platform was given against the newest sent. Frames never
+/// given are not delay: leaving them out is how a slow platform catches up.
 #[tokio::test]
-#[ignore = "finding M3.4: keyframes alone exceed this link; drop older keyframes when far behind (agy), and measure the newest frame's age, not frames not given (Sonnet)"]
+#[ignore = "finding M3.4: on a 20 KB/s link the newest picture it has is ~7 s old (frame 16 of 230, nothing dropped); agy's skip to the newest keyframe when far behind is what makes it pass"]
 async fn a_slow_platform_falls_behind_alone_and_never_far() {
     const FRAME: usize = 20 * 1024;
     let w = world().await;
     let (ls, lg) = (free_listener().await, free_listener().await);
     let (sport, gport) = (ls.local_addr().unwrap().port(), lg.local_addr().unwrap().port());
     // 8 KB every 400 ms (20 KB/s) against a stream of about 600 KB/s.
-    let _slow_got = platform_that_is_slow(ls, "k", 8 * 1024, Duration::from_millis(400)).await;
+    let mut slow_got = platform_that_is_slow(ls, "k", 8 * 1024, Duration::from_millis(400)).await;
     let mut good_got = platform(lg, "k").await;
     let mut slow = start(&w, destination_with(sport, "kick", 200, 4000));
     let mut good = start(&w, destination_with(gport, "twitch", 200, 4000));
@@ -278,19 +314,34 @@ async fn a_slow_platform_falls_behind_alone_and_never_far() {
     assert_eq!(good.borrow().since_ms, good_since, "the good one was never reconnected");
     assert_eq!(good.borrow().dropped, 0);
 
-    // The slow one: how far behind the live picture is what it has been given?
+    // The slow one: never silent about why it isn't live, if it isn't.
     let h = slow.borrow().clone();
     match &h.state {
         PushState::Live => {}
         PushState::Reconnecting { reason, .. } => assert!(reason.contains("stalled"), "{reason}"),
         s => panic!("the slow destination is {s:?}"),
     }
-    let given = h.sent / FRAME as u64;
-    let behind_s = sent_n.saturating_sub(given) as f64 * 0.033;
-    eprintln!("slow destination: {given} of {sent_n} frames given, {behind_s:.1} s behind, dropped {}", h.dropped);
+    // How old is the newest picture it was given? (frame numbers ride in the frames' bytes)
+    let mut newest: Option<u32> = None;
+    while let Ok(g) = slow_got.try_recv() {
+        if let Got::Video(_, data) = g
+            && data.len() >= 9
+            && data[1] == 1
+        {
+            let n = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+            newest = Some(newest.map_or(n, |m| m.max(n)));
+        }
+    }
+    let newest = newest.expect("the slow platform was given pictures");
+    let behind_s = (sent_n.saturating_sub(1).saturating_sub(u64::from(newest))) as f64 * 0.033;
+    eprintln!(
+        "slow destination: newest picture it got is frame {newest} of {sent_n} sent: {behind_s:.1} s old, dropped {}",
+        h.dropped
+    );
     assert!(
         behind_s <= 2.0,
-        "the slow destination is {behind_s:.1} s behind the live picture ({given} of {sent_n} frames)"
+        "the newest picture the slow platform has is {behind_s:.1} s old (frame {newest} of {sent_n})"
     );
+    let _ = FRAME;
     feeder.abort();
 }
