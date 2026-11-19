@@ -331,10 +331,16 @@ thread_local! {
 /// Runs `f` (an output's whole finish) with every FFmpeg it finishes sharing one deadline, so
 /// several FFmpegs (video, sound, extra tracks) never wait 45 s each.
 pub(crate) fn finishing_by<T>(by: std::time::Instant, f: impl FnOnce() -> T) -> T {
-    let before = FINISH_BY.with(|c| c.replace(Some(by)));
-    let out = f();
-    FINISH_BY.with(|c| c.set(before));
-    out
+    /// Puts the deadline before back however `f` ends, a panic included (projects-60): a
+    /// thread left with a past one would give its next stop no time at all.
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FINISH_BY.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FINISH_BY.with(|c| c.replace(Some(by))));
+    f()
 }
 
 impl Drop for Proc {
@@ -748,6 +754,15 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = p.finish_within(std::time::Duration::from_secs(1));
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// A stop that panics leaves no deadline behind on its thread.
+    #[test]
+    fn a_panicking_stop_leaves_no_deadline_behind() {
+        let by = std::time::Instant::now();
+        let r = std::panic::catch_unwind(|| finishing_by(by, || panic!("a stop that fails")));
+        assert!(r.is_err());
+        assert_eq!(FINISH_BY.with(std::cell::Cell::get), None);
     }
 
     /// Several FFmpegs finished in one stop share its time.
