@@ -4481,8 +4481,11 @@ pub fn can_share(
     if let Some((w, h)) = s.encode.scale {
         return Err(format!("the stream goes out at {w}×{h}, the recording at the full picture"));
     }
+    // The bitrate isn't compared: the shared encode takes the stream's, live (as auto quality
+    // and a bitrate changed while live do), so the recording follows the stream's.
     let mut stream_encode = s.encode.clone();
     stream_encode.scale = None;
+    stream_encode.video_kbps = plan.encode.video_kbps;
     if stream_encode != plan.encode {
         return Err("the recording is encoded another way than the stream".into());
     }
@@ -4579,6 +4582,9 @@ mod tests {
         };
         let plan = RecordPlan { tracks: vec![1], encode: enc.clone(), ..RecordPlan::default() };
         assert_eq!(can_share(&s, &plan, true, 60, 60), Ok(()));
+        // Another bitrate still shares: the shared encode takes the stream's, live.
+        let faster = StreamSettings { encode: crate::EncodeSettings { video_kbps: 9000, ..enc.clone() }, ..s.clone() };
+        assert_eq!(can_share(&faster, &plan, true, 60, 60), Ok(()));
         let why = |s: &StreamSettings, p: &RecordPlan, same: bool, c: u32| can_share(s, p, same, c, 60).unwrap_err();
         assert!(why(&s, &plan, false, 60).contains("Same as stream"));
         let scaled =

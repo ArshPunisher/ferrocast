@@ -813,7 +813,16 @@ impl OwnStream {
             delay: Duration::from_secs(u64::from(delay_s)),
             held: std::collections::VecDeque::new(),
         };
-        d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))).map_err(|e| fail(e.to_string()))?;
+        if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
+            // The push started above ends with it (projects-60).
+            hub.end();
+            return Err(fail(err.to_string()));
+        }
+        // The shared encode takes the stream's bitrate (what "Same as stream" means): the
+        // recording's file follows it from here.
+        if let Err(err) = d.shared.engine.set_output_kbps(d.output, e.video_kbps) {
+            tracing::warn!(error = %err, kbps = e.video_kbps, "the shared encode kept the recording's bitrate");
+        }
         let begun = d.shared.engine.stats();
         tracing::info!("the stream shares the recording's encoder");
         Ok(Self {
@@ -924,7 +933,9 @@ impl OwnStream {
     /// Pauses or resumes the recording (no gap in the file).
     pub(crate) fn pause(&self, on: bool) -> Result<(), StudioError> {
         let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("This recording can't pause.".into()))?;
-        if Arc::strong_count(&d.lease) > 1 {
+        // Pausing would pause the stream too; resuming is always let through (a recording
+        // paused before a stream joined it must be able to go on; projects-60).
+        if on && Arc::strong_count(&d.lease) > 1 {
             return Err(StudioError::Failed(
                 "Pause isn't available while the recording shares the stream's encoder (Same as stream).".into(),
             ));

@@ -46,6 +46,8 @@ struct Held {
     /// What the main stream was started with (a recording "Same as stream" may share its
     /// encoder: `can_share`).
     stream_with: Option<ferrocast_studio::StreamSettings>,
+    /// What the main recording was started with (a stream may share its encoder).
+    record_with: Option<ferrocast_studio::RecordPlan>,
     /// The vertical picture's stream, beside the main one.
     vstream: Option<Streaming>,
     /// The lighter copy of what's on air, for platforms that take it (720p).
@@ -2355,6 +2357,7 @@ impl StudioHost for DesktopStudio {
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
             h.record = Some(r);
+            h.record_with = Some(plan);
             Ok(v)
         })
         .await?
@@ -3265,14 +3268,16 @@ impl StudioHost for DesktopStudio {
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             // A recording "Same as stream" already running: the stream joins its encoder (one
             // encode for both) when they can share.
-            let recording = h.record.as_ref().map(|r| &r.0).filter(|r| r.stats().active);
-            let plan = ferrocast_studio::RecordPlan {
-                tracks: s.record_tracks.clone(),
-                encode: record_encode(&s),
-                ..Default::default()
-            };
-            let shared = recording.map(|r| {
-                (r, ferrocast_studio::stage::can_share(&settings, &plan, s.record_quality == "stream", c.canvas().fps, s.fps))
+            // Against what the recording really runs with (settings changed since apply from its
+            // next start), never a paused one (the stream would get nothing; projects-60).
+            let recording = h.record.as_ref().map(|r| &r.0).filter(|r| r.stats().active).zip(h.record_with.as_ref());
+            let shared = recording.map(|(r, plan)| {
+                let can = if r.record_stats().paused {
+                    Err("the recording is paused".to_string())
+                } else {
+                    ferrocast_studio::stage::can_share(&settings, plan, s.record_quality == "stream", c.canvas().fps, s.fps)
+                };
+                (r, can)
             });
             let stream = match shared {
                 Some((r, Ok(()))) => c.stream_sharing(r, &server, &key, &settings),
