@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 
 use crate::ffsrc::Live;
-use crate::sound_in::{SoundIn, Which};
+use crate::sound_in::{Heal, SoundIn, Which};
 use crate::{AvError, Picture};
 
 /// A frame of the screen as BGRA, sent to the card without a colour swap.
@@ -192,7 +192,9 @@ enum Pictures {
 #[derive(Debug)]
 pub struct ScreenCapture {
     live: Option<Pictures>,
-    sound: Option<SoundIn>,
+    /// With a picture, its sound starts itself again when it stops (the picture goes on); sound
+    /// alone says it stopped and the watchdog starts it again.
+    sound: Option<Heal>,
 }
 
 fn args(a: &[&str]) -> Vec<String> {
@@ -229,14 +231,16 @@ impl ScreenCapture {
         let sound = match (sound, target) {
             (false, _) => None,
             (true, Target::Window(id)) => match SoundIn::start(Which::Process(super::app_sound::process_of(id))) {
-                Ok(s) => Some(s),
+                Ok(s) => Some((s, Which::Process(super::app_sound::process_of(id)))),
                 Err(e) => {
                     tracing::warn!(error = %e, "the window's sound can't be heard");
                     None
                 }
             },
-            (true, Target::Display(_)) => Some(SoundIn::start(Which::Loopback)?),
+            (true, Target::Display(_)) => Some((SoundIn::start(Which::Loopback)?, Which::Loopback)),
         };
+        let picture = width > 2 || height > 2;
+        let sound = sound.map(|(s, which)| Heal::new(s, which, picture));
         if width <= 2 && height <= 2 {
             return Ok(ScreenCapture { live: None, sound });
         }
@@ -331,8 +335,9 @@ impl ScreenCapture {
             .into_iter()
             .find(|w| w.app.eq_ignore_ascii_case(app))
             .ok_or_else(|| AvError::Source(format!("{app} has no window open")))?;
-        let sound = SoundIn::start(Which::Process(super::app_sound::process_of(w.id)))?;
-        Ok(ScreenCapture { live: None, sound: Some(sound) })
+        let which = Which::Process(super::app_sound::process_of(w.id));
+        let sound = SoundIn::start(which.clone())?;
+        Ok(ScreenCapture { live: None, sound: Some(Heal::new(sound, which, false)) })
     }
 
     /// The newest frame (taken).
@@ -353,23 +358,29 @@ impl ScreenCapture {
 
     /// The computer's sound since the last call (when started with sound).
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
-        self.sound.as_ref().map(SoundIn::take_sound).unwrap_or_default()
+        self.sound.as_ref().map(Heal::take_sound).unwrap_or_default()
     }
 
     pub fn frames(&self) -> u64 {
         match &self.live {
             Some(Pictures::Native(w)) => w.frames(),
             Some(Pictures::Ffmpeg(l)) => l.frames(),
-            None => 0,
+            // Sound alone: its pieces are its sign of life, so a source that came back resets
+            // the watchdog's waits (else they stayed at a minute; agy's review). Not steady:
+            // quiet speakers send nothing, which isn't a stop.
+            None => self.sound.as_ref().map_or(0, Heal::received),
         }
     }
 
-    /// Why the capture ended, if it did.
+    /// Why the capture ended, if it did: its picture, or its sound (the speakers it heard were
+    /// unplugged or changed, or the app quit), which is started again with it.
     pub fn ended(&self) -> Option<String> {
-        match self.live.as_ref()? {
-            Pictures::Native(w) => w.ended(),
-            Pictures::Ffmpeg(l) => l.ended(),
-        }
+        let picture = match self.live.as_ref() {
+            Some(Pictures::Native(w)) => w.ended(),
+            Some(Pictures::Ffmpeg(l)) => l.ended(),
+            None => None,
+        };
+        picture.or_else(|| self.sound.as_ref()?.ended().map(|e| format!("its sound: {e}")))
     }
 }
 

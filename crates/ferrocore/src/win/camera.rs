@@ -89,19 +89,20 @@ impl Capture {
         self.sound.as_ref().map(SoundIn::take_sound).unwrap_or_default()
     }
 
-    /// Pictures received so far.
+    /// Pictures (a camera) or sound pieces (a microphone) received so far.
     pub fn received(&self) -> u64 {
-        self.live.as_ref().map_or(0, Live::frames)
+        self.live.as_ref().map_or(0, Live::frames) + self.sound.as_ref().map_or(0, SoundIn::received)
     }
 
-    /// A camera sends all the time (a microphone here has no count to watch).
+    /// A camera or a microphone sends all the time: quiet for long means it stopped (a
+    /// microphone counted nothing before 20 Nov, so the watchdog never saw one stop).
     pub fn steady(&self) -> bool {
-        self.live.is_some()
+        self.live.is_some() || self.sound.is_some()
     }
 
-    /// Why FFmpeg's camera ended, if it did.
+    /// Why FFmpeg's camera or the microphone ended, if it did.
     pub fn ended(&self) -> Option<String> {
-        self.live.as_ref()?.ended()
+        self.live.as_ref().and_then(Live::ended).or_else(|| self.sound.as_ref()?.ended())
     }
 }
 
