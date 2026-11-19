@@ -608,7 +608,7 @@ async fn test_connection_tries_the_server_and_says_how_it_went() {
     let d =
         e.add_golive_destination("Mine", &format!("rtmp://127.0.0.1:{port}/live"), "k", Canvas::Main).await.unwrap();
     let r = e.golive_test(&d.id).await.unwrap();
-    assert!(r.ok && r.message.contains("answered"), "{r:?}");
+    assert!(r.ok && r.message.contains("reachable"), "{r:?}");
     // Nothing there: said, not an error.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let r = e.golive_test_address(&format!("rtmp://127.0.0.1:{closed}/live"), "").await.unwrap();
