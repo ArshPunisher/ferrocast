@@ -350,11 +350,41 @@ impl Shared {
     }
 }
 
+/// One engine output, held by the stream and the recording that share its encode (a recording
+/// "Same as stream"): the last holder gone stops it, whatever way each went (stopped, failed,
+/// replaced, the app quitting; projects-60's review).
+#[derive(Debug)]
+struct Lease {
+    shared: Arc<Shared>,
+    output: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Our engine closes its output (encoders flushed).
+        if let Err(e) = self.shared.engine.stop_output(self.output) {
+            tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
+        }
+        self.shared.seen().vertical.retain(|o| *o != self.output);
+    }
+}
+
+/// What a holder of a shared output is to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Stream,
+    Record,
+    /// Neither shared nor shareable: a replay buffer, a source shown alone, the vertical stream.
+    Alone,
+}
+
 /// An output on the shared engine.
 #[derive(Debug)]
 struct Drawn {
     shared: Arc<Shared>,
     output: u64,
+    lease: Arc<Lease>,
+    role: Role,
     /// A recording's plan (its names and when to split), and when the file now written began.
     plan: Option<(RecordPlan, std::time::Instant)>,
     /// The scene or source shown on its own, when this is a Source Record.
@@ -706,7 +736,102 @@ impl OwnStream {
             health,
             stop_push,
             runtime,
-            drawn: Some(Drawn { shared, output, plan: None, solo: solo.map(String::from), from }),
+            drawn: Some(Drawn {
+                lease: Arc::new(Lease { shared: shared.clone(), output }),
+                role: match (streaming, record.is_some()) {
+                    _ if replay.is_some() || vertical || solo.is_some() => Role::Alone,
+                    (true, _) => Role::Stream,
+                    (false, true) => Role::Record,
+                    _ => Role::Alone,
+                },
+                shared,
+                output,
+                plan: None,
+                solo: solo.map(String::from),
+                from,
+            }),
+            hub: Some(hub),
+            directs: Default::default(),
+        })
+    }
+
+    /// A recording "Same as stream" joining this running stream's encode, into `path` (one
+    /// encode for both: the Mac's one video encoder can't do two at 4K60). Its stats count from
+    /// now; when either ends the other goes on.
+    pub(crate) fn record_joining(&self, path: &std::path::Path, plan: &RecordPlan) -> Result<Self, StudioError> {
+        let d = self.drawn.as_ref().filter(|d| d.role == Role::Stream).ok_or_else(|| {
+            StudioError::Failed("Only a running stream's encoder can be shared with a recording.".into())
+        })?;
+        d.shared.engine.record_on(d.output, path).map_err(|e| StudioError::Failed(e.to_string()))?;
+        let begun = d.shared.engine.stats();
+        tracing::info!(file = %path.display(), "the recording shares the stream's encoder");
+        Ok(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            counts: Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() }),
+            health: None,
+            stop_push: None,
+            runtime: None,
+            drawn: Some(Drawn {
+                shared: d.shared.clone(),
+                output: d.output,
+                lease: d.lease.clone(),
+                role: Role::Record,
+                plan: Some((plan.clone(), std::time::Instant::now())),
+                solo: None,
+                from: (begun.frames, begun.skipped),
+            }),
+            hub: None,
+            directs: Default::default(),
+        })
+    }
+
+    /// A stream joining this running recording's encode (a recording "Same as stream" that
+    /// started first), sent as `drawn` sends one: from the encoder's next keyframe.
+    pub(crate) fn stream_joining(
+        &self,
+        send_to: Send<'_>,
+        e: &EncodeSettings,
+        delay_s: u32,
+    ) -> Result<Self, StudioError> {
+        let d = self.drawn.as_ref().filter(|d| d.role == Role::Record).ok_or_else(|| {
+            StudioError::Failed("Only a running recording's encoder can be shared with a stream.".into())
+        })?;
+        let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
+        let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
+        let config = d.shared.engine.config();
+        let video = video_config(e, config.width, config.height, config.fps);
+        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let hub = Hub::new();
+        let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
+        let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
+        hub.start();
+        hub.metadata(metadata_of(&video, &audio, config.width, config.height, config.fps));
+        let mut out = Delayed {
+            hub: hub.clone(),
+            counts: counts.clone(),
+            delay: Duration::from_secs(u64::from(delay_s)),
+            held: std::collections::VecDeque::new(),
+        };
+        d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))).map_err(|e| fail(e.to_string()))?;
+        let begun = d.shared.engine.stats();
+        tracing::info!("the stream shares the recording's encoder");
+        Ok(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            counts,
+            health,
+            stop_push,
+            runtime,
+            drawn: Some(Drawn {
+                shared: d.shared.clone(),
+                output: d.output,
+                lease: d.lease.clone(),
+                role: Role::Stream,
+                plan: None,
+                solo: None,
+                from: (begun.frames, begun.skipped),
+            }),
             hub: Some(hub),
             directs: Default::default(),
         })
@@ -720,6 +845,11 @@ impl OwnStream {
         let d = self.drawn.as_ref().ok_or_else(|| fail("This stream can't change while it's live."))?;
         if d.solo.is_some() || d.shared.seen().vertical.contains(&d.output) {
             return Err(fail("Only the main picture's stream changes while it's live."));
+        }
+        if Arc::strong_count(&d.lease) > 1 {
+            return Err(fail(
+                "The stream shares its encoder with the recording (Same as stream): it changes at the next start.",
+            ));
         }
         let config = d.shared.engine.config();
         let fps = fps.clamp(1, config.fps);
@@ -794,6 +924,11 @@ impl OwnStream {
     /// Pauses or resumes the recording (no gap in the file).
     pub(crate) fn pause(&self, on: bool) -> Result<(), StudioError> {
         let d = self.drawn.as_ref().ok_or_else(|| StudioError::Failed("This recording can't pause.".into()))?;
+        if Arc::strong_count(&d.lease) > 1 {
+            return Err(StudioError::Failed(
+                "Pause isn't available while the recording shares the stream's encoder (Same as stream).".into(),
+            ));
+        }
         d.shared.engine.pause_output(d.output, on).map_err(|e| StudioError::Failed(e.to_string()))
     }
 
@@ -1041,16 +1176,26 @@ impl Drop for OwnStream {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        // Our engine closes its output (encoders flushed).
         if let Some(d) = self.drawn.take() {
-            if let Err(e) = d.shared.engine.stop_output(d.output) {
-                tracing::warn!("Ferrocast's own engine didn't close its output cleanly: {e}");
+            // Shared: only this holder's part ends (the stream leaves, or the file is finished)
+            // and the output goes on for the other; the last holder's lease stops it.
+            if Arc::strong_count(&d.lease) > 1 {
+                let left = match d.role {
+                    Role::Stream => d.shared.engine.stream_off(d.output),
+                    Role::Record => d.shared.engine.record_off(d.output),
+                    Role::Alone => Ok(()),
+                };
+                if let Err(e) = left {
+                    tracing::warn!(role = ?d.role, "a shared output's part didn't end cleanly: {e}");
+                }
             }
-            d.shared.seen().vertical.retain(|o| *o != d.output);
             // A source no longer recorded alone needn't come back after a reopen.
             if let Some(name) = &d.solo {
                 d.shared.seen().alone.retain(|n| n != name);
             }
+            // The last holder's lease stops the output first, so its last tags reach the hub
+            // before it ends.
+            drop(d);
             if let Some(hub) = self.hub.take() {
                 hub.end();
             }

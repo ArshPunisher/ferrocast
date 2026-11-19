@@ -43,6 +43,9 @@ struct Held {
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
     stream: Option<Streaming>,
+    /// What the main stream was started with (a recording "Same as stream" may share its
+    /// encoder: `can_share`).
+    stream_with: Option<ferrocast_studio::StreamSettings>,
     /// The vertical picture's stream, beside the main one.
     vstream: Option<Streaming>,
     /// The lighter copy of what's on air, for platforms that take it (720p).
@@ -2325,7 +2328,29 @@ impl StudioHost for DesktopStudio {
             // Ferrocast's own engine draws, mixes and encodes every recording; what it can't do
             // yet is refused with the reason (libobs no longer stands in).
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            let rec = c.record_drawn(&file, &plan).map_err(|e| e.to_string())?;
+            // "Same as stream" while streaming: one encode for both (the Mac's one video
+            // encoder can't do two at 4K60: 31 of 60 fps, 19 Nov), when they can share.
+            let live = h.stream.as_ref().filter(|st| st.stats().active).zip(h.stream_with.as_ref());
+            let rec = match live.map(|(st, with)| {
+                (
+                    st,
+                    ferrocast_studio::stage::can_share(
+                        with,
+                        &plan,
+                        s.record_quality == "stream",
+                        c.canvas().fps,
+                        s.fps,
+                    ),
+                )
+            }) {
+                Some((st, Ok(()))) => c.record_sharing(st, &file, &plan),
+                Some((_, Err(why))) => {
+                    tracing::info!("the recording has its own encoder: {why}");
+                    c.record_drawn(&file, &plan)
+                }
+                None => c.record_drawn(&file, &plan),
+            }
+            .map_err(|e| e.to_string())?;
             tracing::info!(file = %file.display(), "the Studio is recording");
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
@@ -3238,7 +3263,26 @@ impl StudioHost for DesktopStudio {
             // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
             // the reason (libobs no longer stands in).
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            let stream = c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?;
+            // A recording "Same as stream" already running: the stream joins its encoder (one
+            // encode for both) when they can share.
+            let recording = h.record.as_ref().map(|r| &r.0).filter(|r| r.stats().active);
+            let plan = ferrocast_studio::RecordPlan {
+                tracks: s.record_tracks.clone(),
+                encode: record_encode(&s),
+                ..Default::default()
+            };
+            let shared = recording.map(|r| {
+                (r, ferrocast_studio::stage::can_share(&settings, &plan, s.record_quality == "stream", c.canvas().fps, s.fps))
+            });
+            let stream = match shared {
+                Some((r, Ok(()))) => c.stream_sharing(r, &server, &key, &settings),
+                Some((_, Err(why))) => {
+                    tracing::info!("the stream has its own encoder: {why}");
+                    c.stream_drawn(&server, &key, &settings)
+                }
+                None => c.stream_drawn(&server, &key, &settings),
+            }
+            .map_err(|e| e.to_string())?;
             // The canvas still at another rate (the virtual camera kept it): the stream goes out
             // at the chosen one anyway.
             if c.canvas().fps != s.fps
@@ -3248,6 +3292,7 @@ impl StudioHost for DesktopStudio {
             }
             let v = stats_of(&stream);
             h.stream = Some(stream);
+            h.stream_with = Some(settings);
             Ok(v)
         })
         .await?

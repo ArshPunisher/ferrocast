@@ -2145,6 +2145,36 @@ impl Stage {
         Ok(StageOutput::new(own, Some(path), self.canvas))
     }
 
+    /// A recording "Same as stream" that shares the running `stream`'s encoder (see
+    /// [`can_share`]), into `path`.
+    pub fn record_sharing(
+        &self,
+        stream: &StageOutput,
+        path: &Path,
+        plan: &RecordPlan,
+    ) -> Result<StageOutput, StudioError> {
+        for what in own::not_applied(&plan.encode, &plan.muxer) {
+            say_once(format!("the recording starts without {what}: Ferrocore doesn't take them"));
+        }
+        let mut own = stream.own.record_joining(path, plan)?;
+        own.set_plan(plan);
+        Ok(StageOutput::new(own, Some(path.to_path_buf()), self.canvas))
+    }
+
+    /// A stream that shares the running `recording`'s encoder (a recording "Same as stream"
+    /// started first; see [`can_share`]).
+    pub fn stream_sharing(
+        &self,
+        recording: &StageOutput,
+        server: &str,
+        key: &str,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
+        let send = own::Send { server, key, reconnect: s.reconnect };
+        let own = recording.own.stream_joining(send, &s.encode, s.delay_s)?;
+        Ok(StageOutput::new(own, None, self.canvas))
+    }
+
     /// `Collection`'s names for the same, so the app calls either.
     pub fn stream_drawn(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
         self.stream(server, key, s)
@@ -4433,6 +4463,47 @@ fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
         .unwrap_or(first)
 }
 
+/// Whether a recording can share the stream's encoder (one encode for both, where the Mac's
+/// one video encoder can't do two at 4K60): Ok, or why not, in words for the person (the
+/// encoder-budget warning names the same reason; projects-60's review). `same_as_stream`: the
+/// recording's quality is "Same as stream"; `canvas_fps` the picture's rate now, `fps` the
+/// rate chosen.
+pub fn can_share(
+    s: &StreamSettings,
+    plan: &RecordPlan,
+    same_as_stream: bool,
+    canvas_fps: u32,
+    fps: u32,
+) -> Result<(), String> {
+    if !same_as_stream {
+        return Err("the recording's quality isn't Same as stream".into());
+    }
+    if let Some((w, h)) = s.encode.scale {
+        return Err(format!("the stream goes out at {w}×{h}, the recording at the full picture"));
+    }
+    let mut stream_encode = s.encode.clone();
+    stream_encode.scale = None;
+    if stream_encode != plan.encode {
+        return Err("the recording is encoded another way than the stream".into());
+    }
+    if plan.tracks != [1] {
+        return Err(format!(
+            "the recording keeps {} sound tracks: only track 1 can share the stream's",
+            plan.tracks.len()
+        ));
+    }
+    if s.vod_track.is_some() {
+        return Err("the stream sends a VOD track for Twitch".into());
+    }
+    if !s.video_tracks.is_empty() {
+        return Err("Twitch Enhanced Broadcasting sends more qualities".into());
+    }
+    if canvas_fps != fps {
+        return Err(format!("the picture runs at {canvas_fps} fps and the stream at {fps}"));
+    }
+    Ok(())
+}
+
 /// Logs `what` the first time this run (a profile from before Ferrocore keeps its muxer
 /// settings, with no box left to clear them: said once, not at every recording).
 fn say_once(what: String) {
@@ -4492,6 +4563,38 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One encode for a stream and a recording "Same as stream" only when nothing differs, and
+    /// why not, in words, when something does (the same reasons the budget warning gives).
+    #[test]
+    fn a_recording_shares_the_streams_encoder_only_when_nothing_differs() {
+        let enc = crate::EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        let s = StreamSettings {
+            encode: enc.clone(),
+            reconnect: None,
+            delay_s: 0,
+            vod_track: None,
+            own_encoder: false,
+            video_tracks: Vec::new(),
+        };
+        let plan = RecordPlan { tracks: vec![1], encode: enc.clone(), ..RecordPlan::default() };
+        assert_eq!(can_share(&s, &plan, true, 60, 60), Ok(()));
+        let why = |s: &StreamSettings, p: &RecordPlan, same: bool, c: u32| can_share(s, p, same, c, 60).unwrap_err();
+        assert!(why(&s, &plan, false, 60).contains("Same as stream"));
+        let scaled =
+            StreamSettings { encode: crate::EncodeSettings { scale: Some((1920, 1080)), ..enc.clone() }, ..s.clone() };
+        assert!(why(&scaled, &plan, true, 60).contains("1920×1080"));
+        let two = RecordPlan { tracks: vec![1, 2], ..plan.clone() };
+        assert!(why(&s, &two, true, 60).contains("2 sound tracks"));
+        assert!(why(&StreamSettings { vod_track: Some(2), ..s.clone() }, &plan, true, 60).contains("VOD"));
+        assert!(
+            why(&StreamSettings { video_tracks: vec![(1280, 720, 3000)], ..s.clone() }, &plan, true, 60)
+                .contains("Enhanced")
+        );
+        assert!(why(&s, &plan, true, 30).contains("30 fps"));
+        let high = RecordPlan { encode: crate::EncodeSettings { quality: Some(16), ..enc }, ..plan };
+        assert!(why(&s, &high, true, 60).contains("another way"));
+    }
 
     /// A picked display is noted by its UUID (found again when its number changes); a window's
     /// old names go when another window is picked.
