@@ -2238,8 +2238,10 @@ impl StudioHost for DesktopStudio {
 
     async fn record(&self, on: bool) -> Result<Value, String> {
         let app = self.app.clone();
+        tracing::info!(on, "the recording is asked to {}", if on { "start" } else { "stop" });
         self.on_main(move |h| {
             if !on {
+                tracing::info!("the recording's stop reached the main thread");
                 // Waits for the file to be finished; MKV, FLV and TS then become MP4 too.
                 let ended = h.record.take();
                 let s = h.settings.clone().unwrap_or_default();

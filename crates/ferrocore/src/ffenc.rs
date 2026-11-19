@@ -150,14 +150,20 @@ impl Proc {
     fn spawn(args: &[String], chunk: usize) -> Result<Self, AvError> {
         let ff =
             ffmpeg().ok_or_else(|| AvError::Encoder("FFmpeg isn't here, so this system can't encode yet".into()))?;
-        let mut child = hidden(Command::new(ff))
-            .args(["-hide_banner", "-loglevel", "error"])
-            .args(args)
+        let mut cmd = Command::new(ff);
+        cmd.args(["-hide_banner", "-loglevel", "error"]).args(args);
+        Self::start(cmd, chunk)
+    }
+
+    /// Starts `cmd` as FFmpeg is started: raw frames in, FLV tags out.
+    fn start(cmd: Command, chunk: usize) -> Result<Self, AvError> {
+        let mut child = hidden(cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| AvError::Encoder(format!("FFmpeg didn't start ({e})")))?;
+        tracing::info!(pid = child.id(), "FFmpeg started");
         let mut pipe = child.stdin.take().ok_or_else(|| AvError::Encoder("FFmpeg took no input".into()))?;
         let (stdin, queued) = sync_channel::<Vec<u8>>((QUEUED_BYTES / chunk.max(1)).clamp(2, 64));
         let broken = Arc::new(AtomicBool::new(false));
@@ -238,14 +244,6 @@ impl Proc {
         }
     }
 
-    /// Ends FFmpeg's input once what's queued is written.
-    fn close_input(&mut self) {
-        self.stdin = None;
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
-    }
-
     fn died(&mut self) -> AvError {
         let _ = self.child.wait();
         let why = self.stderr.lock().map(|s| s.trim().to_string()).unwrap_or_default();
@@ -256,17 +254,72 @@ impl Proc {
         })
     }
 
-    /// Closes the input and waits for everything still coming.
+    /// Closes the input and waits for everything still coming, for [`FINISH_WITHIN`] at most:
+    /// then FFmpeg is stopped and the file ends with what came (a stuck FFmpeg never holds
+    /// Stop forever; GitHub's Windows runner waited over a minute, 18-19 Nov).
     fn finish(&mut self) -> Vec<Tag> {
+        self.finish_within(FINISH_WITHIN)
+    }
+
+    fn finish_within(&mut self, within: std::time::Duration) -> Vec<Tag> {
         let t = std::time::Instant::now();
-        self.close_input();
+        let deadline = t + within;
+        // The queue's sender gone: the writer writes what's left, then closes FFmpeg's input.
+        self.stdin = None;
+        if let Some(w) = self.writer.take() {
+            while !w.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if w.is_finished() {
+                let _ = w.join();
+            } else {
+                self.writer = Some(w);
+            }
+        }
         tracing::info!(at_ms = t.elapsed().as_millis() as u64, "FFmpeg's input is written and closed");
-        let tags: Vec<Tag> = self.tags.iter().collect();
-        tracing::info!(at_ms = t.elapsed().as_millis() as u64, tags = tags.len(), "FFmpeg's output is read to its end");
+        let mut tags = Vec::new();
+        let mut late = false;
+        loop {
+            match self.tags.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(tag) => tags.push(tag),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    late = true;
+                    break;
+                }
+            }
+        }
+        // Its output closed isn't proof it ended (CodeRabbit): it's waited for within the same
+        // time.
+        while !late && matches!(self.child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() >= deadline {
+                late = true;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        if late {
+            tracing::warn!(
+                seconds = within.as_secs(),
+                tags = tags.len(),
+                "FFmpeg didn't finish in time: stopped, the file ends with what came"
+            );
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
+        // Killed: its input broke, so a writer still writing ends now.
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+        tags.extend(self.tags.try_iter());
+        tracing::info!(at_ms = t.elapsed().as_millis() as u64, tags = tags.len(), "FFmpeg's output is read to its end");
         tags
     }
 }
+
+/// How long stopping waits for FFmpeg to encode what's queued and end (a slow software encode
+/// of a full queue takes seconds, not this long).
+const FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl Drop for Proc {
     fn drop(&mut self) {
@@ -641,6 +694,32 @@ impl Audio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An FFmpeg that never ends (stuck, or its input held open elsewhere: GitHub's Windows
+    /// runner, 18-19 Nov) is stopped at the deadline: Stop never hangs.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_ffmpeg_never_holds_stop() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let mut p = Proc::start(cmd, 1024).unwrap_or_else(|e| panic!("{e}"));
+        let t = std::time::Instant::now();
+        let tags = p.finish_within(std::time::Duration::from_secs(1));
+        assert!(tags.is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// The same when it closes its output but goes on running.
+    #[cfg(unix)]
+    #[test]
+    fn an_ffmpeg_that_closes_its_output_but_runs_on_is_stopped_too() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec 1>&-; exec sleep 30"]);
+        let mut p = Proc::start(cmd, 1024).unwrap_or_else(|e| panic!("{e}"));
+        let t = std::time::Instant::now();
+        let _ = p.finish_within(std::time::Duration::from_secs(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
 
     fn cfg(rate: RateControl) -> VideoConfig {
         VideoConfig {
