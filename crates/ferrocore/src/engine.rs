@@ -720,6 +720,30 @@ struct State {
     /// a rename, the same camera added back) comes back at once instead of being opened again,
     /// which takes seconds on Windows. What each was, and when it was parked.
     parked: Vec<(SourceKind, Live, u64)>,
+    /// Whether any active streaming or recording output currently wants system sleep inhibited.
+    sleep_want: bool,
+    /// Monotonic counter so concurrent start/stop callers never apply a stale sleep state.
+    sleep_epoch: u64,
+}
+
+fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
+    match kind {
+        OutputKind::Stream(_) => true,
+        OutputKind::Record(_) => pipe.recording(),
+        OutputKind::Replay { .. } => false,
+    }
+}
+
+impl State {
+    fn sleep_ticket(&mut self) -> Option<(u64, bool)> {
+        let want = self.outputs.iter().any(|(_, pipe, kind, _)| output_needs_awake(pipe, kind));
+        if want == self.sleep_want {
+            return None;
+        }
+        self.sleep_want = want;
+        self.sleep_epoch += 1;
+        Some((self.sleep_epoch, want))
+    }
 }
 
 /// How often an edit applied in place lets a full load try again the sources that couldn't
@@ -802,6 +826,7 @@ pub struct Engine {
     seen: Arc<Seen>,
     thread: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
+    sleep: Arc<crate::sleep::SleepMonitor>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     next_preview: AtomicU64,
@@ -865,15 +890,18 @@ impl Engine {
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
             parked: Vec::new(),
+            sleep_want: false,
+            sleep_epoch: 0,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
+        let sleep = Arc::new(crate::sleep::SleepMonitor::default());
         let thread = {
-            let (state, gpu, mixer, stop, seen) =
-                (state.clone(), gpu.clone(), mixer.clone(), stop.clone(), seen.clone());
+            let (state, gpu, mixer, stop, seen, sleep) =
+                (state.clone(), gpu.clone(), mixer.clone(), stop.clone(), seen.clone(), sleep.clone());
             std::thread::Builder::new()
                 .name("ferrocast-engine".into())
-                .spawn(move || run(config, &state, &gpu, &mixer, &stop, &seen))
+                .spawn(move || run(config, &state, &gpu, &mixer, &stop, &seen, &sleep))
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
         let watchdog = {
@@ -895,9 +923,21 @@ impl Engine {
             seen,
             thread: Some(thread),
             watchdog,
+            sleep,
             preview: Mutex::new(HashMap::new()),
             next_preview: AtomicU64::new(1),
         })
+    }
+
+    /// Whether sleep is currently inhibited due to live streaming or recording.
+    pub fn sleep_inhibited(&self) -> bool {
+        self.sleep.is_inhibited()
+    }
+
+    fn sync_sleep(&self, ticket: Option<(u64, bool)>) {
+        if let Some((epoch, want)) = ticket {
+            self.sleep.apply(epoch, want);
+        }
     }
 
     pub fn config(&self) -> EngineConfig {
@@ -1931,6 +1971,9 @@ impl Engine {
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
         self.show(&st);
+        let ticket = st.sleep_ticket();
+        drop(st);
+        self.sync_sleep(ticket);
         Ok(id)
     }
 
@@ -2184,6 +2227,9 @@ impl Engine {
         }
         pipe.begin_stream()?;
         *kind = OutputKind::Stream(send);
+        let ticket = st.sleep_ticket();
+        drop(st);
+        self.sync_sleep(ticket);
         Ok(())
     }
 
@@ -2196,7 +2242,11 @@ impl Engine {
         // The stream always leaves (a recording that failed, say on a full disk, mustn't keep
         // it: the next Go live would find a stream there; CodeRabbit).
         *kind = OutputKind::Record(PathBuf::new());
-        if !pipe.recording() {
+        let no_rec = !pipe.recording();
+        let ticket = st.sleep_ticket();
+        drop(st);
+        self.sync_sleep(ticket);
+        if no_rec {
             return Err(AvError::Source("the output had no recording left to go on with".into()));
         }
         Ok(())
@@ -2248,6 +2298,9 @@ impl Engine {
         deliver(&mut st, &self.gpu, true);
         let r = Self::on_output(&mut st, id, f);
         self.show(&st);
+        let ticket = st.sleep_ticket();
+        drop(st);
+        self.sync_sleep(ticket);
         r
     }
 
@@ -2329,7 +2382,7 @@ impl Engine {
         // finished (18 and 19 Nov) and nothing said where it waited.
         let t = Instant::now();
         tracing::info!(id, "an output stops");
-        let taken = {
+        let (taken, ticket) = {
             let mut st = self.lock();
             tracing::info!(id, waited_ms = t.elapsed().as_millis() as u64, "an output stops: the engine's lock taken");
             // Its last frames still on the card go into it first.
@@ -2337,16 +2390,21 @@ impl Engine {
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
             self.show(&st);
-            taken
+            let ticket = st.sleep_ticket();
+            (taken, ticket)
         };
         if let Some((_, pipe, mut kind, _)) = taken {
-            let tags = pipe.finish()?;
+            let finished = pipe.finish();
+            self.sync_sleep(ticket);
+            let tags = finished?;
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stopped: its encoders finished");
             if let OutputKind::Stream(send) = &mut kind {
                 for t in tags {
                     send(t);
                 }
             }
+        } else {
+            self.sync_sleep(ticket);
         }
         Ok(())
     }
@@ -2480,6 +2538,7 @@ impl Drop for Engine {
         for id in ids {
             let _ = self.stop_output(id);
         }
+        self.sleep.release_all();
     }
 }
 
@@ -3128,6 +3187,7 @@ fn run(
     mixer: &Mutex<Mixer>,
     stop: &AtomicBool,
     seen: &Seen,
+    sleep: &crate::sleep::SleepMonitor,
 ) {
     on_time();
     let frame_ns = 1_000_000_000 / u64::from(config.fps);
@@ -3146,13 +3206,17 @@ fn run(
         let started = Instant::now();
 
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            frame(&config, state, gpu, mixer, ts, behind, started, seen);
+            let ticket = frame(&config, state, gpu, mixer, ts, behind, started, seen);
             // Pictures uploaded this frame are sent even when nothing drew (no preview, no
             // output), and what the card finished with is let go: without this, Direct3D and
             // Vulkan keep it all and run out of memory in minutes.
             gpu.submit(std::iter::empty());
             let _ = gpu.device.poll(wgpu::PollType::Poll);
+            ticket
         }));
+        if let Ok(Some((epoch, want))) = ok {
+            sleep.apply(epoch, want);
+        }
         // Behind (a frame took longer than its time): a moment before the next one takes the
         // engine's lock again. Windows' lock isn't fair: re-taken at once, frame after frame,
         // the window's thread waiting for it (stats, the preview) got it only every 10-48 s
@@ -3692,7 +3756,7 @@ fn frame(
     behind: u64,
     started: Instant,
     shown: &Seen,
-) {
+) -> Option<(u64, bool)> {
     let rate = config.sample_rate;
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     st.stats.skipped += behind;
@@ -3969,6 +4033,7 @@ fn frame(
     // Shown before the state's lock goes: a change made right after (a split, a pause) shows
     // itself, never overwritten by this older picture (projects-60).
     *shown.lock().unwrap_or_else(|e| e.into_inner()) = Shown::of(&st);
+    st.sleep_ticket()
 }
 
 #[cfg(test)]
@@ -6195,5 +6260,41 @@ mod tests {
         assert_eq!(woke, 3);
         assert_eq!(sources[&2].watch.next_try, now);
         assert_eq!(sources[&3].watch.next_try, now);
+    }
+
+    #[test]
+    fn sleep_inhibit_follows_streaming_and_recording_lifetime() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(engine) = engine() else {
+            return;
+        };
+        assert!(!engine.sleep_inhibited(), "idle engine does not inhibit sleep");
+
+        // Replay buffer alone does not keep the machine awake.
+        let replay = engine.start_output(OutputKind::Replay { seconds: 5, mb: 16 }).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!engine.sleep_inhibited(), "replay alone leaves sleep uninhibited");
+
+        // Starting a stream activates sleep inhibition; a second recording keeps it active when the
+        // first stops, and stopping the last active output releases it.
+        let dir = std::env::temp_dir().join(format!("ferrocore-sleep-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let rec_path = dir.join("rec.mp4");
+
+        let stream = engine.start_output(OutputKind::Stream(Box::new(|_| {}))).unwrap_or_else(|e| panic!("{e}"));
+        assert!(engine.sleep_inhibited(), "active stream inhibits sleep");
+
+        let rec = engine.start_output(OutputKind::Record(rec_path)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(engine.sleep_inhibited());
+
+        engine.stop_output(stream).unwrap_or_else(|e| panic!("{e}"));
+        assert!(engine.sleep_inhibited(), "recording still active keeps sleep inhibited");
+
+        engine.stop_output(rec).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!engine.sleep_inhibited(), "releasing last recording frees sleep inhibition");
+
+        let _ = engine.stop_output(replay);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

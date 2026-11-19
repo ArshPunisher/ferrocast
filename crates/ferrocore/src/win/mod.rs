@@ -7,6 +7,7 @@
 
 pub mod app_sound;
 pub mod camera;
+pub(crate) mod power;
 pub mod screen;
 pub mod wgc;
 

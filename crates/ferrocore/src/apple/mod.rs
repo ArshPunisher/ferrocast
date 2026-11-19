@@ -5,6 +5,7 @@
 pub(crate) mod aac;
 pub mod camera;
 pub mod media;
+pub(crate) mod power;
 pub mod screen;
 pub(crate) mod vt;
 pub mod zerocopy;

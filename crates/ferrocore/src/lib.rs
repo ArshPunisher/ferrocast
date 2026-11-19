@@ -57,6 +57,7 @@ pub mod obs;
 pub mod pipeline;
 pub mod preview;
 pub mod shaderfx;
+mod sleep;
 /// Sound in through cpal: microphones, and the computer's own sound (Windows).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod sound_in;
