@@ -20,9 +20,9 @@ Ferrocast installs per user, with no admin. So:
 2. **On Windows 11, when the user asks:** "Show in every app" runs one elevated step (one UAC
    prompt). It copies the camera DLL to `%ProgramFiles%\Ferrocast Camera` and registers its
    media source in HKLM. From then on, starting the camera also creates the Media Foundation
-   camera for this session, and the DirectShow registration is removed. Windows shows the
-   Media Foundation camera to DirectShow apps as well, so there's never two "Ferrocast Camera"s.
-   Windows may list it with "Windows Virtual Camera" added to its name: look for either.
+   camera for this session. The DirectShow camera stays (first PC test, 12 Nov: removing it
+   left no camera at all when Windows 11's started but no app saw it), so DirectShow apps may
+   list two. Windows may list the new one with "Windows Virtual Camera" added to its name.
 
 ## How frames travel
 

@@ -146,7 +146,10 @@ impl Camera {
             return Err(MISSING.into());
         }
         let (region, _) = ferrocast_camshare::win::create(NAME_LOCAL, None)?;
-        // Windows 11 set up for every app: its camera, and no DirectShow one beside it.
+        // The DirectShow camera always: it's the one known to work. With Windows 11's camera
+        // too, DirectShow apps may list two "Ferrocast Camera"s; better than none if Windows
+        // 11's starts but no app sees it (first PC test, 12 Nov).
+        let dshow = register_dshow(&dir);
         let mf = if every_app_installed() {
             match MfCamera::start() {
                 Ok(c) => Some(c),
@@ -158,10 +161,12 @@ impl Camera {
         } else {
             None
         };
-        if mf.is_some() {
-            forget_dshow();
-        } else {
-            register_dshow(&dir)?;
+        // DirectShow's registration failing (a locked-down registry) doesn't stop Windows 11's
+        // camera; with neither there's no camera, and the reason is DirectShow's (CodeRabbit).
+        match (&dshow, &mf) {
+            (Err(e), None) => return Err(e.clone()),
+            (Err(e), Some(_)) => tracing::warn!(error = %e, "DirectShow's camera wasn't registered: Windows 11's only"),
+            _ => {}
         }
         let (cw, ch) = camera_size(size.0, size.1);
         let every = fps.div_ceil(MAX_FPS).max(1);
@@ -260,7 +265,7 @@ fn register_dshow(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Takes the DirectShow camera away for this user (Windows 11's is used instead, or Ferrocast
+/// Takes the DirectShow camera away for this user (by hand, or when Ferrocast
 /// is being removed).
 pub fn forget_dshow() {
     for view in [View::Bits64, View::Bits32] {
