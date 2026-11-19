@@ -951,3 +951,91 @@ async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks
     .await;
     assert!(published.is_err(), "must never publish RTMP when broadcast creation failed: {published:?}");
 }
+
+/// S11: the privacy the streamer chose reaches every YouTube broadcast Ferrocast makes. The Api
+/// the engine builds reads the setting when it makes one, so a change applies at once.
+#[tokio::test]
+async fn the_youtube_privacy_setting_reaches_the_broadcasts_ferrocast_makes() {
+    use std::sync::Mutex;
+
+    // Default, and what it must accept and refuse.
+    let (e, _dir) = engine().await;
+    assert_eq!(e.settings().youtube_privacy, "public", "as before unless chosen");
+    let bad = e.patch_settings(json!({ "youtube_privacy": "friends" }).as_object().unwrap()).await.unwrap_err();
+    assert!(
+        bad.to_string().contains("youtube_privacy: use one of public, unlisted, private."),
+        "names the field and the choices: {bad}"
+    );
+    assert_eq!(e.settings().youtube_privacy, "public", "a refused value changes nothing");
+    let bad = e.patch_settings(json!({ "youtube_privacy": 3 }).as_object().unwrap()).await.unwrap_err();
+    assert!(bad.to_string().contains("youtube_privacy: must be text."), "{bad}");
+
+    // A fake YouTube that only records the privacy of each broadcast made.
+    let made: Arc<Mutex<Vec<String>>> = Arc::default();
+    let rec = made.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "items": [{
+                    "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
+                    "cdn": { "resolution": "variable", "frameRate": "variable", "ingestionType": "rtmp",
+                             "ingestionInfo": { "streamName": "k", "ingestionAddress": "rtmp://127.0.0.1:9/live2" } }
+                }] }))
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [] })) }).post(
+                move |axum::Json(b): axum::Json<serde_json::Value>| {
+                    let rec = rec.clone();
+                    async move {
+                        rec.lock().unwrap().push(b["status"]["privacyStatus"].as_str().unwrap_or("").to_string());
+                        axum::Json(json!({ "id": "made-1" }))
+                    }
+                },
+            ),
+        )
+        .route("/api/liveBroadcasts/bind", axum::routing::post(|| async { axum::Json(json!({ "id": "made-1" })) }))
+        .route(
+            "/api/videos",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [{ "snippet": {} }] })) })
+                .put(|| async { axum::Json(json!({})) }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let dir = tempfile::tempdir().unwrap();
+    let apps = crate::PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "c".into(), client_secret: "s".into() }),
+        youtube_endpoints: ferrocast_youtube::Endpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: "http://127.0.0.1:9".into(),
+        },
+        ..Default::default()
+    };
+    let e = Engine::start_with(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()), apps).await.unwrap();
+    let tokens = ferrocast_youtube::Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: crate::now().0 + 3_600_000,
+    };
+    let info = ferrocast_core::stream_info::StreamInfo { title: Some("Ranked".into()), ..Default::default() };
+    // Each Api is built first and the setting changed after: it is read when the broadcast is made.
+    for chosen in ["public", "unlisted", "private"] {
+        let api = e.youtube_api(tokens.clone()).unwrap();
+        e.patch_settings(json!({ "youtube_privacy": chosen }).as_object().unwrap()).await.unwrap();
+        api.update_broadcast_info(&info).await.unwrap();
+    }
+    assert_eq!(*made.lock().unwrap(), ["public", "unlisted", "private"]);
+
+    // A saved value that is none of the three (the file was edited by hand; validation only runs
+    // on a save from the dashboard) never publishes: unlisted.
+    let mut odd = e.settings();
+    odd.youtube_privacy = "friends".into();
+    e.save_settings(odd).await.unwrap();
+    e.youtube_api(tokens).unwrap().update_broadcast_info(&info).await.unwrap();
+    assert_eq!(made.lock().unwrap().last().map(String::as_str), Some("unlisted"));
+}

@@ -234,6 +234,13 @@ impl<W: Write> Mp4Writer<W> {
         self.written
     }
 
+    /// Gives the output up without writing what waits (a disk that can't take it): the output,
+    /// and where the last whole fragment ends. Bytes of a fragment that was cut short lie past
+    /// that point, so the caller cuts the file back there and what is left plays.
+    pub fn abandon(self) -> (W, u64) {
+        (self.out, self.written)
+    }
+
     /// Writes out what's waiting and hands the output back (chapter marks need
     /// `finish_with_chapters`).
     pub fn finish(mut self) -> io::Result<W> {
@@ -309,8 +316,11 @@ impl<W: Write> Mp4Writer<W> {
         self.out.write_all(&(payload.len() as u32 + 8).to_be_bytes())?;
         self.out.write_all(b"mdat")?;
         self.out.write_all(&payload)?;
+        self.out.flush()?;
+        // Counted once it is all out: `written` is where the last whole fragment ends, which is
+        // where a file that ran out of room is cut back to (`abandon`).
         self.written += (moof.len() + payload.len() + 8) as u64;
-        self.out.flush()
+        Ok(())
     }
 }
 

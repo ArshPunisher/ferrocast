@@ -172,7 +172,80 @@ enum Recording {
         held: Vec<(usize, AudioPacket)>,
     },
     On(Box<Writer>),
-    Failed,
+    /// The file couldn't be written (a full disk, a drive taken away): what is in it was kept,
+    /// nothing more is written, and nothing is tried again.
+    Failed(RecordProblem),
+}
+
+/// Why a recording stopped, as a short phrase for the line ("the disk is full") and the rest
+/// (what to do, and the system's own words) for behind the (i).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordProblem {
+    pub reason: String,
+    pub detail: String,
+    /// How many bytes of the file were kept (its size, for the Stats that go on showing it).
+    pub kept: u64,
+}
+
+impl RecordProblem {
+    /// What an I/O error from writing the file means to the person recording.
+    pub fn from_io(e: &std::io::Error) -> Self {
+        use std::io::ErrorKind as K;
+        let os = e.raw_os_error();
+        // ENOSPC (28), Windows' disk full (112) and handle disk full (39).
+        let full = e.kind() == K::StorageFull || matches!(os, Some(28 | 112 | 39));
+        // A disk quota: EDQUOT (Linux 122, macOS 69), Windows' not enough quota (1816).
+        let quota = e.kind() == K::QuotaExceeded || matches!(os, Some(122 | 69 | 1816));
+        // A drive pulled out or gone: ENODEV, ENXIO, Windows' not ready, no such device,
+        // network name deleted, I/O device error, device not connected.
+        #[cfg(unix)]
+        let gone_code = matches!(os, Some(19 | 6));
+        #[cfg(windows)]
+        let gone_code = matches!(os, Some(21 | 55 | 64 | 1117 | 1167));
+        #[cfg(not(any(unix, windows)))]
+        let gone_code = false;
+        let gone = matches!(e.kind(), K::NotFound | K::BrokenPipe | K::NotConnected) || gone_code;
+        let denied = matches!(e.kind(), K::PermissionDenied | K::ReadOnlyFilesystem) || os == Some(30);
+        let (reason, advice) = if full {
+            ("the disk is full", "Free some space or choose another drive, then record again.")
+        } else if quota {
+            ("the disk quota is used up", "Free some space or choose another drive, then record again.")
+        } else if gone {
+            ("the drive isn't there anymore", "Connect it again or choose another folder, then record again.")
+        } else if denied {
+            ("the folder can't be written", "Choose a folder you can write to, then record again.")
+        } else {
+            ("the file couldn't be written", "Check the drive, or choose another folder, then record again.")
+        };
+        let said: String = e.to_string().chars().take(200).collect();
+        RecordProblem {
+            reason: reason.into(),
+            detail: format!("{advice} What was recorded until now is saved and plays. ({said})"),
+            kept: 0,
+        }
+    }
+}
+
+/// Stops writing a file that can't be written: what was whole in it is kept (the half-written
+/// piece at its end is cut off, so it plays), and the reason is logged once.
+fn give_up(w: Box<Writer>, e: &std::io::Error) -> RecordProblem {
+    let (file, whole) = w.abandon();
+    salvage(file, whole);
+    let problem = RecordProblem { kept: whole, ..RecordProblem::from_io(e) };
+    tracing::error!(error = %e, reason = %problem.reason, kept = whole, "the recording stopped; the file so far was kept");
+    problem
+}
+
+/// Cuts `file` back to `whole` bytes (a fragment cut short by a full disk would end it), and
+/// asks the system to write out what it has. Shrinking a file needs no room. Every step may
+/// fail without harm: nothing here panics or retries.
+fn salvage(file: BufWriter<File>, whole: u64) {
+    // What the buffer still holds belongs to a piece that never went out.
+    let (f, _unwritten) = file.into_parts();
+    if f.metadata().is_ok_and(|m| m.len() > whole) {
+        let _ = f.set_len(whole);
+    }
+    let _ = f.sync_all();
 }
 
 /// The file being written: a crash-safe MP4, or MKV when its name ends in `.mkv`.
@@ -216,6 +289,14 @@ impl Writer {
         match self {
             Self::Mp4(w) => w.chapter(name),
             Self::Mkv(w) => w.chapter(name),
+        }
+    }
+
+    /// Gives the file up without writing what waits: it, and where its last whole piece ends.
+    fn abandon(self) -> (BufWriter<File>, u64) {
+        match self {
+            Self::Mp4(w) => w.abandon(),
+            Self::Mkv(w) => w.abandon(),
         }
     }
 
@@ -320,9 +401,14 @@ impl Pipeline {
     fn drop_pending_file(&mut self) {
         if let Some((f, _, path)) = self.split_to.take() {
             drop(f);
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
-                let _ = std::fs::remove_file(&path);
-            }
+            Self::forget_empty(&path);
+        }
+    }
+
+    /// Removes `path` when nothing was written to it.
+    fn forget_empty(path: &Path) {
+        if std::fs::metadata(path).is_ok_and(|m| m.len() == 0) {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -454,6 +540,9 @@ impl Pipeline {
     /// recording": each file plays on its own from 0. The file is made now, so a path that
     /// can't be written fails at once. Err without a recording.
     pub fn split(&mut self, path: &Path) -> Result<(), AvError> {
+        if let Some(Recording::Failed(p)) = &self.recording {
+            return Err(AvError::Encoder(format!("the recording stopped: {}", p.reason)));
+        }
         if !matches!(self.recording, Some(Recording::On(_) | Recording::Waiting { .. })) {
             return Err(AvError::Encoder("there's no recording to split".into()));
         }
@@ -476,6 +565,8 @@ impl Pipeline {
     pub fn recorded_bytes(&self) -> u64 {
         match &self.recording {
             Some(Recording::On(w)) => w.written(),
+            // What was kept of a recording that stopped: its size goes on showing.
+            Some(Recording::Failed(p)) => p.kept,
             _ => 0,
         }
     }
@@ -739,7 +830,15 @@ impl Pipeline {
 
     /// Whether the recording broke (a full disk): the stream goes on without it.
     pub fn recording_failed(&self) -> bool {
-        matches!(self.recording, Some(Recording::Failed))
+        matches!(self.recording, Some(Recording::Failed(_)))
+    }
+
+    /// Why the recording stopped, when it did.
+    pub fn recording_problem(&self) -> Option<&RecordProblem> {
+        match &self.recording {
+            Some(Recording::Failed(p)) => Some(p),
+            _ => None,
+        }
     }
 
     /// A time on the output's clock (µs) as the stream's tag time (ms).
@@ -820,14 +919,23 @@ impl Pipeline {
         let cfg = *self.video.config();
         let acfg = *self.audio.config();
         let aheader = self.audio.header();
+        // A recording that failed isn't tried again, and no new file is made for it (a split
+        // that asked for one before it failed is let go).
+        if matches!(self.recording, Some(Recording::Failed(_))) {
+            self.drop_pending_file();
+            return;
+        }
         // A split waiting: the old file is closed and the new one starts on this keyframe.
         if p.key
             && let Some(next) = self.split_to.take()
         {
             if let Some(Recording::On(w)) = self.recording.take()
-                && w.finish().is_err()
+                && let Err(e) = w.finish()
             {
-                self.recording = Some(Recording::Failed);
+                let problem = RecordProblem::from_io(&e);
+                tracing::error!(error = %e, reason = %problem.reason, "the recording couldn't be finished at a split");
+                self.recording = Some(Recording::Failed(problem));
+                Self::forget_empty(&next.2);
                 return;
             }
             self.recording = Some(Recording::Waiting { file: BufWriter::new(next.0), mkv: next.1, held: Vec::new() });
@@ -846,21 +954,25 @@ impl Pipeline {
                     let tracks = vec![a; 1 + self.extra.len()];
                     match Writer::new(file, mkv, v, tracks) {
                         Ok(mut w) => {
-                            let ok = w.video(p).is_ok() && held.iter().all(|(t, a)| w.audio(*t, a).is_ok());
-                            if ok { Recording::On(Box::new(w)) } else { Recording::Failed }
+                            let wrote = w.video(p).and_then(|()| held.iter().try_for_each(|(t, a)| w.audio(*t, a)));
+                            match wrote {
+                                Ok(()) => Recording::On(Box::new(w)),
+                                Err(e) => Recording::Failed(give_up(Box::new(w), &e)),
+                            }
                         }
-                        Err(_) => Recording::Failed,
+                        Err(e) => {
+                            let problem = RecordProblem::from_io(&e);
+                            tracing::error!(error = %e, reason = %problem.reason, "the recording couldn't be started");
+                            Recording::Failed(problem)
+                        }
                     }
                 }
                 None => Recording::Waiting { file, mkv, held },
             },
-            Some(Recording::On(mut w)) => {
-                if w.video(p).is_ok() {
-                    Recording::On(w)
-                } else {
-                    Recording::Failed
-                }
-            }
+            Some(Recording::On(mut w)) => match w.video(p) {
+                Ok(()) => Recording::On(w),
+                Err(e) => Recording::Failed(give_up(w, &e)),
+            },
             other => {
                 self.recording = other;
                 return;
@@ -884,10 +996,12 @@ impl Pipeline {
         }
         match &mut self.recording {
             Some(Recording::Waiting { held, .. }) => held.push((track, p)),
-            Some(Recording::On(w)) => {
-                if w.audio(track, &p).is_err() {
-                    self.recording = Some(Recording::Failed);
-                }
+            Some(Recording::On(_)) => {
+                let Some(Recording::On(mut w)) = self.recording.take() else { return };
+                self.recording = Some(match w.audio(track, &p) {
+                    Ok(()) => Recording::On(w),
+                    Err(e) => Recording::Failed(give_up(w, &e)),
+                });
             }
             _ => {}
         }
@@ -911,6 +1025,225 @@ fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
         _ if pts < from => CutStep::Write,
         Some(at) if key && pts >= at => CutStep::End,
         _ => CutStep::Leave,
+    }
+}
+
+impl Pipeline {
+    /// Records into `file` (tests: a file that fails when it is told to).
+    #[cfg(test)]
+    fn record_into(&mut self, file: File) {
+        self.recording = Some(Recording::Waiting { file: BufWriter::new(file), mkv: false, held: Vec::new() });
+    }
+}
+
+/// A disk that runs out (M7-01): the recording ends, what was written plays, it is said once,
+/// and nothing is retried.
+#[cfg(test)]
+mod full_disk_tests {
+    use std::io::{self, Read, Write};
+
+    use super::*;
+    use crate::mp4::{AudioTrack, Mp4Writer, VideoTrack};
+    use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    /// A sink that takes `room` bytes and then says the disk is full (a short write first, as a
+    /// disk does when it has less room than the write).
+    struct Disk {
+        got: Vec<u8>,
+        room: usize,
+    }
+
+    impl Write for Disk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.got.len() >= self.room {
+                return Err(io::Error::from(io::ErrorKind::StorageFull));
+            }
+            let n = buf.len().min(self.room - self.got.len());
+            self.got.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tracks() -> (VideoTrack, AudioTrack) {
+        (
+            VideoTrack {
+                codec: VideoCodec::H264,
+                width: 64,
+                height: 64,
+                config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+            },
+            AudioTrack { sample_rate: 48000, channels: 2, config: vec![0x11, 0x90], bitrate_kbps: 160 },
+        )
+    }
+
+    /// Feeds 200 packets (a keyframe every 10) of about 1 KB each.
+    fn feed(w: &mut Mp4Writer<Disk>) -> io::Result<()> {
+        for i in 0..200i64 {
+            let pts = i * 33_333;
+            w.video(&VideoPacket { pts_us: pts, dts_us: pts, key: i % 10 == 0, data: vec![i as u8; 1000] })?;
+            w.audio(&AudioPacket { pts_us: pts, data: vec![7; 40] })?;
+        }
+        Ok(())
+    }
+
+    /// The top-level boxes of an MP4 as (kind, size), and whether they end exactly at its end.
+    fn boxes(b: &[u8]) -> (Vec<([u8; 4], usize)>, bool) {
+        let (mut at, mut out) = (0usize, Vec::new());
+        while at + 8 <= b.len() {
+            let size = u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+            let kind = [b[at + 4], b[at + 5], b[at + 6], b[at + 7]];
+            if size < 8 || at + size > b.len() {
+                return (out, false);
+            }
+            out.push((kind, size));
+            at += size;
+        }
+        (out, at == b.len())
+    }
+
+    #[test]
+    fn a_disk_that_fills_leaves_a_file_that_ends_on_a_whole_fragment() {
+        let (v, a) = tracks();
+        // Room for the header and a few fragments, not for all of them.
+        let mut w =
+            Mp4Writer::new(Disk { got: Vec::new(), room: 40_000 }, Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        let err = feed(&mut w).expect_err("the disk is full");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        let (mut disk, whole) = w.abandon();
+        // Before it is cut back, the file ends in the middle of a fragment…
+        assert!(!boxes(&disk.got).1, "a piece was cut short");
+        assert!(whole < disk.got.len() as u64);
+        // …after, every box is whole and there are fragments to play.
+        disk.got.truncate(whole as usize);
+        let (list, clean) = boxes(&disk.got);
+        assert!(clean, "{list:?}");
+        assert!(list.iter().filter(|(k, _)| k == b"moof").count() >= 2, "{list:?}");
+        assert_eq!(list[0].0, *b"ftyp");
+        assert_eq!(list.last().map(|l| l.0), Some(*b"mdat"));
+    }
+
+    #[test]
+    fn written_counts_a_fragment_only_once_it_is_all_out() {
+        let (v, a) = tracks();
+        let mut w =
+            Mp4Writer::new(Disk { got: Vec::new(), room: 40_000 }, Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        let _ = feed(&mut w);
+        let (disk, whole) = w.abandon();
+        assert!(whole <= disk.got.len() as u64, "never past what is in the file: {whole} of {}", disk.got.len());
+    }
+
+    #[test]
+    fn salvage_cuts_a_file_back_and_never_makes_it_longer() {
+        let dir = std::env::temp_dir().join(format!("ferrocore-salvage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.join("x.mp4");
+        let mut f = BufWriter::new(File::create(&path).unwrap_or_else(|e| panic!("{e}")));
+        f.write_all(&[1; 1000]).unwrap_or_else(|e| panic!("{e}"));
+        f.flush().unwrap_or_else(|e| panic!("{e}"));
+        f.write_all(&[2; 50]).unwrap_or_else(|e| panic!("{e}")); // still in the buffer
+        salvage(f, 600);
+        assert_eq!(std::fs::metadata(&path).map(|m| m.len()).ok(), Some(600));
+        // A count that is past the end (a flush that failed) leaves the file as it is.
+        let mut f = BufWriter::new(File::create(&path).unwrap_or_else(|e| panic!("{e}")));
+        f.write_all(&[1; 100]).unwrap_or_else(|e| panic!("{e}"));
+        f.flush().unwrap_or_else(|e| panic!("{e}"));
+        salvage(f, 5_000);
+        assert_eq!(std::fs::metadata(&path).map(|m| m.len()).ok(), Some(100));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_went_wrong_is_said_in_words() {
+        let say = |e: io::Error| RecordProblem::from_io(&e);
+        for e in [
+            io::Error::from(io::ErrorKind::StorageFull),
+            io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 }),
+        ] {
+            let p = say(e);
+            assert_eq!(p.reason, "the disk is full");
+            assert!(p.detail.contains("Free some space") && p.detail.contains("plays"), "{p:?}");
+        }
+        assert_eq!(say(io::Error::from(io::ErrorKind::NotFound)).reason, "the drive isn't there anymore");
+        assert_eq!(say(io::Error::from(io::ErrorKind::PermissionDenied)).reason, "the folder can't be written");
+        assert_eq!(say(io::Error::other("odd")).reason, "the file couldn't be written");
+        assert!(say(io::Error::other("x".repeat(1000))).detail.len() < 400, "long system text is cut");
+    }
+
+    /// Whether this computer encodes (the Mac always; elsewhere with FFmpeg's H.264).
+    fn encodes() -> bool {
+        (cfg!(target_os = "macos") && std::env::var("FERROCAST_AV_ENCODER").as_deref() != Ok("ffmpeg"))
+            || crate::ffenc::h264_encoder().is_some()
+    }
+
+    /// The whole pipeline writing into a file whose other end goes away partway (a drive taken
+    /// out): the recording fails once, the file so far is whole, and later frames, a split and
+    /// more frames do nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn a_recording_that_cannot_be_written_stops_once_and_is_not_tried_again() {
+        use std::os::unix::net::UnixStream;
+        if !encodes() {
+            return;
+        }
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 1,
+            software: false,
+        };
+        let mut pipe = Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (ours, mut theirs) = UnixStream::pair().unwrap_or_else(|e| panic!("{e}"));
+        // The far end takes 30 KB and goes away.
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while got.len() < 30_000 {
+                match theirs.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            got
+        });
+        pipe.record_into(File::from(std::os::fd::OwnedFd::from(ours)));
+        let (y, uv) = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let mut failed_at = None;
+        for i in 0..400u64 {
+            let ts = i * 33_333_333;
+            let _ = pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts);
+            let _ = pipe.audio(&vec![0.1f32; 1600 * 2], ts);
+            if failed_at.is_none() && pipe.recording_failed() {
+                failed_at = Some(i);
+            }
+            if failed_at.is_some_and(|f| i > f + 40) {
+                break;
+            }
+        }
+        let got = reader.join().unwrap_or_default();
+        let failed_at = failed_at.expect("the recording failed once the far end was gone");
+        assert!(failed_at > 0, "not at the first frame: it was written until the end went away");
+        let p = pipe.recording_problem().expect("a reason").clone();
+        assert_eq!(p.reason, "the drive isn't there anymore", "{p:?}");
+        assert!(!pipe.recording(), "it no longer says it records");
+        assert!(pipe.recorded_bytes() > 0, "the size of what was kept goes on showing");
+        // Frames after it write nothing and don't change the answer; a split is refused in words.
+        let again = pipe.recording_problem().cloned();
+        assert_eq!(again, Some(p));
+        let err = pipe.split(Path::new("/nonexistent/next.mp4")).expect_err("no split of a failed recording");
+        assert!(err.to_string().contains("the recording stopped: the drive isn't there anymore"), "{err}");
+        // What the far end got starts like an MP4 (the header went out whole).
+        assert_eq!(&got[4..8], b"ftyp");
     }
 }
 

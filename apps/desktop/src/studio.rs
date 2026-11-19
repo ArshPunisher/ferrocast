@@ -983,7 +983,9 @@ fn record_stats(r: &(Recording, PathBuf, std::time::Instant)) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("file".into(), Value::String(r.1.display().to_string()));
         o.insert("seconds".into(), json!(r.2.elapsed().as_secs()));
-        o.insert("error".into(), r.0.last_error().map_or(Value::Null, Value::String));
+        // Why it stopped by itself (a full disk), else what the output says (its own error).
+        let stopped = o.get("error").and_then(Value::as_str).map(|why| format!("The recording stopped: {why}."));
+        o.insert("error".into(), stopped.or_else(|| r.0.last_error()).map_or(Value::Null, Value::String));
         o.insert("encoder".into(), r.0.encoder().map_or(Value::Null, Value::String));
     }
     v
@@ -2363,6 +2365,25 @@ impl StudioHost for DesktopStudio {
             }))
         })
         .await?
+    }
+
+    async fn record_stats(&self) -> Result<Value, String> {
+        self.on_main(|h| {
+            h.record.as_ref().map_or(Value::Null, |r| {
+                let mut v = record_stats(r);
+                if let Some(o) = v.as_object_mut() {
+                    // What to do about it, for behind the (i); and the room left where it writes.
+                    if let Some((_, detail)) = r.0.record_problem() {
+                        o.insert("error_detail".into(), Value::String(detail));
+                    }
+                    let folder = r.1.parent().map(PathBuf::from).unwrap_or_default();
+                    let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
+                    o.insert("disk_free_mb".into(), json!(ferrocast_studio::system::free_disk_mb(&at)));
+                }
+                v
+            })
+        })
+        .await
     }
 
     async fn record(&self, on: bool) -> Result<Value, String> {

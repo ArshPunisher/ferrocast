@@ -372,20 +372,38 @@ impl Engine {
         self.inner.secrets.set(key, &json).map_err(|e| EngineError::Unavailable(e.to_string()))
     }
 
-    fn youtube_api(&self, tokens: ferrocast_youtube::Tokens) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
+    pub(crate) fn youtube_api(
+        &self,
+        tokens: ferrocast_youtube::Tokens,
+    ) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
         let app = self.apps().youtube.clone().ok_or_else(|| EngineError::Unavailable("no YouTube app".into()))?;
         let secrets = self.inner.secrets.clone();
         let persist = Arc::new(move |t: &ferrocast_youtube::Tokens| {
             let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
             secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())
         });
-        Ok(Arc::new(ferrocast_youtube::Api::new(
-            ferrocast_youtube::http_client(),
-            self.apps().youtube_endpoints.clone(),
-            app,
-            tokens,
-            persist,
-        )))
+        // The privacy of the broadcasts it makes is read from the settings each time, so a change
+        // applies to the next one. A weak link: the Api lives inside the engine's connectors.
+        let engine = Arc::downgrade(&self.inner);
+        let privacy: ferrocast_youtube::PrivacySource = Arc::new(move || {
+            // A value that isn't one of the three (a hand-edited file) must not publish: unlisted.
+            engine
+                .upgrade()
+                .map(|inner| Engine { inner }.settings().youtube_privacy)
+                .map_or(ferrocast_youtube::Privacy::Unlisted, |v| {
+                    ferrocast_youtube::Privacy::parse(&v).unwrap_or(ferrocast_youtube::Privacy::Unlisted)
+                })
+        });
+        Ok(Arc::new(
+            ferrocast_youtube::Api::new(
+                ferrocast_youtube::http_client(),
+                self.apps().youtube_endpoints.clone(),
+                app,
+                tokens,
+                persist,
+            )
+            .with_privacy(privacy),
+        ))
     }
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {

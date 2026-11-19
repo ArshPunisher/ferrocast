@@ -192,6 +192,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stats(&self) -> Result<Value, String>;
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
+    /// The recording's stats now (`active`, `bytes`, `seconds`, `file`, `error`, `error_detail`,
+    /// `disk_free_mb`), or null without one. Looked at every couple of seconds.
+    async fn record_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
     async fn record_pause(&self, on: bool) -> Result<(), String>;
     /// Starts or stops the replay buffer → `{ active }`.
     async fn replay(&self, _on: bool) -> Result<Value, String> {

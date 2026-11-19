@@ -408,8 +408,11 @@ impl Canvas {
 pub type FrameSink = Box<dyn FnMut(&Nv12, u64) + Send>;
 
 /// A recording output's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecordState {
+    /// Why the recording stopped (a full disk, a drive taken away), when it did: the file so far
+    /// was kept and nothing is written any more.
+    pub failed: Option<crate::pipeline::RecordProblem>,
     pub paused: bool,
     /// Bytes in the file being written now.
     pub bytes: u64,
@@ -496,6 +499,7 @@ fn quiet_of(st: &State) -> Vec<(String, bool, u64)> {
 
 fn record_state(pipe: &Pipeline) -> RecordState {
     RecordState {
+        failed: pipe.recording_problem().cloned(),
         paused: pipe.paused() || pipe.recording_paused(),
         bytes: pipe.recorded_bytes(),
         splitting: pipe.splitting(),
@@ -2204,7 +2208,7 @@ impl Engine {
 
     /// An output's recording now.
     pub fn output_record_state(&self, id: u64) -> Result<RecordState, AvError> {
-        if let Some(r) = self.now_or_shown(id, |pipe| Ok(record_state(pipe)), |(_, r, _)| *r) {
+        if let Some(r) = self.now_or_shown(id, |pipe| Ok(record_state(pipe)), |(_, r, _)| r.clone()) {
             return r;
         }
         Err(AvError::Source("no such output".into()))
@@ -3606,6 +3610,12 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
         let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
+                continue;
+            }
+            // A recording on its own that can't be written any more has nothing to encode for:
+            // it would only keep the encoder busy until someone presses Stop. (One that shares
+            // its encode with a stream goes on, for the stream.)
+            if matches!(kind, OutputKind::Record(_)) && pipe.recording_failed() {
                 continue;
             }
             let mut tags = Vec::new();

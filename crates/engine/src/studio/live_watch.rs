@@ -38,6 +38,8 @@ impl Engine {
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     was_live = live;
                 }
+                // A recording stopping or running out of room matters live or not.
+                engine.record_watch_tick().await;
                 if live {
                     engine.scene_chapter_tick().await;
                     engine.auto_quality_tick().await;

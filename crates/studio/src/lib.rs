@@ -425,12 +425,15 @@ impl RecordPlan {
 }
 
 /// How a recording is going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordStats {
+    /// False once the recording stopped, by itself too (a full disk, a drive taken away).
     pub active: bool,
     pub paused: bool,
     pub bytes: u64,
     pub frames: u32,
+    /// Why it stopped, in one line, when it did by itself ("the disk is full").
+    pub error: Option<String>,
 }
 
 /// How video and sound are encoded.
