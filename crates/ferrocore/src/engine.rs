@@ -427,6 +427,9 @@ pub struct SourceLoad {
     pub height: u32,
 }
 
+/// The loop's stats and error as of its last frame (see `Engine::stats`).
+type Seen = Mutex<(Stats, Option<String>)>;
+
 /// How the engine is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Stats {
@@ -707,6 +710,10 @@ pub struct Engine {
     /// Shared with countdowns, so fonts are loaded once.
     text: Arc<Mutex<TextRenderer>>,
     stop: Arc<AtomicBool>,
+    /// The loop's stats and error as of its last frame, for those who only read them (/stats
+    /// every second, health): they never wait for the state lock the loop holds a whole frame
+    /// (on a slow card, every Studio call through the window's thread waited behind it).
+    seen: Arc<Seen>,
     thread: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
@@ -772,11 +779,13 @@ impl Engine {
             parked: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let seen: Arc<Seen> = Arc::default();
         let thread = {
-            let (state, gpu, mixer, stop) = (state.clone(), gpu.clone(), mixer.clone(), stop.clone());
+            let (state, gpu, mixer, stop, seen) =
+                (state.clone(), gpu.clone(), mixer.clone(), stop.clone(), seen.clone());
             std::thread::Builder::new()
                 .name("ferrocast-engine".into())
-                .spawn(move || run(config, &state, &gpu, &mixer, &stop))
+                .spawn(move || run(config, &state, &gpu, &mixer, &stop, &seen))
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
         let watchdog = {
@@ -795,6 +804,7 @@ impl Engine {
             mixer,
             text: Arc::new(Mutex::new(TextRenderer::new())),
             stop,
+            seen,
             thread: Some(thread),
             watchdog,
             preview: Mutex::new(HashMap::new()),
@@ -2177,13 +2187,14 @@ impl Engine {
         Ok(())
     }
 
+    /// As of the loop's last frame (it never waits for the frame being made).
     pub fn stats(&self) -> Stats {
-        self.lock().stats
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).0
     }
 
-    /// What stopped the loop or an output, if anything did.
+    /// What stopped the loop or an output, if anything did (as of its last frame).
     pub fn error(&self) -> Option<String> {
-        let own = self.lock().error.clone();
+        let own = self.seen.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
         own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
@@ -2946,7 +2957,14 @@ pub fn raise_this_thread() {
 }
 
 /// The frame loop.
-fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
+fn run(
+    config: EngineConfig,
+    state: &Mutex<State>,
+    gpu: &Compositor,
+    mixer: &Mutex<Mixer>,
+    stop: &AtomicBool,
+    seen: &Seen,
+) {
     on_time();
     let frame_ns = 1_000_000_000 / u64::from(config.fps);
     let mut next = now_ns();
@@ -2964,7 +2982,8 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
         let started = Instant::now();
 
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            frame(&config, state, gpu, mixer, ts, behind, started);
+            let made = frame(&config, state, gpu, mixer, ts, behind, started);
+            *seen.lock().unwrap_or_else(|e| e.into_inner()) = made;
             // Pictures uploaded this frame are sent even when nothing drew (no preview, no
             // output), and what the card finished with is let go: without this, Direct3D and
             // Vulkan keep it all and run out of memory in minutes.
@@ -2985,7 +3004,9 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
             if faults.is_power_of_two() {
                 tracing::error!(why = panic_text(&*p), faults, "the engine caught a fault in a frame and carried on");
             }
-            state.lock().unwrap_or_else(|e| e.into_inner()).stats.recovered += 1;
+            let st = &mut *state.lock().unwrap_or_else(|e| e.into_inner());
+            st.stats.recovered += 1;
+            *seen.lock().unwrap_or_else(|e| e.into_inner()) = (st.stats, st.error.clone());
         }
     }
 }
@@ -3425,7 +3446,7 @@ fn frame(
     ts: u64,
     behind: u64,
     started: Instant,
-) {
+) -> (Stats, Option<String>) {
     let rate = config.sample_rate;
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     st.stats.skipped += behind;
@@ -3670,6 +3691,7 @@ fn frame(
     st.stats.frames += 1;
     st.stats.frame_ms = ms;
     st.stats.worst_ms = st.stats.worst_ms.max(ms);
+    (st.stats, st.error.clone())
 }
 
 #[cfg(test)]
