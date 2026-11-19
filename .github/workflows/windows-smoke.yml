@@ -112,3 +112,21 @@ jobs:
         run: |
           $ff = (Get-Command ffmpeg).Source
           cargo run --locked -p ferrocast-wincam --example camera_check -- --dll target/debug/ferrocast_camera.dll --ffmpeg $ff
+      # Windows 11's camera was refused here (0x80070005, 19 Nov). Its media source is loaded by
+      # the Frame Server service, not by us: can that service read the DLL's folder, is the
+      # camera allowed for desktop apps, do its services run, and what did it log.
+      - name: Why Windows 11's camera was refused (only after a failure)
+        if: failure()
+        shell: pwsh
+        run: |
+          icacls target\debug
+          icacls target\debug\ferrocast_camera.dll
+          $consent = 'Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam'
+          foreach ($k in "HKLM:\$consent", "HKCU:\$consent", "HKCU:\$consent\NonPackaged") {
+            Write-Host "== $k"; Get-ItemProperty $k -ErrorAction SilentlyContinue | Format-List
+          }
+          Get-Service FrameServer, FrameServerMonitor -ErrorAction SilentlyContinue | Format-Table Name, Status, StartType
+          Get-WinEvent -ListLog '*FrameServer*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "== $($_.LogName)"
+            Get-WinEvent -LogName $_.LogName -MaxEvents 20 -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message
+          }
