@@ -268,10 +268,7 @@ impl LiveWatch {
                 format!("mic:{name}"),
                 bad,
                 "error",
-                format!(
-                    "{name} hasn't heard a sound for {} minutes: is it unplugged or muted on the device?",
-                    secs(heard) / 60
-                ),
+                format!("{name} has had no sound for {} min: unplugged or muted?", secs(heard) / 60),
                 format!("{name} hears you again."),
             );
         }
@@ -293,10 +290,7 @@ impl LiveWatch {
                 format!("camera:{name}:black"),
                 black_bad,
                 "error",
-                format!(
-                    "{name} has been black for {} s: is the lens covered, or another app using it?",
-                    secs(dark_since)
-                ),
+                format!("{name} has been black for {} s: lens covered, or used by another app?", secs(dark_since)),
                 format!("{name} has a picture again."),
             );
             let frozen_bad = cfg.camera_frozen_s > 0 && !*black && secs(changed) >= i64::from(cfg.camera_frozen_s);
@@ -305,7 +299,7 @@ impl LiveWatch {
                 format!("camera:{name}:frozen"),
                 frozen_bad,
                 "warn",
-                format!("{name} has shown the very same picture for {} s: it may have frozen.", secs(changed)),
+                format!("{name} shows the same picture for {} s: it may be frozen.", secs(changed)),
                 format!("{name} is moving again."),
             );
         }
@@ -318,7 +312,7 @@ impl LiveWatch {
                 format!("destination:{name}"),
                 bad,
                 "error",
-                format!("{name} hasn't been getting your stream for {} s.", secs(sent)),
+                format!("{name} hasn't received your stream for {} s.", secs(sent)),
                 format!("{name} is getting your stream again."),
             );
         }
@@ -390,13 +384,7 @@ pub fn ready(checks: &[Check]) -> bool {
 /// The disk check, from the free space where recordings go (MB).
 pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
     match free_mb {
-        None => Check::new(
-            "disk",
-            "Disk space",
-            CheckStatus::Skip,
-            "The Studio isn't started, so free space is unknown.",
-            None,
-        ),
+        None => Check::new("disk", "Disk space", CheckStatus::Skip, "Studio isn't started: free space unknown.", None),
         Some(mb) => {
             let gb = mb / 1024.0;
             let label = format!("{gb:.0} GB free where recordings go.");
@@ -405,7 +393,7 @@ pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
                     "disk",
                     "Disk space",
                     CheckStatus::Fail,
-                    format!("{label} Recordings and replays will fail."),
+                    format!("{gb:.0} GB free: recordings and replays will fail."),
                     fix("Free up space", "#/studio/golive"),
                 )
             } else if gb < f64::from(min_gb) {
@@ -413,7 +401,7 @@ pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
                     "disk",
                     "Disk space",
                     CheckStatus::Warn,
-                    format!("{label} Less than the {min_gb} GB you asked for."),
+                    format!("{gb:.0} GB free, less than your {min_gb} GB minimum."),
                     None,
                 )
             } else {
@@ -623,7 +611,7 @@ impl ScenesConfig {
         let asked = asked.trim();
         if asked.is_empty() {
             return Err(if self.chat_allowed.is_empty() {
-                "No scenes are allowed from chat yet (Studio, OBS).".into()
+                "No scenes allowed from chat yet: tick some in Scene control.".into()
             } else {
                 format!("Scenes: {}.", self.chat_allowed.join(", "))
             });

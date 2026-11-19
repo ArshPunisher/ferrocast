@@ -90,22 +90,22 @@ impl HealthMeter {
             (
                 (share(d(s.lagged, first.lagged), d(s.frames, first.frames)) * 400.0).min(40.0),
                 if self.encoder_late_share() >= 0.5 {
-                    "frames are late: the video encoder can't keep up (a lower resolution or frame rate helps)".into()
+                    "the encoder can't keep up: lower the resolution or frame rate".into()
                 } else {
-                    "frames are drawn late: the computer is busy (fewer sources or a lower frame rate helps)".into()
+                    "the computer is busy: use fewer sources or a lower frame rate".into()
                 },
             ),
             (
                 (share(d(s.skipped, first.skipped), d(s.encoded, first.encoded)) * 400.0).min(40.0),
-                "the encoder is falling behind (the hardware encoder or a lower quality helps)".into(),
+                "the encoder is behind: use the hardware encoder or lower quality".into(),
             ),
             (
                 (share(d(s.dropped, first.dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "frames are dropped on the way out: the upload is struggling".into(),
+                "the upload is struggling: frames are dropped".into(),
             ),
             (
                 (share(d(s.net_dropped, first.net_dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "a platform is losing packets: the upload is struggling".into(),
+                "the upload is struggling: a platform is losing packets".into(),
             ),
         ];
         if s.reconnecting {
@@ -117,7 +117,7 @@ impl HealthMeter {
         if s.quality_pct < 100 {
             costs.push((
                 f64::from(100 - s.quality_pct) / 3.0,
-                format!("quality is lowered to {}% to stay smooth", s.quality_pct),
+                format!("quality is at {}% to stay smooth", s.quality_pct),
             ));
         }
         if s.cpu > 85.0 {
@@ -203,7 +203,7 @@ mod tests {
             m.push(look(0, 0, 0));
             m.push(look(1, 30, busy)).reason.unwrap_or_default()
         };
-        assert!(late(1800).contains("video encoder"), "{}", late(1800));
+        assert!(late(1800).contains("the encoder can't keep up"), "{}", late(1800));
         assert!(late(400).contains("the computer is busy"), "{}", late(400));
         // Late frames from a busy computer aren't the encoder's because it's busy afterwards.
         let mut m = HealthMeter::default();
