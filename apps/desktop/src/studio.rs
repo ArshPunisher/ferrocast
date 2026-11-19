@@ -39,6 +39,9 @@ use crate::studio_library::{self as library, Kind};
 #[derive(Default)]
 struct Held {
     collection: Option<Collection>,
+    /// True in Safe Mode when a temporary empty collection is running until the user confirms
+    /// loading the saved collection; guards against overwriting the saved file on disk.
+    collection_deferred: bool,
     preview: Option<Preview>,
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
@@ -641,9 +644,10 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
         c.stop_follow(&f);
     }
     let old = h.collection.take().map(|c| {
-        save(&c, from);
+        save_confirmed(h.collection_deferred, &c, from);
         c.save(COLLECTION)
     });
+    let was_deferred = h.collection_deferred;
     h.history.clear();
     h.selected = None;
     h.frames = None;
@@ -657,7 +661,8 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     let made = load_collection_doc(canvas, to);
     match made {
         Ok(c) => {
-            save(&c, to);
+            h.collection_deferred = false;
+            save_confirmed(false, &c, to);
             c.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             c.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(c);
@@ -666,6 +671,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
             Ok(())
         }
         Err(e) => {
+            h.collection_deferred = was_deferred;
             if let Some(old) = old {
                 h.collection = Collection::load(canvas, &old, FIRST_SCENE).ok();
             }
@@ -1304,8 +1310,12 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
     }
 }
 
-/// Writes the collection next to the plugins' config, atomically with `.bak` backup.
-fn save(c: &Collection, file: &std::path::Path) {
+/// Writes the collection atomically with `.bak` backup unless collection loading is deferred in
+/// Safe Mode (so the temporary blank collection never overwrites saved scenes on disk).
+fn save_confirmed(deferred: bool, c: &Collection, file: &std::path::Path) {
+    if deferred {
+        return;
+    }
     let doc = c.save(COLLECTION);
     if let Err(e) = ferrocast_store::durable::save_json_pretty(file, &doc) {
         tracing::warn!(error = %e, file = %file.display(), "the Studio's scenes couldn't be saved");
@@ -1568,6 +1578,7 @@ impl DesktopStudio {
             renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
             detail: None,
             recovered: None,
+            safe_mode: None,
         }
     }
 }
@@ -1650,6 +1661,10 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn start(&self) -> Result<StudioStatus, String> {
+        self.start_with_mode(true).await
+    }
+
+    async fn start_with_mode(&self, load_collection: bool) -> Result<StudioStatus, String> {
         #[cfg(windows)]
         fetch_matte(self.data.clone());
         let config = self.data.join("studio");
@@ -1665,14 +1680,20 @@ impl StudioHost for DesktopStudio {
             let _ = &config;
             h.renderer = "ferrocast";
             let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-            // The saved scenes (falling back to `.bak` if unreadable), or one empty scene the first time.
-            let collection = load_collection_doc(canvas, &file).map_err(|e| e.to_string())?;
+            let collection = if load_collection {
+                h.collection_deferred = false;
+                load_collection_doc(canvas, &file).map_err(|e| e.to_string())?
+            } else {
+                // Safe Mode: start cleanly without loading the saved collection until confirmed.
+                h.collection_deferred = true;
+                Collection::new(canvas, FIRST_SCENE).map_err(|e| e.to_string())?
+            };
             if let Some((name, id)) = &s.monitoring
                 && let Err(e) = collection.set_monitoring_device(name, id)
             {
                 tracing::warn!(error = %e, "the listening device is gone; using the system's");
             }
-            save(&collection, &file);
+            save_confirmed(h.collection_deferred, &collection, &file);
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
@@ -1684,10 +1705,24 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn confirm_collection(&self) -> Result<StudioStatus, String> {
+        let data = self.data.clone();
+        self.on_main(move |h| {
+            let file = scenes_file(&data);
+            if h.collection.is_some() {
+                swap_collection(h, &file, &file)?;
+                write_session(session_now(h).as_ref());
+            }
+            Ok(Self::status_of(h))
+        })
+        .await?
+    }
+
     async fn stop(&self) -> Result<StudioStatus, String> {
         let data = self.data.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
+            let deferred = h.collection_deferred;
             // The stream, the recording, the preview and the scenes go (saved first); the engine
             // stays loaded for the next Start.
             h.vstream = None;
@@ -1710,8 +1745,9 @@ impl StudioHost for DesktopStudio {
                 c.stop_follow(&f);
             }
             if let Some(c) = h.collection.take() {
-                save(&c, &file);
+                save_confirmed(deferred, &c, &file);
             }
+            h.collection_deferred = false;
             write_session(None);
             Self::status_of(h)
         })
@@ -2019,7 +2055,7 @@ impl StudioHost for DesktopStudio {
                         let c = h.collection.as_ref().ok_or(STOPPED)?;
                         c.update_filter(&n, &f, &json!({ "state": state })).map_err(|e| e.to_string())?;
                         // Written now: a crash right after keeps what was saved (CodeRabbit).
-                        save(c, &scenes_file(&data));
+                        save_confirmed(h.collection_deferred, c, &scenes_file(&data));
                         Ok(())
                     })
                     .await??;
@@ -2152,7 +2188,7 @@ impl StudioHost for DesktopStudio {
                 // A scene that came back or went changes what the pictures show.
                 sync_views(h);
                 let done = done?;
-                save(c, &file);
+                save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
                 let (undo, redo) = h.history.labels();
                 return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
@@ -2183,7 +2219,7 @@ impl StudioHost for DesktopStudio {
             }
             sync_views(h);
             if changes && out.is_ok() {
-                save(c, &file);
+                save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
             }
             out
@@ -2325,7 +2361,7 @@ impl StudioHost for DesktopStudio {
                 // A captured window resized keeps its shape on the canvas (and stays so after
                 // a restart).
                 if c.follow_sizes() {
-                    save(c, &scenes_file(&data));
+                    save_confirmed(h.collection_deferred, c, &scenes_file(&data));
                 }
             }
             let disk_free = {
@@ -2499,7 +2535,7 @@ impl StudioHost for DesktopStudio {
                     c.add_source(&scene, "ffmpeg_source", &source, &settings, false).map_err(|e| e.to_string())?;
                 c.edit_item(&scene, item.id, ItemEdit::Hide).map_err(|e| e.to_string())?;
             }
-            save(c, &scenes_file(&data));
+            save_confirmed(h.collection_deferred, c, &scenes_file(&data));
             // The connection whose source this was, if any, is over.
             h.guests.retain(|(_, s, _)| *s != source);
             h.guests.push((name, source, guest));
@@ -3063,7 +3099,7 @@ impl StudioHost for DesktopStudio {
                     let f = file.clone();
                     self.on_main(move |h| {
                         if let Some(c) = &h.collection {
-                            save(c, &f);
+                            save_confirmed(h.collection_deferred, c, &f);
                         }
                     })
                     .await?;
@@ -3097,7 +3133,7 @@ impl StudioHost for DesktopStudio {
                         let f = from.clone();
                         self.on_main(move |h| {
                             if let Some(c) = &h.collection {
-                                save(c, &f);
+                                save_confirmed(h.collection_deferred, c, &f);
                             }
                         })
                         .await?;
@@ -3739,5 +3775,25 @@ mod budget_tests {
         // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
         save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
         assert_eq!((load_settings(dir.path()).width, load_settings(dir.path()).fps), (2560, 60));
+    }
+
+    #[test]
+    fn deferred_safe_mode_collection_never_overwrites_saved_scenes() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let scenes_path = scenes_file(dir.path());
+        let saved_doc = json!({
+            "current_scene": "Main Show",
+            "scene_order": [{ "name": "Main Show" }]
+        });
+        save_json(&scenes_path, &saved_doc);
+
+        if let Ok(temp_blank) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) {
+            // While `collection_deferred` is true (Safe Mode before user confirm), save_confirmed is a no-op.
+            save_confirmed(true, &temp_blank, &scenes_path);
+            let still_on_disk: Value =
+                serde_json::from_slice(&std::fs::read(&scenes_path).unwrap_or_else(|e| panic!("{e}")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(still_on_disk["current_scene"], "Main Show");
+        }
     }
 }
