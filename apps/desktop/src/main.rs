@@ -52,6 +52,9 @@ const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct Shell {
     close_to_tray: AtomicBool,
+    /// The tray icon was made. Without one, closing the window quits: hidden, nothing could
+    /// bring it back.
+    has_tray: AtomicBool,
     panic_shortcut: Mutex<Option<Shortcut>>,
 }
 
@@ -172,10 +175,16 @@ fn main() {
             let shell = Arc::new(Shell::default());
             shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
             app.manage(shell.clone());
-            build_tray(app.handle())?;
+            // A desktop with no tray, or its icon file not writable (Linux, 19 Nov: a second
+            // user's start panicked on the first one's /tmp/tray-icon), runs without the tray.
+            match build_tray(app.handle()) {
+                Ok(()) => shell.has_tray.store(true, Ordering::Relaxed),
+                Err(e) => tracing::warn!(error = %e, "no tray icon: Ferrocast runs without it, and closing quits"),
+            }
             if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
                 tracing::warn!(error = %e, "couldn't register the show-window shortcut (another app may use it)");
             }
+            let has_tray = shell.has_tray.load(Ordering::Relaxed);
             tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
             if store::packaged() {
                 // Store installs get new versions from the Store (its rules, and the package
@@ -188,7 +197,8 @@ fn main() {
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
-            if !minimized {
+            // Started minimized (at login) with no tray: shown, or nothing could bring it up.
+            if !minimized || !has_tray {
                 show_window(app.handle());
             }
             Ok(())
@@ -204,7 +214,9 @@ fn main() {
             {
                 let app = window.app_handle();
                 let _ = app.save_window_state(StateFlags::all());
-                let to_tray = app.try_state::<Arc<Shell>>().is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed));
+                let to_tray = app
+                    .try_state::<Arc<Shell>>()
+                    .is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed));
                 if to_tray {
                     // Closing hides: the engine keeps alerts and the bot running from the tray.
                     api.prevent_close();
@@ -804,6 +816,15 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&quit)
         .build()?;
     let mut tray = TrayIconBuilder::with_id("main").tooltip("Ferrocast").menu(&menu).show_menu_on_left_click(true);
+    // Linux writes the tray's icon to a file: ours under this user's data, never the shared
+    // /tmp/tray-icon (owned by whoever started an app with a tray first) when there's no
+    // XDG_RUNTIME_DIR.
+    #[cfg(target_os = "linux")]
+    {
+        let dir = data_dir().join("tray");
+        let _ = std::fs::create_dir_all(&dir);
+        tray = tray.temp_dir_path(dir);
+    }
     // macOS: a black template image of the mark, so the menu bar tints it for light, dark and
     // highlighted states. Elsewhere the tray shows the app icon.
     #[cfg(target_os = "macos")]
