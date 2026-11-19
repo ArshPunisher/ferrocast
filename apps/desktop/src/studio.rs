@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
     CaptionsSet, FilePick, FilterEdit, FollowSet, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq,
-    STOPPED, ShelfAct, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
 // The Studio's scenes kept by Ferrocast's own engine (ENGINE.md step 3): no libobs.
 use ferrocast_studio::stage::Stage as Collection;
@@ -115,6 +115,8 @@ struct Held {
     follow_run: u64,
     /// Auto quality's share of the set bitrate on the stream now (None: all of it).
     live_pct: Option<u8>,
+    /// Shared-stream ceiling pushed by Go live (Twitch 6,000 / Kick 8,000 kbps H.264 2 s).
+    stream_cap: Option<StreamCap>,
 }
 
 /// `kbps` at auto quality's share `pct` (the floor a stream never goes under: 300).
@@ -332,6 +334,7 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
         video_encoder: chosen.cloned().unwrap_or_else(|| hardware.unwrap_or("obs_x264").into()),
         video_kbps: s.video_kbps,
         vbr: s.vbr,
+        strict_cbr: false,
         quality: None,
         keyframe_s: s.keyframe_s,
         profile: s.profile.clone(),
@@ -428,12 +431,12 @@ fn light_size(width: u32, height: u32) -> Option<(u32, u32)> {
     })
 }
 
-fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value {
+fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32>, also: Also) -> Value {
     let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
     let canvas = mpx(s.width, s.height);
     // Only the video encoder's own encodes count: x264 (software, Lossless) runs on the CPU.
     let hardware = |id: &str| !id.to_ascii_lowercase().contains("x264");
-    let mut stream = stream_settings(s);
+    let mut stream = stream_settings(s, cap);
     // Twitch Enhanced Broadcasting's qualities: Twitch's plan sets them when the stream starts;
     // about 720p and 480p beside the main one (projects-60).
     if also.enhanced {
@@ -485,11 +488,50 @@ fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value 
     })
 }
 
+/// Replaces any HEVC/H.265 encoder id with its H.264 counterpart when a destination requires H.264.
+fn h264_encoder_for(id: &str) -> String {
+    let low = id.to_ascii_lowercase();
+    if !low.contains("hevc") && !low.contains("h265") {
+        return id.to_string();
+    }
+    if let Some(prefix) = id.strip_suffix(".hevc") {
+        format!("{prefix}.avc")
+    } else if cfg!(target_os = "macos") {
+        "com.apple.videotoolbox.videoencoder.ave.avc".into()
+    } else {
+        "ffmpeg_hardware".into()
+    }
+}
+
+/// Effective encode settings for the main stream after clamping to `cap` (if any) and `live_pct`.
+fn effective_stream_encode(s: &StudioSettings, cap: Option<StreamCap>, live_pct: Option<u8>) -> EncodeSettings {
+    let mut e = encode_of(s);
+    if let Some(cap) = cap {
+        e.video_kbps = e.video_kbps.min(cap.max_kbps);
+        if cap.h264_only {
+            e.video_encoder = h264_encoder_for(&e.video_encoder);
+        }
+        if cap.keyframe_secs > 0 {
+            e.keyframe_s = cap.keyframe_secs;
+        }
+        // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
+        e.vbr = false;
+        e.strict_cbr = true;
+    }
+    e.video_kbps = at_pct(e.video_kbps, live_pct);
+    e
+}
+
+fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
+    let normalize = |e: &EncodeSettings| EncodeSettings { video_kbps: 0, audio_kbps: 0, ..e.clone() };
+    normalize(a) != normalize(b)
+}
+
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
-/// viewers get (Twitch takes up to 6000 kbps; Kick refuses over 8000, 25 Oct).
-fn stream_settings(s: &StudioSettings) -> StreamSettings {
+/// viewers get (capped when Twitch or Kick is active).
+fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings {
     StreamSettings {
-        encode: encode_of(s),
+        encode: effective_stream_encode(s, cap, None),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
         delay_s: s.delay_s,
         vod_track: (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track),
@@ -2240,23 +2282,15 @@ impl StudioHost for DesktopStudio {
                 // The stream on air takes a new encoder, size or frame rate at once, without
                 // stopping; a new bitrate alone just changes the bitrate.
                 let was = h.settings.clone();
+                let was_encode = was.as_ref().map(|o| effective_stream_encode(o, h.stream_cap, h.live_pct));
+                let encode = effective_stream_encode(&s, h.stream_cap, h.live_pct);
                 // What changed besides the bitrate: the encoder, its options, the size, the rate.
                 let shape_changed = was.as_ref().is_some_and(|o| {
-                    let (mut a, mut b) = (encode_of(o), encode_of(&s));
-                    a.video_kbps = 0;
-                    b.video_kbps = 0;
-                    // The sound's bitrate isn't changed live (a new video encoder for it was a
-                    // hiccup for nothing): it's for the next stream.
-                    a.audio_kbps = 0;
-                    b.audio_kbps = 0;
-                    a != b || o.fps != s.fps
+                    was_encode.as_ref().is_some_and(|a| shape_differs(a, &encode)) || o.fps != s.fps
                 });
-                // At auto quality's share, as the stream was (a full bitrate here, then the
-                // next step up from 70% would have lowered it).
-                let kbps = at_pct(s.video_kbps, h.live_pct);
+                let kbps = encode.video_kbps;
                 let reshaped = match h.stream.as_ref() {
                     Some(st) if live && shape_changed => {
-                        let encode = EncodeSettings { video_kbps: kbps, ..encode_of(&s) };
                         match st.reshape(&encode, s.fps) {
                             Ok(()) => {
                                 // What it runs with now: a recording "Same as stream" started
@@ -2280,11 +2314,11 @@ impl StudioHost for DesktopStudio {
                 }
                 let was_kbps = was.as_ref().map(|o| o.video_kbps);
                 if was_kbps.is_some_and(|k| k != s.video_kbps) {
-                    // The vertical picture's stream uses the same bitrate (CodeRabbit); the main
-                    // one has it already when it was reshaped.
-                    let main = if reshaped { None } else { h.stream.as_mut() };
-                    for st in [main, h.vstream.as_mut()].into_iter().flatten() {
+                    if !reshaped && let Some(st) = h.stream.as_mut() {
                         st.set_video_kbps(kbps);
+                    }
+                    if let Some(st) = h.vstream.as_mut() {
+                        st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
@@ -2880,13 +2914,52 @@ impl StudioHost for DesktopStudio {
         .map_err(|e| e.to_string())
     }
 
+    async fn set_stream_cap(&self, cap: Option<StreamCap>) -> Result<(), String> {
+        self.on_main(move |h| {
+            if h.stream_cap == cap {
+                return;
+            }
+            h.stream_cap = cap;
+            if !h.stream.as_ref().is_some_and(|s| s.stats().active) {
+                return;
+            }
+            let s = h.settings.clone().unwrap_or_default();
+            let target = effective_stream_encode(&s, cap, h.live_pct);
+            let cur_encode = h.stream_with.as_ref().map(|w| &w.encode);
+            if cur_encode.is_some_and(|prev| shape_differs(prev, &target)) {
+                if let Some(st) = h.stream.as_ref() {
+                    match st.reshape(&target, s.fps) {
+                        Ok(()) => {
+                            if let Some(w) = h.stream_with.as_mut() {
+                                w.encode = target;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "couldn't reshape stream for updated platform cap"),
+                    }
+                }
+            } else if cur_encode.is_none_or(|prev| prev.video_kbps != target.video_kbps)
+                && let Some(st) = h.stream.as_mut()
+            {
+                st.set_video_kbps(target.video_kbps);
+                if let Some(w) = h.stream_with.as_mut() {
+                    w.encode.video_kbps = target.video_kbps;
+                }
+            }
+        })
+        .await
+    }
+
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
         self.on_main(move |h| {
             let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
+            let capped = h.stream_cap.map_or(set, |c| set.min(c.max_kbps));
             h.live_pct = (pct < 100).then_some(pct);
-            let kbps = at_pct(set, h.live_pct);
-            for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
+            let kbps = at_pct(capped, h.live_pct);
+            if let Some(st) = h.stream.as_mut() {
                 st.set_video_kbps(kbps);
+            }
+            if let Some(st) = h.vstream.as_mut() {
+                st.set_video_kbps(at_pct(set, h.live_pct));
             }
             // The lighter stream (3,000 kbps at most) comes down with it.
             if let Some(l) = h.lstream.as_mut() {
@@ -3231,10 +3304,10 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
         // (one that failed isn't an encode; CodeRabbit).
-        let (saved, replay) = self
+        let (saved, replay, cap) = self
             .on_main(move |h| {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
-                (s, h.replay.as_ref().is_some_and(|r| r.active()))
+                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap)
             })
             .await?;
         let s = match draft {
@@ -3242,7 +3315,7 @@ impl StudioHost for DesktopStudio {
             None => saved,
         };
         let also = Also { enhanced, light, replay: replay || s.replay_when_streaming };
-        Ok(encode_budget(&s, ferrocast_studio::system::video_engines(), also))
+        Ok(encode_budget(&s, cap, ferrocast_studio::system::video_engines(), also))
     }
 
     async fn screen_access(&self) -> Result<Value, String> {
@@ -3363,7 +3436,7 @@ impl StudioHost for DesktopStudio {
             // A frame rate chosen during the last stream, still waiting.
             apply_waiting_canvas(&app, h);
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s);
+            let mut settings = stream_settings(&s, h.stream_cap);
             settings.video_tracks = tracks;
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, qualities = settings.video_tracks.len() + 1, "the Studio starts streaming into Go live");
             // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
@@ -3427,7 +3500,7 @@ impl StudioHost for DesktopStudio {
             }
             h.lstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s);
+            let mut settings = stream_settings(&s, None);
             // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
             let canvas = studio.canvas();
             settings.encode.scale = light_size(canvas.width, canvas.height);
@@ -3466,7 +3539,7 @@ impl StudioHost for DesktopStudio {
             }
             h.vstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let settings = stream_settings(&s);
+            let settings = stream_settings(&s, None);
             tracing::info!(
                 kbps = settings.encode.video_kbps,
                 "the Studio's vertical picture starts streaming into Go live"
@@ -3674,35 +3747,63 @@ mod budget_tests {
             record_quality: quality.into(),
             ..StudioSettings::default()
         };
-        let level =
-            |s: &StudioSettings| encode_budget(s, Some(1), Also::default())["level"].as_str().unwrap_or("").to_string();
+        let level = |s: &StudioSettings| {
+            encode_budget(s, None, Some(1), Also::default())["level"].as_str().unwrap_or("").to_string()
+        };
         assert_eq!(level(&at(3840, 2160, 60, "high")), "over");
         // One 4K60 encode is all one engine does (1.0x): at the limit, but holding its 60.
-        let shared = encode_budget(&at(3840, 2160, 60, "stream"), Some(1), Also::default());
+        let shared = encode_budget(&at(3840, 2160, 60, "stream"), None, Some(1), Also::default());
         assert_eq!((shared["shared"].as_bool(), shared["level"].as_str()), (Some(true), Some("limit")), "{shared}");
         assert_eq!(level(&at(3840, 2160, 30, "high")), "limit");
         assert_eq!(level(&at(2560, 1440, 60, "high")), "ok");
         // A Max's two engines: two 4K60 encodes fill them, two 4K30 fit.
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), Some(2), Also::default())["level"], "limit");
-        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), Some(2), Also::default())["level"], "ok");
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, Also::default())["level"], "unknown");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, Some(2), Also::default())["level"], "limit");
+        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), None, Some(2), Also::default())["level"], "ok");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, None, Also::default())["level"], "unknown");
         let mut two = at(3840, 2160, 60, "stream");
         two.record_tracks = vec![1, 2];
-        let b = encode_budget(&two, Some(1), Also::default());
+        let b = encode_budget(&two, None, Some(1), Also::default());
         assert_eq!(b["level"], "over");
         assert!(b["why_not_shared"].as_str().is_some_and(|w| w.contains("2 sound tracks")), "{b}");
         // projects-60's gaps: Twitch's qualities can't share and add encodes; the replay buffer
         // is its own encode; x264 (Lossless) isn't the video encoder's.
         let same = at(3840, 2160, 60, "stream");
-        let eb = encode_budget(&same, Some(1), Also { enhanced: true, ..Also::default() });
+        let eb = encode_budget(&same, None, Some(1), Also { enhanced: true, ..Also::default() });
         assert_eq!((eb["shared"].as_bool(), eb["level"].as_str()), (Some(false), Some("over")), "{eb}");
-        let replay = encode_budget(&same, Some(1), Also { replay: true, ..Also::default() });
+        let replay = encode_budget(&same, None, Some(1), Also { replay: true, ..Also::default() });
         assert_eq!(replay["level"], "over", "{replay}");
-        let lossless = encode_budget(&at(3840, 2160, 60, "lossless"), Some(1), Also::default());
+        let lossless = encode_budget(&at(3840, 2160, 60, "lossless"), None, Some(1), Also::default());
         assert_eq!(
             (lossless["record_mpx"].as_f64(), lossless["level"].as_str()),
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    #[test]
+    fn twitch_cap_clamps_encode_forces_h264_2s_strict_cbr_and_clamps_auto_quality() {
+        let mut s = StudioSettings {
+            video_kbps: 14_000,
+            vbr: true,
+            keyframe_s: 4,
+            video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.hevc".into()),
+            ..StudioSettings::default()
+        };
+        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let capped = effective_stream_encode(&s, Some(twitch), None);
+        assert_eq!(capped.video_kbps, 6_000);
+        assert!(!capped.vbr, "CBR forced when capped");
+        assert!(capped.strict_cbr, "strict 1x VBV / DataRateLimits enabled");
+        assert_eq!(capped.keyframe_s, 2);
+        assert!(!capped.video_encoder.to_ascii_lowercase().contains("hevc"), "{}", capped.video_encoder);
+
+        // Auto quality scales the capped ceiling (6,000), never 14,000, and recovery returns to 6,000.
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(75)).video_kbps, 4_500);
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(100)).video_kbps, 6_000);
+
+        // A user setting already below the cap scales from its own bitrate.
+        s.video_kbps = 4_500;
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(50)).video_kbps, 2_250);
+        assert_eq!(effective_stream_encode(&s, None, None).video_kbps, 4_500);
     }
 }

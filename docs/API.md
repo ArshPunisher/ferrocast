@@ -851,9 +851,13 @@ type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                        then the default again; this names the one in use ("iPhone USB"). Back to the default when the stream ends */ }
 type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
+type RuleNotice = { code: "bitrate" | "codec" | "keyint"; summary: string; detail: string; fix_kbps?: number }
+type CappedInfo = { kbps: number; resolution?: [number, number]; separate_encode: boolean; summary: string; detail: string }
 type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;
                          enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
-                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks */;
+                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks (legacy strings) */;
+                         issues?: RuleNotice[] /* structured rules broken by the active stream (Contract C-2) */;
+                         capped?: CappedInfo /* calm badge when Studio fits the shared stream to Twitch/Kick limits (Contract C-2) */;
                          lighter_for_route?: true /* on the lighter stream for now: its route fell behind while the others kept up
                                                      (RTMP on the main picture, while the Studio streams). It tries the full stream
                                                      again after 2 min, doubling up to 20 min if it comes back down within 5 */;
@@ -874,6 +878,7 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
 type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number /* 2–30, 4 */; calm_s: number /* 5–120, 10 */;
                             first_pause_s: number /* 10–3600, 60 */; max_pause_s: number /* ≥ first, ≤ 7200; 600 */; first_to_pause: string | null };
                   keep_free_pct: number /* 0–50, 20: the upload check's reserve */; port: number /* the local server's, from the next start */;
+                  ignore_service_limits?: boolean /* false: let Studio stream past Twitch/Kick limits without auto-capping (C-6) */;
                   per: { [destination id]: { server: string | null /* a platform's own address instead (region, rtmp or rtmps) */;
                                              first_retry_s: number /* 1–30 */; max_retry_s: number /* ≥ first, ≤ 600 */;
                                              backup?: string /* another destination's id: it waits on standby (ticked or not) and sends

@@ -94,6 +94,7 @@ fn rate_of(e: &EncodeSettings) -> RateControl {
         Some(q) if is_x264(&e.video_encoder) => RateControl::Crf(q.min(51) as u8),
         Some(q) => RateControl::Quality((100 - q.min(51) * 100 / 51) as f32 / 100.0),
         None if e.vbr => RateControl::Average,
+        None if e.strict_cbr => RateControl::CappedCbr,
         None => RateControl::Cbr,
     }
 }
@@ -1371,6 +1372,9 @@ mod tests {
         assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
         cq.encode.quality = None;
         assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
+        cq.encode.strict_cbr = true;
+        assert_eq!(rate_of(&cq.encode), RateControl::CappedCbr);
+        cq.encode.strict_cbr = false;
         // Lossless: x264 at rate factor 0.
         cq.encode.video_encoder = "obs_x264".into();
         cq.encode.quality = Some(0);

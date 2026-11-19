@@ -17,6 +17,7 @@ pub use ferrocast_golive::cut::{CutBox, CutConfig, Layout};
 pub use ferrocast_golive::cutter::CutState as CutStateView;
 use ferrocast_golive::cutter::CutState;
 use ferrocast_golive::probe::{self, Need, Service, TWITCH_BANDWIDTH_TEST};
+pub use ferrocast_golive::probe::{CappedInfo, PlatformLimit, RuleCode, RuleNotice};
 use ferrocast_golive::{Destination, Health, Hub, Ingest, PushState, StreamStats, Target, Verdict};
 use ferrocast_obs::control::{self as obs, StreamService};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,9 @@ pub struct Advanced {
     pub port: u16,
     /// Per destination: its own server address and retry timing.
     pub per: HashMap<String, DestAdvanced>,
+    /// Power-user override matching OBS `IgnoreRecommended` (C-6): disables automatic Twitch/Kick
+    /// Studio encoding caps so the user's configured bitrate/codec go out untouched.
+    pub ignore_service_limits: bool,
 }
 
 impl Default for Advanced {
@@ -174,6 +178,7 @@ impl Default for Advanced {
             keep_free_pct: 20,
             port: ferrocast_golive::ingest::DEFAULT_PORT,
             per: HashMap::new(),
+            ignore_service_limits: false,
         }
     }
 }
@@ -457,8 +462,14 @@ pub struct DestinationView {
     pub health: Option<Health>,
     /// Why this destination can't start (no account, a missing permission), in words.
     pub blocked: Option<String>,
-    /// Its rules broken by the stream OBS is sending.
+    /// Its rules broken by the stream OBS is sending (kept in sync with `issues` for older clients).
     pub rules: Vec<String>,
+    /// Structured rules broken by the active stream (Contract C-2).
+    #[serde(default)]
+    pub issues: Vec<RuleNotice>,
+    /// Calm cap badge shown when Studio fits its shared encode to Twitch/Kick limits (Contract C-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capped: Option<CappedInfo>,
     /// Sent straight from the Ferrocast Studio by this protocol ("srt", "rist", "whip");
     /// absent for RTMP.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -522,6 +533,29 @@ pub(crate) struct GoLive {
     tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
     /// Twitch Enhanced Broadcasting's plan for the stream on now (None: a normal stream).
     pub(crate) enhanced: Mutex<Option<ferrocast_golive::twitch_eb::Plan>>,
+    /// Cached Studio encode settings so `view_with` can build the C-2 cap badge synchronously.
+    studio_video: Mutex<Option<StudioCapConfig>>,
+    /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
+    studio_live: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StudioCapConfig {
+    video_kbps: u32,
+    is_hevc: bool,
+    keyframe_s: u32,
+    vbr: bool,
+}
+
+impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
+    fn from(s: &crate::studio_host::StudioSettings) -> Self {
+        Self {
+            video_kbps: s.video_kbps,
+            is_hevc: s.video_encoder.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("hevc")),
+            keyframe_s: s.keyframe_s,
+            vbr: s.vbr,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -563,6 +597,8 @@ impl Default for GoLive {
             quality: Mutex::new(Default::default()),
             tested: Mutex::new(HashMap::new()),
             enhanced: Mutex::new(None),
+            studio_video: Mutex::new(None),
+            studio_live: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -654,7 +690,7 @@ fn refused(code: &'static str, message: impl Into<String>, hint: impl Into<Strin
 }
 
 impl Engine {
-    fn golive(&self) -> &GoLive {
+    pub(crate) fn golive(&self) -> &GoLive {
         &self.inner.golive
     }
 
@@ -865,8 +901,54 @@ impl Engine {
         self.golive().cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    pub(crate) fn note_studio_settings(&self, s: &crate::studio_host::StudioSettings) {
+        *lock(&self.golive().studio_video) = Some(StudioCapConfig::from(s));
+    }
+
+    pub(crate) fn set_studio_live(&self, on: bool) {
+        self.golive().studio_live.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Active platform ceiling for Studio's shared main stream (Twitch 6,000 kbps / Kick
+    /// 8,000 kbps H.264 2 s), or `None` when disabled by `ignore_service_limits`, Enhanced
+    /// Broadcasting, manual light routing, or when only uncapped destinations are enabled.
+    pub fn studio_limit(&self) -> Option<PlatformLimit> {
+        let cfg = self.golive_config();
+        if cfg.advanced.ignore_service_limits {
+            return None;
+        }
+        probe::effective_limit(
+            cfg.destinations
+                .iter()
+                .filter(|d| {
+                    d.enabled
+                        && d.canvas == Canvas::Main
+                        && d.url.as_deref().and_then(direct_kind).is_none()
+                        && !d.wants_light()
+                })
+                .map(|d| (d.kind, d.enhanced)),
+        )
+    }
+
+    pub(crate) async fn sync_stream_cap(&self) {
+        let Ok(host) = self.studio_host() else { return };
+        let cap = self.studio_limit().map(|l| crate::studio_host::StreamCap {
+            max_kbps: l.max_kbps,
+            h264_only: l.h264_only,
+            keyframe_secs: l.keyframe_secs,
+        });
+        if let Err(e) = host.set_stream_cap(cap).await {
+            tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
+        }
+    }
+
     /// The Go live tab: destinations with their health, OBS's setting, the stream's numbers.
     pub async fn golive_view(&self) -> GoLiveView {
+        if lock(&self.golive().studio_video).is_none()
+            && let Ok(host) = self.studio_host()
+        {
+            self.note_studio_settings(&host.settings().await);
+        }
         let ingest = lock(&self.golive().ingest).clone();
         let obs = self.golive_obs_view(ingest.as_deref()).await;
         self.view_with(ingest, obs)
@@ -884,6 +966,9 @@ impl Engine {
         let blocked = lock(&g.blocked);
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
+        let eff_limit = self.studio_limit();
+        let studio_cfg = *lock(&g.studio_video);
+        let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
         let destinations = cfg
             .destinations
             .iter()
@@ -901,6 +986,29 @@ impl Engine {
                         }),
                     ),
                 };
+                let dest_stats = self.hub_of(d).stats();
+                let mut issues =
+                    if d.enabled { probe::rules_structured(&dest_stats, d.kind, d.enhanced) } else { Vec::new() };
+                let capped = if d.enabled
+                    && d.canvas == Canvas::Main
+                    && d.url.as_deref().and_then(direct_kind).is_none()
+                    && !d.enhanced
+                    && !d.wants_light()
+                    && (!live || studio_streaming)
+                    && let Some(limit) = eff_limit
+                    && probe::ceiling(d.kind, d.enhanced).is_some()
+                    && let Some(sv) = studio_cfg
+                {
+                    probe::capped_info(limit, sv.video_kbps, sv.is_hevc, sv.keyframe_s, sv.vbr)
+                } else {
+                    None
+                };
+                if capped.is_some() && studio_streaming && !self.on_light(d) {
+                    // Studio is holding the shared encode at the platform ceiling with 1x VBV /
+                    // DataRateLimits; suppress stale/rounding bitrate warnings mid-stream.
+                    issues.clear();
+                }
+                let rules = issues.iter().map(|i| i.detail.clone()).collect();
                 DestinationView {
                     id: d.id.clone(),
                     kind: d.kind,
@@ -914,11 +1022,9 @@ impl Engine {
                         .map(|r| r.health.borrow().clone())
                         .or_else(|| paused.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
-                    rules: match (d.enabled, d.canvas) {
-                        (false, _) => Vec::new(),
-                        (true, Canvas::Main) => probe::rules(&stats, d.kind),
-                        (true, Canvas::Vertical) => probe::rules(&vertical_stats, d.kind),
-                    },
+                    rules,
+                    issues,
+                    capped,
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
                     enhanced: d.enhanced,
@@ -1316,6 +1422,7 @@ impl Engine {
             d.enhanced = on;
             self.save_golive(cfg.clone()).await?;
         }
+        self.sync_stream_cap().await;
         Ok(cfg)
     }
 
@@ -1836,6 +1943,7 @@ impl Engine {
         // The Studio's vertical and lighter streams follow the ticked platforms and the source.
         self.studio_sync_vertical().await;
         self.studio_sync_light().await;
+        self.sync_stream_cap().await;
         self.send_golive();
     }
 
@@ -1915,6 +2023,7 @@ impl Engine {
         if rules_changed {
             lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
         }
+        self.sync_stream_cap().await;
         Ok(cfg)
     }
 
@@ -2345,6 +2454,9 @@ pub(crate) async fn run(engine: Engine) {
             let now = (main.borrow_and_update().on, vertical.borrow_and_update().on);
             if now.0 != was.0 {
                 tracing::info!(live = now.0, "Go live: the stream changed");
+                if !now.0 {
+                    g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                }
             }
             if now.1 != was.1 {
                 tracing::info!(live = now.1, "Go live: the vertical stream changed");

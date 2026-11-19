@@ -619,7 +619,7 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             "-color_trc".into(),
             "bt709".into(),
         ]);
-        let cbr = matches!(cfg.rate, RateControl::Cbr);
+        let cbr = matches!(cfg.rate, RateControl::Cbr | RateControl::CappedCbr);
         // Constant quality on libobs's scale, 0 (best) … 51, from the 0-1 the engine carries.
         let cq = match cfg.rate {
             RateControl::Quality(f) => Some((((1.0 - f.clamp(0.0, 1.0)) * 51.0).round() as u32).clamp(1, 51)),
@@ -632,9 +632,10 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             (_, Some(_)) if enc != "h264_videotoolbox" => {}
             _ => a.extend(["-b:v".into(), format!("{kbps}k")]),
         }
-        // A rate cap for steady encoders; VideoToolbox's own CBR turns off when one is given.
-        if cbr && enc != "h264_videotoolbox" {
-            a.extend(["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{}k", kbps * 2)]);
+        // Strict 1x VBV buffer matching OBS (rtmp-common.c: 2x VBV allowed keyframes/cuts to burst
+        // past platform limits); VideoToolbox's FFmpeg CBR omits -maxrate unless capped strictly.
+        if cbr && (enc != "h264_videotoolbox" || matches!(cfg.rate, RateControl::CappedCbr)) {
+            a.extend(["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{kbps}k")]);
         }
         // Constant quality as OBS sets it on each encoder ("high" recordings: 16). Before, the
         // Windows engine refused a recording at that quality (10 Nov, the owner's PC).
@@ -1064,9 +1065,13 @@ mod tests {
         assert!(has(&args(&high, "h264_mf"), ["-rate_control", "quality"]));
         assert!(has(&args(&high, "libx264"), ["-crf", "16"]));
         assert_eq!(args(&high, "h264_nvenc").last().map(String::as_str), Some("pipe:1"));
-        // A stream keeps its steady bitrate.
+        // A stream keeps its steady bitrate with a 1x VBV buffer (matching OBS).
         let cbr = args(&cfg(RateControl::Cbr), "h264_nvenc");
         assert!(has(&cbr, ["-b:v", "6000k"]) && has(&cbr, ["-rc", "cbr"]));
+        assert!(has(&cbr, ["-maxrate", "6000k"]) && has(&cbr, ["-bufsize", "6000k"]));
+        assert!(!has(&cbr, ["-bufsize", "12000k"]));
+        let x264 = args(&cfg(RateControl::CappedCbr), "libx264");
+        assert!(has(&x264, ["-maxrate", "6000k"]) && has(&x264, ["-bufsize", "6000k"]));
     }
 
     /// FFmpeg a whole queue behind (here: reading one frame a second) never holds the caller up:

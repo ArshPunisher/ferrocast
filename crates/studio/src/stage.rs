@@ -4509,6 +4509,7 @@ pub fn can_share(
     let mut stream_encode = s.encode.clone();
     stream_encode.scale = None;
     stream_encode.video_kbps = plan.encode.video_kbps;
+    stream_encode.strict_cbr = plan.encode.strict_cbr;
     if stream_encode != plan.encode {
         return Err("the recording is encoded another way than the stream".into());
     }

@@ -152,15 +152,125 @@ pub fn verdict_keeping(upload_kbps: u32, needs: &[Need], free_pct: u8) -> Verdic
     Verdict { upload_kbps, need_kbps: need, fits, fit_count, message }
 }
 
-/// Each platform's rules, held against the stream OBS really sends. Unknown numbers (not
-/// streaming yet) are skipped, never guessed.
-pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
+/// Hard encoding limits for platforms whose ingest rejects or stutters above a ceiling
+/// (OBS `services.json`: Twitch 6,000 kbps H.264 / 2 s; Kick 8,000 kbps H.264 / 2 s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformLimit {
+    pub service: Service,
+    pub name: &'static str,
+    pub max_kbps: u32,
+    pub keyframe_secs: u32,
+    pub h264_only: bool,
+}
+
+/// Strict cap for `s` on a single-track main stream (`enhanced` Twitch uses Enhanced Broadcasting
+/// tracks instead of the legacy 6,000 kbps ceiling).
+pub fn ceiling(s: Service, enhanced: bool) -> Option<PlatformLimit> {
+    match s {
+        Service::Twitch if !enhanced => {
+            Some(PlatformLimit { service: s, name: "Twitch", max_kbps: 6_000, keyframe_secs: 2, h264_only: true })
+        }
+        Service::Kick => {
+            Some(PlatformLimit { service: s, name: "Kick", max_kbps: 8_000, keyframe_secs: 2, h264_only: true })
+        }
+        Service::Twitch | Service::Youtube | Service::Custom => None,
+    }
+}
+
+/// Tightest ceiling across enabled single-track main destinations (`(service, enhanced)`).
+pub fn effective_limit<I>(dests: I) -> Option<PlatformLimit>
+where
+    I: IntoIterator<Item = (Service, bool)>,
+{
+    dests.into_iter().filter_map(|(s, enh)| ceiling(s, enh)).min_by_key(|c| c.max_kbps)
+}
+
+/// Category of a platform rule broken by a live stream (Contract C-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleCode {
+    Bitrate,
+    Codec,
+    Keyint,
+}
+
+/// One structured platform rule issue (Contract C-2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleNotice {
+    pub code: RuleCode,
+    pub summary: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_kbps: Option<u32>,
+}
+
+/// Auto-cap metadata shown as a calm one-line chip on destinations constrained for compatibility (Contract C-2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CappedInfo {
+    pub kbps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<(u32, u32)>,
+    pub separate_encode: bool,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// Builds the calm [`CappedInfo`] chip when Studio fitted configured settings to `limit`, or
+/// `None` if configured settings already fit within `limit`.
+pub fn capped_info(
+    limit: PlatformLimit,
+    configured_kbps: u32,
+    is_hevc: bool,
+    keyframe_s: u32,
+    vbr: bool,
+) -> Option<CappedInfo> {
+    let kbps_capped = configured_kbps > limit.max_kbps;
+    let codec_forced = limit.h264_only && is_hevc;
+    let keyint_forced = limit.keyframe_secs > 0 && keyframe_s != limit.keyframe_secs;
+    if !kbps_capped && !codec_forced && !keyint_forced && !vbr {
+        return None;
+    }
+    let applied = configured_kbps.min(limit.max_kbps);
+    let summary = if kbps_capped {
+        format!("Capped at {} for {}", kbps_text(limit.max_kbps), limit.name)
+    } else if codec_forced {
+        format!("H.264 set for {}", limit.name)
+    } else if keyint_forced {
+        format!("{} s keyframes for {}", limit.keyframe_secs, limit.name)
+    } else {
+        format!("CBR enabled for {}", limit.name)
+    };
+    let consequence = if limit.service == Service::Kick { "doesn't disconnect" } else { "viewers don't stutter" };
+    let detail = if kbps_capped {
+        format!(
+            "Your {} stream is capped at {} H.264 ({} s keyframes, 1× VBV) so {} {}.",
+            kbps_text(configured_kbps),
+            kbps_text(applied),
+            limit.keyframe_secs,
+            limit.name,
+            consequence
+        )
+    } else {
+        format!(
+            "Encoded at {} H.264 with {} s keyframes and 1× VBV CBR so {} {}.",
+            kbps_text(applied),
+            limit.keyframe_secs,
+            limit.name,
+            consequence
+        )
+    };
+    Some(CappedInfo { kbps: applied, resolution: None, separate_encode: false, summary, detail })
+}
+
+/// Structured rules broken by a live stream against platform `s`. Unknown numbers are skipped;
+/// Twitch Enhanced Broadcasting (`enhanced == true`) is exempt from the legacy 6,000 kbps check.
+pub fn rules_structured(stats: &StreamStats, s: Service, enhanced: bool) -> Vec<RuleNotice> {
+    if enhanced && s == Service::Twitch {
+        return Vec::new();
+    }
     let (name, codecs, max_keyint_ms, max_kbps): (&str, &[VideoCodec], u32, u32) = match s {
-        // Twitch: H.264 only, a keyframe every 2 s, 6,000 kbps video (OBS's own recommendations).
         Service::Twitch => ("Twitch", &[VideoCodec::H264], 2_000, 6_000),
-        // YouTube: H.264, HEVC or AV1; a keyframe at least every 4 s (2 s is best).
         Service::Youtube => ("YouTube", &[VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1], 4_000, 51_000),
-        // Kick: H.264, a keyframe every 2 s, up to 8,000 kbps.
         Service::Kick => ("Kick", &[VideoCodec::H264], 2_000, 8_000),
         Service::Custom => return Vec::new(),
     };
@@ -168,31 +278,50 @@ pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
     if let Some(c) = stats.video_codec
         && !codecs.contains(&c)
     {
-        out.push(format!("{name} doesn't take {}. Switch to H.264, or turn {name} off.", codec_name(c)));
+        out.push(RuleNotice {
+            code: RuleCode::Codec,
+            summary: format!("{name} requires H.264"),
+            detail: format!("{name} doesn't take {}. Switch to H.264, or turn {name} off.", codec_name(c)),
+            fix_kbps: None,
+        });
     }
     // A little slack: encoders place keyframes at the frame nearest the interval.
     if let Some(k) = stats.keyframe_interval_ms
         && k > max_keyint_ms + 250
     {
-        out.push(format!(
-            "{name} needs a keyframe every {} s; yours is {:.1} s. Set it to 2 s.",
-            max_keyint_ms / 1000,
-            f64::from(k) / 1000.0
-        ));
+        out.push(RuleNotice {
+            code: RuleCode::Keyint,
+            summary: format!("Keyframes every {:.1} s (need {} s)", f64::from(k) / 1000.0, max_keyint_ms / 1000),
+            detail: format!(
+                "{name} needs a keyframe every {} s; yours is {:.1} s. Set it to 2 s.",
+                max_keyint_ms / 1000,
+                f64::from(k) / 1000.0
+            ),
+            fix_kbps: None,
+        });
     }
     // The measured rate includes audio (up to about 320 kbps).
     if stats.kbps > max_kbps + 400 {
-        // Kick cuts a stream over its limit (seen 25 Oct: it dropped and reconnected every 15 s at
-        // 12,000 kbps); Twitch and YouTube take it and their viewers may see it stutter. The
-        // dashboard reads "to N kbps or less" out of this to offer the fix button: keep that part.
+        let fix = max_kbps.saturating_sub(500);
         let then = if s == Service::Kick { "Kick cuts it off" } else { "it may stutter" };
-        out.push(format!(
-            "Over {name}'s {} limit, {then}. Lower the bitrate to {} or less.",
-            kbps_text(max_kbps),
-            kbps_text(max_kbps.saturating_sub(500)),
-        ));
+        out.push(RuleNotice {
+            code: RuleCode::Bitrate,
+            summary: format!("Over {name}'s {} limit", kbps_text(max_kbps)),
+            detail: format!(
+                "Over {name}'s {} limit, {then}. Lower the bitrate to {} or less.",
+                kbps_text(max_kbps),
+                kbps_text(fix),
+            ),
+            fix_kbps: Some(fix),
+        });
     }
     out
+}
+
+/// Each platform's rules, held against the stream OBS really sends. Unknown numbers (not
+/// streaming yet) are skipped, never guessed.
+pub fn rules(stats: &StreamStats, s: Service) -> Vec<String> {
+    rules_structured(stats, s, false).into_iter().map(|r| r.detail).collect()
 }
 
 fn codec_name(c: VideoCodec) -> &'static str {
@@ -311,5 +440,39 @@ mod tests {
         assert_eq!(kbps_text(51000), "51,000 kbps");
         assert_eq!(kbps_text(900), "900 kbps");
         assert_eq!(kbps_text(1_234_567), "1,234,567 kbps");
+    }
+
+    #[test]
+    fn platform_ceilings_and_structured_rules() {
+        let fast = StreamStats {
+            kbps: 9_000,
+            keyframe_interval_ms: Some(2_000),
+            video_codec: Some(VideoCodec::Hevc),
+            ..Default::default()
+        };
+        // Enhanced Broadcasting exempts Twitch from legacy 6,000 / H.264 rules.
+        assert!(rules_structured(&fast, Service::Twitch, true).is_empty());
+        assert_eq!(ceiling(Service::Twitch, true), None);
+
+        let twitch_issues = rules_structured(&fast, Service::Twitch, false);
+        assert_eq!(twitch_issues.len(), 2);
+        assert_eq!(twitch_issues[0].code, RuleCode::Codec);
+        assert_eq!(twitch_issues[0].fix_kbps, None);
+        assert_eq!(twitch_issues[1].code, RuleCode::Bitrate);
+        assert_eq!(twitch_issues[1].fix_kbps, Some(5_500));
+
+        // Twitch (6,000) takes precedence over Kick (8,000); YouTube and Twitch EB stay uncapped.
+        let limit = effective_limit([(Service::Youtube, false), (Service::Kick, false), (Service::Twitch, false)])
+            .expect("capped");
+        assert_eq!(limit.service, Service::Twitch);
+        assert_eq!(limit.max_kbps, 6_000);
+
+        let cap = capped_info(limit, 14_000, true, 4, false).expect("chip shown");
+        assert_eq!(cap.kbps, 6_000);
+        assert_eq!(cap.summary, "Capped at 6,000 kbps for Twitch");
+        assert!(!cap.separate_encode);
+
+        // Already conforming settings produce no chip.
+        assert_eq!(capped_info(limit, 6_000, false, 2, false), None);
     }
 }
