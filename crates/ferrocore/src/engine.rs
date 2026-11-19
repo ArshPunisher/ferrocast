@@ -1474,6 +1474,8 @@ impl Engine {
                 globals.insert(s.id);
             }
         }
+        let live_ids: std::collections::HashSet<u64> = opened.values().map(|(id, _)| *id).collect();
+        let sidechain_ducking = remap_ducking(imported.ducking, &to, &live_ids);
         {
             // Everything at once, in one lock: no frame is ever drawn (or heard) between the old
             // collection and the new one. A full load used to clear the scenes, take the scene
@@ -1539,7 +1541,7 @@ impl Engine {
         for id in old_rest {
             self.remove_source(id);
         }
-        self.load_audio_care(doc);
+        self.load_audio_care(doc, sidechain_ducking);
         skipped
     }
 
@@ -1621,6 +1623,8 @@ impl Engine {
             l.current = loaded.current;
         }
         let running: std::collections::HashSet<String> = st.opened.keys().cloned().collect();
+        let live_ids: std::collections::HashSet<u64> = st.opened.values().map(|(id, _)| *id).collect();
+        let sidechain_ducking = remap_ducking(imported.ducking, &to, &live_ids);
         // Why each that couldn't open didn't, as the full load said.
         let mut skipped = imported.skipped;
         skipped.extend(st.missing.values().map(|(.., why)| why.clone()));
@@ -1632,13 +1636,14 @@ impl Engine {
                 self.set_sound_effects(id, &s.sound_effects);
             }
         }
-        self.load_audio_care(doc);
+        self.load_audio_care(doc, sidechain_ducking);
         Some(skipped)
     }
 
     /// Ferrocast's own sound care in the document (`ferrocast.audio`): ducking (`ducking`:
-    /// `{ voices, music }` source names and `depth_db`) and loudness (`loudness_lufs`).
-    fn load_audio_care(&self, doc: &serde_json::Value) {
+    /// `{ voices, music }` source names and `depth_db`) and loudness (`loudness_lufs`), merged
+    /// with any OBS sidechained compressors imported as ducking (M2-03).
+    fn load_audio_care(&self, doc: &serde_json::Value, imported_ducking: Option<crate::level::Ducking>) {
         let a = &doc["ferrocast"]["audio"];
         let ids = |key: &str| -> Vec<u64> {
             let st = self.lock();
@@ -1650,12 +1655,30 @@ impl Engine {
                 .filter_map(|n| st.opened.get(n).map(|(id, _)| *id))
                 .collect()
         };
-        let ducking = a["ducking"].is_object().then(|| crate::level::Ducking {
+        let explicit = a["ducking"].is_object().then(|| crate::level::Ducking {
             voices: ids("voices"),
             music: ids("music"),
             depth_db: a["ducking"]["depth_db"].as_f64().map_or(-12.0, |d| (d as f32).clamp(-40.0, -3.0)),
             ..Default::default()
         });
+        let ducking = match (explicit, imported_ducking) {
+            (Some(mut ex), Some(imp)) => {
+                for v in imp.voices {
+                    if !ex.voices.contains(&v) && !ex.music.contains(&v) {
+                        ex.voices.push(v);
+                    }
+                }
+                for m in imp.music {
+                    if !ex.music.contains(&m) && !ex.voices.contains(&m) {
+                        ex.music.push(m);
+                    }
+                }
+                Some(ex)
+            }
+            (Some(ex), None) => Some(ex),
+            (None, Some(imp)) => Some(imp),
+            (None, None) => None,
+        };
         self.set_ducking(ducking);
         self.set_loudness(a["loudness_lufs"].as_f64().map(|l| (l as f32).clamp(-30.0, -8.0)));
     }
@@ -3125,6 +3148,19 @@ fn on_time() {
 /// worker, so a busy computer wakes it in time.
 pub fn raise_this_thread() {
     on_time();
+}
+
+/// Remaps imported ducking source IDs to the engine's live IDs, dropping sources that failed to
+/// open and ensuring no source ducks itself.
+fn remap_ducking(
+    ducking: Option<crate::level::Ducking>,
+    to: &dyn Fn(u64) -> u64,
+    live_ids: &std::collections::HashSet<u64>,
+) -> Option<crate::level::Ducking> {
+    let mut d = ducking?;
+    d.voices = d.voices.into_iter().map(to).filter(|id| live_ids.contains(id)).collect();
+    d.music = d.music.into_iter().map(to).filter(|id| live_ids.contains(id) && !d.voices.contains(id)).collect();
+    (!d.voices.is_empty() && !d.music.is_empty()).then_some(d)
 }
 
 /// The frame loop.

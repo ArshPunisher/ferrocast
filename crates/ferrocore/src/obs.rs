@@ -49,6 +49,9 @@ pub struct Imported {
     /// The scene shown over whatever is on air (`ferrocast_top_layer`: Exeldro's Downstream
     /// Keyer, built in), when it names one of `scenes`.
     pub top_layer: Option<String>,
+    /// Ducking derived from OBS sidechained compressors (`compressor_filter` with
+    /// `sidechain_source`), resolved to imported source IDs (M2-03).
+    pub ducking: Option<crate::level::Ducking>,
 }
 
 fn f(v: &Value, k: &str, d: f64) -> f32 {
@@ -253,6 +256,13 @@ pub fn vst_effect(source: &str, filter: &str, s: &Value) -> Option<AudioEffect> 
     Some(AudioEffect::Plugin { slot: crate::afx::plugin_slot(spec) })
 }
 
+/// OBS's `sidechain_source` on a compressor filter: non-empty and not `"none"` means the
+/// compressor is keyed by another source (ducking), not by itself (`compressor-filter.c:201`).
+fn sidechain_source(s: &Value) -> Option<&str> {
+    let name = s.get("sidechain_source").and_then(Value::as_str)?.trim();
+    (!name.is_empty() && !name.eq_ignore_ascii_case("none")).then_some(name)
+}
+
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
@@ -265,13 +275,20 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
             hold_ms: n("hold_time", 200.0).max(0.0),
             release_ms: n("release_time", 150.0).max(0.0),
         },
-        "compressor_filter" => AudioEffect::Compressor {
-            ratio: n("ratio", 10.0).max(1.0),
-            threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
-            attack_ms: n("attack_time", 6.0).max(0.0),
-            release_ms: n("release_time", 60.0).max(0.0),
-            output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
-        },
+        "compressor_filter" => {
+            // A sidechained compressor ducks under another source; never turn it into a
+            // self-compressor (`import_with` maps it to our Ducking instead, M2-03).
+            if sidechain_source(s).is_some() {
+                return None;
+            }
+            AudioEffect::Compressor {
+                ratio: n("ratio", 10.0).max(1.0),
+                threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
+                attack_ms: n("attack_time", 6.0).max(0.0),
+                release_ms: n("release_time", 60.0).max(0.0),
+                output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+            }
+        }
         "limiter_filter" => AudioEffect::Limiter {
             threshold_db: n("threshold", -6.0).clamp(-60.0, 0.0),
             release_ms: n("release_time", 60.0).max(0.0),
@@ -992,6 +1009,10 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     let mut clones: Vec<(String, String, bool, Vec<crate::Effect>)> = Vec::new();
     // Each camera or capture card opened, by device, and the source that opens it.
     let mut devices: Vec<(String, String)> = Vec::new();
+    // Sidechained compressors collected across all sources and global channels, then resolved to
+    // source IDs once every source has been imported (the sidechain mic often sits in
+    // `AuxAudioDevice1` after scene sources).
+    let mut sidechains: Vec<(String, String, f32, f32)> = Vec::new();
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1062,6 +1083,15 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                     Some(e) => sound_effects.push(e),
                     None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
                 }
+            } else if kind == "compressor_filter"
+                && let Some(sc) = sidechain_source(&fs)
+            {
+                let ratio = f(&fs, "ratio", 10.0).max(1.0);
+                let threshold = f(&fs, "threshold", -18.0).clamp(-60.0, 0.0);
+                let slope = 1.0 - 1.0 / ratio;
+                // Equivalent ducking depth for a typical -12 dBFS speech peak over `threshold`.
+                let depth_db = (-slope * (-12.0 - threshold).max(6.0)).clamp(-40.0, -3.0);
+                sidechains.push((name.clone(), sc.to_string(), threshold, depth_db));
             } else if let Some(e) = audio_effect_from(kind, &fs) {
                 sound_effects.push(e);
             } else if matches!(kind, "noise_suppress_filter" | "noise_suppress_filter_v2" | "ferrocast_deepfilter") {
@@ -1148,6 +1178,41 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 next_id += 1;
             }
             Err(what) => out.skipped.push(format!("{name}: {what}")),
+        }
+    }
+    // Resolve OBS sidechained compressors into our Ducking once every source and global channel
+    // has its ID (M2-03).
+    if !sidechains.is_empty() {
+        let mut voices: Vec<u64> = Vec::new();
+        let mut music: Vec<u64> = Vec::new();
+        let mut depth_db = -3.0f32;
+        let mut threshold_db = 0.0f32;
+        let mut any = false;
+        let sound_id =
+            |src_name: &str| out.sources.iter().find(|s| s.name == src_name && s.sound.is_some()).map(|s| s.id);
+        for (target_name, sc_name, thresh, depth) in sidechains {
+            if target_name == sc_name {
+                out.skipped.push(format!("{target_name}: sidechain compressor can't duck itself"));
+                continue;
+            }
+            let Some(music_id) = sound_id(&target_name) else { continue };
+            let Some(voice_id) = sound_id(&sc_name) else {
+                out.skipped.push(format!("{target_name}: sidechain source \"{sc_name}\" not found"));
+                continue;
+            };
+            if !voices.contains(&voice_id) {
+                voices.push(voice_id);
+            }
+            if !music.contains(&music_id) {
+                music.push(music_id);
+            }
+            depth_db = if any { depth_db.min(depth) } else { depth };
+            threshold_db = if any { threshold_db.min(thresh) } else { thresh };
+            any = true;
+        }
+        music.retain(|m| !voices.contains(m));
+        if any && !voices.is_empty() && !music.is_empty() {
+            out.ducking = Some(crate::level::Ducking { voices, music, depth_db, threshold_db });
         }
     }
     // Clones show their source's picture (no second copy of it, no second sound) with their own
@@ -1812,5 +1877,130 @@ mod tests {
         let denoise: Vec<_> = mic.sound_effects.iter().filter(|e| matches!(e, AudioEffect::Denoise { .. })).collect();
         assert_eq!(denoise.len(), 1, "{:?}", mic.sound_effects);
         assert_eq!(mic.sound_effects.len(), 2, "the gain stays");
+    }
+
+    /// An OBS compressor with `sidechain_source` imports as our Ducking instead of a
+    /// self-compressor (even when the sidechain mic sits later in `AuxAudioDevice1`), while
+    /// `"none"` / `""` still import as a normal compressor and a missing sidechain is skipped
+    /// rather than self-compressing (M2-03).
+    #[test]
+    fn sidechain_compressor_imports_as_ducking_not_self_compressor() {
+        // Direct unit check on audio_effect_from.
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 20.0, "threshold": -32.0, "sidechain_source": "Mic/Aux" }),
+            ),
+            None,
+            "sidechained compressor must never become a self-compressor"
+        );
+        for no_sc in [
+            json!({ "ratio": 4.0 }),
+            json!({ "ratio": 4.0, "sidechain_source": "" }),
+            json!({ "ratio": 4.0, "sidechain_source": "none" }),
+        ] {
+            assert!(
+                matches!(audio_effect_from("compressor_filter", &no_sc), Some(AudioEffect::Compressor { .. })),
+                "normal compressor stays: {no_sc}"
+            );
+        }
+
+        // Full OBS collection import (works on every OS via `ffmpeg_source` media audio).
+        let doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Game Audio",
+                    "settings": { "local_file": "/game.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Lower when I talk",
+                        "settings": {
+                            "ratio": 20.0,
+                            "threshold": -32.0,
+                            "attack_time": 10,
+                            "release_time": 600,
+                            "output_gain": 0.0,
+                            "sidechain_source": "Mic/Aux"
+                        }
+                    }]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music Missing SC",
+                    "settings": { "local_file": "/music.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Broken Duck",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "DeletedMic" }
+                    }]
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": { "items": [{ "name": "Game Audio" }, { "name": "Music Missing SC" }] }
+                }
+            ],
+            "AuxAudioDevice1": {
+                "id": "ffmpeg_source",
+                "name": "Mic/Aux",
+                "settings": { "local_file": "/mic.mp4" }
+            }
+        });
+        let got = import(&doc, (1920, 1080));
+        let Some(game) = got.sources.iter().find(|s| s.name == "Game Audio") else { panic!("game missing") };
+        let Some(mic) = got.sources.iter().find(|s| s.name == "Mic/Aux") else { panic!("mic missing") };
+        let Some(broken) = got.sources.iter().find(|s| s.name == "Music Missing SC") else { panic!("broken missing") };
+        assert!(game.sound_effects.is_empty(), "game must NOT get a self-compressor: {:?}", game.sound_effects);
+        assert!(
+            broken.sound_effects.is_empty(),
+            "missing sidechain must NOT self-compress: {:?}",
+            broken.sound_effects
+        );
+        assert!(
+            got.skipped.iter().any(|s| s.contains("DeletedMic")),
+            "missing sidechain reported in skipped: {:?}",
+            got.skipped
+        );
+        let Some(duck) = got.ducking.clone() else { panic!("expected imported ducking") };
+        assert_eq!(duck.voices, vec![mic.id]);
+        assert_eq!(duck.music, vec![game.id]);
+        assert_eq!(duck.threshold_db, -32.0);
+        assert!((-20.0..=-18.0).contains(&duck.depth_db), "expected ~-19 dB depth, got {}", duck.depth_db);
+
+        // Behavioral check through Mixer: loud Game Audio with silent Mic is NOT self-compressed,
+        // and ducks cleanly once Mic speaks.
+        let rate = 48_000u32;
+        let mut m = crate::mix::Mixer::new(rate, 0);
+        m.set(game.id, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(mic.id, SourceSettings { tracks: 0b10, ..Default::default() });
+        m.set_effects(game.id, &game.sound_effects);
+        m.set_ducking(Some(duck));
+        let t0 = 1_000_000_000u64;
+        m.mix_until(t0);
+        let secs = 2 * rate as usize;
+        // Loud game audio (0.5 amplitude = -6 dBFS, way over -32 dB threshold).
+        m.push(game.id, &vec![0.5f32; secs * 2], 2, rate, t0);
+        // Mic silent for first 1 s, then talks at 0.3 amplitude for second 1 s.
+        let mut mic_pcm = vec![0.0f32; secs * 2];
+        for i in (rate as usize)..secs {
+            let v = (i as f32 * 300.0 * std::f32::consts::TAU / rate as f32).sin() * 0.3;
+            mic_pcm[i * 2] = v;
+            mic_pcm[i * 2 + 1] = v;
+        }
+        m.push(mic.id, &mic_pcm, 2, rate, t0);
+        let blocks = m.mix_until(t0 + secs as u64 * 1_000_000_000 / u64::from(rate));
+        let quiet_mic_block = &blocks[blocks.len() / 4];
+        let talking_mic_block = &blocks[blocks.len() * 3 / 4];
+        assert!(
+            (quiet_mic_block.tracks[0][0] - 0.5).abs() < 1e-4,
+            "game audio untouched when mic silent (not self-compressed): {}",
+            quiet_mic_block.tracks[0][0]
+        );
+        assert!(
+            talking_mic_block.tracks[0][0] < 0.1,
+            "game audio ducked when mic speaks: {}",
+            talking_mic_block.tracks[0][0]
+        );
     }
 }
