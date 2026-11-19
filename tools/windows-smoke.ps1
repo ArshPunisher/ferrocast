@@ -204,7 +204,18 @@ $result.numbers = [ordered]@{
   cores = $cores
 }
 Write-Host ("numbers: " + ($result.numbers | ConvertTo-Json -Compress))
-if ($null -ne $result.numbers.engine_fps) { Check 'frame rate' ($result.numbers.engine_fps -ge $MinShare * $Fps) "$($result.numbers.engine_fps) of $Fps fps (needs $([math]::Round($MinShare * $Fps, 1)))" }
+# The card Ferrocore drew on. Windows' software one (no graphics card: GitHub's runner) draws on
+# the CPU, as fast as the machine under it: the same build made 17 fps on 11 Nov and 3.9 on a
+# re-run of it on 19 Nov. There the rate is noted, not judged; on a real card it must hold.
+$card = Select-String -Path (Join-Path $home_ 'logs\ferrocast.log') -Pattern 'draws on this card card=(.+)$' -ErrorAction SilentlyContinue |
+  Select-Object -Last 1 | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
+$result.numbers.card = $card
+$software = "$card" -match 'Basic Render Driver|WARP'
+if ($null -ne $result.numbers.engine_fps) {
+  $rate = "$($result.numbers.engine_fps) of $Fps fps (needs $([math]::Round($MinShare * $Fps, 1))) on $card"
+  if ($software) { Note "frame rate not judged on Windows' software card: $rate" }
+  else { Check 'frame rate' ($result.numbers.engine_fps -ge $MinShare * $Fps) $rate }
+}
 
 # The file: picture and sound in it (FFmpeg's own reading, the copy the app fetched).
 $file = Get-ChildItem $rec -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
