@@ -436,6 +436,10 @@ pub struct Stats {
     pub recovered: u64,
     /// Sources the watchdog started again (a camera that stopped sending, a capture that died).
     pub restarts: u64,
+    /// Time the outputs' encoders take for one frame's pictures, all together, in ms (smoothed):
+    /// near the frame's whole time, the encoder is what holds the frames back (19 Nov: 4K60
+    /// streamed and recorded at once, the Mac's one encoder at its limit, 31 of 60 fps).
+    pub encode_ms: f32,
 }
 
 /// Settings fixed for the engine's life.
@@ -3225,6 +3229,10 @@ struct InFlight {
 /// any past [`IN_FLIGHT`] (waiting for the card); every one with `flush`.
 fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
     let _ = gpu.device.poll(wgpu::PollType::Poll);
+    if st.outputs.is_empty() {
+        // Nothing encodes: the next output's time starts afresh.
+        st.stats.encode_ms = 0.0;
+    }
     while let Some(front) = st.in_flight.front() {
         let ready = front.drawn.iter().all(|(_, f)| f.as_ref().map_or(true, PendingNv12::ready));
         if !(ready || flush || st.in_flight.len() > IN_FLIGHT) {
@@ -3237,6 +3245,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
             .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
             .collect();
         let mut failed = None;
+        let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
                 continue;
@@ -3246,10 +3255,12 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
                 match frame {
                     Ok(f) => {
                         let w = canvas.width as usize;
+                        let t0 = Instant::now();
                         match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
                             Ok(t) => tags = t,
                             Err(e) => failed = Some(e.to_string()),
                         }
+                        encoding += t0.elapsed();
                     }
                     Err(e) => failed = Some(e.clone()),
                 }
@@ -3257,10 +3268,12 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
                     let c = canvas.track(w, h);
                     if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
                         let s = w as usize;
+                        let t0 = Instant::now();
                         match pipe.video_track(i, Frame::Nv12 { y: &f.y, y_stride: s, uv: &f.uv, uv_stride: s }, ts) {
                             Ok(t) => tags.extend(t),
                             Err(e) => failed = Some(e.to_string()),
                         }
+                        encoding += t0.elapsed();
                     }
                 }
             }
@@ -3284,6 +3297,12 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
         }
         if failed.is_some() {
             st.error = failed;
+        }
+        // Only frames that went through an encoder count (a canvas drawn every other frame, or
+        // one that failed to draw, would pull the average down by half).
+        if encoding > Duration::ZERO {
+            let ms = encoding.as_secs_f32() * 1000.0;
+            st.stats.encode_ms = if st.stats.encode_ms == 0.0 { ms } else { st.stats.encode_ms * 0.9 + ms * 0.1 };
         }
         // A tap's picture that failed to draw is left out (the camera repeats its last one); it
         // doesn't stop the outputs.

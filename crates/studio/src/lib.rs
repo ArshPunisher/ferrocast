@@ -516,6 +516,8 @@ pub struct EngineStats {
     /// Faults the engine caught and carried on from, and sources its watchdog started again.
     pub recovered: u32,
     pub restarts: u32,
+    /// Time the encoders take for one frame, all outputs together (smoothed), in ms.
+    pub encode_ms: f64,
 }
 
 /// How a source's picture looks now (`Stage::look`): for catching a black or frozen camera.

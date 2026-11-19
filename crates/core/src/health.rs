@@ -27,6 +27,9 @@ pub struct Sample {
     pub paused: bool,
     pub quality_pct: u8,
     pub cpu: f64,
+    /// Now: the encoders take most of each frame's time (the engine's `encode_ms` against the
+    /// frame's time), so late frames are the encoder's doing, not the drawing's.
+    pub encoder_bound: bool,
 }
 
 /// How the stream is doing.
@@ -52,6 +55,20 @@ fn share(part: u64, all: u64) -> f64 {
 }
 
 impl HealthMeter {
+    /// Of the frames drawn late in the window, the share drawn while the encoders held the
+    /// frames back (each look's flag stands for the late frames since the look before).
+    fn encoder_late_share(&self) -> f64 {
+        let (mut by_encoder, mut all) = (0u64, 0u64);
+        for (a, b) in self.looks.iter().zip(self.looks.iter().skip(1)) {
+            let late = b.lagged.saturating_sub(a.lagged);
+            all += late;
+            if b.encoder_bound {
+                by_encoder += late;
+            }
+        }
+        share(by_encoder, all)
+    }
+
     /// A new look → the health over the last ten seconds.
     pub fn push(&mut self, s: Sample) -> Health {
         // Counters that went back mean a new stream: start over.
@@ -69,7 +86,11 @@ impl HealthMeter {
         let mut costs: Vec<(f64, String)> = vec![
             (
                 (share(d(s.lagged, first.lagged), d(s.frames, first.frames)) * 400.0).min(40.0),
-                "frames are drawn late: the computer is busy (fewer sources or a lower frame rate helps)".into(),
+                if self.encoder_late_share() >= 0.5 {
+                    "frames are late: the video encoder can't keep up (a lower resolution or frame rate helps)".into()
+                } else {
+                    "frames are drawn late: the computer is busy (fewer sources or a lower frame rate helps)".into()
+                },
             ),
             (
                 (share(d(s.skipped, first.skipped), d(s.encoded, first.encoded)) * 400.0).min(40.0),
@@ -168,5 +189,29 @@ mod tests {
         m.push(Sample { lagged: 30, ..at(6) });
         // Counters back at the start: the earlier looks are dropped.
         assert_eq!(m.push(at(1)).score, 100);
+    }
+
+    #[test]
+    fn late_frames_name_the_encoder_when_it_holds_them_back() {
+        let late = |encoder_bound: bool| {
+            let mut m = HealthMeter::default();
+            m.push(at(0));
+            let mut s = at(2);
+            s.lagged = 30;
+            s.encoder_bound = encoder_bound;
+            m.push(s).reason.unwrap_or_default()
+        };
+        assert!(late(true).contains("video encoder"), "{}", late(true));
+        assert!(late(false).contains("the computer is busy"), "{}", late(false));
+        // Late frames from a busy computer aren't the encoder's because it's busy afterwards.
+        let mut m = HealthMeter::default();
+        m.push(at(0));
+        let mut s = at(1);
+        s.lagged = 30;
+        m.push(s);
+        let mut s = at(2);
+        s.lagged = 30;
+        s.encoder_bound = true;
+        assert!(m.push(s).reason.unwrap_or_default().contains("the computer is busy"));
     }
 }
