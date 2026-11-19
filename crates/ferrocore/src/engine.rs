@@ -4717,12 +4717,15 @@ mod tests {
         assert!(times.windows(2).all(|w| w[1] > w[0]), "the time went back: {times:?}");
     }
 
+    #[cfg(target_os = "macos")]
     fn has_ffprobe() -> bool {
         std::process::Command::new("ffprobe").arg("-version").output().is_ok_and(|o| o.status.success())
     }
 
     /// What a stream sent: (video?, ms, keyframe?, codec header?).
+    #[cfg(target_os = "macos")]
     type Sent = Arc<Mutex<Vec<(bool, u32, bool, bool)>>>;
+    #[cfg(target_os = "macos")]
     fn sink_into(sent: &Sent) -> Box<dyn FnMut(Tag) + Send> {
         let sent = sent.clone();
         Box::new(move |t: Tag| {
@@ -4738,6 +4741,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "macos")]
     fn shared_scene(e: &Engine) {
         e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 90, 60, 255] })
             .unwrap_or_else(|x| panic!("{x}"));
