@@ -82,12 +82,18 @@ jobs:
             out: target/release/bundle
           - name: Linux
             # The oldest supported Ubuntu: the program needs the glibc it's built with, and
-            # 24.04's (2.39) left it unable to start on Debian 12, Ubuntu 22.04 and RHEL 9 (19 Nov).
+            # 24.04's (2.39) left it unable to start on Debian 12 and Ubuntu 22.04 (19 Nov).
+            # RHEL 9's 2.34 is older still: not covered.
             os: ubuntu-22.04
             targets: ""
             args: ""
             out: target/release/bundle
     runs-on: ${{ matrix.os }}
+    env:
+      # Captions' speech engine (whisper.cpp's ggml) is built for any CPU from 2013 on (AVX2),
+      # not tuned to the build machine's (-march=native: AVX-512 there, a crash on people's
+      # older CPUs when captions run). whisper-rs-sys hands GGML_* to its cmake.
+      GGML_NATIVE: "OFF"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -221,7 +227,7 @@ jobs:
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
           cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config "$config"
-      - name: The Linux program starts on glibc 2.35 (Ubuntu 22.04, Debian 12, RHEL 9)
+      - name: The Linux program starts on glibc 2.35 (Ubuntu 22.04, Debian 12)
         if: matrix.name == 'Linux'
         shell: bash
         # Packages don't name a glibc: a program needing a newer one installs, then won't start.
@@ -232,6 +238,8 @@ jobs:
             exit 1
           fi
           echo "the program needs $need"
+          # C++ inside (whisper.cpp): its libstdc++ need, for the record.
+          objdump -T target/release/ferrocast | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1 || true
           if [ "$(printf '%s\n' "$need" GLIBC_2.35 | sort -V | tail -1)" != GLIBC_2.35 ]; then
             echo "::error::the Linux program needs $need; Ubuntu 22.04 and Debian 12 have 2.35/2.36"
             exit 1
