@@ -433,7 +433,9 @@ impl Engine {
         };
         self.send_live(LiveFrame::new(
             "notice",
-            &Notice { key: Some("cloud-sync".into()), level: NoticeLevel::Info, message: note.clone(), action: None },
+            &Notice::new(NoticeLevel::Info, "Sync: the web's change replaced this PC's")
+                .key("cloud-sync")
+                .detail(note.clone()),
         ));
         st.notes.insert(0, note);
         st.notes.truncate(NOTES_KEPT);

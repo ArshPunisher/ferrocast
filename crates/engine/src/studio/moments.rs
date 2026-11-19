@@ -5,6 +5,7 @@
 
 use ferrocast_core::event::{Event, EventKind, Platform};
 use ferrocast_core::moments::{self, Marker, MomentKind, MomentsConfig};
+use ferrocast_core::show::LiveAlert;
 use ferrocast_store::repo;
 use serde::Serialize;
 
@@ -125,15 +126,14 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(YOUTUBE_SETTLE).await;
-            let (ok, message) = match engine.youtube_chapters(since).await {
-                Ok(n) => (true, format!("{n} chapters added to your YouTube video.")),
-                Err(e) => (false, format!("No chapters on YouTube: {e}")),
+            let alert = match engine.youtube_chapters(since).await {
+                Ok(n) => {
+                    LiveAlert::fixed("chapters:youtube", "warn", format!("{n} chapters added to your YouTube video."))
+                }
+                Err(e) => LiveAlert::raised("chapters:youtube", "warn", "No chapters on YouTube").detail(e.to_string()),
             };
-            tracing::info!(ok, "{message}");
-            engine.studio_frame(
-                "live_alert",
-                &ferrocast_core::show::LiveAlert { id: "chapters:youtube".into(), level: "warn", message, cleared: ok },
-            );
+            tracing::info!(ok = alert.cleared, "{}", alert.message);
+            engine.studio_frame("live_alert", &alert);
         });
     }
 

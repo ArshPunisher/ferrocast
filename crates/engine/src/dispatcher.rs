@@ -100,16 +100,15 @@ impl Engine {
                 Action::Folded { alert_ids } => {
                     self.send_live(LiveFrame::new(
                         "notice",
-                        &Notice {
-                            key: Some("alerts-folded".into()),
-                            level: NoticeLevel::Info,
-                            message: format!(
+                        &Notice::new(
+                            NoticeLevel::Info,
+                            format!(
                                 "{} queued alert{} went to the event list instead.",
                                 alert_ids.len(),
                                 if alert_ids.len() == 1 { "" } else { "s" }
                             ),
-                            action: None,
-                        },
+                        )
+                        .key("alerts-folded"),
                     ));
                 }
             }

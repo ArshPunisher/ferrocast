@@ -87,15 +87,9 @@ impl Engine {
                     };
                     self.send_live(LiveFrame::new(
                         "notice",
-                        &Notice {
-                            key: Some(format!("account:{}", platform_key(e.platform))),
-                            level: NoticeLevel::Warn,
-                            message,
-                            action: Some(crate::frames::NoticeAction {
-                                label: "Reconnect".into(),
-                                href: "#/settings/accounts".into(),
-                            }),
-                        },
+                        &Notice::new(NoticeLevel::Warn, message)
+                            .key(format!("account:{}", platform_key(e.platform)))
+                            .action("Reconnect", "#/settings/accounts"),
                     ));
                 }
                 return;
@@ -603,15 +597,10 @@ impl Engine {
             ferrocast_core::event::ReversalReason::Refund => "A refund",
             ferrocast_core::event::ReversalReason::Cancelled => "A cancelled payment",
         };
-        let message = if goals_changed {
-            format!("{what} took a tip back; goals were updated.")
-        } else {
-            format!("{what} took a tip back.")
-        };
-        self.send_live(LiveFrame::new(
-            "notice",
-            &Notice { key: None, level: NoticeLevel::Warn, message, action: None },
-        ));
+        let notice = Notice::new(NoticeLevel::Warn, format!("{what} took a tip back")).key("tip-reversal");
+        // A burst of reversals is one line, not a stack.
+        let notice = if goals_changed { notice.detail("Your goals were updated.") } else { notice };
+        self.send_live(LiveFrame::new("notice", &notice));
     }
 
     pub(crate) fn broadcast_goals(&self, seq: u64) {

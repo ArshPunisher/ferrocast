@@ -43,6 +43,9 @@ pub struct Health {
     /// What costs the most, in words (None at 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What to do about it, behind an (i) (None with the reason).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// The score's memory: the last few looks.
@@ -86,58 +89,72 @@ impl HealthMeter {
         let d = |a: u64, b: u64| a.saturating_sub(b);
         // Each trouble costs points (the worst named): 1% of frames late, skipped or dropped
         // costs 4, up to 40 each.
-        let mut costs: Vec<(f64, String)> = vec![
+        // (points lost, what it is in a few words, what to do about it)
+        let mut costs: Vec<(f64, String, &str)> = vec![
             (
                 (share(d(s.lagged, first.lagged), d(s.frames, first.frames)) * 400.0).min(40.0),
                 if self.encoder_late_share() >= 0.5 {
-                    "the encoder can't keep up: lower the resolution or frame rate".into()
+                    "the encoder can't keep up".into()
                 } else {
-                    "the computer is busy: use fewer sources or a lower frame rate".into()
+                    "the computer is busy".into()
+                },
+                if self.encoder_late_share() >= 0.5 {
+                    "Lower the resolution or the frame rate."
+                } else {
+                    "Use fewer sources or a lower frame rate."
                 },
             ),
             (
                 (share(d(s.skipped, first.skipped), d(s.encoded, first.encoded)) * 400.0).min(40.0),
-                "the encoder is behind: use the hardware encoder or lower quality".into(),
+                "the encoder is behind".into(),
+                "Use the hardware encoder, or a lower quality.",
             ),
             (
                 (share(d(s.dropped, first.dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "the upload is struggling: frames are dropped".into(),
+                "the upload is struggling".into(),
+                "Frames are being dropped on the way out. Lower the bitrate, or use a wired connection.",
             ),
             (
                 (share(d(s.net_dropped, first.net_dropped), d(s.sent, first.sent)) * 400.0).min(40.0),
-                "the upload is struggling: a platform is losing packets".into(),
+                "a platform is losing packets".into(),
+                "The upload is struggling. Lower the bitrate, or use a wired connection.",
             ),
         ];
         if s.reconnecting {
-            costs.push((50.0, "the stream is reconnecting".into()));
+            costs.push((50.0, "the stream is reconnecting".into(), "Check your internet connection."));
         }
         if s.paused {
-            costs.push((20.0, "a platform is paused to keep the others smooth".into()));
+            costs.push((
+                20.0,
+                "a platform is paused".into(),
+                "Upload protection paused it to keep the others smooth. It comes back by itself.",
+            ));
         }
         if s.quality_pct < 100 {
             costs.push((
                 f64::from(100 - s.quality_pct) / 3.0,
-                format!("quality is at {}% to stay smooth", s.quality_pct),
+                format!("quality is at {}%", s.quality_pct),
+                "Auto quality lowered it to keep the stream smooth. It goes back up by itself.",
             ));
         }
         if s.cpu > 85.0 {
-            costs.push(((s.cpu - 85.0).min(15.0), "the computer is nearly at its limit".into()));
+            costs.push(((s.cpu - 85.0).min(15.0), "the computer is nearly at its limit".into(), "Close other apps."));
         }
-        let lost: f64 = costs.iter().map(|(c, _)| c).sum();
+        let lost: f64 = costs.iter().map(|(c, ..)| c).sum();
         let score = (100.0 - lost).round().clamp(0.0, 100.0) as u8;
-        let reason = costs
+        let (reason, detail) = costs
             .into_iter()
-            .filter(|(c, _)| *c >= 1.0)
+            .filter(|(c, ..)| *c >= 1.0)
             .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, why)| why)
-            .filter(|_| score < 100);
+            .filter(|_| score < 100)
+            .map_or((None, None), |(_, why, fix)| (Some(why), Some(fix.to_string())));
         let verdict = match score {
             90.. => "great",
             75.. => "good",
             50.. => "shaky",
             _ => "poor",
         };
-        Health { score, verdict, reason }
+        Health { score, verdict, reason, detail }
     }
 }
 
@@ -165,7 +182,8 @@ mod tests {
         // 1 in 60 late, 3 in 60 skipped by the encoder: about 7 + 20.
         let h = m.push(Sample { lagged: 1, skipped: 3, ..at(1) });
         assert_eq!((h.score, h.verdict), (73, "shaky"));
-        assert!(h.reason.unwrap().contains("encoder"));
+        assert!(h.reason.clone().unwrap().contains("encoder"));
+        assert!(h.detail.unwrap().contains("hardware encoder"), "what to do is the detail");
         // Reconnecting outweighs it.
         let h = m.push(Sample { lagged: 1, skipped: 3, reconnecting: true, ..at(2) });
         assert!(h.reason.unwrap().contains("reconnecting"));

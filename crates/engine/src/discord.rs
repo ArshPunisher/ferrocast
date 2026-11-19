@@ -157,15 +157,10 @@ impl Engine {
             if let Err(f) = engine.post_discord(&url, &text, cfg.mention_everyone).await {
                 engine.send_live(LiveFrame::new(
                     "notice",
-                    &Notice {
-                        key: Some("discord".into()),
-                        level: NoticeLevel::Warn,
-                        message: format!("The Discord go-live post failed: {}", f.error),
-                        action: Some(crate::frames::NoticeAction {
-                            label: "Discord settings".into(),
-                            href: "#/settings/discord".into(),
-                        }),
-                    },
+                    &Notice::new(NoticeLevel::Warn, "The Discord go-live post failed")
+                        .key("discord")
+                        .detail(f.error.to_string())
+                        .action("Discord settings", "#/settings/discord"),
                 ));
             }
         });
