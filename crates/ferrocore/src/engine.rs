@@ -4780,6 +4780,25 @@ mod tests {
         let _ = std::fs::remove_file(file);
     }
 
+    /// A recording joined and stopped before its first frame leaves no empty file behind.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_recording_stopped_before_its_first_frame_leaves_no_file() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let sent: Sent = Arc::default();
+        let id = e.start_output(OutputKind::Stream(sink_into(&sent))).unwrap_or_else(|x| panic!("{x}"));
+        let file = std::env::temp_dir().join(format!("ferrocore-unborn-{}.mp4", std::process::id()));
+        // Straight after: most often no frame came between (a frame that did starts the file,
+        // which is then a real one); never an empty file.
+        e.record_on(id, &file).unwrap_or_else(|x| panic!("{x}"));
+        e.record_off(id).unwrap_or_else(|x| panic!("{x}"));
+        let left = std::fs::metadata(&file).map(|m| m.len()).ok();
+        assert_ne!(left, Some(0), "an empty file was left at {}", file.display());
+        let _ = std::fs::remove_file(&file);
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+    }
+
     /// A stream joins a running recording's encode: it opens with the codec headers and a
     /// keyframe at 0, no sound from before it; when it leaves, the recording goes on.
     #[test]

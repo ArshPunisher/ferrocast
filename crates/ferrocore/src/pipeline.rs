@@ -43,7 +43,8 @@ pub struct Pipeline {
     /// The next frame is made a keyframe (after a pause, or to start a split file on).
     key_next: bool,
     /// A new file to go on in at the next keyframe ("Split recording").
-    split_to: Option<(File, bool)>,
+    /// Its path too: removed when nothing was written to it (stopped before its keyframe).
+    split_to: Option<(File, bool, std::path::PathBuf)>,
     /// The replay buffer's memory, when this output is one.
     replay: Option<Replay>,
     /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
@@ -275,19 +276,30 @@ impl Pipeline {
         let f = File::create(path)
             .map_err(|e| AvError::Encoder(format!("the recording can't be written at {} ({e})", path.display())))?;
         self.recording = None;
-        self.split_to = Some((f, is_mkv(path)));
+        self.split_to = Some((f, is_mkv(path), path.to_path_buf()));
         self.key_next = true;
         Ok(())
     }
 
     /// Ends this output's recording (its file finished); its encoders and stream go on.
     pub fn end_recording(&mut self) -> Result<(), AvError> {
-        self.split_to = None;
+        self.drop_pending_file();
         match self.recording.take() {
             Some(Recording::On(w)) => {
                 w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))
             }
             _ => Ok(()),
+        }
+    }
+
+    /// A file made for a recording or split that never got its first frame: an empty file left
+    /// in the recordings folder otherwise (projects-60).
+    fn drop_pending_file(&mut self) {
+        if let Some((f, _, path)) = self.split_to.take() {
+            drop(f);
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
@@ -390,7 +402,7 @@ impl Pipeline {
         }
         let f = File::create(path)
             .map_err(|e| AvError::Encoder(format!("the next file can't be written at {} ({e})", path.display())))?;
-        self.split_to = Some((f, is_mkv(path)));
+        self.split_to = Some((f, is_mkv(path), path.to_path_buf()));
         self.key_next = true;
         Ok(())
     }
@@ -625,6 +637,7 @@ impl Pipeline {
             let packets = enc.flush()?;
             tags.extend(Self::track_tags(i, enc, sent, packets));
         }
+        self.drop_pending_file();
         if let Some(Recording::On(w)) = self.recording.take() {
             w.finish().map_err(|e| AvError::Encoder(format!("the recording couldn't be finished ({e})")))?;
         }
