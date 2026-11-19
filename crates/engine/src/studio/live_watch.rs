@@ -99,12 +99,7 @@ impl Engine {
         let (message, cleared) = if pct >= 100 {
             ("Your stream is back to full quality.".to_string(), true)
         } else {
-            (
-                format!(
-                    "Your upload struggled: the stream's quality is at {pct}% to stay smooth. It goes back up by itself."
-                ),
-                false,
-            )
+            (format!("Upload struggled: quality is at {pct}%; it recovers by itself."), false)
         };
         self.studio_frame("live_alert", &LiveAlert { id: "auto_quality".into(), level: "warn", message, cleared });
     }

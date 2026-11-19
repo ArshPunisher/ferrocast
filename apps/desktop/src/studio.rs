@@ -2220,14 +2220,14 @@ impl StudioHost for DesktopStudio {
                     if canvas != now && !rate_only {
                         if busy {
                             notes.push(
-                                "The new picture size and frame rate apply once streaming, recording, the replay buffer, NDI and the virtual camera are off."
+                                "The new size and frame rate apply once streaming, recording, replay, NDI and the virtual camera are off."
                                     .into(),
                             );
                         } else {
                             apply_canvas(&app, h, canvas)?;
                         }
                     } else if rate_only && canvas.fps > now.fps {
-                        notes.push(format!("The stream goes up to {} fps after it ends; it can't go above the picture's rate while live.", canvas.fps));
+                        notes.push(format!("The stream goes up to {} fps once it ends.", canvas.fps));
                     }
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
@@ -2276,7 +2276,7 @@ impl StudioHost for DesktopStudio {
                     _ => false,
                 };
                 if live && was.as_ref().is_some_and(|o| o.audio_kbps != s.audio_kbps) {
-                    notes.push("The new sound bitrate is used from the next stream.".into());
+                    notes.push("The new sound bitrate starts with the next stream.".into());
                 }
                 let was_kbps = was.as_ref().map(|o| o.video_kbps);
                 if was_kbps.is_some_and(|k| k != s.video_kbps) {
@@ -2297,10 +2297,7 @@ impl StudioHost for DesktopStudio {
         let failed = crate::studio_keys::apply(&self.app, &keys);
         let mut all = note;
         if !failed.is_empty() {
-            all.push(format!(
-                "These shortcuts are used by another app or aren't keys this Mac knows: {}.",
-                failed.join(", ")
-            ));
+            all.push(format!("These shortcuts are used by another app or aren't valid here: {}.", failed.join(", ")));
         }
         Ok((!all.is_empty()).then(|| all.join(" ")))
     }

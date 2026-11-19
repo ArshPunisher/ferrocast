@@ -385,7 +385,7 @@ impl Engine {
             &Notice {
                 key: Some("discord-pro".into()),
                 level: NoticeLevel::Warn,
-                message: format!("The Ferrocast bot couldn't do that in Discord. {message}"),
+                message: format!("The Discord bot couldn't finish: {message}"),
                 action: Some(NoticeAction { label: "Discord settings".into(), href: "#/settings/discord".into() }),
             },
         ));
@@ -531,7 +531,7 @@ impl Engine {
                 }
                 let blocked = v["blocked"].as_u64().is_some_and(|n| n > 0).then(|| match v["issue"]["code"].as_str() {
                     Some("guild_missing") => "Ferrocast isn't in your server any more. Connect it again.".to_string(),
-                    _ => "Some roles couldn't be given. Move Ferrocast's role above the perk roles in Server Settings › Roles.".to_string(),
+                    _ => "Some roles weren't given: move Ferrocast's role above the perk roles.".to_string(),
                 });
                 Sent::Done { blocked }
             }

@@ -406,7 +406,7 @@ impl Engine {
                 o.name = format!("{} (this PC)", o.name.trim()).chars().take(60).collect();
                 let name = o.name.clone();
                 match self.db(move |s| repo::overlays::create_from(s, o)).await {
-                    Ok(_) => format!("The web’s change to an overlay replaced this PC’s. Yours is kept as “{name}”."),
+                    Ok(_) => format!("The web’s overlay change replaced this PC’s. Yours is kept as “{name}”."),
                     Err(_) => return,
                 }
             }
@@ -421,13 +421,13 @@ impl Engine {
                     format!("{} (this PC)", d.name.trim()).chars().take(ferrocast_core::design::MAX_NAME).collect();
                 let name = copy.name.clone();
                 match self.db(move |s| repo::designs::insert(s, &copy)).await {
-                    Ok(_) => format!("The web’s change to a design replaced this PC’s. Yours is kept as “{name}”."),
+                    Ok(_) => format!("The web’s design change replaced this PC’s. Yours is kept as “{name}”."),
                     Err(_) => return,
                 }
             }
             RULE => {
                 let name = mine["name"].as_str().unwrap_or("an alert").to_string();
-                format!("Your change to the {name} rule on this PC was replaced by the one from the web.")
+                format!("The web’s {name} rule replaced your change on this PC.")
             }
             _ => return,
         };

@@ -2104,8 +2104,8 @@ impl Engine {
         self.get_ffmpeg().await?;
         Err(crate::golive::refused_pub(
             "ffmpeg_downloading",
-            "Ferrocast is downloading FFmpeg for the software encoder (x264) and Lossless (about 30 MB).",
-            "Try again in a minute, or pick the Mac's hardware encoder.",
+            "Downloading FFmpeg for x264 and Lossless (about 30 MB).",
+            "Try again in a minute, or pick the hardware encoder.",
         ))
     }
 
@@ -2330,9 +2330,7 @@ impl Engine {
         };
         match started {
             Ok(true) => None,
-            Ok(false) => {
-                Some("A vertical platform is on, but there's no vertical picture: add one in Studio, Go live.".into())
-            }
+            Ok(false) => Some("A vertical platform is on, but there's no vertical picture: add one in Go live.".into()),
             Err(e) => {
                 tracing::warn!(error = %e, "the Studio's vertical picture didn't start streaming");
                 Some("The vertical stream didn't start; the wide one did.".into())
@@ -2594,7 +2592,7 @@ fn failed(message: String) -> EngineError {
         return refused(409, "studio_already_here", message, "Pick it in the Sources list instead.");
     }
     if message.contains("isn't here yet") {
-        return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
+        return refused(422, "studio_not_supported", message, "Use Reload for now.");
     }
     if message.starts_with("The replay buffer is off") {
         return refused(

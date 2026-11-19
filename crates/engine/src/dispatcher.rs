@@ -104,7 +104,7 @@ impl Engine {
                             key: Some("alerts-folded".into()),
                             level: NoticeLevel::Info,
                             message: format!(
-                                "{} alert{} waited too long and went to the event list instead.",
+                                "{} queued alert{} went to the event list instead.",
                                 alert_ids.len(),
                                 if alert_ids.len() == 1 { "" } else { "s" }
                             ),

@@ -1160,3 +1160,4 @@ async fn a_late_destination_joining_mid_gop_counts_zero_drops() {
     assert_eq!(next(&mut got).await, Got::Video(50, Bytes::from_static(INTER)));
     assert_eq!(health.borrow().dropped, 0, "pre-keyframe startup skips must not count as drops");
 }
+mod platforms;

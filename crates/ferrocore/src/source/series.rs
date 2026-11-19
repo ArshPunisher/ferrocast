@@ -184,6 +184,11 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
                         return;
                     }
                 }
+                // A file that stopped because it couldn't be played (cut off, unreadable): the next
+                // one plays, and the log says why this one stopped.
+                if let Some(why) = m.error() {
+                    tracing::warn!(file = %p.files[i].display(), %why, "a playlist file stopped with a problem: next");
+                }
             }
             // Round again; a list where nothing opens waits before trying again.
             if !p.looping || (!played && !wait(stop, Duration::from_secs(5))) {

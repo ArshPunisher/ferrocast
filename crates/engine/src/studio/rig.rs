@@ -57,8 +57,8 @@ impl Engine {
             Err(_) => Err(EngineError::Refused {
                 status: 409,
                 code: "studio_stopped",
-                message: "The Studio isn't started.".into(),
-                hint: "Start it in Studio, Go live (or open OBS, if you stream with OBS).".into(),
+                message: "Studio isn't started.".into(),
+                hint: "Start it in Go live, or open OBS if you use OBS.".into(),
                 retry_after: None,
             }),
         }

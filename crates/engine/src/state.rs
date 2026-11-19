@@ -184,8 +184,9 @@ impl ConnectorView {
             ConnectorStatus::Reconnecting { attempt } => ("reconnecting", Some(format!("Attempt {attempt}"))),
             ConnectorStatus::Disconnected { reason } => ("disconnected", Some(reason.clone())),
             ConnectorStatus::SignInNeeded => ("sign_in_needed", Some("Sign in again to keep events coming.".into())),
-            ConnectorStatus::ScopesMissing { scopes } => {
-                ("scopes_missing", Some(format!("Needs permission: {}", scopes.join(", "))))
+            ConnectorStatus::ScopesMissing { .. } => {
+                // The scope names are the platform's own words; the streamer needs the fix, not them.
+                ("scopes_missing", Some("Needs more permission: reconnect it in Settings, Accounts.".into()))
             }
         };
         self.state = state.into();

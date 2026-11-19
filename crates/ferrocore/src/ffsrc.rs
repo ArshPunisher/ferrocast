@@ -21,6 +21,10 @@ const PIECE: usize = 1024;
 /// Pictures a file shows before its sound is placed on their clock: the first few come in a
 /// burst, so the clock (the earliest start they give) settles by then.
 const SETTLE_FRAMES: u64 = 8;
+/// A file's sound goes to the mixer when it plays within this long, not as soon as FFmpeg hands it
+/// over (0.35-0.45 s before its picture): what the mixer already holds still plays after a pause,
+/// a seek or a cut to another scene, so what waits here is what those can still stop.
+const SOUND_HOLD_NS: u64 = 40_000_000;
 
 /// FFmpeg, as the engine knows it (the app's own, or the PATH's).
 pub fn ffmpeg() -> Result<PathBuf, AvError> {
@@ -471,6 +475,44 @@ pub enum MediaState {
     Ended,
 }
 
+/// The sound in `q` (pieces and where they are in the file) that plays by `now` + the hold, in
+/// order, each with its time on the pictures' clock (`start`); what plays later stays queued.
+/// Sound for a moment already shown is let go (the first pieces, held while the clock settled:
+/// handed to the mixer late, it would hold every sound back that much for good).
+fn due_sound(q: &mut std::collections::VecDeque<(Vec<f32>, u64, u64)>, start: u64, now: u64) -> Vec<(Vec<f32>, u64)> {
+    let (floor, limit) = (now.saturating_sub(20_000_000), now.saturating_add(SOUND_HOLD_NS));
+    let mut out = Vec::new();
+    while let Some((_, _, pos)) = q.front() {
+        let ts = start + pos * 1_000_000_000 / 48_000;
+        if ts > limit {
+            break;
+        }
+        if let Some((pcm, ..)) = q.pop_front()
+            && ts >= floor
+        {
+            out.push((pcm, ts));
+        }
+    }
+    out
+}
+
+/// Whether a file that isn't looping is over: its pictures ended and, when its sound comes from a
+/// reader of its own (that starts a little later), that ended too with all of it taken. The
+/// pictures' end alone dropped the readers and the last of the sound with them.
+fn is_over(pictures: &Shared, sound: Option<&Shared>) -> bool {
+    if !pictures.ended.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(s) = sound else {
+        // No sound reader: a file with no picture is its own sound reader (its sound taken), one
+        // with no sound is over with its pictures.
+        return pictures.sound.lock().map(|q| q.is_empty()).unwrap_or(true);
+    };
+    // Sound is only taken once the pictures have set its clock; without it, it can't be placed.
+    let placed = pictures.frames.load(Ordering::Relaxed) >= SETTLE_FRAMES;
+    s.ended.load(Ordering::Acquire) && (!placed || s.sound.lock().map(|q| q.is_empty()).unwrap_or(true))
+}
+
 /// A file's readers now: pictures (or the sound alone), sound, since when and from where (ns).
 type Run = (Reader, Option<Reader>, Instant, u64);
 
@@ -661,9 +703,12 @@ impl Media {
     }
 
     pub fn state(&self) -> (MediaState, u64) {
-        let ended =
-            self.run.lock().ok().and_then(|r| r.as_ref().map(|(p, _, _, _)| p.shared.ended.load(Ordering::Acquire)));
-        if ended == Some(true) && !self.looping {
+        let over = self
+            .run
+            .lock()
+            .ok()
+            .and_then(|r| r.as_ref().map(|(p, s, _, _)| is_over(&p.shared, s.as_ref().map(|s| &*s.shared))));
+        if over == Some(true) && !self.looping {
             self.halt(MediaState::Ended, self.duration_ns);
         }
         let s = self.state.lock().map(|s| s.0).unwrap_or(MediaState::Stopped);
@@ -689,20 +734,7 @@ impl Media {
             return Vec::new();
         }
         let Some(start) = p.shared.start_ns.lock().ok().and_then(|s| *s) else { return Vec::new() };
-        // Sound for a moment already shown is let go (the first pieces, held while the clock
-        // settled): handed to the mixer late, it would hold every sound back that much for good.
-        let floor = now_ns().saturating_sub(20_000_000);
-        sound
-            .shared
-            .sound
-            .lock()
-            .map(|mut q| {
-                q.drain(..)
-                    .map(|(pcm, _, pos)| (pcm, start + pos * 1_000_000_000 / 48_000))
-                    .filter(|(_, ts)| *ts >= floor)
-                    .collect()
-            })
-            .unwrap_or_default()
+        sound.shared.sound.lock().map(|mut q| due_sound(&mut q, start, now_ns())).unwrap_or_default()
     }
 
     pub fn ended(&self) -> bool {
@@ -828,7 +860,14 @@ mod tests {
         m.control(Control::Seek(1_500_000_000));
         assert_eq!(m.state().1, 1_500_000_000);
         m.control(Control::Play);
-        std::thread::sleep(Duration::from_millis(1500));
+        // Played as the engine plays it: pictures and sound taken as they come (a file is over
+        // once what it decoded has been taken).
+        let until = Instant::now() + Duration::from_millis(1800);
+        while Instant::now() < until && !m.ended() {
+            let _ = m.frame_at(0);
+            let _ = m.take_sound();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(m.state().0, MediaState::Ended, "played to the end");
         assert!(m.ended());
 
@@ -879,5 +918,85 @@ mod tests {
         }
         assert!(late > 30, "sound after it looped: {late} pieces in its last second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file's sound reaches the mixer when it's about to play, not up to 0.4 s before: sound the
+    /// mixer already holds plays on after a pause, a seek or a cut to another scene.
+    #[test]
+    fn a_files_sound_is_handed_over_when_due() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ffsrc-due-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        let ok = Command::new(ffmpeg().unwrap())
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=30:duration=3"])
+            .args(["-f", "lavfi", "-i", "sine=duration=3", "-c:v", "libx264", "-c:a", "aac", "-shortest"])
+            .arg(&file)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let m = Media::open_for_card(&file, false).unwrap();
+        let started = Instant::now();
+        let (mut most_ahead, mut pieces) = (0u64, 0usize);
+        while started.elapsed() < Duration::from_millis(2000) {
+            let _ = m.frame_nv12();
+            let now = now_ns();
+            for (_, at) in m.take_sound() {
+                pieces += 1;
+                most_ahead = most_ahead.max(at.saturating_sub(now));
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(pieces > 20, "sound came: {pieces} pieces");
+        assert!(most_ahead <= 40_000_000 + 5_000_000, "sound came {} ms before it plays", most_ahead / 1_000_000);
+    }
+
+    /// Pieces that play later than the hold wait; the ones already shown are let go.
+    #[test]
+    fn sound_is_taken_when_due_and_stale_sound_is_let_go() {
+        let ms = |m: u64| m * 1_000_000;
+        // 48000/1000 samples a millisecond: pieces of 1,024 samples at 0, 1,024, 2,048… of the file.
+        let mut q: std::collections::VecDeque<_> = (0..10u64).map(|i| (vec![0.0f32; 2048], 0u64, i * 1_024)).collect();
+        // The clock puts the file's start at 1,000 ms and it's now 1,050: the pieces start at
+        // 1,000, 1,021.3, 1,042.7, 1,064, 1,085.3 and 1,106.7 ms. The hold takes those that play by
+        // 1,090; the first two began more than 20 ms ago (before 1,030): let go.
+        let got = due_sound(&mut q, ms(1_000), ms(1_050));
+        let times: Vec<u64> = got.iter().map(|p| p.1 / 1_000_000).collect();
+        assert_eq!(times, vec![1_042, 1_064, 1_085]);
+        assert_eq!(q.len(), 5, "the rest waits");
+        // A pause drops what waits.
+        q.clear();
+        assert!(due_sound(&mut q, ms(1_000), ms(9_000)).is_empty());
+    }
+
+    fn shared(ended: bool, frames: u64, queued: usize) -> Shared {
+        let s = Shared::default();
+        s.ended.store(ended, Ordering::Release);
+        s.frames.store(frames, Ordering::Relaxed);
+        for _ in 0..queued {
+            s.sound.lock().unwrap().push_back((vec![0.0; 2048], 0, 0));
+        }
+        s
+    }
+
+    /// A file with its sound in a reader of its own is over when both ended and the sound is
+    /// taken: the pictures' end alone dropped the readers, and the sound's last pieces with them.
+    #[test]
+    fn a_file_is_over_when_its_pictures_and_its_sound_are() {
+        let pictures_done = shared(true, 100, 0);
+        // Sound still running, or with pieces waiting: not over.
+        assert!(!is_over(&pictures_done, Some(&shared(false, 0, 0))));
+        assert!(!is_over(&pictures_done, Some(&shared(true, 0, 3))));
+        assert!(is_over(&pictures_done, Some(&shared(true, 0, 0))));
+        // Pictures still going: not over, whatever the sound did.
+        assert!(!is_over(&shared(false, 100, 0), Some(&shared(true, 0, 0))));
+        // Too few pictures to have set the sound's clock: its sound never comes, so it can't hold the file.
+        assert!(is_over(&shared(true, 3, 0), Some(&shared(true, 0, 9))));
+        // No sound reader: a silent file is over with its pictures; a sound-only file when taken.
+        assert!(is_over(&pictures_done, None));
+        assert!(!is_over(&shared(true, 0, 2), None));
     }
 }

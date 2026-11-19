@@ -88,7 +88,7 @@ pub async fn download_verified(
     }
     let got = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect::<String>();
     if got != sha256 {
-        return Err("the downloaded file isn't the expected one (its checksum differs), so it wasn't used".into());
+        return Err("the downloaded file's checksum differs, so it wasn't used".into());
     }
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || unpack(&body, &dest)).await.map_err(|e| e.to_string())??;

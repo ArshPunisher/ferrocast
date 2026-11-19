@@ -120,7 +120,7 @@ impl Engine {
                 "obs",
                 "Studio",
                 CheckStatus::Fail,
-                "The Studio isn't started (and OBS isn't open).",
+                "Studio isn't started.",
                 fix("Open the Studio", "#/studio/golive"),
             )),
         }
@@ -141,7 +141,7 @@ impl Engine {
                                 id,
                                 label,
                                 CheckStatus::Fail,
-                                format!("{} has no scene called \"{s}\" (renamed or deleted?).", r.title()),
+                                format!("{} has no scene \"{s}\": renamed or deleted?", r.title()),
                                 fix("Pick the scene again", "#/studio/show"),
                             )
                         });
@@ -159,7 +159,7 @@ impl Engine {
                         &format!("mic:{m}"),
                         m,
                         CheckStatus::Warn,
-                        "Not muted, but no sound comes in: is it plugged in, and the right one picked?",
+                        "Not muted, but silent: check the cable and the input.",
                         fix("Check the mic", "#/studio/engine"),
                     ),
                     Ok(false) => Check::new(&format!("mic:{m}"), m, CheckStatus::Ok, "Not muted.", None),
@@ -191,7 +191,7 @@ impl Engine {
                         &format!("cam:{cam}"),
                         cam,
                         CheckStatus::Fail,
-                        format!("Shown in \"{scene}\", but its picture is black: is the lens covered, or another app using the camera?"),
+                        format!("Shown in \"{scene}\" but black: lens covered, or used by another app?"),
                         fix("Check the camera", "#/studio/engine"),
                     ),
                     Ok(Some(true)) => {
@@ -240,7 +240,7 @@ impl Engine {
                 "platforms",
                 "Platforms",
                 CheckStatus::Warn,
-                "No platform is connected: chat, alerts and stream info won't work.",
+                "No platform connected: chat, alerts and stream info won't work.",
                 fix("Connect", "#/settings/accounts"),
             ));
         }
@@ -278,7 +278,7 @@ impl Engine {
                     "discord",
                     "Discord post",
                     CheckStatus::Warn,
-                    "No Discord webhook is set (or posts are off), so nothing is posted.",
+                    "No Discord webhook set (or posts off): nothing is posted.",
                     fix("Discord settings", "#/settings/discord"),
                 ));
             }
@@ -512,7 +512,7 @@ impl Engine {
                 id,
                 label,
                 "skipped",
-                format!("\"{scene}\" has nothing in it, so the scene on air stays. Pick another in Show settings."),
+                format!("\"{scene}\" is empty, so the on-air scene stays. Pick another in Show settings."),
             );
         }
         match self.rig_switch(r, scene).await {
