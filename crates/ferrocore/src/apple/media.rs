@@ -437,8 +437,9 @@ impl Media {
                         Control::Seek(ns) => {
                             let clamped = if self.duration_ns > 0 { ns.min(self.duration_ns) } else { ns };
                             shared.position.store(clamped, Ordering::Relaxed);
-                            if st.ended {
+                            if st.ended || st.stopped {
                                 st.ended = false;
+                                st.stopped = false;
                                 st.paused = true;
                             }
                         }
@@ -583,7 +584,7 @@ fn read(
                     from = clamp(n);
                     shared.position.store(from, Ordering::Relaxed);
                     clear();
-                    if reader_state == MediaState::Ended {
+                    if matches!(reader_state, MediaState::Ended | MediaState::Stopped) {
                         reader_state = MediaState::Paused;
                     }
                 }
@@ -846,6 +847,14 @@ mod tests {
         let (state, pos) = m.state();
         assert_eq!(state, MediaState::Playing);
         assert!(pos < 1_000_000_000, "resumed from 0 after Stop while paused, not 2 s: {pos}");
+        // Seeking while Stopped then playing must honour the seek target instead of resetting to 0.
+        m.control(Control::Stop);
+        show(100);
+        m.control(Control::Seek(2_000_000_000));
+        m.control(Control::Play);
+        show(450);
+        let (state, pos) = m.state();
+        assert!(state == MediaState::Playing && pos >= 1_900_000_000, "Seek while Stopped then Play: {pos}");
     }
 
     /// A trimmed MP4 whose first sample PTS is 5 s must show its first frame promptly, not stall

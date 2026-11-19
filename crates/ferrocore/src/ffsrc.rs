@@ -1017,7 +1017,7 @@ fn read_media(spec: PassSpec, start_stopped: bool, shared: Arc<MediaShared>, sto
                     from = clamp(n);
                     shared.position.store(from, Ordering::Relaxed);
                     shared.clear_queues();
-                    if reader_state == MediaState::Ended {
+                    if matches!(reader_state, MediaState::Ended | MediaState::Stopped) {
                         reader_state = MediaState::Paused;
                     }
                 }
@@ -1520,8 +1520,9 @@ impl Media {
                 Control::Seek(ns) => {
                     let clamped = if self.duration_ns > 0 { ns.min(self.duration_ns) } else { ns };
                     self.shared.position.store(clamped, Ordering::Relaxed);
-                    if st.ended {
+                    if st.ended || st.stopped {
                         st.ended = false;
+                        st.stopped = false;
                         st.paused = true;
                     }
                 }
