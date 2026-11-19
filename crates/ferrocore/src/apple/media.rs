@@ -13,7 +13,8 @@ use std::time::Duration;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
-    AVAssetReader, AVAssetReaderOutput, AVAssetReaderTrackOutput, AVMediaTypeAudio, AVMediaTypeVideo, AVURLAsset,
+    AVAssetReader, AVAssetReaderOutput, AVAssetReaderStatus, AVAssetReaderTrackOutput, AVMediaTypeAudio,
+    AVMediaTypeVideo, AVURLAsset,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeRange};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
@@ -26,6 +27,10 @@ const AHEAD_NS: u64 = 300_000_000;
 /// A frame kept waiting at most (a stalled engine can't grow memory).
 const MAX_FRAMES: usize = 12;
 const MAX_SOUND: usize = 400;
+/// Sound is handed to the mixer when it is this close to playing, not 300 ms before: what the
+/// mixer already holds still plays after a pause, a seek or a cut to another scene (it can't be
+/// taken back), so anything held here is what a pause can still stop.
+const SOUND_HOLD_NS: u64 = 40_000_000;
 
 #[derive(Debug, Default)]
 struct Shared {
@@ -193,6 +198,42 @@ fn sound_of(s: &CMSampleBuffer) -> Option<Vec<f32>> {
     }
 }
 
+/// The sound in `q` that plays no later than `hold` after `now`, taken out in order; what plays
+/// later stays (and goes if the file is paused, seeked or stopped meanwhile).
+fn take_due(q: &mut VecDeque<(Vec<f32>, u64)>, now: u64, hold: u64) -> Vec<(Vec<f32>, u64)> {
+    let mut out = Vec::new();
+    while q.front().is_some_and(|(_, at)| *at <= now.saturating_add(hold)) {
+        out.extend(q.pop_front());
+    }
+    out
+}
+
+impl Shared {
+    /// A file that can't be played ends here, with the reason (a playlist moves on to the next
+    /// file; it waits for a control, and Play or Restart try it again).
+    fn give_up(&self, why: &str) {
+        if let Ok(mut err) = self.error.lock() {
+            *err = Some(format!("the media couldn't be played ({why})"));
+        }
+        if let Ok(mut q) = self.frames.lock() {
+            q.clear();
+        }
+        if let Ok(mut q) = self.sound.lock() {
+            q.clear();
+        }
+        self.ended.store(true, Ordering::Relaxed);
+    }
+
+    /// Decoded to the end and everything decoded has been taken: only then is a file over (the
+    /// reader runs 300 ms ahead, and a playlist that moved on at the reader's end lost the last
+    /// 300 ms of the file's picture and sound).
+    fn finished(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+            && self.frames.lock().map(|q| q.is_empty()).unwrap_or(true)
+            && self.sound.lock().map(|q| q.is_empty()).unwrap_or(true)
+    }
+}
+
 impl Media {
     /// Opens a file and starts playing it (its first frame shows about 100 ms from now).
     pub fn open(path: &Path, looping: bool) -> Result<Self, AvError> {
@@ -269,7 +310,7 @@ impl Media {
     /// Where it stands, and where it is in the file (ns).
     pub fn state(&self) -> (MediaState, u64) {
         let s = &self.shared;
-        let state = if s.ended.load(Ordering::Relaxed) {
+        let state = if s.finished() {
             MediaState::Ended
         } else if s.stopped.load(Ordering::Relaxed) {
             MediaState::Stopped
@@ -281,14 +322,16 @@ impl Media {
         (state, s.position.load(Ordering::Relaxed))
     }
 
-    /// Sound decoded since the last call, each piece with the host time it plays at.
+    /// Sound decoded since the last call that is about to play, each piece with the host time it
+    /// plays at (what plays later waits here, where a pause or a seek can still drop it).
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
-        self.shared.sound.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
+        self.shared.sound.lock().map(|mut q| take_due(&mut q, host_ns(), SOUND_HOLD_NS)).unwrap_or_default()
     }
 
-    /// Played to the end (not looping).
+    /// Played to the end (not looping), or it couldn't be played (`error` says why), and
+    /// everything decoded has been taken.
     pub fn ended(&self) -> bool {
-        self.shared.ended.load(Ordering::Relaxed)
+        self.shared.finished()
     }
 
     pub fn error(&self) -> Option<String> {
@@ -349,12 +392,14 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
         let pass = match open_pass(&asset, from) {
             Ok(p) => p,
             Err(e) => {
-                if let Ok(mut err) = shared.error.lock() {
-                    *err = Some(format!("the media couldn't be played ({e})"));
-                }
-                return;
+                shared.give_up(&e);
+                follows = None;
+                continue 'passes;
             }
         };
+        if let Ok(mut err) = shared.error.lock() {
+            *err = None;
+        }
         let start = follows.unwrap_or_else(|| (host_ns() + 100_000_000).saturating_sub(from));
         let (mut v_next, mut a_next) =
             (pass.video.as_ref().and_then(|o| next(o)), pass.audio.as_ref().and_then(|o| next(o)));
@@ -425,12 +470,24 @@ fn read(url_text: &str, looping: bool, duration_ns: u64, shared: &Shared, stop: 
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+        // A reader that failed part way ends the pass as the end of the file does; say why.
+        // SAFETY: the reader belongs to this thread.
+        let failed = unsafe { pass.reader.status() == AVAssetReaderStatus::Failed };
+        if failed
+            && !stop.load(Ordering::Acquire)
+            && let Ok(mut err) = shared.error.lock()
+        {
+            // SAFETY: as above.
+            let why = unsafe { pass.reader.error() }.map(|e| e.localizedDescription().to_string());
+            *err =
+                Some(format!("the media stopped being readable ({})", why.unwrap_or_else(|| "no reason given".into())));
+        }
         // SAFETY: the reader belongs to this thread.
         unsafe { pass.reader.cancelReading() };
         if stop.load(Ordering::Acquire) {
             return;
         }
-        if !looping {
+        if !looping || failed {
             shared.ended.store(true, Ordering::Relaxed);
             continue;
         }
@@ -489,5 +546,114 @@ mod tests {
         m.control(Control::Stop);
         show(100);
         assert_eq!(m.state(), (MediaState::Stopped, 0));
+    }
+
+    fn piece(at: u64) -> (Vec<f32>, u64) {
+        (vec![0.0; 2048], at)
+    }
+
+    /// Only sound about to play is taken; the rest waits where a pause can still drop it.
+    #[test]
+    fn sound_is_taken_when_it_is_due_not_300_ms_ahead() {
+        let ms = |m: u64| m * 1_000_000;
+        let mut q: VecDeque<_> = (0..20).map(|i| piece(ms(1_000 + i * 21))).collect();
+        // At 1,000 ms with a 40 ms hold: the pieces at 1,000 and 1,021 (1,042 plays after 1,040).
+        let got = take_due(&mut q, ms(1_000), ms(40));
+        assert_eq!(got.iter().map(|p| p.1).collect::<Vec<_>>(), vec![ms(1_000), ms(1_021)]);
+        assert_eq!(q.len(), 18, "the rest waits");
+        assert!(take_due(&mut q, ms(1_000), ms(40)).is_empty(), "nothing twice");
+        // A pause drops what waits: nothing of it reaches the mixer later.
+        q.clear();
+        assert!(take_due(&mut q, ms(5_000), ms(40)).is_empty());
+        // Everything late comes at once, in order.
+        let mut q: VecDeque<_> = (0..5).map(|i| piece(ms(i * 21))).collect();
+        assert_eq!(take_due(&mut q, ms(10_000), ms(40)).len(), 5);
+    }
+
+    /// A file is over when what was decoded has been taken, not when the reader (300 ms ahead of
+    /// the screen) reaches the end.
+    #[test]
+    fn a_file_is_over_only_when_what_was_decoded_has_been_taken() {
+        let sh = Shared::default();
+        assert!(!sh.finished(), "still reading");
+        sh.ended.store(true, Ordering::Relaxed);
+        assert!(sh.finished(), "read to the end, nothing waiting");
+        sh.sound.lock().unwrap().push_back(piece(1));
+        assert!(!sh.finished(), "its last sound still waits");
+        sh.sound.lock().unwrap().clear();
+        assert!(sh.finished());
+    }
+
+    /// Played as a playlist plays it (take what's due until `ended`), a file gives its whole
+    /// sound: it used to end 300 ms early, with that much of the sound and picture still queued.
+    #[test]
+    fn a_playlist_style_reader_gets_the_whole_file() {
+        let Some(f) = clip() else { return };
+        let m = Media::open(&f, false).unwrap_or_else(|e| panic!("{e}"));
+        let (mut frames, mut sound_frames) = (0u32, 0usize);
+        let (mut most_ahead, started) = (0u64, std::time::Instant::now());
+        while !m.ended() && started.elapsed() < Duration::from_secs(8) {
+            if m.frame_at(host_ns()).is_some() {
+                frames += 1;
+            }
+            let now = host_ns();
+            for (pcm, at) in m.take_sound() {
+                sound_frames += pcm.len() / 2;
+                most_ahead = most_ahead.max(at.saturating_sub(now));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(m.ended(), "it ended");
+        let secs = sound_frames as f64 / 48_000.0;
+        assert!(secs > 3.85, "the whole 4 s of sound came, not the last 300 ms cut off: {secs:.2} s");
+        assert!(frames >= 112, "about 120 pictures of the 4 s clip: {frames}");
+        assert!(most_ahead <= SOUND_HOLD_NS + 5_000_000, "sound came {} ms before it plays", most_ahead / 1_000_000);
+    }
+
+    /// A pass that can't open ends the file with its reason (it used to set the error and leave
+    /// the file "playing" for good, and a playlist waited on it forever).
+    #[test]
+    fn a_file_that_cant_be_opened_is_over_and_says_why() {
+        let sh = Shared::default();
+        sh.frames.lock().unwrap().push_back((Picture::solid(2, 2, [0, 0, 0, 255]), 1, 1));
+        sh.sound.lock().unwrap().push_back(piece(1));
+        sh.give_up("it couldn't be read");
+        assert!(sh.finished(), "over, with nothing waiting");
+        let why = sh.error.lock().unwrap().clone().unwrap_or_default();
+        assert_eq!(why, "the media couldn't be played (it couldn't be read)");
+    }
+
+    /// A clip cut off part way (a download that stopped) ends instead of holding a playlist.
+    #[test]
+    fn a_cut_off_clip_ends() {
+        let f = std::env::temp_dir().join(format!("ferrocore-media-cut-{}.mp4", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30:duration=4"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .args(["-movflags", "+faststart"])
+            .arg(&f)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        let bytes = std::fs::read(&f).unwrap_or_default();
+        assert!(std::fs::write(&f, &bytes[..bytes.len() * 6 / 10]).is_ok());
+        let Ok(m) = Media::open(&f, false) else {
+            // Not even its header reads: said at once, nothing to hold.
+            let _ = std::fs::remove_file(&f);
+            return;
+        };
+        let started = std::time::Instant::now();
+        while !m.ended() && started.elapsed() < Duration::from_secs(6) {
+            let _ = m.frame_at(host_ns());
+            let _ = m.take_sound();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (ended, error) = (m.ended(), m.error());
+        drop(m);
+        let _ = std::fs::remove_file(&f);
+        eprintln!("cut-off clip: ended {ended}, said {error:?}");
+        assert!(ended, "a cut-off clip is over, so a playlist moves on");
     }
 }
