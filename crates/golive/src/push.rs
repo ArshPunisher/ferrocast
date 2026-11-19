@@ -210,10 +210,16 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     if !still_on(&live.borrow()) {
                         break;
                     }
-                    // A session that went live and then failed starts the count over: a
-                    // platform that keeps dropping a long stream is retried at once, not
-                    // after the longest wait.
-                    if health.borrow().state == PushState::Live {
+                    // A session that stayed live a while and then failed starts the count over: a
+                    // platform that keeps dropping a long stream is retried at once, not after
+                    // the longest wait. One that took the stream and closed it at once doesn't
+                    // (19 Nov, live: Kick took it and closed it every 8 s for the whole stream,
+                    // always "attempt 1", never waiting longer and never saying why).
+                    let (was_live, live_for_ms) = {
+                        let h = health.borrow();
+                        (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
+                    };
+                    if was_live && live_for_ms >= STAYED_LIVE_MS {
                         attempt = 0;
                     }
                     attempt = attempt.saturating_add(1);
@@ -222,13 +228,17 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
                     tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), "golive: destination failed, retrying");
+                    let reason = if was_live && live_for_ms < STAYED_LIVE_MS && dest.id.starts_with("kick") {
+                        format!(
+                            "{err} Kick took the stream and closed it at once: streaming to other platforms too \
+                             needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
+                        )
+                    } else {
+                        err.to_string()
+                    };
                     set_state(
                         &health,
-                        PushState::Reconnecting {
-                            attempt,
-                            retry_in_ms: wait.as_millis() as u64,
-                            reason: err.to_string(),
-                        },
+                        PushState::Reconnecting { attempt, retry_in_ms: wait.as_millis() as u64, reason },
                     );
                     tokio::select! {
                         _ = stop.wait_for(|s| *s) => break 'streams,
@@ -254,6 +264,9 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
         }
     });
 }
+
+/// How long a session stays live before its failure starts the retry count over.
+const STAYED_LIVE_MS: u64 = 30_000;
 
 /// 1, 2, 4, 8, 16, 30, 30… seconds by default, each ±20% so many destinations don't retry in
 /// step.

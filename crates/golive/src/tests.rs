@@ -570,17 +570,20 @@ async fn platform_that_drops(
 }
 
 #[tokio::test]
-async fn a_platform_that_keeps_dropping_a_live_stream_is_retried_from_the_first_wait() {
+async fn a_platform_that_takes_the_stream_and_drops_it_at_once_waits_longer_each_time() {
+    // 19 Nov, live: Kick took the stream and closed it at once, every 8 s for the whole
+    // stream, always "attempt 1". A session live for only a moment doesn't start the count
+    // over (one live a while does: STAYED_LIVE_MS), so the waits grow as with any failure.
     let w = world().await;
     let l = free_listener().await;
     let dport = l.local_addr().unwrap().port();
     let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
     let mut health = start(&w, destination(dport, "k"));
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
-    for _ in 0..2 {
+    for want in 1..=2u32 {
         state_is(&mut health, |s| *s == PushState::Live).await;
         match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
-            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, 1, "the count starts over after being live"),
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
             s => panic!("{s:?}"),
         }
     }
