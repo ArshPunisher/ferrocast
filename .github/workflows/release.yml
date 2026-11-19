@@ -81,7 +81,9 @@ jobs:
             args: ""
             out: target/release/bundle
           - name: Linux
-            os: ubuntu-24.04
+            # The oldest supported Ubuntu: the program needs the glibc it's built with, and
+            # 24.04's (2.39) left it unable to start on Debian 12, Ubuntu 22.04 and RHEL 9 (19 Nov).
+            os: ubuntu-22.04
             targets: ""
             args: ""
             out: target/release/bundle
@@ -219,6 +221,21 @@ jobs:
           # shellcheck disable=SC2086 # matrix.args and $bundles hold separate words.
           # --features deepfilter: the Studio's Strong noise removal (DeepFilterNet, its model built in).
           cargo tauri build ${{ matrix.args }} --features deepfilter $bundles --config "$config"
+      - name: The Linux program starts on glibc 2.35 (Ubuntu 22.04, Debian 12, RHEL 9)
+        if: matrix.name == 'Linux'
+        shell: bash
+        # Packages don't name a glibc: a program needing a newer one installs, then won't start.
+        run: |
+          need=$(objdump -T target/release/ferrocast | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 || true)
+          if [ -z "$need" ]; then
+            echo "::error::no glibc version read from target/release/ferrocast (objdump -T)"
+            exit 1
+          fi
+          echo "the program needs $need"
+          if [ "$(printf '%s\n' "$need" GLIBC_2.35 | sort -V | tail -1)" != GLIBC_2.35 ]; then
+            echo "::error::the Linux program needs $need; Ubuntu 22.04 and Debian 12 have 2.35/2.36"
+            exit 1
+          fi
       # Off until the Windows builds are code-signed: Smart App Control (on in fresh Windows 11)
       # blocks an unsigned setup Microsoft hasn't seen before, and ours carries the app packed
       # in one file. NSIS's installer, unsigned too, is let through (3 Nov 2026 test).

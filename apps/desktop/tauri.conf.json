@@ -59,6 +59,13 @@
     "linux": {
       "appimage": {
         "bundleMediaFramework": false
+      },
+      "deb": {
+        "section": "video",
+        "recommends": ["pulseaudio-utils", "x11-xserver-utils"]
+      },
+      "rpm": {
+        "recommends": ["pulseaudio-utils", "xrandr"]
       }
     },
     "windows": {
