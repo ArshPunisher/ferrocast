@@ -559,7 +559,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // Canvas-sized, so fitting it before the first replay fits the replay too.
                 (SourceKind::Color { width: canvas.0.max(1), height: canvas.1.max(1), rgba: [0, 0, 0, 0] }, false)
             } else {
-                (SourceKind::Media { path: path.into(), looping: false }, true)
+                (SourceKind::Media { path: path.into(), options: crate::ffsrc::MediaOptions::default() }, true)
             }
         }
         "ffmpeg_source" => {
@@ -571,7 +571,17 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
             (
                 SourceKind::Media {
                     path: text_of("local_file").into(),
-                    looping: s.get("looping").and_then(Value::as_bool).unwrap_or(false),
+                    options: crate::ffsrc::MediaOptions {
+                        looping: s.get("looping").and_then(Value::as_bool).unwrap_or(false),
+                        restart_on_activate: s.get("restart_on_activate").and_then(Value::as_bool).unwrap_or(true),
+                        close_when_inactive: s.get("close_when_inactive").and_then(Value::as_bool).unwrap_or(false),
+                        clear_on_media_end: s.get("clear_on_media_end").and_then(Value::as_bool).unwrap_or(true),
+                        speed_percent: s
+                            .get("speed_percent")
+                            .and_then(Value::as_u64)
+                            .map_or(100, |v| v.clamp(1, 200) as u32),
+                        hw_decode: s.get("hw_decode").and_then(Value::as_bool).unwrap_or(true),
+                    },
                 },
                 true,
             )
@@ -1362,11 +1372,48 @@ mod tests {
         );
         assert!(matches!(kind(json!({ "local_file": "" })), Ok(SourceKind::Color { .. })));
         match kind(json!({ "local_file": "/rec/Replay.mp4", "looping": true })) {
-            Ok(SourceKind::Media { path, looping }) => {
+            Ok(SourceKind::Media { path, options }) => {
                 assert_eq!(path, std::path::PathBuf::from("/rec/Replay.mp4"));
-                assert!(!looping, "a replay plays once");
+                assert!(!options.looping, "a replay plays once");
             }
             other => panic!("a media file: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ffmpeg_source_reads_all_five_media_options() {
+        let kind = |set: Value| kind_from("ffmpeg_source", &set, (1920, 1080), &[]).map(|k| k.0);
+        // OBS defaults when omitted.
+        match kind(json!({ "local_file": "/a.mp4" })) {
+            Ok(SourceKind::Media { options, .. }) => {
+                assert!(!options.looping);
+                assert!(options.restart_on_activate);
+                assert!(!options.close_when_inactive);
+                assert!(options.clear_on_media_end);
+                assert_eq!(options.speed_percent, 100);
+                assert!(options.hw_decode);
+            }
+            other => panic!("expected Media: {other:?}"),
+        }
+        // Explicit overrides and speed clamping.
+        match kind(json!({
+            "local_file": "/b.mkv",
+            "looping": true,
+            "restart_on_activate": false,
+            "close_when_inactive": true,
+            "clear_on_media_end": false,
+            "speed_percent": 350,
+            "hw_decode": false,
+        })) {
+            Ok(SourceKind::Media { options, .. }) => {
+                assert!(options.looping);
+                assert!(!options.restart_on_activate);
+                assert!(options.close_when_inactive);
+                assert!(!options.clear_on_media_end);
+                assert_eq!(options.speed_percent, 200);
+                assert!(!options.hw_decode);
+            }
+            other => panic!("expected Media: {other:?}"),
         }
     }
 
