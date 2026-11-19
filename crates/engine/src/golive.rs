@@ -501,7 +501,7 @@ pub(crate) struct GoLive {
     pub cfg: RwLock<GoLiveConfig>,
     ingest: Mutex<Option<String>>,
     running: Mutex<HashMap<String, Running>>,
-    blocked: Mutex<HashMap<String, String>>,
+    pub(crate) blocked: Mutex<HashMap<String, String>>,
     upload: Mutex<Option<UploadCheck>>,
     /// The last stream's measured rate, for planning the next one (0: none yet).
     last_kbps: std::sync::atomic::AtomicU32,
@@ -535,6 +535,10 @@ pub(crate) struct GoLive {
     studio_video: Mutex<Option<StudioCapConfig>>,
     /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
     studio_live: std::sync::atomic::AtomicBool,
+    /// The Studio couldn't put the platform's cap on the stream on air (its encoder is shared with
+    /// a recording, say): the stream isn't held to it, so no badge says it is and no warning about
+    /// its bitrate is held back.
+    cap_failed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,6 +601,7 @@ impl Default for GoLive {
             enhanced: Mutex::new(None),
             studio_video: Mutex::new(None),
             studio_live: std::sync::atomic::AtomicBool::new(false),
+            cap_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -915,6 +920,9 @@ impl Engine {
         if cfg.advanced.ignore_service_limits {
             return None;
         }
+        // One that can't start (no account, no key) isn't on this stream, so it sets no limit: a
+        // YouTube stream was held to 6,000 kbps by a Twitch switch with nobody signed in.
+        let blocked = lock(&self.golive().blocked).clone();
         probe::effective_limit(
             cfg.destinations
                 .iter()
@@ -922,7 +930,8 @@ impl Engine {
                     d.enabled
                         && d.canvas == Canvas::Main
                         && d.url.as_deref().and_then(direct_kind).is_none()
-                        && !d.wants_light()
+                        && !self.wants_light_now(d)
+                        && !blocked.contains_key(&d.id)
                 })
                 .map(|d| (d.kind, d.enhanced)),
         )
@@ -935,9 +944,24 @@ impl Engine {
             h264_only: l.h264_only,
             keyframe_secs: l.keyframe_secs,
         });
-        if let Err(e) = host.set_stream_cap(cap).await {
-            tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
+        let failed = &self.golive().cap_failed;
+        match host.set_stream_cap(cap).await {
+            Ok(()) => failed.store(false, std::sync::atomic::Ordering::Release),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
+                // The stream on air isn't held to the platform's limit: said, and the view stops
+                // claiming it is (the badge, the held-back bitrate warning).
+                failed.store(true, std::sync::atomic::Ordering::Release);
+                let what = cap.map_or("the platform".to_string(), |c| format!("{} kbps", c.max_kbps));
+                self.notice_detail(
+                    "stream-cap",
+                    crate::frames::NoticeLevel::Warn,
+                    "This stream isn't held to its platform's limit",
+                    &format!("Ferrocast couldn't set {what} on the stream on air: {e}"),
+                );
+            }
         }
+        self.send_golive_pub();
     }
 
     /// The Go live tab: destinations with their health, OBS's setting, the stream's numbers.
@@ -961,12 +985,14 @@ impl Engine {
         let cfg = self.golive_config();
         let running = lock(&g.running);
         let paused = lock(&g.paused);
+        // Before `blocked` is held: the limit reads it too.
+        let eff_limit = self.studio_limit();
         let blocked = lock(&g.blocked);
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
-        let eff_limit = self.studio_limit();
         let studio_cfg = *lock(&g.studio_video);
         let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let cap_held = !g.cap_failed.load(std::sync::atomic::Ordering::Acquire);
         let destinations = cfg
             .destinations
             .iter()
@@ -992,6 +1018,7 @@ impl Engine {
                     && d.url.as_deref().and_then(direct_kind).is_none()
                     && !d.enhanced
                     && !d.wants_light()
+                    && cap_held
                     && (!live || studio_streaming)
                     && let Some(limit) = eff_limit
                     && probe::ceiling(d.kind, d.enhanced).is_some()
@@ -1003,8 +1030,10 @@ impl Engine {
                 };
                 if capped.is_some() && studio_streaming && !self.on_light(d) {
                     // Studio is holding the shared encode at the platform ceiling with 1x VBV /
-                    // DataRateLimits; suppress stale/rounding bitrate warnings mid-stream.
-                    issues.clear();
+                    // DataRateLimits; hold back the bitrate warning (the measured rate counts the
+                    // audio and the container). The codec and keyframe rules still speak: an
+                    // encoder that isn't H.264 (AV1) must not be hidden by the badge.
+                    issues.retain(|i| i.code != probe::RuleCode::Bitrate);
                 }
                 let rules = issues.iter().map(|i| i.detail.clone()).collect();
                 DestinationView {

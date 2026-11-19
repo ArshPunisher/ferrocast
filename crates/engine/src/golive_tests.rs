@@ -433,6 +433,8 @@ struct DirectStudio {
     stopped: std::sync::Mutex<Vec<String>>,
     settings: std::sync::Mutex<crate::studio_host::StudioSettings>,
     caps: std::sync::Mutex<Vec<Option<crate::studio_host::StreamCap>>>,
+    /// Set: `set_stream_cap` refuses with this (the encoder is shared with a recording).
+    cap_refused: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -470,7 +472,7 @@ impl crate::studio_host::StudioHost for DirectStudio {
     }
     async fn set_stream_cap(&self, cap: Option<crate::studio_host::StreamCap>) -> Result<(), String> {
         self.caps.lock().unwrap().push(cap);
-        Ok(())
+        self.cap_refused.lock().unwrap().clone().map_or(Ok(()), Err)
     }
     async fn stats(&self) -> Result<serde_json::Value, String> {
         Err("n/a".into())
@@ -1108,6 +1110,9 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
         ..Default::default()
     };
     e.set_studio_host(studio.clone());
+    // Signed in (a destination that can't start sets no limit).
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Kick)));
 
     let enable_only = |target: &str| {
         GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == target)).collect::<Vec<_>>()
@@ -1157,5 +1162,118 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     let v = e.golive_view().await;
     let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
     assert_eq!(kick.capped, None);
+    e.studio_stream(false).await.unwrap();
+}
+
+/// A platform that is signed in and gives a local address and a key (so its destination can start).
+#[derive(Debug)]
+struct SignedIn(ferrocast_core::event::Platform);
+#[async_trait::async_trait]
+impl ferrocast_connector::Connector for SignedIn {
+    fn platform(&self) -> ferrocast_core::event::Platform {
+        self.0
+    }
+    fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+        Default::default()
+    }
+    async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into() })
+    }
+}
+
+fn twitch_studio_settings() -> crate::studio_host::StudioSettings {
+    crate::studio_host::StudioSettings { video_kbps: 14_000, vbr: true, keyframe_s: 4, ..Default::default() }
+}
+
+/// A stream of `kbps` on the main hub, as the Studio's would arrive.
+fn push_main(e: &crate::Engine, frame_bytes: usize) {
+    let hub = &e.golive().hub;
+    hub.start();
+    hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+    for i in 0..=40u32 {
+        let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+        d.resize(frame_bytes, 0);
+        hub.video(i * 100, d.into());
+    }
+}
+
+/// The cap is for the streams that go out: a destination that can't start (Twitch with nobody
+/// signed in) sets no limit, so a YouTube stream was held to 6,000 kbps by a switch that did
+/// nothing.
+#[tokio::test]
+async fn a_destination_that_cannot_start_sets_no_limit() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    let both: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "youtube"))
+        .collect();
+    e.set_golive_destinations(both).await.unwrap();
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000), "Twitch on, as far as anyone knows");
+    // It couldn't start (no account): the stream is YouTube's alone.
+    e.golive().blocked.lock().unwrap().insert("twitch".into(), "Connect Twitch first.".into());
+    assert_eq!(e.studio_limit(), None);
+    e.sync_stream_cap().await;
+    assert_eq!(studio.caps.lock().unwrap().last().copied().flatten(), None, "lifted for the stream on air");
+    // It can: the limit is back.
+    e.golive().blocked.lock().unwrap().clear();
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000));
+}
+
+/// A cap the Studio couldn't put on the stream on air (its encoder is shared with a recording)
+/// isn't claimed: no badge says the stream is held, and the bitrate warning isn't held back, so
+/// the 7,011 kbps one comes back instead of silence. The codec rule still speaks when capped.
+#[tokio::test]
+async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let only_twitch = || {
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "twitch")).collect::<Vec<_>>()
+    };
+    e.set_golive_destinations(only_twitch()).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    // 7,011 kbps arrives.
+    push_main(&e, 90_000);
+    let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
+    let v = e.golive_view().await;
+    assert!(twitch(&v).capped.is_some(), "held: the badge says so");
+    assert!(twitch(&v).issues.is_empty(), "held: its rounding isn't nagged about");
+    // The Studio can't apply it on the stream on air.
+    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
+    e.set_golive_destinations(only_twitch().into_iter().chain([]).collect()).await.unwrap();
+    e.sync_stream_cap().await;
+    let v = e.golive_view().await;
+    assert_eq!(twitch(&v).capped, None, "not claimed");
+    assert_eq!(twitch(&v).issues.len(), 1, "{:?}", twitch(&v).issues);
+    assert_eq!(twitch(&v).issues[0].code, ferrocast_golive::probe::RuleCode::Bitrate);
+    // Applied again (the recording stopped): held, as before.
+    *studio.cap_refused.lock().unwrap() = None;
+    e.sync_stream_cap().await;
+    let v = e.golive_view().await;
+    assert!(twitch(&v).capped.is_some() && twitch(&v).issues.is_empty());
     e.studio_stream(false).await.unwrap();
 }
