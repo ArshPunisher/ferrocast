@@ -11,6 +11,51 @@ pub fn mul_to_db(mul: f32) -> f32 {
     if mul == 0.0 { f32::NEG_INFINITY } else { 20.0 * mul.log10() }
 }
 
+/// Flushes tiny exponential-decay tails well before they enter IEEE 754 `f32` subnormal range
+/// (`< 1.175e-38`), preventing x86 denormal microcode stalls in silent audio filters (M2-06).
+#[inline]
+fn flush_denormal(x: f32) -> f32 {
+    if x.abs() < 1e-20 { 0.0 } else { x }
+}
+
+/// Enables Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ) in MXCSR on x86/x86_64 audio
+/// threads so residual subnormals in filters or third-party DSP never trigger x86 microcode
+/// traps (M2-06). Safe and idempotent; no-op on non-x86 targets.
+#[allow(unsafe_code)]
+pub fn enable_ftz_daz() {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        #[cfg(target_arch = "x86")]
+        let has_sse = std::arch::is_x86_feature_detected!("sse");
+        #[cfg(target_arch = "x86_64")]
+        let has_sse = true;
+        if has_sse {
+            const FTZ: u32 = 0x8000;
+            const DAZ: u32 = 0x0040;
+            let mut bits = FTZ;
+            if std::arch::is_x86_feature_detected!("sse3") {
+                bits |= DAZ;
+            }
+            let mut mxcsr: u32 = 0;
+            // SAFETY: SSE (MXCSR) is present; DAZ is gated on SSE3; `stmxcsr`/`ldmxcsr` only
+            // read/write this thread's floating-point control register and a local `u32`.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{ptr}]",
+                    ptr = in(reg) &raw mut mxcsr,
+                    options(nostack, preserves_flags),
+                );
+                mxcsr |= bits;
+                core::arch::asm!(
+                    "ldmxcsr [{ptr}]",
+                    ptr = in(reg) &raw const mxcsr,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
+}
+
 /// A sound filter made outside the engine (DeepFilterNet's noise removal, which the app builds
 /// in): it cleans stereo blocks in place, keeping its own state. False: it couldn't (gone, or
 /// too slow for this computer); the block is left as it was and the engine's light noise
@@ -204,16 +249,25 @@ pub struct AudioFilter {
     eq: [EqState; 2],
     /// A filter made outside the engine (noise removal).
     plugin: Option<Box<dyn SoundPlugin>>,
-    // Light noise removal: the noise floor it hears (RMS) and the gain now.
+    /// True once `plugin` has processed at least one block (failed init leaves this false so
+    /// we never install a permanent handover delay line around `light_denoise`).
+    plugin_ran: bool,
+    // Light noise removal: the noise floor it hears (RMS), steady-noise candidate, and current gain.
     floor: f32,
+    nr_steady_rms: f32,
+    nr_steady_s: f32,
     nr_gain: f32,
     /// After a plugin that held the sound back gave way (the strong noise removal too slow
     /// here): the sound is held back as long still, so the source doesn't jump in time.
     delay: Option<[std::collections::VecDeque<f32>; 2]>,
 }
 
-/// libobs's compressor `gain_coefficient`.
+/// libobs's compressor `gain_coefficient` (guards non-positive/non-finite times so negative
+/// imported parameters never produce `exp(+inf)` / `NaN`, M2-07).
 fn coefficient(rate: f32, secs: f32) -> f32 {
+    if !rate.is_finite() || rate <= 0.0 || !secs.is_finite() || secs <= 0.0 {
+        return 0.0;
+    }
     (-1.0 / (rate * secs)).exp()
 }
 
@@ -238,7 +292,10 @@ impl AudioFilter {
                 AudioEffect::Plugin { slot } => PLUGIN_MAKER.get().and_then(|make| make(slot, rate)),
                 _ => None,
             },
+            plugin_ran: false,
             floor: 0.0,
+            nr_steady_rms: 0.0,
+            nr_steady_s: 0.0,
             nr_gain: 1.0,
             delay: None,
         }
@@ -293,6 +350,7 @@ impl AudioFilter {
         let rate = self.rate;
         if let Some(p) = self.plugin.as_mut() {
             if p.process([&mut *l, &mut *r]) {
+                self.plugin_ran = true;
                 return;
             }
             // A VST that was late or stopped: this block passes as it was; it starts itself again.
@@ -301,7 +359,9 @@ impl AudioFilter {
             }
             tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
             let mut gone = self.plugin.take();
-            let late = gone.as_ref().map_or(0, |p| p.latency_frames());
+            // Only keep a handover delay line when the plugin actually ran and delayed audio;
+            // a failed init never delayed the stream and must not leave an 82.7 ms delay behind.
+            let late = if self.plugin_ran { gone.as_ref().map_or(0, |p| p.latency_frames()) } else { 0 };
             if late > 0 {
                 // What it still held plays first (silence only for what it never had).
                 let kept = gone.as_mut().and_then(|p| p.hand_over());
@@ -347,15 +407,19 @@ impl AudioFilter {
                 }
             }
             AudioEffect::NoiseGate { open_db, close_db, attack_ms, hold_ms, release_ms } => {
+                let open_db = if open_db.is_finite() { open_db } else { -26.0 };
+                let close_db = if close_db.is_finite() { close_db } else { -32.0 };
                 let open = db_to_mul(open_db);
                 // Closing at or above where it opens never closes (the level never falls: the
                 // gate stuck open, as in OBS): the More form allows it, so it closes at least
                 // 3 dB under where it opens (how fast it falls follows that gap).
                 let close = db_to_mul(close_db.min(open_db - 3.0));
-                let attack_rate = 1.0 / (attack_ms / 1000.0 * rate);
-                let release_rate = 1.0 / (release_ms / 1000.0 * rate);
+                let attack_rate =
+                    if attack_ms.is_finite() && attack_ms > 0.0 { 1.0 / (attack_ms / 1000.0 * rate) } else { 1.0 };
+                let release_rate =
+                    if release_ms.is_finite() && release_ms > 0.0 { 1.0 / (release_ms / 1000.0 * rate) } else { 1.0 };
                 let decay_rate = (open - close) / ((1.0 / 75.0) * rate);
-                let hold = hold_ms / 1000.0;
+                let hold = if hold_ms.is_finite() { hold_ms.max(0.0) / 1000.0 } else { 0.0 };
                 let rate_i = 1.0 / rate;
                 for i in 0..n {
                     let cur = l[i].abs().max(r[i].abs());
@@ -366,7 +430,7 @@ impl AudioFilter {
                         self.held = 0.0;
                         self.is_open = false;
                     }
-                    self.level = self.level.max(cur) - decay_rate;
+                    self.level = (self.level.max(cur) - decay_rate).max(0.0);
                     if self.is_open {
                         self.attenuation = (self.attenuation + attack_rate).min(1.0);
                     } else {
@@ -378,26 +442,23 @@ impl AudioFilter {
                     l[i] *= self.attenuation;
                     r[i] *= self.attenuation;
                 }
+                self.level = flush_denormal(self.level);
+                self.attenuation = flush_denormal(self.attenuation);
             }
             AudioEffect::Compressor { ratio, threshold_db, attack_ms, release_ms, output_db } => {
-                self.compress(
-                    l,
-                    r,
-                    n,
-                    1.0 - 1.0 / ratio.max(1.0),
-                    threshold_db,
-                    attack_ms,
-                    release_ms,
-                    db_to_mul(output_db),
-                );
+                let ratio = if ratio.is_finite() { ratio.max(1.0) } else { 1.0 };
+                self.compress(l, r, n, 1.0 - 1.0 / ratio, threshold_db, attack_ms, release_ms, db_to_mul(output_db));
             }
             AudioEffect::Limiter { threshold_db, release_ms } => {
                 self.compress(l, r, n, 1.0, threshold_db, 0.001, release_ms, 1.0);
             }
             AudioEffect::Expander { ratio, threshold_db, attack_ms, release_ms, output_db, rms } => {
+                let ratio = if ratio.is_finite() { ratio.max(1.0) } else { 1.0 };
                 self.expand(l, r, n, false, ratio, threshold_db, attack_ms, release_ms, output_db, 0.0, rms);
             }
             AudioEffect::UpwardCompressor { ratio, threshold_db, attack_ms, release_ms, output_db, knee_db } => {
+                let ratio = if ratio.is_finite() { ratio.clamp(0.0, 1.0) } else { 0.5 };
+                let knee_db = if knee_db.is_finite() { knee_db.max(0.0) } else { 0.0 };
                 self.expand(l, r, n, true, ratio, threshold_db, attack_ms, release_ms, output_db, knee_db, true);
             }
             AudioEffect::Eq3 { low_db, mid_db, high_db } => {
@@ -425,6 +486,9 @@ impl AudioFilter {
                         st.s[0] = sample;
                         *v = lo * lg + mid * mg + hi * hg;
                     }
+                    for v in st.lf.iter_mut().chain(st.hf.iter_mut()).chain(st.s.iter_mut()) {
+                        *v = flush_denormal(*v);
+                    }
                 }
             }
             // Without the app's strong noise removal (not in this build, it didn't start, or this
@@ -433,9 +497,10 @@ impl AudioFilter {
         }
     }
 
-    /// Light noise removal, for any computer: it follows the noise floor (the quietest the sound
-    /// gets, rising slowly) and turns down what stays near it (hiss, hum, a fan between words)
-    /// by up to 24 dB at strength 100; a voice above it passes untouched.
+    /// Light noise removal, for any computer: it tracks the background room noise floor (frozen
+    /// during speech so continuous talking is never ducked) and turns down what stays near the
+    /// floor (hiss, hum, a fan between words) by up to 24 dB at strength 100; a voice above it
+    /// passes untouched.
     fn light_denoise(&mut self, l: &mut [f32], r: &mut [f32], strength: u32) {
         let n = l.len();
         if n == 0 {
@@ -443,17 +508,45 @@ impl AudioFilter {
         }
         let rms = (l.iter().chain(r.iter()).map(|v| v * v).sum::<f32>() / (2 * n) as f32).sqrt();
         let secs = n as f32 / self.rate;
-        // Down at once to anything quieter; up 3 dB a second (a louder room is learnt). Digital
-        // silence (a gate shut before it, a muted device) says nothing about the room: it isn't
-        // learnt, and the floor starts at a quiet room's (-60 dBFS), so a voice coming after
-        // silence isn't taken for the noise (it was turned down 12-24 dB; peer, 18 Nov).
+        // Digital silence (a gate shut before it, a muted device) says nothing about the room:
+        // it isn't learnt, and the floor starts at a quiet room's (-60 dBFS), so a voice coming
+        // after silence isn't taken for the noise (peer, 18 Nov).
         const SILENCE: f32 = 3.2e-5; // -90 dBFS
         const START: f32 = 1e-3; // -60 dBFS
+        // Hard ceiling on background floor (-36 dBFS): continuous speech above this never pulls
+        // the floor upward and never gets ducked mid-sentence (M2-01).
+        const MAX_FLOOR: f32 = 0.015_848_932; // -36 dBFS
+        const STEADY_HOLD_S: f32 = 0.25;
         if self.floor <= 0.0 {
             self.floor = START;
         }
         if rms >= SILENCE {
-            self.floor = if rms < self.floor { rms } else { self.floor * db_to_mul(3.0 * secs) };
+            if rms < self.floor {
+                self.floor = rms;
+                self.nr_steady_rms = rms;
+                self.nr_steady_s = 0.0;
+            } else if rms <= MAX_FLOOR {
+                let over_floor = mul_to_db(rms / self.floor.max(1e-9));
+                let steady_diff =
+                    if self.nr_steady_rms > 0.0 { mul_to_db(rms / self.nr_steady_rms).abs() } else { f32::INFINITY };
+                if steady_diff <= 4.5 {
+                    self.nr_steady_s = (self.nr_steady_s + secs).min(STEADY_HOLD_S + 1.0);
+                    self.nr_steady_rms += (rms - self.nr_steady_rms) * (secs * 3.0).min(1.0);
+                } else {
+                    self.nr_steady_rms = rms;
+                    self.nr_steady_s = 0.0;
+                }
+                if over_floor <= 6.0 {
+                    self.floor = (self.floor * db_to_mul(3.0 * secs)).min(rms);
+                } else if self.nr_steady_s >= STEADY_HOLD_S {
+                    // Steady room noise above the initial -60 dBFS guess (or a fan turning on).
+                    self.floor = (self.floor * db_to_mul(18.0 * secs)).min(rms).min(MAX_FLOOR);
+                }
+            } else {
+                // Active speech above background noise ceiling: freeze the floor completely.
+                self.nr_steady_rms = 0.0;
+                self.nr_steady_s = 0.0;
+            }
         }
         let depth = 24.0 * strength.clamp(1, 100) as f32 / 100.0;
         // Within 6 dB of the floor is noise; 12 dB over is surely not: in between, partly.
@@ -468,9 +561,11 @@ impl AudioFilter {
             l[i] *= self.nr_gain;
             r[i] *= self.nr_gain;
         }
+        self.nr_gain = flush_denormal(self.nr_gain);
     }
 
     /// libobs's compressor and limiter: a peak envelope (the louder side), then gain.
+    /// Fused scalar loop: zero per-block heap allocation and denormal-free decay (M2-06).
     #[allow(clippy::too_many_arguments)]
     fn compress(
         &mut self,
@@ -483,29 +578,30 @@ impl AudioFilter {
         release_ms: f32,
         out: f32,
     ) {
+        if n == 0 {
+            return;
+        }
+        let threshold = if threshold.is_finite() { threshold } else { -18.0 };
         let ag = coefficient(self.rate, attack_ms / 1000.0);
         let rg = coefficient(self.rate, release_ms / 1000.0);
-        let mut env_buf = vec![0f32; n];
-        for data in [&*l, &*r] {
-            let mut env = self.envelope;
-            for (i, s) in data.iter().take(n).enumerate() {
-                let x = s.abs();
-                env = if env < x { x + ag * (env - x) } else { x + rg * (env - x) };
-                env_buf[i] = env_buf[i].max(env);
-            }
-        }
-        if let Some(last) = env_buf.last() {
-            self.envelope = *last;
-        }
-        for (i, e) in env_buf.iter().enumerate() {
-            let gain = db_to_mul((slope * (threshold - mul_to_db(*e))).min(0.0));
+        let mut env_l = self.envelope;
+        let mut env_r = self.envelope;
+        for i in 0..n {
+            let xl = l[i].abs();
+            env_l = flush_denormal(if env_l < xl { xl + ag * (env_l - xl) } else { xl + rg * (env_l - xl) });
+            let xr = r[i].abs();
+            env_r = flush_denormal(if env_r < xr { xr + ag * (env_r - xr) } else { xr + rg * (env_r - xr) });
+            let e = env_l.max(env_r);
+            let gain = if e > 0.0 { db_to_mul((slope * (threshold - mul_to_db(e))).min(0.0)) } else { 1.0 };
             l[i] *= gain * out;
             r[i] *= gain * out;
         }
+        self.envelope = flush_denormal(env_l.max(env_r));
     }
 
     /// libobs's expander, gate preset and upward compressor: per side, RMS (10 ms) or peak
     /// detection, gain in dB with attack and release.
+    /// Fused per-channel loop: zero per-block heap allocation and denormal-free state (M2-06).
     #[allow(clippy::too_many_arguments)]
     fn expand(
         &mut self,
@@ -521,53 +617,72 @@ impl AudioFilter {
         knee: f32,
         rms: bool,
     ) {
+        if n == 0 {
+            return;
+        }
+        let threshold = if threshold.is_finite() { threshold } else { -40.0 };
         let ag = coefficient(self.rate, attack_ms / 1000.0);
         let rg = coefficient(self.rate, release_ms / 1000.0);
         let slope = 1.0 - ratio;
         let out = db_to_mul(output_db);
         let rmscoef = (-100.0 / self.rate).exp2();
+        let half_knee = knee * 0.5;
         for (c, data) in [&mut *l, &mut *r].into_iter().enumerate() {
-            // Each side's envelope (libobs keeps the per-sample max over sides only per side).
-            let mut env = vec![0f32; n];
             let mut run = self.runave[c];
-            for (i, s) in data.iter().take(n).enumerate() {
-                if rms {
-                    run = rmscoef * run + (1.0 - rmscoef) * s * s;
-                    env[i] = run.max(0.0).sqrt();
-                } else {
-                    run = s * s;
-                    env[i] = s.abs();
-                }
-            }
-            self.runave[c] = run;
             let mut prev = self.gain_db[c];
-            for i in 0..n {
-                let env_db = mul_to_db(env[i]);
+            for s in data.iter_mut().take(n) {
+                let sample = *s;
+                let env = if rms {
+                    run = rmscoef * run + (1.0 - rmscoef) * sample * sample;
+                    if run < 1e-25 {
+                        run = 0.0;
+                    }
+                    run.max(0.0).sqrt()
+                } else {
+                    run = flush_denormal(sample * sample);
+                    sample.abs()
+                };
+                let env_db = mul_to_db(env);
                 let mut diff = threshold - env_db;
                 if upward && env_db <= (threshold - 60.0) / 2.0 {
                     diff = if env_db + 60.0 > 0.0 { env_db + 60.0 } else { 0.0 };
                 }
                 let p = if upward { prev.max(0.0) } else { prev };
                 let gain = if upward {
-                    if env_db >= threshold + knee / 2.0 {
+                    if env_db >= threshold + half_knee {
                         0.0
-                    } else if threshold - knee / 2.0 >= env_db {
+                    } else if knee <= 1e-6 || threshold - half_knee >= env_db {
                         slope * diff
                     } else {
-                        slope * (diff + knee / 2.0).powi(2) / (2.0 * knee)
+                        slope * (diff + half_knee).powi(2) / (2.0 * knee)
                     }
                 } else if diff > 0.0 {
                     (slope * diff).max(-60.0)
                 } else {
                     0.0
                 };
-                let g = if gain > p { ag * p + (1.0 - ag) * gain } else { rg * p + (1.0 - rg) * gain };
+                let g = flush_denormal(if gain > p { ag * p + (1.0 - ag) * gain } else { rg * p + (1.0 - rg) * gain });
                 prev = g;
                 let m = if upward { db_to_mul(g) } else { db_to_mul(g.min(0.0)) };
-                data[i] *= m * out;
+                *s = sample * m * out;
             }
-            self.gain_db[c] = prev;
+            self.runave[c] = if run < 1e-25 { 0.0 } else { run };
+            self.gain_db[c] = flush_denormal(prev);
         }
+    }
+
+    #[cfg(test)]
+    fn has_subnormal(&self) -> bool {
+        let eq_sub = self.eq.iter().any(|st| st.lf.iter().chain(&st.hf).chain(&st.s).any(|v| v.is_subnormal()));
+        self.attenuation.is_subnormal()
+            || self.level.is_subnormal()
+            || self.envelope.is_subnormal()
+            || self.runave.iter().any(|v| v.is_subnormal())
+            || self.gain_db.iter().any(|v| v.is_subnormal())
+            || self.floor.is_subnormal()
+            || self.nr_steady_rms.is_subnormal()
+            || self.nr_gain.is_subnormal()
+            || eq_sub
     }
 }
 
@@ -616,13 +731,13 @@ mod tests {
         assert!(!f.retune(AudioEffect::Gain { db: 0.0 }));
     }
 
-    /// A plugin that holds the sound back and then gives up: the light noise removal takes
-    /// over with the same delay, so the source doesn't jump in time.
+    /// A plugin that fails immediately on block 1 (failed model init) never delayed the stream
+    /// and must NOT leave a permanent handover delay line around `light_denoise` (M2-02).
     #[test]
-    fn giving_up_keeps_the_delay() {
+    fn failed_init_leaves_zero_delay() {
         #[derive(Debug)]
-        struct Late(usize);
-        impl SoundPlugin for Late {
+        struct FailsAtInit(usize);
+        impl SoundPlugin for FailsAtInit {
             fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
                 false
             }
@@ -630,13 +745,43 @@ mod tests {
                 self.0
             }
         }
-        let mut f = AudioFilter::with_plugin(Box::new(Late(2944)), RATE);
+        let mut f = AudioFilter::with_plugin(Box::new(FailsAtInit(3968)), RATE);
+        f.effect = AudioEffect::Denoise { strength: 65 };
+        let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+        f.process([&mut l, &mut r]);
+        assert_eq!(f.latency_frames(), 0, "failed init must not leave an 82.7 ms delay");
+        assert!(rms(&l) > 0.4, "audio passes through light_denoise immediately, not silenced");
+    }
+
+    /// A plugin that actually ran and held the sound back, and then gives up mid-stream: the
+    /// light noise removal takes over with the same delay, so the source doesn't jump in time.
+    #[test]
+    fn giving_up_keeps_the_delay() {
+        #[derive(Debug)]
+        struct RunsOnceThenQuits(usize, bool);
+        impl SoundPlugin for RunsOnceThenQuits {
+            fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+                if self.1 {
+                    return false;
+                }
+                self.1 = true;
+                ch[0].fill(0.0);
+                ch[1].fill(0.0);
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                self.0
+            }
+        }
+        let mut f = AudioFilter::with_plugin(Box::new(RunsOnceThenQuits(2944, false)), RATE);
         f.effect = AudioEffect::Denoise { strength: 100 };
         assert_eq!(f.latency_frames(), 2944);
         let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
         f.process([&mut l, &mut r]);
-        assert_eq!(f.latency_frames(), 2944, "the same delay after it gave way");
-        assert!(l.iter().all(|v| *v == 0.0), "held back: the first block is still on its way");
+        let (mut l, mut r) = (vec![0.5f32; 1024], vec![0.5f32; 1024]);
+        f.process([&mut l, &mut r]);
+        assert_eq!(f.latency_frames(), 2944, "the same delay after it gave way mid-stream");
+        assert!(l.iter().all(|v| *v == 0.0), "held back: the handover delay stays aligned");
     }
 
     /// A plugin that holds the sound back and gives up mid-stream hands over what it still
@@ -771,6 +916,109 @@ mod tests {
         v.iter().fold(0.0, |a, x| a.max(x.abs()))
     }
 
+    fn pink_noise(n: usize, target_rms: f32, seed: &mut u32) -> Vec<f32> {
+        let (mut b0, mut b1, mut b2, mut b3, mut b4, mut b5, mut b6) = (0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let w = ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
+            b0 = 0.99886 * b0 + w * 0.0555179;
+            b1 = 0.99332 * b1 + w * 0.0750759;
+            b2 = 0.969_00 * b2 + w * 0.153_852;
+            b3 = 0.86650 * b3 + w * 0.3104856;
+            b4 = 0.55000 * b4 + w * 0.5329522;
+            b5 = -0.7616 * b5 - w * 0.0168980;
+            let p = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362;
+            b6 = w * 0.115926;
+            out.push(p);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    fn voiced_speech(n: usize, target_rms: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        let mut phase = 0.0f64;
+        let rate = f64::from(RATE);
+        for i in 0..n {
+            let t = i as f64 / rate;
+            let f0 = 135.0 + 12.0 * (std::f64::consts::TAU * 0.65 * t).sin();
+            phase += std::f64::consts::TAU * f0 / rate;
+            let f1 = 550.0 + 150.0 * (std::f64::consts::TAU * 0.9 * t).sin();
+            let f2 = 1650.0 + 350.0 * (std::f64::consts::TAU * 0.7 * t).cos();
+            let f3 = 2650.0 + 200.0 * (std::f64::consts::TAU * 1.1 * t).sin();
+            let mut s = 0.0f64;
+            for k in 1..=24 {
+                let fk = f0 * f64::from(k);
+                let g1 = 1.0 / ((fk - f1).powi(2) + 45.0f64.powi(2)).sqrt();
+                let g2 = 0.6 / ((fk - f2).powi(2) + 65.0f64.powi(2)).sqrt();
+                let g3 = 0.3 / ((fk - f3).powi(2) + 90.0f64.powi(2)).sqrt();
+                let env = (g1 + g2 + g3) / f64::from(k).powf(0.5);
+                s += (phase * f64::from(k)).sin() * env;
+            }
+            let syll = 0.65 + 0.35 * (0.5 + 0.5 * (std::f64::consts::TAU * 3.5 * t).sin());
+            out.push((s * syll) as f32);
+        }
+        let r = rms(&out).max(1e-9);
+        for v in &mut out {
+            *v *= target_rms / r;
+        }
+        out
+    }
+
+    /// 15 s of continuous voiced formant speech over -45 dBFS pink noise through `light_denoise`:
+    /// voice energy stays flat (no floor creep, no pumping) while pauses between words are
+    /// attenuated monotonically with strength (M2-01).
+    #[test]
+    fn light_denoise_keeps_continuous_speech_steady_without_pumping() {
+        let r = RATE as usize;
+        let mut seed = 42u32;
+        let noise_rms = db_to_mul(-45.0);
+        let speech_rms = db_to_mul(-18.0);
+        let noise = pink_noise(18 * r, noise_rms, &mut seed);
+        let speech = voiced_speech(15 * r, speech_rms);
+        let mut input = noise.clone();
+        for i in 0..(15 * r) {
+            input[r + i] += speech[i];
+        }
+        let mut prev_pause_nr = 0.0f32;
+        for strength in [25u32, 50, 75, 100] {
+            let mut f = AudioFilter::new(AudioEffect::Denoise { strength }, RATE);
+            f.plugin = None;
+            let (mut l, mut rr) = (input.clone(), input.clone());
+            for (a, b) in l.chunks_mut(1024).zip(rr.chunks_mut(1024)) {
+                f.process([a, b]);
+            }
+            let early = mul_to_db(rms(&l[2 * r..5 * r]) / rms(&input[2 * r..5 * r]));
+            let late = mul_to_db(rms(&l[12 * r..15 * r]) / rms(&input[12 * r..15 * r]));
+            let pause_after = mul_to_db(rms(&l[17 * r..18 * r]) / rms(&noise[17 * r..18 * r]));
+            let mut w_min = f32::INFINITY;
+            let mut w_max = f32::NEG_INFINITY;
+            for sec in 2..15 {
+                let g = mul_to_db(rms(&l[sec * r..(sec + 1) * r]) / rms(&input[sec * r..(sec + 1) * r]));
+                w_min = w_min.min(g);
+                w_max = w_max.max(g);
+            }
+            let drift = late - early;
+            let spread = w_max - w_min;
+            assert!(
+                drift.abs() < 0.5,
+                "strength={strength}: speech drifted {drift:+.2} dB (early {early:+.2}, late {late:+.2})"
+            );
+            assert!(spread < 1.0, "strength={strength}: speech pumped {spread:.2} dB across 13 s");
+            assert!(early > -0.5, "strength={strength}: speech attenuated {early:+.2} dB");
+            assert!(
+                pause_after < prev_pause_nr - 3.0,
+                "strength={strength}: pause_nr {pause_after:+.2} dB should strengthen past {prev_pause_nr:+.2} dB"
+            );
+            prev_pause_nr = pause_after;
+        }
+        assert!(prev_pause_nr < -20.0, "strength=100 pause noise reduced by >20 dB: {prev_pause_nr:+.2} dB");
+    }
+
     #[test]
     fn gain_and_polarity() {
         let out = run(AudioEffect::Gain { db: -6.0 }, &[0.5, -0.5]);
@@ -846,5 +1094,122 @@ mod tests {
         let low = peak(&run(cut, &sine(100.0, 0.5, 0.5))[12_000..]);
         assert!(mul_to_db(low / 0.5) < -6.0, "100 Hz down {} dB", mul_to_db(low / 0.5));
         assert!(peak(&run(cut, &sine(2000.0, 0.5, 0.5))[12_000..]) > 0.4);
+    }
+
+    /// After an impulse followed by 10 s of digital silence, no filter leaves IEEE 754 subnormal
+    /// floats in its internal state (which would stall x86 CPUs on silence, M2-06).
+    #[test]
+    fn filters_never_enter_subnormal_state_on_silence() {
+        enable_ftz_daz();
+        let effects = [
+            AudioEffect::NoiseGate { open_db: -26.0, close_db: -32.0, attack_ms: 5.0, hold_ms: 10.0, release_ms: 10.0 },
+            AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 1.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -6.0, release_ms: 5.0 },
+            AudioEffect::Expander {
+                ratio: 4.0,
+                threshold_db: -40.0,
+                attack_ms: 2.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 2.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            },
+            AudioEffect::Eq3 { low_db: 3.0, mid_db: -2.0, high_db: 4.0 },
+            AudioEffect::Denoise { strength: 65 },
+        ];
+        for effect in effects {
+            let mut f = AudioFilter::new(effect, RATE);
+            f.plugin = None;
+            // Impulse block.
+            let mut l = vec![0.0f32; 1024];
+            let mut r = vec![0.0f32; 1024];
+            l[0] = 0.8;
+            r[0] = -0.8;
+            f.process([&mut l, &mut r]);
+            // 10 seconds of silence (470 blocks of 1024 samples).
+            for _ in 0..470 {
+                l.fill(0.0);
+                r.fill(0.0);
+                f.process([&mut l, &mut r]);
+                assert!(!f.has_subnormal(), "{effect:?} entered subnormal state during silence");
+                assert!(l.iter().chain(&r).all(|v| v.is_finite() && !v.is_subnormal()), "{effect:?} emitted subnormal");
+            }
+        }
+    }
+
+    /// Malformed negative/zero/NaN filter settings (e.g. from hand-edited OBS JSON) never cause
+    /// `exp(+inf)` or `0/0` NaN poisoning in any filter (M2-07).
+    #[test]
+    fn malformed_filter_params_produce_finite_output() {
+        let bad = [
+            AudioEffect::Compressor {
+                ratio: -4.0,
+                threshold_db: -18.0,
+                attack_ms: -5.0,
+                release_ms: 0.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -6.0, release_ms: -10.0 },
+            AudioEffect::Expander {
+                ratio: 0.2,
+                threshold_db: -40.0,
+                attack_ms: -1.0,
+                release_ms: -2.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 0.0,
+                release_ms: -5.0,
+                output_db: 0.0,
+                knee_db: 0.0,
+            },
+            AudioEffect::NoiseGate { open_db: -26.0, close_db: -32.0, attack_ms: -1.0, hold_ms: -5.0, release_ms: 0.0 },
+        ];
+        let inp = sine(440.0, 0.4, 0.1);
+        for effect in bad {
+            let out = run(effect, &inp);
+            assert!(out.iter().all(|v| v.is_finite()), "{effect:?} produced non-finite output");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn enable_ftz_daz_sets_mxcsr_bits_on_x86() {
+        let got = std::thread::spawn(|| {
+            enable_ftz_daz();
+            let mut mxcsr: u32 = 0;
+            // SAFETY: SSE exists on x86_64 (and x86 test runners supporting SSE); reads MXCSR into local u32.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{ptr}]",
+                    ptr = in(reg) &raw mut mxcsr,
+                    options(nostack, preserves_flags),
+                );
+            }
+            mxcsr
+        })
+        .join()
+        .unwrap_or(0);
+        assert_ne!(got & 0x8000, 0, "FTZ bit must be set in MXCSR: {got:#x}");
+        if std::arch::is_x86_feature_detected!("sse3") {
+            assert_ne!(got & 0x0040, 0, "DAZ bit must be set in MXCSR when SSE3 is present: {got:#x}");
+        }
     }
 }

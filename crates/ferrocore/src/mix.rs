@@ -101,13 +101,19 @@ impl Default for SourceSettings {
 
 /// A source's levels per channel (left, right), in dBFS (-inf is silence): over the last block
 /// (what the ducker hears), or over [`METER_BLOCKS`] for a meter ([`Mixer::levels`]).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Levels {
     pub peak: [f32; 2],
     pub rms: [f32; 2],
     /// The highest the sound came in at, before its filters and its fader (a noise gate's
     /// threshold is set against this: the meter after the gate shows nothing while it's shut).
     pub input_peak: [f32; 2],
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Self { peak: [f32::NEG_INFINITY; 2], rms: [f32::NEG_INFINITY; 2], input_peak: [f32::NEG_INFINITY; 2] }
+    }
 }
 
 /// Blocks a meter reads over (about 300 ms): a meter read ten times a second saw one block in
@@ -1111,7 +1117,8 @@ impl Mixer {
         if now_ns.saturating_sub(since) < SHRINK_AFTER_NS {
             return;
         }
-        let target = (self.worst_late_ns + 2 * LATENCY_ROOM_NS + block_ns(self.rate)).max(self.floor_ns);
+        let min_wait = (self.floor_ns + self.held_most_ns()).min(self.cap_ns());
+        let target = (self.worst_late_ns + 2 * LATENCY_ROOM_NS + block_ns(self.rate)).max(min_wait).min(self.cap_ns());
         if self.latency_ns > target + LATENCY_ROOM_NS / 2 {
             tracing::info!(
                 from_ms = self.latency_ns / 1_000_000,
@@ -2312,5 +2319,57 @@ mod tests {
             last = Some(f[0]);
         }
         assert!(worst <= steepest * 1.15, "warm handoff jumped: step={worst:.4} (sine={steepest:.4})");
+    }
+
+    /// After a calm 20 s stretch (`SHRINK_AFTER_NS`), `maybe_wait_less` must never shrink the
+    /// mixer's wait below `floor_ns + held_most_ns()` while a delayed filter (e.g. DeepFilterNet,
+    /// 3968 frames = 82.7 ms) is active; once removed, the wait shrinks back down (M2-05).
+    #[test]
+    fn maybe_wait_less_never_drops_below_active_filter_latency() {
+        #[derive(Debug)]
+        struct Delayed(usize);
+        impl crate::afx::SoundPlugin for Delayed {
+            fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                self.0
+            }
+        }
+        let floor = 40_000_000u64;
+        let mut m = Mixer::new(RATE, floor);
+        m.set(1, SourceSettings::default());
+        let Some(src) = m.sources.get_mut(&1) else { panic!("source 1 missing") };
+        src.filters.push(AudioFilter::with_plugin(Box::new(Delayed(3968)), RATE));
+        let held = m.held_most_ns();
+        assert!(held > 80_000_000, "expected ~82.7 ms filter delay, got {held}");
+        // Case 1: already at floor + held; 25 s of silence must not drop wait below floor + held.
+        m.latency_ns = floor + held;
+        let mut t = 1_000_000_000u64;
+        m.mix_until(t);
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert!(
+            m.latency_ns() >= floor + held,
+            "latency shrank below floor + filter delay: {} < {}",
+            m.latency_ns(),
+            floor + held
+        );
+        // Case 2: recover from a transient 400 ms spike down to floor + held, no lower.
+        m.latency_ns = 400_000_000;
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert_eq!(m.latency_ns(), floor + held, "shrunk from spike back to floor + filter delay");
+        // Case 3: once the delayed filter is removed, wait shrinks back down.
+        m.set_effects(1, &[]);
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert!(m.latency_ns() < floor + held, "latency shrinks once filter is removed: {}", m.latency_ns());
     }
 }

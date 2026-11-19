@@ -1086,9 +1086,9 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": false, "cx": 100, "limit_cy": false, "cy": 100, "loop": true })
         }
         "gain_filter" => json!({ "db": 0.0 }),
-        "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "ferrocast_deepfilter" => json!({ "strength": 65 }),
         "ferrocast_vst" => json!({ "path": "", "cid": "", "name": "", "state": "" }),
-        "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -30 }),
+        "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -45 }),
         "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),
         "noise_gate_filter" => {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
