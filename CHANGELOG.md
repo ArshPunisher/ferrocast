@@ -5,6 +5,33 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.4.0
+
+Stream and record 4K60 at once, steadier sound, and a Windows app that never freezes.
+
+- **Stream and record 4K60 together**: with Recording quality "Same as stream", the recording
+  uses the stream's own encode, so both run at full 60 fps (a Mac's video encoder has room for
+  one 4K60 encode; two dropped to half speed). Settings warns before you pick something your
+  encoder can't keep up with, and says why when the two can't share.
+- **Pause while live**: pausing a "Same as stream" recording pauses only the file; your stream
+  goes on. The file has no gap and the sound stays in step.
+- **No more Windows freezes**: on a slow graphics card every click could wait seconds while the
+  engine drew; the app now answers at once, and stopping a recording never hangs.
+- **Sound**: edits no longer drop the sound or flash black, noise removal never holds up the
+  mix, monitoring comes back after a change and doesn't crackle, and a mic with noise removal
+  twice runs it once. New: true peak meters, low latency monitoring, and the noise gate shows
+  the level it hears.
+- **Windows and screens found again**: a captured window or screen is found again when its
+  number changes (a game restarting, a monitor plugged back in), never swapped for another; a
+  window minimised or on another desktop keeps its place.
+- **Every recording format works**: MOV, MKV and MP4; older settings with FLV, TS or HLS record
+  MKV instead of failing.
+- **Health**: the stream's health says when the video encoder itself is holding frames back.
+- **Windows camera**: the classic Ferrocast Camera now always stays beside Windows 11's, so
+  every app finds one; if Windows has camera access off, Ferrocast says where to turn it on.
+- **Linux**: the app runs on Ubuntu 22.04 and Debian 12, and starts without a tray.
+- **Captions** say when a processor is too old to run them instead of crashing.
+
 ## 3.3.0
 
 A smoother stream, sharper pictures, and filters you can see as you set them.
