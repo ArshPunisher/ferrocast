@@ -116,16 +116,24 @@ pub fn backoff(attempt: u32) -> Duration {
 }
 
 async fn channel(url: &str) -> Result<Channel, String> {
+    channel_with(url, KEEPALIVE_EVERY, KEEPALIVE_TIMEOUT).await
+}
+
+/// The chat channel, pinging after `every` of silence and giving up on a ping unanswered for
+/// `timeout`.
+async fn channel_with(url: &str, every: Duration, timeout: Duration) -> Result<Channel, String> {
     // HTTP/2 pings: a connection that died silently (Wi-Fi blip, a router dropping the idle
     // mapping) ends the stream within ~30 s and the chat reconnects; without them it hung
-    // forever, chat quietly gone for the rest of the stream (agy's M10 scan, M10-02).
+    // forever, chat quietly gone for the rest of the stream (agy's M10 scan, M10-02). The
+    // client pings only after `every` without anything from the server, so a chat with traffic
+    // sends none.
     let mut ep = Endpoint::from_shared(url.to_string())
         .map_err(|e| e.to_string())?
         .connect_timeout(Duration::from_secs(10))
-        .http2_keep_alive_interval(KEEPALIVE_EVERY)
-        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .http2_keep_alive_interval(every)
+        .keep_alive_timeout(timeout)
         .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(KEEPALIVE_EVERY));
+        .tcp_keepalive(Some(every));
     if url.starts_with("https://") {
         ep = ep.tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?;
     }
@@ -217,5 +225,42 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
             return End::Lost("the chat stream keeps dropping".into());
         }
         tokio::time::sleep(backoff(drops)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server that accepts the connection and then never says a word (a dead Wi-Fi link the
+    /// client wasn't told about): the call ends with an error within the keepalive time, so
+    /// `follow` reconnects, instead of waiting for ever.
+    #[tokio::test]
+    async fn a_connection_that_goes_silent_ends_the_call() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s); // kept open, never read from or written to
+            }
+        });
+        let call = |ch: Channel| async move {
+            let mut client = V3DataLiveChatMessageServiceClient::new(ch);
+            client
+                .stream_list(tonic::Request::new(LiveChatMessageListRequest {
+                    live_chat_id: Some("chat".into()),
+                    ..Default::default()
+                }))
+                .await
+                .map(|_| ())
+        };
+        let ch = channel_with(&url, Duration::from_millis(200), Duration::from_millis(200)).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), call(ch)).await;
+        let status = ended.expect("a silent connection must end the call").unwrap_err();
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        // Without pings (the old channel) the same server leaves the call waiting.
+        let plain = Endpoint::from_shared(url).unwrap().connect().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), call(plain)).await.is_err(), "no pings: it hangs");
     }
 }
