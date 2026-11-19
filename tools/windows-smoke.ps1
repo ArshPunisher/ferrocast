@@ -205,7 +205,7 @@ try { Api PUT '/preview' @{ rect = $null } | Out-Null } catch { }
 
 # Record, sampling the app's CPU (Windows' view) and the engine's own numbers each second.
 $r = Try-Api 'recording starts' POST '/record' @{ on = $true }
-$cpu = @(); $fpsSeen = @(); $frameMs = @()
+$cpu = @(); $fpsSeen = @(); $frameMs = @(); $statsMs = @()
 $cores = [Environment]::ProcessorCount
 $p = Get-Process -Id $app.Id
 $last = $p.TotalProcessorTime; $t0 = Get-Date
@@ -215,7 +215,9 @@ for ($i = 0; $i -lt $Seconds; $i++) {
   $p.Refresh(); $now = Get-Date
   $cpu += 100 * ($p.TotalProcessorTime - $last).TotalSeconds / ($now - $t0).TotalSeconds / $cores
   $last = $p.TotalProcessorTime; $t0 = $now
+  $asked = Get-Date
   try { $s = Api GET '/stats'; $fpsSeen += $s.engine.fps; $frameMs += $s.engine.frame_ms } catch { Note "stats failed: $($_.Exception.Message)" }
+  $statsMs += ((Get-Date) - $asked).TotalMilliseconds
   if ($i -eq [int]($Seconds / 2)) { Shot 'recording' }
 }
 $stats = $null
@@ -226,6 +228,13 @@ if (-not $app.HasExited) {
   if ($null -eq $stopped -and -not $result.checks['recording stops'].ok -and -not $app.HasExited) { Stall 'the stop' }
 }
 
+# The window's thread answers while recording: on the runner it got to /stats only every 10-48 s
+# (19 Nov), the engine's frame loop re-taking its lock at once when behind (Windows' lock isn't
+# fair); every Studio call waited behind it.
+if ($statsMs.Count) {
+  $median = ($statsMs | Sort-Object)[[int]($statsMs.Count / 2)]
+  Check 'the app answers while recording' ($median -lt 5000) ("stats took {0:N0} ms (median of {1})" -f $median, $statsMs.Count)
+}
 Check 'app still running' (-not $app.HasExited) $(if ($app.HasExited) { "exit code $($app.ExitCode)" } else { "after $Seconds s of recording" })
 $avg = { param($a) if ($a.Count) { [math]::Round(($a | Measure-Object -Average).Average, 1) } else { $null } }
 $result.numbers = [ordered]@{

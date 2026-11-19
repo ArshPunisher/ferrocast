@@ -2971,6 +2971,14 @@ fn run(config: EngineConfig, state: &Mutex<State>, gpu: &Compositor, mixer: &Mut
             gpu.submit(std::iter::empty());
             let _ = gpu.device.poll(wgpu::PollType::Poll);
         }));
+        // Behind (a frame took longer than its time): a moment before the next one takes the
+        // engine's lock again. Windows' lock isn't fair: re-taken at once, frame after frame,
+        // the window's thread waiting for it (stats, the preview) got it only every 10-48 s
+        // on GitHub's runner, every Studio call stuck behind it (19 Nov). On time, the loop
+        // sleeps until the next frame anyway.
+        if now_ns() >= next {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if let Err(p) = ok {
             // A fault in a frame is that frame lost, not the engine: the next one is drawn.
             faults += 1;
