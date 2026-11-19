@@ -52,7 +52,41 @@ impl MadeSlot {
     }
 }
 
+/// Who can watch a broadcast Ferrocast makes. Ordered from the most private to the most public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Privacy {
+    Private,
+    Unlisted,
+    #[default]
+    Public,
+}
+
+impl Privacy {
+    /// `public`, `unlisted` or `private` (what the engine's setting and YouTube's API both say).
+    pub fn parse(s: &str) -> Option<Privacy> {
+        match s {
+            "public" => Some(Privacy::Public),
+            "unlisted" => Some(Privacy::Unlisted),
+            "private" => Some(Privacy::Private),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Privacy::Public => "public",
+            Privacy::Unlisted => "unlisted",
+            Privacy::Private => "private",
+        }
+    }
+}
+
+/// Where the Api reads the streamer's privacy choice each time it makes a broadcast, so a change
+/// in the settings applies to the next one without rebuilding the Api.
+pub type PrivacySource = Arc<dyn Fn() -> Privacy + Send + Sync>;
+
 pub struct Api {
+    privacy: PrivacySource,
     pub(crate) http: reqwest::Client,
     pub(crate) ep: Endpoints,
     app: AppCredentials,
@@ -101,6 +135,7 @@ pub struct Channel {
 impl Api {
     pub fn new(http: reqwest::Client, ep: Endpoints, app: AppCredentials, tokens: Tokens, on_tokens: OnTokens) -> Self {
         Api {
+            privacy: Arc::new(Privacy::default),
             http,
             ep,
             app,
@@ -110,6 +145,13 @@ impl Api {
             made: Mutex::new(MadeSlot::default()),
             made_vertical: Mutex::new(MadeSlot::default()),
         }
+    }
+
+    /// Makes every broadcast this Api creates with the privacy `source` says at that moment.
+    #[must_use]
+    pub fn with_privacy(mut self, source: PrivacySource) -> Self {
+        self.privacy = source;
+        self
     }
 
     pub async fn access(&self) -> Result<String, YoutubeError> {
@@ -377,7 +419,7 @@ impl Api {
                 if replaced {
                     tracing::info!("YouTube: binding new broadcast to Ferrocast's own key (variable RTMP)");
                 }
-                let id = self.make_broadcast("Live now", None, "public", &stream).await?;
+                let id = self.make_broadcast("Live now", None, (self.privacy)(), &stream).await?;
                 made.broadcast = Some(MadeBroadcast { id: id.clone(), stream_id: stream, at: now_ms() });
                 id
             }
@@ -417,7 +459,7 @@ impl Api {
         &self,
         title: &str,
         description: Option<&str>,
-        privacy: &str,
+        privacy: Privacy,
         stream: &str,
     ) -> Result<String, YoutubeError> {
         let mut snippet = json!({ "title": title.chars().take(MAX_TITLE_CHARS).collect::<String>(), "scheduledStartTime": rfc3339_utc(now_ms()) });
@@ -426,7 +468,7 @@ impl Api {
         }
         let body = json!({
             "snippet": snippet,
-            "status": { "privacyStatus": privacy, "selfDeclaredMadeForKids": false },
+            "status": { "privacyStatus": privacy.as_str(), "selfDeclaredMadeForKids": false },
             "contentDetails": { "enableAutoStart": true, "enableAutoStop": true, "monitorStream": { "enableMonitorStream": false } },
         });
         let b = self
@@ -818,7 +860,7 @@ impl Api {
                     }
                 }
                 None => {
-                    let id = self.make_broadcast("Live now", None, "public", &stream).await?;
+                    let id = self.make_broadcast("Live now", None, (self.privacy)(), &stream).await?;
                     tracing::info!("YouTube: made a broadcast for the stream");
                     made.broadcast = Some(MadeBroadcast { id, stream_id: stream.clone(), at: now_ms() });
                 }
@@ -973,13 +1015,16 @@ impl Api {
             .chars()
             .take(MAX_TITLE_CHARS)
             .collect();
+        // The vertical broadcast copies the normal live's privacy, but never shows more than the
+        // streamer chose: with "private" chosen it stays private beside a public normal live.
+        let chosen = (self.privacy)();
         let privacy = normal
             .as_ref()
             .and_then(|b| b.pointer("/status/privacyStatus").and_then(Value::as_str))
-            .unwrap_or("public")
-            .to_string();
+            .and_then(Privacy::parse)
+            .map_or(chosen, |copied| copied.min(chosen));
         let description = normal.as_ref().and_then(|b| b.pointer("/snippet/description").and_then(Value::as_str));
-        let bid = self.make_broadcast(&title, description, &privacy, &id).await?;
+        let bid = self.make_broadcast(&title, description, privacy, &id).await?;
         made.broadcast = Some(MadeBroadcast { id: bid.clone(), stream_id: id, at: now_ms() });
         drop(made);
 

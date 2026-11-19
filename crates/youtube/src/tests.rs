@@ -485,6 +485,100 @@ async fn with_no_broadcast_one_is_made_for_the_stream_info() {
     assert_eq!((p[2]["id"].as_str(), p[2]["snippet"]["title"].as_str()), (Some("made-1"), Some("Ranked")));
 }
 
+#[test]
+fn privacy_is_ordered_from_private_to_public_and_names_what_youtube_says() {
+    use crate::Privacy;
+    assert!(Privacy::Private < Privacy::Unlisted && Privacy::Unlisted < Privacy::Public);
+    assert_eq!(Privacy::default(), Privacy::Public, "as before: public unless the streamer chose");
+    for p in [Privacy::Public, Privacy::Unlisted, Privacy::Private] {
+        assert_eq!(Privacy::parse(p.as_str()), Some(p));
+    }
+    for bad in ["", "Public", "members", "unlisted ", "PRIVATE"] {
+        assert_eq!(Privacy::parse(bad), None, "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_broadcast_is_made_with_the_privacy_the_streamer_chose() {
+    use crate::Privacy;
+    use ferrocast_core::stream_info::StreamInfo;
+    for (chosen, said) in [(Privacy::Public, "public"), (Privacy::Unlisted, "unlisted"), (Privacy::Private, "private")]
+    {
+        let (ep, puts) = fake_videos(false).await;
+        let api = video_api(ep).with_privacy(Arc::new(move || chosen));
+        api.update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await.unwrap();
+        let p = puts.lock().unwrap().clone();
+        assert_eq!(p[0]["made"]["status"]["privacyStatus"], said);
+        assert_eq!(p[0]["made"]["status"]["selfDeclaredMadeForKids"], false, "that part is not the choice");
+    }
+}
+
+#[tokio::test]
+async fn the_choice_is_read_when_a_broadcast_is_made_not_when_the_api_is_built() {
+    use crate::Privacy;
+    use ferrocast_core::stream_info::StreamInfo;
+    let cell = Arc::new(std::sync::atomic::AtomicU8::new(2));
+    let read = cell.clone();
+    let source = Arc::new(move || match read.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => Privacy::Private,
+        1 => Privacy::Unlisted,
+        _ => Privacy::Public,
+    });
+    let (ep, puts) = fake_videos(false).await;
+    let api = video_api(ep).with_privacy(source);
+    // The streamer changes the setting after the Api exists, before the broadcast is made.
+    cell.store(0, std::sync::atomic::Ordering::SeqCst);
+    api.update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(puts.lock().unwrap()[0]["made"]["status"]["privacyStatus"], "private");
+}
+
+#[tokio::test]
+async fn the_vertical_broadcast_never_shows_more_than_the_choice_or_the_normal_live() {
+    use crate::Privacy;
+    // The normal live is unlisted (fake_live). Public chosen: it copies unlisted, as before.
+    // Private chosen: private, though the normal live is more public than that.
+    for (chosen, said) in
+        [(Privacy::Public, "unlisted"), (Privacy::Unlisted, "unlisted"), (Privacy::Private, "private")]
+    {
+        let (ep, calls) = fake_live().await;
+        video_api(ep).with_privacy(Arc::new(move || chosen)).vertical_ingest().await.unwrap();
+        let log = calls.lock().unwrap().clone();
+        assert!(
+            log.iter().any(|c| c.starts_with(&format!("broadcasts.insert \"{said}\""))),
+            "{chosen:?} should make it {said}: {log:?}"
+        );
+    }
+    // No normal live to copy: the choice itself.
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    video_api(ep).with_privacy(Arc::new(|| Privacy::Unlisted)).vertical_ingest().await.unwrap();
+    let log = calls.lock().unwrap().clone();
+    assert!(log.iter().any(|c| c.contains("POST /liveBroadcasts ") && c.contains("privacy=unlisted")), "{log:?}");
+}
+
+#[tokio::test]
+async fn going_live_with_no_broadcast_makes_one_with_the_choice_too() {
+    use crate::Privacy;
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    video_api(ep).with_privacy(Arc::new(|| Privacy::Private)).ingest().await.unwrap();
+    let log = calls.lock().unwrap().clone();
+    assert!(
+        log.iter().any(|c| c.starts_with("POST /liveBroadcasts b-new-") && c.contains("privacy=private")),
+        "{log:?}"
+    );
+}
+
 #[tokio::test]
 async fn one_broadcast_is_made_even_when_youtube_is_slow_to_list_it() {
     use ferrocast_core::stream_info::StreamInfo;

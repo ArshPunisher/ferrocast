@@ -23,7 +23,7 @@ use std::time::Duration;
 use ferrocast_connector::ConnectorError;
 use ferrocast_core::event::Platform;
 
-pub use api::Api;
+pub use api::{Api, Privacy, PrivacySource};
 pub use connector::YoutubeConnector;
 pub use oauth::{AppCredentials, Tokens};
 
