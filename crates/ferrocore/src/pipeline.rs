@@ -62,10 +62,12 @@ pub struct Pipeline {
     /// Picture and sound are cut by their time, not by when the encoder hands them back (it
     /// does so a frame or two late; cut that way, the sound fell 0.35 s behind in 4 pauses).
     rec_cuts: Vec<(i64, Option<i64>)>,
-    /// Resumed: the cut ends at the next keyframe out of the encoder (VideoToolbox makes one
-    /// when asked; FFmpeg's encoders keep their own interval, so it may be seconds later: a
-    /// frame before it needs frames from inside the cut; projects-60).
-    rec_resume: bool,
+    /// Resumed, from this time on (µs): the cut ends at the first keyframe out of the encoder
+    /// drawn from then (VideoToolbox makes one when asked; FFmpeg's encoders keep their own
+    /// interval, so it may be seconds later: a frame before it needs frames from inside the
+    /// cut; and a keyframe drawn while paused, still in the encoder, is paused picture;
+    /// projects-60).
+    rec_resume: Option<i64>,
     /// Sound that came while the cut's end wasn't known yet (resumed, no keyframe since).
     rec_held: Vec<(usize, AudioPacket)>,
     /// The newest frame given to the encoder (µs).
@@ -273,7 +275,7 @@ impl Pipeline {
             stream_from_us: 0,
             stream_waits_key: false,
             rec_cuts: Vec::new(),
-            rec_resume: false,
+            rec_resume: None,
             rec_held: Vec::new(),
             last_in_us: 0,
         })
@@ -297,7 +299,7 @@ impl Pipeline {
         self.key_next = true;
         // A recording before it on this output may have stopped paused: this one starts afresh.
         self.rec_cuts.clear();
-        self.rec_resume = false;
+        self.rec_resume = None;
         self.rec_held.clear();
         Ok(())
     }
@@ -329,16 +331,16 @@ impl Pipeline {
     pub fn pause_recording(&mut self, on: bool) {
         let open = self.rec_cuts.last().is_some_and(|c| c.1.is_none());
         if on && !open {
-            // From the next frame on (every frame drawn before went in already).
-            let frame_us = 1_000_000 / i64::from(self.video.config().fps_num.max(1));
-            self.rec_cuts.push((self.last_in_us + frame_us, None));
-            self.rec_resume = false;
+            // From the next frame on (every frame drawn before went in already): any time after
+            // the newest one, whatever the frame rate (60000/1001 too; projects-60).
+            self.rec_cuts.push((self.last_in_us + 1, None));
+            self.rec_resume = None;
         } else if on {
             // Paused again before it went on: nothing held is needed.
-            self.rec_resume = false;
+            self.rec_resume = None;
             self.rec_held.clear();
-        } else if open && !self.rec_resume {
-            self.rec_resume = true;
+        } else if open && self.rec_resume.is_none() {
+            self.rec_resume = Some(self.last_in_us + 1);
             self.key_next = true;
         }
     }
@@ -782,14 +784,16 @@ impl Pipeline {
         let mut resumed = false;
         if let Some(c) = self.rec_cuts.last_mut()
             && c.1.is_none()
-            && p.pts_us >= c.0
         {
-            if !(self.rec_resume && p.key) {
-                return;
+            match cut_step(c.0, self.rec_resume, p.key, p.pts_us) {
+                CutStep::Write => {}
+                CutStep::Leave => return,
+                CutStep::End => {
+                    c.1 = Some(p.pts_us);
+                    self.rec_resume = None;
+                    resumed = true;
+                }
             }
-            c.1 = Some(p.pts_us);
-            self.rec_resume = false;
-            resumed = true;
         }
         self.write_video(p);
         // The sound held meanwhile, cut by the same line, after the keyframe (in the file it
@@ -871,7 +875,7 @@ impl Pipeline {
         }
         if !self.rec_cuts.is_empty() {
             // Resumed, the cut's end not known yet: held until the next frame says it.
-            if self.rec_resume && self.rec_cuts.last().is_some_and(|c| c.1.is_none() && p.pts_us >= c.0) {
+            if self.rec_resume.is_some() && self.rec_cuts.last().is_some_and(|c| c.1.is_none() && p.pts_us >= c.0) {
                 self.rec_held.push((track, p));
                 return;
             }
@@ -887,5 +891,47 @@ impl Pipeline {
             }
             _ => {}
         }
+    }
+}
+
+/// What a frame out of the encoder does while a recording-only pause's cut is open (from
+/// `from`; resumed from `resume`, if it was).
+#[derive(Debug, PartialEq, Eq)]
+enum CutStep {
+    /// Drawn before the pause: written.
+    Write,
+    /// Inside the cut: left out.
+    Leave,
+    /// The keyframe the recording goes on at: it ends the cut.
+    End,
+}
+
+fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
+    match resume {
+        _ if pts < from => CutStep::Write,
+        Some(at) if key && pts >= at => CutStep::End,
+        _ => CutStep::Leave,
+    }
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::{CutStep, cut_step};
+
+    /// A recording-only pause from 3.0 s, resumed at 3.9 s: frames from before 3.0 s are
+    /// written; the cut ends only at a keyframe drawn from 3.9 s on, never at one drawn while
+    /// paused and still in the encoder (FFmpeg's lookahead keeps up to a second; that would put
+    /// paused picture in the file), nor at a frame that isn't one (FFmpeg's encoders don't make
+    /// a keyframe when asked; it would lean on frames left out; projects-60).
+    #[test]
+    fn the_cut_ends_only_at_a_keyframe_drawn_after_the_resume() {
+        let (from, at) = (3_000_000, 3_900_000);
+        assert_eq!(cut_step(from, None, false, 2_966_667), CutStep::Write);
+        assert_eq!(cut_step(from, Some(at), false, 2_966_667), CutStep::Write);
+        assert_eq!(cut_step(from, None, true, 3_500_000), CutStep::Leave, "still paused");
+        assert_eq!(cut_step(from, Some(at), true, 3_800_000), CutStep::Leave, "a keyframe drawn while paused");
+        assert_eq!(cut_step(from, Some(at), false, 3_933_333), CutStep::Leave, "not a keyframe");
+        assert_eq!(cut_step(from, Some(at), true, 3_900_000), CutStep::End);
+        assert_eq!(cut_step(from, Some(at), true, 4_000_000), CutStep::End);
     }
 }
