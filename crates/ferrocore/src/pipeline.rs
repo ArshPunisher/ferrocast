@@ -530,7 +530,13 @@ impl Pipeline {
     }
 
     /// Ends: what's still in the encoder is sent, and the recording closed.
-    pub fn finish(mut self) -> Result<Vec<Tag>, AvError> {
+    pub fn finish(self) -> Result<Vec<Tag>, AvError> {
+        // Every FFmpeg in it (video, sound, extra tracks) shares one stop time.
+        let by = std::time::Instant::now() + crate::ffenc::FINISH_WITHIN;
+        crate::ffenc::finishing_by(by, move || self.finish_now())
+    }
+
+    fn finish_now(mut self) -> Result<Vec<Tag>, AvError> {
         let packets = self.video.flush()?;
         let mut tags = self.video_out(packets)?;
         let offset = self.audio_offset_us.unwrap_or(0);

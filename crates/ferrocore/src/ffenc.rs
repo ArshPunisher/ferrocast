@@ -258,7 +258,12 @@ impl Proc {
     /// then FFmpeg is stopped and the file ends with what came (a stuck FFmpeg never holds
     /// Stop forever; GitHub's Windows runner waited over a minute, 18-19 Nov).
     fn finish(&mut self) -> Vec<Tag> {
-        self.finish_within(FINISH_WITHIN)
+        // One time for a whole stop (video, sound and extra tracks finish one after another):
+        // what's left of it, else the usual.
+        let within = FINISH_BY
+            .with(std::cell::Cell::get)
+            .map_or(FINISH_WITHIN, |by| by.saturating_duration_since(std::time::Instant::now()));
+        self.finish_within(within)
     }
 
     fn finish_within(&mut self, within: std::time::Duration) -> Vec<Tag> {
@@ -307,10 +312,7 @@ impl Proc {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
-        // Killed: its input broke, so a writer still writing ends now.
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
+        let _ = self.writer.take().map(let_go);
         tags.extend(self.tags.try_iter());
         tracing::info!(at_ms = t.elapsed().as_millis() as u64, tags = tags.len(), "FFmpeg's output is read to its end");
         tags
@@ -319,7 +321,21 @@ impl Proc {
 
 /// How long stopping waits for FFmpeg to encode what's queued and end (a slow software encode
 /// of a full queue takes seconds, not this long).
-const FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+pub(crate) const FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+thread_local! {
+    /// When the stop under way on this thread must be done by (see [`finishing_by`]).
+    static FINISH_BY: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (an output's whole finish) with every FFmpeg it finishes sharing one deadline, so
+/// several FFmpegs (video, sound, extra tracks) never wait 45 s each.
+pub(crate) fn finishing_by<T>(by: std::time::Instant, f: impl FnOnce() -> T) -> T {
+    let before = FINISH_BY.with(|c| c.replace(Some(by)));
+    let out = f();
+    FINISH_BY.with(|c| c.set(before));
+    out
+}
 
 impl Drop for Proc {
     fn drop(&mut self) {
@@ -327,9 +343,18 @@ impl Drop for Proc {
         self.stdin = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
+        let _ = self.writer.take().map(let_go);
+    }
+}
+
+/// Waits for FFmpeg's input thread once FFmpeg is gone, unless it's still writing: then it's
+/// let go, as its pipe may never break (another program that inherited FFmpeg's input keeps
+/// it open; projects-60's hypothesis for the Windows runner's hang). Stop never waits on it.
+fn let_go(w: std::thread::JoinHandle<()>) {
+    if w.is_finished() {
+        let _ = w.join();
+    } else {
+        tracing::warn!("FFmpeg's input thread was still writing when FFmpeg ended: let go");
     }
 }
 
@@ -707,6 +732,41 @@ mod tests {
         let tags = p.finish_within(std::time::Duration::from_secs(1));
         assert!(tags.is_empty());
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// One that never reads its input, with more queued than a pipe holds: its input thread is
+    /// still writing at the deadline, and Stop still returns.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_input_never_holds_stop() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let mut p = Proc::start(cmd, 256 * 1024).unwrap_or_else(|e| panic!("{e}"));
+        for _ in 0..2 {
+            p.write(vec![0u8; 256 * 1024]).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let t = std::time::Instant::now();
+        let _ = p.finish_within(std::time::Duration::from_secs(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// Several FFmpegs finished in one stop share its time.
+    #[cfg(unix)]
+    #[test]
+    fn one_stop_shares_one_deadline() {
+        let stuck = || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "exec sleep 30"]);
+            Proc::start(cmd, 1024).unwrap_or_else(|e| panic!("{e}"))
+        };
+        let (mut a, mut b, mut c) = (stuck(), stuck(), stuck());
+        let t = std::time::Instant::now();
+        finishing_by(t + std::time::Duration::from_secs(1), || {
+            a.finish();
+            b.finish();
+            c.finish();
+        });
+        assert!(t.elapsed() < std::time::Duration::from_secs(3), "{:?}", t.elapsed());
     }
 
     /// The same when it closes its output but goes on running.
