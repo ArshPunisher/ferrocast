@@ -96,12 +96,13 @@ impl Engine {
             tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
             return;
         }
-        let (message, cleared) = if pct >= 100 {
-            ("Your stream is back to full quality.".to_string(), true)
+        let alert = if pct >= 100 {
+            LiveAlert::fixed("auto_quality", "warn", "Your stream is back to full quality.")
         } else {
-            (format!("Upload struggled: quality is at {pct}%; it recovers by itself."), false)
+            LiveAlert::raised("auto_quality", "warn", format!("Upload struggled: quality is at {pct}%"))
+                .detail("Ferrocast lowered the quality to keep the stream smooth. It goes back up by itself.")
         };
-        self.studio_frame("live_alert", &LiveAlert { id: "auto_quality".into(), level: "warn", message, cleared });
+        self.studio_frame("live_alert", &alert);
     }
 
     /// The stream's health: the engine's and the network's counters into the score.
@@ -147,12 +148,7 @@ impl Engine {
         }
         self.studio_frame(
             "live_alert",
-            &LiveAlert {
-                id: "auto_quality".into(),
-                level: "warn",
-                message: "Your stream is back to full quality.".into(),
-                cleared: true,
-            },
+            &LiveAlert::fixed("auto_quality", "warn", "Your stream is back to full quality."),
         );
     }
 

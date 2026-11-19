@@ -208,8 +208,31 @@ pub struct LiveAlert {
     pub id: String,
     /// `warn` or `error`.
     pub level: &'static str,
+    /// One short line (about 60 characters).
     pub message: String,
+    /// The rest (a cause, what to check), behind an (i) on the page; an older dashboard ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub cleared: bool,
+}
+
+impl LiveAlert {
+    /// Something wrong, in one line.
+    pub fn raised(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
+        Self { id: id.into(), level, message: message.into(), detail: None, cleared: false }
+    }
+
+    /// It's fine again, in one line.
+    pub fn fixed(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
+        Self { id: id.into(), level, message: message.into(), detail: None, cleared: true }
+    }
+
+    /// What the line leaves out.
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
 }
 
 /// Since when each thing has been wrong, and what's been said: a pure state machine the
@@ -244,20 +267,25 @@ impl LiveWatch {
             return out;
         }
         let secs = |since: i64| (s.at - since).max(0) / 1000;
-        let mut set =
-            |out: &mut Vec<LiveAlert>, id: String, bad: bool, level: &'static str, message: String, fixed: String| {
-                match (bad, self.raised.contains(&id)) {
-                    (true, false) => {
-                        self.raised.insert(id.clone());
-                        out.push(LiveAlert { id, level, message, cleared: false });
-                    }
-                    (false, true) => {
-                        self.raised.remove(&id);
-                        out.push(LiveAlert { id, level, message: fixed, cleared: true });
-                    }
-                    _ => {}
+        let mut set = |out: &mut Vec<LiveAlert>,
+                       id: String,
+                       bad: bool,
+                       level: &'static str,
+                       message: String,
+                       detail: &str,
+                       fixed: String| {
+            match (bad, self.raised.contains(&id)) {
+                (true, false) => {
+                    self.raised.insert(id.clone());
+                    out.push(LiveAlert::raised(id, level, message).detail(detail));
                 }
-            };
+                (false, true) => {
+                    self.raised.remove(&id);
+                    out.push(LiveAlert::fixed(id, level, fixed));
+                }
+                _ => {}
+            }
+        };
         for (name, db) in &s.mics {
             let heard = *self.heard.entry(name.clone()).or_insert(s.at);
             let heard = if *db > SILENT_DB { s.at } else { heard };
@@ -268,7 +296,8 @@ impl LiveWatch {
                 format!("mic:{name}"),
                 bad,
                 "error",
-                format!("{name} has had no sound for {} min: unplugged or muted?", secs(heard) / 60),
+                format!("{name} has no sound ({} min)", secs(heard) / 60),
+                "Is it unplugged, or muted on the device?",
                 format!("{name} hears you again."),
             );
         }
@@ -290,7 +319,8 @@ impl LiveWatch {
                 format!("camera:{name}:black"),
                 black_bad,
                 "error",
-                format!("{name} has been black for {} s: lens covered, or used by another app?", secs(dark_since)),
+                format!("{name} is black ({} s)", secs(dark_since)),
+                "Is the lens covered, or is another app using the camera?",
                 format!("{name} has a picture again."),
             );
             let frozen_bad = cfg.camera_frozen_s > 0 && !*black && secs(changed) >= i64::from(cfg.camera_frozen_s);
@@ -299,7 +329,8 @@ impl LiveWatch {
                 format!("camera:{name}:frozen"),
                 frozen_bad,
                 "warn",
-                format!("{name} shows the same picture for {} s: it may be frozen.", secs(changed)),
+                format!("{name} looks frozen ({} s)", secs(changed)),
+                "It shows the same picture, so it may have frozen. Reconnect or restart it.",
                 format!("{name} is moving again."),
             );
         }
@@ -312,7 +343,8 @@ impl LiveWatch {
                 format!("destination:{name}"),
                 bad,
                 "error",
-                format!("{name} hasn't received your stream for {} s.", secs(sent)),
+                format!("{name} isn't getting your stream ({} s)", secs(sent)),
+                "Look at its state in Go live: it says why.",
                 format!("{name} is getting your stream again."),
             );
         }
@@ -332,7 +364,7 @@ impl LiveWatch {
         let gone: Vec<String> = self.raised.iter().filter(|id| !present.contains(*id)).cloned().collect();
         for id in gone {
             self.raised.remove(&id);
-            out.push(LiveAlert { id, level: "warn", message: "That's no longer watched.".into(), cleared: true });
+            out.push(LiveAlert::fixed(id, "warn", "That's no longer watched."));
         }
         out
     }
@@ -1016,8 +1048,15 @@ mod watch_tests {
         }
         assert_eq!(said.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["camera:Cam:black"]);
         assert!(!said[0].cleared);
+        // One short line, and what to check behind the (i).
+        assert!(said[0].message.chars().count() <= 60, "{}", said[0].message);
+        assert!(said[0].detail.as_deref().unwrap_or("").contains("lens"), "{:?}", said[0]);
+        let wire = serde_json::to_value(&said[0]).unwrap();
+        assert!(wire["detail"].is_string() && wire["cleared"] == false, "{wire}");
         // Back, moving: cleared.
         let back = w.tick(&cfg, &sample(40, -20.0, false, 99, true));
+        let cleared = serde_json::to_value(back.iter().find(|a| a.cleared).unwrap()).unwrap();
+        assert!(cleared.get("detail").is_none(), "a plain line has no detail key: {cleared}");
         assert!(back.iter().any(|a| a.id == "camera:Cam:black" && a.cleared));
         // Frozen (not black) for 30 s.
         let mut said = Vec::new();
