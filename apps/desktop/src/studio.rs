@@ -453,7 +453,7 @@ fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32
     }
     let plan = ferrocast_studio::RecordPlan {
         tracks: s.record_tracks.clone(),
-        encode: record_encode(s),
+        encode: record_encode_capped(s, cap),
         ..Default::default()
     };
     let shares = ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps)
@@ -542,6 +542,18 @@ fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings
 
 /// What a recording uses: the stream's settings, or constant quality (high: near-lossless
 /// with the same encoder; lossless: x264, much bigger files).
+/// What a recording is encoded with: "Same as stream" is the stream's own encode, held to the
+/// platform's limit when one is (so it can share the stream's encoder, in either order, and a
+/// stream joining the recording's encoder is as strict as it asks); the others are as chosen.
+fn record_encode_capped(s: &StudioSettings, cap: Option<StreamCap>) -> EncodeSettings {
+    if s.record_quality == "stream"
+        && let Some(cap) = cap
+    {
+        return EncodeSettings { scale: None, ..effective_stream_encode(s, Some(cap), None) };
+    }
+    record_encode(s)
+}
+
 fn record_encode(s: &StudioSettings) -> EncodeSettings {
     let mut e = encode_of(s);
     match s.record_quality.as_str() {
@@ -2466,7 +2478,7 @@ impl StudioHost for DesktopStudio {
                 split_minutes: s.record_split_minutes,
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode(&s),
+                encode: record_encode_capped(&s, h.stream_cap),
                 muxer: s.record_muxer.clone(),
                 own_encoder: s.own_encoder,
             };
@@ -2936,26 +2948,32 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn set_stream_cap(&self, cap: Option<StreamCap>) -> Result<(), String> {
-        self.on_main(move |h| {
+        self.on_main(move |h| -> Result<(), String> {
             if h.stream_cap == cap {
-                return;
+                return Ok(());
             }
             h.stream_cap = cap;
             if !h.stream.as_ref().is_some_and(|s| s.stats().active) {
-                return;
+                return Ok(());
             }
             let s = h.settings.clone().unwrap_or_default();
             let target = effective_stream_encode(&s, cap, h.live_pct);
             let cur_encode = h.stream_with.as_ref().map(|w| &w.encode);
             if cur_encode.is_some_and(|prev| shape_differs(prev, &target)) {
                 if let Some(st) = h.stream.as_ref() {
+                    // Its encoder is swapped on the run (a new header and keyframe, no stop). It
+                    // can refuse (the encoder is shared with a recording): that is told, never
+                    // swallowed, as the stream then isn't held to the limit.
                     match st.reshape(&target, s.fps) {
                         Ok(()) => {
                             if let Some(w) = h.stream_with.as_mut() {
                                 w.encode = target;
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, "couldn't reshape stream for updated platform cap"),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "couldn't reshape stream for updated platform cap");
+                            return Err(e.to_string());
+                        }
                     }
                 }
             } else if cur_encode.is_none_or(|prev| prev.video_kbps != target.video_kbps)
@@ -2966,8 +2984,9 @@ impl StudioHost for DesktopStudio {
                     w.encode.video_kbps = target.video_kbps;
                 }
             }
+            Ok(())
         })
-        .await
+        .await?
     }
 
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
@@ -3799,6 +3818,39 @@ mod budget_tests {
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    /// "Same as stream" is the stream's own encode, held to the platform's limit: so the stream and
+    /// the recording can share one encoder in either order, and a stream joining a recording's
+    /// encoder is as strict as it asks (it used to join a plain CBR one, past Twitch's limit, with
+    /// nothing saying so).
+    #[test]
+    fn a_same_as_stream_recording_follows_the_platform_cap_so_the_two_share_strictly() {
+        let s = StudioSettings {
+            video_kbps: 14_000,
+            vbr: false,
+            keyframe_s: 2,
+            record_quality: "stream".into(),
+            ..StudioSettings::default()
+        };
+        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let stream = stream_settings(&s, Some(twitch));
+        let capped = record_encode_capped(&s, Some(twitch));
+        assert!(capped.strict_cbr && capped.scale.is_none());
+        let plan = ferrocast_studio::RecordPlan { tracks: vec![1], encode: capped, ..Default::default() };
+        assert_eq!(ferrocast_studio::stage::can_share(&stream, &plan, true, 60, 60), Ok(()));
+        // Without a cap, nothing changes: the plain stream and the plain recording share.
+        let plain = ferrocast_studio::RecordPlan {
+            tracks: vec![1],
+            encode: record_encode_capped(&s, None),
+            ..Default::default()
+        };
+        assert_eq!(ferrocast_studio::stage::can_share(&stream_settings(&s, None), &plain, true, 60, 60), Ok(()));
+        // A recording that began plain can't be joined by a strict stream: it gets its own encoder.
+        assert!(ferrocast_studio::stage::can_share(&stream, &plain, true, 60, 60).is_err());
+        // The other qualities are as chosen, cap or not.
+        let high = StudioSettings { record_quality: "high".into(), ..s.clone() };
+        assert_eq!(record_encode_capped(&high, Some(twitch)), record_encode(&high));
     }
 
     #[test]

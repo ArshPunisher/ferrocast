@@ -4515,7 +4515,9 @@ pub fn can_share(
     let mut stream_encode = s.encode.clone();
     stream_encode.scale = None;
     stream_encode.video_kbps = plan.encode.video_kbps;
-    stream_encode.strict_cbr = plan.encode.strict_cbr;
+    // The rate control is compared too: a stream held strictly under a platform's limit
+    // (`strict_cbr`) that joined a recording's plain CBR encoder would lose its 1x VBV and burst
+    // past the limit with nothing saying so.
     if stream_encode != plan.encode {
         return Err("the recording is encoded another way than the stream".into());
     }
@@ -4649,8 +4651,16 @@ mod tests {
                 .contains("Enhanced")
         );
         assert!(why(&s, &plan, true, 30).contains("30 fps"));
-        let high = RecordPlan { encode: crate::EncodeSettings { quality: Some(16), ..enc }, ..plan };
+        let high = RecordPlan { encode: crate::EncodeSettings { quality: Some(16), ..enc.clone() }, ..plan.clone() };
         assert!(why(&s, &high, true, 60).contains("another way"));
+        // A stream held strictly under a platform's limit doesn't join a plain CBR encoder (it
+        // would lose its 1x VBV and burst past the limit, unseen), and the other way round.
+        let strict = crate::EncodeSettings { strict_cbr: true, ..enc };
+        let strict_stream = StreamSettings { encode: strict.clone(), ..s.clone() };
+        assert!(why(&strict_stream, &plan, true, 60).contains("another way"));
+        let strict_plan = RecordPlan { encode: strict, ..plan };
+        assert_eq!(can_share(&strict_stream, &strict_plan, true, 60, 60), Ok(()));
+        assert!(why(&s, &strict_plan, true, 60).contains("another way"));
     }
 
     /// A picked display is noted by its UUID (found again when its number changes); a window's
