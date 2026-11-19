@@ -21,6 +21,9 @@ pub(crate) const SIZE: (u32, u32) = (1280, 720);
 const CHUNK: usize = 1024;
 /// Default network I/O and stall timeout before killing FFmpeg and reconnecting.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an attempt must deliver before it counts as healthy and the backoff starts over. A
+/// server that sends a frame and drops is not healthy: it is retried after the growing wait.
+const HEALTHY_AFTER: Duration = Duration::from_secs(10);
 /// Maximum stderr bytes kept in memory for diagnostics (the pipe is always drained to EOF).
 const STDERR_KEEP: usize = 8 * 1024;
 
@@ -395,6 +398,8 @@ fn run(
         let done = Arc::new(AtomicBool::new(false));
         let last_activity = Arc::new(AtomicU64::new(now_ns()));
         let delivered = Arc::new(AtomicBool::new(false));
+        // When the first picture or sound chunk came (ns; 0: nothing yet) and when the last did.
+        let first_at = Arc::new(AtomicU64::new(0));
         let timed_out = Arc::new(AtomicBool::new(false));
         let attempt_wake = Arc::new((Mutex::new(()), Condvar::new()));
 
@@ -433,11 +438,12 @@ fn run(
 
         // Sound on its own thread (it waits for FFmpeg to connect).
         let sound = listener.map(|l| {
-            let (feed, done, last_activity, delivered) =
-                (feed.clone(), done.clone(), last_activity.clone(), delivered.clone());
+            let (feed, done, last_activity, delivered, first_at) =
+                (feed.clone(), done.clone(), last_activity.clone(), delivered.clone(), first_at.clone());
             std::thread::spawn(move || {
                 read_sound(&l, &done, |pcm| {
                     last_activity.store(now_ns(), Ordering::Relaxed);
+                    let _ = first_at.compare_exchange(0, now_ns(), Ordering::Relaxed, Ordering::Relaxed);
                     delivered.store(true, Ordering::Release);
                     let span = CHUNK as u64 * 1_000_000_000 / 48_000;
                     let f = feed.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -451,6 +457,7 @@ fn run(
             let mut frame = vec![0u8; (w * h * 4) as usize];
             while !stop.load(Ordering::Acquire) && out.read_exact(&mut frame).is_ok() {
                 last_activity.store(now_ns(), Ordering::Relaxed);
+                let _ = first_at.compare_exchange(0, now_ns(), Ordering::Relaxed, Ordering::Relaxed);
                 delivered.store(true, Ordering::Release);
                 let f = feed.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 f.picture(ferrocore::Picture { width: w, height: h, rgba: frame.clone(), premultiplied: false });
@@ -481,21 +488,70 @@ fn run(
             parts = next;
             continue;
         }
-        // If GPU decode produced zero media and wasn't just a timeout, fall back to CPU immediately.
+        // Hardware decoding stops only when FFmpeg blamed the decoder for an attempt that
+        // delivered nothing (not a refused connection, a 404 or a quiet stream).
         let got_any = delivered.load(Ordering::Acquire);
-        if use_hw && parts.picture && !got_any && !timed_out.load(Ordering::Acquire) {
-            tracing::info!("a network media source: hardware decode failed, falling back to CPU");
-            use_hw = false;
-            continue;
+        let hw_next = hardware_after(use_hw, got_any, timed_out.load(Ordering::Acquire), &err_text);
+        if use_hw && !hw_next && parts.picture {
+            tracing::info!("a network media source: the decoder failed, hardware decoding is off for it");
         }
-        if got_any {
-            failures = 0;
-        } else {
-            failures = failures.saturating_add(1);
-        }
-        let backoff_secs = (base_delay.as_secs().max(1) << failures.saturating_sub(1).min(4)).min(60);
-        sleep_or_stop(stop, wake, Duration::from_secs(backoff_secs));
+        use_hw = hw_next;
+        // How long it delivered this time: only a good stretch starts the wait over.
+        let first = first_at.load(Ordering::Relaxed);
+        let good_for = (got_any && first > 0)
+            .then(|| Duration::from_nanos(last_activity.load(Ordering::Relaxed).saturating_sub(first)));
+        failures = failures_after(failures, good_for);
+        sleep_or_stop(stop, wake, backoff_after(base_delay, failures));
     }
+}
+
+/// Whether FFmpeg's error text blames the decoder or the hardware behind it (and not the
+/// network): only then is hardware decoding turned off for good. A server that is down, a 404 or
+/// a stream that went quiet say nothing about the decoder.
+fn decoder_trouble(errors: &str) -> bool {
+    let e = errors.to_ascii_lowercase();
+    const SIGNS: &[&str] = &[
+        "hwaccel",
+        "hardware",
+        "videotoolbox",
+        "vaapi",
+        "vdpau",
+        "cuda",
+        "nvdec",
+        "cuvid",
+        "dxva",
+        "d3d11",
+        "qsv",
+        "failed setup for format",
+        "no device available for decoder",
+        "error while decoding",
+        "could not open codec",
+        "failed to open codec",
+        "decoder",
+    ];
+    SIGNS.iter().any(|s| e.contains(s))
+}
+
+/// Whether the next attempt decodes on the hardware: it stops only after an attempt that
+/// delivered nothing and whose error text blames the decoder (never a refused connection, a 404
+/// or our own watchdog).
+fn hardware_after(was_on: bool, delivered: bool, timed_out: bool, errors: &str) -> bool {
+    was_on && (delivered || timed_out || !decoder_trouble(errors))
+}
+
+/// How many attempts in a row have been no good, after one that delivered for `healthy_for`
+/// (None: nothing arrived): only a stretch of good frames starts the backoff over.
+fn failures_after(failures: u32, delivered_for: Option<Duration>) -> u32 {
+    match delivered_for {
+        Some(d) if d >= HEALTHY_AFTER => 0,
+        _ => failures.saturating_add(1),
+    }
+}
+
+/// The wait before the next attempt: the source's own delay, doubling for each attempt in a row
+/// that wasn't good, up to a minute.
+fn backoff_after(base: Duration, failures: u32) -> Duration {
+    Duration::from_secs((base.as_secs().max(1) << failures.saturating_sub(1).min(5)).min(60))
 }
 
 /// The sound FFmpeg sends (48 kHz stereo f32), a chunk at a time to `chunk`, once it connects
@@ -601,6 +657,58 @@ mod tests {
         let sound = Parts { picture: false, sound: true };
         let only = args(&set, "tcp://127.0.0.1:9", sound, true, DEFAULT_TIMEOUT).unwrap_or_default().join(" ");
         assert!(!only.contains("hwaccel"), "{only}");
+    }
+
+    /// A dead server or a 404 says nothing about the decoder: hardware decoding stays on and the
+    /// wait keeps growing; only the decoder's own errors turn it off (M8-05).
+    #[test]
+    fn only_a_decoder_error_turns_hardware_decoding_off() {
+        for net in [
+            "tcp://127.0.0.1:1: Connection refused",
+            "Server returned 404 Not Found\nhttp://cam.test/a.m3u8: Server returned 404 Not Found",
+            "rtmp://live.test/app/key: Input/output error",
+            "Connection timed out",
+            "",
+        ] {
+            assert!(!decoder_trouble(net), "{net:?}");
+            assert!(hardware_after(true, false, false, net), "nothing delivered, but not the decoder: {net:?}");
+        }
+        for dec in [
+            "[h264 @ 0x1] Failed setup for format videotoolbox_vld: hwaccel initialisation returned error.",
+            "No device available for decoder: device type cuda needed for codec h264_cuvid.",
+            "Hardware device setup failed for decoder on device type d3d11va",
+            "Could not open codec h264",
+        ] {
+            assert!(decoder_trouble(dec), "{dec:?}");
+            assert!(!hardware_after(true, false, false, dec), "off after a decoder error: {dec:?}");
+            assert!(hardware_after(true, true, false, dec), "it delivered, so it worked");
+            assert!(hardware_after(true, false, true, dec), "our own watchdog killed it");
+        }
+        // Off stays off.
+        assert!(!hardware_after(false, true, false, ""));
+    }
+
+    /// The wait starts over only after 10 s of good frames (a server that sends one frame and
+    /// drops is retried after the growing wait, not every second), doubling to a minute.
+    #[test]
+    fn the_wait_starts_over_only_after_a_good_stretch() {
+        let s = Duration::from_secs;
+        let mut f = 0;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            f = failures_after(f, None);
+            waits.push(backoff_after(s(1), f).as_secs());
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 32, 32], "doubling, and held (the cap is 5 doublings)");
+        // One frame, then a drop: still failing, the wait goes on growing.
+        assert_eq!(failures_after(3, Some(Duration::from_millis(40))), 4);
+        assert_eq!(failures_after(3, Some(s(9))), 4);
+        // Ten seconds of delivery is healthy: starts over.
+        assert_eq!(failures_after(5, Some(s(10))), 0);
+        assert_eq!(backoff_after(s(1), 0), s(1));
+        // A source's own delay is the base, and a minute is the most.
+        assert_eq!(backoff_after(s(10), 3), s(40));
+        assert_eq!(backoff_after(s(10), 6), s(60));
     }
 
     /// Half-open TCP stream that stalls after accepting must time out and reconnect rather than
