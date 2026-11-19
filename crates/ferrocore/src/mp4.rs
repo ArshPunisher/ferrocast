@@ -184,6 +184,8 @@ pub struct Mp4Writer<W: Write> {
     /// The header as written (after `ftyp`), to write again with the chapter marks.
     moov: Vec<u8>,
     ftyp_len: u64,
+    /// The `ftyp` as written (a MOV replaces it when it is finished, and puts it back if that fails).
+    ftyp: Vec<u8>,
     /// Chapter marks: where (µs from the file's start) and their names.
     chapters: Vec<(i64, String)>,
     /// The latest time written (µs from the file's start): where a mark goes.
@@ -273,6 +275,7 @@ impl<W: Write> Mp4Writer<W> {
         out.flush()?;
         let written = (ftyp.len() + moov.len() + ROOM) as u64;
         let ftyp_len = ftyp.len() as u64;
+        let ftyp_bytes = ftyp.clone();
         Ok(Self {
             out,
             video,
@@ -287,6 +290,7 @@ impl<W: Write> Mp4Writer<W> {
             written,
             moov,
             ftyp_len,
+            ftyp: ftyp_bytes,
             chapters: Vec::new(),
             last_us: 0,
             flavor,
@@ -537,10 +541,19 @@ impl<W: Write + Seek> Mp4Writer<W> {
             self.out.flush()
         })();
         if let Err(e) = flip {
+            // Everything put back: the fragments, the first header, the first `ftyp`.
             for undo in &self.moofs {
                 let _ = hide(&mut self.out, *undo, b"moof");
             }
-            let _ = self.out.flush();
+            let old = self.moov.len() as u32;
+            let _ = (|| -> io::Result<()> {
+                self.out.seek(SeekFrom::Start(self.ftyp_len))?;
+                self.out.write_all(&old.to_be_bytes())?;
+                self.out.write_all(b"moov")?;
+                self.out.seek(SeekFrom::Start(0))?;
+                self.out.write_all(&self.ftyp)?;
+                self.out.flush()
+            })();
             fail!(self, e);
         }
         Ok(self.out)
@@ -1117,10 +1130,15 @@ mod finished_tests {
     struct Full {
         file: Cursor<Vec<u8>>,
         room: usize,
+        /// A write that starts here fails (the MOV's new `ftyp`, the last step of finishing).
+        fail_at: Option<u64>,
     }
 
     impl Write for Full {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_at == Some(self.file.position()) {
+                return Err(io::Error::from(io::ErrorKind::StorageFull));
+            }
             let end = self.file.position() as usize + buf.len();
             if end > self.room.max(self.file.get_ref().len()) && end > self.room {
                 return Err(io::Error::from(io::ErrorKind::StorageFull));
@@ -1141,8 +1159,12 @@ mod finished_tests {
     #[test]
     fn a_disk_that_fills_while_finishing_leaves_the_file_as_the_fragmented_one_it_was() {
         let (v, a) = tracks();
-        let mut w = Mp4Writer::with_tracks(Full { file: Cursor::new(Vec::new()), room: 1 << 30 }, Some(v), vec![a])
-            .unwrap_or_else(|e| panic!("{e}"));
+        let mut w = Mp4Writer::with_tracks(
+            Full { file: Cursor::new(Vec::new()), room: 1 << 30, fail_at: None },
+            Some(v),
+            vec![a],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
         for i in 0..90i64 {
             let pts = i * 33_333;
             w.video(&VideoPacket { pts_us: pts, dts_us: pts, key: i % 30 == 0, data: vec![i as u8; 500] })
@@ -1160,6 +1182,35 @@ mod finished_tests {
         assert!(top.iter().all(|b| &b.kind != b"free" || b.end - b.at + 8 == ROOM || b.end - b.at < 100));
         assert_eq!(top.iter().filter(|b| &b.kind == b"moov").count(), 1, "the fragmented header, only");
         assert!(top.iter().filter(|b| &b.kind == b"moof").count() >= 3, "and all the fragments, still moof");
+    }
+
+    #[test]
+    fn a_failure_at_the_very_last_step_puts_everything_back() {
+        // The last step of finishing a MOV writes its new ftyp at 0: it fails, after the new
+        // header, the free boxes and the first header's flip were all written.
+        let (v, a) = tracks();
+        let mut w = Mp4Writer::with_flavor(
+            Full { file: Cursor::new(Vec::new()), room: 1 << 30, fail_at: None },
+            Some(v),
+            vec![a],
+            Flavor::Mov,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..90i64 {
+            let pts = i * 33_333;
+            w.video(&VideoPacket { pts_us: pts, dts_us: pts, key: i % 30 == 0, data: vec![i as u8; 500] })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        w.out.fail_at = Some(0);
+        let failed = w.finalize().expect_err("the ftyp can't be written");
+        let (mut file, whole) = (failed.out.file.into_inner(), failed.whole as usize);
+        file.truncate(whole);
+        let top = boxes_in(&file, 0, file.len());
+        assert_eq!(&file[8..12], b"iso6", "the first ftyp is as it was");
+        assert_eq!(top.iter().filter(|b| &b.kind == b"moov").count(), 1, "the first header is a header again");
+        let moov = find(&top, b"moov").unwrap_or_else(|| panic!("moov"));
+        assert!(find(&boxes_in(&file, moov.at, moov.end), b"mvex").is_some(), "the fragmented one");
+        assert_eq!(top.iter().filter(|b| &b.kind == b"moof").count(), 3, "every fragment header is back");
     }
 
     #[test]
