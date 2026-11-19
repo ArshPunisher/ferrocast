@@ -561,11 +561,48 @@ impl Api {
         // Ferrocast's own vertical stream (and its broadcast) is never the normal one.
         let (main, _) = self.broadcasts(vertical.as_deref()).await?;
         let bound = main.as_ref().and_then(|b| b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str));
-        let stream = main_stream_id(&streams, vertical.as_deref(), bound).ok_or_else(|| {
+        let mut stream = main_stream_id(&streams, vertical.as_deref(), bound).ok_or_else(|| {
             YoutubeError::Refused(
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })?;
+        let mut streams = streams;
+        // A key set to one resolution (an old "1080p" key) caps the stream there whatever is
+        // sent (19 Nov, live: 1440p went out as 1080p on an old vertical key). Ferrocast's own
+        // key, any resolution, is used instead, and the broadcast bound to it (as OBS's YouTube
+        // sign-in makes its own stream).
+        // Not while a broadcast made a moment ago (bound to the old key) isn't listed yet.
+        if fixed_resolution(&streams, &stream) && just_made(&made).is_none() {
+            match self.own_stream(&streams).await {
+                Ok((id, list)) => {
+                    let bound_ok = match &main {
+                        Some(b) if !is_live(b) => {
+                            let bid = b.get("id").and_then(Value::as_str).unwrap_or_default();
+                            self.call(
+                                Method::POST,
+                                "/liveBroadcasts/bind",
+                                &[("id", bid), ("part", "id"), ("streamId", id.as_str())],
+                                None,
+                            )
+                            .await
+                            .map(drop)
+                        }
+                        // Already live on the old key: it stays there (moving it would end it).
+                        Some(_) => Err(YoutubeError::Refused("the broadcast is live on its key".into())),
+                        None => Ok(()),
+                    };
+                    match bound_ok {
+                        Ok(()) => {
+                            tracing::info!("YouTube: the stream goes to Ferrocast's own key (any resolution)");
+                            stream = id;
+                            streams = list;
+                        }
+                        Err(err) => tracing::warn!(%err, "YouTube: kept the broadcast's key, set to one resolution"),
+                    }
+                }
+                Err(err) => tracing::warn!(%err, "YouTube: couldn't make Ferrocast's own key"),
+            }
+        }
         match &main {
             // One waiting for "Go live" in YouTube Studio starts with the stream instead.
             Some(b) => {
@@ -594,6 +631,44 @@ impl Api {
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })
+    }
+}
+
+impl Api {
+    /// Ferrocast's own normal stream (any resolution), made once and found again by its title
+    /// → its id and the stream list with it in (liveStreams.insert, 50 units, the first time).
+    async fn own_stream(&self, streams: &Value) -> Result<(String, Value), YoutubeError> {
+        let found = streams.get("items").and_then(Value::as_array).and_then(|i| {
+            i.iter().find(|s| {
+                s.pointer("/snippet/title").and_then(Value::as_str) == Some(MAIN_STREAM_TITLE)
+                    && s.pointer("/cdn/resolution").and_then(Value::as_str) == Some("variable")
+                    && usable(s).is_some()
+            })
+        });
+        if let Some(id) = found.and_then(|s| s.get("id").and_then(Value::as_str)) {
+            return Ok((id.to_string(), streams.clone()));
+        }
+        let body = json!({
+            "snippet": { "title": MAIN_STREAM_TITLE, "description": "Ferrocast streams here, at any resolution." },
+            "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable" },
+            "contentDetails": { "isReusable": true },
+        });
+        let made =
+            self.call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body)).await?;
+        let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if id.is_empty() || usable(&made).is_none() {
+            return Err(YoutubeError::Refused(
+                "YouTube hasn't given Ferrocast's key yet; try again in a minute".into(),
+            ));
+        }
+        tracing::info!("YouTube: made Ferrocast's own stream key (any resolution)");
+        let mut list = streams.clone();
+        if let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) {
+            items.push(made);
+        } else {
+            list = json!({ "items": [made] });
+        }
+        Ok((id, list))
     }
 }
 
@@ -684,6 +759,23 @@ impl Api {
 
 /// The upright stream Ferrocast makes for YouTube Shorts live (found again by this title).
 pub const VERTICAL_STREAM_TITLE: &str = "Ferrocast vertical";
+
+/// The normal stream Ferrocast makes when the channel's key is set to one resolution.
+pub const MAIN_STREAM_TITLE: &str = "Ferrocast";
+
+/// Whether stream `id` in `list` is set to one resolution (not "variable").
+fn fixed_resolution(list: &Value, id: &str) -> bool {
+    list.get("items")
+        .and_then(Value::as_array)
+        .and_then(|i| i.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id)))
+        .and_then(|s| s.pointer("/cdn/resolution").and_then(Value::as_str))
+        .is_some_and(|r| r != "variable")
+}
+
+/// Whether a broadcast is on air (or about to be).
+fn is_live(b: &Value) -> bool {
+    matches!(b.pointer("/status/lifeCycleStatus").and_then(Value::as_str), Some("live" | "liveStarting"))
+}
 
 /// Ferrocast's vertical stream in a liveStreams list.
 fn vertical_id(list: &Value) -> Option<String> {

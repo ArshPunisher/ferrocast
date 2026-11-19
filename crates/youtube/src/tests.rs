@@ -743,6 +743,24 @@ fn the_bound_stream_wins_then_the_default_then_the_first() {
     assert!(pick_stream(&json!({}), None).is_none());
 }
 
+/// 19 Nov, live: the channel's key was an old one set to 1080p, so a 1440p stream went out at
+/// 1080p. Ferrocast makes its own key (any resolution), binds the broadcast to it and sends
+/// there; a key that takes any resolution is used as it is.
+#[tokio::test]
+async fn a_key_set_to_one_resolution_is_swapped_for_ferrocasts_own() {
+    let (ep, calls) = fake_live_keyed("1080p").await;
+    let i = video_api(ep).ingest().await.unwrap();
+    assert_eq!(i.key, "vertical-key", "the key made now (the fake names every new one so)");
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.contains(&"streams.insert".to_string()), "{calls:?}");
+    assert!(calls.contains(&"bind b1 sv".to_string()), "the broadcast moved to it: {calls:?}");
+
+    let (ep, calls) = fake_live_keyed("variable").await;
+    let i = video_api(ep).ingest().await.unwrap();
+    assert_eq!(i.key, "main-key");
+    assert!(!calls.lock().unwrap().iter().any(|c| c == "streams.insert" || c.starts_with("bind")));
+}
+
 #[tokio::test]
 async fn ingest_asks_youtube_for_the_channels_stream() {
     let (ep, _) = fake_videos(false).await;
@@ -752,6 +770,11 @@ async fn ingest_asks_youtube_for_the_channels_stream() {
 
 /// A YouTube that keeps the streams and broadcasts it's given (for the vertical stream).
 async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
+    fake_live_keyed("variable").await
+}
+
+/// [`fake_live`] with the channel's default key set to `resolution`.
+async fn fake_live_keyed(resolution: &str) -> (Endpoints, Arc<Mutex<Vec<String>>>) {
     use axum::extract::{Query, State};
     use std::collections::HashMap;
     #[derive(Clone, Default)]
@@ -764,7 +787,7 @@ async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
     let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", rest.local_addr().unwrap());
     st.streams.lock().unwrap().push(json!({ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
-        "cdn": { "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
+        "cdn": { "resolution": resolution, "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
     // Waiting for "Go live" in YouTube Studio (auto-start off), with a custom thumbnail.
     st.broadcasts.lock().unwrap().push(json!({ "id": "b1",
         "snippet": { "title": "Day 41 ranked", "description": "Ranked all night",
