@@ -38,6 +38,9 @@ const DRIFT_CORRECT_S: f64 = 10.0;
 const MAX_DRIFT: f64 = 0.002;
 /// Frames faded out and in where a source's sample rate changes (2 ms at 48 kHz).
 const SWITCH_FADE: usize = 96;
+/// The most the mix catches up on in one call (about 26 MB of blocks): a longer gap is a clock
+/// jump (sleep), and the mix starts again from now. A stall of a few seconds is still mixed.
+const MAX_CATCH_UP_NS: u64 = 10_000_000_000;
 /// After this long with sound on time, the mixer waits only as long as the latest sound in it
 /// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
 const SHRINK_AFTER_NS: u64 = 20_000_000_000;
@@ -842,6 +845,18 @@ impl Mixer {
         let step = block_ns(self.rate);
         let started = self.next_ns.is_some();
         let mut next = *self.next_ns.get_or_insert(until.saturating_sub(step));
+        // The clock jumped (the computer slept, a debugger held it): mixing every block of the
+        // gap would allocate ~2.6 MB per second of it in one call (an hour: gigabytes, an
+        // out-of-memory crash on wake; agy's M11 scan). What was queued is long past: start again.
+        if until.saturating_sub(next) > MAX_CATCH_UP_NS {
+            tracing::warn!(gap_ms = (until - next) / 1_000_000, "the clock jumped: the mix starts again from now");
+            for src in self.sources.values_mut() {
+                src.queue.clear();
+                src.start_ns = None;
+                src.drift_err_ns = 0.0;
+            }
+            next = until.saturating_sub(step);
+        }
         let mut out = Vec::new();
         while next + step <= until {
             out.push(self.mix_block(next));
@@ -1868,5 +1883,20 @@ mod tests {
         m.set_output_capture(1, None);
         m.set_active(1, false);
         assert!(!m.has_monitored(), "inactive source doesn't wake monitor");
+    }
+
+    /// After the computer slept an hour, one call mixes about one block, not an hour of them.
+    #[test]
+    fn a_clock_jump_after_sleep_never_mixes_the_whole_gap() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000;
+        let _ = m.mix_until(t0);
+        m.push(1, &[0.5f32; 480 * 2], 2, 48_000, t0);
+        let blocks = m.mix_until(t0 + 3_600_000_000_000);
+        assert!(blocks.len() <= 2, "{} blocks mixed in one call", blocks.len());
+        // And it goes on normally from there.
+        let later = m.mix_until(t0 + 3_600_000_000_000 + 100_000_000);
+        assert!((4..=6).contains(&later.len()), "{}", later.len());
     }
 }

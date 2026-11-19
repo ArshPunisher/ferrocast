@@ -3564,6 +3564,10 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, st
     }
 }
 
+/// The most of the past a source catches up on after the clock jumped (sleep, a debugger):
+/// beyond it, it starts again from now.
+const MAX_CATCH_UP_NS: u64 = 2_000_000_000;
+
 /// Frames a canvas waits for at most before the loop waits for the card: two (33 ms at 60
 /// fps), as OBS keeps its staging surfaces.
 pub(crate) const IN_FLIGHT: usize = 2;
@@ -3730,8 +3734,11 @@ fn frame(
                 }
             }
             Live::Tone { hz, every_ns, beep_ns, pushed_to } => {
-                // Beeps scheduled up to half a second ahead, on the frame clock.
-                let mut at = pushed_to.unwrap_or(ts - ts % *every_ns);
+                // Beeps scheduled up to half a second ahead, on the frame clock. After the clock
+                // jumped (the computer slept), it starts again from now: catching up on an hour
+                // of beeps in one frame would allocate gigabytes (agy's M11 scan).
+                let fresh = ts - ts % *every_ns;
+                let mut at = pushed_to.filter(|p| *p + MAX_CATCH_UP_NS >= ts).unwrap_or(fresh);
                 while at < ts + 500_000_000 {
                     let n = (u128::from(*beep_ns) * u128::from(rate) / 1_000_000_000) as usize;
                     let pcm: Vec<f32> = (0..n)
