@@ -343,6 +343,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn web_window(&self, _name: String, _url: String) -> Result<(), String> {
         Err(NOT_HERE.into())
     }
+    /// What streaming and recording would ask of this computer's video encoder, against what
+    /// it does (see docs/API.md, `GET /studio/engine/encode-budget`). Elsewhere: no figure.
+    async fn encode_budget(&self) -> Result<Value, String> {
+        Ok(serde_json::json!({ "budget_mpx": null, "level": "unknown" }))
+    }
     /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
     async fn screen_access(&self) -> Result<Value, String> {
         Ok(serde_json::json!({ "granted": true }))
@@ -2404,6 +2409,10 @@ impl Engine {
     pub async fn studio_web_window(&self, name: String, url: String) -> Result<(), EngineError> {
         let (name, url) = web_window_check(&name, &url)?;
         self.studio_host()?.web_window(name, url).await.map_err(failed)
+    }
+
+    pub async fn studio_encode_budget(&self) -> Result<Value, EngineError> {
+        self.studio_host()?.encode_budget().await.map_err(failed)
     }
 
     pub async fn studio_screen_access(&self) -> Result<Value, EngineError> {

@@ -73,6 +73,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/log", get(engine_log))
         .route("/studio/engine/log/show", post(engine_show_log))
         .route("/studio/engine/screen-access", get(engine_screen_access))
+        .route("/studio/engine/encode-budget", get(engine_encode_budget))
         .route("/studio/engine/screen-access/fix", post(engine_fix_screen_access))
         .route("/studio/engine/captions", get(engine_captions).put(engine_set_captions))
         .route("/studio/engine/apps", get(engine_apps))
@@ -907,6 +908,10 @@ struct WebWindowBody {
 async fn engine_web_window(State(app): State<AppState>, Body(b): Body<WebWindowBody>) -> ApiResult<Json<Value>> {
     app.engine.studio_web_window(b.name, b.url).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn engine_encode_budget(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_encode_budget().await?))
 }
 
 async fn engine_screen_access(State(app): State<AppState>) -> ApiResult<Json<Value>> {

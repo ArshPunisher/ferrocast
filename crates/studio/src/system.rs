@@ -45,3 +45,50 @@ mod tests {
         assert!(mb > 0, "this process uses some memory");
     }
 }
+
+/// About how many pixels a second one of the Mac's video encode engines does in H.264 or HEVC:
+/// one 3840×2160 picture at 60 fps (measured on an M4, 19 Nov: one 4K60 at 1.0x, two at 0.5x
+/// each, H.264 and HEVC alike).
+pub const MPX_PER_ENGINE: f64 = 3840.0 * 2160.0 * 60.0 / 1e6;
+
+/// The Mac's video encode engines (Apple's specs: one on M1-M4 and their Pro, two on Max, four
+/// on Ultra); None off Apple silicon, where it isn't known.
+pub fn video_engines() -> Option<u32> {
+    static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let out = std::process::Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output().ok()?;
+        engines_of(&String::from_utf8_lossy(&out.stdout))
+    })
+}
+
+/// [`video_engines`] from the chip's name ("Apple M4 Max").
+fn engines_of(chip: &str) -> Option<u32> {
+    let chip = chip.trim();
+    if !chip.starts_with("Apple M") {
+        return None;
+    }
+    Some(if chip.ends_with("Ultra") {
+        4
+    } else if chip.ends_with("Max") {
+        2
+    } else {
+        1
+    })
+}
+
+#[cfg(test)]
+mod engine_count_tests {
+    use super::*;
+
+    #[test]
+    fn the_macs_video_engines_come_from_its_chip() {
+        assert_eq!(engines_of("Apple M4"), Some(1));
+        assert_eq!(engines_of("Apple M3 Pro"), Some(1));
+        assert_eq!(engines_of("Apple M2 Max"), Some(2));
+        assert_eq!(engines_of("Apple M1 Ultra\n"), Some(4));
+        assert_eq!(engines_of("Intel(R) Core(TM) i9"), None);
+    }
+}
