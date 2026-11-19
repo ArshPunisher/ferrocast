@@ -173,15 +173,20 @@ impl SoundIn {
     }
 }
 
-/// Finished pieces into `sound`, stamped now (the oldest let go past about 5 s).
+/// Finished pieces into `sound`, each stamped with when it began: the newest ends now, the
+/// ones before it a piece earlier each (the oldest let go past about 5 s). One stamp for all
+/// (a device handing over several at once) made them look like a jump back in time, and the
+/// mixer threw away what it had queued: a crackle at every burst (19 Nov).
 fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
     if pieces.is_empty() {
         return;
     }
     let now = now_ns();
+    let n = pieces.len() as u64;
     if let Ok(mut q) = sound.lock() {
-        for p in pieces {
-            q.push_back((p, now));
+        for (k, p) in pieces.into_iter().enumerate() {
+            let len = (p.len() / 2) as u64 * 1_000_000_000 / u64::from(RATE);
+            q.push_back((p, now.saturating_sub((n - k as u64) * len)));
         }
         while q.len() > MAX_PIECES {
             q.pop_front();
@@ -237,6 +242,19 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pieces handed over together are stamped one after another, the newest ending now.
+    #[test]
+    fn a_burst_of_pieces_gets_times_one_after_another() {
+        let sound: Pieces = Arc::default();
+        keep(&sound, vec![vec![0.0; 2048], vec![0.0; 2048], vec![0.0; 2048]]);
+        let q: Vec<u64> = sound.lock().map(|q| q.iter().map(|p| p.1).collect()).unwrap_or_default();
+        let piece = 1024 * 1_000_000_000 / u64::from(RATE);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q[1] - q[0], piece);
+        assert_eq!(q[2] - q[1], piece);
+        assert!(now_ns() - q[2] >= piece, "the newest began a piece ago");
+    }
 
     #[test]
     fn any_rate_and_layout_becomes_48k_stereo() {

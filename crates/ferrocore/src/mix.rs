@@ -25,6 +25,10 @@ const MAX_GAP_NS: u64 = 2_000_000_000;
 const MAX_LATENCY_NS: u64 = 1_000_000_000;
 /// Room added over the lateness seen when the mixer waits longer.
 const LATENCY_ROOM_NS: u64 = 20_000_000;
+/// Sound later than this is one source's trouble, not the mix's: that source is timed by when
+/// its sound comes (19 Nov: a USB capture card's sound came over a second late, the mixer
+/// waited a second for it, and every source, the mic too, came out late and broken).
+const RETIME_NS: u64 = 300_000_000;
 /// After this long with sound on time, the mixer waits only as long as the latest sound in it
 /// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
 const SHRINK_AFTER_NS: u64 = 20_000_000_000;
@@ -121,6 +125,9 @@ struct Source {
     recent: VecDeque<Measured>,
     /// True peak's oversampling memory (the last samples of each side).
     tp: [[f32; TP_TAPS]; 2],
+    /// Added to its times: a source whose sound came later than [`RETIME_NS`] is timed by when
+    /// it comes from then on, so it never holds the whole mix back (libobs's timing_adjust).
+    adjust_ns: u64,
 }
 
 /// Taps of each phase of the true-peak oversampler.
@@ -336,6 +343,7 @@ impl Mixer {
                         levels: Levels::default(),
                         recent: VecDeque::new(),
                         tp: [[0.0; TP_TAPS]; 2],
+                        adjust_ns: 0,
                     },
                 );
             }
@@ -456,7 +464,35 @@ impl Mixer {
         }) else {
             return;
         };
-        let ts = (ts_ns as i64 + offset).max(0) as u64;
+        let mut ts = (ts_ns as i64 + offset).max(0) as u64;
+        if let (Some(next), Some(src)) = (self.next_ns, self.sources.get_mut(&id)) {
+            // Judged on the device's own time, not on the sync offset or what filters hold
+            // back (those are meant: moved earlier on purpose, they aren't lateness; CodeRabbit).
+            let due = next + self.mixed_with_ns;
+            let late_raw = due.saturating_sub(ts_ns);
+            if src.adjust_ns > 0 && late_raw < RETIME_NS / 2 {
+                // Its times came right again: no correction any more (else it would stay late
+                // by the old one, with silence put in; CodeRabbit).
+                src.adjust_ns = 0;
+                src.queue.clear();
+                src.start_ns = None;
+                tracing::info!(source = id, "a source's sound comes on time again");
+            }
+            let late = due.saturating_sub(ts_ns + src.adjust_ns);
+            if late > RETIME_NS {
+                // Timed by when it comes: just in time for the next mix (libobs does the same
+                // with a source whose times are too far off).
+                src.adjust_ns += late;
+                src.queue.clear();
+                src.start_ns = None;
+                tracing::warn!(
+                    source = id,
+                    late_ms = late / 1_000_000,
+                    "a source's sound came far too late: it's timed by when it comes now"
+                );
+            }
+            ts += src.adjust_ns;
+        }
         // Sound for a time already mixed came too late: its start would be cut off, and with a
         // source that's always this late (ScreenCaptureKit hands sound over 20-40 ms after it
         // plays, and the engine takes it once a frame) every piece lost its start, a break
@@ -493,6 +529,18 @@ impl Mixer {
                     None
                 } else if ts > expected && ts - expected <= MAX_GAP_NS {
                     gap = ((ts - expected) * u64::from(rate) / 1_000_000_000) as usize;
+                    None
+                } else if ts < expected && expected - ts <= MAX_GAP_NS && ts >= start {
+                    // Earlier than what's queued (a device handing over a burst late): it takes
+                    // the place of what's queued from its time on, as libobs places it; the
+                    // rest of the queue stays (clearing it all was the tearing, 19 Nov).
+                    let keep = frames_in(ts - start, out_rate).min(src.queue.len() / 2);
+                    src.queue.truncate(keep * 2);
+                    if let Some((_, rs, pending)) = &mut src.resampler {
+                        rs.reset();
+                        pending[0].clear();
+                        pending[1].clear();
+                    }
                     None
                 } else {
                     Some(ts)
@@ -810,6 +858,76 @@ mod tests {
 
     /// Low latency sound: the wait starts at 20 ms and a late device can't push it past 60 ms
     /// (its late start is cut instead); off again, the usual wait.
+    /// A USB capture card's sound came over a second late (19 Nov, live): the mixer waited a
+    /// second for it, and the mic came out late and broken with it. Now that source alone is
+    /// timed by when its sound comes; the wait stays short and the mic plays on, unbroken.
+    #[test]
+    fn a_far_too_late_source_never_holds_the_mix_back() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings::default());
+        m.set(2, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let piece = 960; // 20 ms
+        let mut heard = Vec::new();
+        for k in 0..100u64 {
+            let at = t0 + k * 20_000_000;
+            // The mic, on time; the card, 1.2 s late.
+            m.push(1, &[0.25; 1920], 2, 48_000, at);
+            m.push(2, &[0.25; 1920], 2, 48_000, at.saturating_sub(1_200_000_000));
+            for b in m.mix_until(at + 20_000_000) {
+                heard.extend(b.tracks[0].iter().step_by(2).copied());
+            }
+            let _ = piece;
+        }
+        assert!(m.latency_ns() < 400_000_000, "the mix waits {} ms", m.latency_ns() / 1_000_000);
+        // After the start, the mic is always there (0.25, plus the card's once it's retimed).
+        let steady = &heard[heard.len() / 2..];
+        assert!(
+            steady.iter().all(|v| *v >= 0.24),
+            "the mic broke up: {} silent samples",
+            steady.iter().filter(|v| **v < 0.24).count()
+        );
+    }
+
+    /// A sync offset that moves a source half a second earlier is meant, not lateness: it isn't
+    /// undone by retiming (CodeRabbit). And a source whose times come right again after being
+    /// retimed loses the correction (else it'd stay late by it for good).
+    #[test]
+    fn a_sync_offset_isnt_lateness_and_a_retimed_source_comes_back() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set(1, SourceSettings { sync_offset_ns: -500_000_000, ..SourceSettings::default() });
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        m.push(1, &[0.1; 1920], 2, 48_000, t0);
+        assert_eq!(m.sources[&1].adjust_ns, 0, "the offset kept");
+        m.set(2, SourceSettings::default());
+        m.push(2, &[0.1; 1920], 2, 48_000, t0 - 1_200_000_000);
+        assert!(m.sources[&2].adjust_ns > 1_000_000_000, "retimed");
+        m.push(2, &[0.1; 1920], 2, 48_000, t0 + 20_000_000);
+        assert_eq!(m.sources[&2].adjust_ns, 0, "on time again: no correction");
+    }
+
+    /// A device that hands over a burst earlier than what's queued (by more than the smoothing)
+    /// replaces only what's queued from its time on; the start of the queue isn't thrown away
+    /// (that was the tearing, 19 Nov).
+    #[test]
+    fn a_burst_earlier_than_whats_queued_keeps_the_queue() {
+        let mut m = Mixer::new(48_000, 300_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        // 200 ms queued from t0, then a piece stamped 100 ms before its end.
+        m.push(1, &[0.5; 2 * 9600], 2, 48_000, t0);
+        m.push(1, &[0.5; 2 * 4800], 2, 48_000, t0 + 100_000_000);
+        let mut heard = Vec::new();
+        for b in m.mix_until(t0 + 300_000_000 + 200_000_000) {
+            heard.extend(b.tracks[0].iter().step_by(2).copied());
+        }
+        let sounding = heard.iter().filter(|v| **v > 0.4).count();
+        assert!(sounding >= 9000, "the first 100 ms and the burst both heard: {sounding} samples");
+    }
+
     #[test]
     fn low_latency_keeps_the_wait_short() {
         let mut m = Mixer::new(48_000, 40_000_000);
@@ -820,7 +938,7 @@ mod tests {
         let _ = m.mix_until(t0);
         // A piece half a second late.
         m.push(1, &[0.1; 960], 2, 48_000, t0 - 500_000_000);
-        assert_eq!(m.latency_ns(), 60_000_000, "capped");
+        assert!(m.latency_ns() <= 60_000_000, "capped: {}", m.latency_ns());
         m.set_low_latency(false);
         assert_eq!(m.latency_ns(), 40_000_000, "the usual start again");
     }
@@ -1017,11 +1135,12 @@ mod tests {
         let t0 = 10_000_000_000u64;
         let _ = m.mix_until(t0);
         let piece: Vec<f32> = vec![0.1; 960 * 2];
-        m.push(1, &piece, 2, rate, t0 - 340_000_000);
+        // (Under RETIME_NS: later than that, the source is timed by when it comes instead.)
+        m.push(1, &piece, 2, rate, t0 - 240_000_000);
         let raised = m.latency_ns();
-        assert!(raised > 300_000_000, "the late piece raised the wait: {raised}");
+        assert!(raised > 200_000_000, "the late piece raised the wait: {raised}");
         assert!(m.mix_until(t0 + 33_000_000).is_empty(), "nothing to mix yet");
-        m.push(1, &piece, 2, rate, t0 - 320_000_000);
+        m.push(1, &piece, 2, rate, t0 - 220_000_000);
         assert_eq!(m.latency_ns(), raised, "a piece no later than the first one changes nothing");
     }
 
