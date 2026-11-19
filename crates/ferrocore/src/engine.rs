@@ -561,7 +561,7 @@ enum Live {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Microphone(crate::camera::Capture),
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-    Media(crate::media::Media),
+    Media(Arc<crate::media::Media>),
     Fed(Feed),
     /// Files one after another, on a worker that hands them in as a fed source would.
     Series {
@@ -1006,7 +1006,7 @@ impl Engine {
                     Box::new(move || {
                         open_video(&path, looping).map(|m| {
                             let heard = m.has_audio;
-                            (Live::Media(m), heard)
+                            (Live::Media(Arc::new(m)), heard)
                         })
                     }),
                 );
@@ -1317,27 +1317,26 @@ impl Engine {
     }
 
     /// Plays, pauses, restarts, stops or seeks a media source (OBS's media controls).
+    /// Releases the engine's State lock before dispatching so scrubber drags never stall frames.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_control(&self, id: u64, c: crate::media::Control) -> Result<(), AvError> {
-        match self.lock().sources.get(&id).map(|s| &s.live) {
-            Some(Live::Media(m)) => {
-                m.control(c);
-                Ok(())
-            }
-            _ => Err(AvError::Source(format!("source {id} isn't a media file"))),
-        }
+        let m = match self.lock().sources.get(&id).map(|s| &s.live) {
+            Some(Live::Media(m)) => Arc::clone(m),
+            _ => return Err(AvError::Source(format!("source {id} isn't a media file"))),
+        };
+        m.control(c);
+        Ok(())
     }
 
     /// A media source's state, where it is and how long it lasts (ns).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub fn media_state(&self, id: u64) -> Option<(crate::media::MediaState, u64, u64)> {
-        match self.lock().sources.get(&id).map(|s| &s.live) {
-            Some(Live::Media(m)) => {
-                let (state, at) = m.state();
-                Some((state, at, m.duration_ns))
-            }
-            _ => None,
-        }
+        let m = match self.lock().sources.get(&id).map(|s| &s.live) {
+            Some(Live::Media(m)) => Arc::clone(m),
+            _ => return None,
+        };
+        let (state, at) = m.state();
+        Some((state, at, m.duration_ns))
     }
 
     /// Where an outside source (`SourceKind::Fed`) is handed its pictures and sound.
@@ -1800,7 +1799,7 @@ impl Engine {
         }
         let now = now_ns();
         let mut st = self.lock();
-        st.sources.insert(STINGER, Src::new(Live::Media(m), None, None));
+        st.sources.insert(STINGER, Src::new(Live::Media(Arc::new(m)), None, None));
         let from = st.on_air.replace(name.to_string()).unwrap_or_default();
         if let Some(l) = st.loaded.as_mut()
             && l.scenes.iter().any(|s| s == name)
