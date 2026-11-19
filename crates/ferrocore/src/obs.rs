@@ -300,14 +300,26 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
             strength: s.get("strength").and_then(Value::as_u64).unwrap_or(100).clamp(1, 100) as u32,
         },
         // OBS's Noise Suppression (RNNoise or Speex) becomes it too: as deep as OBS's level
-        // (-30 dB by default), 0.6 dB a step.
+        // (-30 dB by default), 0.6 dB a step. OBS's RNNoise ignores the level (it applies to
+        // Speex only, and OBS hides it for RNNoise), and RNNoise is gentle: as deep as 48 dB
+        // here, a voice came out muffled and low (19 Nov, live, "unclear"); RNNoise's is held
+        // to 24 dB, about what RNNoise takes off.
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
             let level = s.get("suppress_level").and_then(Value::as_f64).unwrap_or(-30.0).abs();
+            // With no method saved: v2 means RNNoise; the older filter, Speex (OBS's defaults).
+            let rnnoise = match s.get("method").and_then(Value::as_str) {
+                Some(m) => m == "rnnoise",
+                None => kind == "noise_suppress_filter_v2",
+            };
+            let level = if rnnoise { level.min(RNNOISE_DB) } else { level };
             AudioEffect::Denoise { strength: (level / 0.6).round().clamp(1.0, 100.0) as u32 }
         }
         _ => return None,
     })
 }
+
+/// The most OBS's RNNoise noise suppression takes off here (dB): RNNoise is gentle.
+const RNNOISE_DB: f64 = 24.0;
 
 /// A source kind the engine plays, from OBS's id and settings; Err with what it is otherwise.
 /// macOS's notification banners (and Notification Center, and the desktop's widgets), by bundle id.
@@ -1173,6 +1185,31 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
 
 #[cfg(test)]
 mod tests {
+
+    /// OBS's RNNoise ignores the level: held gentle here (24 dB) however deep it's set; Speex
+    /// keeps its level (19 Nov, live: RNNoise at -48 became 48 dB of noise removal, a muffled
+    /// voice).
+    #[test]
+    fn obs_rnnoise_stays_gentle_and_speex_keeps_its_level() {
+        use super::{AudioEffect, audio_effect_from};
+        let at = |m: &str, db: i64| match audio_effect_from(
+            "noise_suppress_filter_v2",
+            &serde_json::json!({ "method": m, "suppress_level": db }),
+        ) {
+            Some(AudioEffect::Denoise { strength }) => strength,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at("rnnoise", -48), 40, "24 dB");
+        assert_eq!(at("rnnoise", -12), 20, "less than that stays");
+        assert_eq!(at("speex", -48), 80, "48 dB");
+        // No method saved: the older filter is Speex (its level kept), v2 RNNoise (CodeRabbit).
+        let none = |kind: &str| match audio_effect_from(kind, &serde_json::json!({ "suppress_level": -48 })) {
+            Some(AudioEffect::Denoise { strength }) => strength,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(none("noise_suppress_filter"), 80);
+        assert_eq!(none("noise_suppress_filter_v2"), 40);
+    }
 
     /// A screen capture switched to Window or App with nothing picked yet keeps what it ran
     /// as before; with nothing before, it's left out and says why.
