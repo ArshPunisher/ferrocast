@@ -2094,7 +2094,7 @@ impl Stage {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
         for what in own::not_applied(&s.encode, "") {
-            tracing::warn!("the stream starts without {what}: Ferrocore's encoders don't take them");
+            say_once(format!("the stream starts without {what}: Ferrocore's encoders don't take them"));
         }
         // Track 1 to viewers; Twitch's VOD track after it (sent as Enhanced RTMP multitrack audio).
         let tracks: Vec<u8> = std::iter::once(1).chain(s.vod_track).collect();
@@ -2126,7 +2126,7 @@ impl Stage {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
         for what in own::not_applied(&plan.encode, &plan.muxer) {
-            tracing::warn!("the recording starts without {what}: Ferrocore doesn't take them");
+            say_once(format!("the recording starts without {what}: Ferrocore doesn't take them"));
         }
         let path = path.to_path_buf();
         let how = own::Drawing {
@@ -4431,6 +4431,17 @@ fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
         .map(|n| plan.folder.join(format!("{stem}{gap}({n}).{}", plan.extension())))
         .find(|p| !p.exists())
         .unwrap_or(first)
+}
+
+/// Logs `what` the first time this run (a profile from before Ferrocore keeps its muxer
+/// settings, with no box left to clear them: said once, not at every recording).
+fn say_once(what: String) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&what) {
+        tracing::warn!("{what}");
+        said.push(what);
+    }
 }
 
 /// Notes what a screen capture's window or display is, beside its number, so it's found
