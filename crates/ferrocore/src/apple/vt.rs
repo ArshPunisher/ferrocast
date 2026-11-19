@@ -465,7 +465,12 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
         sink.error = Some(format!("the Mac's video encoder failed a frame (error {status})"));
         return;
     }
-    if flags & DROPPED != 0 || sbuf.is_null() {
+    if flags & DROPPED != 0 {
+        // VideoToolbox left this frame out (it was behind): counted, as FFmpeg's are.
+        crate::video::note_dropped(1);
+        return;
+    }
+    if sbuf.is_null() {
         return;
     }
     // SAFETY: `sbuf` is a live CMSampleBuffer for the duration of the callback; every "Get" below

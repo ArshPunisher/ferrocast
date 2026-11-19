@@ -54,6 +54,20 @@ pub struct VideoConfig {
     pub software: bool,
 }
 
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames the encoders left out since the program started: one that was behind (FFmpeg's queue
+/// full) or that VideoToolbox dropped. OBS's "skipped frames due to encoding lag". The engine's
+/// own frames that weren't drawn in time are counted apart (`Stats::skipped`).
+pub fn dropped_frames() -> u64 {
+    DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An encoder left `n` frames out.
+pub(crate) fn note_dropped(n: u64) {
+    DROPPED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One frame's pixels, borrowed. Strides are bytes per row.
 #[derive(Debug, Clone, Copy)]
 pub enum Frame<'a> {

@@ -69,6 +69,9 @@ pub struct Stage {
     /// The frame rate as last worked out: when, the engine's frames and skipped count then,
     /// and the rate over the second before (`stats`).
     fps_seen: std::cell::Cell<Option<(std::time::Instant, u64, u64, f64)>>,
+    /// The encoders' dropped-frame count when this stage began (the count is the program's): what
+    /// the stats call "skipped" is what came after.
+    dropped_base: u64,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -237,6 +240,7 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
             fps_seen: std::cell::Cell::new(None),
+            dropped_base: ferrocore::video::dropped_frames(),
         };
         s.add_scene(first_scene)?;
         Ok(s)
@@ -266,6 +270,7 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
             fps_seen: std::cell::Cell::new(None),
+            dropped_base: ferrocore::video::dropped_frames(),
         };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
@@ -2530,6 +2535,12 @@ impl Stage {
     pub fn stats(&self) -> crate::EngineStats {
         let (cpu, memory_mb) = crate::system::usage();
         let s = self.engine.borrow().as_ref().map(|e| e.engine.stats()).unwrap_or_default();
+        // Frames the encoders left out (FFmpeg's queue full, VideoToolbox's drops), apart from the
+        // frames the engine didn't draw in time (`lagged`): the health meter names the encoder
+        // from these. Never more than the frames given to them (a new engine counts from 0 again).
+        let encoded = s.frames.min(u64::from(u32::MAX)) as u32;
+        let skipped =
+            ferrocore::video::dropped_frames().saturating_sub(self.dropped_base).min(u64::from(encoded)) as u32;
         crate::EngineStats {
             cpu,
             fps: self.fps_now(s.frames, s.skipped, std::time::Instant::now()),
@@ -2537,8 +2548,8 @@ impl Stage {
             lagged: s.skipped.min(u64::from(u32::MAX)) as u32,
             frames: s.frames.min(u64::from(u32::MAX)) as u32,
             memory_mb,
-            skipped: 0,
-            encoded: s.frames.min(u64::from(u32::MAX)) as u32,
+            skipped,
+            encoded,
             recovered: s.recovered.min(u64::from(u32::MAX)) as u32,
             restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
             encode_ms: f64::from(s.encode_ms),
