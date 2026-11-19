@@ -258,8 +258,11 @@ impl Proc {
 
     /// Closes the input and waits for everything still coming.
     fn finish(&mut self) -> Vec<Tag> {
+        let t = std::time::Instant::now();
         self.close_input();
+        tracing::info!(at_ms = t.elapsed().as_millis() as u64, "FFmpeg's input is written and closed");
         let tags: Vec<Tag> = self.tags.iter().collect();
+        tracing::info!(at_ms = t.elapsed().as_millis() as u64, tags = tags.len(), "FFmpeg's output is read to its end");
         let _ = self.child.wait();
         tags
     }

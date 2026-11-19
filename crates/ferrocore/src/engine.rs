@@ -2114,14 +2114,21 @@ impl Engine {
     }
 
     pub fn stop_output(&self, id: u64) -> Result<(), AvError> {
+        // Each step said with its time: stopping a recording on GitHub's Windows runner never
+        // finished (18 and 19 Nov) and nothing said where it waited.
+        let t = Instant::now();
+        tracing::info!(id, "an output stops");
         let taken = {
             let mut st = self.lock();
+            tracing::info!(id, waited_ms = t.elapsed().as_millis() as u64, "an output stops: the engine's lock taken");
             // Its last frames still on the card go into it first.
             deliver(&mut st, &self.gpu, true);
+            tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at))
         };
         if let Some((_, pipe, mut kind, _)) = taken {
             let tags = pipe.finish()?;
+            tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stopped: its encoders finished");
             if let OutputKind::Stream(send) = &mut kind {
                 for t in tags {
                     send(t);
