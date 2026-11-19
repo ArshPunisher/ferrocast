@@ -731,3 +731,432 @@ async fn only_enhanced_broadcasting_gets_the_other_qualities() {
     // The other platform never sees track 1: next is the main picture.
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }
+
+/// Listener with a small TCP receive buffer so pausing or throttling reads exerts real TCP
+/// backpressure on `push::session`'s writes within a few frames.
+async fn small_buf_listener() -> TcpListener {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    let _ = sock.set_recv_buffer_size(16 * 1024);
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    sock.listen(16).unwrap()
+}
+
+/// A fake platform whose reads can be paused via `open` (true = read freely, false = stall)
+/// and optionally throttled after publishing (`read_cap` bytes per `read_delay`).
+async fn controlled_platform(
+    listener: TcpListener,
+    key: &'static str,
+    open: watch::Receiver<bool>,
+    throttle: Option<(usize, Duration)>,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            let mut open = open.clone();
+            tokio::spawn(async move {
+                let _ = serve_controlled(&mut sock, key, &tx, &mut open, throttle).await;
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+async fn serve_controlled(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    open: &mut watch::Receiver<bool>,
+    throttle: Option<(usize, Duration)>,
+) -> Option<()> {
+    let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
+    let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
+    let mut queue: Vec<ServerSessionResult> = first;
+    queue.extend(s.handle_input(&rest).ok()?);
+    let mut buf = vec![0u8; 65536];
+    let mut published = false;
+    loop {
+        while !queue.is_empty() {
+            for r in std::mem::take(&mut queue) {
+                match r {
+                    ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
+                    ServerSessionResult::RaisedEvent(ev) => match ev {
+                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                            queue.extend(s.accept_request(request_id).ok()?)
+                        }
+                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                            if stream_key == key {
+                                published = true;
+                                let _ = tx.send(Got::Publish(stream_key));
+                                queue.extend(s.accept_request(request_id).ok()?);
+                            } else {
+                                return None;
+                            }
+                        }
+                        ServerSessionEvent::StreamMetadataChanged { .. } => {
+                            let _ = tx.send(Got::Meta);
+                        }
+                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Got::Video(timestamp.value, data));
+                        }
+                        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Got::Audio(timestamp.value, data));
+                        }
+                        _ => {}
+                    },
+                    ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                }
+            }
+        }
+        if published {
+            if !*open.borrow() {
+                open.wait_for(|v| *v).await.ok()?;
+            }
+            if let Some((_, delay)) = throttle {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        let max_read = if published { throttle.map_or(buf.len(), |(cap, _)| cap.min(buf.len())) } else { buf.len() };
+        let n = sock.read(&mut buf[..max_read]).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        queue.extend(s.handle_input(&buf[..n]).ok()?);
+    }
+}
+
+/// Realistic-size FLV video frame (`size` bytes) so a stalled receiver fills the TCP send buffer
+/// within a few frames instead of absorbing an entire test stream in kernel buffers.
+fn sized_video(key: bool, seq: u8, size: usize) -> Bytes {
+    let mut v = vec![seq; size];
+    v[0] = if key { 0x17 } else { 0x27 };
+    v[1] = 0x01;
+    v[2] = 0;
+    v[3] = 0;
+    v[4] = 0;
+    Bytes::from(v)
+}
+
+fn big_video(key: bool, seq: u8) -> Bytes {
+    sized_video(key, seq, 64 * 1024)
+}
+
+/// Realistic-size Twitch Enhanced Broadcasting extra video frame (track 1).
+fn big_eb_video(key: bool, seq: u8) -> Bytes {
+    let mut v = vec![seq; 32 * 1024];
+    let prefix = if key { EB_KEY } else { EB_INTER };
+    v[..prefix.len()].copy_from_slice(prefix);
+    Bytes::from(v)
+}
+
+#[tokio::test]
+async fn a_slow_destination_drops_inter_video_keeps_audio_and_resumes_at_a_keyframe() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.video_frame_rate = Some(20.0);
+    w.hub.metadata(m);
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    let mut slow = controlled_platform(ls, "slow", open_rx, None).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    // Drain connect + headers on both destinations.
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Meta);
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    // First keyframe + audio: both receive it cleanly.
+    w.hub.video(0, big_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Video(0, _)));
+        assert_eq!(next(rx).await, Got::Audio(10, Bytes::from_static(AAC)));
+    }
+
+    // Stall the slow destination's TCP reads, then feed 2.5 s of stream (well under BACKLOG=1024
+    // so RecvError::Lagged never fires): GOP 1 inter frames (50..=1950), GOP 2 keyframe at 2000
+    // + inter frames (2050..=2450), and interleaved audio every 50 ms.
+    // Let fast drain each frame as it's published (like real-time pacing) so fast stays caught up
+    // while slow stalls on TCP backpressure.
+    open_tx.send_replace(false);
+    let mut expected_video_ts = vec![0u32];
+    let mut expected_audio_ts = vec![10u32];
+    for step in 1..=49u32 {
+        let ts = step * 50;
+        let is_key = ts == 2000;
+        expected_video_ts.push(ts);
+        expected_audio_ts.push(ts + 10);
+        w.hub.video(ts, big_video(is_key, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        assert!(matches!(next(&mut fast).await, Got::Video(t, _) if t == ts));
+        assert_eq!(next(&mut fast).await, Got::Audio(ts + 10, Bytes::from_static(AAC)));
+    }
+    assert_eq!(hf.borrow().dropped, 0, "a fast destination drops nothing");
+
+    // Give the slow sender a moment to fill its kernel send buffer and block in write_all.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Unblock the slow destination and end the stream cleanly so we can inspect everything it sent.
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut slow_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut slow_audios = vec![10u32];
+    loop {
+        match next(&mut slow).await {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected slow packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    let slow_dropped = hs.borrow().dropped;
+    assert!(slow_dropped > 0, "slow destination must drop stale non-keyframe video (got dropped={slow_dropped})");
+    assert_eq!(
+        slow_videos.len() as u64 + slow_dropped,
+        expected_video_ts.len() as u64,
+        "every dropped video frame is accounted for in Health.dropped"
+    );
+    assert_eq!(slow_audios, expected_audio_ts, "audio is never dropped by the video-drop path");
+    // Every gap in the slow destination's video stream must resume on a keyframe (no orphan P-frames).
+    let mut saw_gap = false;
+    for pair in slow_videos.windows(2) {
+        let ((prev_ts, _), (cur_ts, cur_key)) = (pair[0], pair[1]);
+        if cur_ts > prev_ts + 50 {
+            saw_gap = true;
+            assert!(cur_key, "resumed at non-keyframe ts={cur_ts} after gap from ts={prev_ts}");
+        }
+    }
+    assert!(saw_gap, "slow destination should have skipped stale inter frames up to keyframe 2000");
+    assert!(slow_videos.iter().any(|&(ts, key)| ts == 2000 && key), "resumed at keyframe 2000");
+    assert!(!slow_videos.iter().any(|&(ts, _)| ts == 1950), "tail inter frame before keyframe 2000 was dropped");
+    assert_eq!(slow_videos.last().map(|&(ts, _)| ts), Some(2450), "caught up and sent frames after keyframe");
+}
+
+#[tokio::test]
+async fn a_continuously_slow_destination_keeps_latency_bounded_and_audio_intact() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (_open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    // Slow platform reads at ~2.1 MB/s (32 KB every 15 ms) against ~6.4 MB/s stream (128 KB every
+    // 20 ms); 128 KB frames keep the OS loopback send buffer to ~2 frames so measured lag reflects
+    // the hub backlog rather than loopback bufferbloat.
+    let mut slow = controlled_platform(ls, "slow", open_rx, Some((32 * 1024, Duration::from_millis(15)))).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    // 6 seconds of stream time (120 video + 120 audio = 240 packets << BACKLOG=1024),
+    // keyframes every 1000 ms (0, 1000, ..., 5000), paced at 20 ms wall time per 50 ms frame.
+    let hub = w.hub.clone();
+    let pub_task = tokio::spawn(async move {
+        let mut expected_audio = Vec::with_capacity(120);
+        for step in 0..120u32 {
+            let ts = step * 50;
+            let is_key = ts % 1000 == 0;
+            hub.video(ts, sized_video(is_key, step as u8, 128 * 1024));
+            hub.audio(ts + 10, Bytes::from_static(AAC));
+            expected_audio.push(ts + 10);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.end();
+        expected_audio
+    });
+
+    // Collect what the slow destination receives while measuring how far behind the live stream edge
+    // each received video frame is.
+    let mut slow_videos: Vec<(u32, bool)> = Vec::new();
+    let mut slow_audios: Vec<u32> = Vec::new();
+    let mut max_lag_ms = 0u32;
+    loop {
+        match timeout(Duration::from_secs(10), slow.recv()).await.expect("slow pkt in time").expect("slow open") {
+            Got::Video(ts, data) => {
+                let live_ts = w.hub.newest_video_ts().unwrap_or(ts);
+                max_lag_ms = max_lag_ms.max(live_ts.saturating_sub(ts));
+                slow_videos.push((ts, crate::flv::video_is_keyframe(&data)));
+            }
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected slow packet: {other:?}"),
+        }
+    }
+    let expected_audio = pub_task.await.unwrap();
+
+    // Drain fast destination too and verify it lost nothing.
+    let mut fast_video_count = 0usize;
+    let mut fast_audios = Vec::new();
+    loop {
+        match next(&mut fast).await {
+            Got::Video(_, _) => fast_video_count += 1,
+            Got::Audio(ts, _) => fast_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected fast packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    assert_eq!(fast_video_count, 120);
+    assert_eq!(fast_audios, expected_audio);
+    assert_eq!(hf.borrow().dropped, 0);
+
+    let slow_dropped = hs.borrow().dropped;
+    assert!(slow_dropped > 0, "continuously slow destination must drop non-keyframe video");
+    assert_eq!(slow_audios, expected_audio, "audio must never be dropped");
+    // Without bounded dropping, the 1/3-speed receiver falls >4000 ms behind over a 6000 ms stream.
+    assert!(max_lag_ms < 2_200, "slow destination latency grew unbounded: max_lag_ms={max_lag_ms}");
+    for pair in slow_videos.windows(2) {
+        let ((prev_ts, _), (cur_ts, cur_key)) = (pair[0], pair[1]);
+        if cur_ts > prev_ts + 50 {
+            assert!(cur_key, "resumed at non-keyframe ts={cur_ts} after gap from ts={prev_ts}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn enhanced_broadcasting_drops_extra_tracks_to_their_own_keyframes() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.video(0, Bytes::from_static(EB_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let ls = small_buf_listener().await;
+    let ps = ls.local_addr().unwrap().port();
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut twitch = controlled_platform(ls, "t", open_rx, None).await;
+    let mut ht = start(&w, Destination { id: "twitch".into(), extra_video: true, ..destination(ps, "t") });
+    state_is(&mut ht, |s| *s == PushState::Live).await;
+
+    assert!(matches!(next(&mut twitch).await, Got::Publish(_)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_HEADER)));
+
+    // Initial keyframes on both tracks + audio.
+    w.hub.video(0, big_video(true, 0));
+    w.hub.video(0, big_eb_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    assert!(matches!(next(&mut twitch).await, Got::Video(0, _)));
+    assert!(matches!(next(&mut twitch).await, Got::Video(0, _)));
+    assert_eq!(next(&mut twitch).await, Got::Audio(10, Bytes::from_static(AAC)));
+
+    // Stall Twitch, then push 2.5 s of main + extra track video + audio.
+    // Stagger keyframes: main track keyframe at 2000, extra track keyframe at 2100.
+    open_tx.send_replace(false);
+    let mut expected_audio = vec![10u32];
+    for step in 1..=49u32 {
+        let ts = step * 50;
+        w.hub.video(ts, big_video(ts == 2000, step as u8));
+        w.hub.video(ts, big_eb_video(ts == 2100, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        expected_audio.push(ts + 10);
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut main_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut extra_videos: Vec<(u32, bool)> = vec![(0, true)];
+    let mut audios = vec![10u32];
+    loop {
+        match next(&mut twitch).await {
+            Got::Video(ts, data) => {
+                let is_key = crate::flv::video_is_keyframe(&data);
+                if crate::flv::video_extra_track(&data).is_some() {
+                    extra_videos.push((ts, is_key));
+                } else {
+                    main_videos.push((ts, is_key));
+                }
+            }
+            Got::Audio(ts, _) => audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut ht, |s| *s == PushState::Waiting).await;
+
+    assert!(ht.borrow().dropped > 0);
+    assert_eq!(audios, expected_audio, "audio is never dropped");
+    // Main resumes at keyframe 2000; extra track stays dropped through 2000 & 2050 and resumes at 2100.
+    assert!(
+        !extra_videos.iter().any(|&(ts, _)| ts == 2000 || ts == 2050),
+        "extra track must not send orphan inter frames after main keyframe"
+    );
+    assert!(extra_videos.iter().any(|&(ts, key)| ts == 2100 && key), "extra track resumed at its own keyframe 2100");
+    for (name, track) in [("main", &main_videos), ("extra", &extra_videos)] {
+        let mut saw_gap = false;
+        for pair in track.windows(2) {
+            if pair[1].0 > pair[0].0 + 50 {
+                saw_gap = true;
+                assert!(pair[1].1, "{name} resumed at non-keyframe ts={} after {}", pair[1].0, pair[0].0);
+            }
+        }
+        assert!(saw_gap, "{name} should have dropped stale inter frames");
+    }
+}
+
+#[tokio::test]
+async fn a_late_destination_joining_mid_gop_counts_zero_drops() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    w.hub.video(0, Bytes::from_static(KEY));
+
+    let l = free_listener().await;
+    let port = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, destination(port, "k"));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+    assert_eq!(next(&mut got).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+
+    // 1.5 s of inter frames and audio arrive before the first keyframe this destination sees:
+    // skipped because it hasn't started yet, NOT counted as drops.
+    for step in 1..=30u32 {
+        let ts = step * 50;
+        w.hub.video(ts, Bytes::from_static(INTER));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+    }
+    w.hub.video(1600, Bytes::from_static(KEY));
+    w.hub.audio(1610, Bytes::from_static(AAC));
+    w.hub.video(1650, Bytes::from_static(INTER));
+
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut got).await, Got::Audio(10, Bytes::from_static(AAC)));
+    assert_eq!(next(&mut got).await, Got::Video(50, Bytes::from_static(INTER)));
+    assert_eq!(health.borrow().dropped, 0, "pre-keyframe startup skips must not count as drops");
+}
