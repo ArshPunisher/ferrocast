@@ -216,6 +216,11 @@ impl ScreenCapture {
         sound: bool,
         hide: &[String],
     ) -> Result<Self, AvError> {
+        // The engine's "its window is closed" (window 0): nothing opened for it, its sound
+        // either (every watchdog try opened and dropped an audio client, projects-60).
+        if let Target::Window(0) = target {
+            return Err(AvError::Source("its window is closed (open it, or pick the window again)".into()));
+        }
         if !hide.is_empty() {
             tracing::info!("the privacy guard leaves apps out on a Mac only: on Windows the whole screen shows");
         }
@@ -291,6 +296,18 @@ impl ScreenCapture {
                     .into_iter()
                     .find(|w| w.id == id)
                     .ok_or_else(|| AvError::Source("that window is closed".into()))?;
+                // FFmpeg's gdigrab finds a window by its title alone (the first with it, of any
+                // app): with two of that title (two "New Tab" browsers, an app and its updater)
+                // the other one could go on air (projects-60). Refused then.
+                // FindWindow ignores case: "Report" and "report" are the same title to it.
+                let low = w.title.to_lowercase();
+                let same = windows_of(false).into_iter().filter(|o| o.title.to_lowercase() == low).count();
+                if same > 1 {
+                    return Err(AvError::Source(format!(
+                        "{same} windows are called \"{}\": this capture can't tell them apart (rename or close the other)",
+                        w.title
+                    )));
+                }
                 let gdi = vec![
                     "-f".into(),
                     "gdigrab".into(),

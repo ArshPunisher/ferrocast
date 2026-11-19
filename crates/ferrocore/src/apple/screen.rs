@@ -180,7 +180,7 @@ pub fn still(target: Target, width: u32) -> Result<Picture, AvError> {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
 }
 
 #[link(name = "ColorSync", kind = "framework")]
@@ -247,12 +247,13 @@ fn gone_display(id: u32) -> String {
     }
 }
 
-/// The displays connected now, by number (CoreGraphics', the same as ScreenCaptureKit's).
+/// The displays connected now, by number (CoreGraphics', the same as ScreenCaptureKit's):
+/// online ones, so a mirrored or sleeping screen still counts as there.
 pub(crate) fn active_displays() -> Vec<u32> {
     let mut ids = [0u32; 32];
     let mut n = 0u32;
     // SAFETY: the array and count are ours; at most 32 are written.
-    if unsafe { CGGetActiveDisplayList(32, ids.as_mut_ptr(), &raw mut n) } != 0 {
+    if unsafe { CGGetOnlineDisplayList(32, ids.as_mut_ptr(), &raw mut n) } != 0 {
         return Vec::new();
     }
     ids[..(n as usize).min(32)].to_vec()
@@ -712,6 +713,9 @@ pub struct ScreenCapture {
     privacy: Option<Arc<AtomicBool>>,
     /// The window captured (a Window Capture): its closing ends the capture.
     window: Option<u32>,
+    /// The display captured (a Display or Application Capture): its going (unplugged)
+    /// ends the capture, so the watchdog opens it again, found by its UUID, when it's back.
+    display: Option<u32>,
 }
 
 /// The stream, handed to the thread that keeps apps out.
@@ -756,6 +760,9 @@ impl ScreenCapture {
         sound: bool,
         hide: &[String],
     ) -> Result<Self, AvError> {
+        if let Target::Window(0) = target {
+            return Err(AvError::Source("its window is closed (open it, or pick the window again)".into()));
+        }
         Self::open(target, None, width, height, fps, cursor, sound, hide)
     }
 
@@ -904,11 +911,11 @@ impl ScreenCapture {
                 }
                 _ => None,
             };
-            let window = match target {
-                Target::Window(id) => Some(id),
-                Target::Display(_) => None,
+            let (window, display) = match target {
+                Target::Window(id) => (Some(id), None),
+                Target::Display(id) => (None, Some(id)),
             };
-            Ok(Self { stream, output, _queue: queue, shared, privacy, window })
+            Ok(Self { stream, output, _queue: queue, shared, privacy, window, display })
         }
     }
 
@@ -936,7 +943,14 @@ impl ScreenCapture {
     /// Why it ended, if it did: a captured window that closed (its app quit). ScreenCaptureKit
     /// then just sends nothing, as for a window that doesn't change, so the watchdog never
     /// opened it again, and the app's new window (found by its app and title) never came back.
+    /// And a captured display that went (unplugged): its stream died with it, and
+    /// the picture stayed black or frozen after it came back (projects-60).
     pub fn ended(&self) -> Option<String> {
+        if let Some(id) = self.display {
+            let now = active_displays();
+            // An empty answer is a failed question, not every display gone.
+            return (!now.is_empty() && !now.contains(&id)).then(|| format!("its display ({id}) went"));
+        }
         let id = self.window?;
         (!window_exists(id)).then(|| format!("its window ({id}) closed"))
     }
@@ -1017,14 +1031,16 @@ mod tests {
     #[test]
     fn a_window_that_isnt_there_reads_as_closed() {
         assert!(!window_exists(0xFFFF_FFF0), "no such window");
-        // A window that is open: the first in the window server's list, when there is one.
-        if let Ok((_, windows)) = shareable()
-            && let Some(w) = windows.first()
-        {
-            assert!(window_exists(w.id), "{w:?}");
-            // Its owner as the window server names it is the app the window list names: how a
-            // saved window is told to be still the same app's.
-            assert_eq!(window_owner(w.id), Some(Some(w.app.clone())), "{w:?}");
+        // Every open window: there, and its owner as the window server names it is the app the
+        // window list names (how a saved window is told to be still the same app's).
+        if let Ok((_, windows)) = shareable() {
+            let differ: Vec<_> = windows
+                .iter()
+                .filter(|w| window_owner(w.id) != Some(Some(w.app.clone())))
+                .map(|w| (w.app.clone(), window_owner(w.id)))
+                .collect();
+            assert!(windows.iter().all(|w| window_exists(w.id)));
+            assert!(differ.is_empty(), "names differ: {differ:?}");
         }
         assert_eq!(window_owner(0xFFFF_FFF0), Some(None));
     }
