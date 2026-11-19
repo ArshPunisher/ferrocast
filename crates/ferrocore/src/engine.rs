@@ -3021,7 +3021,7 @@ fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: 
 /// run at 1440p60 (24 of 2,467 and 26 of 2,829), none with this (0 of 2,356 and of 2,351).
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn on_time() {
+fn on_time_os() {
     // SAFETY: sets the calling thread's own class; it takes no pointers.
     let r = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
     if r != 0 {
@@ -3034,7 +3034,7 @@ fn on_time() {
 /// apps that are minimized or behind a game, which slows their threads and their timers).
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
-fn on_time() {
+fn on_time_os() {
     use windows::Win32::System::Threading::{
         AvSetMmThreadCharacteristicsW, GetCurrentProcess, GetCurrentThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
         PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
@@ -3111,7 +3111,14 @@ fn on_time() {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn on_time() {}
+fn on_time_os() {}
+
+/// Prepares a real-time engine or audio thread: raises OS priority/QoS and enables x86 FTZ/DAZ
+/// so exponential decay in silent audio filters never stalls on denormals (M2-06).
+fn on_time() {
+    crate::afx::enable_ftz_daz();
+    on_time_os();
+}
 
 /// Raises the calling thread to the frame loop's priority (macOS: "user interactive"; Windows:
 /// high, out of power throttling): for a thread the sound depends on, such as a filter's own

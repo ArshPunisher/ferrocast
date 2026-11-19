@@ -11,6 +11,51 @@ pub fn mul_to_db(mul: f32) -> f32 {
     if mul == 0.0 { f32::NEG_INFINITY } else { 20.0 * mul.log10() }
 }
 
+/// Flushes tiny exponential-decay tails well before they enter IEEE 754 `f32` subnormal range
+/// (`< 1.175e-38`), preventing x86 denormal microcode stalls in silent audio filters (M2-06).
+#[inline]
+fn flush_denormal(x: f32) -> f32 {
+    if x.abs() < 1e-20 { 0.0 } else { x }
+}
+
+/// Enables Flush-To-Zero (FTZ) and Denormals-Are-Zero (DAZ) in MXCSR on x86/x86_64 audio
+/// threads so residual subnormals in filters or third-party DSP never trigger x86 microcode
+/// traps (M2-06). Safe and idempotent; no-op on non-x86 targets.
+#[allow(unsafe_code)]
+pub fn enable_ftz_daz() {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        #[cfg(target_arch = "x86")]
+        let has_sse = std::arch::is_x86_feature_detected!("sse");
+        #[cfg(target_arch = "x86_64")]
+        let has_sse = true;
+        if has_sse {
+            const FTZ: u32 = 0x8000;
+            const DAZ: u32 = 0x0040;
+            let mut bits = FTZ;
+            if std::arch::is_x86_feature_detected!("sse3") {
+                bits |= DAZ;
+            }
+            let mut mxcsr: u32 = 0;
+            // SAFETY: SSE (MXCSR) is present; DAZ is gated on SSE3; `stmxcsr`/`ldmxcsr` only
+            // read/write this thread's floating-point control register and a local `u32`.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{ptr}]",
+                    ptr = in(reg) &raw mut mxcsr,
+                    options(nostack, preserves_flags),
+                );
+                mxcsr |= bits;
+                core::arch::asm!(
+                    "ldmxcsr [{ptr}]",
+                    ptr = in(reg) &raw const mxcsr,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
+}
+
 /// A sound filter made outside the engine (DeepFilterNet's noise removal, which the app builds
 /// in): it cleans stereo blocks in place, keeping its own state. False: it couldn't (gone, or
 /// too slow for this computer); the block is left as it was and the engine's light noise
@@ -217,8 +262,12 @@ pub struct AudioFilter {
     delay: Option<[std::collections::VecDeque<f32>; 2]>,
 }
 
-/// libobs's compressor `gain_coefficient`.
+/// libobs's compressor `gain_coefficient` (guards non-positive/non-finite times so negative
+/// imported parameters never produce `exp(+inf)` / `NaN`, M2-07).
 fn coefficient(rate: f32, secs: f32) -> f32 {
+    if !rate.is_finite() || rate <= 0.0 || !secs.is_finite() || secs <= 0.0 {
+        return 0.0;
+    }
     (-1.0 / (rate * secs)).exp()
 }
 
@@ -358,15 +407,19 @@ impl AudioFilter {
                 }
             }
             AudioEffect::NoiseGate { open_db, close_db, attack_ms, hold_ms, release_ms } => {
+                let open_db = if open_db.is_finite() { open_db } else { -26.0 };
+                let close_db = if close_db.is_finite() { close_db } else { -32.0 };
                 let open = db_to_mul(open_db);
                 // Closing at or above where it opens never closes (the level never falls: the
                 // gate stuck open, as in OBS): the More form allows it, so it closes at least
                 // 3 dB under where it opens (how fast it falls follows that gap).
                 let close = db_to_mul(close_db.min(open_db - 3.0));
-                let attack_rate = 1.0 / (attack_ms / 1000.0 * rate);
-                let release_rate = 1.0 / (release_ms / 1000.0 * rate);
+                let attack_rate =
+                    if attack_ms.is_finite() && attack_ms > 0.0 { 1.0 / (attack_ms / 1000.0 * rate) } else { 1.0 };
+                let release_rate =
+                    if release_ms.is_finite() && release_ms > 0.0 { 1.0 / (release_ms / 1000.0 * rate) } else { 1.0 };
                 let decay_rate = (open - close) / ((1.0 / 75.0) * rate);
-                let hold = hold_ms / 1000.0;
+                let hold = if hold_ms.is_finite() { hold_ms.max(0.0) / 1000.0 } else { 0.0 };
                 let rate_i = 1.0 / rate;
                 for i in 0..n {
                     let cur = l[i].abs().max(r[i].abs());
@@ -377,7 +430,7 @@ impl AudioFilter {
                         self.held = 0.0;
                         self.is_open = false;
                     }
-                    self.level = self.level.max(cur) - decay_rate;
+                    self.level = (self.level.max(cur) - decay_rate).max(0.0);
                     if self.is_open {
                         self.attenuation = (self.attenuation + attack_rate).min(1.0);
                     } else {
@@ -389,26 +442,23 @@ impl AudioFilter {
                     l[i] *= self.attenuation;
                     r[i] *= self.attenuation;
                 }
+                self.level = flush_denormal(self.level);
+                self.attenuation = flush_denormal(self.attenuation);
             }
             AudioEffect::Compressor { ratio, threshold_db, attack_ms, release_ms, output_db } => {
-                self.compress(
-                    l,
-                    r,
-                    n,
-                    1.0 - 1.0 / ratio.max(1.0),
-                    threshold_db,
-                    attack_ms,
-                    release_ms,
-                    db_to_mul(output_db),
-                );
+                let ratio = if ratio.is_finite() { ratio.max(1.0) } else { 1.0 };
+                self.compress(l, r, n, 1.0 - 1.0 / ratio, threshold_db, attack_ms, release_ms, db_to_mul(output_db));
             }
             AudioEffect::Limiter { threshold_db, release_ms } => {
                 self.compress(l, r, n, 1.0, threshold_db, 0.001, release_ms, 1.0);
             }
             AudioEffect::Expander { ratio, threshold_db, attack_ms, release_ms, output_db, rms } => {
+                let ratio = if ratio.is_finite() { ratio.max(1.0) } else { 1.0 };
                 self.expand(l, r, n, false, ratio, threshold_db, attack_ms, release_ms, output_db, 0.0, rms);
             }
             AudioEffect::UpwardCompressor { ratio, threshold_db, attack_ms, release_ms, output_db, knee_db } => {
+                let ratio = if ratio.is_finite() { ratio.clamp(0.0, 1.0) } else { 0.5 };
+                let knee_db = if knee_db.is_finite() { knee_db.max(0.0) } else { 0.0 };
                 self.expand(l, r, n, true, ratio, threshold_db, attack_ms, release_ms, output_db, knee_db, true);
             }
             AudioEffect::Eq3 { low_db, mid_db, high_db } => {
@@ -435,6 +485,9 @@ impl AudioFilter {
                         st.s[1] = st.s[0];
                         st.s[0] = sample;
                         *v = lo * lg + mid * mg + hi * hg;
+                    }
+                    for v in st.lf.iter_mut().chain(st.hf.iter_mut()).chain(st.s.iter_mut()) {
+                        *v = flush_denormal(*v);
                     }
                 }
             }
@@ -508,9 +561,11 @@ impl AudioFilter {
             l[i] *= self.nr_gain;
             r[i] *= self.nr_gain;
         }
+        self.nr_gain = flush_denormal(self.nr_gain);
     }
 
     /// libobs's compressor and limiter: a peak envelope (the louder side), then gain.
+    /// Fused scalar loop: zero per-block heap allocation and denormal-free decay (M2-06).
     #[allow(clippy::too_many_arguments)]
     fn compress(
         &mut self,
@@ -523,29 +578,30 @@ impl AudioFilter {
         release_ms: f32,
         out: f32,
     ) {
+        if n == 0 {
+            return;
+        }
+        let threshold = if threshold.is_finite() { threshold } else { -18.0 };
         let ag = coefficient(self.rate, attack_ms / 1000.0);
         let rg = coefficient(self.rate, release_ms / 1000.0);
-        let mut env_buf = vec![0f32; n];
-        for data in [&*l, &*r] {
-            let mut env = self.envelope;
-            for (i, s) in data.iter().take(n).enumerate() {
-                let x = s.abs();
-                env = if env < x { x + ag * (env - x) } else { x + rg * (env - x) };
-                env_buf[i] = env_buf[i].max(env);
-            }
-        }
-        if let Some(last) = env_buf.last() {
-            self.envelope = *last;
-        }
-        for (i, e) in env_buf.iter().enumerate() {
-            let gain = db_to_mul((slope * (threshold - mul_to_db(*e))).min(0.0));
+        let mut env_l = self.envelope;
+        let mut env_r = self.envelope;
+        for i in 0..n {
+            let xl = l[i].abs();
+            env_l = flush_denormal(if env_l < xl { xl + ag * (env_l - xl) } else { xl + rg * (env_l - xl) });
+            let xr = r[i].abs();
+            env_r = flush_denormal(if env_r < xr { xr + ag * (env_r - xr) } else { xr + rg * (env_r - xr) });
+            let e = env_l.max(env_r);
+            let gain = if e > 0.0 { db_to_mul((slope * (threshold - mul_to_db(e))).min(0.0)) } else { 1.0 };
             l[i] *= gain * out;
             r[i] *= gain * out;
         }
+        self.envelope = flush_denormal(env_l.max(env_r));
     }
 
     /// libobs's expander, gate preset and upward compressor: per side, RMS (10 ms) or peak
     /// detection, gain in dB with attack and release.
+    /// Fused per-channel loop: zero per-block heap allocation and denormal-free state (M2-06).
     #[allow(clippy::too_many_arguments)]
     fn expand(
         &mut self,
@@ -561,53 +617,72 @@ impl AudioFilter {
         knee: f32,
         rms: bool,
     ) {
+        if n == 0 {
+            return;
+        }
+        let threshold = if threshold.is_finite() { threshold } else { -40.0 };
         let ag = coefficient(self.rate, attack_ms / 1000.0);
         let rg = coefficient(self.rate, release_ms / 1000.0);
         let slope = 1.0 - ratio;
         let out = db_to_mul(output_db);
         let rmscoef = (-100.0 / self.rate).exp2();
+        let half_knee = knee * 0.5;
         for (c, data) in [&mut *l, &mut *r].into_iter().enumerate() {
-            // Each side's envelope (libobs keeps the per-sample max over sides only per side).
-            let mut env = vec![0f32; n];
             let mut run = self.runave[c];
-            for (i, s) in data.iter().take(n).enumerate() {
-                if rms {
-                    run = rmscoef * run + (1.0 - rmscoef) * s * s;
-                    env[i] = run.max(0.0).sqrt();
-                } else {
-                    run = s * s;
-                    env[i] = s.abs();
-                }
-            }
-            self.runave[c] = run;
             let mut prev = self.gain_db[c];
-            for i in 0..n {
-                let env_db = mul_to_db(env[i]);
+            for s in data.iter_mut().take(n) {
+                let sample = *s;
+                let env = if rms {
+                    run = rmscoef * run + (1.0 - rmscoef) * sample * sample;
+                    if run < 1e-25 {
+                        run = 0.0;
+                    }
+                    run.max(0.0).sqrt()
+                } else {
+                    run = flush_denormal(sample * sample);
+                    sample.abs()
+                };
+                let env_db = mul_to_db(env);
                 let mut diff = threshold - env_db;
                 if upward && env_db <= (threshold - 60.0) / 2.0 {
                     diff = if env_db + 60.0 > 0.0 { env_db + 60.0 } else { 0.0 };
                 }
                 let p = if upward { prev.max(0.0) } else { prev };
                 let gain = if upward {
-                    if env_db >= threshold + knee / 2.0 {
+                    if env_db >= threshold + half_knee {
                         0.0
-                    } else if threshold - knee / 2.0 >= env_db {
+                    } else if knee <= 1e-6 || threshold - half_knee >= env_db {
                         slope * diff
                     } else {
-                        slope * (diff + knee / 2.0).powi(2) / (2.0 * knee)
+                        slope * (diff + half_knee).powi(2) / (2.0 * knee)
                     }
                 } else if diff > 0.0 {
                     (slope * diff).max(-60.0)
                 } else {
                     0.0
                 };
-                let g = if gain > p { ag * p + (1.0 - ag) * gain } else { rg * p + (1.0 - rg) * gain };
+                let g = flush_denormal(if gain > p { ag * p + (1.0 - ag) * gain } else { rg * p + (1.0 - rg) * gain });
                 prev = g;
                 let m = if upward { db_to_mul(g) } else { db_to_mul(g.min(0.0)) };
-                data[i] *= m * out;
+                *s = sample * m * out;
             }
-            self.gain_db[c] = prev;
+            self.runave[c] = if run < 1e-25 { 0.0 } else { run };
+            self.gain_db[c] = flush_denormal(prev);
         }
+    }
+
+    #[cfg(test)]
+    fn has_subnormal(&self) -> bool {
+        let eq_sub = self.eq.iter().any(|st| st.lf.iter().chain(&st.hf).chain(&st.s).any(|v| v.is_subnormal()));
+        self.attenuation.is_subnormal()
+            || self.level.is_subnormal()
+            || self.envelope.is_subnormal()
+            || self.runave.iter().any(|v| v.is_subnormal())
+            || self.gain_db.iter().any(|v| v.is_subnormal())
+            || self.floor.is_subnormal()
+            || self.nr_steady_rms.is_subnormal()
+            || self.nr_gain.is_subnormal()
+            || eq_sub
     }
 }
 
@@ -849,7 +924,7 @@ mod tests {
             let w = ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
             b0 = 0.99886 * b0 + w * 0.0555179;
             b1 = 0.99332 * b1 + w * 0.0750759;
-            b2 = 0.96900 * b2 + w * 0.1538520;
+            b2 = 0.969_00 * b2 + w * 0.153_852;
             b3 = 0.86650 * b3 + w * 0.3104856;
             b4 = 0.55000 * b4 + w * 0.5329522;
             b5 = -0.7616 * b5 - w * 0.0168980;
@@ -1019,5 +1094,122 @@ mod tests {
         let low = peak(&run(cut, &sine(100.0, 0.5, 0.5))[12_000..]);
         assert!(mul_to_db(low / 0.5) < -6.0, "100 Hz down {} dB", mul_to_db(low / 0.5));
         assert!(peak(&run(cut, &sine(2000.0, 0.5, 0.5))[12_000..]) > 0.4);
+    }
+
+    /// After an impulse followed by 10 s of digital silence, no filter leaves IEEE 754 subnormal
+    /// floats in its internal state (which would stall x86 CPUs on silence, M2-06).
+    #[test]
+    fn filters_never_enter_subnormal_state_on_silence() {
+        enable_ftz_daz();
+        let effects = [
+            AudioEffect::NoiseGate { open_db: -26.0, close_db: -32.0, attack_ms: 5.0, hold_ms: 10.0, release_ms: 10.0 },
+            AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 1.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -6.0, release_ms: 5.0 },
+            AudioEffect::Expander {
+                ratio: 4.0,
+                threshold_db: -40.0,
+                attack_ms: 2.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 2.0,
+                release_ms: 5.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            },
+            AudioEffect::Eq3 { low_db: 3.0, mid_db: -2.0, high_db: 4.0 },
+            AudioEffect::Denoise { strength: 65 },
+        ];
+        for effect in effects {
+            let mut f = AudioFilter::new(effect, RATE);
+            f.plugin = None;
+            // Impulse block.
+            let mut l = vec![0.0f32; 1024];
+            let mut r = vec![0.0f32; 1024];
+            l[0] = 0.8;
+            r[0] = -0.8;
+            f.process([&mut l, &mut r]);
+            // 10 seconds of silence (470 blocks of 1024 samples).
+            for _ in 0..470 {
+                l.fill(0.0);
+                r.fill(0.0);
+                f.process([&mut l, &mut r]);
+                assert!(!f.has_subnormal(), "{effect:?} entered subnormal state during silence");
+                assert!(l.iter().chain(&r).all(|v| v.is_finite() && !v.is_subnormal()), "{effect:?} emitted subnormal");
+            }
+        }
+    }
+
+    /// Malformed negative/zero/NaN filter settings (e.g. from hand-edited OBS JSON) never cause
+    /// `exp(+inf)` or `0/0` NaN poisoning in any filter (M2-07).
+    #[test]
+    fn malformed_filter_params_produce_finite_output() {
+        let bad = [
+            AudioEffect::Compressor {
+                ratio: -4.0,
+                threshold_db: -18.0,
+                attack_ms: -5.0,
+                release_ms: 0.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -6.0, release_ms: -10.0 },
+            AudioEffect::Expander {
+                ratio: 0.2,
+                threshold_db: -40.0,
+                attack_ms: -1.0,
+                release_ms: -2.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 0.0,
+                release_ms: -5.0,
+                output_db: 0.0,
+                knee_db: 0.0,
+            },
+            AudioEffect::NoiseGate { open_db: -26.0, close_db: -32.0, attack_ms: -1.0, hold_ms: -5.0, release_ms: 0.0 },
+        ];
+        let inp = sine(440.0, 0.4, 0.1);
+        for effect in bad {
+            let out = run(effect, &inp);
+            assert!(out.iter().all(|v| v.is_finite()), "{effect:?} produced non-finite output");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn enable_ftz_daz_sets_mxcsr_bits_on_x86() {
+        let got = std::thread::spawn(|| {
+            enable_ftz_daz();
+            let mut mxcsr: u32 = 0;
+            // SAFETY: SSE exists on x86_64 (and x86 test runners supporting SSE); reads MXCSR into local u32.
+            unsafe {
+                core::arch::asm!(
+                    "stmxcsr [{ptr}]",
+                    ptr = in(reg) &raw mut mxcsr,
+                    options(nostack, preserves_flags),
+                );
+            }
+            mxcsr
+        })
+        .join()
+        .unwrap_or(0);
+        assert_ne!(got & 0x8000, 0, "FTZ bit must be set in MXCSR: {got:#x}");
+        if std::arch::is_x86_feature_detected!("sse3") {
+            assert_ne!(got & 0x0040, 0, "DAZ bit must be set in MXCSR when SSE3 is present: {got:#x}");
+        }
     }
 }

@@ -52,7 +52,8 @@ pub struct Imported {
 }
 
 fn f(v: &Value, k: &str, d: f64) -> f32 {
-    v.get(k).and_then(Value::as_f64).unwrap_or(d) as f32
+    let x = v.get(k).and_then(Value::as_f64).unwrap_or(d) as f32;
+    if x.is_finite() { x } else { d as f32 }
 }
 
 fn color(v: u64) -> [u8; 4] {
@@ -258,41 +259,42 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
         "gain_filter" => AudioEffect::Gain { db: n("db", 0.0) },
         "invert_polarity_filter" => AudioEffect::InvertPolarity,
         "noise_gate_filter" => AudioEffect::NoiseGate {
-            open_db: n("open_threshold", -26.0),
-            close_db: n("close_threshold", -32.0),
-            attack_ms: n("attack_time", 25.0),
-            hold_ms: n("hold_time", 200.0),
-            release_ms: n("release_time", 150.0),
+            open_db: n("open_threshold", -26.0).clamp(-96.0, 0.0),
+            close_db: n("close_threshold", -32.0).clamp(-96.0, 0.0),
+            attack_ms: n("attack_time", 25.0).max(0.0),
+            hold_ms: n("hold_time", 200.0).max(0.0),
+            release_ms: n("release_time", 150.0).max(0.0),
         },
         "compressor_filter" => AudioEffect::Compressor {
-            ratio: n("ratio", 10.0),
-            threshold_db: n("threshold", -18.0),
-            attack_ms: n("attack_time", 6.0),
-            release_ms: n("release_time", 60.0),
-            output_db: n("output_gain", 0.0),
+            ratio: n("ratio", 10.0).max(1.0),
+            threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
+            attack_ms: n("attack_time", 6.0).max(0.0),
+            release_ms: n("release_time", 60.0).max(0.0),
+            output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
         },
-        "limiter_filter" => {
-            AudioEffect::Limiter { threshold_db: n("threshold", -6.0), release_ms: n("release_time", 60.0) }
-        }
+        "limiter_filter" => AudioEffect::Limiter {
+            threshold_db: n("threshold", -6.0).clamp(-60.0, 0.0),
+            release_ms: n("release_time", 60.0).max(0.0),
+        },
         "expander_filter" => {
             let gate = s.get("presets").and_then(Value::as_str) == Some("gate");
             AudioEffect::Expander {
-                ratio: n("ratio", if gate { 10.0 } else { 2.0 }),
-                threshold_db: n("threshold", -40.0),
-                attack_ms: n("attack_time", 10.0),
-                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }),
-                output_db: n("output_gain", 0.0),
+                ratio: n("ratio", if gate { 10.0 } else { 2.0 }).max(1.0),
+                threshold_db: n("threshold", -40.0).clamp(-60.0, 0.0),
+                attack_ms: n("attack_time", 10.0).max(0.0),
+                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }).max(0.0),
+                output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
                 rms: s.get("detector").and_then(Value::as_str) != Some("peak"),
             }
         }
         "upward_compressor_filter" => AudioEffect::UpwardCompressor {
             // OBS takes 0 to 1 here; more boosts quiet sound past clipping.
             ratio: n("ratio", 0.5).clamp(0.0, 1.0),
-            threshold_db: n("threshold", -20.0),
-            attack_ms: n("attack_time", 10.0),
-            release_ms: n("release_time", 50.0),
-            output_db: n("output_gain", 0.0),
-            knee_db: n("knee_width", 10.0),
+            threshold_db: n("threshold", -20.0).clamp(-60.0, 0.0),
+            attack_ms: n("attack_time", 10.0).max(0.0),
+            release_ms: n("release_time", 50.0).max(0.0),
+            output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+            knee_db: n("knee_width", 10.0).max(0.0),
         },
         "basic_eq_filter" => AudioEffect::Eq3 { low_db: n("low", 0.0), mid_db: n("mid", 0.0), high_db: n("high", 0.0) },
         // Strong noise removal where the app has it; the light one elsewhere.

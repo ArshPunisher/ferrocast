@@ -155,6 +155,7 @@ impl SoundIn {
                 sound,
                 Duration::from_secs(8),
                 move |st, tx, s| {
+                    crate::afx::enable_ftz_daz();
                     let mut conv = Convert::new(2, RATE);
                     let s2 = s.clone();
                     crate::win::app_sound::run(pid, st.clone(), tx, |data| keep(&s2, conv.push(data)));
@@ -173,6 +174,7 @@ impl SoundIn {
                 sound.clone(),
                 Duration::from_secs(6),
                 |st, tx, s| {
+                    crate::afx::enable_ftz_daz();
                     let mut conv = Convert::new(2, RATE);
                     crate::win::app_sound::run_excluding_self(st, tx, |data| keep(&s, conv.push(data)));
                 },
@@ -433,7 +435,14 @@ fn open(which: &Which, sound: Pieces) -> Result<(cpal::Stream, Option<String>), 
     .map_err(|e| format!("its format couldn't be read ({e})"))?;
     let mut conv = Convert::new(usize::from(cfg.channels()), cfg.sample_rate());
     let errs = sound.clone();
-    let mut keep = move |data: &[f32]| keep(&sound, conv.push(data));
+    let mut ftz = false;
+    let mut keep = move |data: &[f32]| {
+        if !ftz {
+            crate::afx::enable_ftz_daz();
+            ftz = true;
+        }
+        keep(&sound, conv.push(data));
+    };
     let err = move |e: cpal::Error| {
         if !stops(e.kind()) {
             // A glitch (a buffer overrun) or a reroute the stream followed: it goes on.
