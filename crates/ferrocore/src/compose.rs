@@ -96,7 +96,7 @@ struct Planes {
 
 /// NV12 → RGB as three rows, each `dot(row.xyz, (y, u, v)) + row.w` on values 0-1: BT.709's or
 /// BT.601's matrix, TV range (Y 16-235, U and V 16-240) or full.
-fn yuv_rows(bt709: bool, full: bool) -> [f32; 12] {
+pub(crate) fn yuv_rows(bt709: bool, full: bool) -> [f32; 12] {
     let (kr, kb) = if bt709 { (0.2126_f32, 0.0722_f32) } else { (0.299, 0.114) };
     let kg = 1.0 - kr - kb;
     // Y' = sy·Y + oy, and each colour difference C = sc·U + oc.
@@ -175,6 +175,17 @@ impl std::fmt::Debug for Rig {
 /// textures every frame.
 const RIGS: usize = 4 * (crate::engine::IN_FLIGHT + 1) + 2;
 
+/// An uploaded source texture kept on the card between frames.
+#[derive(Debug)]
+struct Upload {
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
+    /// True when backed by an external OS surface (`zerocopy::texture` pinning a `CVImageBuffer`):
+    /// copied onto a private GPU texture when hidden or frozen so buffer pools don't starve.
+    pinned: bool,
+}
+
 /// The compositor: a graphics card and what drawing needs on it.
 #[derive(Debug)]
 pub struct Compositor {
@@ -213,8 +224,8 @@ pub struct Compositor {
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Shader effects of one's own, by their code's key: None when the card refused it.
     custom_pipelines: Mutex<HashMap<u64, Option<wgpu::RenderPipeline>>>,
-    /// Pictures kept on the card between frames, by the caller's id: texture, width, height.
-    uploads: Mutex<HashMap<u64, (wgpu::Texture, u32, u32)>>,
+    /// Pictures kept on the card between frames, by the caller's id.
+    uploads: Mutex<HashMap<u64, Upload>>,
     /// Buffers kept between frames to send each upload through (see `write_staged`).
     staging: Mutex<HashMap<u64, Staging>>,
     /// NV12 frames' resources, kept between frames (see `Rig`).
@@ -1376,7 +1387,9 @@ impl Compositor {
         }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         match ups.get(&id) {
-            Some((tex, w, h)) if *w == p.width && *h == p.height && tex.format() == GAMMA => {
+            Some(Upload { texture: tex, width: w, height: h, pinned: false })
+                if *w == p.width && *h == p.height && tex.format() == GAMMA =>
+            {
                 let sent = self.write_staged(id, tex, (p.width, p.height), |dst| {
                     dst.copy_from_slice(&p.rgba);
                     true
@@ -1387,7 +1400,7 @@ impl Compositor {
             }
             _ => {
                 let tex = self.new_picture(p);
-                ups.insert(id, (tex, p.width, p.height));
+                ups.insert(id, Upload { texture: tex, width: p.width, height: p.height, pinned: false });
             }
         }
         Ok(())
@@ -1405,13 +1418,17 @@ impl Compositor {
         if crate::apple::zerocopy::enabled()
             && let Some(t) = crate::apple::zerocopy::texture(&self.device, s, "screen")
         {
-            self.uploads.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (t, w, h));
+            self.uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, Upload { texture: t, width: w, height: h, pinned: true });
             // The copying path's buffers for it aren't needed now.
             self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             return Ok(());
         }
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(ups.get(&id), Some((t, tw, th)) if (*tw, *th) == (w, h) && t.format() == BGRA) {
+        if !matches!(ups.get(&id), Some(Upload { texture: t, width: tw, height: th, pinned: false }) if (*tw, *th) == (w, h) && t.format() == BGRA)
+        {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("screen"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1422,9 +1439,9 @@ impl Compositor {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[BGRA_SRGB],
             });
-            ups.insert(id, (texture, w, h));
+            ups.insert(id, Upload { texture, width: w, height: h, pinned: false });
         }
-        let Some((texture, ..)) = ups.get(&id) else { return Err(AvError::NotUploaded(id)) };
+        let Some(Upload { texture, .. }) = ups.get(&id) else { return Err(AvError::NotUploaded(id)) };
         let row = w as usize * 4;
         let staged = self.write_staged(id, texture, (w, h), |dst| {
             s.with_bytes(|src, stride| {
@@ -1467,7 +1484,7 @@ impl Compositor {
         let target = {
             let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
             match ups.get(&id) {
-                Some((t, tw, th))
+                Some(Upload { texture: t, width: tw, height: th, pinned: false })
                     if (*tw, *th) == (w, h)
                         && t.format() == GAMMA
                         && t.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT) =>
@@ -1487,7 +1504,7 @@ impl Compositor {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT,
                         view_formats: &[LINEAR],
                     });
-                    ups.insert(id, (t.clone(), w, h));
+                    ups.insert(id, Upload { texture: t.clone(), width: w, height: h, pinned: false });
                     t
                 }
             }
@@ -1645,6 +1662,48 @@ impl Compositor {
         Planes { key, y, uv, _buf: buf, bind }
     }
 
+    /// Copies a zero-copy external surface upload onto a GPU-owned texture and drops the
+    /// external surface reference so finite capture buffer pools (Continuity Camera) aren't
+    /// starved while hidden or frozen. No-op when `id` isn't uploaded or already GPU-owned.
+    pub fn unpin_surface(&self, id: u64) {
+        let (src_tex, w, h) = {
+            let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(u) = ups.get(&id).filter(|u| u.pinned) else { return };
+            (u.texture.clone(), u.width, u.height)
+        };
+        let dst = self.target(w, h, wgpu::TextureUsages::COPY_DST);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("unpin") });
+        self.clear(&mut enc, &dst);
+        self.quad(
+            &mut enc,
+            &dst,
+            &Quad {
+                corners: corners(&Affine::IDENTITY, w as f32, h as f32),
+                view: &view(&src_tex, GAMMA),
+                size: (w, h),
+                shader: Shader::Default,
+                blend: Blend::Normal,
+                linear: false,
+                straight: false,
+                point: true,
+                opacity: 1.0,
+            },
+        );
+        let done_at = self.submit(std::iter::once(enc.finish()));
+        let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if ups.get(&id).is_some_and(|u| u.pinned && u.width == w && u.height == h) {
+            ups.insert(id, Upload { texture: dst.texture, width: w, height: h, pinned: false });
+        }
+        drop(ups);
+        drop(src_tex);
+        // Wait briefly for the copy submission so wgpu drops the external HAL texture and
+        // releases the CVImageBuffer even when no output or preview is polling the GPU.
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(done_at),
+            timeout: Some(std::time::Duration::from_millis(50)),
+        });
+    }
+
     /// Lets an uploaded picture go.
     pub fn forget(&self, id: u64) {
         self.uploads.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1702,7 +1761,7 @@ impl Compositor {
 
     fn uploaded(&self, id: u64) -> Result<wgpu::Texture, AvError> {
         let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
-        ups.get(&id).map(|(t, _, _)| t.clone()).ok_or(AvError::NotUploaded(id))
+        ups.get(&id).map(|u| u.texture.clone()).ok_or(AvError::NotUploaded(id))
     }
 
     /// Draws a scene → NV12 (BT.709, limited range, as libobs gives its encoders).
@@ -2154,7 +2213,7 @@ impl Compositor {
                 Content::Uploaded { id, width, height, .. } => {
                     let ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
                     match ups.get(id) {
-                        Some((_, w, h)) if w == width && h == height => {}
+                        Some(Upload { width: w, height: h, .. }) if w == width && h == height => {}
                         _ => return Err(AvError::NotUploaded(*id)),
                     }
                 }

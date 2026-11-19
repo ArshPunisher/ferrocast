@@ -618,6 +618,18 @@ impl Fresh {
             Fresh::Yuv(p) => gpu.upload_nv12(id, p).is_ok(),
         }
     }
+
+    /// Converts any pinned zero-copy external surface into a CPU picture before parking in
+    /// `Src::pending` so finite capture buffer pools aren't starved while hidden.
+    fn into_pending(self) -> Option<Self> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Fresh::Screen(s) => s.to_picture().map(Fresh::Pic),
+            #[cfg(target_os = "windows")]
+            Fresh::Screen(s) => Some(Fresh::Pic(s.to_picture())),
+            other => Some(other),
+        }
+    }
 }
 
 impl Src {
@@ -1075,11 +1087,18 @@ impl Engine {
         let _ = kind;
     }
 
-    /// A parked capture of this kind, taken back (see `State::parked`).
+    /// A parked capture of this kind, taken back (see `State::parked`). Disconnected or ended
+    /// captures are dropped outside the lock and never handed back.
     fn unpark(&self, kind: &SourceKind) -> Option<Live> {
         let mut st = self.lock();
         let at = st.parked.iter().position(|(k, ..)| k == kind)?;
-        Some(st.parked.swap_remove(at).1)
+        let (_, live, _) = st.parked.swap_remove(at);
+        drop(st);
+        if is_live_ended(&live) {
+            drop(live);
+            return None;
+        }
+        Some(live)
     }
 
     /// Opens capture `kind` as source `id` on its own thread. Opening one can take seconds (on
@@ -1215,8 +1234,12 @@ impl Engine {
             let mut st = self.lock();
             st.globals.remove(&id);
             match st.sources.remove(&id) {
-                // A running camera is parked a moment (see `State::parked`).
-                Some(src) if src.opening.is_none() && matches!(src.kind, Some(SourceKind::Camera(_))) => {
+                // A running, healthy camera is parked a moment (see `State::parked`).
+                Some(src)
+                    if src.opening.is_none()
+                        && matches!(src.kind, Some(SourceKind::Camera(_)))
+                        && !is_live_ended(&src.live) =>
+                {
                     if let (Some(kind), live @ Live::Camera(_)) = (src.kind, src.live) {
                         st.parked.push((kind, live, now_ns()));
                     }
@@ -3402,13 +3425,69 @@ fn output_capture_of(live: &Live, kind: Option<&SourceKind>) -> Option<crate::mi
     })
 }
 
-/// The watchdog: once a second it looks at every capture, and one that faulted, ended or
-/// went quiet is started again (waiting longer after each try that didn't hold).
+fn is_live_ended(live: &Live) -> bool {
+    signs(live).is_some_and(|(_, _, e)| e.is_some())
+}
+
+fn poll_hotplug(seq: &mut u64) -> Option<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::camera::take_hotplug_connected(seq)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = seq;
+        None
+    }
+}
+
+/// Clears watchdog reconnect backoff for disconnected/stopped camera and microphone sources whose
+/// device just reconnected so replug recovers immediately instead of waiting for backoff.
+fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[String], now: u64) -> usize {
+    let mut woke = 0;
+    for src in sources.values_mut() {
+        if src.opening.is_some() {
+            continue;
+        }
+        let dead = matches!(src.live, Live::Still) || src.watch.faulted || is_live_ended(&src.live);
+        if !dead {
+            continue;
+        }
+        let matches_device = match &src.kind {
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            Some(SourceKind::Camera(spec)) => {
+                connected.is_empty() || spec.id.is_empty() || connected.iter().any(|id| id == &spec.id)
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            Some(SourceKind::Microphone(dev)) => {
+                connected.is_empty() || dev.is_empty() || dev == "default" || connected.iter().any(|id| id == dev)
+            }
+            _ => false,
+        };
+        if matches_device {
+            src.watch.next_try = now;
+            src.watch.tries = 0;
+            woke += 1;
+        }
+    }
+    woke
+}
+
+/// The watchdog: once a second (or right away when a device connects) it looks at every capture,
+/// and one that faulted, ended or went quiet is started again (waiting longer after each try that
+/// didn't hold).
 fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
+    let mut hotplug_seq = 0u64;
+    let _ = poll_hotplug(&mut hotplug_seq);
     while !stop.load(Ordering::Acquire) {
+        let mut connected = None;
         for _ in 0..10 {
             if stop.load(Ordering::Acquire) {
                 return;
+            }
+            if let Some(ids) = poll_hotplug(&mut hotplug_seq) {
+                connected = Some(ids);
+                break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -3417,6 +3496,9 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, st
         let mut expired = Vec::new();
         {
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ids) = &connected {
+                apply_hotplug_reconnects(&mut st.sources, ids, now);
+            }
             // Parked cameras not wanted back: closed (outside the lock, below).
             let mut i = 0;
             while i < st.parked.len() {
@@ -3747,15 +3829,27 @@ fn frame(
         let Some(s) = st.sources.get_mut(&id) else { continue };
         // A frozen source keeps the picture it has (its first one still comes in).
         if frozen.contains(&id) && s.sent > 0 {
+            s.pending = None;
             continue;
         }
         if !seen.contains(&id) && s.size.is_some() {
-            s.pending = Some(f);
+            s.pending = f.into_pending();
             continue;
         }
         if f.send(gpu, id) {
             s.size = Some(f.info());
             s.sent += 1;
+        }
+    }
+    // Any hidden or frozen source that still holds a pinned zero-copy GPU texture copies it
+    // onto a GPU-owned texture now so CoreVideo buffer pools aren't starved while hidden/frozen.
+    for (id, s) in st.sources.iter_mut() {
+        let keep_frozen = frozen.contains(id) && s.sent > 0;
+        if keep_frozen {
+            s.pending = None;
+        }
+        if !seen.contains(id) || keep_frozen {
+            gpu.unpin_surface(*id);
         }
     }
     let blocks = mx.mix_until(now_ns());
@@ -5964,5 +6058,108 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(&e.snapshot().unwrap_or_default()[20..24], &[0, 0, 255, 255], "{top}: Main alone");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hidden_or_frozen_source_releases_pinned_cv_image_buffer() {
+        let Some(e) = engine() else { return };
+        let Some(buf) = crate::apple::screen::tests::bgra_buffer(64, 36, [10, 20, 200, 255]) else { return };
+        let surface = crate::screen::Surface::of(buf.clone()).unwrap_or_else(|| panic!("BGRA surface"));
+        assert!(surface.io_surface().is_some(), "test buffer must have an IOSurface");
+        e.gpu.upload_surface(1, &surface).unwrap_or_else(|x| panic!("{x}"));
+        {
+            let mut st = e.lock();
+            let mut src = Src::new(Live::Still, Some((64, 36, true)), None);
+            src.sent = 1;
+            st.sources.insert(1, src);
+        }
+        e.set_source(2, SourceKind::Color { width: 64, height: 36, rgba: [0, 255, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Other", vec![SceneItem::new(2, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        // Freeze source 1 while on air, drop local Surface handle, and let frame loop run.
+        let mut frozen_item = SceneItem::new(1, Placement::default());
+        frozen_item.effects = vec![Effect::Freeze];
+        e.set_scene("Main", vec![frozen_item]);
+        drop(surface);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            crate::apple::screen::tests::buffer_retain_count(&buf),
+            1,
+            "frozen source must release its CVImageBuffer"
+        );
+        assert_eq!(&e.snapshot().unwrap_or_default()[0..4], &[200, 20, 10, 255], "frozen frame still renders");
+
+        // Re-pin a fresh surface on air, then hide it by switching to Other.
+        let surface2 = crate::screen::Surface::of(buf.clone()).unwrap_or_else(|| panic!("BGRA surface"));
+        e.gpu.upload_surface(1, &surface2).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        drop(surface2);
+        std::thread::sleep(Duration::from_millis(120));
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            crate::apple::screen::tests::buffer_retain_count(&buf),
+            1,
+            "hidden source must release its CVImageBuffer"
+        );
+        assert_eq!(
+            &e.snapshot_scene("Main").unwrap_or_default()[0..4],
+            &[200, 20, 10, 255],
+            "hidden scene still renders its last frame"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_into_pending_releases_cv_image_buffer() {
+        let Some(buf) = crate::apple::screen::tests::bgra_buffer(32, 16, [30, 60, 90, 255]) else { return };
+        let surface = crate::screen::Surface::of(buf.clone()).unwrap_or_else(|| panic!("BGRA surface"));
+        let fresh = Fresh::Screen(surface);
+        assert_eq!(crate::apple::screen::tests::buffer_retain_count(&buf), 2);
+        let pending = fresh.into_pending().unwrap_or_else(|| panic!("converted to Pic"));
+        assert_eq!(
+            crate::apple::screen::tests::buffer_retain_count(&buf),
+            1,
+            "into_pending must not keep CVImageBuffer pinned while hidden"
+        );
+        assert!(
+            matches!(pending, Fresh::Pic(ref p) if p.width == 32 && p.height == 16 && p.rgba[..4] == [90, 60, 30, 255])
+        );
+    }
+
+    #[test]
+    fn hotplug_reconnect_wakes_only_matching_stopped_sources() {
+        let now = 50_000_000_000u64;
+        let mut sources = BTreeMap::new();
+        let mut dead_cam = Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from("cam-usb-1"))));
+        dead_cam.watch.next_try = now + 16_000_000_000;
+        dead_cam.watch.tries = 3;
+        sources.insert(1, dead_cam);
+
+        let mut other_cam = Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from("cam-other"))));
+        other_cam.watch.next_try = now + 16_000_000_000;
+        other_cam.watch.tries = 3;
+        sources.insert(2, other_cam);
+
+        let mut dead_mic = Src::new(Live::Still, None, Some(SourceKind::Microphone("mic-usb-1".into())));
+        dead_mic.watch.next_try = now + 8_000_000_000;
+        dead_mic.watch.tries = 2;
+        sources.insert(3, dead_mic);
+
+        let woke = apply_hotplug_reconnects(&mut sources, &["cam-usb-1".into()], now);
+        assert_eq!(woke, 1);
+        assert_eq!(sources[&1].watch.next_try, now);
+        assert_eq!(sources[&1].watch.tries, 0);
+        assert_eq!(sources[&2].watch.next_try, now + 16_000_000_000);
+        assert_eq!(sources[&3].watch.next_try, now + 8_000_000_000);
+
+        // Empty list acts as wildcard wake (e.g. generic hotplug reset).
+        let woke = apply_hotplug_reconnects(&mut sources, &[], now);
+        assert_eq!(woke, 3);
+        assert_eq!(sources[&2].watch.next_try, now);
+        assert_eq!(sources[&3].watch.next_try, now);
     }
 }
