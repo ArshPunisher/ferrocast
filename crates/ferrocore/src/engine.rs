@@ -3998,7 +3998,10 @@ mod tests {
         let after: Vec<u32> =
             tags[switched_at..].iter().filter(|(_, b)| b.get(1) == Some(&1)).map(|(ms, _)| *ms).collect();
         let gaps: Vec<u32> = after.windows(2).map(|w| w[1] - w[0]).collect();
-        let typical = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
+        // The median (it took the middle gap unsorted: one late frame on GitHub's Mac VM failed it).
+        let mut sorted = gaps.clone();
+        sorted.sort_unstable();
+        let typical = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
         assert!((55..=80).contains(&typical), "a frame about every 66 ms after: {gaps:?}");
         // A recording refuses.
         let rec = std::env::temp_dir().join(format!("ferrocast-reshape-{}.mp4", std::process::id()));
