@@ -2147,6 +2147,12 @@ impl Stage {
 
     /// A recording "Same as stream" that shares the running `stream`'s encoder (see
     /// [`can_share`]), into `path`.
+    /// Whether `out` was started from this collection (only then can it share its encode: a
+    /// recording kept through a switch to another collection draws that one; CodeRabbit).
+    pub fn started(&self, out: &StageOutput) -> bool {
+        self.engine.borrow().as_ref().is_some_and(|e| out.own.runs_on(e))
+    }
+
     pub fn record_sharing(
         &self,
         stream: &StageOutput,
@@ -2155,6 +2161,9 @@ impl Stage {
     ) -> Result<StageOutput, StudioError> {
         for what in own::not_applied(&plan.encode, &plan.muxer) {
             say_once(format!("the recording starts without {what}: Ferrocore doesn't take them"));
+        }
+        if !self.started(stream) {
+            return Err(StudioError::Failed("The stream runs in another collection.".into()));
         }
         let mut own = stream.own.record_joining(path, plan)?;
         own.set_plan(plan);
@@ -2170,6 +2179,9 @@ impl Stage {
         key: &str,
         s: &StreamSettings,
     ) -> Result<StageOutput, StudioError> {
+        if !self.started(recording) {
+            return Err(StudioError::Failed("The recording runs in another collection.".into()));
+        }
         let send = own::Send { server, key, reconnect: s.reconnect };
         let own = recording.own.stream_joining(send, &s.encode, s.delay_s)?;
         Ok(StageOutput::new(own, None, self.canvas))

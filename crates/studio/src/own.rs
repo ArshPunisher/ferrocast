@@ -758,6 +758,11 @@ impl OwnStream {
     /// A recording "Same as stream" joining this running stream's encode, into `path` (one
     /// encode for both: the Mac's one video encoder can't do two at 4K60). Its stats count from
     /// now; when either ends the other goes on.
+    /// Whether this output runs on engine `e` (each collection has its own).
+    pub(crate) fn runs_on(&self, e: &Arc<Shared>) -> bool {
+        self.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(&d.shared, e))
+    }
+
     pub(crate) fn record_joining(&self, path: &std::path::Path, plan: &RecordPlan) -> Result<Self, StudioError> {
         let d = self.drawn.as_ref().filter(|d| d.role == Role::Stream).ok_or_else(|| {
             StudioError::Failed("Only a running stream's encoder can be shared with a recording.".into())

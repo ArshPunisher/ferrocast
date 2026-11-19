@@ -46,8 +46,9 @@ struct Held {
     /// What the main stream was started with (a recording "Same as stream" may share its
     /// encoder: `can_share`).
     stream_with: Option<ferrocast_studio::StreamSettings>,
-    /// What the main recording was started with (a stream may share its encoder).
-    record_with: Option<ferrocast_studio::RecordPlan>,
+    /// What the main recording was started with, and whether its quality was "Same as stream"
+    /// then (a stream may share its encoder; never by a choice saved since; CodeRabbit).
+    record_with: Option<(ferrocast_studio::RecordPlan, bool)>,
     /// The vertical picture's stream, beside the main one.
     vstream: Option<Streaming>,
     /// The lighter copy of what's on air, for platforms that take it (720p).
@@ -2245,8 +2246,17 @@ impl StudioHost for DesktopStudio {
                 let kbps = at_pct(s.video_kbps, h.live_pct);
                 let reshaped = match h.stream.as_ref() {
                     Some(st) if live && shape_changed => {
-                        match st.reshape(&EncodeSettings { video_kbps: kbps, ..encode_of(&s) }, s.fps) {
-                            Ok(()) => true,
+                        let encode = EncodeSettings { video_kbps: kbps, ..encode_of(&s) };
+                        match st.reshape(&encode, s.fps) {
+                            Ok(()) => {
+                                // What it runs with now: a recording "Same as stream" started
+                                // next compares with this (CodeRabbit: 1080p reshaped to 720p
+                                // was still taken as unscaled).
+                                if let Some(w) = h.stream_with.as_mut() {
+                                    w.encode = encode;
+                                }
+                                true
+                            }
                             Err(e) => {
                                 notes.push(format!("{e} The next stream uses the new settings."));
                                 false
@@ -2406,16 +2416,12 @@ impl StudioHost for DesktopStudio {
             // encoder can't do two at 4K60: 31 of 60 fps, 19 Nov), when they can share.
             let live = h.stream.as_ref().filter(|st| st.stats().active).zip(h.stream_with.as_ref());
             let rec = match live.map(|(st, with)| {
-                (
-                    st,
-                    ferrocast_studio::stage::can_share(
-                        with,
-                        &plan,
-                        s.record_quality == "stream",
-                        c.canvas().fps,
-                        s.fps,
-                    ),
-                )
+                let can = if c.started(st) {
+                    ferrocast_studio::stage::can_share(with, &plan, s.record_quality == "stream", c.canvas().fps, s.fps)
+                } else {
+                    Err("the stream runs in another collection".to_string())
+                };
+                (st, can)
             }) {
                 Some((st, Ok(()))) => c.record_sharing(st, &file, &plan),
                 Some((_, Err(why))) => {
@@ -2429,7 +2435,7 @@ impl StudioHost for DesktopStudio {
             let r = (rec, file, std::time::Instant::now());
             let v = record_stats(&r);
             h.record = Some(r);
-            h.record_with = Some(plan);
+            h.record_with = Some((plan, s.record_quality == "stream"));
             Ok(v)
         })
         .await?
@@ -3353,11 +3359,13 @@ impl StudioHost for DesktopStudio {
             // Against what the recording really runs with (settings changed since apply from its
             // next start), never a paused one (the stream would get nothing; projects-60).
             let recording = h.record.as_ref().map(|r| &r.0).filter(|r| r.stats().active).zip(h.record_with.as_ref());
-            let shared = recording.map(|(r, plan)| {
+            let shared = recording.map(|(r, (plan, same))| {
                 let can = if r.record_stats().paused {
                     Err("the recording is paused".to_string())
+                } else if !c.started(r) {
+                    Err("the recording runs in another collection".to_string())
                 } else {
-                    ferrocast_studio::stage::can_share(&settings, plan, s.record_quality == "stream", c.canvas().fps, s.fps)
+                    ferrocast_studio::stage::can_share(&settings, plan, *same, c.canvas().fps, s.fps)
                 };
                 (r, can)
             });
