@@ -4545,23 +4545,28 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
     let ty = set.get("type").and_then(Value::as_u64).unwrap_or(0);
     let window = set.get("window").and_then(Value::as_u64).map(|w| w as u32);
     let is_window = (kind != "screen_capture" && kind != "display_capture") || ty == 1;
-    if is_window && let Some(id) = window {
-        if !picked {
-            return;
-        }
-        // Names of a window picked before never find this one's app.
-        if let Some(o) = set.as_object_mut() {
-            o.remove("owner_name");
-            o.remove("window_name");
-        }
-        if let Ok((_, windows)) = ferrocore::screen::shareable()
-            && let Some(w) = windows.iter().find(|w| w.id == id)
-        {
-            set["owner_name"] = json!(w.app);
-            set["window_name"] = json!(w.title);
-        }
+    let Some(id) = window.filter(|_| is_window) else {
+        remember_display(set);
+        return;
+    };
+    if !picked {
         return;
     }
+    // Names of a window picked before never find this one's app.
+    if let Some(o) = set.as_object_mut() {
+        o.remove("owner_name");
+        o.remove("window_name");
+    }
+    if let Ok((_, windows)) = ferrocore::screen::shareable()
+        && let Some(w) = windows.iter().find(|w| w.id == id)
+    {
+        set["owner_name"] = json!(w.app);
+        set["window_name"] = json!(w.title);
+    }
+}
+
+/// A Mac display's UUID beside its number (elsewhere a display has none to keep).
+fn remember_display(set: &mut Value) {
     #[cfg(target_os = "macos")]
     if let Some(d) = set.get("display").and_then(Value::as_u64) {
         match ferrocore::screen::display_uuid(d as u32) {
@@ -4573,6 +4578,8 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
             }
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = set;
 }
 
 #[cfg(test)]
