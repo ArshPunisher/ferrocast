@@ -183,6 +183,8 @@ enum Recording {
 pub struct RecordProblem {
     pub reason: String,
     pub detail: String,
+    /// How many bytes of the file were kept (its size, for the Stats that go on showing it).
+    pub kept: u64,
 }
 
 impl RecordProblem {
@@ -219,6 +221,7 @@ impl RecordProblem {
         RecordProblem {
             reason: reason.into(),
             detail: format!("{advice} What was recorded until now is saved and plays. ({said})"),
+            kept: 0,
         }
     }
 }
@@ -228,8 +231,8 @@ impl RecordProblem {
 fn give_up(w: Box<Writer>, e: &std::io::Error) -> RecordProblem {
     let (file, whole) = w.abandon();
     salvage(file, whole);
-    let problem = RecordProblem::from_io(e);
-    tracing::error!(error = %e, reason = %problem.reason, "the recording stopped; the file so far was kept");
+    let problem = RecordProblem { kept: whole, ..RecordProblem::from_io(e) };
+    tracing::error!(error = %e, reason = %problem.reason, kept = whole, "the recording stopped; the file so far was kept");
     problem
 }
 
@@ -562,6 +565,8 @@ impl Pipeline {
     pub fn recorded_bytes(&self) -> u64 {
         match &self.recording {
             Some(Recording::On(w)) => w.written(),
+            // What was kept of a recording that stopped: its size goes on showing.
+            Some(Recording::Failed(p)) => p.kept,
             _ => 0,
         }
     }
@@ -1231,6 +1236,7 @@ mod full_disk_tests {
         let p = pipe.recording_problem().expect("a reason").clone();
         assert_eq!(p.reason, "the drive isn't there anymore", "{p:?}");
         assert!(!pipe.recording(), "it no longer says it records");
+        assert!(pipe.recorded_bytes() > 0, "the size of what was kept goes on showing");
         // Frames after it write nothing and don't change the answer; a split is refused in words.
         let again = pipe.recording_problem().cloned();
         assert_eq!(again, Some(p));
