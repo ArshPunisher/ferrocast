@@ -229,11 +229,10 @@ if (-not $app.HasExited) {
 }
 
 # The window's thread answers while recording: on the runner it got to /stats only every 10-48 s
-# (19 Nov), the engine's frame loop re-taking its lock at once when behind (Windows' lock isn't
-# fair); every Studio call waited behind it.
+# (19 Nov), waiting for the engine's lock, held a whole frame. Stats no longer take it.
 if ($statsMs.Count) {
-  $median = ($statsMs | Sort-Object)[[int]($statsMs.Count / 2)]
-  Check 'the app answers while recording' ($median -lt 5000) ("stats took {0:N0} ms (median of {1})" -f $median, $statsMs.Count)
+  $median = ($statsMs | Sort-Object)[[int][math]::Floor($statsMs.Count / 2)]
+  Check 'the app answers while recording' ($median -lt 1000) ("stats took {0:N0} ms (median of {1})" -f $median, $statsMs.Count)
 }
 Check 'app still running' (-not $app.HasExited) $(if ($app.HasExited) { "exit code $($app.ExitCode)" } else { "after $Seconds s of recording" })
 $avg = { param($a) if ($a.Count) { [math]::Round(($a | Measure-Object -Average).Average, 1) } else { $null } }
