@@ -1182,6 +1182,44 @@ async fn the_show_can_start_and_stop_streaming_in_obs() {
 }
 
 #[tokio::test]
+async fn ending_the_show_now_skips_the_stop_delay() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let tw = Fake::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let cfg = json!({ "start_stream": true, "stop_stream": true, "stop_delay_s": 1, "discord": false });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    let step =
+        |r: &crate::studio::show::ShowRun| r.steps.iter().find(|s| s.id == "stop_stream").map(|s| s.status.clone());
+    // On a show running: the ending is done and the stream stops with it.
+    e.start_show(true).await.unwrap();
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+    // On a show already ending: only the stop comes forward; the thank-you isn't said twice.
+    e.start_show(true).await.unwrap();
+    let ending = e.end_show().await.unwrap();
+    assert_eq!(step(&ending).as_deref(), Some("waiting"));
+    let said = tw.said().len();
+    let stopped = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&stopped).as_deref(), Some("done"));
+    assert_eq!(stopped.id, ending.id, "the same show");
+    assert!(!obs.lock().unwrap().streaming);
+    assert_eq!(tw.said().len(), said, "one thank-you");
+    // The delayed stop of the stopped show doesn't touch a stream started since.
+    e.start_show(true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(obs.lock().unwrap().streaming, "the old show's waiting stop did nothing");
+    // The show not stopping streams by itself: now still stops it (the streamer pressed Stop).
+    e.patch_show_config(json!({ "stop_stream": false }).as_object().unwrap()).await.unwrap();
+    let ended = e.end_show().await.unwrap();
+    assert!(step(&ended).is_none() && obs.lock().unwrap().streaming, "by default it stays on");
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+}
+
+#[tokio::test]
 async fn at_zero_runs_only_the_actions_that_are_on() {
     let (e, _d) = engine().await;
     let obs = with_obs(&e).await;

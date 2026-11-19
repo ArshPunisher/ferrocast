@@ -378,6 +378,44 @@ async fn show_routes_with_obs_closed_then_open() {
     assert_eq!((s, end["show"]["phase"].as_str()), (StatusCode::OK, Some("ended")));
 }
 
+/// `POST /show/end`: no body (older callers) keeps the `stop_delay_s` wait; `{ now: true }` stops the
+/// stream at once, also on a show already ending (it isn't ended twice); a wrong body is a 400.
+#[tokio::test]
+async fn ending_a_show_now_stops_the_stream_at_once() {
+    let r = start().await;
+    let obs = fake_obs(&r).await;
+    let cfg = json!({ "start_stream": true, "stop_stream": true, "stop_delay_s": 30, "discord": false, "recap_message": null });
+    assert_eq!(r.put("/show/config", cfg).await.status(), StatusCode::OK);
+    let bare =
+        || async { r.client.post(format!("{}/api/v1/show/end", r.base)).bearer_auth(&r.token).send().await.unwrap() };
+    let stop_step =
+        |v: &Value| v["show"]["steps"].as_array().unwrap().iter().find(|s| s["id"] == "stop_stream").cloned();
+    // No body: as before, the stop waits.
+    assert_eq!(r.post("/show/start", json!({ "force": true })).await.status(), StatusCode::CREATED);
+    assert!(obs.lock().unwrap().streaming);
+    let (s, v) = body(bare().await).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(stop_step(&v).unwrap()["status"], "waiting");
+    assert!(obs.lock().unwrap().streaming, "still on air");
+    // Stop now, on the show that is ending: done at once, one ending (its steps aren't repeated).
+    let (s, v) = body(r.post("/show/end", json!({ "now": true })).await).await;
+    assert_eq!((s, stop_step(&v).unwrap()["status"].as_str()), (StatusCode::OK, Some("done")));
+    assert_eq!(v["show"]["phase"], "ended");
+    assert!(!obs.lock().unwrap().streaming);
+    // A show running: now ends it and stops it in one go.
+    assert_eq!(r.post("/show/start", json!({ "force": true })).await.status(), StatusCode::CREATED);
+    assert!(obs.lock().unwrap().streaming);
+    let (_, v) = body(r.post("/show/end", json!({ "now": true })).await).await;
+    assert_eq!(stop_step(&v).unwrap()["status"], "done");
+    assert!(!obs.lock().unwrap().streaming);
+    // An empty object is the default; a wrong body is a 400, not a stop.
+    assert_eq!(r.post("/show/start", json!({ "force": true })).await.status(), StatusCode::CREATED);
+    let (_, v) = body(r.post("/show/end", json!({})).await).await;
+    assert_eq!(stop_step(&v).unwrap()["status"], "waiting");
+    assert_eq!(code(r.post("/show/end", json!({ "now": "yes" })).await).await.0, StatusCode::BAD_REQUEST);
+    assert!(obs.lock().unwrap().streaming);
+}
+
 #[tokio::test]
 async fn obs_helper_routes_and_their_errors() {
     let r = start().await;

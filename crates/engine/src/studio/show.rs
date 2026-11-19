@@ -650,7 +650,28 @@ impl Engine {
 
     /// End show: the ending scene, then a thank-you in chat with this stream's supporters.
     pub async fn end_show(&self) -> Result<ShowRun, EngineError> {
+        self.end_show_with(false).await
+    }
+
+    /// End show; with `at_once` (`{ now: true }` in the API) the stream stops at once, as OBS's Stop Streaming does (also when the
+    /// show doesn't stop it by itself): no `stop_delay_s` wait. On a show that is already ending
+    /// (its stop waiting) `at_once` only brings the stop forward: the ending isn't done twice.
+    pub async fn end_show_with(&self, at_once: bool) -> Result<ShowRun, EngineError> {
         let cfg = self.show_config();
+        if at_once {
+            let waiting = |r: &ShowRun| {
+                r.phase == Phase::Ended && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
+            };
+            if let Some(mut run) = self.show_run().filter(waiting) {
+                let step = self.stop_stream_step().await;
+                match run.steps.iter_mut().find(|s| s.id == "stop_stream") {
+                    Some(s) => *s = step,
+                    None => run.steps.push(step),
+                }
+                self.set_show(Some(run.clone()));
+                return Ok(run);
+            }
+        }
         let mut run = self.show_run().filter(|r| r.phase != Phase::Ended).unwrap_or(ShowRun {
             id: ferrocast_store::new_id(),
             phase: Phase::Live,
@@ -693,8 +714,8 @@ impl Engine {
             });
         }
         let _ = self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Show ended", None, false).await;
-        if cfg.stop_stream {
-            run.steps.push(if cfg.stop_delay_s == 0 {
+        if cfg.stop_stream || at_once {
+            run.steps.push(if at_once || cfg.stop_delay_s == 0 {
                 self.stop_stream_step().await
             } else {
                 let engine = self.clone();
@@ -730,7 +751,14 @@ impl Engine {
     /// meanwhile (the streamer went live again).
     async fn stop_stream_later(&self, show_id: &str) {
         let current = self.show_run();
-        if current.as_ref().is_none_or(|r| r.id != show_id || r.phase != Phase::Ended) {
+        // Only while its stop is still waiting: "stop now" may have done it already (and the
+        // streamer may have gone live again since).
+        let waiting = |r: &ShowRun| {
+            r.id == show_id
+                && r.phase == Phase::Ended
+                && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
+        };
+        if !current.as_ref().is_some_and(waiting) {
             return;
         }
         let step = self.stop_stream_step().await;
