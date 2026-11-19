@@ -360,6 +360,17 @@ impl Drop for MfCamera {
 /// A COM pointer kept on its own thread.
 struct Held(IMFVirtualCamera);
 
+/// Why Windows 11's camera wouldn't start, in words. Access denied is Windows' camera privacy
+/// switched off for this user (GitHub's runner, 19 Nov: HKCU's webcam consent "Deny"): no
+/// camera app could use it either, so the user is told where to turn it on.
+fn start_failed(code: windows::core::HRESULT) -> String {
+    if code == windows::Win32::Foundation::E_ACCESSDENIED {
+        "Windows 11's camera couldn't start: camera access is off for this user (Settings › Privacy & security › Camera)".into()
+    } else {
+        format!("Windows 11's camera couldn't start ({})", windows::core::Error::from(code))
+    }
+}
+
 impl MfCamera {
     fn start() -> Result<MfCamera, String> {
         let create = mf_create().ok_or("This Windows has no camera for every app (Windows 11 has).")?;
@@ -402,7 +413,7 @@ impl MfCamera {
                     // SAFETY: a counted IMFVirtualCamera from the call above.
                     let cam = unsafe { IMFVirtualCamera::from_raw(raw) };
                     // SAFETY: starts it (apps can see it now).
-                    unsafe { cam.Start(None) }.map_err(|e| format!("Windows 11's camera couldn't start ({e})"))?;
+                    unsafe { cam.Start(None) }.map_err(|e| start_failed(e.code()))?;
                     Ok(Held(cam))
                 })();
                 match made {

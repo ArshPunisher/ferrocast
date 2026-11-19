@@ -107,6 +107,14 @@ jobs:
           cargo build --locked -p ferrocast-wincam --target i686-pc-windows-msvc
       - name: FFmpeg (to open the camera as apps do)
         run: choco install ffmpeg -y --no-progress
+      # The runner's user has Windows' camera access off (HKCU webcam consent "Deny", seen 19 Nov:
+      # Windows 11's camera then answers "access denied"); a person's PC has it on to use one.
+      - name: Camera access on for this user, as on a PC with a camera app in use
+        shell: pwsh
+        run: |
+          $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam'
+          New-Item -Path $k -Force | Out-Null
+          Set-ItemProperty -Path $k -Name Value -Value Allow
       - name: End to end
         shell: pwsh
         run: |
