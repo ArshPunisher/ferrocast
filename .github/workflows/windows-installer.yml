@@ -1,0 +1,68 @@
+name: Windows installer
+
+# Installs a published Ferrocast setup on GitHub's Windows runner as people do (silently, per
+# user, as an update over the version before), starts the installed app, then uninstalls it
+# and checks nothing of the program is left (tools/windows-installer.ps1). The setup was only
+# ever built on CI, never run there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release to test (default the latest)
+        required: false
+        default: ''
+      older:
+        description: Release installed first, so the setup runs as an update (empty for a fresh install)
+        required: false
+        default: ''
+  release:
+    types: [published]
+  # A change to the test itself runs it (on the latest release, as an update over the one before).
+  push:
+    branches: [own-engine-only]
+    paths:
+      - 'tools/windows-installer.ps1'
+      - '.github/workflows/windows-installer.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install, start, update, uninstall
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the setups
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          OLDER: ${{ inputs.older }}
+        run: |
+          $tag = if ($env:TAG) { $env:TAG } else { gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName }
+          New-Item -ItemType Directory -Force setups | Out-Null
+          gh release download $tag -R $env:GITHUB_REPOSITORY -p '*_x64-setup.exe' -D setups/new
+          $older = $env:OLDER
+          if (-not $older -and $env:GITHUB_EVENT_NAME -eq 'push') {
+            $older = gh release list -R $env:GITHUB_REPOSITORY --exclude-drafts --exclude-pre-releases --json tagName -q '.[1].tagName'
+          }
+          if ($older) { gh release download $older -R $env:GITHUB_REPOSITORY -p '*_x64-setup.exe' -D setups/old }
+      - name: Installer test
+        shell: pwsh
+        run: |
+          $new = (Get-ChildItem setups/new -Filter '*-setup.exe' | Select-Object -First 1).FullName
+          $old = (Get-ChildItem setups/old -Filter '*-setup.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if ($old) { ./tools/windows-installer.ps1 -Setup $new -Older $old -Out inst } else { ./tools/windows-installer.ps1 -Setup $new -Out inst }
+      - name: Keep what it saw
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer
+          path: inst/
+          if-no-files-found: warn
+          retention-days: 14
