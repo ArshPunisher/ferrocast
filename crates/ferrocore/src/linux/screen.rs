@@ -152,6 +152,16 @@ impl ScreenCapture {
         self.sound.as_ref().map(LiveSound::take_sound).unwrap_or_default()
     }
 
+    /// Whether captured sound excludes Ferrocast's own monitor playback (`false` for Pulse `@DEFAULT_MONITOR@`).
+    pub fn excludes_self_audio(&self) -> bool {
+        self.sound.is_none()
+    }
+
+    /// Output device id captured by Pulse `@DEFAULT_MONITOR@`.
+    pub fn loopback_device(&self) -> Option<&str> {
+        self.sound.as_ref().map(|_| "default")
+    }
+
     pub fn frames(&self) -> u64 {
         self.live.as_ref().map_or(0, Live::frames)
     }

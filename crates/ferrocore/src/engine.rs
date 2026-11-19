@@ -696,6 +696,8 @@ struct State {
     /// Where monitored sound is played, when monitoring is on.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     monitor: Option<crate::monitor::Feeder>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    monitor_epoch: u64,
     stats: Stats,
     error: Option<String>,
     /// The previews windows show, by id.
@@ -844,6 +846,8 @@ impl Engine {
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio },
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             monitor: None,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            monitor_epoch: 0,
             stats: Stats::default(),
             error: None,
             previews: HashMap::new(),
@@ -861,10 +865,10 @@ impl Engine {
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
         let watchdog = {
-            let (state, stop) = (state.clone(), stop.clone());
+            let (state, mixer, stop) = (state.clone(), mixer.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("ferrocast-watchdog".into())
-                .spawn(move || watchdog(config, &state, &stop))
+                .spawn(move || watchdog(config, &state, &mixer, &stop))
                 .ok()
         };
         Ok(Self {
@@ -888,6 +892,12 @@ impl Engine {
         self.config
     }
 
+    fn reset_sound(&self, id: u64) {
+        let mut mx = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+        mx.set(id, SourceSettings::default());
+        mx.set_output_capture(id, None);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -909,7 +919,7 @@ impl Engine {
                 (Live::Still, Some(p))
             }
             SourceKind::Tone { hz, every_ms, beep_ms } => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.reset_sound(id);
                 (
                     Live::Tone {
                         hz,
@@ -925,7 +935,7 @@ impl Engine {
                 let live = open_capture(&self.config, &kind)
                     .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
                 if matches!(kind, SourceKind::App { sound: true, .. } | SourceKind::AppSound(_)) {
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    self.reset_sound(id);
                 }
                 (live, None)
             }
@@ -933,7 +943,7 @@ impl Engine {
             SourceKind::AppSound(_) => {
                 let live = open_capture(&self.config, &kind)
                     .unwrap_or_else(|| Err(AvError::Source("not a capture".into())))?;
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.reset_sound(id);
                 (live, None)
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -948,7 +958,7 @@ impl Engine {
                     _ => false,
                 };
                 if heard {
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    self.reset_sound(id);
                 }
                 if let Some(live) = self.unpark(&kind) {
                     tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
@@ -1016,13 +1026,13 @@ impl Engine {
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             SourceKind::Playlist(p) => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.reset_sound(id);
                 let feed = Feed::default();
                 let worker = crate::source::series::playlist(p, feed.clone());
                 (Live::Series { feed, _worker: worker }, Some(Picture::solid(1, 1, [0, 0, 0, 0])))
             }
             SourceKind::Fed { width, height } => {
-                self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                self.reset_sound(id);
                 // Clear until the first picture comes.
                 (Live::Fed(Feed::default()), Some(Picture::solid(width.max(1), height.max(1), [0, 0, 0, 0])))
             }
@@ -1116,14 +1126,22 @@ impl Engine {
             let mine = st.sources.get_mut(&id).filter(|s| s.opening == Some(token));
             let answer = match (opened, mine) {
                 (Ok((live, heard)), Some(src)) => {
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                    let oc = output_capture_of(&live, src.kind.as_ref());
+                    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+                    let oc: Option<crate::mix::OutputCapture> = None;
                     // The one it took over from (when handed over) stops outside the lock.
                     leftover = Some(std::mem::replace(&mut src.live, live));
                     src.opening = None;
                     src.watch = Watch { since: now_ns(), ..Watch::default() };
                     // Its sound into the mix (a file with sound), under the same lock so a
                     // removal can't slip in between (state, then mixer: the frame loop's order).
-                    if heard {
-                        mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, SourceSettings::default());
+                    if heard || oc.is_some() || matches!(src.live, Live::Screen(_)) {
+                        let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
+                        if heard {
+                            mx.set(id, SourceSettings::default());
+                        }
+                        mx.set_output_capture(id, oc);
                     }
                     Ok(())
                 }
@@ -1243,8 +1261,18 @@ impl Engine {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_monitoring(&self, on: bool, device: Option<&str>) -> Result<(), AvError> {
         let m = if on { Some(crate::monitor::Monitor::start(device, self.config.sample_rate)?) } else { None };
-        self.lock().monitor = m.as_ref().map(|m| m.feeder());
-        *self.monitor.lock().unwrap_or_else(|e| e.into_inner()) = m;
+        let feeder = m.as_ref().map(crate::monitor::Monitor::feeder);
+        let dev_id = feeder.as_ref().and_then(crate::monitor::Feeder::device_id);
+        let epoch = feeder.as_ref().map_or(0, crate::monitor::Feeder::device_epoch);
+        {
+            let mut st = self.lock();
+            st.monitor = feeder;
+            st.monitor_epoch = epoch;
+            self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_monitor_device(dev_id);
+        }
+        // Drop old monitor outside both `state` and `monitor` locks (its drop joins its thread).
+        let old = std::mem::replace(&mut *self.monitor.lock().unwrap_or_else(|e| e.into_inner()), m);
+        drop(old);
         Ok(())
     }
 
@@ -3361,9 +3389,22 @@ const PARK_NS: u64 = 8_000_000_000;
 /// its own thread): short enough that the window never feels stuck.
 const OPEN_WAIT: Duration = Duration::from_millis(250);
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn output_capture_of(live: &Live, kind: Option<&SourceKind>) -> Option<crate::mix::OutputCapture> {
+    let is_loopback = matches!(kind, Some(SourceKind::DesktopSound | SourceKind::Screen { sound: true, .. }));
+    if !is_loopback {
+        return None;
+    }
+    let Live::Screen(cap) = live else { return None };
+    Some(crate::mix::OutputCapture {
+        device: cap.loopback_device().unwrap_or("default").to_string(),
+        excludes_self: cap.excludes_self_audio(),
+    })
+}
+
 /// The watchdog: once a second it looks at every capture, and one that faulted, ended or
 /// went quiet is started again (waiting longer after each try that didn't hold).
-fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
+fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
         for _ in 0..10 {
             if stop.load(Ordering::Acquire) {
@@ -3415,10 +3456,15 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, stop: &AtomicBool) {
                 Some(Ok(live)) => {
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(src) = st.sources.get_mut(&id).filter(|s| s.kind.as_ref() == Some(&kind)) {
+                        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+                        let oc = output_capture_of(&live, src.kind.as_ref());
+                        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+                        let oc: Option<crate::mix::OutputCapture> = None;
                         src.live = live;
                         src.watch.count = 0;
                         src.watch.since = now_ns();
                         st.stats.restarts += 1;
+                        mixer.lock().unwrap_or_else(|e| e.into_inner()).set_output_capture(id, oc);
                     }
                 }
                 Some(Err(e)) => {
@@ -3562,6 +3608,15 @@ fn frame(
     // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
     // rest still has its sound taken, so it doesn't pile up.
     let heard = heard(&st);
+    mx.sync_active(&heard);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some((epoch, dev_id)) = st.monitor.as_ref().and_then(|f| {
+        let epoch = f.device_epoch();
+        (epoch != st.monitor_epoch).then(|| (epoch, f.device_id()))
+    }) {
+        st.monitor_epoch = epoch;
+        mx.set_monitor_device(dev_id);
+    }
     // Pictures go to the GPU only for sources something drawn shows (and a source's first,
     // for its size); the rest keep their newest until they're shown.
     let seen = seen(&st);
@@ -3704,12 +3759,17 @@ fn frame(
         }
     }
     let blocks = mx.mix_until(now_ns());
+    let mon_active = mx.has_monitored();
     drop(mx);
     visualize(&mut st, &blocks, &seen, gpu, mixer, rate);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(f) = &st.monitor {
-        for b in &blocks {
-            f.push(&b.monitor);
+        if mon_active {
+            for b in &blocks {
+                f.push(&b.monitor);
+            }
+        } else {
+            f.idle();
         }
     }
 
@@ -4701,7 +4761,7 @@ mod tests {
         e.set_source(1, SourceKind::Tone { hz: 660.0, every_ms: 400, beep_ms: 60 }).unwrap_or_else(|x| panic!("{x}"));
         e.set_sound(1, SourceSettings { volume: 0.1, monitoring: Monitoring::Only, ..Default::default() });
         e.set_global(1, true);
-        if e.set_monitoring(true, None).is_err() {
+        if crate::monitor::devices().is_empty() || e.set_monitoring(true, None).is_err() {
             return; // no speakers here (a CI machine)
         }
         std::thread::sleep(Duration::from_millis(1200));
@@ -4709,6 +4769,18 @@ mod tests {
         e.set_monitoring(false, None).unwrap_or_else(|x| panic!("{x}"));
         assert!(played > 40_000, "about a second played: {played}");
         assert!(short < 10, "the device seldom ran short: {short}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn monitoring_with_missing_device_succeeds_and_drops_cleanly() {
+        let Some(e) = engine() else { return };
+        let r = e.set_monitoring(true, Some("__ferrocast_missing_monitor_device__"));
+        assert!(r.is_ok(), "missing monitor device must retry instead of failing: {r:?}");
+        assert!(e.monitoring_stats().is_some());
+        let t = std::time::Instant::now();
+        e.set_monitoring(false, None).unwrap_or_else(|x| panic!("{x}"));
+        assert!(t.elapsed() < Duration::from_millis(300), "stopped promptly: {:?}", t.elapsed());
     }
 
     /// A dragged source moves in the engine's own item, and the preview's outline is worked out

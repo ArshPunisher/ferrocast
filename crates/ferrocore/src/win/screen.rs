@@ -356,6 +356,17 @@ impl ScreenCapture {
         self.sound.as_ref().map(SoundIn::take_sound).unwrap_or_default()
     }
 
+    /// Whether captured sound excludes Ferrocast's own monitor playback.
+    pub fn excludes_self_audio(&self) -> bool {
+        self.sound.as_ref().is_none_or(SoundIn::excludes_self)
+    }
+
+    /// Output device id captured when using legacy device loopback (`None` when process-excluded).
+    pub fn loopback_device(&self) -> Option<&str> {
+        let s = self.sound.as_ref()?;
+        if s.excludes_self() { None } else { s.device_id() }
+    }
+
     pub fn frames(&self) -> u64 {
         match &self.live {
             Some(Pictures::Native(w)) => w.frames(),

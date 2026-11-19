@@ -13,10 +13,12 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
-    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
 use windows::Win32::System::Com::{BLOB, COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::core::{Interface, implement};
@@ -50,14 +52,24 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     }
 }
 
-/// An audio client hearing process `pid` and its children.
-fn client_for(pid: u32) -> Result<IAudioClient, String> {
+#[derive(Clone, Copy)]
+enum LoopbackTarget {
+    IncludeTree(u32),
+    ExcludeTree(u32),
+}
+
+/// An audio client hearing (or excluding) `target` and its child processes.
+fn client_for(target: LoopbackTarget) -> Result<IAudioClient, String> {
+    let (pid, mode) = match target {
+        LoopbackTarget::IncludeTree(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
+        LoopbackTarget::ExcludeTree(pid) => (pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+    };
     let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: pid,
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -104,14 +116,32 @@ fn client_for(pid: u32) -> Result<IAudioClient, String> {
 
 /// Hears process `pid` until `stop`, handing 48 kHz stereo pieces to `keep`. `ready` is told
 /// once whether it started.
-pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, mut keep: impl FnMut(&[f32])) {
+pub fn run(pid: u32, stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, keep: impl FnMut(&[f32])) {
+    run_target(LoopbackTarget::IncludeTree(pid), stop, ready, keep);
+}
+
+/// Hears everything the computer plays except this process (and its children), until `stop`.
+/// Used for Desktop Audio on Windows 10 version 2004+ so Ferrocast's own monitoring playback
+/// never feeds back or leaks onto the stream.
+pub fn run_excluding_self(stop: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), String>>, keep: impl FnMut(&[f32])) {
+    // SAFETY: GetCurrentProcessId reads the current process identifier with no preconditions.
+    let pid = unsafe { GetCurrentProcessId() };
+    run_target(LoopbackTarget::ExcludeTree(pid), stop, ready, keep);
+}
+
+fn run_target(
+    target: LoopbackTarget,
+    stop: Arc<AtomicBool>,
+    ready: mpsc::Sender<Result<(), String>>,
+    mut keep: impl FnMut(&[f32]),
+) {
     // SAFETY: COM for this thread (its own; undone below).
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     let started = (|| -> Result<(IAudioClient, IAudioCaptureClient), String> {
-        if pid == 0 {
+        if matches!(target, LoopbackTarget::IncludeTree(0)) {
             return Err("that window is closed".into());
         }
-        let client = client_for(pid)?;
+        let client = client_for(target)?;
         let format = WAVEFORMATEX {
             wFormatTag: FLOAT,
             nChannels: 2,

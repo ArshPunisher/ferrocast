@@ -96,6 +96,8 @@ pub struct SoundIn {
     sound: Pieces,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    excludes_self: bool,
+    device_id: Option<String>,
 }
 
 impl Drop for SoundIn {
@@ -108,28 +110,73 @@ impl Drop for SoundIn {
 }
 
 impl SoundIn {
-    /// Starts `which` (on its own thread: a stream stays where it was made).
-    pub fn start(which: Which) -> Result<Self, AvError> {
-        let sound: Pieces = Arc::default();
+    #[cfg(target_os = "windows")]
+    fn start_process_loopback(
+        name: &str,
+        sound: Pieces,
+        timeout: Duration,
+        run_fn: impl FnOnce(Arc<AtomicBool>, std::sync::mpsc::Sender<Result<(), String>>, Pieces) + Send + 'static,
+    ) -> Result<Self, AvError> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (s, st) = (sound.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run_fn(st, ready_tx, s))
+            .map_err(|e| AvError::Source(e.to_string()))?;
+        match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: true, device_id: None }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(AvError::Source(e))
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Release);
+                Err(AvError::Source("the sound device didn't answer".into()))
+            }
+        }
+    }
+
+    /// Starts `which` (on its own thread: a stream stays where it was made).
+    pub fn start(which: Which) -> Result<Self, AvError> {
+        let sound: Pieces = Arc::default();
         #[cfg(target_os = "windows")]
         if let Which::Process(pid) = which {
-            let thread = std::thread::Builder::new()
-                .name("ferrocast-app-sound".into())
-                .spawn(move || {
+            return Self::start_process_loopback(
+                "ferrocast-app-sound",
+                sound,
+                Duration::from_secs(8),
+                move |st, tx, s| {
                     let mut conv = Convert::new(2, RATE);
-                    crate::win::app_sound::run(pid, st, ready_tx, |data| keep(&s, conv.push(data)));
-                })
-                .map_err(|e| AvError::Source(e.to_string()))?;
-            return Self::started(sound, stop, thread, ready_rx);
+                    crate::win::app_sound::run(pid, st, tx, |data| keep(&s, conv.push(data)));
+                },
+            );
         }
+        #[cfg(target_os = "windows")]
+        if matches!(which, Which::Loopback) {
+            match Self::start_process_loopback(
+                "ferrocast-desktop-sound",
+                sound.clone(),
+                Duration::from_secs(6),
+                |st, tx, s| {
+                    let mut conv = Convert::new(2, RATE);
+                    crate::win::app_sound::run_excluding_self(st, tx, |data| keep(&s, conv.push(data)));
+                },
+            ) {
+                Ok(si) => return Ok(si),
+                Err(why) => {
+                    tracing::info!(error = %why, "process-excluding desktop audio unavailable; falling back to device loopback");
+                }
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
+        let (s, st) = (sound.clone(), stop.clone());
         let thread = std::thread::Builder::new()
             .name("ferrocast-sound-in".into())
             .spawn(move || {
-                let stream = match open(&which, s) {
-                    Ok(stream) => stream,
+                let (stream, device_id) = match open(&which, s) {
+                    Ok(opened) => opened,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
@@ -139,7 +186,7 @@ impl SoundIn {
                     let _ = ready_tx.send(Err(format!("it didn't start ({e})")));
                     return;
                 }
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(device_id));
                 while !st.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -154,10 +201,10 @@ impl SoundIn {
         sound: Pieces,
         stop: Arc<AtomicBool>,
         thread: JoinHandle<()>,
-        ready_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+        ready_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
     ) -> Result<Self, AvError> {
         match ready_rx.recv_timeout(Duration::from_secs(8)) {
-            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread) }),
+            Ok(Ok(device_id)) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: false, device_id }),
             Ok(Err(e)) => Err(AvError::Source(e)),
             Err(_) => {
                 // Late: if it opens after all, it closes again at once.
@@ -165,6 +212,16 @@ impl SoundIn {
                 Err(AvError::Source("the sound device didn't answer".into()))
             }
         }
+    }
+
+    /// Whether this capture already excludes Ferrocast's own audio output.
+    pub fn excludes_self(&self) -> bool {
+        self.excludes_self
+    }
+
+    /// Resolved output device id when capturing a speaker loopback (`None` otherwise).
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 
     /// Sound since the last call, oldest first: 48 kHz stereo.
@@ -194,8 +251,8 @@ fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
     }
 }
 
-/// The device and its stream, feeding `sound`.
-fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
+/// The device and its stream, feeding `sound` (plus resolved device id for loopback).
+fn open(which: &Which, sound: Pieces) -> Result<(cpal::Stream, Option<String>), String> {
     let host = cpal::default_host();
     let dev = match which {
         Which::Loopback => host.default_output_device().ok_or("there are no speakers to hear the computer from")?,
@@ -211,6 +268,8 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         #[cfg(target_os = "windows")]
         Which::Process(_) => return Err("one app's sound doesn't come through cpal".into()),
     };
+    let device_id =
+        matches!(which, Which::Loopback).then(|| dev.id().map(|i| i.to_string()).unwrap_or_else(|_| "default".into()));
     let cfg = match which {
         Which::Loopback => dev.default_output_config(),
         _ => dev.default_input_config(),
@@ -220,7 +279,7 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
     let mut keep = move |data: &[f32]| keep(&sound, conv.push(data));
     let err = |e: cpal::Error| tracing::warn!(%e, "a sound input stopped");
     let config = cfg.config();
-    match cfg.sample_format() {
+    let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => dev.build_input_stream(config, move |d: &[f32], _: &_| keep(d), err, None),
         cpal::SampleFormat::I16 => dev.build_input_stream(
             config,
@@ -236,7 +295,8 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         ),
         other => return Err(format!("its sample format ({other}) isn't supported")),
     }
-    .map_err(|e| format!("it couldn't be opened ({e})"))
+    .map_err(|e| format!("it couldn't be opened ({e})"))?;
+    Ok((stream, device_id))
 }
 
 #[cfg(test)]

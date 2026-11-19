@@ -935,6 +935,17 @@ impl ScreenCapture {
         self.shared.sound.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
     }
 
+    /// ScreenCaptureKit sets `excludesCurrentProcessAudio = true`, so captured sound excludes
+    /// Ferrocast's own monitor playback.
+    pub fn excludes_self_audio(&self) -> bool {
+        true
+    }
+
+    /// Output device id for non-self-excluding loopback (`None` here: SCK excludes self).
+    pub fn loopback_device(&self) -> Option<&str> {
+        None
+    }
+
     /// Frames received since the start.
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
