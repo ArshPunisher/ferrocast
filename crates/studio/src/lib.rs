@@ -518,6 +518,8 @@ pub struct EngineStats {
     pub restarts: u32,
     /// Time the encoders take for one frame, all outputs together (smoothed), in ms.
     pub encode_ms: f64,
+    /// All the time the encoders took since the engine started, in ms.
+    pub encoding_ms: u64,
 }
 
 /// How a source's picture looks now (`Stage::look`): for catching a black or frozen camera.

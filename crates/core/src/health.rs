@@ -27,9 +27,11 @@ pub struct Sample {
     pub paused: bool,
     pub quality_pct: u8,
     pub cpu: f64,
-    /// Now: the encoders take most of each frame's time (the engine's `encode_ms` against the
-    /// frame's time), so late frames are the encoder's doing, not the drawing's.
-    pub encoder_bound: bool,
+    /// All the time the engine's encoders took (its `encoding_ms`), and when this look was taken
+    /// (ms): between two looks, encoding over 60% of the time means late frames are the
+    /// encoder's doing, not the drawing's.
+    pub encoding_ms: u64,
+    pub at_ms: u64,
 }
 
 /// How the stream is doing.
@@ -62,7 +64,8 @@ impl HealthMeter {
         for (a, b) in self.looks.iter().zip(self.looks.iter().skip(1)) {
             let late = b.lagged.saturating_sub(a.lagged);
             all += late;
-            if b.encoder_bound {
+            let busy = share(b.encoding_ms.saturating_sub(a.encoding_ms), b.at_ms.saturating_sub(a.at_ms));
+            if busy > 0.6 {
                 by_encoder += late;
             }
         }
@@ -193,25 +196,19 @@ mod tests {
 
     #[test]
     fn late_frames_name_the_encoder_when_it_holds_them_back() {
-        let late = |encoder_bound: bool| {
+        // Two seconds apart; `busy` ms of them spent encoding.
+        let look = |n: u64, lagged: u64, busy: u64| Sample { lagged, encoding_ms: busy, at_ms: n * 2000, ..at(n) };
+        let late = |busy: u64| {
             let mut m = HealthMeter::default();
-            m.push(at(0));
-            let mut s = at(2);
-            s.lagged = 30;
-            s.encoder_bound = encoder_bound;
-            m.push(s).reason.unwrap_or_default()
+            m.push(look(0, 0, 0));
+            m.push(look(1, 30, busy)).reason.unwrap_or_default()
         };
-        assert!(late(true).contains("video encoder"), "{}", late(true));
-        assert!(late(false).contains("the computer is busy"), "{}", late(false));
+        assert!(late(1800).contains("video encoder"), "{}", late(1800));
+        assert!(late(400).contains("the computer is busy"), "{}", late(400));
         // Late frames from a busy computer aren't the encoder's because it's busy afterwards.
         let mut m = HealthMeter::default();
-        m.push(at(0));
-        let mut s = at(1);
-        s.lagged = 30;
-        m.push(s);
-        let mut s = at(2);
-        s.lagged = 30;
-        s.encoder_bound = true;
-        assert!(m.push(s).reason.unwrap_or_default().contains("the computer is busy"));
+        m.push(look(0, 0, 0));
+        m.push(look(1, 30, 200));
+        assert!(m.push(look(2, 30, 2000)).reason.unwrap_or_default().contains("the computer is busy"));
     }
 }

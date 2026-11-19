@@ -128,11 +128,8 @@ impl Engine {
             paused,
             quality_pct: self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct(),
             cpu: e["cpu"].as_f64().unwrap_or(0.0),
-            // The encoders take over 60% of a frame's time.
-            encoder_bound: {
-                let fps = v["canvas"]["fps"].as_f64().filter(|f| *f > 0.0).unwrap_or(30.0);
-                e["encode_ms"].as_f64().unwrap_or(0.0) > 0.6 * 1000.0 / fps
-            },
+            encoding_ms: n(&e["encoding_ms"]),
+            at_ms: u64::try_from(now().0).unwrap_or(0),
         };
         let mut h = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner());
         let now = h.0.push(sample);

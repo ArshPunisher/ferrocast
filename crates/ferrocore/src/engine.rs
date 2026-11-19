@@ -444,6 +444,9 @@ pub struct Stats {
     /// near the frame's whole time, the encoder is what holds the frames back (19 Nov: 4K60
     /// streamed and recorded at once, the Mac's one encoder at its limit, 31 of 60 fps).
     pub encode_ms: f32,
+    /// All the time the encoders took since the start, in µs: against the clock, the share of
+    /// the frame loop's time spent encoding (an output encoding every other frame counts half).
+    pub encoding_us: u64,
 }
 
 /// Settings fixed for the engine's life.
@@ -3336,6 +3339,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
         }
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
+        st.stats.encoding_us += encoding.as_micros() as u64;
         if encoding > Duration::ZERO {
             let ms = encoding.as_secs_f32() * 1000.0;
             st.stats.encode_ms = if st.stats.encode_ms == 0.0 { ms } else { st.stats.encode_ms * 0.9 + ms * 0.1 };

@@ -2500,6 +2500,7 @@ impl Stage {
             recovered: s.recovered.min(u64::from(u32::MAX)) as u32,
             restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
             encode_ms: f64::from(s.encode_ms),
+            encoding_ms: s.encoding_us / 1000,
         }
     }
 
