@@ -33,6 +33,9 @@ pub struct MomentsConfig {
     pub spike_min: u32,
     /// Also put a stream marker on Twitch (needs `channel:manage:broadcast`).
     pub twitch_markers: bool,
+    /// After a YouTube stream, its chapters (scene changes and big moments) go at the end of
+    /// the video's description.
+    pub youtube_chapters: bool,
 }
 
 impl Default for MomentsConfig {
@@ -49,6 +52,7 @@ impl Default for MomentsConfig {
             spike_factor: 3,
             spike_min: 15,
             twitch_markers: false,
+            youtube_chapters: false,
         }
     }
 }
@@ -90,6 +94,8 @@ pub enum MomentKind {
     ChatSpike,
     Clip,
     Manual,
+    /// The scene on air changed (a chapter: "Just chatting", "Gameplay").
+    Scene,
 }
 
 impl MomentKind {
@@ -104,6 +110,7 @@ impl MomentKind {
             MomentKind::ChatSpike => "chat_spike",
             MomentKind::Clip => "clip",
             MomentKind::Manual => "manual",
+            MomentKind::Scene => "scene",
         }
     }
 
@@ -118,6 +125,7 @@ impl MomentKind {
             "chat_spike" => MomentKind::ChatSpike,
             "clip" => MomentKind::Clip,
             "manual" => MomentKind::Manual,
+            "scene" => MomentKind::Scene,
             _ => return None,
         })
     }
@@ -320,6 +328,66 @@ pub fn to_txt(markers: &[Marker]) -> String {
     out
 }
 
+/// YouTube's chapter rules: at least 3, the first at 0:00, each at least 10 s.
+const CHAPTER_MIN: usize = 3;
+const CHAPTER_GAP_MS: i64 = 10_000;
+/// More than this and the list stops being a guide.
+const CHAPTER_MAX: usize = 50;
+
+/// `0:00`, `4:05`, `1:02:03`: YouTube's chapter times.
+fn chapter_time(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Chapters for a VOD's description, as YouTube reads them, from a stream's markers: scene
+/// changes and big moments (chat spikes and first chatters left out), starting at 0:00, at
+/// least 10 s apart (the later one of two close ones wins: it's where things settled).
+/// Err says why there are none (YouTube needs at least 3).
+pub fn youtube_chapters(markers: &[Marker]) -> Result<String, String> {
+    let mut list: Vec<(i64, String)> = Vec::new();
+    let mut sorted: Vec<&Marker> = markers.iter().filter(|m| m.offset_ms.is_some()).collect();
+    sorted.sort_by_key(|m| m.offset_ms);
+    for m in sorted {
+        if matches!(m.kind, MomentKind::ChatSpike | MomentKind::FirstChatter) {
+            continue;
+        }
+        let at = m.offset_ms.unwrap_or(0).max(0);
+        // YouTube refuses < and > in a description.
+        let label: String =
+            m.label.chars().map(|c| if c.is_control() || c == '<' || c == '>' { ' ' } else { c }).collect();
+        let label: String = label.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(100).collect();
+        if label.is_empty() {
+            continue;
+        }
+        if let Some(last) = list.last_mut()
+            && at - last.0 < CHAPTER_GAP_MS
+        {
+            // Too close to the one before: this one replaces it, where it began.
+            last.1 = label;
+            continue;
+        }
+        list.push((at, label));
+    }
+    // The first is at 0:00 (a "Start" when nothing was marked there).
+    match list.first_mut() {
+        Some(first) if first.0 < CHAPTER_GAP_MS => first.0 = 0,
+        _ => list.insert(0, (0, "Start".into())),
+    }
+    list.truncate(CHAPTER_MAX);
+    if list.len() < CHAPTER_MIN {
+        return Err(format!(
+            "YouTube needs at least {CHAPTER_MIN} chapters, 10 seconds apart; this stream has {}. Scene changes and big moments make them.",
+            list.len()
+        ));
+    }
+    Ok(list.iter().map(|(at, l)| format!("{} {l}\n", chapter_time(*at))).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +529,33 @@ mod tests {
         for k in ["tip", "superchat", "bits", "gift", "raid", "first_chatter", "chat_spike", "clip", "manual"] {
             assert_eq!(MomentKind::from_key(k).map(MomentKind::key), Some(k));
         }
+    }
+
+    fn marker(at_s: i64, kind: MomentKind, label: &str) -> Marker {
+        Marker { id: at_s, at: 0, offset_ms: Some(at_s * 1000), kind, label: label.into(), platform: None, clip: false }
+    }
+
+    #[test]
+    fn chapters_follow_youtubes_rules() {
+        let ms = [
+            marker(3, MomentKind::Scene, "Starting soon"),
+            marker(185, MomentKind::Scene, "Just chatting"),
+            marker(190, MomentKind::Scene, "Gameplay"),
+            marker(400, MomentKind::ChatSpike, "Chat spike: 40 messages in 30 seconds"),
+            marker(3725, MomentKind::Raid, "Bo raided\nwith 30"),
+        ];
+        assert_eq!(youtube_chapters(&ms).unwrap(), "0:00 Starting soon\n3:05 Gameplay\n1:02:05 Bo raided with 30\n");
+        // Nothing at the start: a "Start" goes first. Too few: why.
+        let few = [marker(60, MomentKind::Scene, "Gameplay")];
+        assert!(youtube_chapters(&few).unwrap_err().contains("at least 3"));
+        let two = [marker(60, MomentKind::Scene, "Gameplay"), marker(600, MomentKind::Scene, "Chat")];
+        assert_eq!(youtube_chapters(&two).unwrap(), "0:00 Start\n1:00 Gameplay\n10:00 Chat\n");
+        assert_eq!(MomentKind::from_key("scene"), Some(MomentKind::Scene));
+        let odd = [
+            marker(0, MomentKind::Manual, "I <3 you"),
+            marker(30, MomentKind::Scene, "A"),
+            marker(60, MomentKind::Scene, "B"),
+        ];
+        assert!(youtube_chapters(&odd).unwrap().starts_with("0:00 I 3 you\n"));
     }
 }

@@ -130,7 +130,7 @@ impl Engine {
     /// Tells Ferrocast's own encoders where FFmpeg is (they go through it off a Mac).
     pub(crate) fn share_ffmpeg(&self) {
         if let Some(p) = self.ffmpeg_path() {
-            ferrocast_av::ffenc::set_ffmpeg(&p);
+            ferrocore::ffenc::set_ffmpeg(&p);
         }
     }
 

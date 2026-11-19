@@ -12,6 +12,13 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::process::Command;
 
+/// PowerShell with no console window of its own (`ferrocore::ffenc::hidden`): a spoken alert
+/// flashed a terminal on screen, on stream, in an installed Ferrocast.
+#[cfg(target_os = "windows")]
+fn hidden_powershell() -> Command {
+    Command::from(ferrocore::ffenc::hidden(std::process::Command::new("powershell")))
+}
+
 mod cloud;
 #[cfg(test)]
 mod cloud_tests;
@@ -67,8 +74,7 @@ pub async fn voices() -> Vec<Voice> {
     #[cfg(target_os = "windows")]
     {
         let script = "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name + '|' + $_.VoiceInfo.Culture.Name }";
-        let Ok(out) =
-            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]).output().await
+        let Ok(out) = hidden_powershell().args(["-NoProfile", "-NonInteractive", "-Command", script]).output().await
         else {
             return Vec::new();
         };
@@ -148,7 +154,7 @@ fn command(input: &Path, voice: Option<&str>, out: &Path) -> Result<Command, Spe
     let script = "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
         if ($env:FC_VOICE) { $s.SelectVoice($env:FC_VOICE) }; $s.SetOutputToWaveFile($env:FC_OUT); \
         $s.Speak([System.IO.File]::ReadAllText($env:FC_IN)); $s.Dispose()";
-    let mut c = Command::new("powershell");
+    let mut c = hidden_powershell();
     c.args(["-NoProfile", "-NonInteractive", "-Command", script]).env("FC_IN", input).env("FC_OUT", out);
     if let Some(v) = voice {
         c.env("FC_VOICE", v);

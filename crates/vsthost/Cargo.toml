@@ -1,0 +1,38 @@
+[package]
+name = "ferrocast-vsthost"
+description = "VST3 sound plugins in a locked-down helper process (ferrocast-vst), and the engine's side of it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ferrocast-vst"
+path = "src/bin/ferrocast-vst.rs"
+
+[dependencies]
+ferrocore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+vst3 = "0.3"
+libloading = "0.8"
+base64 = "0.22"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBundle", "CFURL", "CFString", "CFBase"] }
+# The plugin's own window: the helper's main thread runs AppKit.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSGraphics", "NSRunningApplication"] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
+
+[dev-dependencies]
+ferrocast-vst-testgain = { path = "../vst-testgain" }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"

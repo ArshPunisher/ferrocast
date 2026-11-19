@@ -29,6 +29,8 @@ struct Fake {
     markers: Mutex<Vec<String>>,
     /// Thumbnails taken: (bytes, mime). Only a YouTube fake takes them.
     thumbs: Mutex<Vec<(usize, String)>>,
+    /// What its category search finds, most watched first (none: "<q> result").
+    categories: Vec<(&'static str, &'static str)>,
 }
 
 impl Fake {
@@ -88,6 +90,13 @@ impl Connector for Fake {
         Ok(())
     }
     async fn search_categories(&self, q: &str) -> ferrocast_connector::Result<Vec<CategoryHit>> {
+        if !self.categories.is_empty() {
+            return Ok(self
+                .categories
+                .iter()
+                .map(|(id, name)| CategoryHit { id: (*id).into(), name: (*name).into(), image_url: None })
+                .collect());
+        }
         Ok(vec![CategoryHit { id: "1".into(), name: format!("{q} result"), image_url: None }])
     }
     async fn create_marker(&self, d: &str) -> ferrocast_connector::Result<()> {
@@ -412,6 +421,76 @@ async fn watch_time_counts_chatters_while_live() {
 }
 
 // ---------------------------------------------------------------- stream info
+
+/// A category typed ("Warzone") goes to each platform as its own ("Call of Duty: Warzone", by
+/// its id); YouTube shows Gaming; the preview says the same before anything is sent. Owner,
+/// 15 Nov: Twitch and Kick refused "Warzone" and YouTube showed Fortnite.
+#[tokio::test]
+async fn a_typed_category_becomes_each_platforms_own() {
+    use ferrocast_core::stream_info::Category;
+    let (e, _d) = engine().await;
+    let found = [("33214", "Warzone 2100"), ("512710", "Call of Duty: Warzone"), ("9", "Warzone Tips")];
+    // Most watched first, as Twitch and Kick list them.
+    let ordered = vec![found[1], found[0], found[2]];
+    let tw = Arc::new(Fake { platform: Some(Platform::Twitch), categories: ordered.clone(), ..Default::default() });
+    let kick = Arc::new(Fake { platform: Some(Platform::Kick), categories: ordered, ..Default::default() });
+    let yt = Fake::new(Platform::Youtube);
+    for c in [tw.clone(), kick.clone(), yt.clone()] {
+        e.register_connector(c);
+    }
+    let shown = e.categories_as("warzone").await.unwrap();
+    let name = |p: Platform| shown.iter().find(|x| x.platform == p).and_then(|x| x.name.clone());
+    assert_eq!(name(Platform::Twitch).as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(name(Platform::Kick).as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(name(Platform::Youtube).as_deref(), Some("Gaming"));
+    assert!(
+        shown
+            .iter()
+            .find(|x| x.platform == Platform::Youtube)
+            .unwrap()
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("YouTube Studio")
+    );
+
+    let info = StreamInfo {
+        title: Some("Death Has a Play Button".into()),
+        category: Some(Category { name: "Warzone".into(), ids: Default::default() }),
+        ..Default::default()
+    };
+    let r = e.apply_stream_info(info, None, None).await.unwrap();
+    assert_eq!(r.failed, 0, "{:?}", r.results);
+    let line = |p: Platform| r.results.iter().find(|x| x.platform == p).unwrap().clone();
+    assert_eq!(line(Platform::Twitch).category.as_deref(), Some("Call of Duty: Warzone"));
+    assert_eq!(line(Platform::Youtube).category.as_deref(), Some("Gaming"));
+    assert_eq!(tw.infos.lock().unwrap()[0].category.as_ref().unwrap().ids.twitch.as_deref(), Some("512710"));
+    assert_eq!(kick.infos.lock().unwrap()[0].category.as_ref().unwrap().ids.kick.as_deref(), Some("512710"));
+    // Nothing like it: said before sending, and the platform refuses it as before.
+    let none =
+        Arc::new(Fake { platform: Some(Platform::Twitch), categories: vec![("1", "Fortnite")], ..Default::default() });
+    e.register_connector(none);
+    let shown = e.categories_as("Warzone").await.unwrap();
+    let tw_line = shown.iter().find(|x| x.platform == Platform::Twitch).unwrap();
+    assert!(tw_line.name.is_none() && tw_line.note.as_deref().unwrap().contains("no category called"));
+    assert!(matches!(e.categories_as("  ").await, Err(crate::EngineError::Invalid(_))));
+}
+
+#[test]
+fn the_best_category_is_exact_then_most_watched_with_every_word() {
+    use super::stream_info::best_category;
+    let hit = |name: &str| CategoryHit { id: name.into(), name: name.into(), image_url: None };
+    let hits = [hit("Call of Duty: Warzone"), hit("Warzone 2100"), hit("Valorant")];
+    let best = |q: &str| best_category(q, &hits).map(|h| h.name.as_str());
+    assert_eq!(best("warzone"), Some("Call of Duty: Warzone"), "most watched first, not the shortest");
+    assert_eq!(best("WARZONE 2100"), Some("Warzone 2100"), "an exact name wins");
+    assert_eq!(best("call of duty warzone"), Some("Call of Duty: Warzone"), "punctuation aside");
+    assert_eq!(best("valo"), None, "part of a word isn't enough");
+    assert_eq!(best("  "), None);
+    assert_eq!(best("Minecraft"), None);
+    assert_eq!(best("of"), None, "a small word alone picks nothing");
+    assert_eq!(best("the"), None);
+}
 
 #[tokio::test]
 async fn stream_info_reports_each_platform_and_keeps_history() {
@@ -893,6 +972,73 @@ async fn markers_export_as_csv_and_text() {
     assert!(err.to_string().starts_with("sound:"));
 }
 
+/// A 30 s clip looked at twice a second: 60 pictures in batches, the frame on the right.
+#[tokio::test]
+async fn a_clip_is_looked_at_in_batches_to_fill_the_frame() {
+    let Some(ffmpeg) = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    else {
+        return;
+    };
+    let (e, d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let clip = d.path().join("clip.mp4");
+    let ok = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10:duration=30"])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    let expr = e.clip_focus(&ffmpeg, &clip).await.expect("a path");
+    assert_eq!(*studio.focus_batches.lock().unwrap(), [40, 20]);
+    assert!(expr.contains("0.8000"), "{expr}");
+}
+
+#[tokio::test]
+async fn the_streams_health_is_scored_while_live() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    // Not live yet: no score.
+    assert!(e.studio_stats().await.unwrap().get("health").is_none());
+    e.health_tick().await;
+    e.health_tick().await;
+    let h = e.studio_stats().await.unwrap()["health"].clone();
+    assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(100), Some("great")));
+    // 18 frames drawn late out of the 360 since the first look: 5% costs 20.
+    *studio.lagged.lock().unwrap() = 18;
+    e.health_tick().await;
+    let h = e.studio_stats().await.unwrap()["health"].clone();
+    assert_eq!((h["score"].as_u64(), h["verdict"].as_str()), (Some(80), Some("good")));
+    assert!(h["reason"].as_str().unwrap().contains("late"));
+}
+
+#[tokio::test]
+async fn a_scene_change_while_live_is_a_chapter() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Starting".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.scene_chapter_tick().await;
+    e.scene_chapter_tick().await;
+    *studio.current.lock().unwrap() = "Gameplay".into();
+    e.scene_chapter_tick().await;
+    let scenes: Vec<String> =
+        e.markers(None).await.unwrap().into_iter().filter(|m| m.kind == MomentKind::Scene).map(|m| m.label).collect();
+    assert_eq!(scenes, ["Starting", "Gameplay"], "one per change");
+    // Two scenes seconds apart make one chapter: YouTube wants three, and says so.
+    let err = e.export_markers("youtube", None).await.unwrap_err();
+    assert!(err.to_string().contains("at least 3"), "{err}");
+    // Markers off: no scene chapters.
+    e.patch_moments_config(json!({ "markers": false }).as_object().unwrap()).await.unwrap();
+    *studio.current.lock().unwrap() = "Chat".into();
+    e.scene_chapter_tick().await;
+    assert!(!e.markers(None).await.unwrap().iter().any(|m| m.label == "Chat"));
+}
+
 #[tokio::test]
 async fn a_chat_spike_while_live_is_marked() {
     let (e, _d) = engine().await;
@@ -1084,6 +1230,18 @@ struct FakeStudio {
     current: Mutex<String>,
     muted: Mutex<bool>,
     streaming: Mutex<bool>,
+    /// The camera shown in its scene.
+    cam_shown: Mutex<bool>,
+    /// What the mic hears (dBFS), and whether the camera's picture is black.
+    mic_db: Mutex<f32>,
+    cam_black: Mutex<bool>,
+    /// How many pictures each `focus` call got.
+    focus_batches: Mutex<Vec<usize>>,
+    /// The engine's frames so far (each stats call is two seconds more), and those drawn late.
+    frames: Mutex<u64>,
+    lagged: Mutex<u64>,
+    /// A scene with nothing in it (its source count is given only when this is set).
+    empty_scene: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -1109,14 +1267,29 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn defaults(&self, _kind: String) -> Result<Value, String> {
         Ok(json!({}))
     }
+    async fn focus(&self, pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
+        // The eye on the right, in every picture.
+        self.focus_batches.lock().unwrap().push(pictures.len());
+        Ok(vec![Some(0.8); pictures.len()])
+    }
+
     async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
         use crate::studio_host::StudioAct as A;
         let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
         Ok(match act {
-            A::Scenes => json!({
-                "current": lock(&self.current),
-                "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
-            }),
+            A::Scenes => match self.empty_scene.lock().unwrap().clone() {
+                None => json!({
+                    "current": lock(&self.current),
+                    "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
+                }),
+                Some(empty) => {
+                    let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
+                        .iter()
+                        .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
+                        .collect();
+                    json!({ "current": lock(&self.current), "scenes": scenes })
+                }
+            },
             A::SetCurrent { scene } => {
                 self.acts.lock().unwrap().push(format!("scene {scene}"));
                 *self.current.lock().unwrap() = scene;
@@ -1130,7 +1303,15 @@ impl crate::studio_host::StudioHost for FakeStudio {
                 }
                 Value::Null
             }
-            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": false }]),
+            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": *self.cam_shown.lock().unwrap() }]),
+            A::Levels { .. } => {
+                let db = *self.mic_db.lock().unwrap();
+                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db] } })
+            }
+            A::Look { .. } => {
+                let black = *self.cam_black.lock().unwrap();
+                json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
+            }
             A::EditItem { scene, id, edit } => {
                 self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
                 Value::Null
@@ -1145,7 +1326,18 @@ impl crate::studio_host::StudioHost for FakeStudio {
         Ok(None)
     }
     async fn stats(&self) -> Result<Value, String> {
-        Ok(json!({ "disk_free_mb": 500_000.0, "replay": null }))
+        let frames = {
+            let mut f = self.frames.lock().unwrap();
+            *f += 120;
+            *f
+        };
+        let lagged = *self.lagged.lock().unwrap();
+        Ok(json!({
+            "disk_free_mb": 500_000.0,
+            "replay": null,
+            "engine": { "frames": frames, "lagged": lagged, "encoded": frames, "skipped": 0, "cpu": 20.0 },
+            "stream": { "frames": frames, "dropped": 0, "reconnecting": false },
+        }))
     }
     async fn record(&self, on: bool) -> Result<Value, String> {
         self.acts.lock().unwrap().push(format!("record {on}"));
@@ -1157,7 +1349,12 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn monitoring(&self) -> Result<Value, String> {
         Ok(json!({ "devices": [] }))
     }
-    async fn stream_start(&self, _server: String, _key: String) -> Result<Value, String> {
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
         self.acts.lock().unwrap().push("stream true".into());
         *self.streaming.lock().unwrap() = true;
         Ok(json!({ "active": true }))
@@ -1176,6 +1373,38 @@ impl crate::studio_host::StudioHost for FakeStudio {
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(json!({}))
     }
+}
+
+/// 19 Nov, live: the show's live scene was an empty "Main", and five minutes in the stream went
+/// black; then, after the Studio was stopped and started, Go live said "a show is already
+/// running". An empty scene is never switched to, and a show whose stream stopped is over.
+#[tokio::test]
+async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Starting".into()),
+        empty_scene: Mutex::new(Some("Live".into())),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({
+            "live_scene": "Live", "countdown_s": 0, "discord": false, "alerts_on": false, "bot_on": false,
+            "start_stream": true,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let run = e.start_show(true).await.unwrap();
+    let live = run.steps.iter().find(|s| s.id == "live_scene").unwrap_or_else(|| panic!("{:?}", run.steps));
+    assert_eq!(live.status, "skipped", "{live:?}");
+    assert!(live.detail.contains("has nothing in it"), "{live:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting", "the scene on air stays");
+    // The stream stops some other way (the Studio stopped): a new show may start.
+    *studio.streaming.lock().unwrap() = false;
+    assert!(e.start_show(true).await.is_ok(), "the old show was over");
 }
 
 #[tokio::test]
@@ -1289,4 +1518,60 @@ async fn a_raid_puts_its_rules_scene_on_for_a_while_and_a_follow_shows_a_source(
     e.rules_saw(&follow).await;
     eventually(shown).await;
     eventually(|| !shown()).await;
+}
+
+/// The pre-flight checks what the Studio actually hears and shows: a mic that's on but silent,
+/// a camera that's shown but black.
+#[tokio::test]
+async fn the_preflight_hears_a_silent_mic_and_sees_a_black_camera() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        mic_db: Mutex::new(-90.0),
+        cam_black: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({ "live_scene": "Live", "mic_sources": ["Mic"], "cam_sources": ["Camera"] }).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    let pf = e.preflight().await;
+    let check = |pf: &crate::studio::show::Preflight, id: &str| pf.checks.iter().find(|c| c.id == id).cloned().unwrap();
+    let mic = check(&pf, "mic:Mic");
+    assert_eq!(mic.status, ferrocast_core::show::CheckStatus::Warn);
+    assert!(mic.detail.contains("no sound comes in"), "{mic:?}");
+    let cam = check(&pf, "cam:Camera");
+    assert_eq!(cam.status, ferrocast_core::show::CheckStatus::Fail);
+    assert!(cam.detail.contains("black"), "{cam:?}");
+    assert!(!pf.ready);
+    // Sound in, a picture on: both fine.
+    *studio.mic_db.lock().unwrap() = -18.0;
+    *studio.cam_black.lock().unwrap() = false;
+    let pf = e.preflight().await;
+    assert_eq!(check(&pf, "mic:Mic").status, ferrocast_core::show::CheckStatus::Ok);
+    assert_eq!(check(&pf, "cam:Camera").status, ferrocast_core::show::CheckStatus::Ok);
+}
+
+/// A watched camera black long enough puts the show on BRB by itself, and its picture coming
+/// back returns it to where it was.
+#[tokio::test]
+async fn a_black_camera_puts_the_show_on_brb_and_back() {
+    use ferrocast_core::show::LiveAlert;
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+    let alert = |cleared| LiveAlert { id: "camera:Cam:black".into(), level: "error", message: String::new(), cleared };
+    e.brb_when_black(&[alert(false)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    // Another alert while black changes nothing; the picture back returns.
+    e.brb_when_black(&[]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    e.brb_when_black(&[alert(true)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+    // Asked for without a BRB scene: refused.
+    assert!(e.patch_scenes_config(json!({ "brb_scene": null }).as_object().unwrap()).await.is_err());
 }

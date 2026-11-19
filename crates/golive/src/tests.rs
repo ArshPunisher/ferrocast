@@ -214,11 +214,20 @@ fn destination(port: u16, key: &str) -> Destination {
         key: key.into(),
         retry: Default::default(),
         extra_audio: false,
+        extra_video: false,
     }
 }
 
 fn start(w: &World, d: Destination) -> watch::Receiver<Health> {
-    let (tx, rx) = watch::channel(Health { state: PushState::Waiting, kbps: 0, dropped: 0, since_ms: 0 });
+    let (tx, rx) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
     tokio::spawn(push::run(d, w.hub.clone(), tx, w.stop.subscribe()));
     rx
 }
@@ -293,6 +302,51 @@ async fn a_late_destination_gets_the_headers_and_starts_at_a_keyframe() {
     // Timestamps start at zero for this destination.
     assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
     assert_eq!(next(&mut got).await, Got::Video(33, Bytes::from_static(INTER)));
+}
+
+/// The Studio feeds its hub itself (no OBS): its `onMetaData` goes first too, as OBS's does.
+/// Kick hung up every few seconds on a stream without one (15 Nov).
+#[tokio::test]
+async fn a_stream_made_here_sends_its_metadata_before_anything() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.video_frame_rate = Some(60.0);
+    w.hub.metadata(m);
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    assert_eq!(w.hub.stats().width, Some(1920));
+
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, destination(dport, "k"));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    assert_eq!(next(&mut got).await, Got::Meta);
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+}
+
+/// A picture changed while live (Optimize): a platform rejoining after it is told the new size,
+/// not the one the stream began with.
+#[tokio::test]
+async fn metadata_changed_reaches_those_who_join_later() {
+    let w = world().await;
+    w.hub.start();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.audio_sample_rate = Some(48_000);
+    w.hub.metadata(m);
+    w.hub.metadata_changed(|m| {
+        m.video_width = Some(1280);
+        m.video_height = Some(720);
+    });
+    assert_eq!(w.hub.stats().width, Some(1280));
+    let kept = w.hub.subscribe().headers.metadata.unwrap();
+    assert_eq!((kept.video_width, kept.video_height, kept.audio_sample_rate), (Some(1280), Some(720), Some(48_000)));
 }
 
 #[tokio::test]
@@ -516,17 +570,20 @@ async fn platform_that_drops(
 }
 
 #[tokio::test]
-async fn a_platform_that_keeps_dropping_a_live_stream_is_retried_from_the_first_wait() {
+async fn a_platform_that_takes_the_stream_and_drops_it_at_once_waits_longer_each_time() {
+    // 19 Nov, live: Kick took the stream and closed it at once, every 8 s for the whole
+    // stream, always "attempt 1". A session live for only a moment doesn't start the count
+    // over (one live a while does: STAYED_LIVE_MS), so the waits grow as with any failure.
     let w = world().await;
     let l = free_listener().await;
     let dport = l.local_addr().unwrap().port();
     let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
     let mut health = start(&w, destination(dport, "k"));
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
-    for _ in 0..2 {
+    for want in 1..=2u32 {
         state_is(&mut health, |s| *s == PushState::Live).await;
         match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
-            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, 1, "the count starts over after being live"),
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
             s => panic!("{s:?}"),
         }
     }
@@ -629,5 +686,48 @@ async fn only_twitch_gets_the_vod_track_and_late_it_gets_its_header() {
     assert_eq!(next(&mut other).await, Got::Video(0, Bytes::from_static(KEY)));
     assert_eq!(next(&mut other).await, Got::Audio(10, Bytes::from_static(AAC_FRAME)));
     // The other platform never sees the VOD track: next is the picture.
+    assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
+}
+
+/// Twitch Enhanced Broadcasting's extra qualities (Enhanced RTMP multitrack video, track 1 here).
+const EB_HEADER: &[u8] = b"\x96\x00avc1\x01\x01\x64\x00\x1f";
+const EB_KEY: &[u8] = b"\x96\x03avc1\x01\x00\x00\x00\x01";
+const EB_INTER: &[u8] = b"\xA6\x03avc1\x01\x00\x00\x00\x02";
+
+#[tokio::test]
+async fn only_enhanced_broadcasting_gets_the_other_qualities() {
+    let w = world().await;
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    obs.meta().await;
+    obs.video(0, AVC_HEADER).await;
+    obs.video(0, EB_HEADER).await;
+    obs.audio(0, AAC_HEADER).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (lt, lo) = (free_listener().await, free_listener().await);
+    let (pt, po) = (lt.local_addr().unwrap().port(), lo.local_addr().unwrap().port());
+    let (mut twitch, mut other) = (platform(lt, "t").await, platform(lo, "o").await);
+    let mut ht = start(&w, Destination { extra_video: true, ..destination(pt, "t") });
+    let mut ho = start(&w, destination(po, "o"));
+    state_is(&mut ht, |s| *s == PushState::Live).await;
+    state_is(&mut ho, |s| *s == PushState::Live).await;
+    for rx in [&mut twitch, &mut other] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Meta);
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+    // The late joiner gets the extra track's header too; Twitch only.
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_HEADER)));
+
+    // An extra track's keyframe isn't where a destination starts: the main one's is.
+    obs.video(900, EB_KEY).await;
+    obs.video(1000, KEY).await;
+    obs.video(1000, EB_INTER).await;
+    obs.video(1040, INTER).await;
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(KEY)));
+    assert_eq!(next(&mut twitch).await, Got::Video(0, Bytes::from_static(EB_INTER)));
+    assert_eq!(next(&mut other).await, Got::Video(0, Bytes::from_static(KEY)));
+    // The other platform never sees track 1: next is the main picture.
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }

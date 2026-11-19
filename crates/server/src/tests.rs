@@ -1274,6 +1274,22 @@ async fn updates_are_offered_only_when_found_and_never_while_live() {
 }
 
 #[tokio::test]
+async fn a_store_install_points_to_the_store_for_updates() {
+    let r = start().await;
+    r.engine.updates_from_store();
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!((v["store"].as_bool(), v["can_install"].as_bool()), (Some(true), Some(false)));
+    // Checks and restarts say where updates come from, not "download it yourself".
+    let check = r.post("/api/v1/updates/check", json!({})).await;
+    assert_eq!(error_code(check).await, (StatusCode::CONFLICT, "store_updates".into()));
+    let restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(error_code(restart).await, (StatusCode::CONFLICT, "store_updates".into()));
+    r.engine.set_available_update(Some(found("9.9.9")));
+    let install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(error_code(install).await, (StatusCode::CONFLICT, "store_updates".into()));
+}
+
+#[tokio::test]
 async fn an_install_shows_progress_then_waits_for_the_restart_never_while_live() {
     let r = start().await;
     let mut live = r.engine.subscribe_live();
@@ -1594,11 +1610,7 @@ async fn go_live_routes_refuse_what_is_wrong() {
         |id: &str| r.client.delete(format!("{}/api/v1/golive/destinations/{id}", r.base)).bearer_auth(&r.token).send();
     assert_eq!(error_code(del("twitch").await.unwrap()).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(error_code(del("c_nope").await.unwrap()).await.0, StatusCode::NOT_FOUND);
-    // Nothing ticked: the upload check says so. No OBS: setup says how to fix it.
-    assert_eq!(
-        error_code(r.post("/api/v1/golive/upload-check", json!({})).await).await,
-        (StatusCode::UNPROCESSABLE_ENTITY, "golive_none".into())
-    );
+    // No OBS: setup says how to fix it.
     assert_eq!(
         error_code(r.post("/api/v1/golive/obs/restore", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "golive_nothing_saved".into())
@@ -1632,6 +1644,10 @@ async fn go_live_routes_refuse_what_is_wrong() {
     let ok: Value = r.put("/api/v1/golive/aitum", json!({ "ok": true })).await.json().await.unwrap();
     assert_eq!(ok["aitum_ok"], true);
     assert_eq!(error_code(r.put("/api/v1/golive/aitum", json!({ "ok": 1 })).await).await.0, StatusCode::BAD_REQUEST);
+    // Auto quality: on unless turned off.
+    assert_eq!(v["auto_quality"], true);
+    let off: Value = r.put("/api/v1/golive/auto-quality", json!({ "on": false })).await.json().await.unwrap();
+    assert_eq!(off["auto_quality"], false);
     assert_eq!(
         error_code(r.post("/api/v1/golive/resume/kick", json!({})).await).await,
         (StatusCode::UNPROCESSABLE_ENTITY, "golive_not_paused".into())

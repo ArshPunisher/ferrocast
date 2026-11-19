@@ -16,8 +16,10 @@ mod import;
 mod loyalty;
 #[cfg(test)]
 pub(crate) use core::lan_ip;
+mod automations;
 mod media;
 mod moderation;
+mod plugins;
 mod polls;
 mod pro;
 mod recap;
@@ -219,6 +221,10 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(autoreplies::routes())
         // Pro dashboard from anywhere: devices, pairing links (see crate::remote)
         .merge(crate::remote::routes())
+        // Plugins: effects others make (see routes/plugins.rs; installing is an upload)
+        .merge(plugins::routes())
+        // "When X, do Y" rules (routes/automations.rs)
+        .merge(automations::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.
@@ -236,6 +242,11 @@ pub(crate) fn uploads() -> Router<AppState> {
             Router::new()
                 .route("/designs/import", post(designs::import))
                 .layer(axum::extract::DefaultBodyLimit::max(designs::MAX_DESIGN_BODY)),
+        )
+        .merge(
+            Router::new()
+                .route("/plugins", post(plugins::install))
+                .layer(axum::extract::DefaultBodyLimit::max(plugins::MAX_PLUGIN_BODY)),
         )
         .merge(
             Router::new()

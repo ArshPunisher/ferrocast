@@ -1,0 +1,49 @@
+[package]
+name = "ferrocast-wincam"
+description = "Ferrocast Camera on Windows: a DirectShow source filter and a Media Foundation media source, in one DLL apps and the camera frame server load."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The DLL apps load; the rlib for its tests.
+name = "ferrocast_camera"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ferrocast-camshare = { path = "../camshare" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    # The end-to-end check reads DirectShow's camera names (VARIANTs).
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+] }
+windows-core = "0.61"
+
+[lints.rust]
+# COM objects and the DLL's exports are unsafe by nature; each block says why it's sound.
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"

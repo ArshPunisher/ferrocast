@@ -41,9 +41,12 @@ Always `{"error": {"code": "...", "message": "...", "hint": "..." | null}}`, nev
 ## Privacy
 
 The Pro tabs below are about subscriptions: the relay keeps only a keyed hash of the checkout
-email, so there `email` is always `null` (with `email_on_file: true|false`). Install ids are
-shown masked (`"AbC1…"`); search accepts a full install id. A "user" there is one Pro
-subscription (paid `sub_…` or free grant `comp_…`).
+email (`email_on_file: true|false`). A subscription or grant that belongs to an account (bought
+signed in, matched by email, or given to it) comes with that account's `email`, `name` (the
+users list's `display_name`) and `account_id`; one only an install has (bought before
+accounts) has `null` there. Install ids are shown masked (`"AbC1…"`); search accepts a full
+install id, or part of an account's email or name. A "user" there is one Pro subscription (paid
+`sub_…` or free grant `comp_…`), with `forever: true` for a grant until revoked.
 
 Since 1.3 people may also have an **account** (free, Google or email sign-in, docs/ACCOUNTS.md).
 Accounts have a verified email, shown in the Accounts tab (§ Accounts at the end).
@@ -232,12 +235,13 @@ Actions: `grant.create`, `grant.revoke`, `code.create`, `code.disable`, `price.s
 { "install_id": "AbC1dEf2gHi3jKl4", "days": 14, "note": "Giveaway winner" }
 ```
 
-`days` 1..90 (a grant never reaches more than 90 days past now; granting again extends).
-`plan`, if sent, must be `"pro"`. Hookline's `email` / `forever` are refused with 422
-`unsupported` (no accounts, no forever grants). The install id is the part before the dot of
-the app's relay-install secret.
+`days` 1..90 (a grant never reaches more than 90 days past now; granting again extends), or
+`"forever": true` instead (until revoked; its `ends_at` is `9999-12-31T23:59:59Z`, and days
+given later never shorten it). `plan`, if sent, must be `"pro"`. Hookline's `email` is refused
+with 422 `unsupported` (give an account Pro on its own route). The install id is the part
+before the dot of the app's relay-install secret.
 
-→ 201 `{ "id": "comp_Xy12ab34cd56", "plan": "pro", "starts_at": "...", "ends_at": "...", "extended": false }`
+→ 201 `{ "id": "comp_Xy12ab34cd56", "plan": "pro", "starts_at": "...", "ends_at": "...", "forever": false, "extended": false }`
 
 Errors: 404 `unknown_install`; 409 `has_subscription` (that install pays for Pro; nothing
 changed); 422 `invalid_days`.
@@ -432,13 +436,15 @@ The list row plus:
 
 404 `not_found` for an unknown id.
 
-### `POST /admin/v1/accounts/{id}/grant` `{ "days": 1..90, "note"? }` → 201
+### `POST /admin/v1/accounts/{id}/grant` `{ "days": 1..90 | "forever": true, "note"? }` → 201
 
 Gives (or extends) free Pro to the account, capped at 90 days from now (like Give Pro on an
-install). It reaches the account's 3 most recently signed-in PCs and the web dashboard.
+install), or forever (until revoked; days given later never shorten it). It reaches the
+account's 3 most recently signed-in PCs and the web dashboard. The account's `grants` say
+`forever` too.
 
 ```json
-{ "id": "comp_…", "account_id": "ac_…", "plan": "pro", "starts_at": "…", "ends_at": "…", "extended": false }
+{ "id": "comp_…", "account_id": "ac_…", "plan": "pro", "starts_at": "…", "ends_at": "…", "forever": false, "extended": false }
 ```
 
 409 `has_subscription` when the account pays for Pro; 422 `invalid_days`, `invalid_text`.

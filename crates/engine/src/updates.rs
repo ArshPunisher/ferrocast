@@ -81,6 +81,8 @@ pub struct InstallState {
 pub(crate) struct UpdateState {
     /// A desktop shell with the updater is attached (never in the headless app).
     updater: bool,
+    /// The Microsoft Store installed this copy and updates it (never with `updater`).
+    store: bool,
     available: Option<AvailableUpdate>,
     checking: bool,
     /// When the last check finished (ms since the epoch), whatever it found.
@@ -105,6 +107,8 @@ pub struct UpdateView {
     pub published_at: Option<String>,
     /// This app can download and install it (the desktop app); false in the headless app.
     pub can_install: bool,
+    /// The Microsoft Store installed this copy and keeps it up to date (`can_install` false).
+    pub store: bool,
     pub checking: bool,
     pub checked_at: Option<i64>,
     pub error: Option<UpdateProblem>,
@@ -122,7 +126,15 @@ fn refused(status: u16, code: &'static str, message: &str, hint: &str) -> Engine
     EngineError::Refused { status, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
 
-fn no_updater() -> EngineError {
+fn no_updater(store: bool) -> EngineError {
+    if store {
+        return refused(
+            409,
+            "store_updates",
+            "The Microsoft Store keeps this copy of Ferrocast up to date.",
+            "To get a new version now, open the Microsoft Store, go to Downloads, and press Get updates.",
+        );
+    }
     refused(
         409,
         "no_updater",
@@ -141,7 +153,7 @@ fn claimable(s: &UpdateState, blocked: bool) -> Result<AvailableUpdate, EngineEr
         });
     };
     if !s.updater {
-        return Err(no_updater());
+        return Err(no_updater(s.store));
     }
     match s.install.phase {
         InstallPhase::Downloading | InstallPhase::Installing => {
@@ -196,6 +208,7 @@ impl Engine {
             notes: found.and_then(|u| u.notes.clone()),
             published_at: found.and_then(|u| u.published_at.clone()),
             can_install: s.updater,
+            store: s.store,
             checking: s.checking,
             checked_at: s.checked_at,
             error: s.error,
@@ -208,6 +221,15 @@ impl Engine {
     /// The desktop shell has an updater: the dashboard may offer checks and installs.
     pub fn attach_updater(&self) {
         self.with_update(|s| s.updater = true);
+    }
+
+    /// The Microsoft Store installed this copy: it updates it, so Ferrocast offers no checks
+    /// or installs of its own and the dashboard points to the Store instead.
+    pub fn updates_from_store(&self) {
+        self.with_update(|s| {
+            s.updater = false;
+            s.store = true;
+        });
     }
 
     /// A check started (on its own timer or because the dashboard asked).
@@ -339,7 +361,7 @@ impl Engine {
         let before = {
             let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
             if !s.updater {
-                return Err(no_updater());
+                return Err(no_updater(s.store));
             }
             s.checks_done
         };
@@ -376,12 +398,12 @@ impl Engine {
 
     /// "Restart to finish": only after an install, and never while live (R-60).
     pub fn request_update_restart(&self) -> Result<String, EngineError> {
-        let (updater, install) = {
+        let (updater, store, install) = {
             let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
-            (s.updater, s.install.clone())
+            (s.updater, s.store, s.install.clone())
         };
         if !updater {
-            return Err(no_updater());
+            return Err(no_updater(store));
         }
         if install.phase != InstallPhase::Ready {
             return Err(refused(

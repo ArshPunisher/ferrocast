@@ -71,7 +71,7 @@ Captions, voice control and follow my face need a Mac for now.
 ## Why Ferrocast
 
 - **You own your setup.** Overlays, sounds, commands, points and tip history live on your machine. One click exports all of it.
-- **Light while you game.** The engine is Rust. The window closes to the tray, and overlays are plain HTML.
+- **Light while you game.** Ferrocore, the video engine, is Rust. The window closes to the tray, and overlays are plain HTML.
 - **Few clicks.** Sign in, pick a look, press Go live.
 - **Free and open.** GPL-3.0. You don't need a Ferrocast account to stream.
 
@@ -83,7 +83,8 @@ This repo holds the engine, the local server, the desktop app and the small rela
 |---|---|
 | `crates/core` | Events, dedupe, alert queue, templates, filters, commands. Pure Rust, no I/O. |
 | `crates/engine` | Wires adapters, the bot, moderation and alerts together. |
-| `crates/studio` | The built-in Studio: OBS's libobs and its plugins, loaded at runtime. |
+| `crates/ferrocore` | **Ferrocore**, our own video and sound engine: GPU compositor (wgpu), capture, encoders, mixer. No libobs. |
+| `crates/studio` | The built-in Studio: scenes, sources and outputs, run on Ferrocore. |
 | `crates/golive` | Go live everywhere: a local ingest and one forwarder per platform, no re-encode. |
 | `crates/twitch`, `crates/youtube`, `crates/kick` | One adapter per platform. |
 | `crates/obs` | OBS WebSocket v5 control. |

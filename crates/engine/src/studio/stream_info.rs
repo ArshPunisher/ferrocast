@@ -289,6 +289,78 @@ impl Engine {
     }
 }
 
+/// YouTube's video category for a stream with a game: its API can't name the game (YouTube
+/// works that out from the stream itself; YouTube Studio can change it).
+const YOUTUBE_GAMING: &str = "Gaming";
+
+/// Lowercase words, punctuation dropped ("Call of Duty: Warzone" → call, of, duty, warzone).
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+}
+
+/// The platform's category for what the streamer typed: its exact name (case and punctuation
+/// aside); else the first of its search's hits (they come most watched first) holding every
+/// word typed ("Warzone" → "Call of Duty: Warzone", not "Warzone 2100"); else none. Only small
+/// words typed ("of", "the") never pick a game that happens to hold them.
+pub(crate) fn best_category<'a>(typed: &str, hits: &'a [CategoryHit]) -> Option<&'a CategoryHit> {
+    let want = words(typed);
+    if want.is_empty() {
+        return None;
+    }
+    let telling = want.iter().any(|w| w.chars().count() >= 3 && !["the", "and", "for"].contains(&w.as_str()));
+    hits.iter().find(|h| words(&h.name) == want).or_else(|| {
+        if !telling {
+            return None;
+        }
+        hits.iter().find(|h| {
+            let have = words(&h.name);
+            want.iter().all(|w| have.contains(w))
+        })
+    })
+}
+
+/// What each platform would show for a category typed in the form, before anything is sent:
+/// its own name for it, or none when it has no such category (or isn't connected).
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryAs {
+    pub platform: Platform,
+    pub name: Option<String>,
+    /// Why it isn't the game's name (YouTube), or what's wrong.
+    pub note: Option<String>,
+}
+
+impl Engine {
+    /// [`CategoryAs`] for each connected platform, asked at the same time.
+    pub async fn categories_as(&self, typed: &str) -> Result<Vec<CategoryAs>, EngineError> {
+        let typed = typed.trim();
+        if typed.is_empty() || typed.chars().count() > 100 {
+            return Err(EngineError::Invalid("q: type 1 to 100 characters.".into()));
+        }
+        let jobs =
+            Platform::CHAT.iter().copied().filter_map(|p| self.connector(p).map(|c| (p, c))).map(|(p, c)| async move {
+                if p == Platform::Youtube {
+                    return CategoryAs {
+                        platform: p,
+                        name: Some(YOUTUBE_GAMING.into()),
+                        note: Some("YouTube picks the game from your stream; change it in YouTube Studio.".into()),
+                    };
+                }
+                match tokio::time::timeout(PLATFORM_DEADLINE, c.search_categories(typed)).await {
+                    Ok(Ok(hits)) => match best_category(typed, &hits) {
+                        Some(h) => CategoryAs { platform: p, name: Some(h.name.clone()), note: None },
+                        None => CategoryAs {
+                            platform: p,
+                            name: None,
+                            note: Some(format!("{} has no category called \"{typed}\".", p.label())),
+                        },
+                    },
+                    _ => CategoryAs { platform: p, name: None, note: Some(format!("{} didn't answer.", p.label())) },
+                }
+            });
+        Ok(futures_util::future::join_all(jobs).await)
+    }
+}
+
 /// One platform's push, turned into a result the dashboard can show.
 async fn push_one(
     p: Platform,
@@ -322,6 +394,7 @@ async fn push_one(
         skipped,
         error: Some(PlatformError { code: code.into(), message, hint: hint.map(String::from) }),
         waiting: false,
+        category: None,
     };
     let Some(c) = c else {
         return fail(
@@ -330,6 +403,22 @@ async fn push_one(
             Some("Connect it in Settings, Accounts."),
             skipped,
         );
+    };
+    // A category typed rather than picked from this platform's list: its own name for it
+    // ("Warzone" is "Call of Duty: Warzone" on Twitch and Kick; owner, 15 Nov: the exact name
+    // alone was refused, and 2 of 3 platforms took the stream info).
+    let shown = match info.category.as_mut() {
+        None => None,
+        Some(_) if p == Platform::Youtube => Some(YOUTUBE_GAMING.to_string()),
+        Some(cat) if cat.ids.get(p).is_some() => Some(cat.name.clone()),
+        Some(cat) => match tokio::time::timeout(PLATFORM_DEADLINE, c.search_categories(&cat.name)).await {
+            Ok(Ok(hits)) => best_category(&cat.name, &hits).map(|h| {
+                cat.ids.set(p, h.id.clone());
+                h.name.clone()
+            }),
+            // The platform's own lookup below says what's wrong.
+            _ => None,
+        },
     };
     // Nothing this platform takes (only YouTube's description or thumbnail were set).
     let nothing = info.title.is_none()
@@ -380,7 +469,7 @@ async fn push_one(
                 }
             }
             // With nothing this platform takes, `applied` is empty and `skipped` says why.
-            PlatformResult { platform: p, ok: true, applied, skipped, error: None, waiting: false }
+            PlatformResult { platform: p, ok: true, applied, skipped, error: None, waiting: false, category: shown }
         }
         Ok(Err(e)) => {
             let (code, hint) = match &e {

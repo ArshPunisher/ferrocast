@@ -33,11 +33,14 @@ ignore = [
   # Font parsing for our engine's Text source (cosmic-text → rustybuzz/fontdb → ttf-parser).
   # Unmaintained, not a known vulnerability; it reads fonts installed on this computer. The
   # engine isn't in the app yet. Revisit when cosmic-text moves to skrifa/read-fonts.
-  { id = "RUSTSEC-2026-0192", reason = "unmaintained font parser, via cosmic-text in ferrocast-av" },
+  { id = "RUSTSEC-2026-0192", reason = "unmaintained font parser, via cosmic-text in ferrocore" },
   # The Marvin attack recovers keys from RSA *decryption* timing. Ferrocast only verifies
   # Kick's webhook signatures with Kick's public key (relay) and signs in tests; no private
   # key ever decrypts anything in a shipped binary. Revisit when rsa 0.10 is stable.
   { id = "RUSTSEC-2023-0071", reason = "signature verification only; no RSA decryption in shipped code" },
+  # Unmaintained, not a known vulnerability (all versions; no maintained release to move to):
+  # dates and times for logs, file names and schedules. Revisit when jiff or time replaces it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no known vulnerability; no maintained release yet" },
   # zip 4 inside tauri-plugin-updater: the extract() flaws need an attacker-made archive, and
   # the updater only unpacks an update after checking our minisign signature. Ferrocast's
   # own code uses zip 9 and never calls extract(). Revisit when the updater moves to zip 9.

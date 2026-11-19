@@ -1,11 +1,11 @@
 //! A guest's camera in the Studio, end to end on this computer: a page (served here) takes a
 //! browser's camera and mic and sends them over WebRTC; ferrocast-guest answers and receives them;
-//! libobs's FFmpeg source shows them. Open the page in a browser (headless Chrome with a fake
-//! camera works) and the example screenshots the guest into <out dir>.
+//! our engine shows them (FFmpeg reads the stream). Open the page in a browser (headless Chrome
+//! with a fake camera works) and the example screenshots the guest into <out dir>.
 //!
 //!   cargo run -p ferrocast-studio --example guest -- <out dir> [port]
 //!
-//! FERROCAST_OBS_DIR names the engine (macOS: its Contents, else an installed OBS.app).
+//! FFmpeg is taken from PATH.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -14,7 +14,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ferrocast_guest::Guest;
-use ferrocast_studio::{Canvas, Collection, Paths, Studio};
+use ferrocast_studio::Canvas;
+use ferrocast_studio::stage::Stage;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -90,15 +91,11 @@ fn main() -> Result<()> {
     let out = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(8899);
     std::fs::create_dir_all(&out)?;
-    let paths = if cfg!(windows) {
-        let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| r"C:\Program Files\obs-studio".into());
-        Paths::from_obs_windows(Path::new(&dir))
-    } else {
-        let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| "/Applications/OBS.app/Contents".into());
-        Paths::from_obs_app(Path::new(&dir), true)
-    };
-    let studio = Studio::start(&paths, Canvas { width: 1280, height: 720, fps: 30 }, &out.join("plugin-config"))?;
-    let c = Collection::new(&studio, "Main")?;
+    let ffmpeg = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p).map(|d| d.join("ffmpeg")).find(|f| f.is_file()))
+        .ok_or("FFmpeg isn't on PATH")?;
+    ferrocore::ffenc::set_ffmpeg(&ffmpeg);
+    let c = Stage::new(Canvas { width: 1280, height: 720, fps: 30 }, "Main")?;
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     println!("open http://127.0.0.1:{port}/ in a browser");
@@ -108,11 +105,7 @@ fn main() -> Result<()> {
     let offer = offer_rx.recv_timeout(Duration::from_secs(60))?;
     let (answer, guest) = Guest::accept(&offer, &out.join("guest.sdp"), None)?;
     answer_tx.send(answer)?;
-    let item = c.add_source("Main", "ffmpeg_source", "Guest", &ferrocast_guest::source_settings(guest.sdp()), false)?;
-    // GUEST_HIDDEN: added hidden, as the app adds a guest.
-    if std::env::var_os("GUEST_HIDDEN").is_some() {
-        c.edit_item("Main", item.id, ferrocast_studio::ItemEdit::Hide)?;
-    }
+    c.add_source("Main", "ffmpeg_source", "Guest", &ferrocast_guest::source_settings(guest.sdp()), true)?;
 
     let start = Instant::now();
     let mut seen = false;
@@ -121,8 +114,7 @@ fn main() -> Result<()> {
         let s = guest.status();
         let shot = out.join("guest.png");
         // No picture yet: nothing to screenshot.
-        let Ok((w, h, lit)) = c.screenshot("Guest", &shot).map_err(|e| e.into()).and_then(|()| brightness(&shot))
-        else {
+        let Ok((w, h, lit)) = c.screenshot("Main", &shot).map_err(|e| e.into()).and_then(|()| brightness(&shot)) else {
             println!("{:>2}s: {s:?}, no picture yet", start.elapsed().as_secs());
             continue;
         };

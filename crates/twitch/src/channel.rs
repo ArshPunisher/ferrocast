@@ -80,6 +80,14 @@ impl Helix {
         self.call(Method::POST, "/streams/markers", &[], Some(body)).await.map(|_| ())
     }
 
+    /// The channel's newest followers, newest first (Get Channel Followers, up to 100): each
+    /// with `user_id`, `user_login`, `user_name` and `followed_at`.
+    pub async fn recent_followers(&self, broadcaster: &str) -> Result<Vec<Value>, TwitchError> {
+        let q = [("broadcaster_id", broadcaster), ("first", "100")];
+        let v = self.call(Method::GET, "/channels/followers", &q, None).await?;
+        Ok(v.get("data").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
     /// When `user_id` followed (Get Channel Followers, `moderator:read:followers`).
     pub async fn followed_at(&self, broadcaster: &str, user_id: &str) -> Result<Option<String>, TwitchError> {
         let q = [("broadcaster_id", broadcaster), ("user_id", user_id)];

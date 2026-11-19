@@ -76,6 +76,20 @@ pub fn start(
     WhisperListener { stop, failed }
 }
 
+/// Whether this processor can run the speech model: on a PC, built for AVX2, FMA and F16C (any
+/// from 2013 on; release builds turn GGML_NATIVE off), it would crash on one without them
+/// (Celeron and Pentium Silver have no AVX at all). A Mac's or an ARM build's always can.
+fn cpu_ok() -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
+    if !(std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c"))
+    {
+        return Err("Captions need a newer processor (one with AVX2, from 2013 on).".into());
+    }
+    Ok(())
+}
+
 fn run(
     reader: &TapReader,
     rate: u32,
@@ -83,6 +97,7 @@ fn run(
     stop: &AtomicBool,
     on_text: &dyn Fn(String, bool),
 ) -> Result<(), String> {
+    cpu_ok()?;
     whisper_rs::install_logging_hooks();
     let ctx = WhisperContext::new_with_params(&opts.model, WhisperContextParameters::default())
         .map_err(|e| format!("The speech model didn't load ({e}). Remove it and download it again."))?;
@@ -150,6 +165,7 @@ pub fn transcribe(
     sound: &[f32],
     how: &ferrocast_engine::studio_host::Transcribe,
 ) -> Result<Vec<ferrocast_engine::studio_host::Said>, String> {
+    cpu_ok()?;
     whisper_rs::install_logging_hooks();
     if rms(sound) < SILENCE {
         return Ok(Vec::new());

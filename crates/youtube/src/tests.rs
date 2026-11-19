@@ -342,8 +342,16 @@ async fn fake_videos(scheduled: bool) -> (Endpoints, Arc<Mutex<Vec<serde_json::V
         .route(
             "/api/liveBroadcasts",
             axum::routing::get(move |Query(q): Query<HashMap<String, String>>| async move {
-                let upcoming = q.get("broadcastStatus").map(String::as_str) == Some("upcoming");
-                let items = if upcoming && scheduled { json!([{ "id": "vid-1" }]) } else { json!([]) };
+                let status = q.get("broadcastStatus").map(String::as_str);
+                let items = match status {
+                    Some("upcoming") if scheduled => json!([{ "id": "vid-1" }]),
+                    // Two ended streams: yesterday's, and the one that just ended.
+                    Some("completed") => json!([
+                        { "id": "old", "snippet": { "actualStartTime": "2026-11-01T10:00:00Z" } },
+                        { "id": "vid-1", "snippet": { "actualStartTime": "2026-11-02T01:00:00.250Z" } },
+                    ]),
+                    _ => json!([]),
+                };
                 axum::Json(json!({ "items": items }))
             })
             // With no broadcast, one is made (recorded like a PUT, as {"made": body}).
@@ -431,6 +439,35 @@ async fn stream_info_updates_the_broadcast_video_and_keeps_its_description() {
     assert!(api.update_broadcast_info(&long).await.unwrap_err().to_string().contains("100 characters"));
     assert_eq!(crate::api::search_video_categories("gam")[0].id, "20");
     assert_eq!(crate::api::search_video_categories("").len(), crate::api::VIDEO_CATEGORIES.len());
+}
+
+#[tokio::test]
+async fn chapters_go_at_the_end_of_the_ended_streams_description() {
+    let (ep, puts) = fake_videos(false).await;
+    let api = video_api(ep);
+    let start = crate::api::parse_rfc3339_ms("2026-11-02T01:00:00.250Z").unwrap();
+    assert_eq!(start, 1_793_581_200_250);
+    // Yesterday's is too early; this one went live a minute after the stream began here.
+    assert_eq!(api.last_broadcast(start - 60_000).await.unwrap(), Some(("vid-1".into(), start)));
+    assert_eq!(api.last_broadcast(start + 3_600_000).await.unwrap(), None);
+    api.set_chapters("vid-1", "0:00 Start\n3:05 Gameplay\n10:00 Chat\n").await.unwrap();
+    let body = puts.lock().unwrap()[0].clone();
+    assert_eq!(body["snippet"]["description"], "Keep me\n\nChapters:\n0:00 Start\n3:05 Gameplay\n10:00 Chat");
+    assert_eq!(body["snippet"]["title"], "Old");
+    // Chapters put there before are replaced, the rest kept.
+    let again = crate::api::with_chapters("Hi\n\nChapters:\n0:00 A\n1:00 B\n", "0:00 C\n");
+    assert_eq!(again, "Hi\n\nChapters:\n0:00 C");
+    assert_eq!(crate::api::with_chapters("", "0:00 C\n"), "Chapters:\n0:00 C");
+    // Text after the old chapters (links, tags) stays, the new ones going last.
+    assert_eq!(
+        crate::api::with_chapters("Hi\n\nChapters:\n0:00 A\n1:02:03 B\n\nFollow me: x.com/me\n#gaming", "0:00 C\n"),
+        "Hi\n\nFollow me: x.com/me\n#gaming\n\nChapters:\n0:00 C"
+    );
+    assert_eq!(
+        crate::api::parse_rfc3339_ms("2026-11-02T06:30:00+05:30"),
+        crate::api::parse_rfc3339_ms("2026-11-02T01:00:00Z")
+    );
+    assert_eq!(crate::api::parse_rfc3339_ms("yesterday"), None);
 }
 
 #[tokio::test]
@@ -706,6 +743,24 @@ fn the_bound_stream_wins_then_the_default_then_the_first() {
     assert!(pick_stream(&json!({}), None).is_none());
 }
 
+/// 19 Nov, live: the channel's key was an old one set to 1080p, so a 1440p stream went out at
+/// 1080p. Ferrocast makes its own key (any resolution), binds the broadcast to it and sends
+/// there; a key that takes any resolution is used as it is.
+#[tokio::test]
+async fn a_key_set_to_one_resolution_is_swapped_for_ferrocasts_own() {
+    let (ep, calls) = fake_live_keyed("1080p").await;
+    let i = video_api(ep).ingest().await.unwrap();
+    assert_eq!(i.key, "vertical-key", "the key made now (the fake names every new one so)");
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.contains(&"streams.insert".to_string()), "{calls:?}");
+    assert!(calls.contains(&"bind b1 sv".to_string()), "the broadcast moved to it: {calls:?}");
+
+    let (ep, calls) = fake_live_keyed("variable").await;
+    let i = video_api(ep).ingest().await.unwrap();
+    assert_eq!(i.key, "main-key");
+    assert!(!calls.lock().unwrap().iter().any(|c| c == "streams.insert" || c.starts_with("bind")));
+}
+
 #[tokio::test]
 async fn ingest_asks_youtube_for_the_channels_stream() {
     let (ep, _) = fake_videos(false).await;
@@ -715,6 +770,11 @@ async fn ingest_asks_youtube_for_the_channels_stream() {
 
 /// A YouTube that keeps the streams and broadcasts it's given (for the vertical stream).
 async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
+    fake_live_keyed("variable").await
+}
+
+/// [`fake_live`] with the channel's default key set to `resolution`.
+async fn fake_live_keyed(resolution: &str) -> (Endpoints, Arc<Mutex<Vec<String>>>) {
     use axum::extract::{Query, State};
     use std::collections::HashMap;
     #[derive(Clone, Default)]
@@ -727,7 +787,7 @@ async fn fake_live() -> (Endpoints, Arc<Mutex<Vec<String>>>) {
     let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", rest.local_addr().unwrap());
     st.streams.lock().unwrap().push(json!({ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
-        "cdn": { "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
+        "cdn": { "resolution": resolution, "ingestionInfo": { "streamName": "main-key", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } }));
     // Waiting for "Go live" in YouTube Studio (auto-start off), with a custom thumbnail.
     st.broadcasts.lock().unwrap().push(json!({ "id": "b1",
         "snippet": { "title": "Day 41 ranked", "description": "Ranked all night",

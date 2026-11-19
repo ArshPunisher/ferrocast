@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferrocast Setup</title>
+<style>
+@font-face{font-family:"Bricolage Grotesque";src:url(fonts/bricolage.woff2) format("woff2");font-weight:200 800;font-display:swap}
+@font-face{font-family:"Hanken Grotesk";src:url(fonts/hanken.woff2) format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"JetBrains Mono";src:url(fonts/jetbrains-mono.woff2) format("woff2");font-weight:100 800;font-display:swap}
+:root{
+  --bg:#0a0b0d;--s1:#101216;--s2:#16191e;--s3:#1d2127;--line:#252a31;--line2:#343a44;
+  --text:#eef0f4;--text2:#c3c8d1;--text3:#9aa1ac;
+  --molten:#ffa424;--molten2:#ffb547;--onm:#fff;--arct:#33d4ff;--arc:#33d4ff;
+  --arcsoft:rgba(51,212,255,.12);--arcline:rgba(51,212,255,.4);
+  --ok:#3ddc84;--warn:#ffc04d;--warnsoft:rgba(255,192,77,.10);
+  --danger:#ff6b6b;--dangersoft:rgba(255,107,107,.12);--onDanger:#1a0505;
+  --ease:cubic-bezier(.22,1,.36,1);
+  color-scheme:dark;
+}
+@media (prefers-color-scheme:light){:root{
+  --bg:#f2f3f6;--s1:#fff;--s2:#f7f8fa;--s3:#eceef2;--line:#dfe2e8;--line2:#c9ced7;
+  --text:#0e1014;--text2:#343a45;--text3:#4f5662;
+  --molten:#cf7400;--molten2:#e08a1a;--onm:#fff;--arct:#05678c;--arc:#0888b8;
+  --arcsoft:rgba(8,136,184,.10);--arcline:rgba(8,136,184,.38);
+  --ok:#14853f;--warn:#8a5a00;--warnsoft:rgba(207,116,0,.09);
+  --danger:#c42b2b;--dangersoft:rgba(196,43,43,.08);--onDanger:#fff;
+  color-scheme:light;
+}}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;overflow:hidden}
+body{background:var(--s1);color:var(--text);font:15px/1.5 "Hanken Grotesk",system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+  -webkit-user-select:none;user-select:none;display:flex;flex-direction:column;border:1px solid var(--line2)}
+h1,h2{font-family:"Bricolage Grotesque",sans-serif;letter-spacing:-.025em;font-weight:700}
+.mono{font-family:"JetBrains Mono",monospace;font-variant-numeric:tabular-nums}
+button{font:inherit;cursor:pointer;color:inherit}
+button:focus-visible,input:focus-visible,.check:focus-within{outline:2px solid var(--arct);outline-offset:2px}
+svg.i{width:1em;height:1em;fill:currentColor;flex:none}
+
+/* title bar */
+.tb{height:34px;display:flex;align-items:center;justify-content:space-between;flex:none;font-size:12px;color:var(--text3);background:var(--s2);border-bottom:1px solid var(--line)}
+.tb .t{display:flex;gap:8px;align-items:center;padding-left:12px;flex:1;height:100%}
+.tb .t .mk{width:14px;height:14px;color:var(--text)}
+.tb .ctl{display:flex}
+.tb .ctl button{width:46px;height:34px;border:0;background:transparent;display:grid;place-items:center;font-size:13px;color:var(--text2)}
+.tb .ctl button:hover{background:var(--s3);color:var(--text)}
+.tb .ctl button.x:hover{background:#c42b1c;color:#fff}
+.tb .ctl button[disabled]{opacity:.35;cursor:default;background:transparent}
+
+/* layout */
+.app{flex:1;display:flex;min-height:0}
+.rail{width:200px;flex:none;border-right:1px solid var(--line);background:var(--s2);padding:20px 14px 16px;display:flex;flex-direction:column;gap:18px}
+.rail .brand{display:flex;gap:10px;align-items:center;font-family:"Bricolage Grotesque";font-weight:700;font-size:17px;padding:0 6px}
+.rail .brand svg{width:28px;height:28px}
+.rail ol{padding:0;display:flex;flex-direction:column;gap:4px}
+.rail li{list-style:none;display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:10px;font-size:14px;color:var(--text3);font-weight:600;transition:background .25s var(--ease),color .25s}
+.rail li .n{width:22px;height:22px;border-radius:50%;border:1px solid var(--line2);display:grid;place-items:center;font-size:11.5px;font-family:"JetBrains Mono";flex:none}
+.rail li.done{color:var(--text2)}
+.rail li.done .n{background:color-mix(in srgb,var(--ok) 18%,transparent);border-color:transparent;color:var(--ok)}
+.rail li.now{background:var(--arcsoft);color:var(--text)}
+.rail li.now .n{border-color:var(--arct);color:var(--arct)}
+.rail .ver{margin-top:auto;font-family:"JetBrains Mono";font-size:11px;color:var(--text3);padding:0 6px}
+main{flex:1;padding:24px 26px 18px;display:flex;flex-direction:column;gap:13px;min-width:0}
+.screen{display:contents}
+main.enter>*{animation:in .32s var(--ease) both}
+@keyframes in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+h1{font-size:21px;line-height:1.2}
+.sub{color:var(--text3);font-size:14px;margin-top:-4px}
+.foot{margin-top:auto;display:flex;gap:10px;justify-content:flex-end;align-items:center;border-top:1px solid var(--line);padding:14px 26px 0;margin-left:-26px;margin-right:-26px}
+.foot .l{margin-right:auto}
+.big{font-family:"Bricolage Grotesque";font-size:44px;font-weight:800;letter-spacing:-.035em;line-height:1}
+.head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px}
+.head>div{min-width:0}
+
+.btn{border-radius:10px;padding:10px 18px;font-weight:700;font-size:14px;border:1px solid transparent;transition:transform .12s var(--ease),background .15s,opacity .15s;white-space:nowrap}
+.btn:active:not([disabled]){transform:scale(.97)}
+.btn.p{background:var(--molten);color:var(--onm)}
+.btn.p:hover:not([disabled]){background:var(--molten2)}
+.btn.g{background:transparent;color:var(--text2);border-color:var(--line2)}
+.btn.g:hover:not([disabled]){background:var(--s3);color:var(--text)}
+.btn.d{background:var(--danger);color:var(--onDanger)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.link{color:var(--arct);background:none;border:0;padding:0;font-weight:600;font-size:13.5px;display:inline-flex;gap:6px;align-items:center}
+.link:hover{text-decoration:underline}
+
+.kvs{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+.kv{display:flex;justify-content:space-between;gap:12px;color:var(--text3);font-size:13px}
+.kv b{color:var(--text);font-weight:600}
+.lbl{font-size:13px;font-weight:600;color:var(--text2)}
+.field{display:flex;gap:8px}
+.field .path{flex:1;min-width:0;background:var(--s2);border:1px solid var(--line2);border-radius:10px;padding:9px 12px;font-size:13px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;-webkit-user-select:text;user-select:text}
+.hint{font-size:12.5px;color:var(--text3);display:flex;gap:6px;align-items:center}
+.hint.bad{color:var(--danger)}
+.check{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--s2);cursor:pointer}
+.check input{margin-top:3px;accent-color:var(--arc);width:16px;height:16px;flex:none;cursor:pointer}
+.check b{display:block;font-size:14px}
+.check small{display:block;color:var(--text3);font-size:12.5px}
+.check.off{opacity:.5;cursor:default}
+
+.bar{height:8px;border-radius:999px;background:var(--s3);overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--molten);border-radius:inherit;transition:width .2s linear}
+.log{font-family:"JetBrains Mono";font-size:11.5px;color:var(--text3);background:var(--s2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;height:112px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;gap:2px}
+.log span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:16px;flex:none}
+.log span:last-child{color:var(--text2)}
+.log.sel{-webkit-user-select:text;user-select:text;justify-content:flex-start;overflow:auto}
+.log.sel span{white-space:normal;overflow:visible;word-break:break-all}
+.note{display:flex;gap:10px;align-items:flex-start;background:var(--arcsoft);border:1px solid var(--arcline);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--text2)}
+.note svg{color:var(--arct);font-size:17px;margin-top:1px}
+.note.warn{background:var(--warnsoft);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.note.warn svg{color:var(--warn)}
+.note.err{background:var(--dangersoft);border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.note.err svg{color:var(--danger)}
+.note b{color:var(--text)}
+.okmark{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok);font-size:28px}
+main.enter .okmark{animation:pop .5s var(--ease) both}
+@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:none;opacity:1}}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media (prefers-reduced-motion:reduce){main.enter>*,main.enter .okmark{animation:none}.bar i{transition:none}}
+</style>
+</head>
+<body>
+<header class="tb" id="tb">
+  <div class="t" id="drag"><span class="mk" data-mark></span><span id="title">Ferrocast Setup</span></div>
+  <div class="ctl">
+    <button type="button" id="min" aria-label="Minimize"><svg class="i" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H40a8,8,0,0,1,0-16H216A8,8,0,0,1,224,128Z"/></svg></button>
+    <button type="button" id="close" class="x" aria-label="Close"><svg class="i" viewBox="0 0 256 256"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"/></svg></button>
+  </div>
+</header>
+<div class="app">
+  <aside class="rail" aria-label="Steps">
+    <div class="brand"><span data-mark></span><span>Ferrocast</span></div>
+    <ol id="steps"></ol>
+    <div class="ver" id="ver"></div>
+  </aside>
+  <main id="main"></main>
+</div>
+<div class="sr" aria-live="polite" id="live"></div>
+
+<script>
+'use strict';
+/* Ferrocast's logo. */
+const MARK = '<svg viewBox="0 0 64 64" aria-hidden="true"><path d="M17.33 54.5V25A15.5 15.5 0 0 1 32.83 9.5H39.33V18.5H32.83A6.5 6.5 0 0 0 26.33 25V54.5ZM10.83 25.5H33.33V33.5H10.83Z" fill="currentColor"/><path d="M48.03 21.12L34.35 37.73L50.85 32.78L44.85 32.78Z" fill="var(--molten)"/><path d="M36.72 39.14L42.73 39.14L39.02 50.8L53.17 34.2Z" fill="var(--arc)"/></svg>';
+/* Phosphor icons (MIT), regular weight unless noted. */
+const P = {
+  check:'<path d="M232.49,80.49l-128,128a12,12,0,0,1-17,0l-56-56a12,12,0,1,1,17-17L96,183,215.51,63.51a12,12,0,0,1,17,17Z"/>',
+  warn:'<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm-8-80V80a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,172Z"/>',
+  info:'<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm16-40a8,8,0,0,1-8,8,16,16,0,0,1-16-16V128a8,8,0,0,1,0-16,16,16,0,0,1,16,16v40A8,8,0,0,1,144,176ZM112,84a12,12,0,1,1,12,12A12,12,0,0,1,112,84Z"/>',
+  drive:'<path d="M208,136H48a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V152A16,16,0,0,0,208,136Zm0,64H48V152H208v48Zm0-160H48A16,16,0,0,0,32,56v48a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V56A16,16,0,0,0,208,40Zm0,64H48V56H208v48ZM192,80a12,12,0,1,1-12-12A12,12,0,0,1,192,80Zm0,96a12,12,0,1,1-12-12A12,12,0,0,1,192,176Z"/>',
+  lock:'<path d="M128,112a28,28,0,0,0-8,54.83V184a8,8,0,0,0,16,0V166.83A28,28,0,0,0,128,112Zm0,40a12,12,0,1,1,12-12A12,12,0,0,1,128,152Zm80-72H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Z"/>',
+  copy:'<path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"/>',
+  out:'<path d="M224,104a8,8,0,0,1-16,0V59.32l-66.33,66.34a8,8,0,0,1-11.32-11.32L196.68,48H152a8,8,0,0,1,0-16h64a8,8,0,0,1,8,8Zm-40,24a8,8,0,0,0-8,8v72H48V80h72a8,8,0,0,0,0-16H48A16,16,0,0,0,32,80V208a16,16,0,0,0,16,16H176a16,16,0,0,0,16-16V136A8,8,0,0,0,184,128Z"/>'
+};
+const icon = n => `<svg class="i" viewBox="0 0 256 256" aria-hidden="true">${P[n]}</svg>`;
+document.querySelectorAll('[data-mark]').forEach(e => e.innerHTML = MARK);
+
+/* ---------- talking to setup ---------- */
+const NATIVE = !!(window.__SETUP__ && window.ipc);
+const B = window.__SETUP__ || demoBoot();
+function ask(msg){ if (NATIVE) window.ipc.postMessage(JSON.stringify(msg)); else demoAsk(msg); }
+
+/* ---------- formatting ---------- */
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const MB = 1048576;
+function mb(b){ return (b / MB).toFixed(1) + ' MB'; }
+function size(b){ return b >= 1024 * MB ? (b / 1024 / MB).toFixed(1) + ' GB' : mb(b); }
+function eta(s){ s = Math.max(1, Math.round(s)); return s < 60 ? `${s} s left` : `${Math.floor(s / 60)} min ${s % 60} s left`; }
+function took(s){ s = Math.max(1, Math.round(s)); return s < 60 ? `${s} second${s === 1 ? '' : 's'}` : `${Math.floor(s / 60)} min ${s % 60} s`; }
+
+/* ---------- state ---------- */
+const S = {
+  flow: B.flow,                         // install | update | uninstall
+  screen: B.flow === 'uninstall' ? 'confirm' : (B.flow === 'update' || B.passive) ? 'progress' : 'welcome',
+  space: B.space || null,               // {dir, drive, free, need, enough, ours}
+  desktop: B.oldVersion ? !!B.desktopExists : true,
+  open: true,
+  delData: false, extras: (B.extras || 0) > 0,
+  step: -1, done: 0, total: 0, files: [], speed: 0, lastT: 0, lastDone: 0, startT: 0,
+  result: null, error: null, busy: false
+};
+
+const RAIL = {
+  install: ['Welcome', 'Options', 'Install', 'Finish'],
+  update: ["What's new", 'Download', 'Install', 'Done'],
+  uninstall: ['Confirm', 'Remove', 'Done']
+};
+function railIndex(){
+  const sc = S.screen;
+  if (S.flow === 'install') return {welcome:0, options:1, progress:2, error:2, done:4}[sc];
+  if (S.flow === 'update') return {progress:2, error:2, done:4}[sc];
+  return {confirm:0, progress:1, error:1, done:3}[sc];
+}
+function drawRail(){
+  const cur = railIndex();
+  document.getElementById('steps').innerHTML = RAIL[S.flow].map((s, i) =>
+    `<li class="${i < cur ? 'done' : i === cur ? 'now' : ''}"${i === cur ? ' aria-current="step"' : ''}><span class="n">${i < cur ? icon('check') : i + 1}</span>${esc(s)}</li>`).join('');
+  document.getElementById('ver').textContent = S.flow === 'uninstall' ? '' : `${B.version} \u00b7 x64`;
+  document.getElementById('title').textContent = {install:'Ferrocast Setup', update:'Ferrocast Update', uninstall:'Uninstall Ferrocast'}[S.flow];
+  document.getElementById('close').disabled = S.busy && S.flow !== 'install';
+}
+
+/* ---------- screens ---------- */
+const V = {
+  welcome(){
+    const sp = S.space;
+    const re = B.oldVersion && B.oldVersion !== B.version;
+    return `
+      <h1>${re ? `Update Ferrocast to ${esc(B.version)}` : 'Welcome to Ferrocast'}</h1>
+      <p class="sub">${re ? `You have ${esc(B.oldVersion)}. Your scenes and settings stay.` : 'Stream, record and go live everywhere, on your own engine.'}</p>
+      <div class="kvs">
+        <div class="kv"><span>Size</span><b class="mono">${mb(B.size)}</b></div>
+        ${sp && sp.free != null ? `<div class="kv"><span>Free on ${esc(sp.drive)}</span><b class="mono">${size(sp.free)}</b></div>` : ''}
+        <div class="kv"><span>Installs for</span><b>You only (no admin)</b></div>
+      </div>
+      ${B.running ? `<div class="note warn">${icon('warn')}<span><b>Ferrocast is open.</b> Setup closes it when you install. Stop any stream or recording first.</span></div>` : ''}
+      <div class="foot"><button type="button" class="btn g l" data-do="cancel">Cancel</button><button type="button" class="btn p" data-go="options" autofocus>Next</button></div>`;
+  },
+  options(){
+    const sp = S.space || {};
+    const bad = sp.ours === false ? 'This folder has other files in it. Pick an empty folder, or one that only holds Ferrocast.'
+      : sp.enough === false ? `Not enough space: Ferrocast needs ${mb(sp.need)} and ${esc(sp.drive)} has ${mb(sp.free)} free.` : '';
+    return `
+      <h1>Options</h1>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <span class="lbl" id="dirl">Install folder</span>
+        <div class="field"><div class="path mono" id="dir" aria-labelledby="dirl" title="${esc(sp.dir)}">${esc(sp.dir)}</div><button type="button" class="btn g" data-do="browse">Change</button></div>
+        <span class="hint${bad ? ' bad' : ''}" id="dirhint">${bad ? icon('warn') + esc(bad) : sp.free != null ? icon('drive') + `${size(sp.free)} free on ${esc(sp.drive)}` : ''}</span>
+      </div>
+      <label class="check"><input type="checkbox" id="desktop"${S.desktop ? ' checked' : ''}><div><b>Desktop shortcut</b><small>The Start menu always gets one</small></div></label>
+      <div class="foot"><button type="button" class="btn g l" data-go="welcome">Back</button><button type="button" class="btn p" data-do="install"${bad ? ' disabled' : ''}>Install</button></div>`;
+  },
+  progress(){
+    const verb = S.flow === 'uninstall' ? 'Removing' : S.flow === 'update' ? `Updating to ${esc(B.version)}` : 'Installing';
+    const canCancel = S.flow === 'install' && S.step <= 2;
+    return `
+      <div class="head"><div><h1>${verb}</h1><p class="sub" id="eta">${esc(B.steps[Math.max(0, S.step)])}</p></div><div class="big mono" id="pct" aria-hidden="true">0%</div></div>
+      <div class="bar" role="progressbar" aria-label="${verb}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="barw"><i id="fill"></i></div>
+      <div class="kv mono"><span id="amt">${S.flow === 'uninstall' ? '' : `0.0 of ${mb(B.size)}`}</span><span id="spd"></span></div>
+      <div class="log" id="log" aria-hidden="true"></div>
+      ${S.flow === 'update' ? `<div class="note">${icon('lock')}<span>Signed and checked before it was used. Your scenes and settings stay.</span></div>` : ''}
+      <div class="foot">${canCancel ? '<button type="button" class="btn g" data-do="cancel" id="cancel">Cancel</button>' : '<span class="hint">Please keep this window open</span>'}</div>`;
+  },
+  done(){
+    const r = S.result || {};
+    if (S.flow === 'uninstall') return `
+      <div class="okmark">${icon('check')}</div><h1>Ferrocast is removed</h1>
+      <p class="sub">${S.delData ? 'Your scenes, settings and sign-ins are removed too.' : 'Your scenes and settings are kept for next time.'} Recordings were not touched.</p>
+      <div class="foot"><button type="button" class="link l" data-link="feedback">Tell us why (optional) ${icon('out')}</button><button type="button" class="btn p" data-do="close" autofocus>Close</button></div>`;
+    if (S.flow === 'update') return `
+      <div class="okmark">${icon('check')}</div><h1>You're on ${esc(B.version)}</h1>
+      <p class="sub">Ferrocast is opening.</p>`;
+    return `
+      <div class="okmark">${icon('check')}</div><h1>Ferrocast is installed</h1>
+      <p class="sub">${mb(r.bytes || B.size)} in ${took(r.seconds || 1)}.</p>
+      <label class="check"><input type="checkbox" id="open"${S.open ? ' checked' : ''}><div><b>Open Ferrocast now</b></div></label>
+      <div class="foot"><button type="button" class="btn p" data-do="finish" autofocus>Finish</button></div>`;
+  },
+  error(){
+    const e = S.error || {};
+    const what = {install:"Install didn't finish", update:"Update didn't finish", uninstall:"Uninstall didn't finish"}[S.flow];
+    return `
+      <h1>${what}</h1>
+      <div class="note err">${icon('warn')}<span><b>${esc(e.title)}</b><br>${esc(e.detail)}</span></div>
+      <div class="log sel" id="details">${(e.log || []).map(l => `<span>${esc(l)}</span>`).join('')}</div>
+      <div class="foot"><button type="button" class="link l" data-do="copy">${icon('copy')} <span id="copied">Copy details</span></button>
+        ${S.flow === 'install' ? '<button type="button" class="btn g" data-go="options">Options</button>' : '<button type="button" class="btn g" data-do="close">Close</button>'}
+        <button type="button" class="btn p" data-do="retry">Try again</button></div>`;
+  },
+  confirm(){
+    return `
+      <h1>Uninstall Ferrocast</h1><p class="sub">Your recordings are never touched.</p>
+      ${B.running ? `<div class="note warn">${icon('warn')}<span><b>Ferrocast is open.</b> It closes when you press Uninstall.</span></div>` : ''}
+      <label class="check"><input type="checkbox" id="deldata"${S.delData ? ' checked' : ''}><div><b>Also delete my scenes, settings and sign-ins</b><small>Off keeps them for next time</small></div></label>
+      ${(B.extras || 0) > 0 ? `<label class="check${S.delData ? ' off' : ''}"><input type="checkbox" id="extras"${S.extras || S.delData ? ' checked' : ''}${S.delData ? ' disabled' : ''}><div><b>Remove downloaded extras</b><small>FFmpeg and speech models, ${mb(B.extras)}</small></div></label>` : ''}
+      <div class="foot"><button type="button" class="btn g l" data-do="cancel" autofocus>Cancel</button><button type="button" class="btn d" data-do="uninstall">Uninstall</button></div>`;
+  }
+};
+
+const main = document.getElementById('main');
+function draw(){
+  drawRail();
+  main.classList.remove('enter'); void main.offsetWidth; main.classList.add('enter');
+  main.innerHTML = V[S.screen]();
+  const f = main.querySelector('[autofocus]'); if (f) f.focus();
+  if (S.screen === 'progress') paint();
+  say({welcome:'Welcome', options:'Options', progress:'Working', done:'Finished', error:'Something went wrong', confirm:'Uninstall'}[S.screen]);
+}
+function go(screen){ S.screen = screen; draw(); }
+function say(t){ document.getElementById('live').textContent = t; }
+
+/* Updates only the moving parts while working (no redraw, so nothing flickers). */
+function paint(){
+  const $ = id => document.getElementById(id);
+  const total = S.total || (S.flow === 'uninstall' ? 0 : B.size);
+  const p = total ? Math.min(100, S.done / total * 100) : 0;
+  if (!$('fill')) return;
+  $('fill').style.width = p.toFixed(1) + '%';
+  $('pct').textContent = Math.floor(p) + '%';
+  $('barw').setAttribute('aria-valuenow', Math.floor(p));
+  const unpacking = S.flow !== 'uninstall' && S.step === 2;
+  if (S.flow === 'uninstall') $('amt').textContent = total ? `${S.done} of ${total} files` : '';
+  else $('amt').textContent = `${mb(S.done)} of ${mb(total)}`;
+  $('spd').textContent = unpacking && S.speed > 0 ? (S.speed / MB).toFixed(1) + ' MB/s' : '';
+  const stepName = B.steps[Math.max(0, S.step)] || '';
+  $('eta').textContent = unpacking && S.speed > 0 && S.done < total ? eta((total - S.done) / S.speed) : S.done >= total && total ? 'Finishing' : stepName;
+  $('log').innerHTML = S.files.map(f => `<span>${S.flow === 'uninstall' ? 'removed  ' : 'wrote    '}${esc(f)}</span>`).join('');
+  const c = $('cancel'); if (c && S.step > 2) c.remove();
+}
+
+/* What setup reports. */
+window.setup = {
+  event(e){
+    if (e.kind === 'step'){
+      S.step = e.index;
+      if (S.screen !== 'progress') go('progress'); else paint();
+    } else if (e.kind === 'progress'){
+      const now = performance.now();
+      if (S.lastT && e.done > S.lastDone){
+        // Smoothed rate, so the time left doesn't jump about.
+        const rate = (e.done - S.lastDone) / ((now - S.lastT) / 1000);
+        S.speed = S.speed ? S.speed * 0.85 + rate * 0.15 : rate;
+      }
+      S.lastT = now; S.lastDone = e.done;
+      S.done = e.done; S.total = e.total;
+      if (e.file && S.files[S.files.length - 1] !== e.file){ S.files.push(e.file); if (S.files.length > 5) S.files.shift(); }
+      paint();
+    } else if (e.kind === 'done'){
+      S.busy = false; S.result = e; S.done = S.total;
+      paint(); setTimeout(() => go('done'), 350);
+    } else if (e.kind === 'error'){
+      S.busy = false; S.error = e; go('error');
+    }
+  },
+  space(sp){ S.space = sp; if (S.screen === 'options') draw(); },
+  closeAsked(){
+    const c = document.getElementById('cancel');
+    if (c){ c.focus(); say('Press Cancel to stop setup'); }
+  }
+};
+
+function start(){
+  S.busy = true; S.step = -1; S.done = 0; S.total = 0; S.files = []; S.speed = 0; S.lastT = 0; S.lastDone = 0;
+  S.screen = 'progress'; draw();
+  if (S.flow === 'uninstall') ask({do:'uninstall', data:S.delData, extras:S.delData || S.extras});
+  else ask({do:'install', dir:S.space.dir, desktop:S.desktop});
+}
+
+main.addEventListener('click', ev => {
+  const t = ev.target.closest('button'); if (!t) return;
+  if (t.dataset.go){ go(t.dataset.go); return; }
+  if (t.dataset.link){ ask({do:'link', to:t.dataset.link}); return; }
+  switch (t.dataset.do){
+    case 'cancel': ask({do:'cancel'}); break;
+    case 'browse': ask({do:'browse', dir:S.space.dir}); break;
+    case 'install': case 'uninstall': case 'retry': start(); break;
+    case 'finish': ask({do:'finish', open:S.open}); break;
+    case 'close': ask({do:'close'}); break;
+    case 'copy': {
+      const e = S.error || {};
+      const text = [e.title, e.detail, '', ...(e.log || [])].join('\n');
+      const done = () => { const c = document.getElementById('copied'); if (c) c.textContent = 'Copied'; };
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => {});
+      break;
+    }
+  }
+});
+main.addEventListener('change', ev => {
+  const t = ev.target;
+  if (t.id === 'desktop') S.desktop = t.checked;
+  if (t.id === 'open') S.open = t.checked;
+  if (t.id === 'extras') S.extras = t.checked;
+  if (t.id === 'deldata'){ S.delData = t.checked; draw(); }
+});
+document.getElementById('drag').addEventListener('mousedown', ev => { if (ev.button === 0) ask({do:'drag'}); });
+document.getElementById('min').addEventListener('click', () => ask({do:'minimize'}));
+document.getElementById('close').addEventListener('click', () => {
+  if (S.busy) window.setup.closeAsked(); else ask({do:'close'});
+});
+document.addEventListener('contextmenu', ev => ev.preventDefault());
+document.addEventListener('keydown', ev => {
+  // No browser shortcuts (reload, find, print, zoom) in setup's window.
+  if ((ev.ctrlKey && /^[rfpjgu+=\-0]$/i.test(ev.key)) || ev.key === 'F5' || ev.key === 'F3') ev.preventDefault();
+});
+
+draw();
+// An update starts by itself (the app already said "Update now"), and so does /P.
+if (S.flow === 'update' || (S.flow === 'install' && B.passive)) start();
+
+/* ---------- demo: the page alone in a browser, with made-up numbers ---------- */
+function demoBoot(){
+  const q = new URLSearchParams(location.search);
+  const flow = q.get('flow') || 'install';
+  const steps = flow === 'uninstall' ? ['Closing Ferrocast','Removing files','Removing shortcuts','Removing extras']
+    : ['Checking space','Closing Ferrocast','Unpacking Ferrocast','Adding shortcuts','Registering uninstall'];
+  return {flow, version:'2.4.0', oldVersion: q.get('old'), size:124157850, running: q.has('running'), extras:327155712, desktopExists:true, steps,
+    space:{dir:'C:\\Users\\Arsh\\AppData\\Local\\Ferrocast', drive:'C:', free: q.has('full') ? 67108864 : 229780000000, need:136573635, enough: !q.has('full'), ours:true}};
+}
+function demoAsk(m){
+  const fail = new URLSearchParams(location.search).get('fail');
+  if (m.do === 'install' || m.do === 'uninstall'){
+    const un = m.do === 'uninstall';
+    const files = ['Ferrocast.exe','resources\\dashboard\\assets\\index.js','resources\\dashboard\\assets\\index.css','resources\\overlays\\alert.js','resources\\splash\\index.html','WebView2Loader.dll','obs-ffmpeg-mux.exe','resources\\models\\rvm.onnx','uninstall.exe'];
+    const total = un ? 412 : 124157850; let done = 0, step = 0, t0 = performance.now(), i = 0;
+    const ev = e => window.setup.event(e);
+    ev({kind:'step', index:0});
+    const timer = setInterval(() => {
+      if (step < 2 && !un){ step++; ev({kind:'step', index:step}); return; }
+      if (un && step < 1){ step = 1; ev({kind:'step', index:1}); return; }
+      done = Math.min(total, done + (un ? 9 : (5 + Math.random() * 10) * MB / 10));
+      ev({kind:'progress', done:Math.floor(done), total, file:files[i++ % files.length]});
+      if (fail && done > total * .4){ clearInterval(timer); ev({kind:'error', title:'Not enough space on C:', detail:'Ferrocast needs 130.2 MB and C: has 64.0 MB free. Free some space, or pick another drive in Options. Nothing was changed.', log:['[1762172210] install 2.4.0 into C:\\Users\\Arsh\\AppData\\Local\\Ferrocast','[1762172211] writing resources\\models\\rvm.onnx: There is not enough space on the disk. (os error 112)']}); return; }
+      if (done >= total){ clearInterval(timer);
+        const rest = un ? [2,3] : [3,4];
+        rest.forEach((s, k) => setTimeout(() => ev({kind:'step', index:s}), 150 * (k + 1)));
+        setTimeout(() => ev({kind:'done', seconds:(performance.now() - t0) / 1000, bytes: un ? 0 : total}), 450);
+      }
+    }, 100);
+  } else if (m.do === 'browse'){
+    window.setup.space({dir:'D:\\Apps\\Ferrocast', drive:'D:', free:880000000000, need:136573635, enough:true, ours:true});
+  }
+}
+</script>
+</body>
+</html>

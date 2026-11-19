@@ -291,6 +291,13 @@ async fn stream_info_answers_200_207_or_422_with_each_platforms_result() {
     let (s, v) = body(r.get("/stream-info/categories?platform=twitch&q=valo").await).await;
     assert_eq!((s, v["items"][0]["name"].as_str()), (StatusCode::OK, Some("valorant")));
     assert_eq!(code(r.get("/stream-info/categories?platform=twitch").await).await.0, StatusCode::BAD_REQUEST);
+    // What each platform would show for a typed one (the fake finds "valorant" for "valo",
+    // which isn't every word typed, so it says there's none).
+    let (s, v) = body(r.get("/stream-info/categories/as?q=valo").await).await;
+    assert_eq!(s, StatusCode::OK);
+    let tw = v["items"].as_array().unwrap().iter().find(|x| x["platform"] == "twitch").unwrap().clone();
+    assert!(tw["name"].is_null() && tw["note"].as_str().unwrap().contains("no category called"), "{tw}");
+    assert_eq!(code(r.get("/stream-info/categories/as?q=").await).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(code(r.get("/stream-info/categories?platform=nope&q=x").await).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         code(r.get("/stream-info/categories?platform=youtube&q=x").await).await.0,

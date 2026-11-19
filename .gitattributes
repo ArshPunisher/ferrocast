@@ -1,0 +1,2 @@
+# The catalog test files are signed byte for byte: never change their line endings.
+crates/engine/testdata/catalog/** -text

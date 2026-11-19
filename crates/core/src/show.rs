@@ -49,6 +49,30 @@ pub struct ShowConfig {
     pub platforms: Vec<crate::event::Platform>,
     /// What happens when the countdown reaches zero (each on or off).
     pub at_zero: AtZero,
+    /// While live: warn when a mic (`mic_sources`) goes silent, a camera (`cam_sources`) goes
+    /// black or freezes, or a destination stops sending.
+    pub watch: LiveWatchConfig,
+}
+
+/// When the live watch speaks up (each 0: off).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveWatchConfig {
+    pub on: bool,
+    /// A mic this long without a sound (30 to 1800 s).
+    pub mic_silent_s: u32,
+    /// A camera this long black (5 to 600 s).
+    pub camera_black_s: u32,
+    /// A camera this long showing the very same picture (10 to 600 s).
+    pub camera_frozen_s: u32,
+    /// A destination this long not sending (10 to 600 s).
+    pub destination_down_s: u32,
+}
+
+impl Default for LiveWatchConfig {
+    fn default() -> Self {
+        LiveWatchConfig { on: true, mic_silent_s: 120, camera_black_s: 10, camera_frozen_s: 30, destination_down_s: 30 }
+    }
 }
 
 /// When Start show's countdown reaches zero (owner, 24 Oct: "configurable, each on or off").
@@ -97,6 +121,7 @@ impl Default for ShowConfig {
             min_disk_gb: 10,
             platforms: Vec::new(),
             at_zero: AtZero::default(),
+            watch: LiveWatchConfig::default(),
         }
     }
 }
@@ -145,7 +170,177 @@ impl ShowConfig {
         if self.min_disk_gb > 10_000 {
             return Err("min_disk_gb: up to 10000 GB.".into());
         }
+        let w = &self.watch;
+        for (field, v, range) in [
+            ("watch.mic_silent_s", w.mic_silent_s, 30..=1800),
+            ("watch.camera_black_s", w.camera_black_s, 5..=600),
+            ("watch.camera_frozen_s", w.camera_frozen_s, 10..=600),
+            ("watch.destination_down_s", w.destination_down_s, 10..=600),
+        ] {
+            if v != 0 && !range.contains(&v) {
+                return Err(format!("{field}: {} to {} seconds, or 0 for off.", range.start(), range.end()));
+            }
+        }
         Ok(())
+    }
+}
+
+/// Quieter than this (dBFS) over a second and a half: a mic that hears nothing.
+pub const SILENT_DB: f32 = -60.0;
+
+// ------------------------------------------------------------------ live watch
+
+/// One look at what's going out, every couple of seconds while live (ms since the epoch).
+#[derive(Debug, Clone, Default)]
+pub struct WatchSample {
+    pub at: i64,
+    /// Each watched mic's loudest peak since the last sample (dBFS); missing: not known.
+    pub mics: Vec<(String, f32)>,
+    /// Each watched camera: black, and its picture's fingerprint.
+    pub cameras: Vec<(String, bool, u64)>,
+    /// Each running destination (its name) and whether it's sending.
+    pub destinations: Vec<(String, bool)>,
+}
+
+/// A live mistake to tell the streamer about, or that it's fixed (`cleared`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveAlert {
+    pub id: String,
+    /// `warn` or `error`.
+    pub level: &'static str,
+    pub message: String,
+    pub cleared: bool,
+}
+
+/// Since when each thing has been wrong, and what's been said: a pure state machine the
+/// engine feeds a sample every couple of seconds while live.
+#[derive(Debug, Default)]
+pub struct LiveWatch {
+    /// The last time each mic heard something, each camera's picture changed (and its
+    /// fingerprint), each camera went black, each destination last sent.
+    heard: std::collections::HashMap<String, i64>,
+    changed: std::collections::HashMap<String, (u64, i64)>,
+    dark: std::collections::HashMap<String, i64>,
+    sending: std::collections::HashMap<String, i64>,
+    /// Alerts raised and not yet cleared.
+    raised: std::collections::BTreeSet<String>,
+}
+
+impl LiveWatch {
+    /// A new stream: everything starts fresh.
+    pub fn reset(&mut self) {
+        *self = LiveWatch::default();
+    }
+
+    /// The alerts raised now (and not cleared).
+    pub fn raised(&self) -> Vec<String> {
+        self.raised.iter().cloned().collect()
+    }
+
+    /// One sample → the alerts to raise and to clear.
+    pub fn tick(&mut self, cfg: &LiveWatchConfig, s: &WatchSample) -> Vec<LiveAlert> {
+        let mut out = Vec::new();
+        if !cfg.on {
+            return out;
+        }
+        let secs = |since: i64| (s.at - since).max(0) / 1000;
+        let mut set =
+            |out: &mut Vec<LiveAlert>, id: String, bad: bool, level: &'static str, message: String, fixed: String| {
+                match (bad, self.raised.contains(&id)) {
+                    (true, false) => {
+                        self.raised.insert(id.clone());
+                        out.push(LiveAlert { id, level, message, cleared: false });
+                    }
+                    (false, true) => {
+                        self.raised.remove(&id);
+                        out.push(LiveAlert { id, level, message: fixed, cleared: true });
+                    }
+                    _ => {}
+                }
+            };
+        for (name, db) in &s.mics {
+            let heard = *self.heard.entry(name.clone()).or_insert(s.at);
+            let heard = if *db > SILENT_DB { s.at } else { heard };
+            self.heard.insert(name.clone(), heard);
+            let bad = cfg.mic_silent_s > 0 && secs(heard) >= i64::from(cfg.mic_silent_s);
+            set(
+                &mut out,
+                format!("mic:{name}"),
+                bad,
+                "error",
+                format!(
+                    "{name} hasn't heard a sound for {} minutes: is it unplugged or muted on the device?",
+                    secs(heard) / 60
+                ),
+                format!("{name} hears you again."),
+            );
+        }
+        for (name, black, sig) in &s.cameras {
+            let dark_since = if *black {
+                *self.dark.entry(name.clone()).or_insert(s.at)
+            } else {
+                self.dark.remove(name);
+                s.at
+            };
+            let changed = match self.changed.get(name) {
+                Some((was, at)) if was == sig => *at,
+                _ => s.at,
+            };
+            self.changed.insert(name.clone(), (*sig, changed));
+            let black_bad = cfg.camera_black_s > 0 && *black && secs(dark_since) >= i64::from(cfg.camera_black_s);
+            set(
+                &mut out,
+                format!("camera:{name}:black"),
+                black_bad,
+                "error",
+                format!(
+                    "{name} has been black for {} s: is the lens covered, or another app using it?",
+                    secs(dark_since)
+                ),
+                format!("{name} has a picture again."),
+            );
+            let frozen_bad = cfg.camera_frozen_s > 0 && !*black && secs(changed) >= i64::from(cfg.camera_frozen_s);
+            set(
+                &mut out,
+                format!("camera:{name}:frozen"),
+                frozen_bad,
+                "warn",
+                format!("{name} has shown the very same picture for {} s: it may have frozen.", secs(changed)),
+                format!("{name} is moving again."),
+            );
+        }
+        for (name, up) in &s.destinations {
+            let sent = if *up { s.at } else { *self.sending.entry(name.clone()).or_insert(s.at) };
+            self.sending.insert(name.clone(), sent);
+            let bad = cfg.destination_down_s > 0 && !*up && secs(sent) >= i64::from(cfg.destination_down_s);
+            set(
+                &mut out,
+                format!("destination:{name}"),
+                bad,
+                "error",
+                format!("{name} hasn't been getting your stream for {} s.", secs(sent)),
+                format!("{name} is getting your stream again."),
+            );
+        }
+        // Gone from the sample (a camera removed, a destination stopped): not watched, so
+        // whatever it raised is cleared (BRB by itself comes back too).
+        let mut present = std::collections::BTreeSet::new();
+        for (n, _) in &s.mics {
+            present.insert(format!("mic:{n}"));
+        }
+        for (n, _, _) in &s.cameras {
+            present.insert(format!("camera:{n}:black"));
+            present.insert(format!("camera:{n}:frozen"));
+        }
+        for (n, _) in &s.destinations {
+            present.insert(format!("destination:{n}"));
+        }
+        let gone: Vec<String> = self.raised.iter().filter(|id| !present.contains(*id)).cloned().collect();
+        for id in gone {
+            self.raised.remove(&id);
+            out.push(LiveAlert { id, level: "warn", message: "That's no longer watched.".into(), cleared: true });
+        }
+        out
     }
 }
 
@@ -241,6 +436,9 @@ pub struct ScenesConfig {
     /// The BRB scene (`!brb` / the BRB button, and during Twitch ads when `brb_on_ads`).
     pub brb_scene: Option<String>,
     pub brb_on_ads: bool,
+    /// While live, BRB by itself when a watched camera (Show's `cam_sources`) has been black for
+    /// the live watch's `camera_black_s`, and back when its picture returns.
+    pub brb_when_black: bool,
     /// Mute these inputs while on BRB.
     pub brb_mute: Vec<String>,
     /// Mods may type `!clip` to save the replay buffer.
@@ -249,6 +447,9 @@ pub struct ScenesConfig {
     pub clip_on_big_moments: bool,
     /// Each saved clip also as a 1080×1920 copy for Shorts, TikTok and Reels (ffmpeg).
     pub vertical_clips: bool,
+    /// The vertical copy fills the frame, following a face that fills the picture (else the
+    /// action), instead of the whole clip over a blurred copy of itself.
+    pub vertical_fill: bool,
     /// Away: while live, the BRB scene after this many minutes with the Show's mics silent,
     /// and back when you talk again (0: off; the Studio only).
     pub away_minutes: u32,
@@ -334,10 +535,12 @@ impl Default for ScenesConfig {
             hotkeys: Vec::new(),
             brb_scene: None,
             brb_on_ads: false,
+            brb_when_black: false,
             brb_mute: Vec::new(),
             clip_command: true,
             clip_on_big_moments: false,
             vertical_clips: false,
+            vertical_fill: false,
             away_minutes: 0,
             clip_by_voice: false,
             clip_captions: false,
@@ -408,6 +611,9 @@ impl ScenesConfig {
         }
         if self.brb_on_ads && self.brb_scene.is_none() {
             return Err("brb_scene: pick the BRB scene to switch to during ads.".into());
+        }
+        if self.brb_when_black && self.brb_scene.is_none() {
+            return Err("brb_scene: pick the BRB scene to switch to when a camera goes black.".into());
         }
         Ok(())
     }
@@ -790,5 +996,70 @@ mod tests {
         assert_eq!(recap_vars(&names, 1, 2, 3_600_000)["duration"], "1 hour");
         let many: Vec<String> = (0..12).map(|i| format!("n{i}")).collect();
         assert!(recap_vars(&many, 0, 0, 0)["thanks"].ends_with("and 4 more"));
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    fn at(s: i64) -> i64 {
+        1_000_000 + s * 1000
+    }
+
+    #[test]
+    fn a_silent_mic_a_black_or_frozen_camera_and_a_down_destination_are_said_once_then_cleared() {
+        let cfg = LiveWatchConfig::default();
+        let mut w = LiveWatch::default();
+        let sample = |t: i64, db: f32, black: bool, sig: u64, up: bool| WatchSample {
+            at: at(t),
+            mics: vec![("Mic".into(), db)],
+            cameras: vec![("Cam".into(), black, sig)],
+            destinations: vec![("Twitch".into(), up)],
+        };
+        // All fine, the picture moving.
+        for t in 0..10 {
+            assert!(w.tick(&cfg, &sample(t * 2, -20.0, false, t as u64, true)).is_empty());
+        }
+        // The camera goes black; 10 s later it's said, once.
+        let mut said = Vec::new();
+        for t in 10..20 {
+            said.extend(w.tick(&cfg, &sample(t * 2, -20.0, true, 0, true)));
+        }
+        assert_eq!(said.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["camera:Cam:black"]);
+        assert!(!said[0].cleared);
+        // Back, moving: cleared.
+        let back = w.tick(&cfg, &sample(40, -20.0, false, 99, true));
+        assert!(back.iter().any(|a| a.id == "camera:Cam:black" && a.cleared));
+        // Frozen (not black) for 30 s.
+        let mut said = Vec::new();
+        for t in 21..40 {
+            said.extend(w.tick(&cfg, &sample(t * 2, -20.0, false, 7, true)));
+        }
+        assert!(said.iter().any(|a| a.id == "camera:Cam:frozen" && !a.cleared), "{said:?}");
+        // The mic silent for 2 minutes, the destination down for 30 s.
+        let mut said = Vec::new();
+        for t in 40..110 {
+            said.extend(w.tick(&cfg, &sample(t * 2, -90.0, false, t as u64, t < 80)));
+        }
+        let ids: Vec<&str> = said.iter().filter(|a| !a.cleared).map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"mic:Mic") && ids.contains(&"destination:Twitch"), "{ids:?}");
+        assert_eq!(w.raised(), ["destination:Twitch", "mic:Mic"]);
+        // A destination that stops running is no longer watched: its alert is cleared.
+        let gone = w.tick(&cfg, &WatchSample { at: at(300), mics: vec![("Mic".into(), -20.0)], ..Default::default() });
+        assert!(gone.iter().any(|a| a.id == "destination:Twitch" && a.cleared), "{gone:?}");
+        assert!(w.raised().is_empty());
+        // Off: nothing said.
+        let off = LiveWatchConfig { on: false, ..Default::default() };
+        assert!(LiveWatch::default().tick(&off, &sample(0, -90.0, true, 0, false)).is_empty());
+    }
+
+    #[test]
+    fn watch_times_are_checked() {
+        let mut c = ShowConfig::default();
+        c.watch.mic_silent_s = 5;
+        assert!(c.validate().unwrap_err().contains("watch.mic_silent_s"));
+        c.watch.mic_silent_s = 0;
+        assert!(c.validate().is_ok());
     }
 }

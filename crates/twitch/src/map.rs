@@ -75,7 +75,7 @@ fn n(v: &Value, key: &str) -> u64 {
 /// An actor from the usual `<prefix>_user_id/_login/_name` triple.
 /// The plain viewer fields are `user_id/user_login/user_name`; others carry a prefix
 /// (`chatter_user_id`, `from_broadcaster_user_id`, `target_user_id`).
-fn actor(v: &Value, prefix: &str) -> Actor {
+pub(crate) fn actor(v: &Value, prefix: &str) -> Actor {
     let key = |field: &str| {
         if prefix == "user" { format!("user_{field}") } else { format!("{prefix}_user_{field}") }
     };

@@ -11,3 +11,6 @@
 /apps/desktop/gen
 node_modules
 /apps/desktop/obs-runtime
+
+# The VST helper, built for the release bundle (release.yml).
+apps/desktop/binaries/

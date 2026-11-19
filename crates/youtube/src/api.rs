@@ -321,6 +321,59 @@ impl Api {
         Ok(())
     }
 
+    /// The broadcast that went live at `since_ms` or after (give or take 15 minutes): its video
+    /// id and when it went live, newest first; ended ones, then the live one (1 unit each).
+    pub async fn last_broadcast(&self, since_ms: i64) -> Result<Option<(String, i64)>, YoutubeError> {
+        let mut best: Option<(String, i64)> = None;
+        for status in ["completed", "active"] {
+            let q =
+                [("part", "id,snippet"), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "10")];
+            let v = self.call(Method::GET, "/liveBroadcasts", &q, None).await?;
+            for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+                let (Some(id), Some(start)) = (
+                    b.get("id").and_then(Value::as_str),
+                    b.pointer("/snippet/actualStartTime").and_then(Value::as_str).and_then(parse_rfc3339_ms),
+                ) else {
+                    continue;
+                };
+                if start >= since_ms - 900_000 && best.as_ref().is_none_or(|(_, s)| start > *s) {
+                    best = Some((id.to_string(), start));
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Puts `chapters` ("0:00 Start" lines) at the end of video `id`'s description, replacing
+    /// chapters put there before; the rest of it and the other details are kept
+    /// (videos.list + videos.update, 51 units).
+    pub async fn set_chapters(&self, id: &str, chapters: &str) -> Result<(), YoutubeError> {
+        let v = self.call(Method::GET, "/videos", &[("part", "snippet"), ("id", id)], None).await?;
+        let mut snippet = v
+            .pointer("/items/0/snippet")
+            .cloned()
+            .ok_or_else(|| YoutubeError::Protocol("the stream's video wasn't found".into()))?;
+        if let Some(o) = snippet.as_object_mut() {
+            for k in ["publishedAt", "channelId", "thumbnails", "channelTitle", "liveBroadcastContent", "localized"] {
+                o.remove(k);
+            }
+        }
+        let old = snippet.get("description").and_then(Value::as_str).unwrap_or_default();
+        let description = with_chapters(old, chapters);
+        if description.chars().count() > MAX_DESCRIPTION_CHARS {
+            return Err(YoutubeError::Refused(format!(
+                "the description would pass YouTube's {MAX_DESCRIPTION_CHARS} characters with the chapters"
+            )));
+        }
+        snippet["description"] = json!(description);
+        if snippet.get("categoryId").is_none() {
+            snippet["categoryId"] = json!("20");
+        }
+        self.call(Method::PUT, "/videos", &[("part", "snippet")], Some(json!({ "id": id, "snippet": snippet })))
+            .await?;
+        Ok(())
+    }
+
     /// Changes the broadcast video's title, category, tags, language and description
     /// (`videos.update`, 50 units). The video's snippet is read first so whatever isn't
     /// being changed (the description, unless given) is kept.
@@ -508,11 +561,48 @@ impl Api {
         // Ferrocast's own vertical stream (and its broadcast) is never the normal one.
         let (main, _) = self.broadcasts(vertical.as_deref()).await?;
         let bound = main.as_ref().and_then(|b| b.pointer("/contentDetails/boundStreamId").and_then(Value::as_str));
-        let stream = main_stream_id(&streams, vertical.as_deref(), bound).ok_or_else(|| {
+        let mut stream = main_stream_id(&streams, vertical.as_deref(), bound).ok_or_else(|| {
             YoutubeError::Refused(
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })?;
+        let mut streams = streams;
+        // A key set to one resolution (an old "1080p" key) caps the stream there whatever is
+        // sent (19 Nov, live: 1440p went out as 1080p on an old vertical key). Ferrocast's own
+        // key, any resolution, is used instead, and the broadcast bound to it (as OBS's YouTube
+        // sign-in makes its own stream).
+        // Not while a broadcast made a moment ago (bound to the old key) isn't listed yet.
+        if fixed_resolution(&streams, &stream) && just_made(&made).is_none() {
+            match self.own_stream(&streams).await {
+                Ok((id, list)) => {
+                    let bound_ok = match &main {
+                        Some(b) if !is_live(b) => {
+                            let bid = b.get("id").and_then(Value::as_str).unwrap_or_default();
+                            self.call(
+                                Method::POST,
+                                "/liveBroadcasts/bind",
+                                &[("id", bid), ("part", "id"), ("streamId", id.as_str())],
+                                None,
+                            )
+                            .await
+                            .map(drop)
+                        }
+                        // Already live on the old key: it stays there (moving it would end it).
+                        Some(_) => Err(YoutubeError::Refused("the broadcast is live on its key".into())),
+                        None => Ok(()),
+                    };
+                    match bound_ok {
+                        Ok(()) => {
+                            tracing::info!("YouTube: the stream goes to Ferrocast's own key (any resolution)");
+                            stream = id;
+                            streams = list;
+                        }
+                        Err(err) => tracing::warn!(%err, "YouTube: kept the broadcast's key, set to one resolution"),
+                    }
+                }
+                Err(err) => tracing::warn!(%err, "YouTube: couldn't make Ferrocast's own key"),
+            }
+        }
         match &main {
             // One waiting for "Go live" in YouTube Studio starts with the stream instead.
             Some(b) => {
@@ -541,6 +631,44 @@ impl Api {
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
         })
+    }
+}
+
+impl Api {
+    /// Ferrocast's own normal stream (any resolution), made once and found again by its title
+    /// → its id and the stream list with it in (liveStreams.insert, 50 units, the first time).
+    async fn own_stream(&self, streams: &Value) -> Result<(String, Value), YoutubeError> {
+        let found = streams.get("items").and_then(Value::as_array).and_then(|i| {
+            i.iter().find(|s| {
+                s.pointer("/snippet/title").and_then(Value::as_str) == Some(MAIN_STREAM_TITLE)
+                    && s.pointer("/cdn/resolution").and_then(Value::as_str) == Some("variable")
+                    && usable(s).is_some()
+            })
+        });
+        if let Some(id) = found.and_then(|s| s.get("id").and_then(Value::as_str)) {
+            return Ok((id.to_string(), streams.clone()));
+        }
+        let body = json!({
+            "snippet": { "title": MAIN_STREAM_TITLE, "description": "Ferrocast streams here, at any resolution." },
+            "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable" },
+            "contentDetails": { "isReusable": true },
+        });
+        let made =
+            self.call(Method::POST, "/liveStreams", &[("part", "id,snippet,cdn,contentDetails")], Some(body)).await?;
+        let id = made.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if id.is_empty() || usable(&made).is_none() {
+            return Err(YoutubeError::Refused(
+                "YouTube hasn't given Ferrocast's key yet; try again in a minute".into(),
+            ));
+        }
+        tracing::info!("YouTube: made Ferrocast's own stream key (any resolution)");
+        let mut list = streams.clone();
+        if let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) {
+            items.push(made);
+        } else {
+            list = json!({ "items": [made] });
+        }
+        Ok((id, list))
     }
 }
 
@@ -632,6 +760,23 @@ impl Api {
 /// The upright stream Ferrocast makes for YouTube Shorts live (found again by this title).
 pub const VERTICAL_STREAM_TITLE: &str = "Ferrocast vertical";
 
+/// The normal stream Ferrocast makes when the channel's key is set to one resolution.
+pub const MAIN_STREAM_TITLE: &str = "Ferrocast";
+
+/// Whether stream `id` in `list` is set to one resolution (not "variable").
+fn fixed_resolution(list: &Value, id: &str) -> bool {
+    list.get("items")
+        .and_then(Value::as_array)
+        .and_then(|i| i.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id)))
+        .and_then(|s| s.pointer("/cdn/resolution").and_then(Value::as_str))
+        .is_some_and(|r| r != "variable")
+}
+
+/// Whether a broadcast is on air (or about to be).
+fn is_live(b: &Value) -> bool {
+    matches!(b.pointer("/status/lifeCycleStatus").and_then(Value::as_str), Some("live" | "liveStarting"))
+}
+
 /// Ferrocast's vertical stream in a liveStreams list.
 fn vertical_id(list: &Value) -> Option<String> {
     list.get("items")?
@@ -640,6 +785,75 @@ fn vertical_id(list: &Value) -> Option<String> {
         .find(|s| s.pointer("/snippet/title").and_then(Value::as_str) == Some(VERTICAL_STREAM_TITLE))
         .and_then(|s| s.get("id").and_then(Value::as_str))
         .map(String::from)
+}
+
+/// `2026-10-24T10:30:00Z` (or with `.123` and an offset) as Unix ms; None when it isn't one.
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d, hh, mm, ss) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Fractions of a second, then Z or ±hh:mm.
+    let mut rest = &s[19..];
+    let mut ms = 0;
+    if let Some(f) = rest.strip_prefix('.') {
+        let digits = f.bytes().take_while(u8::is_ascii_digit).count();
+        ms = format!("{:0<3}", &f[..digits.min(3)]).parse::<i64>().ok()?;
+        rest = &f[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && (o.starts_with('+') || o.starts_with('-')) && &o[3..4] == ":" => {
+            let v = o[1..3].parse::<i64>().ok()? * 3600 + o[4..6].parse::<i64>().ok()? * 60;
+            if o.starts_with('-') { -v } else { v }
+        }
+        _ => return None,
+    };
+    // Days from civil (H. Hinnant).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + hh * 3600 + mm * 60 + ss - offset) * 1000 + ms)
+}
+
+/// The line chapters start under in a description, and YouTube's description limit.
+const CHAPTERS_HEAD: &str = "Chapters:\n0:00 ";
+const MAX_DESCRIPTION_CHARS: usize = 5000;
+
+/// `description` with `chapters` at its end, under "Chapters:". Chapters put there before
+/// (that line followed by a 0:00 one, and the timed lines after) go; all else is kept.
+pub(crate) fn with_chapters(description: &str, chapters: &str) -> String {
+    let at =
+        description.match_indices(CHAPTERS_HEAD).map(|(i, _)| i).find(|&i| i == 0 || description[..i].ends_with('\n'));
+    let timed = |line: &str| {
+        line.split_once(' ').is_some_and(|(t, _)| t.contains(':') && t.bytes().all(|b| b.is_ascii_digit() || b == b':'))
+    };
+    let (before, after) = match at {
+        Some(at) => {
+            let mut end = at;
+            for (i, line) in description[at..].split_inclusive('\n').enumerate() {
+                if i > 0 && !timed(line) {
+                    break;
+                }
+                end += line.len();
+            }
+            (&description[..at], &description[end..])
+        }
+        None => (description, ""),
+    };
+    let mut parts: Vec<String> =
+        [before.trim(), after.trim()].into_iter().filter(|p| !p.is_empty()).map(String::from).collect();
+    parts.push(format!("Chapters:\n{}", chapters.trim_end()));
+    parts.join("\n\n")
 }
 
 /// Unix ms as `2026-10-24T10:30:00Z` (UTC; days-to-civil from H. Hinnant's date algorithms).

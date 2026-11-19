@@ -2,15 +2,16 @@
 //! wide picture as a nested scene) slides sideways so the face in it stays in the middle. The
 //! item is made to fill the picture's height, and is never moved so far that an edge shows.
 //! Finding the face is Apple's Vision on a Mac (`ffi::vision`); the rest works anywhere.
+//! The stage moves the item (`stage::Stage::start_follow`).
 
 use serde::Serialize;
 
-use super::{Collection, Transform};
-use crate::StudioError;
+use super::Transform;
+#[cfg(target_os = "macos")]
 use crate::ffi;
 
 /// How wide the snapshot faces are looked for in is (small: a face fills plenty of it).
-const LOOK_WIDTH: u32 = 320;
+pub(crate) const LOOK_WIDTH: u32 = 320;
 
 /// A move smaller than this share of the picture's width isn't made (no jitter).
 const DEAD_ZONE: f32 = 0.03;
@@ -54,6 +55,21 @@ pub fn find_busy(rgba: &[u8], w: u32, h: u32) -> Vec<Face> {
     }
 }
 
+/// A face at least this share of the picture's width is the subject (a camera filling it);
+/// a smaller one is a facecam in a corner, and the action is followed instead.
+const BIG_FACE: f64 = 0.12;
+
+/// Where to keep the eye in an RGBA picture, across (0 to 1): a face big enough to be the
+/// subject, else what stands out; None when nothing does.
+pub fn focus_x(rgba: &[u8], w: u32, h: u32) -> Option<f32> {
+    let pick = |f: &Face| (f.x + f.w / 2.0) as f32;
+    find_faces(rgba, w, h)
+        .iter()
+        .find(|f| f.w >= BIG_FACE)
+        .map(pick)
+        .or_else(|| find_busy(rgba, w, h).first().map(pick))
+}
+
 /// A small picture of what an item shows, to look for faces in.
 #[derive(Debug, Clone)]
 pub struct FollowLook {
@@ -69,7 +85,7 @@ pub struct FaceFollow {
     pub id: i64,
     /// Follows what stands out (the action) instead of a face.
     pub action: bool,
-    before: Transform,
+    pub(crate) before: Transform,
     /// Looks in a row without a face.
     pub misses: u32,
 }
@@ -97,87 +113,26 @@ pub(crate) fn shown_mid(face: &Face, src_w: f32, crop_left: f32, crop_right: f32
     ((px - crop_left) / shown).clamp(0.0, 1.0)
 }
 
-impl Collection {
-    /// Starts an item following faces: it fills the picture's height, centred, from its top
-    /// left (how it was comes back with [`Collection::stop_follow`]).
-    pub fn start_follow(&self, scene: &str, id: i64, action: bool) -> Result<FaceFollow, StudioError> {
-        let before = self.transform(scene, id)?;
-        let (cw, ch) = self.size_of(self.scene_ptr(scene)?);
-        let shown_w = (before.width as i32 - before.crop_left - before.crop_right).max(1) as f32;
-        let shown_h = (before.height as i32 - before.crop_top - before.crop_bottom).max(1) as f32;
-        if before.width == 0 || before.height == 0 {
-            return Err(StudioError::Failed("That source shows no picture yet.".into()));
-        }
-        let scale = ch as f32 / shown_h;
-        let t = Transform {
-            x: aim(0.5, shown_w * scale, cw as f32),
-            y: 0.0,
-            rotation: 0.0,
-            scale_x: scale,
-            scale_y: scale,
-            alignment: 5,
-            bounds: "none".into(),
-            bounds_alignment: 0,
-            bounds_width: 0.0,
-            bounds_height: 0.0,
-            ..before.clone()
-        };
-        self.set_transform(scene, id, &t)?;
-        Ok(FaceFollow { scene: scene.into(), id, action, before, misses: 0 })
-    }
-
-    /// A small picture of what the item's source shows now.
-    pub fn follow_look(&self, f: &FaceFollow) -> Result<Option<FollowLook>, StudioError> {
-        let item = self.item(&f.scene, f.id)?;
-        let a = self.api();
-        let src = a.obs_sceneitem_get_source(item);
-        let (sw, sh) = (a.obs_source_get_width(src), a.obs_source_get_height(src));
-        if sw == 0 || sh == 0 {
-            return Ok(None);
-        }
-        let h = ((LOOK_WIDTH as f32 * sh as f32 / sw as f32).round() as u32).clamp(1, LOOK_WIDTH * 4);
-        Ok(ffi::snapshot_scaled(a, src, (sw, sh), LOOK_WIDTH, h).map(|rgba| FollowLook {
-            rgba,
-            width: LOOK_WIDTH,
-            height: h,
-        }))
-    }
-
-    /// Moves the item a step toward `face` (the biggest found), or keeps it where it is.
-    pub fn follow_step(&self, f: &mut FaceFollow, face: Option<Face>) -> Result<(), StudioError> {
-        let Some(face) = face else {
-            f.misses += 1;
-            return Ok(());
-        };
-        f.misses = 0;
-        let t = self.transform(&f.scene, f.id)?;
-        let (cw, _) = self.size_of(self.scene_ptr(&f.scene)?);
-        let shown_w = (t.width as i32 - t.crop_left - t.crop_right).max(1) as f32 * t.scale_x.abs();
-        let mid = shown_mid(&face, t.width as f32, t.crop_left as f32, t.crop_right as f32);
-        // Measured from its left edge: where that is depends on how it's anchored.
-        let left = match t.alignment & 3 {
-            1 => t.x,
-            2 => t.x - shown_w,
-            _ => t.x - shown_w / 2.0,
-        };
-        let to = ease(left, aim(mid, shown_w, cw as f32), cw as f32);
-        if to != left {
-            self.set_transform(&f.scene, f.id, &Transform { x: t.x + (to - left), ..t })?;
-        }
-        Ok(())
-    }
-
-    /// Puts the item back as it was before following (when it's still there).
-    pub fn stop_follow(&self, f: &FaceFollow) {
-        if self.item(&f.scene, f.id).is_ok() {
-            let _ = self.set_transform(&f.scene, f.id, &f.before);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vision finds what stands out: a bright square on the right of a dark picture.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_eye_goes_to_what_stands_out() {
+        let (w, h) = (320u32, 180u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 60..120 {
+            for x in 230..290 {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[255, 220, 40, 255]);
+            }
+        }
+        let x = focus_x(&rgba, w, h).expect("something stands out");
+        // Vision boxes attention loosely: right of the middle is enough.
+        assert!(x > 0.55, "{x}");
+    }
 
     #[test]
     fn the_face_goes_to_the_middle_without_showing_an_edge() {

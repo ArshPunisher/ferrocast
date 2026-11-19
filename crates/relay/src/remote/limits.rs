@@ -96,6 +96,13 @@ impl Limits {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// Forgets every bucket (tests that start over).
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
 }
 
 /// The rate-limit key for an address: IPv4 as is, IPv6 by its /64 (IPv4-mapped as IPv4).

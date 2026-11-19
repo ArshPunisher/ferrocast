@@ -31,6 +31,23 @@ const AUDIO_PT: u8 = 111;
 const START_KBPS: u32 = 2500;
 const MAX_KBPS: u32 = 6000;
 
+/// The video codec asked of the browser: VP8 for the Studio (it decodes it), H.264 where the
+/// picture goes on untouched to platforms that take only H.264 (Ferrocast Bond's phone page).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Video {
+    Vp8,
+    H264,
+}
+
+impl Video {
+    fn rtpmap(self) -> &'static str {
+        match self {
+            Video::Vp8 => "VP8/90000",
+            Video::H264 => "H264/90000",
+        }
+    }
+}
+
 /// How long a guest may stay unreachable before they count as gone.
 const GONE_AFTER: Duration = Duration::from_secs(15);
 
@@ -91,16 +108,28 @@ impl Guest {
     /// for the FFmpeg source is written; `host` the address this computer is reached on (None:
     /// the one its traffic leaves by).
     pub fn accept(offer: &str, sdp: &Path, host: Option<IpAddr>) -> Result<(String, Guest), GuestError> {
-        let offer: SdpOffer = serde_json::from_str(offer).map_err(|e| GuestError::BadOffer(e.to_string()))?;
-        let mut rtc = Rtc::builder()
-            .clear_codecs()
-            .enable_vp8(true)
-            .enable_opus(true, false)
-            .set_rtp_mode(true)
-            .build(Instant::now());
         // Bound to the one address it's offered on: str0m matches what arrives to that address.
         let host = host.unwrap_or_else(local_address);
         let socket = UdpSocket::bind((host, 0))?;
+        Self::accept_with(offer, sdp, Video::Vp8, socket)
+    }
+
+    /// `accept` asking for `video`, on a socket the caller bound (to one address, maybe in a
+    /// range of ports a firewall lets through).
+    pub fn accept_with(
+        offer: &str,
+        sdp: &Path,
+        video: Video,
+        socket: UdpSocket,
+    ) -> Result<(String, Guest), GuestError> {
+        let offer: SdpOffer = serde_json::from_str(offer).map_err(|e| GuestError::BadOffer(e.to_string()))?;
+        let mut rtc = Rtc::builder()
+            .clear_codecs()
+            .enable_vp8(video == Video::Vp8)
+            .enable_h264(video == Video::H264)
+            .enable_opus(true, false)
+            .set_rtp_mode(true)
+            .build(Instant::now());
         let base = socket.local_addr()?;
         let c = Candidate::host(base, "udp").map_err(|e| GuestError::Answer(e.to_string()))?;
         rtc.add_local_candidate(c);
@@ -113,7 +142,7 @@ impl Guest {
         }
         let answer = rtc.sdp_api().accept_offer(offer).map_err(|e| GuestError::Answer(e.to_string()))?;
         let mut answer = serde_json::to_value(&answer).map_err(|e| GuestError::Answer(e.to_string()))?;
-        if let Some(sdp) = answer.get("sdp").and_then(|s| s.as_str()).map(with_bitrates) {
+        if let Some(sdp) = answer.get("sdp").and_then(|s| s.as_str()).map(|s| with_bitrates(s, video)) {
             answer["sdp"] = sdp.into();
         }
         let answer = answer.to_string();
@@ -121,11 +150,11 @@ impl Guest {
         // The sending socket first, then two pairs held open while they're picked, so none of the
         // six ports is the same.
         let out = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let (video, video_port) = free_pair()?;
-        let (audio, audio_port) = free_pair()?;
+        let (video_pair, video_port) = free_pair()?;
+        let (audio_pair, audio_port) = free_pair()?;
         // Let go just before FFmpeg takes them.
-        drop((video, audio));
-        write_sdp(sdp, video_port, audio_port)?;
+        drop((video_pair, audio_pair));
+        write_sdp(sdp, video, video_port, audio_port)?;
         let shared = Arc::new(Shared::default());
         let born = Instant::now();
         let s = shared.clone();
@@ -191,29 +220,31 @@ pub fn source_settings(sdp: &Path) -> serde_json::Value {
 }
 
 /// The SDP file: the guest's video on one port, their sound on another, both here.
-fn sdp_text(video_port: u16, audio_port: u16) -> String {
+fn sdp_text(video: Video, video_port: u16, audio_port: u16) -> String {
+    let codec = video.rtpmap();
+    let fmtp = if video == Video::H264 { format!("a=fmtp:{VIDEO_PT} packetization-mode=1\r\n") } else { String::new() };
     format!(
         "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Ferrocast guest\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-         m=video {video_port} RTP/AVP {VIDEO_PT}\r\na=rtpmap:{VIDEO_PT} VP8/90000\r\n\
+         m=video {video_port} RTP/AVP {VIDEO_PT}\r\na=rtpmap:{VIDEO_PT} {codec}\r\n{fmtp}\
          m=audio {audio_port} RTP/AVP {AUDIO_PT}\r\na=rtpmap:{AUDIO_PT} opus/48000/2\r\n"
     )
 }
 
-fn write_sdp(path: &Path, video_port: u16, audio_port: u16) -> std::io::Result<()> {
+fn write_sdp(path: &Path, video: Video, video_port: u16, audio_port: u16) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, sdp_text(video_port, audio_port))
+    std::fs::write(path, sdp_text(video, video_port, audio_port))
 }
 
-/// The answer's SDP with Chrome's bitrate hints on its VP8 (`x-google-start-bitrate`, read from
-/// the far side's description): an fmtp line added, or the hints added to the one there.
-fn with_bitrates(sdp: &str) -> String {
+/// The answer's SDP with Chrome's bitrate hints on its video (`x-google-start-bitrate`, read
+/// from the far side's description): an fmtp line added, or the hints added to the one there.
+fn with_bitrates(sdp: &str, video: Video) -> String {
     let hints = format!("x-google-start-bitrate={START_KBPS};x-google-max-bitrate={MAX_KBPS}");
     let pts: Vec<&str> = sdp
         .lines()
         .filter_map(|l| l.strip_prefix("a=rtpmap:"))
-        .filter_map(|r| r.split_once(' ').filter(|(_, c)| c.eq_ignore_ascii_case("VP8/90000")).map(|(pt, _)| pt))
+        .filter_map(|r| r.split_once(' ').filter(|(_, c)| c.eq_ignore_ascii_case(video.rtpmap())).map(|(pt, _)| pt))
         .collect();
     let mut out = String::with_capacity(sdp.len() + 128);
     for line in sdp.split_inclusive("\r\n") {
@@ -394,7 +425,7 @@ fn run(
                             .find(|c| c.pt() == p.header.payload_type)
                             .map(|c| c.spec().codec);
                         let (pt, dest) = match codec {
-                            Some(Codec::Vp8) => {
+                            Some(Codec::Vp8 | Codec::H264) => {
                                 s.video.store(true, Ordering::Release);
                                 if video_ssrc.is_none() {
                                     video_ssrc = Some(p.header.ssrc);
@@ -481,7 +512,7 @@ mod tests {
 
     #[test]
     fn the_sdp_names_both_ports() {
-        let t = sdp_text(50000, 50002);
+        let t = sdp_text(Video::Vp8, 50000, 50002);
         assert!(t.contains("m=video 50000 RTP/AVP 96\r\na=rtpmap:96 VP8/90000"));
         assert!(t.contains("m=audio 50002 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2"));
     }
@@ -489,7 +520,7 @@ mod tests {
     #[test]
     fn chrome_is_told_to_start_sharp() {
         let sdp = "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 rtx/90000\r\na=fmtp:97 apt=96\r\n";
-        let out = with_bitrates(sdp);
+        let out = with_bitrates(sdp, Video::Vp8);
         assert!(
             out.contains(
                 "a=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=2500;x-google-max-bitrate=6000\r\n"
@@ -498,7 +529,7 @@ mod tests {
         assert!(out.contains("a=fmtp:97 apt=96\r\n"), "the resend line is left alone");
         let had = "a=rtpmap:96 VP8/90000\r\na=fmtp:96 max-fs=12288\r\n";
         assert_eq!(
-            with_bitrates(had),
+            with_bitrates(had, Video::Vp8),
             "a=rtpmap:96 VP8/90000\r\na=fmtp:96 max-fs=12288;x-google-start-bitrate=2500;x-google-max-bitrate=6000\r\n"
         );
     }

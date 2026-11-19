@@ -34,6 +34,16 @@ pub struct CategoryIds {
 }
 
 impl CategoryIds {
+    /// Keeps `id` as `p`'s own (Twitch, YouTube or Kick; others have none).
+    pub fn set(&mut self, p: Platform, id: String) {
+        match p {
+            Platform::Twitch => self.twitch = Some(id),
+            Platform::Youtube => self.youtube = Some(id),
+            Platform::Kick => self.kick = Some(id),
+            _ => {}
+        }
+    }
+
     pub fn get(&self, p: Platform) -> Option<&str> {
         match p {
             Platform::Twitch => self.twitch.as_deref(),
@@ -341,6 +351,10 @@ pub struct PlatformResult {
     /// `applied` on it as soon as you're live (no scheduling in YouTube Studio).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// The category it shows now, in its own words ("Call of Duty: Warzone" for "Warzone";
+    /// YouTube's video category "Gaming": it picks the game itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

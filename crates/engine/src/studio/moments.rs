@@ -14,6 +14,9 @@ use crate::{Engine, EngineError, now};
 /// The lane keeps this many (oldest drop off; dismissed ones go at once).
 const LANE_KEEP: usize = 50;
 
+/// How long after a YouTube stream ends its chapters wait (YouTube closes the broadcast).
+const YOUTUBE_SETTLE: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LaneItem {
     pub id: String,
@@ -99,7 +102,53 @@ impl Engine {
         let l = label.to_string();
         let m = self.db(move |s| repo::studio::add_marker(s, kind, &l, platform, start, clip)).await?;
         self.studio_frame("marker", &m);
+        // A chapter in the Studio's recording too, when it records (it says no otherwise).
+        if self.studio_host().is_ok() {
+            let engine = self.clone();
+            let name: String = m.label.chars().filter(|c| !c.is_control()).take(100).collect();
+            tokio::spawn(async move {
+                if let Err(e) = engine.studio_record_chapter(name).await {
+                    tracing::debug!(error = %e, "no recording chapter");
+                }
+            });
+        }
         Ok(m)
+    }
+
+    /// After a YouTube stream that began at `since` (Unix ms) ends: its chapters at the end of
+    /// the video's description (when asked), and a word on the dashboard either way. YouTube
+    /// takes a little while to close the broadcast, so this waits first.
+    pub(crate) fn youtube_chapters_later(&self, since: i64) {
+        if !self.moments_config().youtube_chapters {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(YOUTUBE_SETTLE).await;
+            let (ok, message) = match engine.youtube_chapters(since).await {
+                Ok(n) => (true, format!("{n} chapters added to your YouTube video.")),
+                Err(e) => (false, format!("No chapters on YouTube: {e}")),
+            };
+            tracing::info!(ok, "{message}");
+            engine.studio_frame(
+                "live_alert",
+                &ferrocast_core::show::LiveAlert { id: "chapters:youtube".into(), level: "warn", message, cleared: ok },
+            );
+        });
+    }
+
+    /// The stream's chapters, timed from when YouTube's video began, into its description →
+    /// how many.
+    async fn youtube_chapters(&self, since: i64) -> Result<usize, String> {
+        let yt = self.connector(Platform::Youtube).ok_or("YouTube isn't connected.")?;
+        let (video, start) =
+            yt.last_vod(since).await.map_err(|e| e.to_string())?.ok_or("YouTube has no video of this stream (yet).")?;
+        let list = self.markers(Some(start.min(now().0))).await.map_err(|e| e.to_string())?;
+        let timed: Vec<Marker> =
+            list.into_iter().map(|m| Marker { offset_ms: Some((m.at - start).max(0)), ..m }).collect();
+        let text = moments::youtube_chapters(&timed)?;
+        yt.set_chapters(&video, &text).await.map_err(|e| e.to_string())?;
+        Ok(text.lines().count())
     }
 
     /// Markers since `since` (default: this stream's start, or the last 24 hours).
@@ -137,7 +186,13 @@ impl Engine {
                 format!("ferrocast-markers-{y:04}-{m:02}-{d:02}.txt"),
                 moments::to_txt(&list),
             )),
-            _ => Err(EngineError::Invalid("format: csv or txt.".into())),
+            // Timed from the stream's start, as YouTube reads chapters in a description.
+            "youtube" => Ok((
+                "text/plain; charset=utf-8",
+                format!("ferrocast-chapters-{y:04}-{m:02}-{d:02}.txt"),
+                moments::youtube_chapters(&list).map_err(EngineError::Invalid)?,
+            )),
+            _ => Err(EngineError::Invalid("format: csv, txt or youtube.".into())),
         }
     }
 

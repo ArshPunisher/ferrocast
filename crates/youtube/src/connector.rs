@@ -83,6 +83,14 @@ impl Connector for YoutubeConnector {
         Ok(self.api.set_thumbnail(image, mime).await?)
     }
 
+    async fn last_vod(&self, since_ms: i64) -> Result<Option<(String, i64)>> {
+        Ok(self.api.last_broadcast(since_ms).await?)
+    }
+
+    async fn set_chapters(&self, video: &str, chapters: &str) -> Result<()> {
+        Ok(self.api.set_chapters(video, chapters).await?)
+    }
+
     async fn ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.ingest().await?)
     }

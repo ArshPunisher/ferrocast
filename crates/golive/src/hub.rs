@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
-use rml_rtmp::sessions::StreamMetadata;
+pub use rml_rtmp::sessions::StreamMetadata;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
@@ -41,6 +41,8 @@ pub struct Headers {
     pub audio: Option<Bytes>,
     /// Extra audio tracks' codec headers, by track (Twitch's VOD track).
     pub extra_audio: Vec<(u8, Bytes)>,
+    /// Extra video tracks' codec headers, by track (Twitch Enhanced Broadcasting).
+    pub extra_video: Vec<(u8, Bytes)>,
 }
 
 /// Which stream is on. Every new publish gets the next number, so a destination can tell a
@@ -147,11 +149,32 @@ impl Hub {
         let _ = self.tx.send(Frame::Metadata(m));
     }
 
+    /// Changes the kept metadata (a stream whose picture changed while live) for destinations
+    /// that join or rejoin from now on. Those already sending aren't sent it again: they get
+    /// the new codec header and a keyframe, as a stream changing resolution sends.
+    pub fn metadata_changed(&self, f: impl FnOnce(&mut StreamMetadata)) {
+        let mut st = self.lock();
+        let Some(old) = st.headers.metadata.as_deref() else { return };
+        let mut m = old.clone();
+        f(&mut m);
+        st.stats.width = m.video_width;
+        st.stats.height = m.video_height;
+        st.stats.fps = m.video_frame_rate;
+        st.headers.metadata = Some(Arc::new(m));
+    }
+
     /// An FLV video tag body (a codec header, or a frame) at `ts` milliseconds.
     pub fn video(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
-        let key = flv::video_is_keyframe(&data);
-        if flv::video_is_header(&data) {
+        let extra = flv::video_extra_track(&data);
+        // Only the main track's keyframes are where a joining destination may start.
+        let key = extra.is_none() && flv::video_is_keyframe(&data);
+        if let Some((track, header)) = extra {
+            if header {
+                st.headers.extra_video.retain(|(t, _)| *t != track);
+                st.headers.extra_video.push((track, data.clone()));
+            }
+        } else if flv::video_is_header(&data) {
             st.stats.video_codec = flv::video_codec(&data);
             st.headers.video = Some(data.clone());
         } else if key {

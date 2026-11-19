@@ -92,6 +92,18 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "add stream markers" })
     }
 
+    /// The stream that went live at `since_ms` or after, kept as a video: its id and when it
+    /// went live (Unix ms), where the platform keeps one (YouTube).
+    async fn last_vod(&self, _since_ms: i64) -> Result<Option<(String, i64)>> {
+        Ok(None)
+    }
+
+    /// Puts chapters ("0:00 Start" lines) at the end of a video's description, replacing
+    /// chapters put there before.
+    async fn set_chapters(&self, _video: &str, _chapters: &str) -> Result<()> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "add chapters to a video" })
+    }
+
     /// When `login` followed the channel, if the platform says (Unix ms).
     async fn followed_at(&self, _user_id: &str) -> Result<Option<i64>> {
         Ok(None)

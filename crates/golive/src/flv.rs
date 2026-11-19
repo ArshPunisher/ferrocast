@@ -93,9 +93,68 @@ pub fn audio_extra_track(data: &[u8]) -> Option<(u8, bool)> {
     (track != 0).then_some((track, kind & 0x0F == 0))
 }
 
+/// Enhanced RTMP's video packet types this writes: SequenceStart (the codec header),
+/// CodedFrames (with a composition time), CodedFramesX (none: pts is dts), Multitrack.
+pub const VIDEO_SEQUENCE_START: u8 = 0;
+pub const VIDEO_CODED_FRAMES: u8 = 1;
+pub const VIDEO_CODED_FRAMES_X: u8 = 3;
+const VIDEO_MULTITRACK: u8 = 6;
+
+/// An extra video track's tag (Twitch Enhanced Broadcasting: Enhanced RTMP multitrack video, one
+/// track a packet, as OBS's `flv_packet_ex` writes it): `track` 1 or more, `kind` one of the
+/// packet types above, `cts` the composition time in ms (CodedFrames only).
+pub fn video_track_tag(track: u8, keyframe: bool, kind: u8, fourcc: &[u8; 4], cts: i32, data: &[u8]) -> Vec<u8> {
+    let frame = if keyframe { 0x10 } else { 0x20 };
+    let mut out = Vec::with_capacity(data.len() + 10);
+    out.push(0x80 | frame | VIDEO_MULTITRACK);
+    out.push(ONE_TRACK | (kind & 0x0F));
+    out.extend_from_slice(fourcc);
+    out.push(track);
+    if kind == VIDEO_CODED_FRAMES {
+        out.extend_from_slice(&cts.to_be_bytes()[1..]);
+    }
+    out.extend_from_slice(data);
+    out
+}
+
+/// An extra video track's packet: its track number and whether it's that track's codec header.
+/// None for the main track (0) and everything else. A destination that isn't Twitch's
+/// Enhanced Broadcasting drops these.
+pub fn video_extra_track(data: &[u8]) -> Option<(u8, bool)> {
+    let &b = data.first()?;
+    if b & 0x80 == 0 || b & 0x0F != VIDEO_MULTITRACK {
+        return None;
+    }
+    let &kind = data.get(1)?;
+    if kind & 0xF0 != ONE_TRACK {
+        return None;
+    }
+    let &track = data.get(6)?;
+    (track != 0).then_some((track, kind & 0x0F == VIDEO_SEQUENCE_START))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_video_tracks_as_obs_writes_them() {
+        // A track's header: 0x96 = ex header, keyframe, Multitrack; 0x00 = one track, SequenceStart.
+        let head = video_track_tag(2, true, VIDEO_SEQUENCE_START, b"avc1", 0, &[1, 2]);
+        assert_eq!(head, [0x96, 0x00, b'a', b'v', b'c', b'1', 2, 1, 2]);
+        assert_eq!(video_extra_track(&head), Some((2, true)));
+        // A frame with a composition time (3 bytes, big endian) before its data.
+        let frame = video_track_tag(1, false, VIDEO_CODED_FRAMES, b"avc1", 66, &[9]);
+        assert_eq!(frame, [0xA6, 0x01, b'a', b'v', b'c', b'1', 1, 0, 0, 66, 9]);
+        assert_eq!(video_extra_track(&frame), Some((1, false)));
+        // CodedFramesX: no composition time.
+        assert_eq!(video_track_tag(1, true, VIDEO_CODED_FRAMES_X, b"avc1", 0, &[7]).len(), 8);
+        // The main track, classic AVC and other ex packets aren't extra tracks.
+        assert_eq!(video_extra_track(&video_track_tag(0, true, VIDEO_CODED_FRAMES_X, b"avc1", 0, &[])), None);
+        assert_eq!(video_extra_track(&[0x17, 0x01]), None);
+        assert_eq!(video_extra_track(&[0x91, b'h', b'v', b'c', b'1']), None);
+        assert_eq!(video_extra_track(&[0x96, 0x00]), None);
+    }
 
     #[test]
     fn extra_audio_tracks_as_obs_sends_them() {

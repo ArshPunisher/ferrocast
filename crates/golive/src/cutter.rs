@@ -144,7 +144,12 @@ async fn run_once(
     stop: &mut watch::Receiver<bool>,
 ) -> Outcome {
     let args = cut::ffmpeg_args(cfg, w, h, enc, publish);
-    let mut child = match Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    // No console window of its own on Windows (an installed app has none, so Windows made
+    // one for FFmpeg, and closing it ended the vertical stream). CREATE_NO_WINDOW.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let mut child = match cmd
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

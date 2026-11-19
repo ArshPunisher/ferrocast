@@ -13,6 +13,11 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+/// FFmpeg with no console window of its own on Windows (`ferrocore::ffenc::hidden`).
+fn hidden(ffmpeg: &Path) -> Command {
+    Command::from(ferrocore::ffenc::hidden(std::process::Command::new(ffmpeg)))
+}
+
 use crate::Engine;
 use crate::studio_host::{Said, Transcribe};
 
@@ -96,6 +101,91 @@ fn audio_args(clip: &Path) -> Vec<OsString> {
     a
 }
 
+/// Filling the frame: the clip is looked at this often, for at most this many looks.
+const LOOK_EVERY_S: f32 = 0.5;
+const MAX_LOOKS: usize = 600;
+/// Pictures handed to Vision together (about 9 MB).
+const LOOK_BATCH: usize = 40;
+/// The looks' size (the eye's place across doesn't need more).
+const LOOK_W: u32 = 320;
+const LOOK_H: u32 = 180;
+/// The frame moves when the eye goes this far (share of the width), and glides there this long.
+const MOVE_AT: f32 = 0.08;
+const GLIDE_S: f32 = 0.6;
+/// At most this many turning points (ffmpeg reads them as one expression).
+const MAX_POINTS: usize = 120;
+
+/// ffmpeg's arguments to read a clip as small RGBA pictures, `LOOK_EVERY_S` apart, on stdout.
+fn look_args(clip: &Path) -> Vec<OsString> {
+    let mut a: Vec<OsString> =
+        ["-hide_banner", "-loglevel", "error", "-nostdin", "-i"].iter().map(OsString::from).collect();
+    a.push(clip.as_os_str().to_owned());
+    let vf = format!("fps={},scale={LOOK_W}:{LOOK_H}", 1.0 / LOOK_EVERY_S);
+    for s in ["-an", "-vf", &vf, "-frames:v", &MAX_LOOKS.to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", "-"] {
+        a.push(s.into());
+    }
+    a
+}
+
+/// Where the frame's middle goes over time, from where the eye was at each look (`every_s`
+/// apart; None: nothing found): turning points (seconds, 0 to 1 across), straight between.
+/// It holds still until the eye moves far enough (and the next look agrees: a blip doesn't
+/// count), then glides; it keeps up with steady movement. None when nothing was ever found.
+pub fn frame_path(looks: &[Option<f32>], every_s: f32) -> Option<Vec<(f32, f32)>> {
+    let first = looks.iter().flatten().next().copied()?;
+    // Gaps keep the last place; the start, the first one found.
+    let mut last = first;
+    let filled: Vec<f32> = looks
+        .iter()
+        .map(|l| {
+            if let Some(v) = l {
+                last = v.clamp(0.0, 1.0);
+            }
+            last
+        })
+        .collect();
+    // A median of three: one odd look doesn't move the frame.
+    let med: Vec<f32> = (0..filled.len())
+        .map(|i| {
+            let mut w = [filled[i.saturating_sub(1)], filled[i], filled[(i + 1).min(filled.len() - 1)]];
+            w.sort_by(f32::total_cmp);
+            w[1]
+        })
+        .collect();
+    let mut hold = med[0];
+    let mut points = vec![(0.0, hold)];
+    for (i, &m) in med.iter().enumerate().skip(1) {
+        let t = i as f32 * every_s;
+        let stays = med.get(i + 1).is_none_or(|n| (n - hold).abs() >= MOVE_AT);
+        if (m - hold).abs() < MOVE_AT || !stays || points.last().is_some_and(|p| p.0 >= t) {
+            continue;
+        }
+        if points.len() + 2 > MAX_POINTS {
+            break;
+        }
+        points.push((t, hold));
+        points.push((t + GLIDE_S, m));
+        hold = m;
+    }
+    Some(points)
+}
+
+/// The frame's middle at time `t` as an ffmpeg expression: straight lines between the points,
+/// still before the first and after the last.
+pub fn path_expr(points: &[(f32, f32)]) -> String {
+    let Some(&(t0, m0)) = points.first() else { return "0.5".into() };
+    let &(tn, mn) = points.last().unwrap_or(&(t0, m0));
+    let mut terms = vec![format!("lt(t,{t0:.3})*{m0:.4}"), format!("gte(t,{tn:.3})*{mn:.4}")];
+    for w in points.windows(2) {
+        let ((a, ma), (b, mb)) = (w[0], w[1]);
+        if b <= a {
+            continue;
+        }
+        terms.push(format!("gte(t,{a:.3})*lt(t,{b:.3})*({ma:.4}+({:.4})*(t-{a:.3})/{:.3})", mb - ma, b - a));
+    }
+    terms.join("+")
+}
+
 /// Longer than any clip takes; a stuck ffmpeg is stopped and its half-written file removed.
 const LIMIT: Duration = Duration::from_secs(300);
 
@@ -109,14 +199,22 @@ pub fn vertical_path(clip: &Path) -> Option<PathBuf> {
 /// the middle, the sound copied as it is. Paths go as arguments, never through a shell.
 /// `subs`: a subtitle file's name in ffmpeg's working folder, burned in (a plain name: paths
 /// with colons or quotes break ffmpeg's filter syntax).
-pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>) -> Vec<OsString> {
+/// `fill`: the frame's middle over time (`path_expr`): the clip fills 1080×1920, cut to follow
+/// it, instead of sitting whole over the blurred copy.
+pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>, fill: Option<&str>) -> Vec<OsString> {
     let burn = subs.map(|f| format!(",subtitles={f}:force_style='{SUB_STYLE}'")).unwrap_or_default();
-    let filter = format!(
-        "[0:v]split=2[bg][fg];\
-        [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[back];\
-        [fg]scale=1080:-2[front];\
-        [back][front]overlay=(W-w)/2:(H-h)/2{burn},format=yuv420p[v]"
-    );
+    let filter = match fill {
+        Some(m) => format!(
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,\
+            crop=1080:1920:x='clip(({m})*iw-540,0,iw-1080)':y='(ih-1920)/2'{burn},format=yuv420p[v]"
+        ),
+        None => format!(
+            "[0:v]split=2[bg][fg];\
+            [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[back];\
+            [fg]scale=1080:-2[front];\
+            [back][front]overlay=(W-w)/2:(H-h)/2{burn},format=yuv420p[v]"
+        ),
+    };
     let filter = filter.as_str();
     let mut a: Vec<OsString> =
         ["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i"].iter().map(OsString::from).collect();
@@ -171,9 +269,63 @@ impl Engine {
         tokio::spawn(async move {
             let subs = if cfg.clip_captions { engine.clip_subtitles(&ffmpeg, &clip).await } else { None };
             if cfg.vertical_clips {
-                make_vertical(&ffmpeg, &clip, subs.as_deref()).await;
+                let fill = if cfg.vertical_fill { engine.clip_focus(&ffmpeg, &clip).await } else { None };
+                make_vertical(&ffmpeg, &clip, subs.as_deref(), fill.as_deref()).await;
             }
         });
+    }
+
+    /// Where the vertical copy's frame goes over time (`path_expr`), from looks at the clip;
+    /// None (the blurred layout) when nothing was found or it can't be looked at here.
+    pub(crate) async fn clip_focus(&self, ffmpeg: &Path, clip: &Path) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        // One clip looked at at a time, a batch of pictures at a time: memory stays small.
+        static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let host = self.studio_host().ok()?;
+        let _turn = ONE.acquire().await.ok()?;
+        let mut child = hidden(ffmpeg)
+            .args(look_args(clip))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut out = child.stdout.take()?;
+        let size = (LOOK_W * LOOK_H * 4) as usize;
+        let mut looks: Vec<Option<f32>> = Vec::new();
+        let read_all = async {
+            loop {
+                let mut batch = Vec::with_capacity(LOOK_BATCH);
+                while batch.len() < LOOK_BATCH {
+                    let mut p = vec![0u8; size];
+                    if out.read_exact(&mut p).await.is_err() {
+                        break;
+                    }
+                    batch.push(p);
+                }
+                let last = batch.len() < LOOK_BATCH;
+                if !batch.is_empty() {
+                    looks.extend(host.focus(batch, LOOK_W, LOOK_H).await?);
+                }
+                if last {
+                    return Ok::<(), String>(());
+                }
+            }
+        };
+        match tokio::time::timeout(AUDIO_LIMIT, read_all).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::info!(error = %e, "the frame can't follow anything here: the whole clip, blurred behind");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("looking at the clip took too long: the whole clip, blurred behind");
+                return None;
+            }
+        }
+        let _ = child.wait().await;
+        let path = frame_path(&looks, LOOK_EVERY_S)?;
+        Some(path_expr(&path))
     }
 
     /// Writes "<clip>.srt" (never over one already there) → its path, when anything was said.
@@ -187,7 +339,7 @@ impl Engine {
             tracing::info!("no clip subtitles: no speech model is downloaded");
             return None;
         };
-        let run = Command::new(ffmpeg).args(audio_args(clip)).kill_on_drop(true).output();
+        let run = hidden(ffmpeg).args(audio_args(clip)).kill_on_drop(true).output();
         let sound = match tokio::time::timeout(AUDIO_LIMIT, run).await {
             Ok(Ok(o)) if o.status.success() => o.stdout,
             other => {
@@ -226,7 +378,7 @@ impl Engine {
 
 /// Makes "<clip> vertical.mp4" (never over one already there), with `subs` burned in when
 /// given. ffmpeg runs in a folder of its own holding the subtitles as "subs.srt".
-async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>) {
+async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Option<&str>) {
     let Some(out) = vertical_path(clip).filter(|o| !o.exists()) else { return };
     // Half-written, it has another name, so a folder never shows a broken clip.
     let part = out.with_extension("mp4.part");
@@ -243,8 +395,8 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>) {
         Some(s) if made => tokio::fs::copy(s, work.join("subs.srt")).await.is_ok(),
         _ => false,
     };
-    let args = vertical_args(clip, &part, burn.then_some("subs.srt"));
-    let mut cmd = Command::new(ffmpeg);
+    let args = vertical_args(clip, &part, burn.then_some("subs.srt"), fill);
+    let mut cmd = hidden(ffmpeg);
     cmd.args(args).kill_on_drop(true);
     if burn {
         cmd.current_dir(&work);
@@ -292,7 +444,7 @@ mod tests {
         // A name that looks like an option or holds shell characters stays one argument.
         let clip = Path::new("/c/-y; rm -rf ~ $(x).mp4");
         let out = Path::new("/c/-y; rm -rf ~ $(x) vertical.mp4");
-        let a = vertical_args(clip, out, None);
+        let a = vertical_args(clip, out, None, None);
         assert_eq!(a.iter().filter(|x| x.as_os_str() == clip.as_os_str()).count(), 1);
         assert_eq!(a.last().unwrap(), out.as_os_str());
         // Never overwrites (-n), and the input comes right after -i.
@@ -347,13 +499,13 @@ mod tests {
 
     #[test]
     fn subtitles_burn_in_by_a_plain_name() {
-        let a = vertical_args(Path::new("/c/a.mp4"), Path::new("/c/a v.mp4"), Some("subs.srt"));
+        let a = vertical_args(Path::new("/c/a.mp4"), Path::new("/c/a v.mp4"), Some("subs.srt"), None);
         let f = a.iter().position(|x| x == "-filter_complex").unwrap();
         let filter = a[f + 1].to_str().unwrap();
         assert!(filter.contains(",subtitles=subs.srt:force_style='"), "{filter}");
         assert!(filter.ends_with(",format=yuv420p[v]"));
         // No subtitles: the filter as before.
-        let b = vertical_args(Path::new("/c/a.mp4"), Path::new("/c/a v.mp4"), None);
+        let b = vertical_args(Path::new("/c/a.mp4"), Path::new("/c/a v.mp4"), None, None);
         let g = b.iter().position(|x| x == "-filter_complex").unwrap();
         assert!(!b[g + 1].to_str().unwrap().contains("subtitles"));
     }
@@ -365,5 +517,75 @@ mod tests {
         assert_eq!(a[i + 1], "/c/-x.mp4");
         assert!(a.windows(2).any(|w| w[0] == "-ar" && w[1] == "16000"));
         assert_eq!(a.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn the_frame_holds_then_glides_to_where_the_eye_stays() {
+        // Nothing for a second, then the left; a one-look blip right; then it moves right and stays.
+        let looks =
+            [None, None, Some(0.3), Some(0.31), Some(0.9), Some(0.3), Some(0.32), Some(0.7), Some(0.71), Some(0.7)];
+        let p = frame_path(&looks, 0.5).unwrap();
+        assert_eq!(p[0], (0.0, 0.3), "starts where the eye first was");
+        assert_eq!(p.len(), 3, "the blip is ignored, the move made once: {p:?}");
+        assert_eq!(p[1].1, 0.3);
+        assert!((p[2].1 - 0.7).abs() < 0.02 && (p[2].0 - p[1].0 - GLIDE_S).abs() < 1e-4, "{p:?}");
+        assert!(frame_path(&[None, None], 0.5).is_none(), "nothing found: the blurred layout");
+        // Moving steadily across: the frame keeps up instead of waiting for a stop.
+        let walk: Vec<Option<f32>> = (1..=9).map(|i| Some(i as f32 / 10.0)).collect();
+        let w = frame_path(&walk, 0.5).unwrap();
+        assert!(w.iter().any(|(t, m)| *t < 2.5 && *m >= 0.3), "{w:?}");
+        let e = path_expr(&p);
+        assert!(e.starts_with("lt(t,0.000)*0.3000+gte(t,"), "{e}");
+        let a = vertical_args(Path::new("/c/a.mp4"), Path::new("/c/b.mp4"), None, Some(&e));
+        let f = a.iter().position(|x| x == "-filter_complex").unwrap();
+        let f = a[f + 1].to_str().unwrap();
+        assert!(f.contains("crop=1080:1920:x='clip((") && !f.contains("boxblur"), "{f}");
+    }
+
+    /// The real thing with ffmpeg (when it's here): a wide test clip becomes a 1080×1920 one
+    /// that follows a path.
+    #[tokio::test]
+    async fn a_filled_vertical_copy_is_made() {
+        let Ok(ffmpeg) = which_ffmpeg() else { return };
+        let dir = std::env::temp_dir().join(format!("fc-fill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let made = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=30:duration=3",
+            ])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Looked at twice a second: 6 small pictures for 3 seconds.
+        let raw = std::process::Command::new(&ffmpeg).args(look_args(&clip)).output().unwrap().stdout;
+        assert_eq!(raw.len(), 6 * (LOOK_W * LOOK_H * 4) as usize);
+        let looks = [Some(0.2), Some(0.2), Some(0.2), Some(0.8), Some(0.8), Some(0.8)];
+        let e = path_expr(&frame_path(&looks, 0.5).unwrap());
+        make_vertical(&ffmpeg, &clip, None, Some(&e)).await;
+        let out = vertical_path(&clip).unwrap();
+        let probe = std::process::Command::new(ffmpeg.with_file_name("ffprobe"))
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "1080,1920");
+    }
+
+    fn which_ffmpeg() -> Result<PathBuf, ()> {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .ok_or(())
     }
 }

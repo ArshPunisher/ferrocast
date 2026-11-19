@@ -1,4 +1,7 @@
-# Ferrocast's own engine: plan
+# Ferrocore: Ferrocast's own engine
+
+The engine is named **Ferrocore** (2 Nov 2026); its code is `crates/ferrocore`. The plan below was written
+while it was still called "our own engine".
 
 Written 31 Oct 2026 at the owner's request. Nothing here is built yet; it's the plan to pick from.
 
@@ -89,7 +92,7 @@ ships months before an own engine and keeps working after it (the new engine reu
 A Rust engine that does **everything people use OBS for, plus what OBS can't**, smaller and
 crash-proof, built so that **users never lose a feature** while it replaces libobs piece by piece.
 
-Working name: **Ferrocast Engine** (crate `crates/av`; name to pick).
+Working name: **Ferrocast Engine** (crate `crates/ferrocore`; name to pick).
 
 ### The rule that makes it safe: replace piece by piece
 
@@ -181,7 +184,7 @@ At every step the Studio looks and works the same, and every step ships on its o
 ### Status
 
 **1 Nov 2026 (one night's run): E0 done; E1 built; E2's compositor matches libobs; E3 and E4
-started; the engine core runs with no libobs at all.** All in `crates/av` (`ferrocast-av`), not
+started; the engine core runs with no libobs at all.** All in `crates/ferrocore` (`ferrocore`), not
 used by the app yet.
 
 Checked against libobs by `cargo run -p ferrocast-studio --example engine_match -- <dir>
@@ -208,7 +211,7 @@ Checked against libobs by `cargo run -p ferrocast-studio --example engine_match 
 
 Speed: a 1080p frame (background, game, camera uploaded each frame with rounded corners and
 border, a turned bicubic logo, a lower third) drawn and read back as NV12 in **2.7 ms** on this
-Mac (`cargo run --release -p ferrocast-av --example bench`), a sixth of a 60 fps frame.
+Mac (`cargo run --release -p ferrocore --example bench`), a sixth of a 60 fps frame.
 
 **1 Nov 2026 (day): in the app, and further.**
 
@@ -237,6 +240,40 @@ D3D textures from capture to encoder); the preview drawn by the engine too (libo
 draws it); edits applied in place instead of reopening the scenes; the rest of libobs's filters (Scale/Aspect Ratio, render
 and video delay, HDR tone mapping); sound filters compared against libobs's output; web pages;
 game capture (E5); helper processes (E6).
+
+**1 Nov 2026 (afternoon): our engine only, branch `own-engine-only`.** The owner chose to
+remove libobs with no fallback. Done on the branch (each checked as noted in its commit):
+
+| What | Notes |
+|---|---|
+| Every stream and recording through our engine, no fallback | what it can't do is refused with the reason |
+| Constant quality; x264 and Lossless through FFmpeg (fetched by itself when picked) | lossless round trip gives back every pixel |
+| Pause, split (by hand, minutes, megabytes), MKV, up to six sound tracks | real files checked with ffprobe |
+| Output size (scaled), stream delay, the vertical stream, the replay buffer, Source Record | |
+| One engine shared by every output and preview | cameras and microphones open once |
+| The preview, Studio Mode's on-air view, the vertical preview, the Scenes grid's tiles (Mac) | checked in a real window: edits within 0.4 s, outlines and handles |
+| Fixed on the way (also on main): FFmpeg recoloured our frames (BT.601 taken for BT.709); the mixer dropped queued sound at a gap | |
+
+**The scene store without libobs (step 3): done.** `crates/studio/src/stage.rs` keeps the
+collection as an OBS-format document edited in Rust and hands it to the engine after each edit
+(unchanged sources keep running); it answers every call the app makes on a collection, and its
+outputs and views answer as the app's streams, recordings and previews. Kinds and their forms
+are our engine's own (`kinds.rs`), recording names follow OBS's patterns (`naming.rs`), stats
+come from the system (`system.rs`), undo keeps whole snapshots, and recordings are remuxed by
+FFmpeg. **The app's Studio starts with no libobs**: run from a folder with no OBS files, it
+records H.264 and AAC at 1080p with no libobs loaded.
+
+**Then (1 Nov evening):** web page sources, projectors and the multiview, media play/pause/seek,
+network media and guests (FFmpeg reads the stream), chapter marks in MP4 and MKV, Twitch's VOD
+track (Enhanced RTMP multitrack audio), Strong noise removal (DeepFilterNet as an engine sound
+plugin) and Remove background (Vision's person mask into a Cutout effect) all run on our engine.
+
+**libobs is gone from the branch:** its code (the old `Studio`, `Collection`, streams,
+recordings, filters, ~11,000 lines), the libobs examples, the bundled OBS runtime
+(`deploy/obs-runtime-*`), the `obs-ffmpeg-mux` helper and the OBS-only Windows CI jobs.
+
+Left: Windows capture and preview (step 6; Remove background there waits on it, its RVM model
+kept in `ffi/matte.rs`); SRT, RIST and WHIP sends; the virtual camera (needs Apple signing).
 
 ### Honest sizes and risks
 

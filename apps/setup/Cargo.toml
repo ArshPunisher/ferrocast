@@ -1,0 +1,59 @@
+[package]
+name = "ferrocast-setup"
+description = "Ferrocast's Windows setup: installs, updates and uninstalls the app in its own window."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ferrocast-setup"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+
+[target.'cfg(windows)'.dependencies]
+tao = "0.37"
+wry = "0.57"
+winreg = "0.56"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Storage_EnhancedStorage",
+  "Win32_Graphics_Dwm",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Windows calls (registry, shortcuts, processes) need `unsafe`; it stays inside `src/win`.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"

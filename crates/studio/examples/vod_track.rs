@@ -1,16 +1,16 @@
-//! Twitch's VOD track on a real engine (macOS: FERROCAST_OBS_DIR, else an installed OBS.app):
-//! the Studio streams with `vod_track` to a small RTMP server here, which sees the main audio
+//! Twitch's VOD track on our own engine (the Mac's encoder): the Studio streams with `vod_track` to a small RTMP server here, which sees the main audio
 //! (track 0) and the VOD track (Enhanced RTMP multitrack audio, track 1), as OBS sends them.
 //!
 //!   cargo run -p ferrocast-studio --example vod_track -- <out dir>
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use ferrocast_studio::{Canvas, Collection, EncodeSettings, Paths, StreamSettings, Studio};
+use ferrocast_studio::stage::Stage;
+use ferrocast_studio::{Canvas, EncodeSettings, StreamSettings};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult};
 use serde_json::json;
@@ -75,13 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .arg(&tone)
             .status()?;
     }
-    let dir = std::env::var("FERROCAST_OBS_DIR").unwrap_or_else(|_| "/Applications/OBS.app/Contents".into());
-    let studio = Studio::start(
-        &Paths::from_obs_app(Path::new(&dir), true),
-        Canvas { width: 640, height: 360, fps: 30 },
-        &out.join("plugin-config"),
-    )?;
-    let c = Collection::new(&studio, "Live")?;
+    let c = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Live")?;
     c.add_source("Live", "color_source_v3", "Back", &json!({ "color": 0xFF_30_30_30u32 }), true)?;
     c.add_source(
         "Live",
@@ -97,10 +91,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = listener.local_addr()?.port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || serve(listener, tx));
-    let mut enc = EncodeSettings::with_encoder("obs_x264");
+    let mut enc = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
     enc.video_kbps = 800;
-    let settings = StreamSettings { encode: enc, reconnect: None, delay_s: 0, vod_track: Some(2), own_encoder: false };
-    let stream = studio.stream(&format!("rtmp://127.0.0.1:{port}/live"), "key", &settings)?;
+    let settings = StreamSettings {
+        encode: enc,
+        reconnect: None,
+        delay_s: 0,
+        vod_track: Some(2),
+        own_encoder: true,
+        video_tracks: Vec::new(),
+    };
+    let stream = c.stream(&format!("rtmp://127.0.0.1:{port}/live"), "key", &settings)?;
     let (mut main, mut vod, mut vod_header) = (0, 0, false);
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until && (main < 20 || vod < 20) {

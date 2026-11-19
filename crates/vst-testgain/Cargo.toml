@@ -1,0 +1,14 @@
+[package]
+name = "ferrocast-vst-testgain"
+description = "A tiny VST3 gain plugin, ours, for testing the VST helper (never shipped)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vst3 = "0.3"

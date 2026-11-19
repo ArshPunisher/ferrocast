@@ -11,12 +11,20 @@
 // Debug builds of the whole app are big enough that macOS's linker notes its unwind table can't
 // be compact ("__eh_frame section too large"): harmless, and CI turns warnings into errors.
 #![allow(linker_messages)]
+// Proving a drawing job Send goes deep through wgpu's types (pictures drawn off the
+// window's thread).
+#![recursion_limit = "256"]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+mod crash;
+#[cfg(target_os = "macos")]
+mod mac_update;
+mod store;
 mod studio;
 mod studio_history;
 mod studio_keys;
@@ -44,6 +52,9 @@ const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct Shell {
     close_to_tray: AtomicBool,
+    /// The tray icon was made. Without one, closing the window quits: hidden, nothing could
+    /// bring it back.
+    has_tray: AtomicBool,
     panic_shortcut: Mutex<Option<Shortcut>>,
 }
 
@@ -85,7 +96,9 @@ fn init_tracing(dir: &std::path::Path) {
     let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        tracing::error!(%info, "Ferrocast stopped unexpectedly");
+        // Where it came from too (function names in builds with symbols, addresses without).
+        let trace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(%info, %trace, "Ferrocast stopped unexpectedly");
         default(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
@@ -94,7 +107,19 @@ fn init_tracing(dir: &std::path::Path) {
 fn main() {
     let dir = data_dir();
     init_tracing(&dir);
-    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG);
+    // VST plugins run in their own locked-down helper, which may never read this folder (stream
+    // keys, sign-ins); the Studio's sound filters then reach them.
+    ferrocast_vsthost::client::keep_private(vec![dir.clone()]);
+    ferrocast_vsthost::install();
+    #[cfg(windows)]
+    crash::install(&dir);
+    #[cfg(all(windows, debug_assertions))]
+    crash::test_crash_if_asked();
+    // The Store package's startup task can't pass `--minimized`: it's asked instead.
+    let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
+    if store::packaged() {
+        tracing::info!("running from the Microsoft Store package: the Store updates it");
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_opener::init())
@@ -150,17 +175,31 @@ fn main() {
             let shell = Arc::new(Shell::default());
             shell.close_to_tray.store(engine.settings().close_to_tray, Ordering::Relaxed);
             app.manage(shell.clone());
-            build_tray(app.handle())?;
+            watch_threads(app.handle().clone());
+            // A desktop with no tray, or its icon file not writable (Linux, 19 Nov: a second
+            // user's start panicked on the first one's /tmp/tray-icon), runs without the tray.
+            match build_tray(app.handle()) {
+                Ok(()) => shell.has_tray.store(true, Ordering::Relaxed),
+                Err(e) => tracing::warn!(error = %e, "no tray icon: Ferrocast runs without it, and closing quits"),
+            }
             if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
                 tracing::warn!(error = %e, "couldn't register the show-window shortcut (another app may use it)");
             }
+            let has_tray = shell.has_tray.load(Ordering::Relaxed);
             tauri::async_runtime::spawn(follow_settings(app.handle().clone(), engine.clone(), shell));
-            tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
+            if store::packaged() {
+                // Store installs get new versions from the Store (its rules, and the package
+                // folder is read-only), so the dashboard says that instead of offering ours.
+                engine.updates_from_store();
+            } else {
+                tauri::async_runtime::spawn(keep_updated(app.handle().clone(), engine.clone()));
+            }
             let pending = Pending::default();
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
-            if !minimized {
+            // Started minimized (at login) with no tray: shown, or nothing could bring it up.
+            if !minimized || !has_tray {
                 show_window(app.handle());
             }
             Ok(())
@@ -176,7 +215,9 @@ fn main() {
             {
                 let app = window.app_handle();
                 let _ = app.save_window_state(StateFlags::all());
-                let to_tray = app.try_state::<Arc<Shell>>().is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed));
+                let to_tray = app
+                    .try_state::<Arc<Shell>>()
+                    .is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed));
                 if to_tray {
                     // Closing hides: the engine keeps alerts and the bot running from the tray.
                     api.prevent_close();
@@ -207,6 +248,9 @@ fn main() {
         RunEvent::Exit => {
             studio::end_session();
             tracing::info!("Ferrocast quitting");
+            // Before the main thread's own end, which can't run the engine's GPU cleanup.
+            studio::close();
+            tracing::info!("the Studio closed");
         }
         _ => {}
     });
@@ -457,7 +501,20 @@ async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             continue;
         }
         // Unpacking and moving the app takes a moment: off the async workers.
-        let installed = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        let installed = tokio::task::spawn_blocking(move || {
+            // A Mac keeps the same Ferrocast.app folder, so the Dock's pin survives the update;
+            // the plugin's own install (it swaps the whole folder) is the fallback, and asks
+            // for an admin password where the folder needs one.
+            #[cfg(target_os = "macos")]
+            if let Some(app) = std::env::current_exe().ok().and_then(|e| mac_update::bundle_of(&e)) {
+                match mac_update::install(&bytes, &app) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::warn!(error = %e, "couldn't update inside the app folder; replacing it whole"),
+                }
+            }
+            update.install(bytes)
+        })
+        .await;
         match installed {
             Ok(Ok(())) => {
                 tracing::info!(%version, "update installed; waiting for the restart");
@@ -507,10 +564,24 @@ async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
         let settings = engine.settings();
         shell.close_to_tray.store(settings.close_to_tray, Ordering::Relaxed);
         if login != Some(settings.launch_at_login) {
-            let al = app.autolaunch();
-            let result = if settings.launch_at_login { al.enable() } else { al.disable() };
+            let on = settings.launch_at_login;
+            let result = if store::packaged() {
+                // The package's startup task (a Run key written from inside a package is never
+                // read by Windows).
+                tauri::async_runtime::spawn_blocking(move || store::set_launch_at_login(on))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                let al = app.autolaunch();
+                if on { al.enable() } else { al.disable() }.map_err(|e| e.to_string())
+            };
             match result {
-                Ok(()) => login = Some(settings.launch_at_login),
+                Ok(()) => {
+                    if store::packaged() {
+                        tracing::info!(on, "launch at login set through the package's startup task");
+                    }
+                    login = Some(on);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "couldn't change launch at login");
                     login = Some(settings.launch_at_login); // don't retry every two seconds
@@ -727,6 +798,45 @@ fn show_window(app: &AppHandle) {
     }
 }
 
+/// Says in the log when the window's thread or the async workers stop getting to their work
+/// (5 s), and when they're back: on GitHub's Windows runner every call through the window's
+/// thread waited forever and nothing said which part was stuck (19 Nov).
+fn watch_threads(app: AppHandle) {
+    use std::sync::atomic::AtomicU64;
+    let start = std::time::Instant::now();
+    let now = move || start.elapsed().as_millis() as u64;
+    let main_seen = Arc::new(AtomicU64::new(0));
+    let async_seen = Arc::new(AtomicU64::new(0));
+    let spawned = std::thread::Builder::new().name("ferrocast-liveness".into()).spawn(move || {
+        let mut stuck = [false, false];
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let m = main_seen.clone();
+            if app.run_on_main_thread(move || m.store(now(), Ordering::Relaxed)).is_err() {
+                return;
+            }
+            let a = async_seen.clone();
+            tauri::async_runtime::spawn(async move { a.store(now(), Ordering::Relaxed) });
+            let t = now();
+            for (i, (seen, what)) in
+                [(&main_seen, "the window's thread"), (&async_seen, "the async workers")].into_iter().enumerate()
+            {
+                let quiet = t.saturating_sub(seen.load(Ordering::Relaxed));
+                if quiet > 5_000 && !stuck[i] {
+                    stuck[i] = true;
+                    tracing::warn!(seconds = quiet / 1000, "nothing ran on {what} for a while");
+                } else if quiet <= 5_000 && stuck[i] {
+                    stuck[i] = false;
+                    tracing::info!("{what}: running again");
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "the thread that watches for stalls didn't start");
+    }
+}
+
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "Open Ferrocast").build(app)?;
     let test = MenuItemBuilder::with_id("test", "Test an alert").build(app)?;
@@ -746,6 +856,15 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&quit)
         .build()?;
     let mut tray = TrayIconBuilder::with_id("main").tooltip("Ferrocast").menu(&menu).show_menu_on_left_click(true);
+    // Linux writes the tray's icon to a file: ours under this user's data, never the shared
+    // /tmp/tray-icon (owned by whoever started an app with a tray first) when there's no
+    // XDG_RUNTIME_DIR.
+    #[cfg(target_os = "linux")]
+    {
+        let dir = data_dir().join("tray");
+        let _ = std::fs::create_dir_all(&dir);
+        tray = tray.temp_dir_path(dir);
+    }
     // macOS: a black template image of the mark, so the menu bar tints it for light, dark and
     // highlighted states. Elsewhere the tray shows the app icon.
     #[cfg(target_os = "macos")]

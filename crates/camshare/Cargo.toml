@@ -1,0 +1,30 @@
+[package]
+name = "ferrocast-camshare"
+description = "The virtual camera's frames in shared memory: the layout, a writer and a reader that never tear, and the picture helpers both sides need."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+] }
+
+[lints.rust]
+# Shared memory is raw memory another process writes: every access is behind `Region`.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"
