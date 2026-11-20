@@ -60,6 +60,7 @@ pub mod mp4;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+pub mod rt;
 pub mod shaderfx;
 mod sleep;
 /// Sound in through cpal: microphones, and the computer's own sound (Windows).

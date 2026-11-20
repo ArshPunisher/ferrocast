@@ -518,7 +518,28 @@ pub struct Mixer {
     usual_floor_ns: u64,
     /// The active monitoring output device id (`None` when monitoring is off or disconnected).
     monitor_device: Option<String>,
+    /// Working space kept between blocks, so a steady mix allocates nothing (D1).
+    scratch: Scratch,
+    /// Blocks given back by [`Mixer::recycle`], made again instead of allocated.
+    pool: Vec<Block>,
+    /// Blocks allocated new (not found in the pool) so far.
+    allocated: usize,
 }
+
+/// Working buffers of the mixer, made once and grown only when a bigger piece comes.
+#[derive(Debug, Default)]
+struct Scratch {
+    /// The planar copy of a pushed piece.
+    l: Vec<f32>,
+    r: Vec<f32>,
+    /// One source's block while it is mixed, and the planar halves its filters work on.
+    buf: Vec<f32>,
+    fl: Vec<f32>,
+    fr: Vec<f32>,
+}
+
+/// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
+const MAX_POOL: usize = 64;
 
 /// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
 const LOW_FLOOR_NS: u64 = 20_000_000;
@@ -624,6 +645,50 @@ impl Mixer {
             low_latency: false,
             usual_floor_ns: latency_ns,
             monitor_device: None,
+            scratch: Scratch {
+                l: Vec::with_capacity(RESAMPLE_CHUNK * 4),
+                r: Vec::with_capacity(RESAMPLE_CHUNK * 4),
+                buf: Vec::with_capacity(BLOCK * 2),
+                fl: Vec::with_capacity(BLOCK),
+                fr: Vec::with_capacity(BLOCK),
+            },
+            pool: Vec::new(),
+            allocated: 0,
+        }
+    }
+
+    /// Gives a block back once it has been used, to be made again by a later mix. Blocks of
+    /// another shape, and those beyond [`MAX_POOL`], are simply dropped.
+    pub fn recycle(&mut self, b: Block) {
+        let whole =
+            b.tracks.len() == TRACKS && b.tracks.iter().all(|t| t.len() == BLOCK * 2) && b.monitor.len() == BLOCK * 2;
+        if whole && self.pool.len() < MAX_POOL {
+            self.pool.push(b);
+        }
+    }
+
+    /// How many blocks were allocated new, not taken from the pool (a steady mix that gives them
+    /// back stops adding to it).
+    #[must_use]
+    pub fn blocks_allocated(&self) -> usize {
+        self.allocated
+    }
+
+    /// A silent block: from the pool when there is one.
+    fn take_block(&mut self, ts_ns: u64) -> Block {
+        match self.pool.pop() {
+            Some(mut b) => {
+                b.ts_ns = ts_ns;
+                for t in &mut b.tracks {
+                    t.fill(0.0);
+                }
+                b.monitor.fill(0.0);
+                b
+            }
+            None => {
+                self.allocated += 1;
+                Block { ts_ns, tracks: vec![vec![0f32; BLOCK * 2]; TRACKS], monitor: vec![0f32; BLOCK * 2] }
+            }
         }
     }
 
@@ -866,6 +931,25 @@ impl Mixer {
     /// A source's sound: `channels` interleaved (1 or 2; more are folded to their first two) at
     /// `rate`, its first frame at `ts_ns`. Unknown sources are ignored.
     pub fn push(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) {
+        // The planar copy lives in buffers kept between pushes (taken out, so the rest of
+        // `self` can be borrowed meanwhile): a steady source allocates nothing.
+        let (mut l, mut r) = (std::mem::take(&mut self.scratch.l), std::mem::take(&mut self.scratch.r));
+        self.push_with(id, pcm, channels, rate, ts_ns, &mut l, &mut r);
+        self.scratch.l = l;
+        self.scratch.r = r;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_with(
+        &mut self,
+        id: u64,
+        pcm: &[f32],
+        channels: usize,
+        rate: u32,
+        ts_ns: u64,
+        l: &mut Vec<f32>,
+        r: &mut Vec<f32>,
+    ) {
         let out_rate = self.rate;
         if channels == 0 || rate == 0 || pcm.is_empty() {
             return;
@@ -996,7 +1080,10 @@ impl Mixer {
         }
         // Stereo, planar, after the silence that fills a gap.
         let frames = pcm.len() / channels;
-        let (mut l, mut r) = (vec![0.0; gap], vec![0.0; gap]);
+        l.clear();
+        r.clear();
+        l.resize(gap, 0.0);
+        r.resize(gap, 0.0);
         l.reserve(frames);
         r.reserve(frames);
         for f in pcm.chunks_exact(channels) {
@@ -1041,8 +1128,8 @@ impl Mixer {
         }
         if rate == out_rate && !src.drift.follows {
             src.resampler = None;
-            src.drift.push_tail(&l, &r);
-            for (a, b) in l.iter().zip(&r) {
+            src.drift.push_tail(l, r);
+            for (a, b) in l.iter().zip(r.iter()) {
                 src.queue.push_back(*a);
                 src.queue.push_back(*b);
             }
@@ -1061,8 +1148,8 @@ impl Mixer {
                 }
             }
             let Some(rs) = &mut src.resampler else { return };
-            rs.pending[0].extend_from_slice(&l);
-            rs.pending[1].extend_from_slice(&r);
+            rs.pending[0].extend_from_slice(l);
+            rs.pending[1].extend_from_slice(r);
             rs.process_ready(&mut src.queue, src.drift.follows, src.drift.ratio);
         }
         let max = MAX_QUEUE_SECS * out_rate as usize * 2;
@@ -1077,6 +1164,14 @@ impl Mixer {
 
     /// Every block that ends `latency` before `now_ns`. The first call starts the clock there.
     pub fn mix_until(&mut self, now_ns: u64) -> Vec<Block> {
+        let mut out = Vec::new();
+        self.mix_until_into(now_ns, &mut out);
+        out
+    }
+
+    /// [`Mixer::mix_until`], the blocks added to `out` (kept by the caller between calls, and
+    /// the blocks given back with [`Mixer::recycle`]: a steady mix then allocates nothing).
+    pub fn mix_until_into(&mut self, now_ns: u64, out: &mut Vec<Block>) {
         self.maybe_wait_less(now_ns);
         let until = now_ns.saturating_sub(self.latency_ns);
         let step = block_ns(self.rate);
@@ -1094,19 +1189,20 @@ impl Mixer {
             }
             next = until.saturating_sub(step);
         }
-        let mut out = Vec::new();
+        let mut made = 0usize;
         while next + step <= until {
-            out.push(self.mix_block(next));
+            let block = self.mix_block(next);
+            out.push(block);
+            made += 1;
             // Exact frame counts, so blocks never drift from the sample clock.
             next += step;
         }
         // The wait `next` was reached with: only a mix that moved it (or started it) changes
         // that, else a raised wait would count the next late piece as later still (review).
-        if !started || !out.is_empty() {
+        if !started || made > 0 {
             self.mixed_with_ns = self.latency_ns;
         }
         self.next_ns = Some(next);
-        out
     }
 
     /// After a calm stretch, the wait comes down to what the sound in it needed: nothing is lost
@@ -1133,15 +1229,16 @@ impl Mixer {
 
     fn mix_block(&mut self, start: u64) -> Block {
         let rate = self.rate;
-        let mut tracks = vec![vec![0f32; BLOCK * 2]; TRACKS];
-        let mut monitor = vec![0f32; BLOCK * 2];
+        let Block { mut tracks, mut monitor, .. } = self.take_block(start);
+        // The buffers one source's block is made in: kept between blocks.
+        let mut buf = std::mem::take(&mut self.scratch.buf);
+        let (mut fl, mut fr) = (std::mem::take(&mut self.scratch.fl), std::mem::take(&mut self.scratch.fr));
         // Talking, from the voices' last block (a block late: about 20 ms, nothing to hear).
         let duck = self.ducker.as_mut().map(|d| {
             let talking = d.cfg.voices.iter().any(|v| {
                 self.sources.get(v).is_some_and(|s| s.levels.peak[0].max(s.levels.peak[1]) > d.cfg.threshold_db)
             });
-            let (from, to) = d.step(talking, BLOCK as f32 / rate as f32);
-            (d.cfg.music.clone(), from, to)
+            d.step(talking, BLOCK as f32 / rate as f32)
         });
         let mon_dev = self.monitor_device.as_deref();
         // OBS `should_silence_monitored_source`: when an active, unmuted non-self-excluding output
@@ -1161,7 +1258,8 @@ impl Mixer {
             }
         }
         for (id, src) in self.sources.iter_mut() {
-            let mut buf = vec![0f32; BLOCK * 2];
+            buf.clear();
+            buf.resize(BLOCK * 2, 0.0);
             if let Some(s0) = src.start_ns {
                 // Drop what's before this block; place what's in it.
                 if s0 < start {
@@ -1203,8 +1301,8 @@ impl Mixer {
                 f[0] *= gl;
                 f[1] *= gr;
             }
-            if let Some((music, from, to)) = &duck
-                && music.contains(id)
+            if let Some((from, to)) = &duck
+                && self.ducker.as_ref().is_some_and(|d| d.cfg.music.contains(id))
                 && (from - 1.0).abs().max((to - 1.0).abs()) > 1e-4
             {
                 // Smoothly across the block, no click.
@@ -1220,16 +1318,21 @@ impl Mixer {
             // `clamp_audio_output`). Before the filters too, so one can't poison a filter's state.
             finite(&mut buf);
             if !src.filters.is_empty() {
-                let (mut l, mut r): (Vec<f32>, Vec<f32>) = buf.as_chunks::<2>().0.iter().map(|f| (f[0], f[1])).unzip();
+                fl.clear();
+                fr.clear();
+                for f in buf.as_chunks::<2>().0 {
+                    fl.push(f[0]);
+                    fr.push(f[1]);
+                }
                 for f in &mut src.filters {
-                    f.process([&mut l, &mut r]);
+                    f.process([&mut fl, &mut fr]);
                     // Between filters too: one that makes NaN mustn't poison the next one's state.
-                    finite(&mut l);
-                    finite(&mut r);
+                    finite(&mut fl);
+                    finite(&mut fr);
                 }
                 for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                    f[0] = l[i];
-                    f[1] = r[i];
+                    f[0] = fl[i];
+                    f[1] = fr[i];
                 }
                 finite(&mut buf);
             }
@@ -1304,6 +1407,9 @@ impl Mixer {
         for v in &mut monitor {
             *v = clip(*v);
         }
+        self.scratch.buf = buf;
+        self.scratch.fl = fl;
+        self.scratch.fr = fr;
         Block { ts_ns: start, tracks, monitor }
     }
 }
@@ -2371,5 +2477,94 @@ mod tests {
             m.mix_until(t);
         }
         assert!(m.latency_ns() < floor + held, "latency shrinks once filter is removed: {}", m.latency_ns());
+    }
+}
+
+#[cfg(test)]
+mod steady_state_tests {
+    use super::*;
+
+    /// Every buffer that grows with the sound, as sizes: when a steady mix stops changing these, it
+    /// is not allocating (the allocator itself is counted in `tests/mix_alloc.rs`).
+    fn footprint(m: &Mixer) -> Vec<usize> {
+        let mut v = vec![
+            m.blocks_allocated(),
+            m.pool.len(),
+            m.scratch.l.capacity(),
+            m.scratch.r.capacity(),
+            m.scratch.buf.capacity(),
+            m.scratch.fl.capacity(),
+            m.scratch.fr.capacity(),
+        ];
+        for s in m.sources.values() {
+            v.push(s.queue.capacity());
+            v.push(s.recent.capacity());
+            if let Some(rs) = &s.resampler {
+                v.extend([rs.pending[0].capacity(), rs.pending[1].capacity()]);
+            }
+            v.extend([s.drift.tail[0].capacity(), s.drift.tail[1].capacity()]);
+        }
+        v
+    }
+
+    /// A same-rate mic, a 44.1 kHz card (resampled) and a source with a filter, 20 ms at a time,
+    /// meters reading true peak: after a short warm-up, 1,000 blocks change no buffer's size and
+    /// take every block from the pool.
+    #[test]
+    fn mix_block_steady_state_reuses_buffers() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        for id in 1..=3 {
+            m.set(id, SourceSettings::default());
+        }
+        m.set_effects(3, &[AudioEffect::Gain { db: -2.0 }]);
+        m.set_true_peak(true);
+        let mic = vec![0.2f32; 960 * 2];
+        let card = vec![0.1f32; 882 * 2];
+        let mut out: Vec<Block> = Vec::new();
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let mut step = |m: &mut Mixer, k: u64| {
+            let at = t0 + k * 20_000_000;
+            m.push(1, &mic, 2, 48_000, at);
+            m.push(2, &card, 2, 44_100, at);
+            m.push(3, &mic, 2, 48_000, at);
+            m.mix_until_into(at + 20_000_000, &mut out);
+            for b in out.drain(..) {
+                assert!(b.tracks[0].iter().any(|v| *v != 0.0) || k < 5, "sound on track 1 at {k}");
+                m.recycle(b);
+            }
+        };
+        for k in 0..100 {
+            step(&mut m, k);
+        }
+        let warm = footprint(&m);
+        for k in 100..1100 {
+            step(&mut m, k);
+        }
+        assert_eq!(footprint(&m), warm, "a buffer grew or a block was made in 1,000 steady blocks");
+        assert!(m.blocks_allocated() <= 3, "blocks made new: {}", m.blocks_allocated());
+    }
+
+    /// Without giving blocks back, nothing changes for the caller: they are made as before.
+    #[test]
+    fn blocks_not_given_back_are_simply_made_new() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        let _ = m.mix_until(1_000_000_000);
+        m.push(1, &[0.5; 2 * 4800], 2, 48_000, 1_000_000_000);
+        let before = m.blocks_allocated();
+        let blocks = m.mix_until(1_100_000_000);
+        assert!(blocks.len() >= 4);
+        assert_eq!(m.blocks_allocated() - before, blocks.len());
+        assert!(blocks[1].tracks[0].iter().any(|v| *v > 0.4));
+        // A block of another shape isn't kept.
+        m.recycle(Block { ts_ns: 0, tracks: vec![vec![0.0; 4]], monitor: vec![] });
+        assert_eq!(m.pool.len(), 0);
+        // A recycled one comes back silent, not with the old sound in it.
+        let b = blocks.into_iter().nth(1).unwrap();
+        m.recycle(b);
+        let again = m.take_block(5);
+        assert_eq!(again.ts_ns, 5);
+        assert!(again.tracks.iter().all(|t| t.iter().all(|v| *v == 0.0)) && again.monitor.iter().all(|v| *v == 0.0));
     }
 }

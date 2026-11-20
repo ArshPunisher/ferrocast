@@ -72,15 +72,31 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut TimebaseInfo) -> i32;
 }
 
+/// The Mac's tick-to-nanosecond ratio, asked once (it never changes while the machine runs): every
+/// `host_ns` call asked for it again, two system calls a time, from capture callbacks too.
+fn timebase() -> Option<(u32, u32)> {
+    static TIMEBASE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut tb = TimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: a plain system call; `tb` is ours.
+        let ok = unsafe { mach_timebase_info(&raw mut tb) } == 0;
+        (ok && tb.denom != 0).then_some((tb.numer, tb.denom))
+    })
+}
+
+/// `ticks` of the host clock in nanoseconds.
+fn ticks_to_ns(ticks: u64, tb: Option<(u32, u32)>) -> u64 {
+    match tb {
+        Some((numer, denom)) if numer != denom => (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64,
+        _ => ticks,
+    }
+}
+
 /// The host clock in nanoseconds (what CoreMedia's host clock and capture times use).
 pub(crate) fn host_ns() -> u64 {
-    let mut tb = TimebaseInfo { numer: 0, denom: 0 };
-    // SAFETY: both are plain system calls; `tb` is ours.
-    let (t, ok) = unsafe { (mach_absolute_time(), mach_timebase_info(&raw mut tb) == 0) };
-    if !ok || tb.denom == 0 {
-        return t;
-    }
-    (u128::from(t) * u128::from(tb.numer) / u128::from(tb.denom)) as u64
+    // SAFETY: a plain system call.
+    let t = unsafe { mach_absolute_time() };
+    ticks_to_ns(t, timebase())
 }
 
 /// A Core Foundation object this code owns (one retain), released when dropped.
@@ -172,5 +188,32 @@ pub(crate) fn data_bytes(data: CFTypeRef) -> Vec<u8> {
         let n = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
         let p = CFDataGetBytePtr(data);
         if p.is_null() || n == 0 { Vec::new() } else { std::slice::from_raw_parts(p, n).to_vec() }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// The cached ratio is the one the system gives, the clock goes forward, and the sums are right
+    /// for a ratio that isn't 1 (Apple silicon's is 125/3) and for one that is (Intel's).
+    #[test]
+    fn the_host_clock_uses_the_systems_ratio_asked_once() {
+        let mut tb = TimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: a plain system call; `tb` is ours.
+        assert_eq!(unsafe { mach_timebase_info(&raw mut tb) }, 0);
+        assert_eq!(timebase(), Some((tb.numer, tb.denom)));
+        assert_eq!(timebase(), timebase(), "the same answer every time");
+        let a = host_ns();
+        let b = host_ns();
+        assert!(b >= a && b - a < 1_000_000_000);
+        assert_eq!(ticks_to_ns(24, Some((125, 3))), 1_000);
+        assert_eq!(
+            ticks_to_ns(24_000_000_000_000, Some((125, 3))),
+            1_000_000_000_000_000,
+            "no overflow in a day's ticks"
+        );
+        assert_eq!(ticks_to_ns(777, Some((1, 1))), 777);
+        assert_eq!(ticks_to_ns(777, None), 777, "no ratio known: the ticks as they are, as before");
     }
 }
