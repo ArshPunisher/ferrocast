@@ -611,6 +611,28 @@ pub struct StreamStats {
     /// True when the server/platform refused the stream rather than a network outage.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// What the stream delay holds now, in megabytes (left out without a delay).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub delay_mb: f32,
+}
+
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// A delayed stream's tail being sent after it ended: seconds to go, megabytes left.
+pub fn delay_drain() -> Option<(f64, f64)> {
+    own::delay_drain()
+}
+
+/// The most memory a stream delay holds, in megabytes (from the next stream).
+pub fn set_delay_cap_mb(mb: u32) {
+    own::set_delay_cap_mb(mb);
+}
+
+/// Ends any delayed tail being sent (the streamer chose Stop now).
+pub fn discard_delay() {
+    own::discard_delay();
 }
 
 fn is_zero_u32(v: &u32) -> bool {

@@ -436,10 +436,16 @@ async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -
 #[derive(Deserialize)]
 struct StreamBody {
     on: bool,
+    /// With `on: false`: don't send what the stream delay still holds (Stop now).
+    #[serde(default)]
+    discard_delay: bool,
 }
 
 async fn engine_stream(State(app): State<AppState>, Body(b): Body<StreamBody>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.engine.studio_stream(b.on).await?))
+    if b.on {
+        return Ok(Json(app.engine.studio_stream(true).await?));
+    }
+    Ok(Json(app.engine.studio_stream_stop(b.discard_delay).await?))
 }
 
 async fn engine_stream_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {

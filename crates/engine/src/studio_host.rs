@@ -310,6 +310,12 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String>;
     /// Stops the stream (and the vertical picture's with it).
     async fn stream_stop(&self) -> Result<(), String>;
+    /// A delayed stream's tail still being sent after Stop: seconds to go and megabytes left.
+    fn delay_drain(&self) -> Option<(f64, f64)> {
+        None
+    }
+    /// Ends the delayed tail at once (what is left of the delay is dropped).
+    async fn discard_delay(&self) {}
     /// Also streams the vertical picture, while it's on, over RTMP to `key` → whether it
     /// started (false: there's no vertical picture).
     async fn vertical_stream_start(&self, _server: String, _key: String) -> Result<bool, String> {
@@ -833,6 +839,9 @@ pub struct StudioSettings {
     pub reconnect_tries: u32,
     /// Viewers see everything this many seconds later (0: off).
     pub delay_s: u32,
+    /// The most memory the delay holds, in megabytes: past it the oldest seconds are dropped
+    /// (16 to 4096; 256).
+    pub delay_max_mb: u32,
     /// Twitch's VOD track: this audio track (2 to 6) also goes to Twitch for the VOD (leave
     /// music off it); 0: off.
     pub twitch_vod_track: u8,
@@ -937,6 +946,7 @@ impl Default for StudioSettings {
             reconnect_every_s: 2,
             reconnect_tries: 25,
             delay_s: 0,
+            delay_max_mb: 256,
             twitch_vod_track: 0,
             sample_rate: 48000,
             stereo: true,
@@ -1113,6 +1123,9 @@ impl StudioSettings {
         }
         if self.delay_s > 1800 {
             return bad("delay_s: 0 to 1800.");
+        }
+        if !(16..=4096).contains(&self.delay_max_mb) {
+            return bad("delay_max_mb: 16 to 4096 megabytes.");
         }
         if ![44_100, 48_000].contains(&self.sample_rate) {
             return bad("sample_rate: 44100 or 48000.");
@@ -2194,6 +2207,18 @@ impl Engine {
         // so, and not when only the drawing is slow or one platform has trouble of its own.
         let struggling =
             self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(crate::now().0);
+        // The stream delay: what it holds while live, or how long its tail still has to go after Stop.
+        let drain = self.studio_host().ok().and_then(|h| h.delay_drain());
+        let held_mb = v.pointer("/stream/delay_mb").and_then(Value::as_f64).unwrap_or(0.0);
+        if let Some(o) = v.as_object_mut()
+            && (drain.is_some() || held_mb > 0.0)
+        {
+            let (draining, remaining_s, mb) = drain.map_or((false, 0.0, held_mb), |(r, mb)| (true, r, mb));
+            o.insert(
+                "delay".into(),
+                serde_json::json!({ "draining": draining, "remaining_s": remaining_s.round(), "mb": (mb * 10.0).round() / 10.0 }),
+            );
+        }
         if let Some(s) = v.get_mut("stream").and_then(Value::as_object_mut) {
             s.insert("upload_struggling".into(), Value::Bool(struggling));
             if let Some(reason) = self.golive_main_failed() {
@@ -2389,6 +2414,16 @@ impl Engine {
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let _out = self.studio().output_lock.lock().await;
         self.studio_stream_locked(on).await
+    }
+
+    /// Stops the stream; with `discard_delay` the delay's tail (what the stream delay still holds)
+    /// isn't sent either, at once. Without, it goes on being sent for the delay (`stats.delay`).
+    pub async fn studio_stream_stop(&self, discard_delay: bool) -> Result<Value, EngineError> {
+        let out = self.studio_stream(false).await?;
+        if discard_delay {
+            self.studio_host()?.discard_delay().await;
+        }
+        Ok(out)
     }
 
     /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
@@ -2986,10 +3021,20 @@ mod tests {
         outputs: std::sync::Mutex<Vec<String>>,
         streaming: std::sync::atomic::AtomicBool,
         said: std::sync::Mutex<Vec<(String, String, String)>>,
+        /// What `stats` answers (null when none), and the delay's tail being sent.
+        stats: std::sync::Mutex<Option<Value>>,
+        drain: std::sync::Mutex<Option<(f64, f64)>>,
+        discarded: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
+        fn delay_drain(&self) -> Option<(f64, f64)> {
+            *self.drain.lock().unwrap()
+        }
+        async fn discard_delay(&self) {
+            self.discarded.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         async fn take_notices(&self) -> Vec<(String, String, String)> {
             std::mem::take(&mut *self.said.lock().unwrap())
         }
@@ -3022,7 +3067,7 @@ mod tests {
             Ok(None)
         }
         async fn stats(&self) -> Result<Value, String> {
-            Ok(Value::Null)
+            Ok(self.stats.lock().unwrap().clone().unwrap_or(Value::Null))
         }
         async fn record(&self, on: bool) -> Result<Value, String> {
             self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push(format!("record {on}"));
@@ -3193,6 +3238,32 @@ mod tests {
         taken();
         e.studio_sync_vertical().await;
         assert!(!sent(&taken()));
+    }
+
+    /// The stream delay in the stats: what it holds while live, then how long its tail has to go after
+    /// Stop; Stop now (discard_delay) ends the tail, plain Stop doesn't.
+    #[tokio::test]
+    async fn the_stream_delay_shows_in_the_stats_and_stop_now_discards_the_tail() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        // Live with a delay holding 3.2 MB.
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({ "stream": { "active": true, "delay_mb": 3.2 } }));
+        let v = e.studio_stats().await.unwrap();
+        assert_eq!(v["delay"], serde_json::json!({ "draining": false, "remaining_s": 0.0, "mb": 3.2 }));
+        // Without a delay: no "delay".
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({ "stream": { "active": true } }));
+        assert!(e.studio_stats().await.unwrap().get("delay").is_none());
+        // Stopped, the tail still going: 12 s to go, 1.5 MB.
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({}));
+        *fake.drain.lock().unwrap() = Some((11.6, 1.46));
+        let v = e.studio_stats().await.unwrap();
+        assert_eq!(v["delay"], serde_json::json!({ "draining": true, "remaining_s": 12.0, "mb": 1.5 }));
+        // Stop leaves the tail; Stop now ends it.
+        e.studio_stream_stop(false).await.unwrap();
+        assert!(!fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
+        e.studio_stream_stop(true).await.unwrap();
+        assert!(fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Twitch Enhanced Broadcasting's plan belongs to the Studio stream that fetched it: gone
@@ -3699,6 +3770,7 @@ mod tests {
             ("record_quality", StudioSettings { record_quality: "ultra".into(), ..d.clone() }),
             ("reconnect", StudioSettings { reconnect_every_s: 0, ..d.clone() }),
             ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
+            ("delay_max_mb", StudioSettings { delay_max_mb: 8, ..d.clone() }),
             ("sample_rate", StudioSettings { sample_rate: 96_000, ..d.clone() }),
         ] {
             let err = e.studio_set_settings(bad).await.unwrap_err();

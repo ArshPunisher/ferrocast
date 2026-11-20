@@ -132,6 +132,8 @@ struct Counts {
     error: Mutex<Option<String>>,
     /// A new bitrate asked for while live (0: none), for the encoder thread to take.
     new_kbps: AtomicU32,
+    /// What the stream delay holds now, in bytes (0 without a delay).
+    delay_bytes: AtomicU64,
 }
 
 /// Where a stream goes: the server, the key, and how it reconnects.
@@ -554,7 +556,14 @@ fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
 
 /// The most a stream delay holds in memory (OBS has no cap: a long delay through an outage grows
 /// until it runs out). At the cap the oldest seconds go, from a keyframe to the next.
-const DELAY_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DELAY_MAX_MB_DEFAULT: u32 = 256;
+
+/// The cap now, in megabytes (the Studio's setting; set before each stream starts).
+static DELAY_CAP_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DELAY_MAX_MB_DEFAULT);
+
+pub(crate) fn set_delay_cap_mb(mb: u32) {
+    DELAY_CAP_MB.store(mb.clamp(16, 4096), Ordering::Relaxed);
+}
 
 /// The stream on its way to Go live's hub, held back `delay` first (OBS's stream delay: what
 /// you do shows that much later, so viewers can't snipe). Ending does not dump what's still held
@@ -579,6 +588,9 @@ struct Delayed {
 struct DrainGate {
     state: Mutex<DrainState>,
     cv: std::sync::Condvar,
+    /// When the last held tag is sent, and how many bytes are still to go (for the status).
+    ends_at: Mutex<Option<std::time::Instant>>,
+    left_bytes: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -598,6 +610,16 @@ pub(crate) fn discard_delay() {
     for g in drains.iter().filter_map(std::sync::Weak::upgrade) {
         g.cancel();
     }
+}
+
+/// A delayed tail being sent now: seconds to go and megabytes left (None when there is none).
+pub(crate) fn delay_drain() -> Option<(f64, f64)> {
+    let drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+    drains.iter().filter_map(std::sync::Weak::upgrade).filter(|g| g.is_running()).find_map(|g| {
+        let ends = (*g.ends_at.lock().unwrap_or_else(|p| p.into_inner()))?;
+        let left = ends.saturating_duration_since(std::time::Instant::now()).as_secs_f64();
+        Some((left, g.left_bytes.load(Ordering::Relaxed) as f64 / 1e6))
+    })
 }
 
 impl DrainGate {
@@ -669,7 +691,7 @@ impl Delayed {
             delay,
             held: std::collections::VecDeque::new(),
             held_bytes: 0,
-            cap: DELAY_MAX_BYTES,
+            cap: DELAY_CAP_MB.load(Ordering::Relaxed) as usize * 1024 * 1024,
             capped: false,
             gate,
         }
@@ -688,6 +710,7 @@ impl Delayed {
             }
         }
         self.keep_under_cap();
+        self.counts.delay_bytes.store(self.held_bytes as u64, Ordering::Relaxed);
     }
 
     /// Over the cap: the oldest seconds are dropped, up to the next keyframe (never a header).
@@ -743,6 +766,9 @@ impl Drop for Delayed {
         // own; the stream's owner waits for it (`gate`) before it ends the hub.
         let (hub, counts, delay, gate) = (self.hub.clone(), self.counts.clone(), self.delay, self.gate.clone());
         let held = std::mem::take(&mut self.held);
+        *gate.ends_at.lock().unwrap_or_else(|p| p.into_inner()) = held.back().map(|(at, _)| *at + delay);
+        gate.left_bytes.store(self.held_bytes as u64, Ordering::Relaxed);
+        self.counts.delay_bytes.store(0, Ordering::Relaxed);
         gate.state.lock().unwrap_or_else(|p| p.into_inner()).running = true;
         {
             let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
@@ -756,7 +782,10 @@ impl Drop for Delayed {
                     if !gate.wait_until(at + delay) {
                         break;
                     }
+                    let n = tag_len(&t) as u64;
                     pass(&hub, &counts, t);
+                    // (This thread is the only writer.)
+                    gate.left_bytes.store(gate.left_bytes.load(Ordering::Relaxed).saturating_sub(n), Ordering::Relaxed);
                 }
                 gate.finish();
             }
@@ -1229,6 +1258,7 @@ impl OwnStream {
                 attempts,
                 detail,
                 refused,
+                delay_mb: self.counts.delay_bytes.load(Ordering::Relaxed) as f32 / 1e6,
             };
         }
         StreamStats {
@@ -1243,6 +1273,7 @@ impl OwnStream {
             attempts,
             detail,
             refused,
+            delay_mb: 0.0,
         }
     }
 
@@ -1323,6 +1354,7 @@ impl OwnStream {
             attempts,
             detail,
             refused,
+            delay_mb: 0.0,
         })
     }
 

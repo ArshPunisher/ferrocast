@@ -534,6 +534,7 @@ fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
 /// viewers get (capped when Twitch or Kick is active).
 fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings {
+    ferrocast_studio::set_delay_cap_mb(s.delay_max_mb);
     StreamSettings {
         encode: effective_stream_encode(s, cap, None),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
@@ -3904,6 +3905,14 @@ impl StudioHost for DesktopStudio {
             Ok(v)
         })
         .await?
+    }
+
+    fn delay_drain(&self) -> Option<(f64, f64)> {
+        ferrocast_studio::delay_drain()
+    }
+
+    async fn discard_delay(&self) {
+        ferrocast_studio::discard_delay();
     }
 
     async fn stream_stop(&self) -> Result<(), String> {
