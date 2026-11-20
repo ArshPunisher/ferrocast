@@ -183,6 +183,67 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
     }
 }
 
+/// The last blocks' mixing times and wake errors, in microseconds, in fixed arrays.
+struct TimingWindow {
+    mix_us: [u32; Self::LEN],
+    late_us: [u32; Self::LEN],
+    n: usize,
+}
+
+impl TimingWindow {
+    /// About 5.5 s of 21.3 ms blocks.
+    const LEN: usize = 256;
+
+    fn new() -> Self {
+        Self { mix_us: [0; Self::LEN], late_us: [0; Self::LEN], n: 0 }
+    }
+
+    fn add(&mut self, mix: std::time::Duration, late_ns: u64) {
+        self.mix_us[self.n] = u32::try_from(mix.as_micros()).unwrap_or(u32::MAX);
+        self.late_us[self.n] = u32::try_from(late_ns / 1000).unwrap_or(u32::MAX);
+        self.n += 1;
+        if self.n == Self::LEN {
+            self.n = 0;
+            let (mix, late) = (Self::stats(&mut self.mix_us), Self::stats(&mut self.late_us));
+            // Said at warn when mixing nears the real-time budget or the wake is late (a demotion
+            // shows as the wake error growing back to milliseconds), else only at debug: a normal
+            // stream does not log every 5.5 s for hours.
+            macro_rules! say {
+                ($level:ident) => {
+                    tracing::$level!(
+                        mix_avg_us = mix.0,
+                        mix_p99_us = mix.1,
+                        mix_max_us = mix.2,
+                        late_p50_us = late.3,
+                        late_p99_us = late.1,
+                        late_max_us = late.2,
+                        "audio thread timing over {} blocks",
+                        Self::LEN
+                    )
+                };
+            }
+            if Self::anomaly(mix.1, late.1) {
+                say!(warn);
+            } else {
+                say!(debug);
+            }
+        }
+    }
+
+    /// Whether a window's p99 mixing time is over half the real-time budget, or its p99 wake error over
+    /// a millisecond.
+    fn anomaly(mix_p99_us: u32, late_p99_us: u32) -> bool {
+        u64::from(mix_p99_us) * 1000 > crate::engine::AUDIO_COMPUTATION_NS / 2 || late_p99_us > 1000
+    }
+
+    /// (average, p99, max, median) of the window; sorts it.
+    fn stats(a: &mut [u32; Self::LEN]) -> (u32, u32, u32, u32) {
+        let avg = (a.iter().map(|&x| u64::from(x)).sum::<u64>() / Self::LEN as u64) as u32;
+        a.sort_unstable();
+        (avg, a[Self::LEN * 99 / 100], a[Self::LEN - 1], a[Self::LEN / 2])
+    }
+}
+
 /// Pure tick state machine for the dedicated audio thread, parameterized over [`AudioClock`] so
 /// production uses [`SystemClock`] and tests drive [`crate::rt::SimClock`] deterministically.
 pub struct AudioRunner<C: AudioClock> {
@@ -351,14 +412,22 @@ impl<C: AudioClock> AudioRunner<C> {
         self.clock.sleep_until_ns(self.next_tick_ns);
     }
 
-    /// Runs ticks continuously until `stop` becomes true.
+    /// Runs ticks continuously until `stop` becomes true. Every [`TimingWindow::LEN`] blocks it says
+    /// how long mixing took and how late the thread woke (one log line, no allocation to keep it:
+    /// two arrays of that length), which is how the real-time class's `computation` is sized and
+    /// a demotion (the wake error growing back to milliseconds) is seen.
     pub fn run(&mut self, stop: &AtomicBool) {
+        let mut window = TimingWindow::new();
         while !stop.load(Ordering::Acquire) {
+            let began = std::time::Instant::now();
             self.step();
+            let mix = began.elapsed();
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            self.clock.sleep_until_ns(self.next_tick_ns);
+            let due = self.next_tick_ns;
+            self.clock.sleep_until_ns(due);
+            window.add(mix, self.clock.now_ns().saturating_sub(due));
         }
     }
 
@@ -678,6 +747,17 @@ mod tests {
 
     const RATE: u32 = 48_000;
     const STEP_NS: u64 = BLOCK as u64 * 1_000_000_000 / RATE as u64;
+
+    /// A normal stream's windows (mixing 0.2 ms, a late wake of 0.7 ms at worst in the soak) stay at
+    /// debug; mixing over half the 4 ms budget, or a wake over 1 ms at p99, is said at warn.
+    #[test]
+    fn the_timing_line_is_a_warning_only_for_an_anomaly() {
+        assert!(!TimingWindow::anomaly(350, 700), "the soak's normal windows");
+        assert!(!TimingWindow::anomaly(2000, 1000), "the bounds are not over");
+        assert!(TimingWindow::anomaly(2100, 10), "mixing over half the budget");
+        assert!(TimingWindow::anomaly(200, 1001), "a wake over a millisecond late");
+        assert!(TimingWindow::anomaly(1481, 3110), "the soak's one bad window");
+    }
 
     /// Gate: a 250 ms video stall leaves `AudioRunner<SimClock>` cadence steady (exact 21.33 ms
     /// blocks, 0 monitor underruns, 0 dropped blocks) and `AtomicLevels::load()` non-blocking
