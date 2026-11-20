@@ -612,6 +612,34 @@ async fn a_destination_that_gave_up_tries_again_slowly_and_comes_back() {
     obs.video(10, KEY).await;
 }
 
+/// After giving up, a destination probes once per wait, and stays Failed while it does: it doesn't
+/// start the whole retry loop again (a connect storm for hours, Health and the status flickering
+/// between Failed and Connecting, and two out-of-phase platforms never being Failed together).
+#[tokio::test]
+async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    let before = push::fault::connects(dport);
+    // Three waits' worth of time.
+    let until = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    while tokio::time::Instant::now() < until {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Failed { .. }), "left Failed for {s:?} while probing");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let probes = push::fault::connects(dport) - before;
+    assert!((1..=4).contains(&probes), "one probe per wait, not a retry loop each time: {probes}");
+    push::fault::set_no_name(dport, false);
+}
+
 /// A destination that takes the stream and closes it at once (Kick without multistreaming, 40 ms) has
 /// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
 #[tokio::test]

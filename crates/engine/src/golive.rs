@@ -2371,6 +2371,12 @@ impl Engine {
             let mut out = Vec::new();
             for (id, r) in running.iter() {
                 let h = r.health.borrow().clone();
+                // It came back by itself (the slow retries): no longer failed, and a later failure
+                // alerts again.
+                if matches!(h.state, PushState::Live) {
+                    failed.remove(id);
+                    alerted.remove(id);
+                }
                 if let PushState::Failed { reason, detail, .. } = &h.state {
                     failed.insert(id.clone(), h.clone());
                     if alerted.insert(id.clone()) {

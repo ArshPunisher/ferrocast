@@ -283,7 +283,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         // a row, then its backup (and back, the same way); each stream starts on the own one.
         let mut on_backup = false;
         let mut connect_failures = 0u32;
-        loop {
+        'connect: loop {
             let target = match (&dest.backup, on_backup) {
                 (Some(b), true) => b,
                 _ => &dest.target,
@@ -421,15 +421,38 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 _ = live.wait_for(|l| !still_on(l)) => break,
                             }
                         }
-                        tokio::select! {
-                            _ = stop.wait_for(|s| *s) => break 'streams,
-                            _ = live.wait_for(|l| !still_on(l)) => break,
-                            _ = tokio::time::sleep(SLOW_RETRY) => {}
+                        // One try per wait (1, 2, then 5 minutes), still Failed while it runs; only a
+                        // session that really goes live starts the ordinary loop again.
+                        let mut step = 0usize;
+                        loop {
+                            let wait = SLOW_RETRY[step.min(SLOW_RETRY.len() - 1)].mul_f64(0.8 + fastrand::f64() * 0.4);
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break 'connect,
+                                _ = tokio::time::sleep(wait) => {}
+                            }
+                            let mut probe_live: Option<Instant> = None;
+                            let probed = tokio::select! {
+                                _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
+                                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut probe_live) => r,
+                            };
+                            match probed {
+                                Ok(Ended::Stopped) => break 'streams,
+                                Ok(Ended::StreamEnded) => break 'connect,
+                                Err(_) => {
+                                    if !still_on(&live.borrow()) {
+                                        break 'connect;
+                                    }
+                                    if probe_live.is_some() {
+                                        attempt = 0;
+                                        net_tries = 0;
+                                        down_since = None;
+                                        continue 'connect;
+                                    }
+                                    step += 1;
+                                }
+                            }
                         }
-                        attempt = 0;
-                        net_tries = 0;
-                        down_since = None;
-                        continue;
                     }
                     let shown = if net_down { net_tries } else { attempt };
                     let wait = if net_down {
@@ -477,12 +500,12 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
     });
 }
 
-/// How long a destination that gave up (not for a refusal) waits before it tries again, for as long
-/// as the stream goes on.
+/// How long a destination that gave up (not for a refusal) waits before each single try, for as long
+/// as the stream goes on: it stays Failed meanwhile.
 #[cfg(not(test))]
-const SLOW_RETRY: Duration = Duration::from_secs(60);
+const SLOW_RETRY: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300)];
 #[cfg(test)]
-const SLOW_RETRY: Duration = Duration::from_millis(400);
+const SLOW_RETRY: [Duration; 3] = [Duration::from_millis(150), Duration::from_millis(300), Duration::from_millis(600)];
 
 /// A session live this long (ms) counts as the destination having worked in this stream.
 const EVER_LIVE_AFTER_MS: u64 = 1_000;
@@ -591,6 +614,18 @@ pub(crate) mod fault {
     pub(crate) fn slow_ms(port: u16) -> u64 {
         SLOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, m)| *m)
     }
+    static CONNECTS: Mutex<Vec<(u16, u32)>> = Mutex::new(Vec::new());
+    /// Counts a connect attempt to this port.
+    pub(crate) fn count_connect(port: u16) {
+        let mut d = CONNECTS.lock().unwrap_or_else(|e| e.into_inner());
+        match d.iter_mut().find(|(p, _)| *p == port) {
+            Some((_, n)) => *n += 1,
+            None => d.push((port, 1)),
+        }
+    }
+    pub(crate) fn connects(port: u16) -> u32 {
+        CONNECTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, n)| *n)
+    }
     static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     /// The destination's name can't be looked up (a typo, or no DNS).
     pub(crate) fn set_no_name(port: u16, on: bool) {
@@ -608,6 +643,8 @@ pub(crate) mod fault {
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
+    #[cfg(test)]
+    fault::count_connect(t.port);
     #[cfg(test)]
     {
         let ms = fault::slow_ms(t.port);
