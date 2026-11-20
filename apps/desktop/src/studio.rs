@@ -1322,25 +1322,68 @@ macro_rules! to_json {
     };
 }
 
+/// The scenes the Studio shows: what `Scenes` answers.
+fn scenes_json(c: &Collection) -> Result<Value, String> {
+    to_json!(json!({
+        "scenes": c.scenes(),
+        "current": c.current(),
+        "transition": c.transition(),
+        // Studio Mode's preview (null when it's off), its quick transitions and options.
+        "preview": c.preview_scene(),
+        "quick": c.quick_transitions(),
+        "studio_options": c.studio_options(),
+        "tbar": c.tbar_state(),
+        "black": c.is_black(),
+        "vertical": c.vertical(),
+        "top_layer": c.top_layer(),
+    }))
+}
+
+/// The names of the scenes shown inside these items (a scene item, or one inside a group).
+fn nested_scenes(items: &Value, found: &mut impl FnMut(&str)) {
+    for item in items.as_array().into_iter().flatten() {
+        if item["visible"].as_bool() == Some(false) {
+            continue;
+        }
+        if item["kind"].as_str() == Some("scene")
+            && let Some(n) = item["name"].as_str()
+        {
+            found(n);
+        }
+        nested_scenes(&item["children"], found);
+    }
+}
+
 /// Does one act on the collection → what it shows (null for a change).
 fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::StudioError> {
     use StudioAct as A;
     let done = |r: Result<(), ferrocast_studio::StudioError>| r.map(|()| Value::Null);
     let v = |x: Result<Value, String>| x.map_err(ferrocast_studio::StudioError::Failed);
     match act {
-        A::Scenes => v(to_json!(json!({
-            "scenes": c.scenes(),
-            "current": c.current(),
-            "transition": c.transition(),
-            // Studio Mode's preview (null when it's off), its quick transitions and options.
-            "preview": c.preview_scene(),
-            "quick": c.quick_transitions(),
-            "studio_options": c.studio_options(),
-            "tbar": c.tbar_state(),
-            "black": c.is_black(),
-            "vertical": c.vertical(),
-            "top_layer": c.top_layer(),
-        }))),
+        A::Scenes => v(scenes_json(c)),
+        A::WatchSnapshot => v((|| {
+            let scenes = scenes_json(c)?;
+            let current = scenes["current"].as_str().filter(|n| !n.is_empty()).map(String::from);
+            let audio = match &current {
+                Some(scene) => to_json!(c.audio(scene).map_err(|e| e.to_string())?)?,
+                None => Value::Null,
+            };
+            // The scene on air and every scene shown inside it (through groups), once each.
+            let mut items = serde_json::Map::new();
+            let mut todo: Vec<(String, usize)> = current.into_iter().map(|s| (s, 0)).collect();
+            while let Some((scene, depth)) = todo.pop() {
+                if items.contains_key(&scene) {
+                    continue;
+                }
+                let Ok(list) = c.items(&scene) else { continue };
+                let list = to_json!(list)?;
+                if depth < 8 {
+                    nested_scenes(&list, &mut |n| todo.push((n.to_string(), depth + 1)));
+                }
+                items.insert(scene, list);
+            }
+            Ok::<Value, String>(json!({ "scenes": scenes, "audio": audio, "items": Value::Object(items) }))
+        })()),
         A::SetTopLayer { scene } => done(c.set_top_layer(scene.as_deref())),
         A::Refresh => {
             c.refresh();

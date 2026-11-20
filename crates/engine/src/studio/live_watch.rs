@@ -59,6 +59,15 @@ pub(crate) fn judged_names(mixer: &Value, listed: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// One look at the Studio for a tick: its scenes, the on-air scene's sounds, and the items of
+/// that scene and the scenes shown inside it (by name).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WatchSnap {
+    pub scenes: Option<Value>,
+    pub audio: Option<Value>,
+    pub items: serde_json::Map<String, Value>,
+}
+
 /// How many reads make one tick's level, and how far apart: each read covers the last ~300 ms,
 /// so six reads 300 ms apart cover 1.8 s of the 2 s between ticks (one read covered 0.3).
 const HOLD_READS: usize = 6;
@@ -168,7 +177,9 @@ impl Engine {
             let mut was_live = false;
             loop {
                 tick.tick().await;
-                let live = engine.studio_streaming().await;
+                // One read of the Studio's own sender for the whole tick (streaming? dropped?).
+                let sender = engine.studio_sender_stats().await;
+                let live = sender.as_ref().is_some_and(|v| v["active"].as_bool() == Some(true));
                 if live != was_live {
                     // A new stream: everything starts fresh (and the page is told what that dropped).
                     engine.reset_live_watch().await;
@@ -181,27 +192,52 @@ impl Engine {
                 // A recording stopping or running out of room matters live or not.
                 engine.record_watch_tick().await;
                 if live {
-                    engine.scene_chapter_tick().await;
-                    engine.auto_quality_tick().await;
+                    // One look at the Studio's scenes, sounds and items for everything below.
+                    let snap = engine.watch_snapshot().await;
+                    engine.scene_chapter_tick_with(snap.scenes.as_ref()).await;
+                    let dropped = sender.as_ref().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
+                    engine.auto_quality_tick_with(dropped).await;
                     engine.health_tick().await;
-                    engine.live_watch_tick().await;
+                    engine.live_watch_tick_with(&snap).await;
                 }
             }
         });
     }
 
-    /// Whether the Studio is streaming now.
-    async fn studio_streaming(&self) -> bool {
-        let Ok(host) = self.studio_host() else { return false };
-        host.stream_stats().await.ok().is_some_and(|v| v["active"].as_bool() == Some(true))
+    /// The Studio's own sender's stats, once a tick.
+    async fn studio_sender_stats(&self) -> Option<Value> {
+        self.studio_host().ok()?.stream_stats().await.ok()
+    }
+
+    /// The scenes, the on-air scene's sounds and the items needed to judge it, in one read on the
+    /// Studio's thread (a tick used to make a handful of separate ones).
+    pub(crate) async fn watch_snapshot(&self) -> WatchSnap {
+        match self.studio_act(StudioAct::WatchSnapshot).await {
+            Ok(v) => WatchSnap {
+                scenes: Some(v["scenes"].clone()).filter(|s| !s.is_null()),
+                audio: Some(v["audio"].clone()).filter(|a| !a.is_null()),
+                items: v["items"].as_object().cloned().unwrap_or_default(),
+            },
+            Err(_) => WatchSnap::default(),
+        }
     }
 
     /// The scene on air, when it changed: a chapter marker (the first one starts the stream's).
+    #[cfg(test)]
     pub(crate) async fn scene_chapter_tick(&self) {
         if !self.moments_config().markers {
             return;
         }
         let Ok(v) = self.studio_act(StudioAct::Scenes).await else { return };
+        self.scene_chapter_tick_with(Some(&v)).await;
+    }
+
+    /// [`Self::scene_chapter_tick`] on scenes already read (the tick's snapshot).
+    pub(crate) async fn scene_chapter_tick_with(&self, scenes: Option<&Value>) {
+        if !self.moments_config().markers {
+            return;
+        }
+        let Some(v) = scenes else { return };
         let Some(scene) = v["current"].as_str().filter(|s| !s.is_empty()).map(String::from) else { return };
         {
             let mut now = self.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner());
@@ -217,11 +253,9 @@ impl Engine {
 
     /// Auto quality: trouble getting the stream out lowers its bitrate a step, calm raises it
     /// back (when Go live's switch is on).
-    pub(crate) async fn auto_quality_tick(&self) {
+    /// Auto quality's look at the sender's skipped packets (read once a tick).
+    pub(crate) async fn auto_quality_tick_with(&self, feed_dropped: u64) {
         let Ok(host) = self.studio_host() else { return };
-        // The Studio's own sender's skipped packets (not frames drawn late: a lower bitrate
-        // doesn't help those).
-        let feed_dropped = host.stream_stats().await.ok().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
         let (_, paused) = self.golive_trouble();
         let s = ferrocast_core::auto_quality::Signals { dests: self.golive_senders(), feed_dropped, paused };
         let changed = {
@@ -312,10 +346,23 @@ impl Engine {
 
     /// What goes out now: every mic on air with its levels, the scene on air, the Show's cameras
     /// and Go live's destinations.
+    #[cfg(test)]
     pub(crate) async fn watch_sample(&self, mono: i64, show: &ferrocast_core::show::ShowConfig) -> WatchSample {
+        let snap = self.watch_snapshot().await;
+        self.watch_sample_with(mono, show, &snap).await
+    }
+
+    /// [`Self::watch_sample`] on one snapshot of the Studio: with it a tick asks the Studio's
+    /// thread for at most two things (the snapshot, and the cameras' look).
+    pub(crate) async fn watch_sample_with(
+        &self,
+        mono: i64,
+        show: &ferrocast_core::show::ShowConfig,
+        snap: &WatchSnap,
+    ) -> WatchSample {
         let mut sample = WatchSample { at: mono, ..Default::default() };
         // Every mic on air (not only the Show's list), and the scene they're in.
-        let scenes = self.studio_act(StudioAct::Scenes).await.ok();
+        let scenes = snap.scenes.clone();
         let on_air = scenes.as_ref().and_then(|v| v["current"].as_str()).filter(|n| !n.is_empty()).map(String::from);
         if let Some(scene) = &on_air {
             // The Show's own starting, ending and BRB scenes: a mic is muted on purpose there.
@@ -324,7 +371,7 @@ impl Engine {
                 .into_iter()
                 .flatten()
                 .any(|n| n == scene);
-            if let Ok(mixer) = self.studio_act(StudioAct::Audio { scene: scene.clone() }).await {
+            if let Some(mixer) = snap.audio.clone() {
                 let names = judged_names(&mixer, &show.mic_sources);
                 if !names.is_empty()
                     && let Ok(v) = self.held_levels(names).await
@@ -344,7 +391,7 @@ impl Engine {
                     }
                 }
             }
-            if let Some(empty) = self.rig_scene_is_empty(&crate::studio::rig::Rig::Studio, scene).await {
+            if let Some(empty) = crate::studio::rig::studio_scene_is_empty_in(&snap.items, scene) {
                 let faded = scenes.as_ref().is_some_and(|v| v["black"].as_bool() == Some(true));
                 sample.scene = Some(SceneLook { name: scene.clone(), empty, faded });
             }
@@ -449,7 +496,14 @@ impl Engine {
     }
 
     /// One look → the alerts it raises or clears, sent on.
+    #[cfg(test)]
     pub(crate) async fn live_watch_tick(&self) -> Vec<LiveAlert> {
+        let snap = self.watch_snapshot().await;
+        self.live_watch_tick_with(&snap).await
+    }
+
+    /// [`Self::live_watch_tick`] on one snapshot of the Studio.
+    pub(crate) async fn live_watch_tick_with(&self, snap: &WatchSnap) -> Vec<LiveAlert> {
         let cfg = self.show_config().watch;
         if !cfg.on {
             return Vec::new();
@@ -465,7 +519,7 @@ impl Engine {
         if wake_jumped {
             self.reset_live_watch().await;
         }
-        let sample = self.watch_sample(mono, &show).await;
+        let sample = self.watch_sample_with(mono, &show, snap).await;
         let alerts = self.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).tick(&cfg, &sample);
         for a in &alerts {
             tracing::info!(id = %a.id, cleared = a.cleared, "live watch: {}", a.message);

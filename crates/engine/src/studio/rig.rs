@@ -127,6 +127,28 @@ fn find_item(items: &Value, name: &str) -> Option<(i64, bool)> {
     })
 }
 
+/// [`Engine::rig_scene_is_empty`] for the Studio on items already read (`items`: scene name ->
+/// its items, the scene and every scene shown inside it). `None` when `scene` isn't in them.
+pub(crate) fn studio_scene_is_empty_in(items: &serde_json::Map<String, Value>, scene: &str) -> Option<bool> {
+    let root = items.get(scene)?;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(scene.to_string());
+    let mut nested = Vec::new();
+    if studio_items_have_visible(root, &mut nested) {
+        return Some(false);
+    }
+    while let Some(sub) = nested.pop() {
+        if !visited.insert(sub.clone()) {
+            continue;
+        }
+        let Some(list) = items.get(&sub) else { continue };
+        if studio_items_have_visible(list, &mut nested) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 impl Engine {
     /// The Studio when it's running, else OBS. With neither, the answer points at the Studio
     /// (OBS is the fallback); a wrong OBS password still says so.
