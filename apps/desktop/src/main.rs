@@ -267,17 +267,22 @@ fn main() {
                         r.engine.shutdown();
                     }
                 },
-                || {
-                    studio::end_session();
-                    if let Some(r) = running.as_ref() {
-                        r.engine.clear_running_marker();
-                    }
-                },
+                || clear_run_markers(running.as_ref().map(|r| &r.engine)),
             );
             tracing::info!("the Studio closed");
         }
         _ => {}
     });
+}
+
+/// The "Ferrocast is running" notes (the Studio's session and the engine's `running.json`) that
+/// the next launch reads as a crash and answers with Safe Mode. Removed at the end of a clean quit,
+/// and by the Windows updater just before its installer ends the process.
+fn clear_run_markers(engine: Option<&Engine>) {
+    studio::end_session();
+    if let Some(engine) = engine {
+        engine.clear_running_marker();
+    }
 }
 
 fn clean_exit_sequence(
@@ -343,6 +348,16 @@ async fn check_update<R: tauri::Runtime>(
         let url = feed.parse().map_err(tauri_plugin_updater::Error::UrlParse)?;
         builder = builder.endpoints(vec![url])?;
     }
+    // Windows: the updater runs the installer and ends the process itself (`process::exit`, no
+    // `RunEvent::Exit`), so the clean-quit notes would stay behind and the first launch of every
+    // new version would open in Safe Mode with the owner's scenes held back. The hook runs once the
+    // installer is ready to start, so a failed install leaves the notes where they were. (It does
+    // nothing on the other systems, where the restart goes through the clean exit.)
+    let handle = app.clone();
+    builder = builder.on_before_exit(move || {
+        let running = handle.try_state::<Running>();
+        clear_run_markers(running.as_ref().map(|r| &r.engine));
+    });
     builder.timeout(timeout).configure_client(|c| c.connect_timeout(CONNECT_TIMEOUT)).build()?.check().await
 }
 
@@ -1241,6 +1256,26 @@ mod update_tests {
         let cut = release_notes(Some(&long)).unwrap();
         assert_eq!(cut.chars().count(), NOTES_MAX + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    /// The Windows updater ends the process after its `on_before_exit` hook, which calls this: with
+    /// the notes left behind, the next launch reads the update as a crash and opens in Safe Mode.
+    #[tokio::test]
+    async fn the_run_markers_the_updater_clears_are_the_ones_that_start_safe_mode() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = Engine::start_with_mode(dir.path(), false).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(dir.path().join("running.json").exists(), "a running launch leaves its note");
+        assert!(
+            ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "and the next launch would take it for a crash"
+        );
+        clear_run_markers(Some(&engine));
+        assert!(!dir.path().join("running.json").exists());
+        assert!(
+            !ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "a launch after the update is a normal one"
+        );
+        engine.shutdown();
     }
 
     #[test]
