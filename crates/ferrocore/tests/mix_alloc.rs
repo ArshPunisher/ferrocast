@@ -47,7 +47,46 @@ fn a_steady_mix_allocates_nothing() {
     m.set(1, SourceSettings::default());
     m.set(2, SourceSettings::default());
     m.set(3, SourceSettings::default());
-    m.set_effects(3, &[AudioEffect::Gain { db: -2.0 }]);
+    m.set_effects(
+        3,
+        &[
+            AudioEffect::Gain { db: -2.0 },
+            AudioEffect::InvertPolarity,
+            AudioEffect::NoiseGate {
+                open_db: -26.0,
+                close_db: -32.0,
+                attack_ms: 25.0,
+                hold_ms: 200.0,
+                release_ms: 150.0,
+            },
+            AudioEffect::Compressor {
+                ratio: 4.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
+            AudioEffect::Expander {
+                ratio: 2.0,
+                threshold_db: -40.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            },
+            AudioEffect::Eq3 { low_db: 2.0, mid_db: -1.0, high_db: 3.0 },
+            AudioEffect::Denoise { strength: 50 },
+        ],
+    );
     m.set_true_peak(true);
     let mic = vec![0.2f32; 960 * 2];
     let card = vec![0.1f32; 882 * 2];
