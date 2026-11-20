@@ -59,6 +59,8 @@ struct RaceStudio {
     stream_start_barrier: Barrier,
     switch_live_barrier: Barrier,
     shelf_switches: AtomicUsize,
+    /// Every scene the Show put on air, in order.
+    switched: Mutex<Vec<String>>,
 }
 
 impl Default for RaceStudio {
@@ -71,6 +73,7 @@ impl Default for RaceStudio {
             stream_start_barrier: Barrier::new(),
             switch_live_barrier: Barrier::new(),
             shelf_switches: AtomicUsize::new(0),
+            switched: Mutex::new(Vec::new()),
         }
     }
 }
@@ -112,13 +115,21 @@ impl StudioHost for RaceStudio {
                     { "name": "Ending", "items": 1 },
                 ]
             })),
-            StudioAct::Items { .. } => {
-                Ok(json!([{ "id": 1, "name": "Cam", "kind": "av_capture_input", "visible": true }]))
-            }
+            // The shape the real Studio answers with (captured from the running app, 20 Nov): every
+            // ordinary source has `"group": false` and an empty `"children"`. A fixture without them
+            // hid that the Show's empty-scene check called every real scene empty.
+            StudioAct::Items { .. } => Ok(json!([{
+                "audio": false, "blend": "normal", "children": [], "deinterlace": null,
+                "frame": [1920.0, 0.0, 0.0, 1080.0, 0.0, 0.0], "group": false, "hide_transition": null,
+                "id": 1, "kind": "av_capture_input", "locked": false, "media": false, "name": "Cam",
+                "scale_filter": "off", "show_transition": null, "srgb_off": false, "top_field_first": false,
+                "visible": true
+            }])),
             StudioAct::SetCurrent { scene } => {
                 if scene == "Gameplay" {
                     self.switch_live_barrier.wait_if_armed().await;
                 }
+                self.switched.lock().unwrap().push(scene.clone());
                 *self.current.lock().unwrap() = scene;
                 Ok(Value::Null)
             }
@@ -324,6 +335,37 @@ async fn stop_during_starting_cancels_show_and_leaves_no_orphan_stream() {
     assert!(matches!(start_res, Err(EngineError::Conflict(_))), "end_live cancelled Preparing: {start_res:?}");
     assert!(!e.is_show_active());
     assert!(!studio.streaming.load(Ordering::SeqCst), "no orphaned live stream after end_live during Starting");
+}
+
+/// Real-shape end to end: a Show with a starting scene and a live scene puts them on air (the
+/// starting scene when it starts, the live scene at zero), none "skipped as empty".
+#[tokio::test]
+async fn a_show_puts_its_starting_and_live_scenes_on_air_with_real_items() {
+    let (e, studio, _dir) = setup().await;
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": "Gameplay", "countdown_s": 30,
+            "start_stream": false, "stop_stream": false, "stop_delay_s": 0,
+            "discord": false, "alerts_on": false, "bot_on": false, "recap_message": null,
+            "at_zero": { "switch": true, "chat": null, "marker": false }
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let run = e.start_show(true).await.unwrap();
+    assert_eq!(run.phase, Phase::Countdown);
+    let skipped: Vec<_> = run.steps.iter().filter(|s| s.status == "skipped").collect();
+    assert!(skipped.is_empty(), "no step skipped as empty: {skipped:?}");
+    assert_eq!(*studio.switched.lock().unwrap(), vec!["Starting"], "the starting scene is on air in the countdown");
+
+    let live = e.skip_countdown().await.unwrap();
+    assert_eq!(live.phase, Phase::Live);
+    assert_eq!(*studio.switched.lock().unwrap(), vec!["Starting", "Gameplay"], "the live scene at zero");
+    assert!(!live.steps.iter().any(|s| s.detail.contains("is empty")), "no scene called empty: {:?}", live.steps);
+    e.end_show().await.unwrap();
 }
 
 #[tokio::test]
