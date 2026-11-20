@@ -637,6 +637,8 @@ struct Delayed {
     held: std::collections::VecDeque<(std::time::Instant, Tag)>,
     held_bytes: usize,
     cap: usize,
+    /// Dropped through the tail without finding a main keyframe: drop inter frames until the next keyframe.
+    need_key: bool,
     /// Said once: the cap was reached.
     capped: bool,
     gate: Arc<DrainGate>,
@@ -777,17 +779,24 @@ impl DrainGate {
 fn is_header(t: &Tag) -> bool {
     match t {
         Tag::Video { body, .. } => {
-            // Classic AVC: codec 7, packet type 0. Enhanced RTMP: the high bit, packet type 0.
-            body.first()
-                .zip(body.get(1))
-                .is_some_and(|(b0, b1)| (b0 & 0x0f == 7 && *b1 == 0) || (b0 & 0x80 != 0 && b0 & 0x0f == 0))
+            ferrocast_golive::flv::video_is_header(body)
+                || ferrocast_golive::flv::video_extra_track(body).is_some_and(|(_, header)| header)
         }
-        Tag::Audio { body, .. } => body.first().zip(body.get(1)).is_some_and(|(b0, b1)| b0 >> 4 == 10 && *b1 == 0),
+        Tag::Audio { body, .. } => {
+            ferrocast_golive::flv::audio_is_header(body)
+                || ferrocast_golive::flv::audio_extra_track(body).is_some_and(|(_, header)| header)
+        }
     }
 }
 
 fn is_keyframe(t: &Tag) -> bool {
-    matches!(t, Tag::Video { body, .. } if body.first().is_some_and(|b| (b >> 4) & 0x7 == 1) && !is_header(t))
+    matches!(
+        t,
+        Tag::Video { body, .. }
+            if !is_header(t)
+                && body.first().is_some_and(|&b| !(b & 0x80 != 0 && b & 0x0f == 6))
+                && ferrocast_golive::flv::video_is_keyframe(body)
+    )
 }
 
 fn tag_len(t: &Tag) -> usize {
@@ -805,6 +814,7 @@ impl Delayed {
             held: std::collections::VecDeque::new(),
             held_bytes: 0,
             cap: DELAY_CAP_MB.load(Ordering::Relaxed) as usize * 1024 * 1024,
+            need_key: false,
             capped: false,
             gate,
             begin,
@@ -814,6 +824,13 @@ impl Delayed {
     fn send(&mut self, t: Tag) {
         if self.delay.is_zero() {
             return pass(&self.hub, &self.counts, &self.begin, t);
+        }
+        if self.need_key && !is_header(&t) {
+            if is_keyframe(&t) {
+                self.need_key = false;
+            } else {
+                return;
+            }
         }
         self.held_bytes += tag_len(&t);
         self.held.push_back((std::time::Instant::now(), t));
@@ -846,6 +863,9 @@ impl Delayed {
             }
             if !dropped {
                 break;
+            }
+            if !self.held.iter().any(|(_, t)| is_keyframe(t)) {
+                self.need_key = true;
             }
             if !self.capped {
                 self.capped = true;
@@ -1910,6 +1930,50 @@ mod tests {
         assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "nothing was sent early");
         // The count of bytes is true.
         assert_eq!(out.held_bytes, out.held.iter().map(|(_, t)| tag_len(t)).sum::<usize>());
+    }
+
+    #[test]
+    fn delayed_cap_ignores_multitrack_keyframes_and_keeps_multitrack_headers() {
+        let (mut out, _) = delayed(60_000);
+        out.cap = 380;
+        // Main video & audio headers, plus Enhanced RTMP extra video & audio track headers.
+        out.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 0, 0, 0] });
+        out.send(Tag::Audio { ms: 0, body: vec![0xAF, 0x00, 0x12, 0x10] });
+        out.send(Tag::Video { ms: 0, body: b"\x96\x00avc1\x01\x01\x00".to_vec() });
+        out.send(Tag::Audio { ms: 0, body: b"\x95\x00mp4a\x01\x12\x10".to_vec() });
+        // Main GOP 1: keyframe + inter + multitrack extra-track keyframe + inter.
+        out.send(video(33, true, 100));
+        out.send(video(66, false, 100));
+        out.send(Tag::Video { ms: 66, body: [b"\x96\x03avc1\x01".as_slice(), &[7u8; 40]].concat() });
+        out.send(video(99, false, 100));
+        // Main GOP 2: real main keyframe -> exceeds cap 380, must skip \x96\x03 and land here.
+        out.send(video(132, true, 100));
+        assert!(out.held_bytes <= out.cap, "{}", out.held_bytes);
+        let first_non_header = out.held.iter().find(|(_, t)| !is_header(t)).map(|(_, t)| t.clone());
+        assert!(
+            matches!(first_non_header, Some(Tag::Video { body, .. }) if body[0] == 0x17 && body[1] == 1),
+            "must trim up to a main-track keyframe, not an extra track keyframe or inter: {:?}",
+            out.held
+                .iter()
+                .map(|(_, t)| match t {
+                    Tag::Video { body, .. } => body[0],
+                    Tag::Audio { body, .. } => body[0],
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(out.held.iter().any(|(_, t)| matches!(t, Tag::Video { body, .. } if body[0] == 0x96 && body[1] == 0)));
+        assert!(out.held.iter().any(|(_, t)| matches!(t, Tag::Audio { body, .. } if body[0] == 0x95 && body[1] == 0)));
+
+        // If a tight cap drops the whole GOP before the next keyframe arrives, trailing inters must not orphan.
+        let (mut tight, _) = delayed(60_000);
+        tight.cap = 150;
+        tight.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 0, 0, 0] });
+        tight.send(video(33, true, 100));
+        tight.send(video(66, false, 100)); // drops GOP 1 -> need_key = true
+        tight.send(video(99, false, 100)); // must be dropped, not left orphaned after headers
+        assert_eq!(tight.held.iter().filter(|(_, t)| !is_header(t)).count(), 0);
+        tight.send(video(132, true, 100));
+        assert_eq!(tight.held.iter().filter(|(_, t)| !is_header(t)).count(), 1);
     }
 
     #[test]
