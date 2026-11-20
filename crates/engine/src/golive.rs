@@ -1879,6 +1879,8 @@ impl Engine {
         let url = match platform_of(d.kind) {
             Some(p) => {
                 let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
+                // The keys set by hand for the vertical canvas are never the normal stream's.
+                c.set_vertical_keys(self.vertical_custom_keys());
                 let got = match d.canvas {
                     Canvas::Main => c.peek_ingest().await,
                     Canvas::Vertical => c.peek_vertical_ingest().await,
@@ -1894,12 +1896,25 @@ impl Engine {
         Target::parse(&url).map_err(|e| e.to_string())
     }
 
+    /// The saved stream keys of the custom servers on the vertical canvas.
+    fn vertical_custom_keys(&self) -> Vec<String> {
+        self.golive_config()
+            .destinations
+            .iter()
+            .filter(|d| d.canvas == Canvas::Vertical && platform_of(d.kind).is_none())
+            .filter_map(|d| self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten())
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
+
     /// A destination's server and key: fetched from its platform (write path, only when actually
     /// going live), or the saved custom one. The error is a clear one-line reason for the streamer.
     pub(crate) async fn resolve(&self, d: &DestinationConfig) -> Result<Destination, String> {
         let (url, key, backup) = match platform_of(d.kind) {
             Some(p) => {
                 let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
+                // The keys set by hand for the vertical canvas are never the normal stream's.
+                c.set_vertical_keys(self.vertical_custom_keys());
                 let got = match d.canvas {
                     Canvas::Main => c.ingest().await,
                     Canvas::Vertical => c.vertical_ingest().await,

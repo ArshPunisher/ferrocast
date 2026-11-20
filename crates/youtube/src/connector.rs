@@ -103,6 +103,10 @@ impl Connector for YoutubeConnector {
         Ok(self.api.ingest().await?)
     }
 
+    fn set_vertical_keys(&self, keys: Vec<String>) {
+        self.api.set_vertical_keys(keys);
+    }
+
     async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.vertical_ingest().await?)
     }

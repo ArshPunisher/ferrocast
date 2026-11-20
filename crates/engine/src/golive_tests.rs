@@ -1386,6 +1386,12 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     e.studio_stream(false).await.unwrap();
 }
 
+// What `SignedIn` was last told about the keys of the vertical canvas.
+// (Per thread: each test runs on its own, so tests that resolve in parallel don't overwrite it.)
+thread_local! {
+    static VERTICAL_KEYS_TOLD: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A platform that is signed in and gives a local address and a key (so its destination can start).
 #[derive(Debug)]
 struct SignedIn(ferrocast_core::event::Platform);
@@ -1393,6 +1399,9 @@ struct SignedIn(ferrocast_core::event::Platform);
 impl ferrocast_connector::Connector for SignedIn {
     fn platform(&self) -> ferrocast_core::event::Platform {
         self.0
+    }
+    fn set_vertical_keys(&self, keys: Vec<String>) {
+        VERTICAL_KEYS_TOLD.with(|t| *t.borrow_mut() = keys);
     }
     fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
         Default::default()
@@ -1547,4 +1556,23 @@ async fn the_key_a_youtube_destination_sent_to_is_named_in_its_view() {
     assert_eq!(note(&v, "youtube").as_deref(), Some("Ferrocast · variable"));
     assert_eq!(note(&v, "twitch"), None);
     assert!(!serde_json::to_string(&v).unwrap().contains("\"k\""), "never the key");
+}
+
+/// The keys of the custom servers on the vertical canvas (and only those) are told to the platform
+/// before the normal stream's key is asked for, so a YouTube key set by hand for vertical video is
+/// never given to the normal stream.
+#[tokio::test]
+async fn the_keys_set_for_the_vertical_canvas_are_told_to_the_platform_before_its_key_is_asked() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.add_golive_destination("Shorts box", "rtmp://127.0.0.1:9/app", "vert-key", crate::golive::Canvas::Vertical)
+        .await
+        .unwrap();
+    e.add_golive_destination("Main box", "rtmp://127.0.0.1:9/app", "main-key", crate::golive::Canvas::Main)
+        .await
+        .unwrap();
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    e.resolve(&yt).await.unwrap();
+    assert_eq!(VERTICAL_KEYS_TOLD.with(|t| t.borrow().clone()), vec!["vert-key".to_string()]);
 }

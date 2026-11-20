@@ -129,6 +129,11 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "give out the stream key" })
     }
 
+    /// The stream keys the vertical canvas is set to send to by hand (a custom server on it): a
+    /// platform that hands out keys must not give any of them to the normal stream. Platforms with
+    /// one key per channel ignore it.
+    fn set_vertical_keys(&self, _keys: Vec<String>) {}
+
     /// Where an upright (vertical) stream goes, made by Ferrocast when needed (YouTube Shorts
     /// live). Platforms with one live per channel don't have one.
     async fn vertical_ingest(&self) -> Result<Ingest> {

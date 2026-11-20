@@ -2033,16 +2033,62 @@ async fn a_good_key_beside_a_vertical_default_is_used_for_the_normal_stream() {
 #[test]
 fn keys_made_for_vertical_video_are_told_by_their_words() {
     use crate::api::stream_unfit_for_main;
+    let none = std::collections::HashSet::new();
     let key = |title: &str, desc: &str| {
         json!({ "id": "s", "snippet": { "title": title, "description": desc },
             "cdn": { "resolution": "variable", "frameRate": "variable", "ingestionType": "rtmp",
                 "ingestionInfo": { "streamName": "k", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } })
     };
-    assert!(!stream_unfit_for_main(&key("Stream key", "")));
-    assert!(!stream_unfit_for_main(&key("Ferrocast", "Ferrocast streams here, at any resolution.")));
+    assert!(!stream_unfit_for_main(&key("Stream key", ""), &none));
+    assert!(!stream_unfit_for_main(&key("Ferrocast", "Ferrocast streams here, at any resolution."), &none));
     for (t, d) in [("My Vertical key", ""), ("phone", "for YouTube SHORTS"), ("9:16", ""), ("Portrait", "")] {
-        assert!(stream_unfit_for_main(&key(t, d)), "{t} / {d}");
+        assert!(stream_unfit_for_main(&key(t, d), &none), "{t} / {d}");
     }
     // Ferrocast's own vertical key is one too: it never carries the normal stream.
-    assert!(stream_unfit_for_main(&key("Ferrocast vertical", "")));
+    assert!(stream_unfit_for_main(&key("Ferrocast vertical", ""), &none));
+}
+
+/// The hard signal: a key the vertical canvas is set to send to is never the normal one, whatever it
+/// is called ("My key 2", the channel's default, variable): the normal stream goes to Ferrocast's own.
+#[tokio::test]
+async fn a_key_the_vertical_canvas_sends_to_is_never_the_normal_streams() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![
+            stream_item("s-2", "My key 2", true, "variable", "variable", "rtmp", "vertical-canvas-key"),
+            stream_item("s-3", "My key 3", false, "variable", "variable", "rtmp", "other-key"),
+        ]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![upcoming("b-v", "s-2", 2)]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st.clone()).await;
+    let api = video_api(ep);
+    // Without the signal a neutral name is taken as the normal key (and its broadcast).
+    let before = api.ingest().await.unwrap();
+    assert_eq!(before.key, "vertical-canvas-key");
+    // With it: not the default, not its broadcast; the other good key carries the stream.
+    api.set_vertical_keys(["vertical-canvas-key".to_string()]);
+    let after = api.ingest().await.unwrap();
+    assert_eq!(after.key, "other-key", "the other good key");
+    assert_eq!(after.note.as_deref(), Some("My key 3 · variable"));
+    let log = calls.lock().unwrap().clone();
+    assert!(!log.iter().any(|c| c.contains("bind b-v")), "the vertical canvas's broadcast stays: {log:?}");
+    // With no other key left, Ferrocast's own is made.
+    let st2 = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s-2",
+            "My key 2",
+            true,
+            "variable",
+            "variable",
+            "rtmp",
+            "vertical-canvas-key",
+        )]])),
+        ..Default::default()
+    };
+    let (ep2, _) = start_scripted(st2).await;
+    let api2 = video_api(ep2);
+    api2.set_vertical_keys(["vertical-canvas-key".to_string()]);
+    let own = api2.ingest().await.unwrap();
+    assert!(own.key.starts_with("var-key-"), "{}", own.key);
+    assert_eq!(own.note.as_deref(), Some("Ferrocast · variable"));
 }

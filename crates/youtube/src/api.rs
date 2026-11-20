@@ -107,6 +107,9 @@ pub struct Api {
     made: Mutex<MadeSlot>,
     /// Same serialization and short-term cache for Ferrocast's vertical stream and broadcast.
     made_vertical: Mutex<MadeSlot>,
+    /// Stream keys (the secret part) the vertical canvas is set to send to by hand (a custom server
+    /// on the vertical canvas): such a stream is never the normal one, whatever its title.
+    vertical_keys: StdMutex<HashSet<String>>,
     /// The stream and broadcast lists read for stream info, kept briefly (key: the request): a title
     /// and a thumbnail set one after the other listed everything twice. Cleared by any write.
     reads: StdMutex<HashMap<String, (i64, Value)>>,
@@ -166,6 +169,7 @@ impl Api {
             bans: StdMutex::new(HashMap::new()),
             made: Mutex::new(MadeSlot::default()),
             made_vertical: Mutex::new(MadeSlot::default()),
+            vertical_keys: StdMutex::new(HashSet::new()),
             reads: StdMutex::new(HashMap::new()),
             writes: AtomicU64::new(0),
             read_ttl_ms: READ_TTL_MS,
@@ -469,9 +473,18 @@ impl Api {
         Ok((main, vertical))
     }
 
+    /// The stream keys the vertical canvas is configured to send to by hand (replaces the last set).
+    pub fn set_vertical_keys(&self, keys: impl IntoIterator<Item = String>) {
+        *self.vertical_keys.lock().unwrap_or_else(|p| p.into_inner()) = keys.into_iter().collect();
+    }
+
+    fn vertical_keys(&self) -> HashSet<String> {
+        self.vertical_keys.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     pub async fn current_broadcast(&self) -> Result<Option<String>, YoutubeError> {
         let streams = self.list_streams(true).await?;
-        let (main, _) = self.broadcasts(&main_excluded(&streams), None, true).await?;
+        let (main, _) = self.broadcasts(&main_excluded(&streams, &self.vertical_keys()), None, true).await?;
         Ok(main.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)))
     }
 
@@ -486,7 +499,7 @@ impl Api {
         let mut streams = self.list_streams(false).await?;
         made.merge_fresh_stream(&mut streams, now);
         let vertical = vertical_ids(&streams);
-        let (main, vert) = self.broadcasts(&main_excluded(&streams), None, false).await?;
+        let (main, vert) = self.broadcasts(&main_excluded(&streams, &self.vertical_keys()), None, false).await?;
         let listed = main
             .as_ref()
             .and_then(|b| b.get("id").and_then(Value::as_str))
@@ -495,7 +508,7 @@ impl Api {
         let main_id = match listed.or_else(|| made.fresh_broadcast(now).map(|m| m.id.clone())) {
             Some(id) => id,
             None => {
-                let candidate = main_stream_id(&streams, &vertical, None).ok_or_else(|| {
+                let candidate = main_stream_id(&streams, &vertical, None, &self.vertical_keys()).ok_or_else(|| {
                     YoutubeError::Refused(
                         "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
                     )
@@ -837,7 +850,7 @@ impl Api {
     pub async fn peek_ingest(&self) -> Result<String, YoutubeError> {
         let streams = self.list_streams(false).await?;
         let vertical = vertical_ids(&streams);
-        let candidate = main_stream_id(&streams, &vertical, None).ok_or_else(|| {
+        let candidate = main_stream_id(&streams, &vertical, None, &self.vertical_keys()).ok_or_else(|| {
             YoutubeError::Refused(
                 "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
             )
@@ -887,7 +900,8 @@ impl Api {
         let vertical = vertical_ids(&streams);
         // Ferrocast's own vertical streams (and their broadcasts), and keys the streamer made for
         // vertical video, are never the normal one.
-        let (main, _) = self.broadcasts(&main_excluded(&streams), selected_broadcast, true).await?;
+        let (main, _) =
+            self.broadcasts(&main_excluded(&streams, &self.vertical_keys()), selected_broadcast, true).await?;
         let fresh_made = if selected_broadcast.is_none() { made.fresh_broadcast(now).cloned() } else { None };
         let live_now = main.as_ref().is_some_and(is_live);
 
@@ -898,17 +912,18 @@ impl Api {
             .map(String::from)
             .or_else(|| if main.is_none() { fresh_made.as_ref().map(|m| m.stream_id.clone()) } else { None });
 
-        let candidate = main_stream_id(&streams, &vertical, current_bound.as_deref()).ok_or_else(|| {
-            YoutubeError::Refused(
-                "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
-            )
-        })?;
+        let candidate = main_stream_id(&streams, &vertical, current_bound.as_deref(), &self.vertical_keys())
+            .ok_or_else(|| {
+                YoutubeError::Refused(
+                    "your channel has no stream key yet; turn on live streaming in YouTube Studio first".into(),
+                )
+            })?;
 
         // A key with fixed resolution, fixed frame rate or non-RTMP ingestion type caps or breaks
         // the stream (19 Nov: 1440p went out as 1080p). Always swap for Ferrocast's variable RTMP
         // key unless the broadcast is already live on air; `just_made` never skips this check.
         let (stream, streams, replaced) = if live_now {
-            if stream_id_needs_replacement(&streams, &candidate) {
+            if stream_id_needs_replacement(&streams, &candidate, &self.vertical_keys()) {
                 tracing::warn!("YouTube: the broadcast is already live on its current key, keeping it");
             }
             (candidate, streams, false)
@@ -979,7 +994,7 @@ impl Api {
         stream_id: String,
         slot: &mut MadeSlot,
     ) -> Result<(String, Value, bool), YoutubeError> {
-        if !stream_id_needs_replacement(&streams, &stream_id) {
+        if !stream_id_needs_replacement(&streams, &stream_id, &self.vertical_keys()) {
             return Ok((stream_id, streams, false));
         }
         let (own_id, list, created) = self.own_stream(&streams).await?;
@@ -993,10 +1008,11 @@ impl Api {
     /// by its title → its id, the stream list with it in, and the newly created item if inserted
     /// (liveStreams.insert, 50 units, the first time).
     async fn own_stream(&self, streams: &Value) -> Result<(String, Value, Option<Value>), YoutubeError> {
+        let vertical_keys = self.vertical_keys();
         let found = streams.get("items").and_then(Value::as_array).and_then(|i| {
             i.iter().find(|s| {
                 s.pointer("/snippet/title").and_then(Value::as_str) == Some(MAIN_STREAM_TITLE)
-                    && !stream_unfit_for_main(s)
+                    && !stream_unfit_for_main(s, &vertical_keys)
             })
         });
         if let Some(id) = found.and_then(|s| s.get("id").and_then(Value::as_str)) {
@@ -1161,22 +1177,31 @@ fn looks_vertical(s: &Value) -> bool {
     })
 }
 
+/// A stream made for vertical video: by its words, or because the vertical canvas is set to send to
+/// its key (`vertical_keys`, whatever it is called).
+fn is_vertical_key(s: &Value, vertical_keys: &HashSet<String>) -> bool {
+    looks_vertical(s)
+        || s.pointer("/cdn/ingestionInfo/streamName")
+            .and_then(Value::as_str)
+            .is_some_and(|k| vertical_keys.contains(k.trim()))
+}
+
 /// A key that mustn't carry the normal stream: [`stream_needs_replacement`], or one made for
 /// vertical video.
-pub(crate) fn stream_unfit_for_main(s: &Value) -> bool {
-    stream_needs_replacement(s) || looks_vertical(s)
+pub(crate) fn stream_unfit_for_main(s: &Value, vertical_keys: &HashSet<String>) -> bool {
+    stream_needs_replacement(s) || is_vertical_key(s, vertical_keys)
 }
 
 /// The streams a normal live never uses: Ferrocast's own vertical one, and any the streamer made
 /// for vertical video.
-fn main_excluded(list: &Value) -> HashSet<String> {
+fn main_excluded(list: &Value, vertical_keys: &HashSet<String>) -> HashSet<String> {
     let mut ids = vertical_ids(list);
     ids.extend(
         list.get("items")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|s| looks_vertical(s))
+            .filter(|s| is_vertical_key(s, vertical_keys))
             .filter_map(|s| s.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(String::from)),
     );
     ids
@@ -1193,8 +1218,8 @@ fn find_stream<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
     list.get("items")?.as_array()?.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id))
 }
 
-fn stream_id_needs_replacement(list: &Value, id: &str) -> bool {
-    find_stream(list, id).is_none_or(stream_unfit_for_main)
+fn stream_id_needs_replacement(list: &Value, id: &str, vertical_keys: &HashSet<String>) -> bool {
+    find_stream(list, id).is_none_or(|s| stream_unfit_for_main(s, vertical_keys))
 }
 
 /// Whether an upcoming broadcast is eligible to be taken automatically without explicit user
@@ -1403,7 +1428,12 @@ fn best_thumbnail(b: &Value) -> Option<String> {
 /// the one bound to its broadcast, else the channel's default, else the first usable RTMP one,
 /// else any non-vertical stream (so a channel with only an HLS/broken key still triggers
 /// replacement instead of failing as "no stream key"); never Ferrocast's vertical stream.
-fn main_stream_id(list: &Value, vertical: &HashSet<String>, bound: Option<&str>) -> Option<String> {
+fn main_stream_id(
+    list: &Value,
+    vertical: &HashSet<String>,
+    bound: Option<&str>,
+    vertical_keys: &HashSet<String>,
+) -> Option<String> {
     let items: Vec<&Value> = list
         .get("items")?
         .as_array()?
@@ -1414,7 +1444,7 @@ fn main_stream_id(list: &Value, vertical: &HashSet<String>, bound: Option<&str>)
     let default = |s: &Value| s.pointer("/snippet/isDefaultStream").and_then(Value::as_bool) == Some(true);
     // Beyond the bound one (which is replaced if it's a vertical key), keys made for vertical video
     // aren't picked; with only those left, the first is named so it's replaced, not "no key".
-    let others: Vec<&Value> = items.iter().copied().filter(|s| !looks_vertical(s)).collect();
+    let others: Vec<&Value> = items.iter().copied().filter(|s| !is_vertical_key(s, vertical_keys)).collect();
     let pick = bound
         .and_then(|b| items.iter().copied().find(|s| id_is(s, b)))
         .or_else(|| others.iter().copied().find(|s| default(s)))
