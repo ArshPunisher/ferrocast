@@ -143,6 +143,8 @@ struct Shared {
     label: &'static str,
     /// The "staying off the Bluetooth microphone" line has been logged.
     bluetooth_noted: std::sync::atomic::AtomicBool,
+    /// Something to say on the dashboard about how this capture opened (taken once).
+    pending_notice: Mutex<Option<crate::notices::Notice>>,
     frame: Mutex<Option<(Picture, u64)>>,
     /// The newest frame as the camera holds it (no copy), when the card can read it directly.
     surface: Mutex<Option<(super::screen::Surface, u64)>>,
@@ -844,6 +846,11 @@ fn pick_output_pixel_format(available: &[u32]) -> u32 {
 }
 
 impl Capture {
+    /// What this capture wants said on the dashboard, once (how a default microphone was chosen).
+    pub fn take_notice(&self) -> Option<crate::notices::Notice> {
+        self.shared.pending_notice.lock().ok().and_then(|mut n| n.take())
+    }
+
     /// Starts a camera: its frames as BGRA (or supported YUV converted cleanly), at the size and
     /// frame rate asked (or full-rate on slow-default USB capture cards when left "Its own").
     pub fn camera(spec: &CameraSpec) -> Result<Self, AvError> {
@@ -900,34 +907,37 @@ impl Capture {
     /// Starts a microphone: its sound as interleaved stereo float at 48 kHz.
     pub fn microphone(id: &str) -> Result<Self, AvError> {
         ensure_hotplug_listener();
-        let follows = if is_default(id) {
+        let (follows, notice) = if is_default(id) {
             let default = default_microphone().ok_or_else(|| AvError::Source("there's no microphone".into()))?;
             let inputs: Vec<(String, String)> = microphones().into_iter().map(|d| (d.id, d.name)).collect();
             let last = LAST_PLAIN_MIC.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let pick = pick_default_mic(&default, &inputs, last.as_deref(), is_bluetooth_input);
-            if let Some(name) = &pick.swapped_from {
-                crate::notices::push(
-                    "mic-bluetooth",
-                    format!("Using {}: your AirPods mic would drop the sound to phone quality.", pick.name),
-                    format!(
-                        "The system's microphone is {name}, a Bluetooth headset: macOS would switch it to a \
-                         16 kHz call mode. Pick it by name in the source's settings to use it anyway."
-                    ),
-                );
-            }
+            let notice = pick.swapped_from.as_ref().map(|name| crate::notices::Notice {
+                key: "mic-bluetooth",
+                line: format!("Using {}: your AirPods mic would drop the sound to phone quality.", pick.name),
+                detail: format!(
+                    "The system's microphone is {name}, a Bluetooth headset: macOS would switch it to a \
+                     16 kHz call mode. Pick it by name in the source's settings to use it anyway."
+                ),
+            });
             if !is_bluetooth_input(&pick.id) {
                 *LAST_PLAIN_MIC.lock().unwrap_or_else(|p| p.into_inner()) = Some(pick.id.clone());
             }
-            Some(pick.id)
+            (Some(pick.id), notice)
         } else {
-            None
+            (None, None)
         };
         let input = open(follows.as_deref().unwrap_or(id), false)?;
         // SAFETY: reading live device from newly created AVCaptureDeviceInput.
         let device = unsafe { input.device() };
         // SAFETY: reading uniqueID of live device.
         let device_id = unsafe { device.uniqueID() }.to_string();
-        let shared = Arc::new(Shared { device_id, label: "microphone", ..Shared::default() });
+        let shared = Arc::new(Shared {
+            device_id,
+            label: "microphone",
+            pending_notice: Mutex::new(notice),
+            ..Shared::default()
+        });
         let delegate = Output::new(shared.clone());
         let queue = DispatchQueue::new("ferrocast.microphone", DispatchQueueAttr::SERIAL);
         // SAFETY: as for the camera.

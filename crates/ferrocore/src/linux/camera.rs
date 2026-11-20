@@ -64,6 +64,11 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// What this capture wants said on the dashboard (nothing here).
+    pub fn take_notice(&self) -> Option<crate::notices::Notice> {
+        None
+    }
+
     /// A camera by its device (`/dev/videoN`).
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
         let id = spec.id.as_str();

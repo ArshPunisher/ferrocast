@@ -943,6 +943,8 @@ struct State {
     stats: Stats,
     /// Why an output failed, by id, until it stops (`deliver`).
     errors: HashMap<u64, String>,
+    /// Things captures want said (see `Engine::take_notices`).
+    notices: crate::notices::Notices,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
     /// Frames drawn and on their way back from the card, oldest first (`deliver`).
@@ -1194,6 +1196,7 @@ impl Engine {
             last_heard: Vec::new(),
             stats: Stats::default(),
             errors: HashMap::new(),
+            notices: Default::default(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
             parked: Vec::new(),
@@ -2927,6 +2930,11 @@ impl Engine {
         }
     }
 
+    /// What captures opened by this engine want said on the dashboard, since the last call.
+    pub fn take_notices(&self) -> Vec<crate::notices::Notice> {
+        self.lock().notices.take()
+    }
+
     /// What stopped this output, if anything did (as of the loop's last frame). Another output's
     /// fault (a vertical stream's, the replay buffer's) isn't it.
     pub fn output_error(&self, id: u64) -> Option<String> {
@@ -4351,6 +4359,7 @@ fn watchdog_step(
         }
         let mut in_flight = 0usize;
         let mut ready: Vec<(u32, u64, String)> = Vec::new();
+        let mut said: Vec<crate::notices::Notice> = Vec::new();
         for (id, src) in st.sources.iter_mut() {
             if src.kind.is_none() {
                 continue;
@@ -4365,6 +4374,12 @@ fn watchdog_step(
                 src.opening_since = 0;
             }
             let running = !matches!(src.live, Live::Still);
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            if let Live::Microphone(c) = &src.live
+                && let Some(n) = c.take_notice()
+            {
+                said.push(n);
+            }
             let live_signs = signs(&src.live);
             let w = &mut src.watch;
             #[cfg(target_os = "macos")]
@@ -4383,6 +4398,9 @@ fn watchdog_step(
             {
                 ready.push((w.tries, *id, why));
             }
+        }
+        for n in said {
+            st.notices.push(n);
         }
         ready.sort_by_key(|(tries, id, _)| (*tries, *id));
         let budget = MAX_PARALLEL_REOPENS.saturating_sub(in_flight);
@@ -6245,6 +6263,18 @@ mod tests {
         *e.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some("out of memory".into());
         assert_eq!(e.output_error(7), Some("out of memory".into()));
         assert_eq!(e.output_error(8), Some("out of memory".into()));
+    }
+
+    /// Notices are an engine's own: one raised in one engine is taken from that engine only.
+    #[test]
+    fn two_engines_keep_their_notices_apart() {
+        let (Some(a), Some(b)) = (engine(), engine()) else { return };
+        let note =
+            |line: &str| crate::notices::Notice { key: "mic-bluetooth", line: line.into(), detail: String::new() };
+        a.lock().notices.push(note("from a"));
+        assert!(b.take_notices().is_empty(), "b doesn't see a's");
+        assert_eq!(a.take_notices(), vec![note("from a")]);
+        assert!(a.take_notices().is_empty(), "taken once");
     }
 
     /// A failed output isn't fed again at 60 frames a second (agy review R2).

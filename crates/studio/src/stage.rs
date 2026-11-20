@@ -3672,6 +3672,12 @@ impl Stage {
         }
     }
 
+    /// What the captures this collection's engine opened want said on the dashboard, since the
+    /// last call (each engine keeps its own).
+    pub fn take_notices(&self) -> Vec<ferrocore::notices::Notice> {
+        self.engine.borrow().as_ref().map(|e| e.engine.take_notices()).unwrap_or_default()
+    }
+
     /// Low latency sound (Settings); kept for every engine made.
     pub fn set_low_latency(&self, on: bool) {
         self.low_latency.set(on);

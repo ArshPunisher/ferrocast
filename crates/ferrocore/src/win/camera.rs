@@ -87,6 +87,11 @@ fn resolve_dshow_options(res: Result<Vec<DshowOption>, ProbeFail>, dev: &str) ->
 }
 
 impl Capture {
+    /// What this capture wants said on the dashboard (nothing here).
+    pub fn take_notice(&self) -> Option<crate::notices::Notice> {
+        None
+    }
+
     /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
     /// Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG (e.g.
     /// 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,

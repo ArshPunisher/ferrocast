@@ -216,6 +216,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn record_stats(&self) -> Result<Value, String> {
         Ok(Value::Null)
     }
+    /// One-line things the Studio's captures want said (key, line, detail), since the last call.
+    async fn take_notices(&self) -> Vec<(String, String, String)> {
+        Vec::new()
+    }
     async fn record_pause(&self, on: bool) -> Result<(), String>;
     /// Starts or stops the replay buffer → `{ active }`.
     async fn replay(&self, _on: bool) -> Result<Value, String> {
@@ -2971,10 +2975,14 @@ mod tests {
         acts: std::sync::Mutex<Vec<StudioAct>>,
         outputs: std::sync::Mutex<Vec<String>>,
         streaming: std::sync::atomic::AtomicBool,
+        said: std::sync::Mutex<Vec<(String, String, String)>>,
     }
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
+        async fn take_notices(&self) -> Vec<(String, String, String)> {
+            std::mem::take(&mut *self.said.lock().unwrap())
+        }
         async fn status(&self) -> StudioStatus {
             StudioStatus { available: true, ..Default::default() }
         }
@@ -3178,6 +3186,28 @@ mod tests {
     }
 
     /// Twitch Enhanced Broadcasting's plan belongs to the Studio stream that fetched it: gone
+    /// What a Studio's capture says reaches the dashboard once, through the host that owns that
+    /// engine (not a process-wide queue another engine could drain).
+    #[tokio::test]
+    async fn a_capture_notice_comes_through_its_own_host_once() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        fake.said.lock().unwrap().push(("mic-bluetooth".into(), "Using KREO KAST.".into(), "why".into()));
+        e.set_studio_host(fake);
+        let mut live = e.subscribe_live();
+        e.record_watch_tick().await;
+        e.record_watch_tick().await;
+        let mut seen = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"] == "mic-bluetooth" {
+                seen.push(v["data"].clone());
+            }
+        }
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!((seen[0]["level"].as_str(), seen[0]["detail"].as_str()), (Some("info"), Some("why")));
+    }
+
     /// when that stream stops, so OBS going live later never sends to an old address and key.
     #[tokio::test]
     async fn an_enhanced_broadcasting_plan_ends_with_its_stream() {

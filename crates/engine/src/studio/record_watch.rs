@@ -112,11 +112,12 @@ fn gb(mb: u64) -> String {
 impl Engine {
     /// One look at the Studio's recording; what it finds is said on the dashboard.
     pub(crate) async fn record_watch_tick(&self) {
-        // What a capture couldn't say itself (a microphone chosen instead of a Bluetooth one).
-        for n in ferrocore::notices::take() {
-            self.notice_detail(n.key, NoticeLevel::Info, &n.line, &n.detail);
-        }
         let Ok(host) = self.studio_host() else { return };
+        // What a capture couldn't say itself (a microphone chosen instead of a Bluetooth one):
+        // this Studio's engine's, not another's.
+        for (key, line, detail) in host.take_notices().await {
+            self.notice_detail(&key, NoticeLevel::Info, &line, &detail);
+        }
         let Ok(v) = host.record_stats().await else { return };
         let says = {
             let mut w = self.studio().record_watch.lock().unwrap_or_else(|p| p.into_inner());

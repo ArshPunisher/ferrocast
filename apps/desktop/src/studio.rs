@@ -2741,6 +2741,17 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn take_notices(&self) -> Vec<(String, String, String)> {
+        self.on_main(|h| {
+            h.collection
+                .as_ref()
+                .map(|c| c.take_notices().into_iter().map(|n| (n.key.to_string(), n.line, n.detail)).collect())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     async fn record_stats(&self) -> Result<Value, String> {
         self.on_main(|h| {
             h.record.as_ref().map_or(Value::Null, |r| {
