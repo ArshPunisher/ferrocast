@@ -17,7 +17,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 /// The Studio's shortcuts registered now and what each does, and the queue their presses go
 /// through: one worker runs them in order, so a quick push-to-talk tap never ends unmuted.
 pub struct StudioKeys {
-    keys: Mutex<HashMap<Shortcut, String>>,
+    keys: Mutex<HashMap<Shortcut, Vec<String>>>,
     queue: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
 }
 
@@ -36,28 +36,49 @@ impl StudioKeys {
     }
 }
 
+/// What the settings ask for: each key once, with every action it runs (a key may be shared by
+/// several actions, as in OBS, and an action may have several keys), and the keys that aren't
+/// keys this computer knows.
+pub(crate) fn plan(wanted: &BTreeMap<String, String>) -> (Vec<(Shortcut, Vec<String>)>, Vec<String>) {
+    let mut by_key: Vec<(Shortcut, Vec<String>)> = Vec::new();
+    let mut unknown = Vec::new();
+    for (action, value) in wanted {
+        for keys in value.split('|') {
+            match keys.parse::<Shortcut>() {
+                Ok(sc) => match by_key.iter_mut().find(|(k, _)| *k == sc) {
+                    Some((_, actions)) => {
+                        if !actions.contains(action) {
+                            actions.push(action.clone());
+                        }
+                    }
+                    None => by_key.push((sc, vec![action.clone()])),
+                },
+                Err(_) => unknown.push(keys.to_string()),
+            }
+        }
+    }
+    (by_key, unknown)
+}
+
 /// Registers these shortcuts in place of the old ones → the keys that couldn't be (taken by
-/// another app, used twice, or not keys this computer knows).
+/// another app, or not keys this computer knows).
 pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> {
     let Some(state) = app.try_state::<StudioKeys>() else { return Vec::new() };
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
-    let mut failed = Vec::new();
-    for (action, keys) in wanted {
-        match keys.parse::<Shortcut>() {
-            Ok(sc) if !map.contains_key(&sc) => match app.global_shortcut().register(sc) {
-                Ok(()) => {
-                    tracing::info!(keys, action, "a Studio shortcut is set");
-                    map.insert(sc, action.clone());
-                }
-                Err(e) => {
-                    tracing::warn!(keys, error = %e, "a Studio shortcut couldn't be registered");
-                    failed.push(keys.clone());
-                }
-            },
-            _ => failed.push(keys.clone()),
+    let (planned, mut failed) = plan(wanted);
+    for (sc, actions) in planned {
+        match app.global_shortcut().register(sc) {
+            Ok(()) => {
+                tracing::info!(keys = %sc, ?actions, "a Studio shortcut is set");
+                map.insert(sc, actions);
+            }
+            Err(e) => {
+                tracing::warn!(keys = %sc, error = %e, "a Studio shortcut couldn't be registered");
+                failed.push(sc.to_string());
+            }
         }
     }
     failed
@@ -66,16 +87,18 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
 /// Runs the Studio's action for this shortcut → false when it isn't one of the Studio's.
 pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> bool {
     let Some(keys) = app.try_state::<StudioKeys>() else { return false };
-    let Some(action) = keys.keys.lock().unwrap_or_else(|p| p.into_inner()).get(shortcut).cloned() else {
+    let Some(actions) = keys.keys.lock().unwrap_or_else(|p| p.into_inner()).get(shortcut).cloned() else {
         return false;
     };
     let pressed = state == ShortcutState::Pressed;
-    tracing::debug!(action, pressed, "a Studio shortcut");
-    // Only push to talk and push to mute act on letting go.
-    if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
-        return true;
+    for action in actions {
+        tracing::debug!(action, pressed, "a Studio shortcut");
+        // Only push to talk and push to mute act on letting go.
+        if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
+            continue;
+        }
+        let _ = keys.queue.send((action, pressed));
     }
-    let _ = keys.queue.send((action, pressed));
     true
 }
 
@@ -90,6 +113,36 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         "record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
             engine.studio_record(!on).await?;
+        }
+        "start_record" => {
+            let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
+            if !on {
+                engine.studio_record(true).await?;
+            }
+        }
+        "stop_record" => {
+            let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
+            if on {
+                engine.studio_record(false).await?;
+            }
+        }
+        "unpause_record" => {
+            let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
+            if paused {
+                engine.studio_record_pause(false).await?;
+            }
+        }
+        "start_replay" | "stop_replay" => {
+            let on = engine.studio_stats().await?["replay"]["active"].as_bool().unwrap_or(false);
+            if on != (action == "start_replay") {
+                engine.studio_replay(action == "start_replay").await?;
+            }
+        }
+        "start_virtualcam" | "stop_virtualcam" => {
+            let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
+            if on != (action == "start_virtualcam") {
+                engine.studio_virtual_camera(action == "start_virtualcam", None).await?;
+            }
         }
         "pause_record" => {
             let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
@@ -217,4 +270,43 @@ async fn muted(engine: &Engine, name: &str) -> Result<bool, EngineError> {
         .and_then(|l| l.iter().find(|a| a["name"] == Value::String(name.into())))
         .and_then(|a| a["muted"].as_bool())
         .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wanted(list: &[(&str, &str)]) -> BTreeMap<String, String> {
+        list.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
+    }
+
+    #[test]
+    fn an_action_may_have_several_keys() {
+        let (planned, unknown) = plan(&wanted(&[("record", "Alt+R|F9")]));
+        assert!(unknown.is_empty());
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|(_, a)| a == &["record".to_string()]));
+    }
+
+    #[test]
+    fn a_key_shared_by_two_actions_runs_both() {
+        let (planned, _) = plan(&wanted(&[("mute:Mic", "F8"), ("scene:BRB", "F8"), ("record", "F9")]));
+        assert_eq!(planned.len(), 2);
+        let shared = planned.iter().find(|(_, a)| a.len() == 2).map(|(_, a)| a.clone()).unwrap();
+        assert_eq!(shared, vec!["mute:Mic".to_string(), "scene:BRB".to_string()]);
+    }
+
+    #[test]
+    fn keys_this_computer_does_not_know_are_reported_not_dropped_silently() {
+        let (planned, unknown) = plan(&wanted(&[("record", "F9|Nonsense+Key"), ("undo", "Alt+Z")]));
+        assert_eq!(planned.len(), 2);
+        assert_eq!(unknown, vec!["Nonsense+Key".to_string()]);
+    }
+
+    #[test]
+    fn the_same_key_twice_on_one_action_counts_once() {
+        let (planned, _) = plan(&wanted(&[("record", "F9|F9")]));
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].1.len(), 1);
+    }
 }

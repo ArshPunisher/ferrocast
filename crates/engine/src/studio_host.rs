@@ -790,16 +790,23 @@ impl FilePick {
 /// Shortcut actions with no name in them (OBS's hotkeys). Others: scene:, mute:,
 /// push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide: <scene>\n<source>;
 /// filter: <source>\n<filter>; quick: <1 to 10>.
-pub const HOTKEY_ACTIONS: [&str; 16] = [
+pub const HOTKEY_ACTIONS: [&str; 23] = [
     "go_live",
     "end_stream",
     "record",
+    "start_record",
+    "stop_record",
     "pause_record",
+    "unpause_record",
     "split_record",
     "chapter",
     "replay",
+    "start_replay",
+    "stop_replay",
     "save_replay",
     "virtualcam",
+    "start_virtualcam",
+    "stop_virtualcam",
     "studio_mode",
     "transition",
     "swap_scenes",
@@ -808,6 +815,9 @@ pub const HOTKEY_ACTIONS: [&str; 16] = [
     "undo",
     "redo",
 ];
+
+/// How many keys one hotkey action takes (OBS's "+" on a hotkey row).
+pub const MAX_KEYS_PER_ACTION: usize = 4;
 
 /// Recording formats: crash-safe MP4 and MOV, fragmented ones, and MKV, FLV and TS.
 pub const RECORD_FORMATS: [&str; 8] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts", "hls"];
@@ -1182,7 +1192,7 @@ impl StudioSettings {
         if self.hotkeys.len() > 200 {
             return bad("hotkeys: up to 200.");
         }
-        for (action, keys) in &self.hotkeys {
+        for (action, value) in &self.hotkeys {
             let known = HOTKEY_ACTIONS.contains(&action.as_str())
                 || ["scene:", "mute:", "push_to_talk:", "push_to_mute:", "media_play_pause:", "media_restart:", "media_stop:", "media_next:", "media_previous:", "screenshot:"]
                     .iter()
@@ -1197,12 +1207,15 @@ impl StudioSettings {
             if !known {
                 return bad("hotkeys: one of the Studio's shortcut actions (see API.md).");
             }
-            if keys.is_empty()
-                || keys.len() > 64
-                // Named keys (Space, Comma, F9…) joined with +: nothing else.
-                || !keys.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+            // One or more keys (up to 4), each named keys (Space, Comma, F9…) joined with +,
+            // the keys of one action joined with |: nothing else.
+            let all: Vec<&str> = value.split('|').collect();
+            if all.len() > MAX_KEYS_PER_ACTION
+                || all.iter().any(|keys| {
+                    keys.is_empty() || keys.len() > 64 || !keys.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+                })
             {
-                return bad("hotkeys: keys like CmdOrCtrl+Shift+L.");
+                return bad("hotkeys: keys like CmdOrCtrl+Shift+L, up to 4 for one action, joined with |.");
             }
         }
         Ok(())
@@ -3878,6 +3891,10 @@ mod tests {
             ("push_to_mute:Mic", "Alt+M"),
             ("split_record", "Alt+S"),
             ("undo", "Alt+Z"),
+            // Several keys for one action; OBS's separate start and stop.
+            ("record", "Alt+R|F9|Cmd+Shift+KeyR"),
+            ("stop_record", "F10"),
+            ("start_replay", "F11"),
         ] {
             hk.hotkeys.insert(action.into(), keys.into());
         }
@@ -3915,6 +3932,11 @@ mod tests {
         ] {
             let err = e.studio_set_settings(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{field}: {err:?}");
+        }
+        for keys in ["F9|", "|F9", "F9||F8", "A|B|C|D|E", "F9|F8;x"] {
+            let mut bad = d.clone();
+            bad.hotkeys.insert("record".into(), keys.into());
+            assert!(bad.check().is_err(), "{keys:?} is refused");
         }
         let mut bad = d.clone();
         bad.hotkeys.insert("explode".into(), "F9".into());
