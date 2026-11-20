@@ -220,11 +220,27 @@ impl History {
             StudioAct::AddFilter { filter, .. } => Some(fresh(format!("Add filter {}", filter.name), None, false)),
             StudioAct::RemoveFilter { filter, .. } => Some(fresh(format!("Remove filter {filter}"), None, false)),
             StudioAct::EditFilter { filter, .. } => Some(fresh(format!("Change filter {filter}"), None, false)),
-            StudioAct::PasteFilters { name, from } => {
-                Some(fresh(format!("Paste filters from {from} to {name}"), None, false))
+            StudioAct::SetItemFilterScope { scene, id, own } => {
+                let who = item_name(c, scene, *id)?;
+                let verb = if *own { "Use own filters for" } else { "Use shared filters for" };
+                Some(fresh(format!("{verb} {who}"), None, false))
             }
-            StudioAct::UpdateFilter { name, filter, .. } => {
-                let key = ("filter", format!("{name}\n{filter}"), 0);
+            StudioAct::PasteFilters { name, from, item, from_item } => {
+                let src = match from_item {
+                    Some(f) => item_name(c, &f.scene, f.id).unwrap_or_else(|| f.scene.clone()),
+                    None => from.clone(),
+                };
+                let to = match item {
+                    Some(it) => item_name(c, &it.scene, it.id).unwrap_or_else(|| it.scene.clone()),
+                    None => name.clone(),
+                };
+                Some(fresh(format!("Paste filters from {src} to {to}"), None, false))
+            }
+            StudioAct::UpdateFilter { name, filter, item, .. } => {
+                let key = match item {
+                    Some(it) => ("filter", format!("{}\n{filter}", it.scene), it.id),
+                    None => ("filter", format!("{name}\n{filter}"), 0),
+                };
                 if self.joins(&key) {
                     return Some(joined(false));
                 }
@@ -420,5 +436,80 @@ mod tests {
         assert_eq!(h.undo(&c), Ok(Some("Hide Box".into())));
         assert_eq!(h.undo(&c), Ok(Some("Move Box into Pair".into())));
         assert!(c.items("Main").unwrap_or_default().iter().any(|i| i.name == "Box"), "out of the group again");
+    }
+
+    #[test]
+    fn item_filter_and_scope_edits_undo_redo_and_merge_sliders_per_item() {
+        use ferrocast_engine::studio_host::ItemTarget;
+
+        let c = stage();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+        c.start_vertical("Vertical").unwrap();
+        let main_it = c
+            .add_source("Main", "color_source_v3", "Card", &serde_json::json!({ "width": 64, "height": 36 }), false)
+            .unwrap();
+        let vert_it = c.add_existing("Vertical", "Card").unwrap();
+        let tgt = Some(ItemTarget { scene: "Vertical".into(), id: vert_it.id });
+
+        step(&mut h, StudioAct::SetItemFilterScope { scene: "Vertical".into(), id: vert_it.id, own: true }, &|| {
+            c.set_item_filter_scope("Vertical", vert_it.id, true).map(|_| ()).map_err(|e| e.to_string())
+        });
+        step(
+            &mut h,
+            StudioAct::AddFilter {
+                name: String::new(),
+                filter: ferrocast_engine::studio_host::NewSource {
+                    kind: "ferrocast_rounded_corners".into(),
+                    name: "Round".into(),
+                    settings: serde_json::json!({ "radius": 8 }),
+                },
+                item: tgt.clone(),
+            },
+            &|| {
+                c.add_item_filter(
+                    "Vertical",
+                    vert_it.id,
+                    "ferrocast_rounded_corners",
+                    "Round",
+                    &serde_json::json!({ "radius": 8 }),
+                )
+                .map_err(|e| e.to_string())
+            },
+        );
+        // Two slider drags on Vertical item merge into one undo step.
+        for r in [14, 24] {
+            step(
+                &mut h,
+                StudioAct::UpdateFilter {
+                    name: String::new(),
+                    filter: "Round".into(),
+                    settings: serde_json::json!({ "radius": r }),
+                    item: tgt.clone(),
+                },
+                &|| {
+                    c.update_item_filter("Vertical", vert_it.id, "Round", &serde_json::json!({ "radius": r }))
+                        .map_err(|e| e.to_string())
+                },
+            );
+        }
+        assert_eq!(h.list().0, ["Change filter Round", "Add filter Round", "Use own filters for Card"]);
+        assert_eq!(c.item_filters("Main", main_it.id).unwrap().len(), 0);
+        assert_eq!(c.item_filter_settings("Vertical", vert_it.id, "Round").unwrap()["radius"], 24);
+
+        // Undo slider change restores radius to 8; undo again removes Round cleanly.
+        assert_eq!(h.undo(&c), Ok(Some("Change filter Round".into())));
+        assert_eq!(c.item_filter_settings("Vertical", vert_it.id, "Round").unwrap()["radius"], 8);
+        assert_eq!(h.undo(&c), Ok(Some("Add filter Round".into())));
+        assert!(c.item_filters("Vertical", vert_it.id).unwrap().is_empty());
+        // Undo scope switch reverts own_filters back to false.
+        assert_eq!(h.undo(&c), Ok(Some("Use own filters for Card".into())));
+        assert!(!c.items("Vertical").unwrap()[0].own_filters);
+        // Redo scope + add restores them.
+        assert_eq!(h.redo(&c), Ok(Some("Use own filters for Card".into())));
+        assert!(c.items("Vertical").unwrap()[0].own_filters);
     }
 }

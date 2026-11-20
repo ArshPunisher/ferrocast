@@ -903,3 +903,152 @@ async fn levels_use_the_slow_window_unless_fast_is_asked_and_never_wait_for_the_
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(v["error"]["message"].as_str().unwrap_or("").contains("window"), "{v}");
 }
+
+#[derive(Debug, Default)]
+struct ItemFilterHost {
+    acts: std::sync::Mutex<Vec<ferrocast_engine::studio_host::StudioAct>>,
+}
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for ItemFilterHost {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        ferrocast_engine::studio_host::StudioSettings::default()
+    }
+    async fn set_settings(&self, _s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        self.acts.lock().unwrap().push(act.clone());
+        match act {
+            ferrocast_engine::studio_host::StudioAct::Filters { .. } => {
+                Ok(json!([{ "name": "Round", "kind": "ferrocast_rounded_corners", "enabled": true, "scope": "item" }]))
+            }
+            ferrocast_engine::studio_host::StudioAct::SetItemFilterScope { own, .. } => {
+                Ok(json!({ "id": 3, "name": "Cam", "own_filters": own }))
+            }
+            ferrocast_engine::studio_host::StudioAct::FilterSettings { .. } => Ok(json!({ "radius": 12 })),
+            ferrocast_engine::studio_host::StudioAct::FilterOptions { .. } => Ok(json!([])),
+            ferrocast_engine::studio_host::StudioAct::SourcePicture { .. } => Ok(json!({ "image": null })),
+            _ => Ok(Value::Null),
+        }
+    }
+}
+
+#[tokio::test]
+async fn item_filter_routes_forward_item_target_and_validate_queries() {
+    use ferrocast_engine::studio_host::{FilterEdit, ItemTarget, StudioAct};
+
+    let r = start().await;
+    let host = Arc::new(ItemFilterHost::default());
+    r.engine.set_studio_host(host.clone());
+
+    assert_eq!(r.get("/studio/engine/scenes/Vertical/items/3/filters").await.status(), StatusCode::OK);
+    assert_eq!(
+        r.post(
+            "/studio/engine/scenes/Vertical/items/3/filters",
+            json!({ "kind": "ferrocast_rounded_corners", "name": "Round" })
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        r.put("/studio/engine/scenes/Vertical/items/3/filters/scope", json!({ "own": true })).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.post("/studio/engine/scenes/Vertical/items/3/filters/Round/edit", json!({ "do": "disable" })).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.get("/studio/engine/scenes/Vertical/items/3/filters/Round/settings").await.status(), StatusCode::OK);
+    assert_eq!(
+        r.put("/studio/engine/scenes/Vertical/items/3/filters/Round/settings", json!({ "settings": { "radius": 8 } }))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.get("/studio/engine/scenes/Vertical/items/3/filters/Round/options").await.status(), StatusCode::OK);
+    assert_eq!(
+        r.post("/studio/engine/scenes/Vertical/items/3/paste-filters", json!({ "from": "Cam" })).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.delete("/studio/engine/scenes/Vertical/items/3/filters/Round").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        r.get("/studio/engine/scenes/Vertical/items/3/picture?w=256&filters=true").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.get("/studio/engine/sources/Cam/picture?w=256&filters=true&scene=Vertical&item=3").await.status(),
+        StatusCode::OK
+    );
+
+    // Unpaired scene/item query params must be rejected with 400.
+    assert_eq!(
+        r.get("/studio/engine/sources/Cam/picture?w=256&filters=true&scene=Vertical").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.get("/studio/engine/sources/Cam/picture?w=256&filters=true&item=3").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let acts = host.acts.lock().unwrap().clone();
+    let expected = Some(ItemTarget { scene: "Vertical".into(), id: 3 });
+    assert!(matches!(&acts[0], StudioAct::Filters { item, .. } if item == &expected));
+    assert!(matches!(&acts[2], StudioAct::SetItemFilterScope { scene, id: 3, own: true } if scene == "Vertical"));
+    assert!(matches!(&acts[3], StudioAct::EditFilter { edit: FilterEdit::Disable, item, .. } if item == &expected));
+    assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
+}

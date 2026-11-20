@@ -197,7 +197,7 @@ impl StudioHost for Studio {
             }
             StudioAct::SetCurrent { scene } => format!("scene {scene}"),
             StudioAct::EditItem { scene, id, edit } => format!("{edit:?} {scene} {id}"),
-            StudioAct::EditFilter { name, filter, edit } => format!("{edit:?} {name} {filter}"),
+            StudioAct::EditFilter { name, filter, edit, .. } => format!("{edit:?} {name} {filter}"),
             other => format!("{other:?}"),
         };
         self.did.lock().unwrap_or_else(|e| e.into_inner()).push(line);

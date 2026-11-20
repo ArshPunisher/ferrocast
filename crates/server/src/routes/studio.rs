@@ -17,7 +17,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use ferrocast_engine::studio_host::{
-    AudioChange, FilterEdit, ItemEdit, MediaAct, NewSource, SceneTransition, StudioAct, StudioModeOptions, WebAct,
+    AudioChange, FilterEdit, ItemEdit, ItemTarget, MediaAct, NewSource, SceneTransition, StudioAct, StudioModeOptions,
+    WebAct,
 };
 
 use crate::AppState;
@@ -63,6 +64,20 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/group", put(engine_item_group))
         .route("/studio/engine/scenes/{scene}/items/{id}/ungroup", post(engine_ungroup))
         .route("/studio/engine/scenes/{scene}/items/{id}/order", put(engine_item_order))
+        .route(
+            "/studio/engine/scenes/{scene}/items/{id}/filters",
+            get(engine_item_filters).post(engine_add_item_filter),
+        )
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/scope", put(engine_set_item_filter_scope))
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}", delete(engine_remove_item_filter))
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/edit", post(engine_edit_item_filter))
+        .route(
+            "/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/settings",
+            get(engine_item_filter_settings).put(engine_update_item_filter),
+        )
+        .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/options", get(engine_item_filter_options))
+        .route("/studio/engine/scenes/{scene}/items/{id}/paste-filters", post(engine_paste_item_filters))
+        .route("/studio/engine/scenes/{scene}/items/{id}/picture", get(engine_item_picture))
         .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
@@ -1129,7 +1144,27 @@ async fn engine_set_audio(
 }
 
 async fn engine_filters(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Filters { name }).await
+    act(&app, StudioAct::Filters { name, item: None }).await
+}
+
+async fn engine_item_filters(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Filters { name: String::new(), item: Some(ItemTarget { scene, id }) }).await
+}
+
+#[derive(Deserialize)]
+struct OwnBody {
+    own: bool,
+}
+
+async fn engine_set_item_filter_scope(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<OwnBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemFilterScope { scene, id, own: b.own }).await
 }
 
 async fn engine_add_filter(
@@ -1137,7 +1172,17 @@ async fn engine_add_filter(
     Path(name): Path<String>,
     Body(filter): Body<NewSource>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let Json(v) = act(&app, StudioAct::AddFilter { name, filter }).await?;
+    let Json(v) = act(&app, StudioAct::AddFilter { name, filter, item: None }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+async fn engine_add_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(filter): Body<NewSource>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) =
+        act(&app, StudioAct::AddFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
 
@@ -1145,12 +1190,22 @@ async fn engine_remove_filter(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::RemoveFilter { name, filter }).await
+    act_done(&app, StudioAct::RemoveFilter { name, filter, item: None }).await
+}
+
+async fn engine_remove_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::RemoveFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
 #[derive(Deserialize)]
 struct FromBody {
+    #[serde(default)]
     from: String,
+    #[serde(default)]
+    from_item: Option<ItemTarget>,
 }
 
 async fn engine_obs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -1204,15 +1259,37 @@ async fn engine_vst_act(
     act(&app, StudioAct::Vst { name, filter, what: b.what }).await
 }
 
-/// `GET …/sources/{name}/picture?w=256[&filters=true]` → `{ image, width, height }`: the
-/// source's own picture now, before its filters (the crop editor and filter previews draw on
-/// it), or with them (the drawer's result).
+/// `GET …/sources/{name}/picture?w=256[&filters=true][&scene=...&item=...]` → `{ image, width, height }`:
+/// the source's own picture now, before its filters (the crop editor and filter previews draw on
+/// it), or with them (the drawer's result, optionally scoped to one scene item override).
 async fn engine_source_picture(
     State(app): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<PictureQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::SourcePicture { name, width: q.w, filters: q.filters }).await
+    let item = match (q.scene, q.item) {
+        (Some(scene), Some(id)) => Some(ItemTarget { scene, id }),
+        (None, None) => None,
+        _ => return Err(ApiError::invalid("scene, item: give both or neither.")),
+    };
+    act(&app, StudioAct::SourcePicture { name, width: q.w, filters: q.filters, item }).await
+}
+
+async fn engine_item_picture(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Query(q): Query<PictureQuery>,
+) -> ApiResult<Json<Value>> {
+    act(
+        &app,
+        StudioAct::SourcePicture {
+            name: String::new(),
+            width: q.w,
+            filters: q.filters,
+            item: Some(ItemTarget { scene, id }),
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1221,6 +1298,8 @@ struct PictureQuery {
     w: u32,
     #[serde(default)]
     filters: bool,
+    scene: Option<String>,
+    item: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1284,7 +1363,24 @@ async fn engine_paste_filters(
     Path(name): Path<String>,
     Body(b): Body<FromBody>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::PasteFilters { name, from: b.from }).await
+    act_done(&app, StudioAct::PasteFilters { name, from: b.from, item: None, from_item: b.from_item }).await
+}
+
+async fn engine_paste_item_filters(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+    Body(b): Body<FromBody>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::PasteFilters {
+            name: String::new(),
+            from: b.from,
+            item: Some(ItemTarget { scene, id }),
+            from_item: b.from_item,
+        },
+    )
+    .await
 }
 
 async fn engine_edit_filter(
@@ -1292,21 +1388,47 @@ async fn engine_edit_filter(
     Path((name, filter)): Path<(String, String)>,
     Body(b): Body<DoBody<FilterEdit>>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::EditFilter { name, filter, edit: b.what }).await
+    act_done(&app, StudioAct::EditFilter { name, filter, edit: b.what, item: None }).await
+}
+
+async fn engine_edit_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+    Body(b): Body<DoBody<FilterEdit>>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::EditFilter { name: String::new(), filter, edit: b.what, item: Some(ItemTarget { scene, id }) },
+    )
+    .await
 }
 
 async fn engine_filter_settings(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::FilterSettings { name, filter }).await
+    act(&app, StudioAct::FilterSettings { name, filter, item: None }).await
+}
+
+async fn engine_item_filter_settings(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterSettings { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_filter_options(
     State(app): State<AppState>,
     Path((name, filter)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::FilterOptions { name, filter }).await
+    act(&app, StudioAct::FilterOptions { name, filter, item: None }).await
+}
+
+async fn engine_item_filter_options(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::FilterOptions { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_update_filter(
@@ -1314,7 +1436,24 @@ async fn engine_update_filter(
     Path((name, filter)): Path<(String, String)>,
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
-    act_done(&app, StudioAct::UpdateFilter { name, filter, settings: b.settings }).await
+    act_done(&app, StudioAct::UpdateFilter { name, filter, settings: b.settings, item: None }).await
+}
+
+async fn engine_update_item_filter(
+    State(app): State<AppState>,
+    Path((scene, id, filter)): Path<(String, i64, String)>,
+    Body(b): Body<SettingsBody>,
+) -> ApiResult<StatusCode> {
+    act_done(
+        &app,
+        StudioAct::UpdateFilter {
+            name: String::new(),
+            filter,
+            settings: b.settings,
+            item: Some(ItemTarget { scene, id }),
+        },
+    )
+    .await
 }
 
 /// A global sound device (every scene) on channel 1 to 6.

@@ -213,7 +213,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                     engine.studio_act(StudioAct::EditItem { scene: scene.to_string(), id, edit }).await?;
                 }
             } else if let Some((source, filter)) = pair("filter:") {
-                let list = engine.studio_act(StudioAct::Filters { name: source.to_string() }).await?;
+                let list = engine.studio_act(StudioAct::Filters { name: source.to_string(), item: None }).await?;
                 let on = list
                     .as_array()
                     .and_then(|l| l.iter().find(|f| f["name"] == Value::String(filter.into())))
@@ -221,7 +221,12 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                     .unwrap_or(false);
                 let edit = if on { FilterEdit::Disable } else { FilterEdit::Enable };
                 engine
-                    .studio_act(StudioAct::EditFilter { name: source.to_string(), filter: filter.to_string(), edit })
+                    .studio_act(StudioAct::EditFilter {
+                        name: source.to_string(),
+                        filter: filter.to_string(),
+                        edit,
+                        item: None,
+                    })
                     .await?;
             } else if let Some(name) = a.strip_prefix("screenshot:") {
                 engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
