@@ -42,6 +42,12 @@ struct Look {
 enum Cmd {
     Look(Look),
     Reload,
+    /// Tests: the screencast is stopped, as when a browser stops sending frames; with the
+    /// watchdog on or off.
+    #[cfg(test)]
+    Stall {
+        watchdog: bool,
+    },
 }
 
 /// A web page shown in a fed source. Dropping it closes the browser.
@@ -80,6 +86,14 @@ impl FedPage {
                 .ok()?
         };
         Some(Self { tx: Some(tx), feed, thread: Some(thread), stalled })
+    }
+
+    /// Tests: makes the browser stop sending frames.
+    #[cfg(test)]
+    pub(crate) fn stall_for_test(&self, watchdog: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::Stall { watchdog });
+        }
     }
 
     /// Whether the page stopped drawing and the watchdog gave up ("This browser source stopped
@@ -188,6 +202,8 @@ fn run(browser: &Path, mut look: Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>, s
                 match rx.recv_timeout(left) {
                     Ok(Cmd::Look(l)) => look = l,
                     Ok(Cmd::Reload) => {}
+                    #[cfg(test)]
+                    Ok(Cmd::Stall { .. }) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -315,8 +331,14 @@ impl Session {
         let mut shot_id = None::<u64>;
         let mut last_print = None::<u64>;
         let mut where_id = None::<u64>;
+        #[cfg(test)]
+        let mut watching = true;
         loop {
-            match dog.step(Instant::now()) {
+            #[cfg(test)]
+            let step = if watching { dog.step(Instant::now()) } else { Step::Wait };
+            #[cfg(not(test))]
+            let step = dog.step(Instant::now());
+            match step {
                 Step::Wait => {}
                 Step::AskPicture => {
                     // No screencast frame for a while: a still page sends none, a stalled
@@ -374,6 +396,13 @@ impl Session {
                     dog.reset(Instant::now());
                     stalled.store(false, Ordering::Relaxed);
                     if self.call("Page.reload", json!({})).is_err() {
+                        return Ended::Lost;
+                    }
+                }
+                #[cfg(test)]
+                Ok(Cmd::Stall { watchdog }) => {
+                    watching = watchdog;
+                    if self.call("Page.stopScreencast", json!({})).is_err() {
                         return Ended::Lost;
                     }
                 }
@@ -803,5 +832,77 @@ mod tests {
         assert!(!needs_navigation("about:blank", "about:blank"));
         // A page that moved on by itself (a redirect) is not sent back.
         assert!(!needs_navigation("https://example.com/other", "https://example.com/alert"));
+    }
+
+    /// Starts a page that flips between red and green every 300 ms, and the engine showing it.
+    fn flipping_page() -> Option<(ferrocore::engine::Engine, FedPage)> {
+        use ferrocore::engine::{Engine, EngineConfig, SceneItem, SourceKind};
+        browser()?;
+        let video = ferrocore::video::VideoConfig {
+            codec: ferrocore::video::VideoCodec::H264,
+            input: ferrocore::video::PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1000,
+            rate: ferrocore::video::RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+            profile: ferrocore::video::H264Profile::High,
+            preset: None,
+            tune: None,
+        };
+        let audio = ferrocore::audio::AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let e =
+            Engine::new(EngineConfig { width: 320, height: 180, fps: 30, ..Default::default() }, video, audio).ok()?;
+        e.set_source(1, SourceKind::Fed { width: 320, height: 180 }).ok()?;
+        e.set_scene("Main", vec![SceneItem::new(1, ferrocore::Placement::default())]);
+        e.go("Main").ok()?;
+        let feed = e.fed(1)?;
+        let html = "data:text/html,<body style='margin:0'><script>let c=0;setInterval(()=>{document.body.style.background=(c++%2)?'rgb(255,0,0)':'rgb(0,255,0)'},300)</script></body>";
+        let page = FedPage::open(html, 320, 180, "", 30, feed)?;
+        Some((e, page))
+    }
+
+    /// The colour at the middle of the engine's picture (red, green or neither).
+    fn colour(e: &ferrocore::engine::Engine) -> Option<[u8; 3]> {
+        let px = e.snapshot().ok()?;
+        let at = (90 * 320 + 160) * 4;
+        Some([*px.get(at)?, *px.get(at + 1)?, *px.get(at + 2)?])
+    }
+
+    /// Waits until the picture has shown both colours (the page is flipping and arriving).
+    fn flips_for(e: &ferrocore::engine::Engine, within: Duration) -> bool {
+        let end = Instant::now() + within;
+        let mut seen = std::collections::HashSet::new();
+        while Instant::now() < end {
+            if let Some(c) = colour(e)
+                && (c == [255, 0, 0] || c == [0, 255, 0])
+            {
+                seen.insert(c);
+                if seen.len() == 2 {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// A browser that stops sending frames while the page goes on changing: the watchdog gets
+    /// the picture moving again; with it off the picture stays frozen.
+    #[test]
+    fn the_watchdog_brings_a_stalled_page_back_and_without_it_it_stays_frozen() {
+        for watchdog in [true, false] {
+            let Some((e, page)) = flipping_page() else { return };
+            assert!(flips_for(&e, Duration::from_secs(60)), "the page flips before the stall");
+            page.stall_for_test(watchdog);
+            // Frames already in flight; then see whether it moves again.
+            std::thread::sleep(Duration::from_millis(1500));
+            let moves = flips_for(&e, Duration::from_secs(12));
+            drop(page);
+            assert_eq!(moves, watchdog, "watchdog {watchdog}: the picture moves again = {moves}");
+        }
     }
 }
