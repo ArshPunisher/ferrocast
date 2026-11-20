@@ -801,3 +801,105 @@ async fn the_studio_engine_needs_the_desktop_app() {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
     }
 }
+
+/// A Studio whose edit queue is never needed: levels come straight from "the engine", and say
+/// which window they were read over.
+#[derive(Debug)]
+struct LevelsStudio;
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for LevelsStudio {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, _act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        // The Studio's queue: waits far longer than any poll, so a handler that used it would time out.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(json!({}))
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        ferrocast_engine::studio_host::StudioSettings::default()
+    }
+    async fn set_settings(&self, _s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
+        Some(json!({ names[0].clone(): { "peak": [if fast { -6.0 } else { -20.0 }, -6.0] } }))
+    }
+}
+
+#[tokio::test]
+async fn levels_use_the_slow_window_unless_fast_is_asked_and_never_wait_for_the_queue() {
+    let r = start().await;
+    r.engine.set_studio_host(Arc::new(LevelsStudio));
+    let ask = |req: Value| async {
+        let t0 = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            r.send(reqwest::Method::POST, "/studio/engine/levels", req),
+        )
+        .await
+        .expect("levels waited for the Studio queue");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        body(res).await
+    };
+    let (s, v) = ask(json!({ "names": ["Mic"] })).await;
+    assert_eq!((s, v["Mic"]["peak"][0].as_f64()), (StatusCode::OK, Some(-20.0)), "no window: the 300 ms one");
+    let (s, v) = ask(json!({ "names": ["Mic"], "window": "slow" })).await;
+    assert_eq!((s, v["Mic"]["peak"][0].as_f64()), (StatusCode::OK, Some(-20.0)));
+    let (s, v) = ask(json!({ "names": ["Mic"], "window": "fast" })).await;
+    assert_eq!((s, v["Mic"]["peak"][0].as_f64()), (StatusCode::OK, Some(-6.0)), "fast: the short window");
+    let (s, v) = ask(json!({ "names": ["Mic"], "window": "bogus" })).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(v["error"]["message"].as_str().unwrap_or("").contains("window"), "{v}");
+}
