@@ -3628,7 +3628,7 @@ impl StudioHost for DesktopStudio {
     async fn log(&self, lines: usize) -> Result<Value, String> {
         let file = self.data.join("logs").join("ferrocast.log");
         let path = file.clone();
-        let tail = tokio::task::spawn_blocking(move || log_tail(&path, lines))
+        let tail = tokio::task::spawn_blocking(move || log_tail_across_rotation(&path, lines))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("The log can't be read: {e}"))?;
@@ -3985,6 +3985,18 @@ fn log_tail(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
     Ok(all[from..].iter().map(|l| strip_ansi(l)).collect())
 }
 
+/// As [`log_tail`], and when the log was just rotated (the file is short) the lines before it come
+/// from the rotated `ferrocast.1.log` beside it, so a look right after a rotation isn't empty.
+fn log_tail_across_rotation(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
+    let mut tail = log_tail(path, n)?;
+    if tail.len() < n
+        && let Ok(older) = log_tail(&path.with_file_name("ferrocast.1.log"), n - tail.len())
+    {
+        tail.splice(0..0, older);
+    }
+    Ok(tail)
+}
+
 /// Removes terminal colour codes (`ESC [ ... m`).
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -4022,6 +4034,22 @@ mod log_tests {
         let even = dir.join("even.log");
         std::fs::write(&even, format!("{}\n{}\n", "a".repeat(399), "b".repeat(399))).unwrap();
         assert_eq!(log_tail(&even, 1).unwrap(), ["b".repeat(399)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_just_rotated_still_shows_the_lines_before_it() {
+        let dir = std::env::temp_dir().join(format!("fc-log-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ferrocast.1.log"), "old 1\nold 2\nold 3\n").unwrap();
+        std::fs::write(dir.join("ferrocast.log"), "new 1\nnew 2\n").unwrap();
+        let tail = log_tail_across_rotation(&dir.join("ferrocast.log"), 4).unwrap();
+        assert_eq!(tail, ["old 2", "old 3", "new 1", "new 2"]);
+        // Enough lines in the new file: the old one isn't read.
+        assert_eq!(log_tail_across_rotation(&dir.join("ferrocast.log"), 2).unwrap(), ["new 1", "new 2"]);
+        // No backup yet: just the log.
+        std::fs::remove_file(dir.join("ferrocast.1.log")).unwrap();
+        assert_eq!(log_tail_across_rotation(&dir.join("ferrocast.log"), 4).unwrap(), ["new 1", "new 2"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
