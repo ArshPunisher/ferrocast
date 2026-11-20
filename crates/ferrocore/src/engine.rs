@@ -823,10 +823,19 @@ struct Watch {
     /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
     /// zero-frame attempts until USB hotplug or a user edit/retry.
     cap_no_signal: bool,
+    /// A camera or microphone: one that has worked is looked for again within seconds when it
+    /// goes (a USB mic bumped out and back in, where Windows has no hotplug wake).
+    quick_retry: bool,
     /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`].
     no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
+    /// Ended because the system turned its permission off (Screen Recording): not tried again
+    /// until the permission is back (`regained_access`); each try would only raise the system's
+    /// prompt again (agy GAPS #20).
+    denied: bool,
+    /// The permission is back: the next look restarts it at once.
+    regained: bool,
 }
 
 impl Watch {
@@ -835,7 +844,7 @@ impl Watch {
     /// moment); anything else waits the long backoff.
     fn backoff(&self, n: u32) -> u64 {
         let wait = backoff_ns(n);
-        if self.cap_no_signal && self.ever_sent { wait.min(CARD_RETRY_MAX_NS) } else { wait }
+        if self.quick_retry && self.ever_sent { wait.min(CARD_RETRY_MAX_NS) } else { wait }
     }
 
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
@@ -846,7 +855,11 @@ impl Watch {
             let _ = kind;
             false
         };
-        Self { since: now, cap_no_signal, ..Self::default() }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        let quick_retry = matches!(kind, Some(SourceKind::Camera(_) | SourceKind::Microphone(_)));
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let quick_retry = false;
+        Self { since: now, cap_no_signal, quick_retry, ..Self::default() }
     }
 }
 
@@ -4107,6 +4120,20 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     if w.faulted {
         return Some("it faulted".into());
     }
+    if w.regained {
+        w.regained = false;
+        w.denied = false;
+        return Some("its permission is back".into());
+    }
+    if w.denied {
+        return None;
+    }
+    if let Some((_, _, Some(why))) = &signs
+        && is_permission_end(why)
+    {
+        w.denied = true;
+        return None;
+    }
     if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
         // Waiting for a signal, with the session left open: a picture that comes now (a console
         // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
@@ -4146,6 +4173,27 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         (now.saturating_sub(w.since) > limit)
             .then(|| if count > 0 { "it stopped sending" } else { "it never sent a first frame" }.into())
     })
+}
+
+/// Whether a capture ended because its permission was turned off.
+fn is_permission_end(why: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        why.starts_with(crate::apple::screen::PERMISSION_REVOKED)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = why;
+        false
+    }
+}
+
+/// A source that stopped for a turned-off permission is tried again once `granted()` says it's
+/// back (asked without prompting), not before.
+fn retry_if_permission_back(w: &mut Watch, granted: impl FnOnce() -> bool) {
+    if w.denied && granted() {
+        w.regained = true;
+    }
 }
 
 /// Opens a slow source on its own thread: what it plays, and whether it has sound to mix.
@@ -4266,6 +4314,8 @@ fn watchdog_step(
             let running = !matches!(src.live, Live::Still);
             let live_signs = signs(&src.live);
             let w = &mut src.watch;
+            #[cfg(target_os = "macos")]
+            retry_if_permission_back(w, crate::apple::screen::screen_access_granted);
             let was_no_signal = w.no_signal;
             let why = look(w, running, live_signs, now);
             if !was_no_signal && w.no_signal {
@@ -5256,6 +5306,32 @@ mod tests {
         assert!(look(&mut src.watch, false, None, 20 * sec).is_some());
     }
 
+    /// A capture that ended because macOS turned its permission off isn't started again every few
+    /// seconds (each try raises the system's prompt); it waits for the permission to come back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_revoked_permission_stops_the_retries_until_it_is_back() {
+        let s = 1_000_000_000;
+        let gone = || Some((0, false, Some(format!("{} (x)", crate::apple::screen::PERMISSION_REVOKED))));
+        let mut w = Watch::for_kind(None, 0);
+        assert_eq!(look(&mut w, true, gone(), s), None);
+        assert!(w.denied);
+        // Minutes pass: not restarted, however often it's looked at.
+        for t in 2..200 {
+            assert_eq!(look(&mut w, true, gone(), t * s), None);
+        }
+        // Still off: asking says no, nothing changes.
+        retry_if_permission_back(&mut w, || false);
+        assert_eq!(look(&mut w, true, gone(), 300 * s), None);
+        // The person turns it on again: restarted once.
+        retry_if_permission_back(&mut w, || true);
+        assert_eq!(look(&mut w, true, gone(), 301 * s), Some("its permission is back".into()));
+        assert!(!w.denied);
+        // An ordinary crash is still restarted as before.
+        let mut crashed = Watch::for_kind(None, 0);
+        assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
+    }
+
     /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
     /// sends, the "no signal" wait ends by itself, with no unplugging or editing (agy GAPS #6).
     #[test]
@@ -5281,8 +5357,13 @@ mod tests {
         let mut card = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
         card.ever_sent = true;
         assert!(card.backoff(0) <= 3 * s && card.backoff(9) <= 3 * s);
-        let mic = Watch::for_kind(Some(&SourceKind::Microphone("usb".into())), 0);
-        assert_eq!(mic.backoff(9), 60 * s);
+        let mut mic = Watch::for_kind(Some(&SourceKind::Microphone("usb".into())), 0);
+        assert_eq!(mic.backoff(9), 60 * s, "a mic that never sent keeps the slow wait");
+        mic.ever_sent = true;
+        assert!(mic.backoff(9) <= 3 * s, "a mic that worked is looked for again within seconds");
+        let mut media = Watch::for_kind(Some(&SourceKind::Color { width: 2, height: 2, rgba: [0; 4] }), 0);
+        media.ever_sent = true;
+        assert_eq!(media.backoff(9), 60 * s, "other sources keep it");
         let unseen = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
         assert_eq!(unseen.backoff(9), 60 * s, "a card that never sent keeps the slow wait");
     }
