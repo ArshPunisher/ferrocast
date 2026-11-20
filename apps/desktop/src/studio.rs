@@ -3044,7 +3044,7 @@ impl StudioHost for DesktopStudio {
                 format: s.replay_format.clone(),
                 spaces: s.record_spaces,
                 seconds: s.replay_seconds,
-                mb: s.replay_mb,
+                mb: s.replay_cap_mb(),
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(&s),
             };
