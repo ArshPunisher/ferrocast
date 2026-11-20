@@ -838,6 +838,14 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
 /// `OwnStream`'s internal 5 s tokio runtime shutdown timeout so normal drains finish cleanly).
 const QUIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// How long a *quit* waits for them. Windows ends an app that is closing its console, logging off
+/// or shutting down about 5 s after asking it to (a stuck app is killed with the database
+/// unfinished), so there the drain is held to 3 s: it, the engine's shutdown and the markers fit in
+/// the grace. Elsewhere it is the usual bound.
+fn quit_drain_for(windows: bool) -> std::time::Duration {
+    if windows { std::time::Duration::from_secs(3) } else { QUIT_DRAIN_TIMEOUT }
+}
+
 fn push_opt_drain<T: Send + 'static>(jobs: &mut Vec<Box<dyn FnOnce() + Send>>, slot: &mut Option<T>) {
     if let Some(item) = slot.take() {
         jobs.push(Box::new(move || {
@@ -980,7 +988,7 @@ pub fn close() -> bool {
         return false;
     };
     let jobs = take_outputs_from_held(&mut held);
-    let clean = drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT);
+    let clean = drain_outputs_bounded(jobs, quit_drain_for(cfg!(windows)));
     clear_non_output_held(&mut held);
     drop(held);
     clean
@@ -4183,6 +4191,15 @@ mod budget_tests {
                     .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(still_on_disk["current_scene"], "Main Show");
         }
+    }
+
+    /// The quit's drain on Windows must leave room inside the ~5 s the system grants a session end
+    /// (shutdown, logoff, console close) for the engine's own shutdown and the markers.
+    #[test]
+    fn a_windows_quit_drain_fits_the_five_second_session_end_grace() {
+        let grace = std::time::Duration::from_secs(5);
+        assert!(quit_drain_for(true) + std::time::Duration::from_millis(1500) <= grace);
+        assert_eq!(quit_drain_for(false), QUIT_DRAIN_TIMEOUT);
     }
 
     #[test]
