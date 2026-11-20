@@ -1357,6 +1357,8 @@ pub struct AudioChange {
     pub push_to_talk_ms: Option<u32>,
     pub push_to_mute: Option<bool>,
     pub push_to_mute_ms: Option<u32>,
+    /// "This is a mic": whether the live watch judges it as a microphone.
+    pub mic: Option<bool>,
     /// The audio tracks (1 to 6) it's mixed into.
     pub tracks: Option<Vec<u8>>,
     /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
@@ -2294,8 +2296,11 @@ impl Engine {
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
         // bump at once and never posts Discord/chat or resurrects Live after Studio stops.
-        // Even when it had already gone (a crash): a show with no Studio under it is over.
-        self.cancel_show_on_studio_stop("Studio stopped.");
+        // Even when it had already gone (a crash): a show with no Studio under it is over. Not
+        // when OBS is there to run a show of its own with the Studio off: that one is not ours.
+        if was_running || !matches!(self.rig().await, Ok(crate::studio::rig::Rig::Obs(_))) {
+            self.cancel_show_on_studio_stop("Studio stopped.");
+        }
         let _out = self.studio().output_lock.lock().await;
         if was_running {
             *crate::golive::lock_enhanced(self) = None;

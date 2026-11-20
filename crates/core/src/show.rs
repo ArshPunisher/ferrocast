@@ -215,6 +215,9 @@ pub struct WatchSample {
     pub levels: Vec<audio_watch::MicLevel>,
     /// The scene on air, when it could be read.
     pub scene: Option<audio_watch::SceneLook>,
+    /// The scene on air is one the Show's own flow uses (starting, ending, BRB): a mic is often
+    /// muted on purpose there, so no muted or quiet notice.
+    pub scene_exempt: bool,
 }
 
 /// A live mistake to tell the streamer about, or that it's fixed (`cleared`).
@@ -235,17 +238,39 @@ pub struct LiveAlert {
     /// The one-tap fix the page may offer: `unmute`, `gain_up` (+6 dB) or `pick_scene`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<&'static str>,
+    /// A second button that says "this is on purpose": `muted_on_purpose` silences this alert
+    /// for the rest of the stream (`LiveWatch::silence`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismiss: Option<&'static str>,
 }
 
 impl LiveAlert {
     /// Something wrong, in one line.
     pub fn raised(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
-        Self { id: id.into(), level, message: message.into(), detail: None, cleared: false, source: None, action: None }
+        Self {
+            id: id.into(),
+            level,
+            message: message.into(),
+            detail: None,
+            cleared: false,
+            source: None,
+            action: None,
+            dismiss: None,
+        }
     }
 
     /// It's fine again, in one line.
     pub fn fixed(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
-        Self { id: id.into(), level, message: message.into(), detail: None, cleared: true, source: None, action: None }
+        Self {
+            id: id.into(),
+            level,
+            message: message.into(),
+            detail: None,
+            cleared: true,
+            source: None,
+            action: None,
+            dismiss: None,
+        }
     }
 
     /// The one-tap fix for `source`.
@@ -253,6 +278,13 @@ impl LiveAlert {
     pub fn action(mut self, source: &str, action: &'static str) -> Self {
         self.source = Some(source.to_string());
         self.action = Some(action);
+        self
+    }
+
+    /// A button that says it is on purpose (the alert is silenced for the stream).
+    #[must_use]
+    pub fn dismissable(mut self, dismiss: &'static str) -> Self {
+        self.dismiss = Some(dismiss);
         self
     }
 
@@ -280,12 +312,30 @@ pub struct LiveWatch {
     /// has had no picture.
     mics: std::collections::HashMap<String, audio_watch::MicTrack>,
     empty_since: Option<i64>,
+    /// Alerts the streamer said are on purpose, for this stream.
+    silenced: std::collections::BTreeSet<String>,
 }
 
 impl LiveWatch {
     /// A new stream: everything starts fresh.
     pub fn reset(&mut self) {
         *self = LiveWatch::default();
+    }
+
+    /// A new stream, or a wake: everything starts fresh, and what was raised is told cleared (the
+    /// page would keep showing it, and nothing else would ever clear it). Returns those frames.
+    pub fn reset_telling(&mut self) -> Vec<LiveAlert> {
+        let told: Vec<LiveAlert> =
+            self.raised.iter().map(|id| LiveAlert::fixed(id.clone(), "warn", "That's no longer watched.")).collect();
+        self.reset();
+        told
+    }
+
+    /// The streamer says this alert is on purpose (a muted mic): it is cleared now and not
+    /// raised again for the rest of the stream. Returns the frame that clears it, if it was up.
+    pub fn silence(&mut self, id: &str) -> Option<LiveAlert> {
+        self.silenced.insert(id.to_string());
+        self.raised.remove(id).then(|| LiveAlert::fixed(id, "warn", "Silenced for this stream."))
     }
 
     /// The alerts raised now (and not cleared).

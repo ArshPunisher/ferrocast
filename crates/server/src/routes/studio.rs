@@ -99,6 +99,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
         .route("/studio/engine/keys/capture", post(engine_capture_keys))
+        .route("/studio/engine/live-alerts/silence", post(engine_silence_alert))
         .route("/studio/engine/screens", get(engine_screens))
         .route("/studio/engine/library/{kind}", get(engine_shelf_list).post(engine_shelf_new))
         .route("/studio/engine/library/{kind}/current", put(engine_shelf_switch))
@@ -1026,9 +1027,23 @@ async fn engine_capture_keys(State(app): State<AppState>, Body(b): Body<CaptureK
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /studio/engine/live-alerts/silence` `{ id }` → 204: a live alert (`mic:…`) is on purpose:
+/// cleared now and not raised again for this stream. 400 for any other id.
+async fn engine_silence_alert(State(app): State<AppState>, Body(b): Body<SilenceAlert>) -> ApiResult<StatusCode> {
+    if !app.engine.live_alert_silence(&b.id) {
+        return Err(ferrocast_engine::EngineError::Invalid("id: a mic alert (mic:muted:…).".into()).into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(serde::Deserialize)]
 struct CaptureKeys {
     on: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SilenceAlert {
+    id: String,
 }
 
 async fn engine_close_projectors(State(app): State<AppState>) -> ApiResult<StatusCode> {

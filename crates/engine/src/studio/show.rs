@@ -315,20 +315,27 @@ impl Engine {
     /// The stream stopped: a show still counting down, or waiting for its first scene, has nothing
     /// to go live with and ends. A live show stays (its own ending, or the next Go live, takes it).
     pub(crate) fn end_show_whose_stream_stopped(&self) {
-        let counting = {
-            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        // One look and the cancel under one lock: a show that went Live (or began again) between
+        // them must not be wiped (agy REV21 R2.6).
+        self.cancel_show_when("The stream stopped.", |m| {
             matches!(m.phase, BroadcastPhase::Countdown | BroadcastPhase::Starting)
                 && m.started_stream
                 && !m.ending_in_flight
-        };
-        if counting {
-            self.cancel_show_on_studio_stop("The stream stopped.");
-        }
+        });
     }
 
     pub(crate) fn cancel_show_on_studio_stop(&self, reason: &str) {
+        self.cancel_show_when(reason, |_| true);
+    }
+
+    /// Cancels the show when `when` says so about the machine, looked at under the same lock the
+    /// cancel is made under.
+    pub(crate) fn cancel_show_when(&self, reason: &str, when: impl FnOnce(&BroadcastMachine) -> bool) {
         let emit = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if !when(&m) {
+                return;
+            }
             if let Some(h) = m.stop_task.take() {
                 h.abort();
             }
@@ -1063,6 +1070,12 @@ impl Engine {
     /// `BroadcastMachine` so racing callers (countdown expiry + Skip click) never post chat
     /// twice, and checks generation before every step and before committing so a cancelled
     /// countdown or stopped Show can never be resurrected.
+    /// Tests: the countdown reaching zero.
+    #[cfg(test)]
+    pub(crate) async fn go_live_now_for_test(&self) -> Result<ShowRun, EngineError> {
+        self.go_live_now(true).await
+    }
+
     async fn go_live_now(&self, allow_starting: bool) -> Result<ShowRun, EngineError> {
         let (my_gen, mut run) = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
@@ -1203,6 +1216,11 @@ impl Engine {
             if m.epoch == my_gen && m.transitioning_live == Some(my_gen) {
                 m.transitioning_live = None;
                 m.phase = BroadcastPhase::Live;
+                // A stream the show started (or found running) at zero is its stream: when it
+                // stops by itself the show is over, and the next Start is not refused.
+                if run.steps.iter().any(|s| s.id == "zero_stream" && s.status != "failed") {
+                    m.started_stream = true;
+                }
                 run.phase = Phase::Live;
                 run.countdown_ends_at = None;
                 m.run = Some(run.clone());
