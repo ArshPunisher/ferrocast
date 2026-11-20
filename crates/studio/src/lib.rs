@@ -568,9 +568,25 @@ pub struct StreamStats {
     /// A direct destination's network (ping, loss, resends), once it's connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<ferrocast_golive::Link>,
-    /// Why a direct destination is trying again, in words.
+    /// Why a direct destination is trying again or failed, in words.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// True when the sender gave up for this stream (`PushState::Failed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// Attempts made before giving up.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
+    /// Full cause and what to do, behind an (i).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// True when the server/platform refused the stream rather than a network outage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// The app in front (its name as the Dock shows it), for a scene per game. None where it

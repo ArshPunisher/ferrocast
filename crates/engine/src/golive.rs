@@ -264,6 +264,7 @@ impl Advanced {
         ferrocast_golive::push::Retry {
             first: Duration::from_secs(u64::from(a.first_retry_s)),
             max: Duration::from_secs(u64::from(a.max_retry_s)),
+            ..ferrocast_golive::push::Retry::default()
         }
     }
 }
@@ -502,6 +503,11 @@ pub(crate) struct GoLive {
     protector: Mutex<ferrocast_golive::protect::Protector>,
     /// Paused destinations' health lines (their forwarders aren't running).
     paused: Mutex<HashMap<String, Health>>,
+    /// Destinations that gave up (`PushState::Failed`) in this or the just-ended stream, kept
+    /// visible until the next stream starts or the streamer unticks/retries them.
+    failed: Mutex<HashMap<String, Health>>,
+    /// Destinations for which a terminal `live_alert` has already been sent in this stream.
+    failed_alerted: Mutex<std::collections::HashSet<String>>,
     /// The cutter for the vertical picture, while it runs (A2.4).
     cut: Mutex<Option<CutRun>>,
     /// The engine's data folder (where fetched ffmpeg lives).
@@ -553,6 +559,8 @@ impl Default for GoLive {
             reconciling: tokio::sync::Mutex::new(()),
             protector: Mutex::new(Default::default()),
             paused: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            failed_alerted: Mutex::new(std::collections::HashSet::new()),
             cut: Mutex::new(None),
             data_dir: Mutex::new(None),
             ingest_task: Mutex::new(None),
@@ -879,6 +887,7 @@ impl Engine {
         let cfg = self.golive_config();
         let running = lock(&g.running);
         let paused = lock(&g.paused);
+        let failed = lock(&g.failed);
         let blocked = lock(&g.blocked);
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
@@ -910,7 +919,8 @@ impl Engine {
                     health: running
                         .get(&d.id)
                         .map(|r| r.health.borrow().clone())
-                        .or_else(|| paused.get(&d.id).cloned()),
+                        .or_else(|| paused.get(&d.id).cloned())
+                        .or_else(|| failed.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
                     rules: match (d.enabled, d.canvas) {
                         (false, _) => Vec::new(),
@@ -1197,10 +1207,12 @@ impl Engine {
         let next = GoLiveConfig { destinations: next, ..self.golive_config() };
         self.save_golive(next.clone()).await?;
         drop(one_at_a_time);
-        // Unticking a paused destination ends its pause (ticking it again starts it at once).
+        // Unticking a paused or failed destination clears it (ticking it again starts fresh).
         for d in next.destinations.iter().filter(|d| !d.enabled) {
             lock(&self.golive().protector).release(&d.id);
             lock(&self.golive().paused).remove(&d.id);
+            lock(&self.golive().failed).remove(&d.id);
+            lock(&self.golive().failed_alerted).remove(&d.id);
         }
         self.reconcile().await;
         Ok(next)
@@ -1953,6 +1965,8 @@ impl Engine {
         match self.resolve(d).await {
             Ok(dest) => {
                 lock(&g.blocked).remove(&d.id);
+                lock(&g.failed).remove(&d.id);
+                lock(&g.failed_alerted).remove(&d.id);
                 let (health_tx, health) = watch::channel(Health {
                     state: PushState::Waiting,
                     kbps: 0,
@@ -2001,6 +2015,8 @@ impl Engine {
             }
         };
         lock(&g.blocked).remove(&d.id);
+        lock(&g.failed).remove(&d.id);
+        lock(&g.failed_alerted).remove(&d.id);
         let now_ms = || u64::try_from(now().0).unwrap_or(0);
         let (health_tx, health) = watch::channel(Health {
             state: PushState::Connecting,
@@ -2013,6 +2029,7 @@ impl Engine {
         });
         let (stop, mut stop_rx) = watch::channel(false);
         let id = d.id.clone();
+        let engine = self.clone();
         tokio::spawn(async move {
             let mut last_bytes = 0u64;
             let mut tick = tokio::time::interval(DIRECT_EVERY);
@@ -2032,7 +2049,16 @@ impl Engine {
                 let bytes = st["bytes"].as_u64().unwrap_or(0);
                 let kbps = u32::try_from(bytes.saturating_sub(last_bytes) * 8 / 1000).unwrap_or(u32::MAX);
                 last_bytes = bytes;
-                let state = if st["reconnecting"].as_bool().unwrap_or(false) {
+                let state = if st["failed"].as_bool().unwrap_or(false) {
+                    PushState::Failed {
+                        attempts: st["attempts"].as_u64().unwrap_or(0) as u32,
+                        reason: st["reason"]
+                            .as_str()
+                            .map_or_else(|| "Couldn't send to the server.".into(), String::from),
+                        detail: st["detail"].as_str().map(String::from),
+                        refused: st["refused"].as_bool().unwrap_or(false),
+                    }
+                } else if st["reconnecting"].as_bool().unwrap_or(false) {
                     PushState::Reconnecting {
                         attempt: 0,
                         retry_in_ms: 0,
@@ -2055,7 +2081,11 @@ impl Engine {
                     h.link = serde_json::from_value(st["link"].clone()).ok();
                 });
             }
-            let _ = host.direct_stop(id).await;
+            let _ = host.direct_stop(id.clone()).await;
+            let mut running = lock(&engine.golive().running);
+            if running.get(&id).is_some_and(|r| r.health.same_channel(&health_tx.subscribe())) {
+                running.remove(&id);
+            }
         });
         lock(&g.running).insert(d.id.clone(), Running { stop, health, light: false });
     }
@@ -2080,13 +2110,130 @@ impl Engine {
         Ok(cfg)
     }
 
-    /// "Resume now" on a paused destination: it starts again at once.
+    /// "Resume now" on a paused or failed destination: it starts again at once.
     pub async fn golive_resume(&self, id: &str) -> Result<(), EngineError> {
-        if !lock(&self.golive().paused).contains_key(id) {
+        let g = self.golive();
+        let is_paused = lock(&g.paused).contains_key(id);
+        let is_failed = lock(&g.failed).contains_key(id)
+            || lock(&g.running).get(id).is_some_and(|r| matches!(r.health.borrow().state, PushState::Failed { .. }));
+        if !is_paused && !is_failed {
             return Err(refused("golive_not_paused", "That platform isn't paused.", "Nothing to resume."));
+        }
+        if is_failed {
+            if let Some(r) = lock(&g.running).remove(id) {
+                r.stop.send_replace(true);
+            }
+            lock(&g.failed).remove(id);
+            lock(&g.failed_alerted).remove(id);
         }
         self.unpause(id).await;
         Ok(())
+    }
+
+    /// Clears saved failure lines for `canvas` (called when a fresh stream begins).
+    pub(crate) fn clear_golive_failures(&self, canvas: Canvas) {
+        let cfg = self.golive_config();
+        let g = self.golive();
+        let ids: std::collections::HashSet<String> =
+            cfg.destinations.into_iter().filter(|d| d.canvas == canvas).map(|d| d.id).collect();
+        lock(&g.failed).retain(|id, _| !ids.contains(id));
+        lock(&g.failed_alerted).retain(|id| !ids.contains(id));
+    }
+
+    /// Returns a reason when at least one enabled main destination reached terminal
+    /// `PushState::Failed` and *every* enabled main destination is now terminally `Failed` or
+    /// `blocked` (zero live, connecting, reconnecting, waiting, or paused).
+    pub(crate) fn golive_main_failed(&self) -> Option<String> {
+        let cfg = self.golive_config();
+        let g = self.golive();
+        let running = lock(&g.running);
+        let paused = lock(&g.paused);
+        let blocked = lock(&g.blocked);
+        let failed = lock(&g.failed);
+        let enabled_main: Vec<&DestinationConfig> = cfg
+            .destinations
+            .iter()
+            .filter(|d| d.canvas == Canvas::Main && d.enabled && !backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+            .collect();
+        if enabled_main.is_empty() {
+            return None;
+        }
+        let mut first_reason: Option<String> = None;
+        for d in enabled_main {
+            if paused.contains_key(&d.id) {
+                return None;
+            }
+            // If this destination's backup is currently running and hasn't failed, stream is alive.
+            if let Some(backup_id) = cfg.advanced.per.get(&d.id).and_then(|a| a.backup.as_deref())
+                && let Some(br) = running.get(backup_id)
+                && !matches!(br.health.borrow().state, PushState::Failed { .. })
+            {
+                return None;
+            }
+            if let Some(r) = running.get(&d.id) {
+                match &r.health.borrow().state {
+                    PushState::Failed { reason, .. } => {
+                        if first_reason.is_none() {
+                            first_reason = Some(reason.clone());
+                        }
+                    }
+                    _ => return None,
+                }
+            } else if let Some(h) = failed.get(&d.id) {
+                if let PushState::Failed { reason, .. } = &h.state
+                    && first_reason.is_none()
+                {
+                    first_reason = Some(reason.clone());
+                }
+            } else if blocked.contains_key(&d.id) {
+                continue;
+            } else {
+                // Not started yet (reconcile hasn't spawned it yet).
+                return None;
+            }
+        }
+        first_reason
+    }
+
+    /// Records any destination that reached `PushState::Failed`, alerts the dashboard once per
+    /// stream, and stops the Studio stream when every enabled main destination has failed so the
+    /// Studio stops showing LIVE for a dead broadcast.
+    async fn failure_tick(&self) {
+        let cfg = self.golive_config();
+        let g = self.golive();
+        let newly_failed: Vec<(String, String, Option<String>)> = {
+            let running = lock(&g.running);
+            let mut failed = lock(&g.failed);
+            let mut alerted = lock(&g.failed_alerted);
+            let mut out = Vec::new();
+            for (id, r) in running.iter() {
+                let h = r.health.borrow().clone();
+                if let PushState::Failed { reason, detail, .. } = &h.state {
+                    failed.insert(id.clone(), h.clone());
+                    if alerted.insert(id.clone()) {
+                        let name =
+                            cfg.destinations.iter().find(|d| &d.id == id).map(dest_name).unwrap_or_else(|| id.clone());
+                        out.push((name, reason.clone(), detail.clone()));
+                    }
+                }
+            }
+            out
+        };
+        for (name, reason, detail) in newly_failed {
+            let mut alert = ferrocast_core::show::LiveAlert::raised(format!("destination:{name}"), "error", reason);
+            if let Some(d) = detail {
+                alert = alert.detail(d);
+            }
+            self.studio_frame("live_alert", &alert);
+        }
+        if let Some(reason) = self.golive_main_failed()
+            && let Ok(host) = self.studio_host()
+            && host.stream_stats().await.ok().is_some_and(|v| !v.is_null())
+        {
+            tracing::warn!(%reason, "Go live: every enabled destination failed; stopping Studio stream");
+            self.abort_live_on_destination_failure(&reason).await;
+            self.send_golive();
+        }
     }
 
     async fn unpause(&self, id: &str) {
@@ -2362,9 +2509,15 @@ pub(crate) async fn run(engine: Engine) {
             let now = (main.borrow_and_update().on, vertical.borrow_and_update().on);
             if now.0 != was.0 {
                 tracing::info!(live = now.0, "Go live: the stream changed");
+                if now.0 {
+                    engine.clear_golive_failures(Canvas::Main);
+                }
             }
             if now.1 != was.1 {
                 tracing::info!(live = now.1, "Go live: the vertical stream changed");
+                if now.1 {
+                    engine.clear_golive_failures(Canvas::Vertical);
+                }
             }
             was = now;
             engine.reconcile().await;
@@ -2374,6 +2527,7 @@ pub(crate) async fn run(engine: Engine) {
         if k > 0 {
             g.last_kbps.store(k, std::sync::atomic::Ordering::Relaxed);
         }
+        engine.failure_tick().await;
         engine.backup_tick().await;
         engine.quality_tick().await;
         engine.protect_tick().await;

@@ -73,6 +73,39 @@ pub async fn platform_on(port: u16, key: &'static str) -> (u16, mpsc::UnboundedR
     (port, rx)
 }
 
+/// A fake platform that accepts publishing with `key` and closes the socket after `after`
+/// (reproducing Kick rejecting multistreaming right after accepting publish).
+pub async fn platform_dropping(key: &'static str, after: Duration) -> (u16, mpsc::UnboundedReceiver<Got>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (itx, mut irx) = mpsc::unbounded_channel();
+                let serve_fut = serve(&mut sock, key, &itx);
+                let drop_fut = async {
+                    while let Some(g) = irx.recv().await {
+                        let published = matches!(g, Got::Publish(_));
+                        let _ = tx.send(g);
+                        if published {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(after).await;
+                };
+                tokio::select! {
+                    _ = serve_fut => {}
+                    _ = drop_fut => {}
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    (port, rx)
+}
+
 async fn serve(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSender<Got>) -> Option<()> {
     let rest = handshake(sock, PeerType::Server).await?;
     let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;

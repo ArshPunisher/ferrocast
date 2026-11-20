@@ -951,3 +951,224 @@ async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks
     .await;
     assert!(published.is_err(), "must never publish RTMP when broadcast creation failed: {published:?}");
 }
+
+/// M9-04 / Contract C-1: a platform that keeps refusing (or Kick accepting then closing) gives up
+/// into `PushState::Failed` with a clear reason, stops retrying, and when it was the only enabled
+/// destination the Studio stops showing LIVE while keeping the failed state visible.
+#[tokio::test]
+async fn destination_give_up_marks_failed_and_stops_studio_live() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{Obs, platform, platform_dropping};
+
+    #[derive(Debug, Default)]
+    struct LiveHost {
+        streaming: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::studio_host::StudioHost for LiveHost {
+        async fn status(&self) -> crate::studio_host::StudioStatus {
+            crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::studio_host::StudioStatus { available: true, running: false, ..Default::default() })
+        }
+        async fn kinds(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "inputs": [] }))
+        }
+        async fn options(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+        async fn settings(&self) -> crate::studio_host::StudioSettings {
+            Default::default()
+        }
+        async fn set_settings(&self, _: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<serde_json::Value, String> {
+            let on = self.streaming.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(
+                json!({ "stream": if on { json!({ "active": true, "reconnecting": false, "error": null }) } else { serde_json::Value::Null } }),
+            )
+        }
+        async fn record(&self, _: bool) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+        async fn record_pause(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "devices": [] }))
+        }
+        async fn act(&self, _: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn stream_start(
+            &self,
+            _: String,
+            _: String,
+            _: Vec<(u32, u32, u32)>,
+        ) -> Result<serde_json::Value, String> {
+            self.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "active": true, "error": null }))
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+            let on = self.streaming.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(if on { json!({ "active": true, "error": null }) } else { serde_json::Value::Null })
+        }
+        async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LocalKick(String);
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for LocalKick {
+        fn platform(&self) -> Platform {
+            Platform::Kick
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "kick-k".into() })
+        }
+    }
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(LiveHost::default());
+    e.set_studio_host(host.clone());
+
+    // 1. Kick alone, refusing multistreaming (accept then close after 40 ms): gives up and
+    //    stops the Studio stream so the Studio stops showing LIVE.
+    let (kport, _kgot) = platform_dropping("kick-k", std::time::Duration::from_millis(40)).await;
+    e.register_connector(Arc::new(LocalKick(format!("rtmp://127.0.0.1:{kport}/app"))));
+    let order: Vec<(String, bool)> =
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "kick")).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let mut adv = e.golive_config().advanced;
+    adv.per
+        .insert("kick".into(), crate::golive::DestAdvanced { first_retry_s: 1, max_retry_s: 1, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+
+    // Wait for Kick to hit PushState::Failed and Studio to stop showing LIVE.
+    let mut failed_state = None;
+    for _ in 0..100 {
+        let v = e.golive_view().await;
+        if let Some(PushState::Failed { .. }) =
+            v.destinations.iter().find(|d| d.id == "kick").and_then(|d| d.health.as_ref()).map(|h| &h.state)
+            && !host.streaming.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            failed_state = v.destinations.into_iter().find(|d| d.id == "kick").and_then(|d| d.health).map(|h| h.state);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    match failed_state {
+        Some(PushState::Failed { attempts, reason, detail, refused }) => {
+            assert_eq!(attempts, ferrocast_golive::push::DEFAULT_MAX_ATTEMPTS);
+            assert!(refused);
+            assert!(reason.contains("Kick refused"), "{reason}");
+            assert!(detail.as_deref().is_some_and(|d| d.contains("Allow multistreaming")), "{detail:?}");
+        }
+        other => panic!("Kick should have reached Failed and stopped Studio stream: {other:?}"),
+    }
+    assert!(
+        !e.studio_stream_stats().await.unwrap()["active"].as_bool().unwrap_or(false),
+        "Studio must not show LIVE after every enabled destination failed"
+    );
+    drop(_obs);
+
+    // 2. Two destinations (good custom + bad-key custom): bad-key reaches Failed while good
+    //    stays Live and Studio stays LIVE.
+    let (gport, _ggot) = platform("good-key").await;
+    let (bport, _bgot) = platform("right-key").await;
+    let good = e
+        .add_golive_destination(
+            "Good",
+            &format!("rtmp://127.0.0.1:{gport}/app"),
+            "good-key",
+            crate::golive::Canvas::Main,
+        )
+        .await
+        .unwrap();
+    let bad = e
+        .add_golive_destination(
+            "Bad",
+            &format!("rtmp://127.0.0.1:{bport}/app"),
+            "wrong-key",
+            crate::golive::Canvas::Main,
+        )
+        .await
+        .unwrap();
+    let mut order2: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == good.id || d.id == bad.id)).collect();
+    order2.sort_by_key(|(id, _)| if *id == good.id { 0 } else { 1 });
+    e.set_golive_destinations(order2).await.unwrap();
+    let mut adv2 = e.golive_config().advanced;
+    adv2.per
+        .insert(bad.id.clone(), crate::golive::DestAdvanced { first_retry_s: 1, max_retry_s: 1, ..Default::default() });
+    e.set_golive_advanced(adv2).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    let _obs2 = Obs::publish(port, "live", &key).await.unwrap();
+    let mut saw_bad_failed = false;
+    for _ in 0..80 {
+        let v = e.golive_view().await;
+        let bad_h = v.destinations.iter().find(|d| d.id == bad.id).and_then(|d| d.health.as_ref());
+        let good_h = v.destinations.iter().find(|d| d.id == good.id).and_then(|d| d.health.as_ref());
+        if matches!(bad_h.map(|h| &h.state), Some(PushState::Failed { refused: true, .. }))
+            && matches!(good_h.map(|h| &h.state), Some(PushState::Live))
+        {
+            saw_bad_failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(saw_bad_failed, "bad destination should fail while good stays live");
+    assert!(
+        e.studio_stream_stats().await.unwrap()["active"].as_bool() == Some(true),
+        "Studio must stay LIVE while at least one destination is still live"
+    );
+}

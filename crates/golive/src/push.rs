@@ -46,17 +46,24 @@ const DROP_THRESHOLD_MS: u32 = 900;
 /// OBS's `num_packets < 5` guard in `check_to_drop_frames`). Prevents a sparse timestamp gap or
 /// brief source pause from falsely dropping frames.
 const MIN_BACKLOG_PACKETS: usize = 4;
+/// Default consecutive failures before a destination gives up for the rest of the stream.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 6;
+/// Consecutive auth/key refusals before giving up (no point hammering a bad key).
+pub const REFUSED_MAX_ATTEMPTS: u32 = 3;
+
 /// How long a destination waits before trying again: the first wait, doubling up to the
-/// longest (Advanced mode can change both).
+/// longest (Advanced mode can change both), and how many failures in a row before giving up
+/// (`0`: keep trying forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retry {
     pub first: Duration,
     pub max: Duration,
+    pub max_attempts: u32,
 }
 
 impl Default for Retry {
     fn default() -> Self {
-        Self { first: Duration::from_secs(1), max: Duration::from_secs(30) }
+        Self { first: Duration::from_secs(1), max: Duration::from_secs(30), max_attempts: DEFAULT_MAX_ATTEMPTS }
     }
 }
 /// How often health (bitrate) is updated while live.
@@ -95,6 +102,18 @@ pub enum PushState {
         attempt: u32,
         retry_in_ms: u64,
         reason: String,
+    },
+    /// Gave up for this stream after repeated failures or a platform refusal (contract C-1).
+    Failed {
+        attempts: u32,
+        /// One short line saying what happened.
+        reason: String,
+        /// Cause and what to do, shown behind an (i).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// True when the platform refused the stream (bad key, Kick multistreaming) rather than a network outage.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refused: bool,
     },
     Stopped,
     /// Upload protection paused it to keep the destinations above smooth (the engine sets
@@ -235,23 +254,47 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         let h = health.borrow();
                         (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
                     };
+                    let rapid_close = was_live && live_for_ms < STAYED_LIVE_MS;
                     if was_live && live_for_ms >= STAYED_LIVE_MS {
                         attempt = 0;
                     }
                     attempt = attempt.saturating_add(1);
-                    let wait = backoff(attempt, &dest.retry);
-                    if err.is_network() && may_move(&dest.target) {
+                    let kick_refused = rapid_close && is_kick(&dest);
+                    let server_refused = matches!(err, PushError::KeyRefused(_) | PushError::Refused(..));
+                    let is_refused = kick_refused || server_refused;
+                    let limit = if dest.retry.max_attempts == 0 {
+                        0
+                    } else if server_refused {
+                        dest.retry.max_attempts.min(REFUSED_MAX_ATTEMPTS)
+                    } else {
+                        dest.retry.max_attempts
+                    };
+                    // Never hop network interfaces on a server refusal or rapid policy close:
+                    // the connection reached the server and the platform itself closed it.
+                    if err.is_network() && !rapid_close && may_move(&dest.target) {
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
+                    if limit > 0 && attempt >= limit {
+                        let (short_reason, detail) = failure_text(&dest, &err, kick_refused);
+                        tracing::warn!(
+                            dest = %dest.id,
+                            attempts = attempt,
+                            refused = is_refused,
+                            error = %err,
+                            "golive: destination failed, giving up for this stream"
+                        );
+                        set_state(
+                            &health,
+                            PushState::Failed { attempts: attempt, reason: short_reason, detail, refused: is_refused },
+                        );
+                        tokio::select! {
+                            _ = stop.wait_for(|s| *s) => break 'streams,
+                            _ = live.wait_for(|l| !still_on(l)) => break,
+                        }
+                    }
+                    let wait = backoff(attempt, &dest.retry);
                     tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), "golive: destination failed, retrying");
-                    let reason = if was_live && live_for_ms < STAYED_LIVE_MS && dest.id.starts_with("kick") {
-                        format!(
-                            "{err} Kick took the stream and closed it at once: streaming to other platforms too \
-                             needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
-                        )
-                    } else {
-                        err.to_string()
-                    };
+                    let reason = if kick_refused { kick_multistream_detail(&err) } else { err.to_string() };
                     set_state(
                         &health,
                         PushState::Reconnecting { attempt, retry_in_ms: wait.as_millis() as u64, reason },
@@ -282,7 +325,40 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
 }
 
 /// How long a session stays live before its failure starts the retry count over.
-const STAYED_LIVE_MS: u64 = 30_000;
+pub(crate) const STAYED_LIVE_MS: u64 = 30_000;
+
+/// Kick's built-in destination or a custom server pointed at Kick's IVS ingest.
+fn is_kick(dest: &Destination) -> bool {
+    let id = dest.id.to_ascii_lowercase();
+    let host = dest.target.host.to_ascii_lowercase();
+    id.starts_with("kick") || host.contains("kick") || host.starts_with("fa723fc1b171.")
+}
+
+fn kick_multistream_detail(err: &PushError) -> String {
+    format!(
+        "{err} Kick took the stream and closed it at once: streaming to other platforms too \
+         needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
+    )
+}
+
+/// One short line and an optional `(i)` detail for terminal `PushState::Failed`.
+fn failure_text(dest: &Destination, err: &PushError, kick_refused: bool) -> (String, Option<String>) {
+    if kick_refused {
+        return ("Kick refused the stream.".into(), Some(kick_multistream_detail(err)));
+    }
+    match err {
+        PushError::KeyRefused(_) => ("Stream key was refused.".into(), Some(err.to_string())),
+        PushError::Refused(_, _) => ("The platform refused the stream.".into(), Some(err.to_string())),
+        _ => {
+            let full = err.to_string();
+            if full.chars().count() <= 60 {
+                (full, None)
+            } else {
+                (format!("{} stopped taking the stream.", dest.target.host), Some(full))
+            }
+        }
+    }
+}
 
 /// 1, 2, 4, 8, 16, 30, 30… seconds by default, each ±20% so many destinations don't retry in
 /// step.

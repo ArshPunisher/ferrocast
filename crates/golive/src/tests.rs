@@ -1160,4 +1160,65 @@ async fn a_late_destination_joining_mid_gop_counts_zero_drops() {
     assert_eq!(next(&mut got).await, Got::Video(50, Bytes::from_static(INTER)));
     assert_eq!(health.borrow().dropped, 0, "pre-keyframe startup skips must not count as drops");
 }
+
+#[tokio::test]
+async fn kick_gives_up_after_repeated_rapid_drops_and_says_why() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_drops(l, "k", Duration::from_millis(50)).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(40), max_attempts: 4 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, reason, detail, refused } => {
+            assert_eq!(attempts, 4);
+            assert!(refused, "Kick rapid drops count as refused");
+            assert!(reason.contains("Kick refused"), "{reason}");
+            let detail = detail.expect("Kick refusal explains why");
+            assert!(detail.contains("Allow multistreaming"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+    // Drain any queued events from the 4 attempts, then verify no further retries happen.
+    while got.try_recv().is_ok() {}
+    assert!(
+        timeout(Duration::from_millis(250), got.recv()).await.is_err(),
+        "a failed destination must stop retrying for the rest of this stream"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_stream_key_gives_up_after_bounded_attempts() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform(l, "right").await;
+    let dest = Destination {
+        id: "twitch".into(),
+        retry: push::Retry {
+            first: Duration::from_millis(20),
+            max: Duration::from_millis(40),
+            max_attempts: push::DEFAULT_MAX_ATTEMPTS,
+        },
+        ..destination(dport, "wrong")
+    };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, reason, detail, refused } => {
+            assert_eq!(attempts, push::REFUSED_MAX_ATTEMPTS);
+            assert!(refused);
+            assert!(reason.contains("key"), "{reason}");
+            assert!(detail.as_deref().is_some_and(|d| d.contains("refused the stream key")), "{detail:?}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
 mod platforms;

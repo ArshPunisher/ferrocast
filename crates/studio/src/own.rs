@@ -987,26 +987,41 @@ impl OwnStream {
         // the engine's own count (its `lagged`); counted here too, they read as "your upload
         // can't keep up" and auto quality lowered the bitrate for them (owner, 15 Nov).
         let sent_dropped = self.health.as_ref().map_or(0, |h| h.borrow().dropped);
+        let (failed, attempts, reason, detail, refused) = match &state {
+            Some(PushState::Failed { attempts, reason, detail, refused }) => {
+                (true, *attempts, Some(reason.clone()), detail.clone(), *refused)
+            }
+            _ => (false, 0, None, None, false),
+        };
+        let stopped_or_failed = matches!(state, Some(PushState::Failed { .. } | PushState::Stopped));
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.shared.engine.error().is_none(),
+                active: d.shared.engine.error().is_none() && !stopped_or_failed,
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
                 dropped: sent_dropped.min(u64::from(u32::MAX)) as u32,
                 link: None,
-                reason: None,
+                reason,
+                failed,
+                attempts,
+                detail,
+                refused,
             };
         }
         StreamStats {
-            active: self.counts.running.load(Ordering::Acquire),
+            active: self.counts.running.load(Ordering::Acquire) && !stopped_or_failed,
             reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
             bytes: self.counts.bytes.load(Ordering::Relaxed),
             frames: self.counts.frames.load(Ordering::Relaxed),
             dropped: 0,
             link: None,
-            reason: None,
+            reason,
+            failed,
+            attempts,
+            detail,
+            refused,
         }
     }
 
@@ -1064,10 +1079,17 @@ impl OwnStream {
         }
     }
 
-    /// A direct destination's stats: live or trying again, and what it lost.
+    /// A direct destination's stats: live, trying again, or failed, and what it lost.
     pub(crate) fn direct_stats(&self, id: &str) -> Option<StreamStats> {
         let (_, h) = self.directs.get(id)?;
         let h = h.borrow();
+        let (failed, attempts, reason, detail, refused) = match &h.state {
+            PushState::Reconnecting { reason, .. } => (false, 0, Some(reason.clone()), None, false),
+            PushState::Failed { attempts, reason, detail, refused } => {
+                (true, *attempts, Some(reason.clone()), detail.clone(), *refused)
+            }
+            _ => (false, 0, None, None, false),
+        };
         Some(StreamStats {
             active: h.state == PushState::Live,
             reconnecting: matches!(h.state, PushState::Reconnecting { .. } | PushState::Connecting),
@@ -1075,10 +1097,11 @@ impl OwnStream {
             frames: 0,
             dropped: h.dropped.min(u64::from(u32::MAX)) as u32,
             link: h.link,
-            reason: match &h.state {
-                PushState::Reconnecting { reason, .. } => Some(reason.clone()),
-                _ => None,
-            },
+            reason,
+            failed,
+            attempts,
+            detail,
+            refused,
         })
     }
 
@@ -1104,8 +1127,10 @@ impl OwnStream {
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {
             return Some(e);
         }
+        // Only terminal failure surfaces as `error`; transient `Reconnecting` is already shown
+        // via `reconnecting: true` and must not make vertical/light sync kill secondary streams.
         match self.health.as_ref().map(|h| h.borrow().state.clone()) {
-            Some(PushState::Reconnecting { reason, .. }) => Some(reason),
+            Some(PushState::Failed { reason, .. }) => Some(reason),
             _ => None,
         }
     }
@@ -1154,7 +1179,11 @@ fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> 
         .build()
         .map_err(|e| e.to_string())?;
     let retry = match d.reconnect {
-        Some((_, every)) => Retry { first: Duration::from_secs(u64::from(every.max(1))), ..Retry::default() },
+        Some((retries, every)) => Retry {
+            first: Duration::from_secs(u64::from(every.max(1))),
+            max_attempts: retries.max(1),
+            ..Retry::default()
+        },
         None => Retry::default(),
     };
     // Every track goes on (Go live then gives Twitch's VOD track and Enhanced Broadcasting's

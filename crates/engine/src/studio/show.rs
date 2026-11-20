@@ -743,6 +743,21 @@ impl Engine {
         }
     }
 
+    /// Stops the Studio stream and ends any active Show when every enabled destination has
+    /// permanently failed (`PushState::Failed`), without posting a thank-you recap.
+    pub(crate) async fn abort_live_on_destination_failure(&self, reason: &str) {
+        if let Err(e) = self.studio_stream(false).await {
+            tracing::warn!(error = %e, "couldn't stop Studio stream after destination failure");
+        }
+        if let Some(mut run) = self.show_run().filter(|r| r.phase != Phase::Ended) {
+            run.phase = Phase::Ended;
+            run.ended_at = Some(now().0);
+            run.countdown_ends_at = None;
+            run.steps.push(Step::new("stream", "Go live", "failed", reason));
+            self.set_show(Some(run));
+        }
+    }
+
     /// Whether OBS is streaming (`GET /api/v1/obs/stream`).
     pub async fn obs_streaming(&self) -> Result<bool, EngineError> {
         let c = self.obs_client().await?;

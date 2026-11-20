@@ -833,7 +833,7 @@ The show, its pre-flight and fixes, BRB, `!scene`, `!clip`, `/obs/replay/save` a
 Live frames for Studio (dashboard socket, §5): `lane { items /* newest first */, added: LaneItem | null, sound, volume }` (play the sound for `added`, only in the dashboard), `marker Marker`, `counter { name, value }`, `show { show: ShowRun | null }`, `obs_health Health`, `brb { on, scene }`.
 
 ### Go live everywhere (2.0, free)
-OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key); Ferrocast sends the same stream on to every ticked destination, each on its own (no re-encode). Keys are fetched from the platforms (Twitch `channel:read:stream_key`, YouTube liveStreams, Kick `streamkey:read`), never pasted; custom servers keep their key in the secret store. A destination that joins mid-stream starts at the next keyframe; one that fails retries with backoff for as long as OBS streams, saying why; one falling behind skips ahead without slowing the others. Plan: `docs/plan/LIVE-STUDIO.md`.
+OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key); Ferrocast sends the same stream on to every ticked destination, each on its own (no re-encode). Keys are fetched from the platforms (Twitch `channel:read:stream_key`, YouTube liveStreams, Kick `streamkey:read`), never pasted; custom servers keep their key in the secret store. A destination that joins mid-stream starts at the next keyframe; one that fails retries with backoff and gives up after repeated failures or a platform refusal (`state: "failed"`), saying why; one falling behind skips ahead without slowing the others. When every enabled destination on the main stream gives up, the Studio stops streaming so it no longer shows LIVE for a dead stream. Plan: `docs/plan/LIVE-STUDIO.md`.
 
 ```ts
 type Service = "twitch" | "youtube" | "kick" | "custom"
@@ -842,6 +842,7 @@ type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "youtub
                            enabled: boolean; canvas?: Canvas /* left out: "main" */ }
 type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                  | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string }
+                 | { state: "failed"; attempts: number; reason: string /* one short line */; detail?: string /* full cause and fix, behind (i) */; refused?: true /* server/platform refusal (bad key, Kick multistreaming) */ }
                  | { state: "paused"; until_ms: number /* earliest it comes back */; reason: string /* upload protection */ })
                  & { kbps: number; dropped: number; since_ms: number;
                      link?: { rtt_ms: number; lost_pct: number; resent_pct: number } /* SRT, RIST and WebRTC once connected: the
@@ -918,7 +919,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | PUT | `/api/v1/golive/vertical/cut` | `CutConfig` → `GoLiveConfig`; a running cut restarts with it. 400 names the field (`game: the box goes past the edge of the picture.`) |
 | PUT | `/api/v1/golive/aitum` | `{ ok: boolean }` → `GoLiveConfig`. Hides (or shows again) the Aitum Multistream setup note |
 | PUT | `/api/v1/golive/auto-quality` | `{ on: boolean }` → `GoLiveConfig`. Auto quality: while the Studio streams, upload trouble lowers its bitrate a step at a time (never below 40%); after 30 calm seconds it goes back up. On by default; turned off, a lowered stream goes back to full quality |
-| POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused destination → 204; it starts again at once. 422 `golive_not_paused` |
+| POST | `/api/v1/golive/resume/{id}` | "Resume now" on a paused or failed destination → 204; it starts again at once. 422 `golive_not_paused` |
 
 **YouTube broadcasts (30 Oct).** No broadcast is ever made by hand. Going live, stream info and thumbnails all use one broadcast: the live one, else the next upcoming one, never Ferrocast's vertical one. When there's none, one is made (public, starting and ending with the stream, bound to the channel's stream). One that waits for "Go live" in YouTube Studio (auto-start off) is set to start with the stream when Go live starts. Stream info and thumbnails go to the vertical broadcast too, and a vertical broadcast made at go-live copies the normal one's title, privacy, description and thumbnail.
 

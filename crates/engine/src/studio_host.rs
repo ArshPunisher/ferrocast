@@ -2089,6 +2089,11 @@ impl Engine {
             self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(crate::now().0);
         if let Some(s) = v.get_mut("stream").and_then(Value::as_object_mut) {
             s.insert("upload_struggling".into(), Value::Bool(struggling));
+            if let Some(reason) = self.golive_main_failed() {
+                s.insert("active".into(), Value::Bool(false));
+                s.insert("reconnecting".into(), Value::Bool(false));
+                s.insert("error".into(), Value::String(reason));
+            }
         }
         Ok(v)
     }
@@ -2287,6 +2292,9 @@ impl Engine {
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
         let running = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
+        if !running {
+            self.clear_golive_failures(crate::golive::Canvas::Main);
+        }
         let out = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
         let (tracks, eb_note) =
             if running { (Vec::new(), None) } else { self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await };
@@ -2386,7 +2394,15 @@ impl Engine {
     }
 
     pub async fn studio_stream_stats(&self) -> Result<Value, EngineError> {
-        self.studio_host()?.stream_stats().await.map_err(failed)
+        let mut v = self.studio_host()?.stream_stats().await.map_err(failed)?;
+        if let Some(s) = v.as_object_mut()
+            && let Some(reason) = self.golive_main_failed()
+        {
+            s.insert("active".into(), Value::Bool(false));
+            s.insert("reconnecting".into(), Value::Bool(false));
+            s.insert("error".into(), Value::String(reason));
+        }
+        Ok(v)
     }
 
     /// A file dialog on the computer Ferrocast runs on → the path picked, or null.

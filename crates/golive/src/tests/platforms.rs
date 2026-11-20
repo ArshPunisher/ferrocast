@@ -19,7 +19,7 @@ async fn state_within(h: &mut watch::Receiver<Health>, within: Duration, want: i
 fn destination_with(port: u16, id: &str, first_ms: u64, max_ms: u64) -> Destination {
     Destination {
         id: id.into(),
-        retry: Retry { first: Duration::from_millis(first_ms), max: Duration::from_millis(max_ms) },
+        retry: Retry { first: Duration::from_millis(first_ms), max: Duration::from_millis(max_ms), ..Retry::default() },
         ..destination(port, "k")
     }
 }
