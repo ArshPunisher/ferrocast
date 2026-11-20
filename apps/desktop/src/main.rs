@@ -23,6 +23,7 @@ use std::time::Duration;
 #[cfg(any(windows, test))]
 mod crash;
 #[cfg(target_os = "macos")]
+mod log_limit;
 mod mac_update;
 mod store;
 mod studio;
@@ -157,7 +158,13 @@ fn init_tracing(dir: &std::path::Path) {
     let writer = RotatingLogWriter::open(&logs, MAX_LOG_BYTES).ok();
     let to_file =
         writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(w)));
-    let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(log_limit::layer())
+        .with(tracing_subscriber::fmt::layer())
+        .with(to_file)
+        .try_init();
+    log_limit::report_in_background();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Where it came from too (function names in builds with symbols, addresses without).

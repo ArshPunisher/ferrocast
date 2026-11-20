@@ -179,7 +179,12 @@ pub(crate) struct Encoder {
     /// Frames handed in since VideoToolbox last called back, and since when it has been quiet.
     quiet: (u32, std::time::Instant),
     seen_callbacks: u64,
+    /// Frames in a row the pool had none to give.
+    pool_misses: u32,
 }
+
+/// Pool misses in a row that mean the session is wedged.
+const POOL_MISSES: u32 = 30;
 
 /// A session that takes this many frames and this long with no callback at all (no packet, no
 /// dropped frame, no error) has wedged: it is treated as lost and built again. (A 1440p60 stream
@@ -373,6 +378,7 @@ impl Encoder {
             rebuilt_at: std::collections::VecDeque::new(),
             quiet: (0, std::time::Instant::now()),
             seen_callbacks: 0,
+            pool_misses: 0,
         })
     }
 
@@ -466,7 +472,16 @@ impl Encoder {
         let mut buf: CFTypeRef = ptr::null();
         // SAFETY: the pool is live; the new buffer is +1.
         let s = unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &raw mut buf) };
-        let buf = Owned::new(buf).ok_or_else(|| fail("make a frame", s))?;
+        let Some(buf) = Owned::new(buf) else {
+            // No frame left in the session's pool: it isn't getting them back (a session that
+            // stopped answering). A few misses are a busy moment; many in a row is a wedge.
+            self.pool_misses += 1;
+            if self.pool_misses >= POOL_MISSES {
+                self.lost = true;
+            }
+            return Err(fail("make a frame", s));
+        };
+        self.pool_misses = 0;
         self.fill(buf.0, frame)?;
         // SAFETY: CoreVideo's constant keys and values; the buffer is live.
         unsafe {
