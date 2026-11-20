@@ -167,6 +167,12 @@ pub struct Advanced {
     /// Power-user override matching OBS `IgnoreRecommended` (C-6): disables automatic Twitch/Kick
     /// Studio encoding caps so the user's configured bitrate/codec go out untouched.
     pub ignore_service_limits: bool,
+    /// Which IP version the RTMP destinations connect over (`auto`, `v4`, `v6`): `v4` for a server
+    /// whose IPv6 route is broken.
+    pub ip_family: ferrocast_golive::IpFamily,
+    /// Send over this connection only (its name or address from `GET /golive/networks`); none:
+    /// the system's way, moving to another connection when it fails. A pinned one never moves.
+    pub bind: Option<String>,
 }
 
 impl Default for Advanced {
@@ -177,6 +183,8 @@ impl Default for Advanced {
             port: ferrocast_golive::ingest::DEFAULT_PORT,
             per: HashMap::new(),
             ignore_service_limits: false,
+            ip_family: Default::default(),
+            bind: None,
         }
     }
 }
@@ -223,6 +231,11 @@ impl Advanced {
         }
         if self.port < 1024 {
             return Err("port: 1024 to 65535.".into());
+        }
+        if let Some(b) = &self.bind
+            && (b.trim().is_empty() || b.chars().count() > 64 || b.chars().any(char::is_control))
+        {
+            return Err("bind: a connection's name or address (up to 64 characters), or none.".into());
         }
         for (id, a) in &self.per {
             let d =
@@ -1970,9 +1983,18 @@ impl Engine {
             Some((server, k)) => (server.to_string(), k.to_string(), true),
             None => (url, key, false),
         };
-        let target = Target::parse(&url).map_err(|e| e.to_string())?;
+        let mut target = Target::parse(&url).map_err(|e| e.to_string())?;
+        // The streamer's choice of IP version and connection (the Studio's own feed to Go live's
+        // local server doesn't pass here).
+        let advanced = self.golive_config().advanced;
+        target.family = advanced.ip_family;
+        target.bind = advanced.bind.filter(|b| !b.trim().is_empty());
         // One that doesn't parse is left out: the primary is what matters.
-        let backup = backup.as_deref().and_then(|b| Target::parse(b).ok());
+        let backup = backup.as_deref().and_then(|b| Target::parse(b).ok()).map(|mut b| {
+            b.family = target.family;
+            b.bind = target.bind.clone();
+            b
+        });
         Ok(Destination {
             id: d.id.clone(),
             target,

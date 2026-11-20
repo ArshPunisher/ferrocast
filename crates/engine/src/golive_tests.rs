@@ -1610,3 +1610,26 @@ async fn the_studios_reconnect_settings_govern_the_go_live_destinations() {
     studio.settings.lock().unwrap().reconnect = false;
     assert!(e.resolve(&yt).await.unwrap().retry.is_never());
 }
+
+/// The IP version and the pinned connection of Go live's Advanced settings reach every RTMP
+/// destination (and its backup server), and a nonsense connection is refused with the field's name.
+#[tokio::test]
+async fn the_ip_version_and_connection_chosen_reach_the_destinations() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    let plain = e.resolve(&yt).await.unwrap();
+    assert_eq!((plain.target.family, plain.target.bind.clone()), (ferrocast_golive::IpFamily::Auto, None));
+    let mut adv = e.golive_config().advanced;
+    adv.ip_family = ferrocast_golive::IpFamily::V4;
+    adv.bind = Some("en7".into());
+    e.set_golive_advanced(adv).await.unwrap();
+    let d = e.resolve(&yt).await.unwrap();
+    assert_eq!((d.target.family, d.target.bind.as_deref()), (ferrocast_golive::IpFamily::V4, Some("en7")));
+    let backup = d.backup.expect("YouTube's backup server");
+    assert_eq!((backup.family, backup.bind.as_deref()), (ferrocast_golive::IpFamily::V4, Some("en7")));
+    let mut bad = e.golive_config().advanced;
+    bad.bind = Some("  ".into());
+    assert!(e.set_golive_advanced(bad).await.unwrap_err().to_string().contains("bind"));
+}

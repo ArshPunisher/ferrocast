@@ -681,6 +681,61 @@ async fn a_destination_with_two_tries_gives_up_after_two() {
     assert_eq!(push::fault::connects(dport), 2);
 }
 
+/// IPv4 only dials 127.0.0.1 and never [::1]; IPv6 only the reverse (against a server on both).
+#[tokio::test]
+async fn an_ip_version_chosen_is_the_only_one_dialled() {
+    let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await else {
+        return; // no IPv6 loopback on this machine
+    };
+    for (family, want_v6) in [(crate::target::IpFamily::V4, false), (crate::target::IpFamily::V6, true)] {
+        let (c, got4, got6) = tokio::join!(
+            push::tcp_family("localhost", port, family),
+            tokio::time::timeout(Duration::from_millis(800), v4.accept()),
+            tokio::time::timeout(Duration::from_millis(800), v6.accept()),
+        );
+        let c = c.unwrap();
+        assert_eq!(c.peer_addr().unwrap().is_ipv6(), want_v6, "{family:?}");
+        // Only the listener of that version ever saw a connection.
+        assert_eq!((got4.is_ok(), got6.is_ok()), (!want_v6, want_v6), "{family:?}");
+    }
+    // A name with no address of the version asked for says so by version.
+    let e = push::tcp_family("127.0.0.1", port, crate::target::IpFamily::V6).await.unwrap_err();
+    assert!(e.to_string().contains("IPv6"), "{e}");
+}
+
+/// A connection the streamer pinned is the one used (checked on the loopback, which every machine
+/// has), and one that isn't there fails by name, without hanging and without moving to another.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pinned_connection_is_used_and_a_missing_one_is_named() {
+    let w = world().await;
+    let l = free_listener().await;
+    let port = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let lo = if_addrs::get_if_addrs().unwrap().into_iter().find(|i| i.ip().is_ipv4() && i.is_loopback()).unwrap();
+    let mut d = destination(port, "k");
+    d.target.bind = Some(lo.name.clone());
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+
+    // Gone: no connection by that name.
+    let l2 = free_listener().await;
+    let port2 = l2.local_addr().unwrap().port();
+    let mut d = destination(port2, "k");
+    d.target.bind = Some("no-such-network0".into());
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 };
+    let mut health = start(&w, d);
+    let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    let PushState::Failed { reason, attempts, .. } = s else { unreachable!() };
+    assert!(reason.contains("no-such-network0"), "names the connection: {reason}");
+    assert_eq!(attempts, 2);
+    assert!(health.borrow().via.is_none(), "never moved to another connection");
+}
+
 /// How many of the frames sent while one worker of a sender runtime is blocked (a call that never
 /// yields, for 2 s) reach the platform.
 fn frames_through_while_a_worker_is_blocked(workers: usize) -> (u32, u32) {
