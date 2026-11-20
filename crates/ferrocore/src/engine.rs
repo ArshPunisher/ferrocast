@@ -3647,6 +3647,11 @@ pub fn raise_this_thread() {
 
 /// RAII guard for real-time audio thread priority/MMCSS registration on `ferrocast-audio`.
 #[allow(dead_code)]
+/// The work the audio thread declares to the real-time scheduler per 21.3 ms block (macOS): 20 times
+/// its measured p99 (about 0.2 ms) and 1.4 times the worst block seen in a 5-minute soak with two
+/// DeepFilterNet mics, music and a 1440p60 stream (2.8 ms; the denoiser runs off the thread).
+pub(crate) const AUDIO_COMPUTATION_NS: u64 = 4_000_000;
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AudioThreadGuard {
@@ -3681,7 +3686,7 @@ pub fn raise_audio_thread() -> AudioThreadGuard {
         }
         // The real-time class, as CoreAudio's own threads: precise wakes for a 21.3 ms block's
         // clock (about 4 ms of work, due within 10 ms of waking).
-        if !crate::apple::make_realtime(21_333_333, 4_000_000, 10_000_000) {
+        if !crate::apple::make_realtime(21_333_333, AUDIO_COMPUTATION_NS, 10_000_000) {
             tracing::debug!("audio thread kept the timeshare class");
         }
         AudioThreadGuard {}
