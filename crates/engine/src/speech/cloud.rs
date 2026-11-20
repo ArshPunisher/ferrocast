@@ -78,6 +78,13 @@ pub(crate) struct CloudTts {
     previews: Mutex<HashMap<String, String>>,
 }
 
+impl CloudTts {
+    /// Media ids of currently cached voice previews (kept during periodic TTS cleanup).
+    pub(crate) fn preview_ids(&self) -> Vec<String> {
+        lock(&self.previews).values().cloned().collect()
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -126,7 +133,7 @@ fn refused(status: u16, code: &'static str, message: &str, hint: &str) -> Engine
 }
 
 impl Engine {
-    fn cloud_tts(&self) -> &CloudTts {
+    pub(crate) fn cloud_tts(&self) -> &CloudTts {
         &self.inner.cloud_tts
     }
 

@@ -209,14 +209,54 @@ impl Engine {
     fn points_cooldown_ok(&self, p: Platform, user_id: &str) -> bool {
         let t = now();
         let mut cd = self.inner.points_cooldown.lock().unwrap_or_else(|p| p.into_inner());
-        let key = (p, user_id.to_string());
-        if cd.get(&key).is_some_and(|last| t.seconds_since(*last) < BALANCE_COOLDOWN_S) {
-            return false;
+        check_points_cooldown(&mut cd, p, user_id, t)
+    }
+}
+
+/// Hard cap on tracked `!points` balance cooldowns so massive raids cannot grow memory unboundedly.
+const MAX_POINTS_COOLDOWNS: usize = 10_000;
+
+fn check_points_cooldown(
+    cd: &mut std::collections::HashMap<(Platform, String), Millis>,
+    p: Platform,
+    user_id: &str,
+    t: Millis,
+) -> bool {
+    let key = (p, user_id.to_string());
+    if cd.get(&key).is_some_and(|last| t.seconds_since(*last) < BALANCE_COOLDOWN_S) {
+        return false;
+    }
+    if cd.len() >= MAX_POINTS_COOLDOWNS {
+        cd.retain(|_, last| t.seconds_since(*last) < BALANCE_COOLDOWN_S);
+        if cd.len() >= MAX_POINTS_COOLDOWNS {
+            let mut times: Vec<i64> = cd.values().map(|m| m.0).collect();
+            let mid = times.len() / 2;
+            let (_, cutoff, _) = times.select_nth_unstable(mid);
+            let cutoff = *cutoff;
+            cd.retain(|_, last| last.0 > cutoff);
+            while cd.len() >= MAX_POINTS_COOLDOWNS {
+                if let Some(k) = cd.keys().next().cloned() {
+                    cd.remove(&k);
+                } else {
+                    break;
+                }
+            }
         }
-        if cd.len() > 10_000 {
-            cd.retain(|_, last| t.seconds_since(*last) < BALANCE_COOLDOWN_S);
+    }
+    cd.insert(key, t);
+    true
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+
+    #[test]
+    fn points_cooldown_enforces_hard_cap() {
+        let mut cd = std::collections::HashMap::new();
+        for i in 0..15_000 {
+            assert!(check_points_cooldown(&mut cd, Platform::Twitch, &format!("u{i}"), Millis(i)));
+            assert!(cd.len() <= MAX_POINTS_COOLDOWNS, "len exceeded cap: {}", cd.len());
         }
-        cd.insert(key, t);
-        true
     }
 }
