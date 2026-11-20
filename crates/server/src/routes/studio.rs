@@ -83,6 +83,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/vertical/follow", get(engine_follow).put(engine_set_follow))
         .route("/studio/engine/restart", post(engine_restart))
         .route("/studio/engine/projectors", post(engine_projector).delete(engine_close_projectors))
+        .route("/studio/engine/keys/capture", post(engine_capture_keys))
         .route("/studio/engine/screens", get(engine_screens))
         .route("/studio/engine/library/{kind}", get(engine_shelf_list).post(engine_shelf_new))
         .route("/studio/engine/library/{kind}/current", put(engine_shelf_switch))
@@ -1002,6 +1003,17 @@ async fn engine_projector(
     Body(b): Body<ferrocast_engine::studio_host::ProjectorReq>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     Ok((StatusCode::CREATED, Json(app.engine.studio_projector(b).await?)))
+}
+
+/// `POST /studio/engine/keys/capture` `{ on }` → 204: a shortcut field waits for a key.
+async fn engine_capture_keys(State(app): State<AppState>, Body(b): Body<CaptureKeys>) -> ApiResult<StatusCode> {
+    app.engine.studio_capture_keys(b.on);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureKeys {
+    on: bool,
 }
 
 async fn engine_close_projectors(State(app): State<AppState>) -> ApiResult<StatusCode> {

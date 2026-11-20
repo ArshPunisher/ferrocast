@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ferrocast_engine::studio_host::{AudioChange, FilterEdit, ItemEdit, MediaAct, StudioAct};
 use ferrocast_engine::{Engine, EngineError};
@@ -19,6 +20,71 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 pub struct StudioKeys {
     keys: Mutex<HashMap<Shortcut, Vec<String>>>,
     queue: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    /// What the settings last asked for (kept while the keys are let go for a shortcut field).
+    wanted: Mutex<BTreeMap<String, String>>,
+    /// Whether a shortcut field is waiting for a key (the global shortcuts are let go).
+    gate: Mutex<CaptureGate>,
+}
+
+/// How long a shortcut field's "waiting for a key" holds the global shortcuts without being
+/// asked again (the page asks every few seconds): if the page goes away without saying so,
+/// they come back by themselves.
+pub(crate) const CAPTURE_HOLD: Duration = Duration::from_secs(30);
+
+/// What a "waiting for a key" call changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Capture {
+    /// The shortcuts are to be let go now.
+    Suspend,
+    /// Still waiting: the hold is extended.
+    Renew,
+    /// The shortcuts are to be put back now.
+    Resume,
+    /// Nothing changes.
+    Nothing,
+}
+
+/// Whether the global shortcuts are let go for a shortcut field, and until when (the pure part,
+/// tested without a window).
+#[derive(Debug, Default)]
+pub(crate) struct CaptureGate {
+    until: Option<Instant>,
+}
+
+impl CaptureGate {
+    /// The page says it is waiting for a key (`on`) or has stopped.
+    pub(crate) fn set(&mut self, on: bool, now: Instant) -> Capture {
+        match (on, self.until) {
+            (true, None) => {
+                self.until = Some(now + CAPTURE_HOLD);
+                Capture::Suspend
+            }
+            (true, Some(_)) => {
+                self.until = Some(now + CAPTURE_HOLD);
+                Capture::Renew
+            }
+            (false, Some(_)) => {
+                self.until = None;
+                Capture::Resume
+            }
+            (false, None) => Capture::Nothing,
+        }
+    }
+
+    /// The hold ran out (the page never said it stopped) → the shortcuts are to be put back.
+    pub(crate) fn expire(&mut self, now: Instant) -> bool {
+        match self.until {
+            Some(t) if now >= t => {
+                self.until = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.until.is_some()
+    }
 }
 
 impl StudioKeys {
@@ -32,7 +98,12 @@ impl StudioKeys {
                 }
             }
         });
-        StudioKeys { keys: Mutex::new(HashMap::new()), queue }
+        StudioKeys {
+            keys: Mutex::new(HashMap::new()),
+            queue,
+            wanted: Mutex::new(BTreeMap::new()),
+            gate: Mutex::new(CaptureGate::default()),
+        }
     }
 }
 
@@ -64,6 +135,11 @@ pub(crate) fn plan(wanted: &BTreeMap<String, String>) -> (Vec<(Shortcut, Vec<Str
 /// another app, or not keys this computer knows).
 pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> {
     let Some(state) = app.try_state::<StudioKeys>() else { return Vec::new() };
+    *state.wanted.lock().unwrap_or_else(|p| p.into_inner()) = wanted.clone();
+    // A shortcut field is waiting for a key: they are put in when it is done.
+    if state.gate.lock().unwrap_or_else(|p| p.into_inner()).active() {
+        return Vec::new();
+    }
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
@@ -82,6 +158,49 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
         }
     }
     failed
+}
+
+/// A shortcut field of the dashboard waits for a key (`on`) or has stopped: every global
+/// shortcut of the app is let go for the wait, so the page gets each key (those assigned already
+/// too) and no action runs from it, then they are put back (also when the page goes away
+/// without saying so: after [`CAPTURE_HOLD`]).
+pub(crate) fn capture(app: &AppHandle, on: bool) {
+    let Some(state) = app.try_state::<StudioKeys>() else { return };
+    let change = state.gate.lock().unwrap_or_else(|p| p.into_inner()).set(on, Instant::now());
+    match change {
+        Capture::Suspend => {
+            tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
+            let _ = app.global_shortcut().unregister_all();
+            watch_capture(app.clone());
+        }
+        Capture::Renew => watch_capture(app.clone()),
+        Capture::Resume => restore(app),
+        Capture::Nothing => {}
+    }
+}
+
+/// Puts the shortcuts back when the hold runs out.
+fn watch_capture(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CAPTURE_HOLD + Duration::from_millis(200)).await;
+        let Some(state) = app.try_state::<StudioKeys>() else { return };
+        let expired = state.gate.lock().unwrap_or_else(|p| p.into_inner()).expire(Instant::now());
+        if expired {
+            tracing::warn!("a shortcut field never said it stopped waiting: the shortcuts are back");
+            restore(&app);
+        }
+    });
+}
+
+/// The app's shortcuts back after a shortcut field: the show-window key, the panic key and the
+/// Studio's.
+fn restore(app: &AppHandle) {
+    crate::restore_app_shortcuts(app);
+    let wanted = match app.try_state::<StudioKeys>() {
+        Some(s) => s.wanted.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        None => return,
+    };
+    let _ = apply(app, &wanted);
 }
 
 /// Runs the Studio's action for this shortcut → false when it isn't one of the Studio's.
@@ -274,6 +393,40 @@ async fn muted(engine: &Engine, name: &str) -> Result<bool, EngineError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{CAPTURE_HOLD, Capture, CaptureGate};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waiting_for_a_key_lets_the_shortcuts_go_and_stopping_puts_them_back() {
+        let mut g = CaptureGate::default();
+        let t = Instant::now();
+        assert!(!g.active());
+        assert_eq!(g.set(true, t), Capture::Suspend);
+        assert!(g.active());
+        // The page asks again every few seconds: nothing is let go twice.
+        assert_eq!(g.set(true, t + Duration::from_secs(10)), Capture::Renew);
+        assert_eq!(g.set(false, t + Duration::from_secs(12)), Capture::Resume);
+        assert!(!g.active());
+        // Stopping when it wasn't waiting changes nothing.
+        assert_eq!(g.set(false, t + Duration::from_secs(13)), Capture::Nothing);
+    }
+
+    #[test]
+    fn a_page_that_goes_away_gives_the_shortcuts_back_after_the_hold() {
+        let mut g = CaptureGate::default();
+        let t = Instant::now();
+        g.set(true, t);
+        assert!(!g.expire(t + CAPTURE_HOLD - Duration::from_secs(1)));
+        assert!(g.active());
+        // Asked again at 20 s: held until 50 s.
+        g.set(true, t + Duration::from_secs(20));
+        assert!(!g.expire(t + CAPTURE_HOLD + Duration::from_secs(1)));
+        assert!(g.expire(t + Duration::from_secs(20) + CAPTURE_HOLD));
+        assert!(!g.active());
+        // Nothing to give back twice.
+        assert!(!g.expire(t + Duration::from_secs(100)));
+    }
+
     use super::*;
 
     fn wanted(list: &[(&str, &str)]) -> BTreeMap<String, String> {

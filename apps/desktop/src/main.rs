@@ -966,6 +966,18 @@ async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
     }
 }
 
+/// The show-window key and the panic key put back, after a shortcut field let every global
+/// shortcut go (see `studio_keys::capture`).
+pub(crate) fn restore_app_shortcuts(app: &AppHandle) {
+    if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
+        tracing::warn!(error = %e, "couldn't register the show-window shortcut again (another app may use it)");
+    }
+    if let (Some(shell), Some(running)) = (app.try_state::<Arc<Shell>>(), app.try_state::<Running>()) {
+        let wanted = running.engine.panic_state().1.hotkey.trim().to_string();
+        set_panic_hotkey(app, &shell, &wanted);
+    }
+}
+
 fn set_panic_hotkey(app: &AppHandle, shell: &Shell, wanted: &str) {
     let mut slot = shell.panic_shortcut.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(old) = slot.take() {

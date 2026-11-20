@@ -208,6 +208,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     fn levels_now(&self, _names: &[String], _fast: bool) -> Option<Value> {
         None
     }
+    /// A shortcut field is waiting for a key (`on`) or stopped waiting: the host's global
+    /// shortcuts are let go for the wait, so the page gets every key (those already in use too)
+    /// and no action runs from it. Asked again within seconds, it keeps them off; it puts them
+    /// back by itself if the page goes away without saying so. Not queued behind other work.
+    fn capture_keys(&self, _on: bool) {}
     /// The Studio's settings (saved by the host; defaults the first time).
     async fn settings(&self) -> StudioSettings;
     /// Saves and applies them (checked before they get here) → what applies only after
@@ -2505,6 +2510,15 @@ impl Engine {
         Ok(out)
     }
 
+    /// A shortcut field of the dashboard is waiting for a key (`on`) or has stopped: the desktop
+    /// lets its global shortcuts go meanwhile (see [`StudioHost::capture_keys`]). Without a
+    /// desktop (the server, a browser) there is nothing to let go: fine.
+    pub fn studio_capture_keys(&self, on: bool) {
+        if let Ok(h) = self.studio_host() {
+            h.capture_keys(on);
+        }
+    }
+
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
     /// to every destination switched on, as a stream from OBS would.
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
@@ -3135,10 +3149,15 @@ mod tests {
         busy: std::sync::atomic::AtomicBool,
         /// Whether `levels_now` answers (an engine is running).
         direct: std::sync::atomic::AtomicBool,
+        /// Each `capture_keys(on)` the page asked for.
+        captured: std::sync::Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
+        fn capture_keys(&self, on: bool) {
+            self.captured.lock().unwrap_or_else(|p| p.into_inner()).push(on);
+        }
         fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
             self.direct
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -3327,6 +3346,19 @@ mod tests {
             .await
             .unwrap();
         (e, dir)
+    }
+
+    /// A shortcut field waiting for a key reaches the desktop's host, in order, and without a
+    /// desktop (the server, a browser) it is fine and does nothing.
+    #[tokio::test]
+    async fn a_shortcut_field_waiting_for_a_key_reaches_the_host() {
+        let (e, _d) = engine().await;
+        e.studio_capture_keys(true);
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        e.studio_capture_keys(true);
+        e.studio_capture_keys(false);
+        assert_eq!(*fake.captured.lock().unwrap_or_else(|p| p.into_inner()), vec![true, false]);
     }
 
     #[tokio::test]
