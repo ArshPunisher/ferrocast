@@ -217,6 +217,8 @@ pub struct SceneItem {
     pub group: Option<(u32, u32)>,
     /// The item's id in the scene collection (OBS's), for outlining it in the preview; 0 none.
     pub item_id: i64,
+    /// `effects` are this item's own list (an override), not its source's filters.
+    pub own_effects: bool,
 }
 
 impl SceneItem {
@@ -233,6 +235,7 @@ impl SceneItem {
             scene: None,
             group: None,
             item_id: 0,
+            own_effects: false,
         }
     }
 }
@@ -500,7 +503,7 @@ fn loads_of(st: &State) -> Vec<SourceLoad> {
 
 /// Captures shown somewhere with no picture yet and not opening: name, screen, since when.
 fn quiet_of(st: &State) -> Vec<(String, bool, u64)> {
-    let shown = seen(st);
+    let shown = seen(st).0;
     st.opened
         .iter()
         .filter_map(|(name, (id, kind))| {
@@ -750,6 +753,9 @@ struct Src {
     video_delay: Option<crate::delay::FrameDelay<Fresh>>,
     /// Its sound held back too, when the filter says so.
     audio_delay: Option<crate::delay::AudioDelay>,
+    /// When the memory cap cut a delay short: (the delay asked, the one both picture and sound
+    /// keep now), so they stay together.
+    delay_cap: Option<(u32, u32)>,
 }
 
 /// How long a hidden capture may hold a pinned zero-copy surface without a newer frame before
@@ -848,7 +854,78 @@ impl Src {
             audio_tx: None,
             video_delay: None,
             audio_delay: None,
+            delay_cap: None,
         }
+    }
+}
+
+/// A picture that waited to be held for a Video Delay: source, when it was seen (ns), picture
+/// (as video where it can be) and its size in memory.
+type Held = (u64, u64, Fresh, usize);
+
+/// Turns pictures into what a Video Delay holds (the copy out of the capture surface and the
+/// RGBA to NV12 pass) on a thread of its own, so the render loop and its lock don't wait on it.
+/// One slow source can't stall a frame: when it is behind, a picture is dropped here.
+struct DelayConv {
+    tx: Option<mpsc::SyncSender<(u64, u64, Fresh)>>,
+    done: Arc<Mutex<Vec<Held>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Pictures waiting for the conversion thread at most (a pinned surface held in here starves the
+/// capture's pool, so few).
+const CONV_QUEUE: usize = 3;
+
+impl DelayConv {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(u64, u64, Fresh)>(CONV_QUEUE);
+        let done: Arc<Mutex<Vec<Held>>> = Arc::default();
+        let out = done.clone();
+        let thread = std::thread::Builder::new()
+            .name("ferrocast-delay-conv".into())
+            .spawn(move || {
+                while let Ok((id, at, f)) = rx.recv() {
+                    // A pinned capture surface would starve its pool while held: copied out.
+                    let Some(f) = f.into_pending() else { continue };
+                    // Held as video (NV12: 1.5 bytes a pixel, not 4) when it's opaque; a picture
+                    // with transparency stays RGBA. The card turns it back.
+                    let f = match f {
+                        Fresh::Pic(p) => match crate::delay::rgba_to_nv12(p.width, p.height, &p.rgba) {
+                            Some(data) => Fresh::Yuv(crate::ffsrc::Nv12Picture {
+                                width: p.width,
+                                height: p.height,
+                                data,
+                                bt709: true,
+                                full_range: false,
+                            }),
+                            None => Fresh::Pic(p),
+                        },
+                        other => other,
+                    };
+                    let bytes = f.bytes();
+                    out.lock().unwrap_or_else(|e| e.into_inner()).push((id, at, f, bytes));
+                }
+            })
+            .ok();
+        Self { tx: Some(tx), done, thread }
+    }
+
+    /// Hands a picture over; false when the thread is behind (the picture is dropped).
+    fn submit(&self, id: u64, at: u64, f: Fresh) -> bool {
+        self.tx.as_ref().is_some_and(|tx| tx.try_send((id, at, f)).is_ok())
+    }
+
+    /// What has been converted since the last call, oldest first.
+    fn take(&self) -> Vec<Held> {
+        std::mem::take(&mut *self.done.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl Drop for DelayConv {
+    fn drop(&mut self) {
+        // The channel closing ends the thread; it isn't waited for (a copy may be in progress).
+        drop(self.tx.take());
+        drop(self.thread.take());
     }
 }
 
@@ -983,6 +1060,8 @@ struct State {
     notices: crate::notices::Notices,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
+    /// Makes the pictures a Video Delay holds, off the render loop (started with the first one).
+    delay_conv: Option<DelayConv>,
     /// Frames drawn and on their way back from the card, oldest first (`deliver`).
     in_flight: std::collections::VecDeque<InFlight>,
     /// Cameras just taken out, still running for [`PARK_NS`]: one added again meanwhile (Undo,
@@ -1216,6 +1295,7 @@ impl Engine {
         let recycle_tx = audio.recycle_sender();
         let audio_cmd = audio.cmd_sender();
         let state = Arc::new(Mutex::new(State {
+            delay_conv: None,
             sources: BTreeMap::new(),
             scenes: BTreeMap::new(),
             on_air: None,
@@ -3175,11 +3255,17 @@ impl Engine {
 }
 
 fn default_source_effects(st: &State, id: u64) -> Vec<Effect> {
-    st.scenes
-        .values()
-        .flatten()
-        .find(|i| i.source == id && i.scene.is_none())
+    shared_source_effects(st.scenes.values().flatten(), id)
+}
+
+/// The source's own filters, as an item that shares them has them. An item with an override of
+/// its own (a crop for the vertical scene) says nothing about the source, and `scenes` is in no
+/// particular order, so those are skipped.
+fn shared_source_effects<'a>(items: impl Iterator<Item = &'a SceneItem>, id: u64) -> Vec<Effect> {
+    items
+        .filter(|i| i.source == id && i.scene.is_none() && !i.own_effects)
         .map(|i| i.effects.clone())
+        .next()
         .unwrap_or_default()
 }
 
@@ -3611,26 +3697,14 @@ fn frozen(st: &State) -> std::collections::HashSet<u64> {
         .collect()
 }
 
-/// Sources a Video Delay filter holds back: (its delay in ms, whether the sound goes with it).
-/// A source's filters are the same wherever it's shown; the longest delay wins when several say.
-fn delays(st: &State) -> HashMap<u64, (u32, bool)> {
-    let mut out: HashMap<u64, (u32, bool)> = HashMap::new();
-    for it in st.scenes.values().flatten().filter(|it| it.scene.is_none()) {
-        for e in &it.effects {
-            if let Effect::Delay { ms, audio } = e
-                && *ms > 0
-            {
-                let cur = out.entry(it.source).or_insert((0, false));
-                cur.0 = cur.0.max(*ms);
-                cur.1 |= *audio;
-            }
-        }
-    }
-    out
-}
-
-fn seen(st: &State) -> std::collections::HashSet<u64> {
-    fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
+/// What is drawn (sources and mask pictures), and the Video Delay filters of the items that
+/// show: (a source's delay in ms, whether its sound goes with it). The items that show decide,
+/// so a delay on a source in a scene that's off air (or an item that's hidden) holds nothing
+/// and doesn't delay the source where it's shown without one; where several show it with
+/// different delays, the longest wins (a source has one queue).
+fn seen(st: &State) -> (std::collections::HashSet<u64>, HashMap<u64, (u32, bool)>) {
+    type Delays = HashMap<u64, (u32, bool)>;
+    fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>, dl: &mut Delays) {
         let Some(items) = st.scenes.get(scene) else { return };
         for it in items.iter().filter(|i| i.visible) {
             for e in &it.effects {
@@ -3639,15 +3713,25 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
                 }
             }
             match &it.scene {
-                Some(inner) if depth < MAX_NESTING => walk(st, inner, depth + 1, out),
+                Some(inner) if depth < MAX_NESTING => walk(st, inner, depth + 1, out, dl),
                 Some(_) => {}
                 None => {
                     out.insert(it.source);
+                    for e in &it.effects {
+                        if let Effect::Delay { ms, audio } = e
+                            && *ms > 0
+                        {
+                            let cur = dl.entry(it.source).or_insert((0, false));
+                            cur.0 = cur.0.max(*ms);
+                            cur.1 |= *audio;
+                        }
+                    }
                 }
             }
         }
     }
     let mut out = std::collections::HashSet::new();
+    let mut dl = Delays::new();
     let mut roots: Vec<&str> = Vec::new();
     roots.extend(st.on_air.as_deref());
     roots.extend(st.top.as_deref());
@@ -3665,11 +3749,11 @@ fn seen(st: &State) -> std::collections::HashSet<u64> {
         }
     }
     for r in roots {
-        walk(st, r, 0, &mut out);
+        walk(st, r, 0, &mut out, &mut dl);
     }
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     out.insert(STINGER);
-    out
+    (out, dl)
 }
 
 /// Pictures kept back while unseen, sent to the GPU now (something is about to draw them
@@ -4649,6 +4733,11 @@ fn watchdog_step(
                             let oc: Option<crate::mix::OutputCapture> = None;
                             leftover = Some(std::mem::replace(&mut src.live, live));
                             src.audio_tx = None;
+                            // What the old capture left in the delay (its pictures and sound)
+                            // mustn't come out ahead of the new one's: started again, empty.
+                            src.video_delay = None;
+                            src.audio_delay = None;
+                            src.delay_cap = None;
                             src.watch.count = 0;
                             src.watch.since = now_ns();
                             src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
@@ -4959,7 +5048,7 @@ fn frame(
     let active_set = active(&st);
     // Pictures go to the GPU only for sources something drawn shows (and a source's first,
     // for its size); the rest keep their newest until they're shown.
-    let seen = seen(&st);
+    let (seen, delayed) = seen(&st);
     // Sources: new pictures to the GPU, captured/media sound forwarded to per-source rings.
     let mut uploads = Vec::new();
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -4979,13 +5068,23 @@ fn frame(
     let n_pending = uploads.len();
     // Video Delay: buffers made when a filter is set or changed (not per frame), dropped when
     // it's gone.
-    let delayed = delays(&st);
     let period_ns = 1_000_000_000 * u64::from(config.frame_rate().1) / u64::from(config.frame_rate().0.max(1));
     for (id, src) in st.sources.iter_mut() {
         match delayed.get(id) {
-            Some(&(ms, audio)) => {
-                if src.video_delay.as_ref().is_none_or(|d| d.delay_ms() != ms) {
-                    src.video_delay = Some(crate::delay::FrameDelay::new(ms, config.fps));
+            Some(&(asked, audio)) => {
+                // After the memory cap cut a delay short, picture and sound keep the cut length
+                // together (sound alone at the full delay would be seconds out of step).
+                let ms = match src.delay_cap {
+                    Some((a, cut)) if a == asked => cut,
+                    _ => {
+                        src.delay_cap = None;
+                        asked
+                    }
+                };
+                match &mut src.video_delay {
+                    // Changed in place: what is held keeps coming, the source doesn't freeze.
+                    Some(d) => d.set_delay_ms(ms),
+                    None => src.video_delay = Some(crate::delay::FrameDelay::new(ms, config.fps)),
                 }
                 // A change of the delay fades the held sound out and in (no click).
                 match (audio, &mut src.audio_delay) {
@@ -5003,6 +5102,7 @@ fn frame(
             None => {
                 src.video_delay = None;
                 src.audio_delay = None;
+                src.delay_cap = None;
             }
         }
     }
@@ -5179,46 +5279,39 @@ fn frame(
     }
     st.stats.recovered += st_recovered;
     let now = now_ns();
-    // Pictures of a delayed source go into its queue; the one whose time has come goes on.
+    // Pictures of a delayed source go to the conversion thread, and into its queue (with the
+    // time they were seen) once converted; the one whose time has come goes on.
     // (What came out of `pending` above was delayed already.)
     if !delayed.is_empty() {
         let mut i = n_pending;
         while i < uploads.len() {
             if delayed.contains_key(&uploads[i].0) {
                 let (id, f) = uploads.swap_remove(i);
-                if let Some(s) = st.sources.get_mut(&id)
-                    && let Some(q) = &mut s.video_delay
-                {
-                    // A pinned capture surface would starve its pool while held: copied out.
-                    if let Some(f) = f.into_pending() {
-                        // Held as video (NV12: 1.5 bytes a pixel, not 4) when it's opaque; a
-                        // picture with transparency stays RGBA. The card turns it back.
-                        let f = match f {
-                            Fresh::Pic(p) => match crate::delay::rgba_to_nv12(p.width, p.height, &p.rgba) {
-                                Some(data) => Fresh::Yuv(crate::ffsrc::Nv12Picture {
-                                    width: p.width,
-                                    height: p.height,
-                                    data,
-                                    bt709: true,
-                                    full_range: false,
-                                }),
-                                None => Fresh::Pic(p),
-                            },
-                            other => other,
-                        };
-                        let bytes = f.bytes();
-                        if q.push(now, f, bytes) {
-                            tracing::warn!(
-                                source = id,
-                                asked_ms = q.delay_ms(),
-                                longest_ms = crate::delay::longest_ms(bytes, config.fps, crate::delay::MAX_VIDEO_BYTES),
-                                "a video delay holds too much picture: its delay is cut short to stay in memory"
-                            );
-                        }
-                    }
+                let conv = st.delay_conv.get_or_insert_with(DelayConv::new);
+                if !conv.submit(id, now, f) {
+                    tracing::debug!(source = id, "a delayed picture was dropped: the conversion is behind");
                 }
             } else {
                 i += 1;
+            }
+        }
+        let converted = st.delay_conv.as_ref().map(DelayConv::take).unwrap_or_default();
+        for (id, at, f, bytes) in converted {
+            if let Some(s) = st.sources.get_mut(&id)
+                && let Some(q) = &mut s.video_delay
+                && q.push(at, f, bytes)
+            {
+                let asked = delayed.get(&id).map_or(q.delay_ms(), |d| d.0);
+                // A few pictures short of the cap, so the cut delay itself doesn't hit it again.
+                let room = crate::delay::MAX_VIDEO_BYTES.saturating_sub(3 * bytes);
+                let cut = crate::delay::longest_ms(bytes, config.fps, room);
+                s.delay_cap = Some((asked, cut.max(1)));
+                tracing::warn!(
+                    source = id,
+                    asked_ms = asked,
+                    kept_ms = cut,
+                    "a video delay holds too much picture: its delay is cut short to stay in memory; the sound keeps the same shorter delay"
+                );
             }
         }
         for (id, s) in st.sources.iter_mut() {
@@ -5407,6 +5500,20 @@ mod tests {
     use super::*;
     use crate::audio::AudioConfig;
     use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    #[test]
+    fn a_sources_default_filters_ignore_items_with_their_own() {
+        let place = || Placement::default();
+        let mut own = SceneItem::new(7, place());
+        own.effects = vec![Effect::RoundedCorners { radius: 99.0 }];
+        own.own_effects = true;
+        let mut shared = SceneItem::new(7, place());
+        shared.effects = vec![Effect::RoundedCorners { radius: 12.0 }];
+        for items in [[&own, &shared], [&shared, &own]] {
+            assert_eq!(shared_source_effects(items.into_iter(), 7), shared.effects);
+        }
+        assert!(shared_source_effects([&own].into_iter(), 7).is_empty());
+    }
 
     #[test]
     fn a_window_whose_app_opened_again_is_found_by_its_app_and_title() {
@@ -7963,6 +8070,23 @@ mod tests {
         one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
         std::thread::sleep(Duration::from_millis(250));
         assert_eq!(px(&e, 0), [0, 255, 0, 255], "no delay once the filter is gone");
+    }
+
+    #[test]
+    fn a_delay_counts_only_where_the_source_is_shown() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        let mut slow = SceneItem::new(1, Placement::default());
+        slow.effects = vec![Effect::Delay { ms: 500, audio: true }];
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Other", vec![slow.clone()]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        assert!(seen(&e.lock()).1.is_empty(), "a delay in a scene that's off air leaves the source alone");
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(seen(&e.lock()).1.get(&1), Some(&(500, true)));
+        slow.visible = false;
+        e.set_scene("Other", vec![slow]);
+        assert!(seen(&e.lock()).1.is_empty(), "nor does a hidden item's");
     }
 
     #[test]

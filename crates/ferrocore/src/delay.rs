@@ -57,6 +57,16 @@ impl<T> FrameDelay<T> {
         (self.delay_ns / 1_000_000) as u32
     }
 
+    /// Changes the delay with what is held kept: longer, the held pictures simply wait more;
+    /// shorter, those past the new time come out at the next call (the newest shows).
+    pub fn set_delay_ms(&mut self, delay_ms: u32) {
+        let ms = delay_ms.min(MAX_DELAY_MS);
+        if ms != self.delay_ms() {
+            self.delay_ns = u64::from(ms) * 1_000_000;
+            self.capped = false;
+        }
+    }
+
     /// Whether the memory cap has cut the delay short at any time.
     pub fn capped(&self) -> bool {
         self.capped
@@ -191,7 +201,8 @@ impl AudioDelay {
     /// The line made again at the asked length, empty.
     fn rebuild(&mut self) {
         let frames = (u64::from(self.delay_ms) * u64::from(self.rate)).div_ceil(1000) as usize;
-        let len = (frames * self.channels).min(MAX_AUDIO_SAMPLES);
+        // A whole number of frames, whatever the channel count.
+        let len = (frames * self.channels).min(MAX_AUDIO_SAMPLES / self.channels * self.channels);
         self.ring.clear();
         self.ring.resize(len, 0.0);
         self.pos = 0;
@@ -320,6 +331,27 @@ mod tests {
             }
         }
         lags
+    }
+
+    #[test]
+    fn a_changed_delay_keeps_what_is_held() {
+        let mut d = FrameDelay::<u64>::new(100, 60);
+        for tick in 0..3u64 {
+            d.push(tick * PERIOD, tick, 1000);
+        }
+        d.set_delay_ms(500);
+        assert_eq!(d.len(), 3, "nothing thrown away");
+        assert_eq!(d.take_due(3 * PERIOD, 0), None, "they wait the longer time");
+        assert_eq!(d.take_due(500_000_000 + 2 * PERIOD, 0), Some(2), "then the newest shows");
+    }
+
+    #[test]
+    fn the_sound_line_is_a_whole_number_of_frames_for_any_channel_count() {
+        let mut a = AudioDelay::new(MAX_DELAY_MS);
+        let pcm = vec![0.0f32; 3 * 64];
+        a.process(&pcm, 3, 192_000);
+        assert_eq!(a.ring.len() % 3, 0);
+        assert!(a.ring.len() <= MAX_AUDIO_SAMPLES);
     }
 
     #[test]
