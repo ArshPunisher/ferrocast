@@ -384,10 +384,10 @@ pub fn install(dir: &Path, zip: &Path) -> Result<PluginInfo, EngineError> {
     let old = dir.join(format!(".{}.old", m.id));
     let _ = std::fs::remove_dir_all(&old);
     if target.exists() {
-        std::fs::rename(&target, &old).map_err(io)?;
+        ferrocast_store::durable::rename_patiently(&target, &old).map_err(io)?;
     }
-    if let Err(e) = std::fs::rename(&fresh, &target) {
-        let _ = std::fs::rename(&old, &target);
+    if let Err(e) = ferrocast_store::durable::rename_patiently(&fresh, &target) {
+        let _ = ferrocast_store::durable::rename_patiently(&old, &target);
         return Err(io(e));
     }
     let _ = std::fs::remove_dir_all(&old);

@@ -112,7 +112,10 @@ fn unpack(gz: &[u8], dest: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
-    std::fs::rename(&part, dest).map_err(|e| format!("couldn't save ffmpeg: {e}"))?;
+    if let Err(e) = ferrocast_store::durable::rename_patiently(&part, dest) {
+        let _ = ferrocast_store::durable::remove_patiently(&part);
+        return Err(format!("couldn't save ffmpeg: {e}"));
+    }
     Ok(())
 }
 

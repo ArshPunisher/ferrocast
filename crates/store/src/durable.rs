@@ -143,7 +143,7 @@ pub fn write_atomic_raw(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(())
     })();
     if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = remove_patiently(&tmp);
     }
     res
 }
@@ -376,5 +376,35 @@ mod tests {
         );
         assert!(out.is_ok());
         assert_eq!(attempts, 3);
+        for code in [5, 32, 33, 1224] {
+            assert!(is_transient_lock_err(&io::Error::from_raw_os_error(code)), "Win32 error {code} must retry");
+        }
+    }
+
+    /// Real Windows file locking: renaming over a file held open without `FILE_SHARE_DELETE`
+    /// fails with `ERROR_SHARING_VIOLATION` until the reader closes it, and `rename_patiently`
+    /// retries across that window and replaces the existing file atomically.
+    #[cfg(windows)]
+    #[test]
+    fn rename_patiently_replaces_existing_file_and_retries_locked_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let target = dir.path().join("settings.json");
+        let staged = dir.path().join("settings.json.tmp");
+        std::fs::write(&target, b"{\"v\":1}").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&staged, b"{\"v\":2}").unwrap_or_else(|e| panic!("{e}"));
+
+        // Hold target open with share_mode(0) (no delete/write/read sharing) like an AV scanner.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&target).unwrap_or_else(|e| panic!("{e}"));
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(lock);
+        });
+
+        rename_patiently(&staged, &target).unwrap_or_else(|e| panic!("expected retry to succeed: {e}"));
+        let _ = holder.join();
+        assert_eq!(std::fs::read(&target).unwrap_or_else(|e| panic!("{e}")), b"{\"v\":2}");
+        assert!(!staged.exists());
     }
 }
