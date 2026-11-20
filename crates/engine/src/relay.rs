@@ -390,9 +390,9 @@ impl Engine {
     }
 
     /// On start: Kick saved from an earlier run.
-    pub(crate) async fn resume_kick(&self, account: repo::settings::Account) {
+    pub(crate) async fn resume_kick(&self, account: repo::settings::Account) -> bool {
         match crate::accounts::saved_tokens::<KickTokens>(&*self.inner.secrets, KICK_TOKENS) {
-            crate::accounts::Saved::Unreadable => {}
+            crate::accounts::Saved::Unreadable => return true,
             crate::accounts::Saved::Found(t) => match self.kick_api(t) {
                 Ok(api) => self.start_kick(api, account),
                 Err(e) => tracing::warn!(%e, "Kick is saved but can't start"),
@@ -408,6 +408,7 @@ impl Engine {
                     .await;
             }
         }
+        false
     }
 
     /// Sends the tip page settings to the relay; returns the page and webhook URLs.

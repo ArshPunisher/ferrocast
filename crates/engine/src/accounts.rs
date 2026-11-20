@@ -256,51 +256,90 @@ impl Engine {
         let Ok(accounts) = self.db(repo::settings::accounts).await else {
             return;
         };
+        let mut unreadable = Vec::new();
         for a in accounts {
-            if a.platform == "kick" {
-                self.resume_kick(a.clone()).await;
-                continue;
+            if self.resume_account(&a).await {
+                unreadable.push(a);
             }
-            if a.platform == "youtube" {
-                match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
-                    Saved::Unreadable => {}
-                    Saved::Found(t) => match self.youtube_api(t) {
-                        Ok(api) => self.start_youtube(api, a.clone()),
-                        Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
-                    },
-                    Saved::Missing => {
-                        let _ = self
-                            .submit(Event::live(
-                                Platform::Youtube,
-                                None,
-                                Millis(0),
-                                EventKind::Connector(ConnectorStatus::SignInNeeded),
-                            ))
-                            .await;
+        }
+        if unreadable.is_empty() {
+            return;
+        }
+        // A keychain that can't be read (locked at boot, a hiccup) leaves those accounts off: say so,
+        // and try again until it opens, instead of staying off without a word until the next start.
+        let names: Vec<&str> = unreadable.iter().map(|a| a.platform.as_str()).collect();
+        self.notice_detail(
+            "accounts:keychain",
+            NoticeLevel::Warn,
+            "Your saved sign-ins can't be read yet",
+            &format!(
+                "The keychain didn't open ({}). Ferrocast keeps them and tries again every 30 seconds.",
+                names.join(", ")
+            ),
+        );
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut left = unreadable;
+            while !left.is_empty() {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let mut still = Vec::new();
+                for a in left {
+                    if engine.resume_account(&a).await {
+                        still.push(a);
                     }
                 }
-                continue;
+                left = still;
             }
-            if a.platform == "twitch" {
-                match saved_tokens::<Tokens>(&*self.inner.secrets, TWITCH_TOKENS) {
-                    Saved::Unreadable => {}
-                    Saved::Found(t) => match self.twitch_auth(t) {
-                        Ok(auth) => self.start_twitch(auth, a),
-                        Err(e) => tracing::warn!(%e, "Twitch is saved but can't start"),
-                    },
-                    Saved::Missing => {
-                        let _ = self
-                            .submit(Event::live(
-                                Platform::Twitch,
-                                None,
-                                Millis(0),
-                                EventKind::Connector(ConnectorStatus::SignInNeeded),
-                            ))
-                            .await;
-                    }
+            engine.notice("accounts:keychain", NoticeLevel::Info, "Your saved sign-ins are back.");
+        });
+    }
+
+    /// Starts one saved account's adapter. `true` when its keychain entry couldn't be read (nothing
+    /// was done: it is kept, to be tried again).
+    async fn resume_account(&self, a: &repo::settings::Account) -> bool {
+        if a.platform == "kick" {
+            return self.resume_kick(a.clone()).await;
+        }
+        if a.platform == "youtube" {
+            match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
+                Saved::Unreadable => return true,
+                Saved::Found(t) => match self.youtube_api(t) {
+                    Ok(api) => self.start_youtube(api, a.clone()),
+                    Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
+                },
+                Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Youtube,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
+            }
+            return false;
+        }
+        if a.platform == "twitch" {
+            match saved_tokens::<Tokens>(&*self.inner.secrets, TWITCH_TOKENS) {
+                Saved::Unreadable => return true,
+                Saved::Found(t) => match self.twitch_auth(t) {
+                    Ok(auth) => self.start_twitch(auth, a.clone()),
+                    Err(e) => tracing::warn!(%e, "Twitch is saved but can't start"),
+                },
+                Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Twitch,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
                 }
             }
         }
+        false
     }
 
     /// Signs a platform out: stops its adapter, forgets its tokens and account.
