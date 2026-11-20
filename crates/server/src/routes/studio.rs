@@ -22,7 +22,7 @@ use ferrocast_engine::studio_host::{
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::extract::Body;
+use crate::extract::{Body, OptionalBody};
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -386,8 +386,11 @@ async fn engine_status(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.studio_status().await))
 }
 
-async fn engine_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.studio_start().await?)))
+async fn engine_start(
+    State(app): State<AppState>,
+    OptionalBody(opts): OptionalBody<ferrocast_engine::StartOptions>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_start_with(opts).await?)))
 }
 
 async fn engine_stop(State(app): State<AppState>) -> ApiResult<Json<Value>> {

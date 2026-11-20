@@ -476,26 +476,24 @@ impl Engine {
 
     pub(crate) async fn cloud_state(&self) -> Saved {
         let path = self.cloud_dir().join("state.json");
-        match tokio::fs::read(&path).await {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "the cloud backup state can't be read; starting over");
-                Saved::default()
-            }),
-            Err(_) => Saved::default(),
-        }
+        tokio::task::spawn_blocking(move || {
+            ferrocast_store::durable::load_json_with_backup(&path, |_| true).map(|l| l.value).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Changes the state file (temp file + rename, one change at a time).
+    /// Changes the state file (temp file + sync + .bak + rename, one change at a time).
     pub(crate) async fn cloud_update<T>(&self, f: impl FnOnce(&mut Saved) -> T) -> Result<T, EngineError> {
         let _one = self.cloud().file.lock().await;
         let mut s = self.cloud_state().await;
         let out = f(&mut s);
-        let dir = self.cloud_dir();
-        tokio::fs::create_dir_all(&dir).await.map_err(io_err)?;
-        let tmp = dir.join("state.json.partial");
+        let path = self.cloud_dir().join("state.json");
         let bytes = serde_json::to_vec_pretty(&s).map_err(io_err)?;
-        tokio::fs::write(&tmp, bytes).await.map_err(io_err)?;
-        tokio::fs::rename(&tmp, dir.join("state.json")).await.map_err(io_err)?;
+        tokio::task::spawn_blocking(move || ferrocast_store::durable::write_json_bytes(&path, &bytes))
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .map_err(io_err)?;
         Ok(out)
     }
 

@@ -1088,9 +1088,13 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                 effects.push(e);
             } else if kind == "ferrocast_vst" {
                 let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                match vst_effect(&name, fname, &fs) {
-                    Some(e) => sound_effects.push(e),
-                    None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
+                if crate::afx::plugins_disabled() {
+                    out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (disabled in Safe Mode)"));
+                } else {
+                    match vst_effect(&name, fname, &fs) {
+                        Some(e) => sound_effects.push(e),
+                        None => out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (none picked)")),
+                    }
                 }
             } else if kind == "compressor_filter"
                 && let Some(sc) = sidechain_source(&fs)

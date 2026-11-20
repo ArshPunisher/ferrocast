@@ -25,6 +25,7 @@ tauri-build = { version = "2", features = [] }
 ferrocast-core.workspace = true
 ferrocast-engine.workspace = true
 ferrocast-server.workspace = true
+ferrocast-store.workspace = true
 ferrocast-studio.workspace = true
 # FFmpeg for remuxing recordings (Ferrocast's own engine finds it).
 ferrocore.workspace = true
@@ -72,8 +73,12 @@ windows = { version = "0.61", features = [
     "ApplicationModel_Activation",
     "Foundation",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

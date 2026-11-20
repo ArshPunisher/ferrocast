@@ -9,6 +9,7 @@ mod error;
 
 pub mod backup;
 pub mod designfile;
+pub mod durable;
 pub mod import;
 pub mod repo;
 

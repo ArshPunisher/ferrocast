@@ -300,12 +300,15 @@ fn endless(code: &str) -> Option<&'static str> {
 
 /// Which plugins are off (`off.json`).
 fn off_list(dir: &Path) -> Vec<String> {
-    std::fs::read(dir.join("off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    ferrocast_store::durable::load_json_with_backup(&dir.join("off.json"), |_| true)
+        .map(|l| l.value)
+        .unwrap_or_default()
 }
 
 fn write_off(dir: &Path, off: &[String]) -> Result<(), EngineError> {
     let body = serde_json::to_vec(off).map_err(|e| EngineError::Internal(e.to_string()))?;
-    std::fs::write(dir.join("off.json"), body).map_err(|e| EngineError::Internal(e.to_string()))
+    ferrocast_store::durable::write_json_bytes(&dir.join("off.json"), &body)
+        .map_err(|e| EngineError::Internal(e.to_string()))
 }
 
 /// The installed plugins, by name.
@@ -476,6 +479,10 @@ pub fn event_for_plugins(e: &ferrocast_core::event::Event) -> serde_json::Value 
 impl Engine {
     /// Loads the logic plugins that are on (after any change to plugins).
     fn load_logic(&self) {
+        if self.safe_mode_plugins_disabled() {
+            self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
+            return;
+        }
         let dir = self.plugins_dir();
         let mut slots = std::collections::HashMap::new();
         for p in list(&dir).into_iter().filter(|p| p.on && p.problem.is_none() && p.kind == "logic") {
@@ -612,6 +619,9 @@ impl Engine {
 
     /// A panel plugin's page and what it may do → `{ html, actions }`.
     pub async fn plugin_panel(&self, id: &str) -> Result<serde_json::Value, EngineError> {
+        if self.safe_mode_plugins_disabled() {
+            return Err(crate::safe_mode::safe_mode_refused("Panel plugins are"));
+        }
         let dir = self.plugins_dir();
         let p = self.plugins().await.into_iter().find(|p| p.id == id && p.kind == "panel").ok_or_else(missing)?;
         if !p.on {
@@ -627,6 +637,9 @@ impl Engine {
 
     /// A step a panel asked for, if its plugin is on and allowed it.
     pub async fn plugin_act(&self, id: &str, step: serde_json::Value) -> Result<(), EngineError> {
+        if self.safe_mode_plugins_disabled() {
+            return Err(crate::safe_mode::safe_mode_refused("Panel plugins are"));
+        }
         let p = self.plugins().await.into_iter().find(|p| p.id == id && p.kind == "panel").ok_or_else(missing)?;
         if !p.on {
             return Err(EngineError::Unavailable(format!("{} is off: turn it on first.", p.name)));
@@ -650,20 +663,29 @@ impl Engine {
         self.store().dir().join("plugins")
     }
 
-    /// Loads the installed plugins that are on (at start).
+    /// Loads the installed plugins that are on (at start), unless disabled in Safe Mode.
     pub fn load_plugins(&self) {
+        if self.safe_mode_plugins_disabled() {
+            ferrocore::shaderfx::set_plugins(Vec::new());
+            self.load_logic();
+            tracing::info!("Safe Mode active: third-party plugins left off");
+            return;
+        }
         apply(&self.plugins_dir());
         self.load_logic();
     }
 
     pub async fn plugins(&self) -> Vec<PluginInfo> {
         let dir = self.plugins_dir();
+        let disabled = self.safe_mode_plugins_disabled();
         let mut out = tokio::task::spawn_blocking(move || list(&dir)).await.unwrap_or_default();
         // A logic plugin paused for stopping too often says why.
         let r = self.inner.plugin_logic.lock().unwrap_or_else(|e| e.into_inner());
         for p in out.iter_mut().filter(|p| p.problem.is_none()) {
             if let Some(why) = r.slots.get(&p.id).and_then(|s| s.stopped.clone()) {
                 p.problem = Some(why);
+            } else if disabled && p.on {
+                p.problem = Some("Paused in Safe Mode.".into());
             }
         }
         out
@@ -671,6 +693,9 @@ impl Engine {
 
     /// Installs the plugin file at `zip` (it's checked first) and puts its effect to use.
     pub async fn install_plugin(&self, zip: &Path) -> Result<PluginInfo, EngineError> {
+        if self.safe_mode_plugins_disabled() {
+            return Err(crate::safe_mode::safe_mode_refused("Installing plugins is"));
+        }
         let (dir, zip) = (self.plugins_dir(), zip.to_path_buf());
         let got = tokio::task::spawn_blocking(move || {
             let r = install(&dir, &zip);
@@ -685,10 +710,16 @@ impl Engine {
     }
 
     pub async fn set_plugin_on(&self, id: &str, on: bool) -> Result<PluginInfo, EngineError> {
+        if on && self.safe_mode_plugins_disabled() {
+            return Err(crate::safe_mode::safe_mode_refused("Turning plugins on is"));
+        }
+        let disabled = self.safe_mode_plugins_disabled();
         let (dir, id) = (self.plugins_dir(), id.to_string());
         let got = tokio::task::spawn_blocking(move || {
             let r = set_on(&dir, &id, on);
-            apply(&dir);
+            if !disabled {
+                apply(&dir);
+            }
             r
         })
         .await
@@ -699,10 +730,13 @@ impl Engine {
     }
 
     pub async fn remove_plugin(&self, id: &str) -> Result<(), EngineError> {
+        let disabled = self.safe_mode_plugins_disabled();
         let (dir, id) = (self.plugins_dir(), id.to_string());
         tokio::task::spawn_blocking(move || {
             let r = remove(&dir, &id);
-            apply(&dir);
+            if !disabled {
+                apply(&dir);
+            }
             r
         })
         .await

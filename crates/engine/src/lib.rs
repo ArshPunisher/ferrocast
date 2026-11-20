@@ -46,11 +46,13 @@ pub use pro::{ProStatus, ProView};
 mod recap;
 mod relay;
 mod remote;
+pub mod safe_mode;
 pub mod smart;
 pub use remote::{
     IN_FLIGHT as REMOTE_IN_FLIGHT, MAX_RESPONSE as REMOTE_MAX_RESPONSE, RemoteHandler, RemoteRequest, RemoteResponse,
     TunnelView,
 };
+pub use safe_mode::{SafeModeStatus, StartOptions};
 mod snapshot;
 pub mod speech;
 mod starter;
@@ -203,6 +205,8 @@ struct Inner {
     automations: Mutex<automation::Automations>,
     /// Logic plugins that are on, loaded and ready to be told about events.
     plugin_logic: Mutex<plugins::Running>,
+    /// Unclean-exit detection and Safe Mode state.
+    safe_mode: Mutex<safe_mode::SafeModeState>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -218,12 +222,18 @@ impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_mode(data_dir, false).await
+    }
+
+    /// Starts the desktop engine with unclean-exit detection and optional `--safe-mode` lock.
+    pub async fn start_with_mode(data_dir: &Path, safe_mode_flag: bool) -> Result<Engine, EngineError> {
         let engine = Self::start_with(
             data_dir,
             Arc::from(ferrocast_secrets::best_available(data_dir)),
             PlatformApps::from_env(),
         )
         .await?;
+        engine.init_safe_mode(data_dir, safe_mode_flag);
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -232,7 +242,7 @@ impl Engine {
         engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
-        // Installed plugins' effects that are on (OBS-COMPETE.md §4).
+        // Installed plugins' effects that are on (skipped in Safe Mode).
         engine.load_plugins();
         Ok(engine)
     }
@@ -339,6 +349,7 @@ impl Engine {
                 studio_host: Default::default(),
                 automations: Mutex::new(Default::default()),
                 plugin_logic: Mutex::new(Default::default()),
+                safe_mode: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -449,6 +460,14 @@ impl Engine {
 
     pub fn store(&self) -> Arc<Store> {
         self.inner.store.clone()
+    }
+
+    /// Flushes persistent engine state (SQLite WAL) cleanly during application quit, before
+    /// deleting clean-exit markers.
+    pub fn shutdown(&self) {
+        if let Err(err) = self.inner.store.checkpoint() {
+            tracing::warn!(%err, "SQLite WAL checkpoint failed during engine shutdown");
+        }
     }
 
     pub(crate) fn state(&self) -> std::sync::RwLockReadGuard<'_, State> {

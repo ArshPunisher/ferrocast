@@ -148,6 +148,17 @@ pub fn set_plugin_state(slot: u32, state: Vec<u8>) {
 pub type MakePlugin = fn(u32, u32) -> Option<Box<dyn SoundPlugin>>;
 
 static PLUGIN_MAKER: std::sync::OnceLock<MakePlugin> = std::sync::OnceLock::new();
+static PLUGINS_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enables or suppresses third-party VST plugin creation (Safe Mode sets `true`).
+pub fn set_plugins_disabled(disabled: bool) {
+    PLUGINS_DISABLED.store(disabled, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether third-party VST plugins are suppressed (Safe Mode).
+pub fn plugins_disabled() -> bool {
+    PLUGINS_DISABLED.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// The app's VST host (set once).
 pub fn set_plugin_maker(make: MakePlugin) {
@@ -156,7 +167,7 @@ pub fn set_plugin_maker(make: MakePlugin) {
 
 /// Whether this app runs VST plugins.
 pub fn plugins_available() -> bool {
-    PLUGIN_MAKER.get().is_some()
+    !plugins_disabled() && PLUGIN_MAKER.get().is_some()
 }
 
 /// A filter's kind and settings (OBS's keys and defaults in the comments).
@@ -305,7 +316,9 @@ impl AudioFilter {
                 AudioEffect::Denoise { strength } if rate == 48_000 => {
                     DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
                 }
-                AudioEffect::Plugin { slot } => PLUGIN_MAKER.get().and_then(|make| make(slot, rate)),
+                AudioEffect::Plugin { slot } => {
+                    (!plugins_disabled()).then(|| PLUGIN_MAKER.get().and_then(|make| make(slot, rate))).flatten()
+                }
                 _ => None,
             },
             plugin_ran: false,
@@ -1350,6 +1363,30 @@ mod tests {
         let low = peak(&run(cut, &sine(100.0, 0.5, 0.5))[12_000..]);
         assert!(mul_to_db(low / 0.5) < -6.0, "100 Hz down {} dB", mul_to_db(low / 0.5));
         assert!(peak(&run(cut, &sine(2000.0, 0.5, 0.5))[12_000..]) > 0.4);
+    }
+
+    #[test]
+    fn safe_mode_disables_plugin_filters_without_affecting_built_in_afx() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_plugins_disabled(false);
+            }
+        }
+        let _guard = Reset;
+
+        set_plugins_disabled(true);
+        assert!(plugins_disabled());
+        assert!(!plugins_available());
+
+        // Safe Mode suppresses third-party SoundPlugin instances: AudioFilter passes audio cleanly.
+        let mut f = AudioFilter::new(AudioEffect::Plugin { slot: 0 }, RATE);
+        let (mut l, mut r) = (vec![0.25f32; 256], vec![-0.25f32; 256]);
+        f.process([&mut l, &mut r]);
+        assert!(l.iter().all(|v| (*v - 0.25).abs() < 1e-6));
+
+        set_plugins_disabled(false);
+        assert!(!plugins_disabled());
     }
 
     /// After an impulse followed by 10 s of digital silence, no filter leaves IEEE 754 subnormal
