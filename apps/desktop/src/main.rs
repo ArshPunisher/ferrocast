@@ -25,6 +25,9 @@ mod crash;
 mod log_limit;
 #[cfg(target_os = "macos")]
 mod mac_update;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod menu;
 mod store;
 mod studio;
 mod studio_history;
@@ -68,7 +71,7 @@ struct Running {
     token: String,
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FERROCAST_HOME") {
         // Absolute: on Windows the Studio moves the working folder to OBS's (studio crate).
         let dir = PathBuf::from(dir);
@@ -357,6 +360,19 @@ fn main() {
             watch_threads(app.handle().clone());
             // A desktop with no tray, or its icon file not writable (Linux, 19 Nov: a second
             // user's start panicked on the first one's /tmp/tray-icon), runs without the tray.
+            // macOS: the menu bar (Settings, Undo, Quit… where a Mac user looks for them).
+            #[cfg(target_os = "macos")]
+            {
+                match menu::build(app.handle()) {
+                    Ok(bar) => {
+                        if let Err(e) = app.set_menu(bar) {
+                            tracing::warn!(error = %e, "the menu bar didn't show");
+                        }
+                        app.on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "the menu bar couldn't be made"),
+                }
+            }
             match build_tray(app.handle()) {
                 Ok(()) => shell.has_tray.store(true, Ordering::Relaxed),
                 Err(e) => tracing::warn!(error = %e, "no tray icon: Ferrocast runs without it, and closing quits"),
@@ -1091,7 +1107,7 @@ fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
 }
 
 /// Shows the main window, creating it if it was never opened.
-fn show_window(app: &AppHandle) {
+pub(crate) fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
@@ -1239,7 +1255,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn with_engine<F, Fut>(app: &AppHandle, f: F)
+pub(crate) fn with_engine<F, Fut>(app: &AppHandle, f: F)
 where
     F: FnOnce(Engine) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
