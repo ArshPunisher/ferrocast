@@ -22,8 +22,20 @@ pub const MUTED_CALM_TICKS: u32 = 5;
 pub const OTHER_MIC_LOUD_DB: f32 = -40.0;
 /// Digital silence: a working mic's own noise is always above this; a dead device reads -100.
 pub const DEAD_DB: f32 = -90.0;
-/// How long a mic must send nothing at all before saying so.
+/// The least a mic must send nothing at all before saying so (the Show's `watch.mic_silent_s`
+/// says how long, and is never taken under this).
 pub const DEAD_S: i64 = 30;
+/// After a "you're muted" notice cleared by itself (the talking stopped), it isn't raised again
+/// for this long: a streamer who muted on purpose isn't told at every burst of talk.
+pub const MUTED_RERAISE_S: i64 = 600;
+/// A fader this low or lower is a mute as far as viewers go.
+pub const FADER_DOWN_DB: f32 = -60.0;
+/// At least this many ticks the mic was open in the window before judging its level (a few
+/// short push-to-talk presses spread over a minute are not a minute of talk).
+pub const QUIET_TICKS_MIN: usize = 12;
+/// Ticks held shut in a row (30 s) after which a "very quiet" notice is let go: nothing is
+/// being said, and nothing more can clear it.
+pub const GATED_CLEAR_TICKS: u32 = 15;
 /// The window the voice's level is judged over, and the least of it that must be seen.
 pub const QUIET_WINDOW_S: i64 = 60;
 pub const QUIET_SPAN_S: i64 = 45;
@@ -72,6 +84,10 @@ pub struct SceneLook {
 pub(super) struct MicTrack {
     loud_run: u32,
     calm_run: u32,
+    /// When its "muted" notice last cleared by itself (the talk stopped): no new one for a while.
+    cleared_at: Option<i64>,
+    /// Ticks in a row it was held shut by a push-to-talk or push-to-mute key.
+    gated_run: u32,
     dead_since: Option<i64>,
     /// `(at, post-fader peak)` while it was on, last `QUIET_WINDOW_S`.
     window: VecDeque<(i64, f32)>,
@@ -95,6 +111,9 @@ fn judge_quiet(window: &VecDeque<(i64, f32)>, raised: bool) -> bool {
     let threshold = (floor + 6.0).max(SPEECH_MIN_DB);
     let speech: Vec<f32> = all.iter().copied().filter(|v| *v > threshold).collect();
     let good = all.iter().filter(|v| **v >= GOOD_PEAK_DB).count();
+    if !raised && window.len() < QUIET_TICKS_MIN {
+        return false;
+    }
     if raised {
         return good < GOOD_TICKS_CLEAR && !speech.is_empty() && percentile(&speech, 0.75) < QUIET_P75_DB;
     }
@@ -119,17 +138,22 @@ impl LiveWatch {
 
     /// The mic and scene checks of one sample.
     pub(super) fn tick_audio(&mut self, cfg: &LiveWatchConfig, s: &WatchSample, out: &mut Vec<LiveAlert>) {
+        // A mic with its fader all the way down is muted as far as viewers go.
+        let off = |m: &MicLevel| m.muted || m.volume_db <= FADER_DOWN_DB;
         let others_loud =
-            |me: &str| s.levels.iter().any(|m| m.name != me && !m.muted && !m.gated && m.peak_db > OTHER_MIC_LOUD_DB);
+            |me: &str| s.levels.iter().any(|m| m.name != me && !off(m) && !m.gated && m.peak_db > OTHER_MIC_LOUD_DB);
         for m in &s.levels {
             let name = &m.name;
             let (id_m, id_q, id_s) =
                 (format!("mic:muted:{name}"), format!("mic:quiet:{name}"), format!("mic:silent:{name}"));
             let was_muted_alert = self.raised.contains(&id_m);
             let mut t = self.mics.remove(name).unwrap_or_default();
-            let live = !m.muted && !m.gated;
-            // Speaking into a muted mic.
-            let wrong = if m.muted && !m.gated && !others_loud(name) {
+            let muted = off(m);
+            let live = !muted && !m.gated;
+            let other = others_loud(name);
+            // Speaking into a muted mic: not while another mic is carrying the voice, not in the
+            // Show's own starting, ending and BRB scenes, not once said to be on purpose.
+            let wrong = if muted && !m.gated && !other && !s.scene_exempt && !self.silenced.contains(&id_m) {
                 if m.input_db > MUTED_TALK_DB {
                     t.loud_run += 1;
                     t.calm_run = 0;
@@ -139,11 +163,25 @@ impl LiveWatch {
                         t.loud_run = 0;
                     }
                 }
-                let bad = if was_muted_alert { t.calm_run < MUTED_CALM_TICKS } else { t.loud_run >= MUTED_TALK_TICKS };
+                let locked = t.cleared_at.is_some_and(|at| s.at - at < MUTED_RERAISE_S * 1000);
+                let bad = if was_muted_alert {
+                    t.calm_run < MUTED_CALM_TICKS
+                } else {
+                    t.loud_run >= MUTED_TALK_TICKS && !locked
+                };
                 bad.then(|| {
-                    LiveAlert::raised(&id_m, "warn", format!("You're talking but {name} is muted."))
+                    let (message, action) = if m.muted {
+                        (format!("You're talking but {name} is muted."), Some("unmute"))
+                    } else {
+                        (format!("You're talking but {name} is turned all the way down."), None)
+                    };
+                    let a = LiveAlert::raised(&id_m, "warn", message)
                         .detail("Nobody hears you. Unmute it, or you're using another mic on purpose.")
-                        .action(name, "unmute")
+                        .dismissable("muted_on_purpose");
+                    match action {
+                        Some(act) => a.action(name, act),
+                        None => a,
+                    }
                 })
             } else {
                 t.loud_run = 0;
@@ -151,10 +189,18 @@ impl LiveWatch {
                 None
             };
             self.flip(out, &id_m, wrong, &format!("{name} is on."));
-            // A mic that sends nothing at all.
-            let dead_wrong = if live && cfg.mic_silent_s > 0 && !m.listed && m.input_db <= DEAD_DB {
+            if was_muted_alert && !self.raised.contains(&id_m) && muted {
+                t.cleared_at = Some(s.at);
+            }
+            if !muted {
+                t.cleared_at = None;
+            }
+            // A mic that sends nothing at all (for as long as the Show's setting says, at least
+            // 30 s), unless another mic is carrying the voice.
+            let dead_wrong = if live && cfg.mic_silent_s > 0 && !m.listed && m.input_db <= DEAD_DB && !other {
                 let since = *t.dead_since.get_or_insert(s.at);
-                ((s.at - since) / 1000 >= DEAD_S).then(|| {
+                let dead_s = i64::from(cfg.mic_silent_s).max(DEAD_S);
+                ((s.at - since) / 1000 >= dead_s).then(|| {
                     LiveAlert::raised(&id_s, "error", format!("No sound from {name}.")).detail(
                         "It sends nothing at all: unplugged, switched off on the device, or taken by another app?",
                     )
@@ -171,14 +217,26 @@ impl LiveWatch {
             while t.window.front().is_some_and(|w| s.at - w.0 > QUIET_WINDOW_S * 1000) {
                 t.window.pop_front();
             }
-            if m.muted {
+            t.gated_run = if m.gated { t.gated_run + 1 } else { 0 };
+            if muted {
                 // Muted on purpose (or "you're muted" says so): the level no longer matters.
                 t.window.clear();
                 self.flip(out, &id_q, None, "Your voice is loud enough now.");
-            } else if live {
+            } else if m.gated {
+                // Held shut: nothing is said. A notice already up is let go after a while: only
+                // holding the key long enough could clear it.
+                if t.gated_run >= GATED_CLEAR_TICKS {
+                    t.window.clear();
+                    self.flip(out, &id_q, None, "Your voice is loud enough now.");
+                }
+            } else if other || s.scene_exempt || self.silenced.contains(&id_q) {
+                // Another mic carries the voice, or the Show's own scene: not this mic's level.
+                t.window.clear();
+                self.flip(out, &id_q, None, "Your voice is loud enough now.");
+            } else {
                 let quiet = judge_quiet(&t.window, self.raised.contains(&id_q));
                 let wrong = quiet.then(|| {
-                    LiveAlert::raised(&id_q, "warn", "Your voice is very quiet.")
+                    LiveAlert::raised(&id_q, "warn", format!("{name} is very quiet."))
                         .detail(format!(
                             "{name} is far below the level viewers need (aim for peaks of -18 to -6 dB). \
                              Raise the mic's gain or volume; +6 dB is a safe first step."
@@ -322,9 +380,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mic_sending_nothing_is_said_after_half_a_minute() {
+    fn a_mic_sending_nothing_is_said_after_the_shows_setting() {
+        // The Show's setting (120 s by default) says how long; never under 30 s.
         let (mut w, mut t) = (LiveWatch::default(), 0);
-        let a = feed(&mut w, &mut t, 28, |_| vec![mic(-100.0, -100.0, false)]);
+        let a = feed(&mut w, &mut t, 118, |_| vec![mic(-100.0, -100.0, false)]);
         assert!(a.is_empty(), "{a:?}");
         let a = feed(&mut w, &mut t, 6, |_| vec![mic(-100.0, -100.0, false)]);
         assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), false)], "{a:?}");
@@ -333,6 +392,26 @@ mod tests {
         // A muted dead mic is not "no sound": it's muted.
         let (mut w, mut t) = (LiveWatch::default(), 0);
         assert!(feed(&mut w, &mut t, 120, |_| vec![mic(-100.0, -100.0, true)]).is_empty());
+        // A longer setting is kept: 600 s says nothing at 5 minutes.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let cfg = LiveWatchConfig { mic_silent_s: 600, ..Default::default() };
+        let mut all = Vec::new();
+        for _ in 0..150 {
+            let s = WatchSample { at: t, levels: vec![mic(-100.0, -100.0, false)], ..Default::default() };
+            all.extend(w.tick(&cfg, &s));
+            t += 2000;
+        }
+        assert!(all.is_empty(), "{all:?}");
+        // The shortest is 30 s, whatever it says.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let cfg = LiveWatchConfig { mic_silent_s: 1, ..Default::default() };
+        let mut all = Vec::new();
+        for _ in 0..10 {
+            let s = WatchSample { at: t, levels: vec![mic(-100.0, -100.0, false)], ..Default::default() };
+            all.extend(w.tick(&cfg, &s));
+            t += 2000;
+        }
+        assert!(all.is_empty(), "20 s is under the least: {all:?}");
     }
 
     #[test]
@@ -355,5 +434,155 @@ mod tests {
         for i in 0..10 {
             assert!(tick(20_000 + i * 2000, look(true, true)).is_empty());
         }
+    }
+
+    // ---- S61a: agy REV21 and the review of the first version.
+
+    fn talk_muted(w: &mut LiveWatch, t: &mut i64, secs: i64) -> Vec<LiveAlert> {
+        feed(w, t, secs, |_| vec![mic(-100.0, -22.0, true)])
+    }
+    fn calm_muted(w: &mut LiveWatch, t: &mut i64, secs: i64) -> Vec<LiveAlert> {
+        feed(w, t, secs, |i| vec![mic(-100.0, room(i), true)])
+    }
+
+    /// Muted on purpose: said once; after it clears by itself it isn't said again for ten
+    /// minutes, however often the talking starts; unmuting and muting again is a change.
+    #[test]
+    fn a_muted_notice_that_cleared_is_not_said_again_for_ten_minutes() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1, "said once");
+        assert_eq!(ids(&calm_muted(&mut w, &mut t, 12)), [("mic:muted:KREO".to_string(), true)], "cleared by itself");
+        // Talking again within ten minutes: nothing.
+        for _ in 0..5 {
+            assert!(talk_muted(&mut w, &mut t, 6).is_empty());
+            assert!(calm_muted(&mut w, &mut t, 14).is_empty());
+        }
+        // After ten minutes since the clear: said again.
+        assert!(calm_muted(&mut w, &mut t, 600).is_empty());
+        assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1, "after ten minutes");
+        // Cleared, then unmuted and muted again: a change, said at once.
+        assert_eq!(calm_muted(&mut w, &mut t, 12).len(), 1);
+        feed(&mut w, &mut t, 2, |_| vec![mic(-20.0, -20.0, false)]);
+        assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1);
+    }
+
+    /// "Muted on purpose": cleared now and not raised again for the stream; a new stream starts fresh.
+    #[test]
+    fn muted_on_purpose_silences_the_notice_for_the_stream() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = talk_muted(&mut w, &mut t, 4);
+        assert_eq!(a[0].dismiss, Some("muted_on_purpose"));
+        let cleared = w.silence("mic:muted:KREO").unwrap_or_else(|| panic!("it was up"));
+        assert!(cleared.cleared);
+        assert!(talk_muted(&mut w, &mut t, 20).is_empty());
+        // The quiet and silent notices are not silenced by it.
+        w.reset();
+        assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1, "a new stream");
+    }
+
+    /// In the Show's starting, ending and BRB scenes a mic is muted on purpose: no muted or quiet notice.
+    #[test]
+    fn the_shows_own_scenes_never_say_muted_or_quiet() {
+        let cfg = LiveWatchConfig::default();
+        let mut w = LiveWatch::default();
+        let mut all = Vec::new();
+        let mut at = 0;
+        for i in 0..40 {
+            let muted =
+                WatchSample { at, levels: vec![mic(-100.0, -22.0, true)], scene_exempt: true, ..Default::default() };
+            all.extend(w.tick(&cfg, &muted));
+            let quiet = WatchSample {
+                at,
+                levels: vec![mic(if i % 2 == 0 { -50.0 } else { -65.0 }, -50.0, false)],
+                scene_exempt: true,
+                ..Default::default()
+            };
+            let mut w2 = LiveWatch::default();
+            all.extend(w2.tick(&cfg, &quiet));
+            at += 2000;
+        }
+        assert!(all.is_empty(), "{all:?}");
+        // The same mic in an ordinary scene is said.
+        let s = |at| WatchSample { at, levels: vec![mic(-100.0, -22.0, true)], ..Default::default() };
+        assert!(w.tick(&cfg, &s(100_000)).is_empty());
+        assert_eq!(w.tick(&cfg, &s(102_000)).len(), 1);
+    }
+
+    /// A fader all the way down is a mute: said as turned down, with no Unmute button.
+    #[test]
+    fn a_fader_all_the_way_down_counts_as_muted() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = feed(&mut w, &mut t, 4, |_| {
+            let mut m = mic(-100.0, -22.0, false);
+            m.volume_db = -80.0;
+            vec![m]
+        });
+        assert_eq!(ids(&a), [("mic:muted:KREO".to_string(), false)], "{a:?}");
+        assert!(a[0].message.contains("turned all the way down"), "{}", a[0].message);
+        assert_eq!(a[0].action, None);
+        // And a silent fader is not "a voice that is very quiet" either.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = feed(&mut w, &mut t, 120, |_| {
+            let mut m = mic(-100.0, room(0), false);
+            m.volume_db = -80.0;
+            vec![m]
+        });
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    /// Another mic carrying the voice: a second mic that is dead or faint is not worth a notice.
+    #[test]
+    fn a_dead_or_faint_second_mic_is_not_said_while_another_carries_the_voice() {
+        let desk = |peak: f32, input: f32| {
+            let mut m = mic(peak, input, false);
+            m.name = "Desk".into();
+            m
+        };
+        // Desk is hardware-muted (digital silence); KREO speaks at -15.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = feed(&mut w, &mut t, 200, |_| vec![mic(-15.0, -15.0, false), desk(-100.0, -100.0)]);
+        assert!(a.is_empty(), "{a:?}");
+        // Desk hears the room faintly (-50) for two minutes.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = feed(&mut w, &mut t, 120, |i| {
+            vec![mic(-15.0, -15.0, false), desk(if i % 2 == 0 { -50.0 } else { -65.0 }, -50.0)]
+        });
+        assert!(a.is_empty(), "{a:?}");
+    }
+
+    /// A few short push-to-talk presses spread over a minute are not a minute of talk, and a
+    /// "very quiet" notice that is up is let go while the key is not held (nothing else could clear it).
+    #[test]
+    fn push_to_talk_never_leaves_a_quiet_notice_stuck() {
+        // Eight short presses over a minute, each a quiet word: too few open ticks to judge.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let a = feed(&mut w, &mut t, 70, |i| {
+            let mut m = mic(if i % 4 == 0 { -45.0 } else { -100.0 }, -45.0, false);
+            m.gated = i % 4 != 0;
+            vec![m]
+        });
+        assert!(a.is_empty(), "{a:?}");
+        // A raised notice, then the key is let go for good: it is let go too.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let quiet = |i: i64| vec![mic(if i % 2 == 0 { -50.0 } else { -65.0 }, -50.0, false)];
+        let a = feed(&mut w, &mut t, 70, quiet);
+        assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "{a:?}");
+        let a = feed(&mut w, &mut t, 40, |_| {
+            let mut m = mic(-100.0, -100.0, false);
+            m.gated = true;
+            vec![m]
+        });
+        assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), true)], "{a:?}");
+    }
+
+    /// A new stream or a wake starts fresh, and tells the page what it forgot.
+    #[test]
+    fn a_reset_tells_the_page_everything_it_had_raised() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1);
+        let told = w.reset_telling();
+        assert_eq!(ids(&told), [("mic:muted:KREO".to_string(), true)]);
+        assert!(w.raised().is_empty());
+        assert!(w.reset_telling().is_empty());
     }
 }

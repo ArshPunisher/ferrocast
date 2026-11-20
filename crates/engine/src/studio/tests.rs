@@ -1287,6 +1287,8 @@ struct FakeStudio {
     record_now: Mutex<serde_json::Value>,
     /// Broken sidechain loops reported in `stats()`.
     sidechain_cycles: Mutex<Vec<serde_json::Value>>,
+    /// A second, unmuted mic ("Desk") speaking at -15.
+    two_mics: Mutex<bool>,
 }
 
 #[async_trait]
@@ -1350,10 +1352,18 @@ impl crate::studio_host::StudioHost for FakeStudio {
                 *self.current.lock().unwrap() = scene;
                 Value::Null
             }
-            A::Audio { .. } => json!([
-                { "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() },
-                { "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false },
-            ]),
+            A::Audio { .. } => {
+                let mut rows = vec![
+                    json!({ "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() }),
+                    json!({ "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false }),
+                ];
+                if *self.two_mics.lock().unwrap() {
+                    rows.push(
+                        json!({ "name": "Desk", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": false }),
+                    );
+                }
+                Value::Array(rows)
+            }
             A::SetAudio { name, change } => {
                 if let Some(m) = change.muted {
                     self.acts.lock().unwrap().push(format!("mute {name} {m}"));
@@ -1375,7 +1385,12 @@ impl crate::studio_host::StudioHost for FakeStudio {
             A::Levels { .. } => {
                 let db = *self.mic_db.lock().unwrap();
                 let input = self.mic_input.lock().unwrap().unwrap_or(db);
-                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } })
+                let mut v = json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } });
+                if *self.two_mics.lock().unwrap() {
+                    v["Desk"] =
+                        json!({ "peak": [-15.0, -15.0], "magnitude": [-15.0, -15.0], "input_peak": [-15.0, -15.0] });
+                }
+                v
             }
             A::Look { .. } => {
                 let black = *self.cam_black.lock().unwrap();
@@ -1716,6 +1731,7 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
         cleared,
         source: None,
         action: None,
+        dismiss: None,
     };
     e.brb_when_black(&[alert(false)]).await;
     assert_eq!(*studio.current.lock().unwrap(), "BRB");
@@ -1751,6 +1767,7 @@ async fn brb_holds_isolate_manual_from_auto_and_hotkeys_run_the_show() {
         cleared,
         source: None,
         action: None,
+        dismiss: None,
     };
     e.brb_when_black(&[alert(false)]).await;
     e.brb_when_black(&[alert(true)]).await;
@@ -2112,4 +2129,56 @@ async fn a_stream_started_at_zero_makes_the_show_stale_when_it_stops() {
     *studio.streaming.lock().unwrap() = false;
     let again = e.start_show_with(no_stream()).await;
     assert!(again.is_ok(), "the next show starts: {again:?}");
+}
+
+/// agy REV21 / S61a #4: a wake (or a new stream) starts the watch over; a BRB that a black camera
+/// put on by itself must come off with it, and the page be told what was dropped.
+#[tokio::test]
+async fn a_reset_with_a_black_camera_raised_takes_brb_off_and_tells_the_page() {
+    use ferrocast_core::show::{LiveWatchConfig, WatchSample};
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+    // The camera black for longer than its limit: raised, and BRB goes on by itself.
+    let cfg = LiveWatchConfig::default();
+    let sample = |at| WatchSample { at, cameras: vec![("Camera".into(), true, 1)], ..Default::default() };
+    let mut alerts = Vec::new();
+    for at in [0, 12_000] {
+        alerts.extend(e.studio().live_watch.lock().unwrap().tick(&cfg, &sample(at)));
+    }
+    assert!(alerts.iter().any(|a| a.id == "camera:Camera:black" && !a.cleared), "raised: {alerts:?}");
+    e.brb_when_black(&alerts).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    // A wake: everything starts over.
+    let told = e.reset_live_watch().await;
+    assert!(told.iter().any(|a| a.id == "camera:Camera:black" && a.cleared), "the page is told: {told:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Live", "BRB never stays stuck");
+    assert!(e.live_alerts().is_empty());
+    // Nothing more to tell, and no BRB to take off a second time.
+    assert!(e.reset_live_watch().await.is_empty());
+}
+
+/// agy REV21 R2.3, S61a #2: a muted mic that isn't the voice (another mic carries it) is no
+/// warning before Go live; with no other mic it still is.
+#[tokio::test]
+async fn preflight_does_not_warn_about_a_muted_mic_while_another_carries_the_voice() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        mic_input: Mutex::new(Some(-30.0)),
+        two_mics: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    let mut checks = Vec::new();
+    e.preflight_picture_and_mics(&crate::studio::rig::Rig::Studio, &e.show_config(), Some("Live"), &mut checks).await;
+    assert!(checks.iter().all(|c| !c.id.starts_with("mic:")), "{checks:?}");
+    *studio.two_mics.lock().unwrap() = false;
+    let mut checks = Vec::new();
+    e.preflight_picture_and_mics(&crate::studio::rig::Rig::Studio, &e.show_config(), Some("Live"), &mut checks).await;
+    assert!(checks.iter().any(|c| c.id == "mic:Mic"), "alone it is warned about: {checks:?}");
 }
