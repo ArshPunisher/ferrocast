@@ -167,7 +167,14 @@ pub(crate) struct Encoder {
     /// After a rebuild: the lost session's codec header, until the new one's is known and
     /// compared with it (`header_changed`).
     prior_header: Option<Vec<u8>>,
+    /// When sessions were rebuilt lately (at most [`REBUILDS`] in [`REBUILD_WINDOW`], then the
+    /// output gives up: a machine whose encoder keeps dying would else rebuild every frame).
+    rebuilt_at: std::collections::VecDeque<std::time::Instant>,
 }
+
+/// Rebuilds of a lost session allowed in the window.
+const REBUILDS: usize = 3;
+const REBUILD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 // SAFETY: the session is only used through `&mut self` (one thread at a time); VideoToolbox
 // sessions may be used from any thread, and the sink is behind a mutex.
@@ -348,14 +355,19 @@ impl Encoder {
             rate_now: (cfg.bitrate_kbps, cfg.rate),
             lost: false,
             prior_header: None,
+            rebuilt_at: std::collections::VecDeque::new(),
         })
     }
 
     /// A new bitrate for what's encoded from now on.
     pub(crate) fn set_rate(&mut self, kbps: u32, rate: RateControl) -> Result<(), AvError> {
-        set_rate(&self.session, kbps, rate)?;
         self.rate_now = (kbps, rate);
-        Ok(())
+        match set_rate(&self.session, kbps, rate) {
+            // A session the system took back can't be told: the new bitrate is kept, and the
+            // session made again on the next frame starts with it.
+            Err(_) if self.session_gone() => Ok(()),
+            other => other,
+        }
     }
 
     /// After a rebuilt session: true once, when its codec header (SPS/PPS) is known and differs
@@ -377,6 +389,17 @@ impl Encoder {
         self.lost = false;
         match self.encode_once(frame, pts_us, key) {
             Err(first) if self.lost => {
+                let now = std::time::Instant::now();
+                while self.rebuilt_at.front().is_some_and(|t| now.duration_since(*t) > REBUILD_WINDOW) {
+                    self.rebuilt_at.pop_front();
+                }
+                if self.rebuilt_at.len() >= REBUILDS {
+                    self.lost = false;
+                    return Err(AvError::Encoder(format!(
+                        "the Mac's video encoder keeps stopping ({REBUILDS} restarts in {} s): {first}",
+                        REBUILD_WINDOW.as_secs()
+                    )));
+                }
                 // The system took the session back: a new one, and this frame goes in as a
                 // keyframe so the stream picks up at once. One try: a second loss is a real fault.
                 tracing::warn!(error = %first, "the Mac's video encoder session was lost; making a new one");
@@ -386,6 +409,8 @@ impl Encoder {
                 // Kept to see whether the new session's parameter sets differ from what the
                 // viewers' decoders were given (`header_changed`).
                 fresh.prior_header = self.header().or_else(|| self.prior_header.take());
+                fresh.rebuilt_at = std::mem::take(&mut self.rebuilt_at);
+                fresh.rebuilt_at.push_back(now);
                 std::mem::swap(self, &mut fresh);
                 self.lost = false;
                 self.encode_once(frame, pts_us, true)
@@ -502,10 +527,22 @@ impl Encoder {
         Ok(())
     }
 
+    /// Whether the system has taken the session back (its frame pool is gone with it).
+    fn session_gone(&self) -> bool {
+        // SAFETY: the session is live (invalidated or not); the pool is only looked at ("Get").
+        unsafe { VTCompressionSessionGetPixelBufferPool(self.session.0) }.is_null()
+    }
+
     pub(crate) fn flush(&mut self) -> Result<Vec<VideoPacket>, AvError> {
         // SAFETY: the session is live; an invalid time means "every frame".
         let s = unsafe { VTCompressionSessionCompleteFrames(self.session.0, CMTime::invalid()) };
         if s != 0 {
+            // A lost session has nothing left to hand over: stopping an output after the system
+            // took it back finishes with what it had, not with an error.
+            if recoverable(s) || self.session_gone() {
+                tracing::warn!(status = s, "the video encoder's session was lost before it finished");
+                return Ok(Vec::new());
+            }
             return Err(fail("finish", s));
         }
         self.take()
@@ -660,6 +697,34 @@ mod tests {
         }
         assert_eq!(failed, None, "an invalidated session must be recreated, not fail the output");
         assert!(keys >= 1, "the new session starts with a keyframe");
+    }
+
+    /// An encoder that keeps dying isn't rebuilt every frame for ever: three restarts, then the
+    /// output stops with its own error (agy review R3).
+    #[test]
+    fn an_encoder_that_keeps_dying_is_given_up_on() {
+        let Ok(mut e) = Encoder::new(&config()) else { return };
+        let pix = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        e.encode(frame(&pix), 0, true).unwrap_or_else(|x| panic!("first: {x}"));
+        let mut results = Vec::new();
+        for i in 1..=5 {
+            e.invalidate_for_test();
+            results.push(e.encode(frame(&pix), i * 33_333, false).is_ok());
+        }
+        assert_eq!(results, [true, true, true, false, false], "three rebuilds, then it gives up");
+    }
+
+    /// Changing the bitrate, or stopping, on a session the system took back is not an error
+    /// (agy review R4/R5).
+    #[test]
+    fn a_lost_session_still_takes_a_bitrate_and_stops_cleanly() {
+        let Ok(mut e) = Encoder::new(&config()) else { return };
+        let pix = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        e.encode(frame(&pix), 0, true).unwrap_or_else(|x| panic!("first: {x}"));
+        e.invalidate_for_test();
+        assert!(e.set_rate(900, RateControl::Cbr).is_ok(), "the bitrate is kept for the new session");
+        assert_eq!(e.rate_now.0, 900);
+        assert!(e.flush().is_ok(), "stopping after a loss isn't an error");
     }
 
     #[test]
