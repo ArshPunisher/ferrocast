@@ -477,10 +477,18 @@ pub struct EncodeSettings {
     pub bframes: bool,
     /// Sent at this size instead of the canvas's.
     pub scale: Option<(u32, u32)>,
+    /// How a picture sent at another size is scaled: "bilinear", "bicubic" (OBS's default),
+    /// "lanczos" or "area".
+    #[serde(default = "default_scale_filter")]
+    pub scale_filter: String,
     pub audio_kbps: u32,
     /// The encoder's own options (OBS's keys), applied over the ones above.
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_scale_filter() -> String {
+    "bicubic".into()
 }
 
 impl EncodeSettings {
@@ -496,6 +504,7 @@ impl EncodeSettings {
             profile: "high".into(),
             bframes: true,
             scale: None,
+            scale_filter: default_scale_filter(),
             audio_kbps: 160,
             extra: Default::default(),
         }
@@ -611,6 +620,40 @@ pub struct StreamStats {
     /// True when the server/platform refused the stream rather than a network outage.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refused: bool,
+    /// What the stream delay holds now, in megabytes (left out without a delay).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub delay_mb: f32,
+}
+
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// A delayed stream's tail being sent after it ended: seconds to go, megabytes left.
+pub fn delay_drain() -> Option<(f64, f64)> {
+    own::delay_drain()
+}
+
+/// The most memory a stream delay holds, in megabytes (from the next stream).
+pub fn set_delay_cap_mb(mb: u32) {
+    own::set_delay_cap_mb(mb);
+}
+
+/// The sound's format from the settings: the rate the engine mixes at (44100 or 48000, from the next
+/// start) and the names of the six audio tracks in a recording's file.
+pub fn set_audio_format(rate: u32, track_names: Vec<String>) {
+    own::set_audio_format(rate, track_names);
+}
+
+/// Broadcast timing (29.97, 59.94, 23.976 for a canvas of 30, 60, 24 fps), from the next time the
+/// engine opens.
+pub fn set_ntsc(on: bool) {
+    own::set_ntsc(on);
+}
+
+/// Ends any delayed tail being sent (the streamer chose Stop now).
+pub fn discard_delay() {
+    own::discard_delay();
 }
 
 fn is_zero_u32(v: &u32) -> bool {

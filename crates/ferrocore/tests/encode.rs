@@ -196,7 +196,8 @@ fn encoded(
     apk.extend(aenc.flush().unwrap_or_else(|e| panic!("{e}")));
     let video =
         VideoTrack { codec: VideoCodec::H264, width: 640, height: 360, config: venc.header().unwrap_or_default() };
-    let audio = AudioTrack { sample_rate: 48000, channels: 2, config: aenc.header(), bitrate_kbps: 128 };
+    let audio =
+        AudioTrack { sample_rate: 48000, channels: 2, config: aenc.header(), bitrate_kbps: 128, name: String::new() };
     (video, audio, vpk, apk)
 }
 

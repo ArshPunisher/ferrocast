@@ -372,6 +372,8 @@ pub struct Canvas {
     /// More of the mixer's tracks a recording carries after `track`, each its own sound track
     /// in the file (OBS's recording tracks 2-6).
     pub more_tracks: Vec<usize>,
+    /// The names of the recording's audio tracks, by track (first: track one).
+    pub track_names: Vec<String>,
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each width, height and kbps, drawn from the same picture scaled down.
     pub video_tracks: Vec<(u32, u32, u32)>,
@@ -388,6 +390,7 @@ impl Canvas {
             track: 0,
             scaled_from: None,
             more_tracks: Vec::new(),
+            track_names: Vec::new(),
             video_tracks: Vec::new(),
         }
     }
@@ -399,7 +402,7 @@ impl Canvas {
         Self {
             width,
             height,
-            scaled_from: Some((w, h, Filter::Bicubic)),
+            scaled_from: Some((w, h, self.scaled_from.map_or(Filter::Bicubic, |(.., f)| f))),
             more_tracks: Vec::new(),
             video_tracks: Vec::new(),
             ..self.clone()
@@ -408,13 +411,13 @@ impl Canvas {
 
     /// The engine's canvas scaled to `width`×`height` (bicubic, OBS's default downscale filter).
     pub fn scaled(config: EngineConfig, width: u32, height: u32) -> Self {
+        Self::scaled_with(config, width, height, Filter::Bicubic)
+    }
+
+    /// The engine's canvas scaled to `width`×`height` with `filter`.
+    pub fn scaled_with(config: EngineConfig, width: u32, height: u32, filter: Filter) -> Self {
         let from = (width, height) != (config.width, config.height);
-        Self {
-            width,
-            height,
-            scaled_from: from.then_some((config.width, config.height, Filter::Bicubic)),
-            ..Self::main(config)
-        }
+        Self { width, height, scaled_from: from.then_some((config.width, config.height, filter)), ..Self::main(config) }
     }
 }
 
@@ -558,14 +561,29 @@ pub struct EngineConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Broadcast timing: `fps` ×1000/1001 (24 → 23.976, 30 → 29.97, 60 → 59.94).
+    pub ntsc: bool,
     pub sample_rate: u32,
     /// How far behind the clock sound is mixed, so late pieces still make it.
     pub audio_latency_ms: u32,
 }
 
+impl EngineConfig {
+    /// The frame rate as a fraction: 30/1, or 30000/1001 with broadcast timing.
+    pub fn frame_rate(&self) -> (u32, u32) {
+        if self.ntsc { (self.fps * 1000, 1001) } else { (self.fps, 1) }
+    }
+
+    /// One frame's time, in nanoseconds (33,333,333 at 30; 33,366,666 at 29.97).
+    pub fn frame_ns(&self) -> u64 {
+        let (n, d) = self.frame_rate();
+        1_000_000_000 * u64::from(d) / u64::from(n.max(1))
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, fps: 30, sample_rate: 48_000, audio_latency_ms: 40 }
+        Self { width: 1920, height: 1080, fps: 30, ntsc: false, sample_rate: 48_000, audio_latency_ms: 40 }
     }
 }
 
@@ -1193,7 +1211,13 @@ impl Engine {
             outputs: Vec::new(),
             next_output: 1,
             taps: Vec::new(),
-            video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
+            video: VideoConfig {
+                width: config.width,
+                height: config.height,
+                fps_num: config.frame_rate().0,
+                fps_den: config.frame_rate().1,
+                ..video
+            },
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
@@ -2426,8 +2450,8 @@ impl Engine {
         let video = VideoConfig {
             width: canvas.width,
             height: canvas.height,
-            fps_num: (self.config.fps / canvas.every).max(1),
-            fps_den: 1,
+            fps_num: (self.config.frame_rate().0 / canvas.every).max(1),
+            fps_den: self.config.frame_rate().1,
             ..video
         };
         // Extra tracks go in a file (a recording, or a saved replay), or with a stream as its
@@ -2438,6 +2462,7 @@ impl Engine {
         };
         let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
+        pipe.set_track_names(canvas.track_names.clone());
         if matches!(kind, OutputKind::Stream(_)) {
             pipe.stream_extra_tracks();
             // Twitch Enhanced Broadcasting's other qualities: H.264, even sides, a few at most.
@@ -2884,7 +2909,9 @@ impl Engine {
         // Drawn at what it was drawn from (the canvas, or its own scene's size), then scaled.
         let from = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
         let from = if canvas.scene.is_none() { (config.width, config.height) } else { from };
-        canvas.scaled_from = ((width, height) != from).then_some((from.0, from.1, Filter::Bicubic));
+        // (The filter chosen for it stays.)
+        let filter = canvas.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
+        canvas.scaled_from = ((width, height) != from).then_some((from.0, from.1, filter));
         canvas.width = width;
         canvas.height = height;
         canvas.every = every;
@@ -3911,7 +3938,7 @@ fn run(
     sleep: &crate::sleep::SleepMonitor,
 ) {
     on_time();
-    let frame_ns = 1_000_000_000 / u64::from(config.fps);
+    let frame_ns = config.frame_ns();
     let mut next = now_ns();
     let mut faults = 0u64;
     while !stop.load(Ordering::Acquire) {
@@ -5135,11 +5162,12 @@ fn frame(
                     continue;
                 }
                 let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
+                let f = c.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
                 let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
-                    Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, Filter::Bicubic)),
+                    Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, f)),
                     Draw::Moving(mut t) => {
-                        t.from = scaled(t.from, w, h, Filter::Bicubic);
-                        t.to = scaled(t.to, w, h, Filter::Bicubic);
+                        t.from = scaled(t.from, w, h, f);
+                        t.to = scaled(t.to, w, h, f);
                         gpu.begin_transition_nv12(&t)
                     }
                 };
@@ -5224,6 +5252,10 @@ mod tests {
     }
 
     fn engine() -> Option<Engine> {
+        engine_with(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() })
+    }
+
+    fn engine_with(config: EngineConfig) -> Option<Engine> {
         let video = VideoConfig {
             codec: VideoCodec::H264,
             input: PixelFormat::Nv12,
@@ -5240,7 +5272,7 @@ mod tests {
             tune: None,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
-        Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
+        Engine::new(config, video, audio).ok()
     }
 
     /// The frame loop's thread runs high and isn't throttled (Windows 11's EcoQoS).
@@ -6286,6 +6318,91 @@ mod tests {
         assert!(e.tap_frames(Canvas::scaled(e.config, 321, 180), sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { every: 0, ..Canvas::main(e.config) }, sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
+    }
+
+    /// Broadcast timing: 29.97 and 59.94 (and 23.976) as fractions, and the frame times that go with them.
+    #[test]
+    fn broadcast_timing_is_a_thousandth_slower() {
+        let c = |fps, ntsc| EngineConfig { fps, ntsc, ..Default::default() };
+        assert_eq!(c(30, false).frame_rate(), (30, 1));
+        assert_eq!(c(30, true).frame_rate(), (30_000, 1001));
+        assert_eq!(c(60, true).frame_rate(), (60_000, 1001));
+        assert_eq!(c(24, true).frame_rate(), (24_000, 1001));
+        assert_eq!(c(30, false).frame_ns(), 33_333_333);
+        assert_eq!(c(30, true).frame_ns(), 33_366_666);
+        assert_eq!(c(60, true).frame_ns(), 16_683_333);
+        // 1000 frames at 59.94 take 16,683 ms (16,667 ms at 60): the stutter a 59.94 source made.
+        assert_eq!(c(60, true).frame_ns() * 1000 / 1_000_000, 16_683);
+    }
+
+    /// An engine at 29.97 hands frames out 33.37 ms apart, and its encoders are told 30000/1001.
+    #[test]
+    fn an_ntsc_engine_paces_frames_at_29_97() {
+        let Some(e) = engine_with(EngineConfig { width: 640, height: 360, fps: 30, ntsc: true, ..Default::default() })
+        else {
+            return;
+        };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let stamps = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let sink = stamps.clone();
+        let tap = e
+            .tap_frames(
+                Canvas::main(e.config),
+                Box::new(move |_f: &Nv12, ts| sink.lock().unwrap_or_else(|p| p.into_inner()).push(ts)),
+            )
+            .unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(900));
+        e.stop_tap(tap);
+        let t = stamps.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(t.len() >= 5, "{} frames", t.len());
+        // Frames on the grid: each a whole number of 33.3667 ms frame times after the first.
+        let grid = e.config.frame_ns();
+        assert!(t.windows(2).all(|w| (w[1] - w[0]) % grid == 0 && w[1] > w[0]), "{t:?}");
+    }
+
+    /// The downscale filter chosen for an output is the one that draws it (it was always bicubic):
+    /// a hard edge scaled 0.6x comes out differently with bilinear, bicubic and lanczos.
+    #[test]
+    fn the_downscale_filter_chosen_is_the_one_used() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 321, height: 360, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default()), SceneItem::new(2, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let first_frame = |filter: Filter| -> Vec<u8> {
+            let got = Arc::new(Mutex::new(None::<Vec<u8>>));
+            let sink = got.clone();
+            let tap = e
+                .tap_frames(
+                    Canvas::scaled_with(e.config, 384, 216, filter),
+                    Box::new(move |f: &Nv12, _| {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(|| f.y.clone());
+                    }),
+                )
+                .unwrap_or_else(|x| panic!("{x}"));
+            let until = Instant::now() + Duration::from_secs(5);
+            while got.lock().unwrap_or_else(|p| p.into_inner()).is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            e.stop_tap(tap);
+            let y = got.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            y.unwrap_or_else(|| panic!("no frame for {filter:?}"))
+        };
+        let bilinear = first_frame(Filter::Bilinear);
+        let bicubic = first_frame(Filter::Bicubic);
+        let lanczos = first_frame(Filter::Lanczos);
+        assert_ne!(bilinear, lanczos, "lanczos isn't bilinear");
+        assert_ne!(bilinear, bicubic, "bicubic isn't bilinear");
+        assert_ne!(bicubic, lanczos, "lanczos isn't bicubic");
+        // The names a stream's setting uses.
+        assert_eq!(Filter::downscale_named("lanczos"), Some(Filter::Lanczos));
+        assert_eq!(Filter::downscale_named("area"), Some(Filter::Area));
+        assert_eq!(Filter::downscale_named("sharp"), None);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]

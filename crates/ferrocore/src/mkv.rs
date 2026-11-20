@@ -188,6 +188,8 @@ impl<W: Write> MkvWriter<W> {
                     uint(0x88, u64::from(i == 0)),
                     uint(0x9C, 0),
                     string(0x86, "A_AAC"),
+                    // The track's name, when it has one (TrackEntry's Name).
+                    if a.name.is_empty() { Vec::new() } else { string(0x536E, &a.name) },
                     element(0x63A2, &a.config),
                     element(0xE1, &[float(0xB5, f64::from(a.sample_rate)), uint(0x9F, u64::from(a.channels))].concat()),
                 ]
@@ -453,5 +455,33 @@ mod tests {
         assert_eq!(element(0x1A45_DFA3, &[1, 2])[..5], [0x1A, 0x45, 0xDF, 0xA3, 0x82]);
         assert_eq!(uint(0xD7, 1), [0xD7, 0x81, 0x01]);
         assert_eq!(uint(0xE7, 0), [0xE7, 0x81, 0x00]);
+    }
+
+    /// A named audio track has a Name in its TrackEntry; an unnamed one has none.
+    #[test]
+    fn audio_tracks_carry_the_names_they_were_given() {
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::VideoCodec;
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let named = AudioTrack { name: "Game".into(), ..a.clone() };
+        let w = MkvWriter::with_tracks(std::io::Cursor::new(Vec::new()), Some(v), vec![named, a])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+        // Name (0x536E), its size (4), its text.
+        let name = [0x53, 0x6E, 0x84, b'G', b'a', b'm', b'e'];
+        assert_eq!(bytes.windows(name.len()).filter(|w| **w == name).count(), 1, "one named track");
+        assert_eq!(bytes.windows(2).filter(|w| **w == [0x53, 0x6E]).count(), 1, "the other has no Name");
     }
 }

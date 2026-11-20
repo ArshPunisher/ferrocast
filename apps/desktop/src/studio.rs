@@ -344,6 +344,7 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
         profile: s.profile.clone(),
         bframes: s.bframes,
         scale: s.scale.map(|[w, h]| (w, h)),
+        scale_filter: s.scale_filter.clone(),
         audio_kbps: s.audio_kbps,
         extra: if chosen.is_some() || s.video_encoder.is_none() {
             s.encoder_settings.clone()
@@ -534,6 +535,7 @@ fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
 /// viewers get (capped when Twitch or Kick is active).
 fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings {
+    ferrocast_studio::set_delay_cap_mb(s.delay_max_mb);
     StreamSettings {
         encode: effective_stream_encode(s, cap, None),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
@@ -740,9 +742,18 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
 
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
-        .map(|l| l.value)
-        .unwrap_or_default()
+    let s =
+        ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+            .map(|l| l.value)
+            .unwrap_or_default();
+    apply_audio_format(&s);
+    s
+}
+
+/// The sound's rate and the audio tracks' names, which the engine and the recording files read.
+fn apply_audio_format(s: &StudioSettings) {
+    ferrocast_studio::set_audio_format(s.sample_rate, s.audio_track_names.clone());
+    ferrocast_studio::set_ntsc(s.fps_ntsc);
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {
@@ -2685,6 +2696,7 @@ impl StudioHost for DesktopStudio {
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
+                apply_audio_format(&s);
                 h.settings = Some(s);
                 // Open multiviews take a new layout at once.
                 refresh_projectors(h);
@@ -3910,6 +3922,14 @@ impl StudioHost for DesktopStudio {
             Ok(v)
         })
         .await?
+    }
+
+    fn delay_drain(&self) -> Option<(f64, f64)> {
+        ferrocast_studio::delay_drain()
+    }
+
+    async fn discard_delay(&self) {
+        ferrocast_studio::discard_delay();
     }
 
     async fn stream_stop(&self) -> Result<(), String> {
