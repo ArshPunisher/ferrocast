@@ -2282,8 +2282,11 @@ impl Engine {
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
         // bump at once and never posts Discord/chat or resurrects Live after Studio stops.
-        // Even when it had already gone (a crash): a show with no Studio under it is over.
-        self.cancel_show_on_studio_stop("Studio stopped.");
+        // Even when it had already gone (a crash): a show with no Studio under it is over. Not
+        // when OBS is there to run a show of its own with the Studio off: that one is not ours.
+        if was_running || !matches!(self.rig().await, Ok(crate::studio::rig::Rig::Obs(_))) {
+            self.cancel_show_on_studio_stop("Studio stopped.");
+        }
         let _out = self.studio().output_lock.lock().await;
         if was_running {
             *crate::golive::lock_enhanced(self) = None;

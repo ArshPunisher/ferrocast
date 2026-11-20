@@ -1171,7 +1171,8 @@ impl Engine {
                 let name = str_field(d, "sourceName")?.to_string();
                 let filter = str_field(d, "filterName")?.to_string();
                 let on = bool_field(d, "filterEnabled")?;
-                let list = self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
+                let list =
+                    self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
                 if !list.as_array().is_some_and(|l| l.iter().any(|f| f["name"].as_str() == Some(filter.as_str()))) {
                     return Err(fail(ST_NOT_FOUND, "No filter was found by that name."));
                 }

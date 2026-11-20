@@ -2040,3 +2040,76 @@ async fn stopping_the_studio_ends_a_show_even_when_it_had_already_gone() {
     e.studio_stop().await.unwrap();
     assert!(!e.is_show_active(), "a show with no Studio under it is over");
 }
+
+/// agy REV21 R2.6 (1): a show running on OBS while the Studio is off is not the Studio's: turning
+/// the (already off) Studio off must leave it. (The stale-show clearing of 1c4b9bb is for a show
+/// that had the Studio under it.)
+#[tokio::test]
+async fn stopping_a_studio_that_is_off_leaves_a_show_running_on_obs() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    *studio.studio_down.lock().unwrap() = true;
+    e.set_studio_host(studio.clone());
+    let _obs = with_obs(&e).await;
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(false) }).await.unwrap();
+    assert!(e.is_show_active(), "a show runs on OBS");
+    e.studio_stop().await.unwrap();
+    assert!(e.is_show_active(), "the Studio was never under it");
+}
+
+/// agy REV21 R2.6 (2): the stream-stopped check and the cancel were two separate looks at the
+/// machine; a show that had gone Live (or begun again) in between was wiped. The cancel is
+/// conditional under one lock now.
+#[tokio::test]
+async fn a_stream_stop_never_ends_a_show_that_is_no_longer_counting_down() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await.unwrap();
+    assert!(e.is_show_active());
+    // The show reaches Live between the stop's look and its cancel: the cancel must see that.
+    {
+        let mut m = e.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.phase = crate::studio::show::BroadcastPhase::Live;
+    }
+    e.end_show_whose_stream_stopped();
+    assert!(e.is_show_active(), "a live show stays (its own ending, or the next Go live, takes it)");
+    // And a countdown is still ended by it.
+    {
+        let mut m = e.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.phase = crate::studio::show::BroadcastPhase::Countdown;
+    }
+    e.end_show_whose_stream_stopped();
+    assert!(!e.is_show_active());
+}
+
+/// agy REV21 R2.6 (3): a show whose stream is started by "at zero" (not by Start show) must count as
+/// having streamed: when that stream later stops, the next Start show must not be refused with
+/// "A show is already running".
+#[tokio::test]
+async fn a_stream_started_at_zero_makes_the_show_stale_when_it_stops() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(
+        json!({ "countdown_s": 30, "discord": false, "alerts_on": false, "bot_on": false, "start_stream": false,
+                "at_zero": { "start_stream": true, "switch": false, "marker": false } })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let no_stream = || crate::studio::show::ShowStartOpts { force: true, stream: Some(false) };
+    e.start_show_with(no_stream()).await.unwrap();
+    e.go_live_now_for_test().await.unwrap();
+    assert!(*studio.streaming.lock().unwrap(), "the stream started at zero");
+    // The stream drops by itself.
+    *studio.streaming.lock().unwrap() = false;
+    let again = e.start_show_with(no_stream()).await;
+    assert!(again.is_ok(), "the next show starts: {again:?}");
+}
