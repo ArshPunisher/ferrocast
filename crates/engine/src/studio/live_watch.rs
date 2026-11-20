@@ -115,6 +115,7 @@ impl Engine {
     pub(crate) async fn health_tick(&self) {
         let Ok(host) = self.studio_host() else { return };
         let Ok(v) = host.stats().await else { return };
+        self.observe_sidechain_cycles(&v);
         let (e, s) = (&v["engine"], &v["stream"]);
         let n = |x: &Value| x.as_u64().unwrap_or(0);
         let (net_dropped, paused) = self.golive_trouble();
