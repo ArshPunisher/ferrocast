@@ -489,6 +489,10 @@ pub struct DestinationView {
     /// A backup on standby: it sends only while this destination (its name) can't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standby_for: Option<String>,
+    /// Which stream key a platform destination sent to the last time it started ("Ferrocast ·
+    /// variable"), for its details; never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_note: Option<String>,
 }
 
 /// Go live's runtime state, one per engine.
@@ -514,6 +518,8 @@ pub(crate) struct GoLive {
     protector: Mutex<ferrocast_golive::protect::Protector>,
     /// Paused destinations' health lines (their forwarders aren't running).
     paused: Mutex<HashMap<String, Health>>,
+    /// Which stream key each platform destination was last started with (see `DestinationView`).
+    key_notes: Mutex<HashMap<String, String>>,
     /// Destinations that gave up (`PushState::Failed`) in this or the just-ended stream, kept
     /// visible until the next stream starts or the streamer unticks/retries them.
     failed: Mutex<HashMap<String, Health>>,
@@ -597,6 +603,7 @@ impl Default for GoLive {
             reconciling: tokio::sync::Mutex::new(()),
             protector: Mutex::new(Default::default()),
             paused: Mutex::new(HashMap::new()),
+            key_notes: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             failed_alerted: Mutex::new(std::collections::HashSet::new()),
             cut: Mutex::new(None),
@@ -1068,6 +1075,7 @@ impl Engine {
                     lighter_for_route: !d.wants_light() && self.on_light(d),
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
+                    key_note: lock(&self.golive().key_notes).get(&d.id).cloned(),
                 }
             })
             .collect();
@@ -1901,6 +1909,10 @@ impl Engine {
                     // A server the person chose themselves has no backup.
                     Ok(i) => {
                         let backup = if own_server.is_some() { None } else { i.backup };
+                        match &i.note {
+                            Some(n) => lock(&self.golive().key_notes).insert(d.id.clone(), n.clone()),
+                            None => lock(&self.golive().key_notes).remove(&d.id),
+                        };
                         (own_server.unwrap_or(i.url), i.key, backup)
                     }
                     Err(e) => return Err(format_platform_error(p, e, true)),

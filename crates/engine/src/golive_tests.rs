@@ -913,7 +913,7 @@ async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks
             Ok(())
         }
         async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
-            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into(), backup: None })
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into(), backup: None, note: None })
         }
     }
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -1076,7 +1076,7 @@ async fn destination_give_up_marks_failed_and_stops_studio_live() {
             Ok(())
         }
         async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
-            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "kick-k".into(), backup: None })
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "kick-k".into(), backup: None, note: None })
         }
     }
 
@@ -1419,7 +1419,9 @@ impl ferrocast_connector::Connector for SignedIn {
         // YouTube gives a backup server beside its own; the others don't.
         let backup =
             (self.0 == ferrocast_core::event::Platform::Youtube).then(|| "rtmp://127.0.0.1:10/app".to_string());
-        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into(), backup })
+        // YouTube says which key it used; the others don't.
+        let note = (self.0 == ferrocast_core::event::Platform::Youtube).then(|| "Ferrocast · variable".to_string());
+        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into(), backup, note })
     }
 }
 
@@ -1525,4 +1527,24 @@ async fn a_backup_server_reaches_the_destination_for_youtube_only() {
     e.set_golive_advanced(adv).await.unwrap();
     let own = e.resolve(&dest("youtube")).await.unwrap();
     assert!(own.backup.is_none() && own.target.port == 11);
+}
+
+/// Which key YouTube's stream went to ("Ferrocast · variable") shows in its details, once it has
+/// started; Twitch, which says nothing, shows none. The key itself never does.
+#[tokio::test]
+async fn the_key_a_youtube_destination_sent_to_is_named_in_its_view() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let cfg = e.golive_config();
+    let dest = |id: &str| cfg.destinations.iter().find(|d| d.id == id).cloned().unwrap();
+    let note =
+        |v: &crate::golive::GoLiveView, id: &str| v.destinations.iter().find(|d| d.id == id).unwrap().key_note.clone();
+    assert_eq!(note(&e.golive_view().await, "youtube"), None, "nothing before it starts");
+    e.resolve(&dest("youtube")).await.unwrap();
+    e.resolve(&dest("twitch")).await.unwrap();
+    let v = e.golive_view().await;
+    assert_eq!(note(&v, "youtube").as_deref(), Some("Ferrocast · variable"));
+    assert_eq!(note(&v, "twitch"), None);
+    assert!(!serde_json::to_string(&v).unwrap().contains("\"k\""), "never the key");
 }
