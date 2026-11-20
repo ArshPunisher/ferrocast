@@ -562,6 +562,8 @@ fn record_encode(s: &StudioSettings) -> EncodeSettings {
     let mut e = encode_of(s);
     match s.record_quality.as_str() {
         "high" => e.quality = Some(16),
+        // In between: libobs's 22 (x264 CRF 22; the Mac's matching 0-1 quality), about half of High's size.
+        "balanced" => e.quality = Some(22),
         "lossless" => {
             e.video_encoder = "obs_x264".into();
             e.quality = Some(0);
@@ -3044,7 +3046,7 @@ impl StudioHost for DesktopStudio {
                 format: s.replay_format.clone(),
                 spaces: s.record_spaces,
                 seconds: s.replay_seconds,
-                mb: s.replay_mb,
+                mb: s.replay_cap_mb(),
                 tracks: s.record_tracks.clone(),
                 encode: record_encode(&s),
             };
@@ -3429,10 +3431,10 @@ impl StudioHost for DesktopStudio {
 
     async fn encoder_options(&self, id: String, settings: serde_json::Map<String, Value>) -> Result<Value, String> {
         self.on_main(move |h| {
-            // Our encoders take their settings from the Studio's own (bitrate, keyframes,
-            // profile): no options of their own to show.
-            let _ = (h.collection.as_ref().ok_or(STOPPED)?, &id);
-            Ok(json!({ "options": [], "values": settings }))
+            // Our encoders take most settings from the Studio's own (bitrate, keyframes, profile);
+            // x264 also has its preset and tune.
+            let _ = h.collection.as_ref().ok_or(STOPPED)?;
+            Ok(json!({ "options": ferrocast_studio::kinds::own_encoder_options(&id), "values": settings }))
         })
         .await?
     }
@@ -4072,6 +4074,17 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    /// Balanced recording sits between High (16) and the stream: libobs's quality 22, which is
+    /// x264's CRF 22 and the Mac's matching 0-1 quality.
+    #[test]
+    fn the_balanced_recording_tier_is_a_constant_quality_of_22() {
+        let s = StudioSettings { record_quality: "balanced".into(), ..StudioSettings::default() };
+        assert_eq!(record_encode(&s).quality, Some(22));
+        let high = StudioSettings { record_quality: "high".into(), ..StudioSettings::default() };
+        assert_eq!(record_encode(&high).quality, Some(16));
+        assert!(StudioSettings { record_quality: "balanced".into(), ..StudioSettings::default() }.check().is_ok());
+    }
 
     #[test]
     fn reads_the_end_of_the_log_without_colour_codes() {

@@ -826,7 +826,8 @@ pub struct StudioSettings {
     pub record_folder_default: String,
     /// "mp4" or "mov" (both crash-safe).
     pub record_format: String,
-    /// "stream" (same as the stream), "high" (near-lossless, the default), "lossless".
+    /// "stream" (same as the stream), "high" (near-lossless, the default), "balanced" (about half
+    /// its size), "lossless", "custom".
     pub record_quality: String,
     pub reconnect: bool,
     pub reconnect_every_s: u32,
@@ -869,7 +870,7 @@ pub struct StudioSettings {
     /// ffmpeg muxer settings of the streamer's own for recordings (OBS's Custom Muxer Settings).
     pub record_muxer: String,
     /// The replay buffer keeps the last this many seconds (5 to 21600), at most this many
-    /// megabytes (0: no limit), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
+    /// megabytes (0: the default cap, 512; 1000000 is as good as none), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
     pub replay_seconds: u32,
     pub replay_mb: u32,
     pub replay_format: String,
@@ -910,6 +911,17 @@ pub struct StudioSettings {
     pub keep_recording: bool,
     pub replay_when_streaming: bool,
     pub keep_replay: bool,
+}
+
+/// The replay buffer's memory cap when none is set: it kept encoded video in RAM without a limit.
+pub const DEFAULT_REPLAY_MB: u32 = 512;
+
+impl StudioSettings {
+    /// The megabytes the replay buffer may hold: `replay_mb`, or the default cap for 0 (profiles
+    /// saved before the cap existed carry 0).
+    pub fn replay_cap_mb(&self) -> u32 {
+        if self.replay_mb == 0 { DEFAULT_REPLAY_MB } else { self.replay_mb }
+    }
 }
 
 impl Default for StudioSettings {
@@ -955,7 +967,7 @@ impl Default for StudioSettings {
             record_remux: true,
             record_muxer: String::new(),
             replay_seconds: 30,
-            replay_mb: 0,
+            replay_mb: DEFAULT_REPLAY_MB,
             replay_format: "mp4".into(),
             speakers: None,
             true_peak: false,
@@ -1053,8 +1065,8 @@ impl StudioSettings {
         if !RECORD_FORMATS.contains(&self.record_format.as_str()) {
             return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls.");
         }
-        if !["stream", "high", "lossless", "custom"].contains(&self.record_quality.as_str()) {
-            return bad("record_quality: stream, high, lossless or custom.");
+        if !["stream", "high", "balanced", "lossless", "custom"].contains(&self.record_quality.as_str()) {
+            return bad("record_quality: stream, high, balanced, lossless or custom.");
         }
         for (field, id) in [("video_encoder", &self.video_encoder), ("record_encoder", &self.record_encoder)] {
             if let Some(id) = id
@@ -1083,7 +1095,7 @@ impl StudioSettings {
             return bad("record_split: up to 1440 minutes or 1000000 MB (0: never).");
         }
         if !(5..=21_600).contains(&self.replay_seconds) || self.replay_mb > 1_000_000 {
-            return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000).");
+            return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000, 0 is 512).");
         }
         if !["metal", "opengl"].contains(&self.renderer.as_str()) {
             return bad("renderer: metal or opengl.");
@@ -2965,6 +2977,16 @@ async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_replay_buffer_has_a_memory_cap_unless_one_is_set() {
+        let mut s = StudioSettings::default();
+        assert_eq!(s.replay_cap_mb(), 512, "the default is capped");
+        s.replay_mb = 0;
+        assert_eq!(s.replay_cap_mb(), 512, "an older profile's 0 is capped too");
+        s.replay_mb = 2048;
+        assert_eq!(s.replay_cap_mb(), 2048);
+    }
+
     use super::*;
 
     #[test]

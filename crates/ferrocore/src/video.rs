@@ -51,11 +51,57 @@ pub struct VideoConfig {
     pub fps_den: u32,
     pub bitrate_kbps: u32,
     pub rate: RateControl,
-    /// Seconds between keyframes (platforms ask for 2).
+    /// Seconds between keyframes (platforms ask for 2); 0 lets the encoder pick (`gop_secs`).
     pub keyframe_secs: u32,
     /// x264 (through FFmpeg) instead of the system's own encoder: sharper at low bitrates, and
     /// lossless with `RateControl::Crf(0)`. H.264 only.
     pub software: bool,
+    /// The H.264 profile (HEVC is always Main). B-frames stay off in every profile: the encoders
+    /// give times back by order, which B-frames would break.
+    pub profile: H264Profile,
+    /// x264's speed preset and tune, when the settings pick them (`X264_PRESETS`, `X264_TUNES`);
+    /// other encoders ignore them.
+    /// (indices into the lists, to keep this small).
+    pub preset: Option<u8>,
+    pub tune: Option<u8>,
+}
+
+/// x264's presets, fastest first, and its tunes (what the recording's "Your own" offers).
+pub const X264_PRESETS: [&str; 9] =
+    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
+pub const X264_TUNES: [&str; 6] = ["film", "animation", "grain", "stillimage", "psnr", "zerolatency"];
+
+/// The index in `list` of a preset or tune a settings file carries, or None if it isn't one.
+pub fn x264_index(list: &[&str], name: &str) -> Option<u8> {
+    list.iter().position(|n| n.eq_ignore_ascii_case(name)).and_then(|i| u8::try_from(i).ok())
+}
+
+impl VideoConfig {
+    /// Seconds between keyframes as the encoders use it: 0 is "let the encoder pick", here 10 s
+    /// (a stream is always given 2 s by its caller: platforms ask for it).
+    pub fn gop_secs(&self) -> u32 {
+        if self.keyframe_secs == 0 { 10 } else { self.keyframe_secs }
+    }
+}
+
+/// H.264's profiles: what the settings' "profile" picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H264Profile {
+    Baseline,
+    Main,
+    #[default]
+    High,
+}
+
+impl H264Profile {
+    /// The settings' word (`baseline`, `main`, `high`); anything else is High.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "baseline" => Self::Baseline,
+            "main" => Self::Main,
+            _ => Self::High,
+        }
+    }
 }
 
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

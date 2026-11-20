@@ -1394,6 +1394,9 @@ mod full_disk_tests {
             rate: RateControl::Cbr,
             keyframe_secs: 1,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let mut pipe = Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -1527,6 +1530,9 @@ mod rebuild_tests {
             rate: RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let mut pipe =
             Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None).ok()?;
@@ -1580,6 +1586,9 @@ mod rebuild_tests {
             rate: RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let dir = std::env::temp_dir().join(format!("ferrocore-rebuild-{}-{differ}", std::process::id()));
         std::fs::create_dir_all(&dir).ok()?;
@@ -1662,6 +1671,9 @@ mod rebuild_tests {
             rate: RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let Ok(mut pipe) =
             Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)

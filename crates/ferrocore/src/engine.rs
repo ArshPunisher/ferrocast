@@ -5235,6 +5235,9 @@ mod tests {
             rate: RateControl::Cbr,
             keyframe_secs: 1,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
@@ -5275,6 +5278,9 @@ mod tests {
             rate: RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let config = EngineConfig { width: 1920, height: 1080, fps: 60, ..Default::default() };
@@ -5370,6 +5376,9 @@ mod tests {
             rate: crate::video::RateControl::Cbr,
             keyframe_secs: 1,
             software: false,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         e.reshape_output(out, 320, 180, 2, video).unwrap_or_else(|x| panic!("{x}"));
         let switched_at = tags.lock().unwrap_or_else(|p| p.into_inner()).len();
@@ -7013,6 +7022,9 @@ mod tests {
             rate: RateControl::Cbr,
             keyframe_secs: 4,
             software: true,
+            profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let config = EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() };

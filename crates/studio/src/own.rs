@@ -36,9 +36,28 @@ fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoC
         fps_den: 1,
         bitrate_kbps: e.video_kbps.max(100),
         rate: rate_of(e),
-        keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
+        keyframe_secs: e.keyframe_s,
         software: is_x264(&e.video_encoder),
+        profile: ferrocore::video::H264Profile::from_name(&e.profile),
+        preset: x264_option(e, "preset", &ferrocore::video::X264_PRESETS),
+        tune: x264_option(e, "tune", &ferrocore::video::X264_TUNES),
     }
+}
+
+/// An x264 preset or tune the settings' encoder options carry (`encode.extra`); only x264 uses it.
+fn x264_option(e: &EncodeSettings, key: &str, list: &[&str]) -> Option<u8> {
+    if !is_x264(&e.video_encoder) {
+        return None;
+    }
+    e.extra.get(key).and_then(|v| v.as_str()).and_then(|n| ferrocore::video::x264_index(list, n))
+}
+
+/// A stream's encoder: platforms ask for a keyframe every 2 s, so "let the encoder pick" (0) is 2.
+fn for_stream(mut v: VideoConfig) -> VideoConfig {
+    if v.keyframe_secs == 0 {
+        v.keyframe_secs = 2;
+    }
+    v
 }
 
 /// x264 (and Lossless) run through FFmpeg, which Ferrocast fetches the first time it's needed.
@@ -699,6 +718,7 @@ impl OwnStream {
         let engine = &shared.engine;
         let config = engine.config();
         let video = video_config(e, config.width, config.height, config.fps);
+        let video = if send_to.is_some() { for_stream(video) } else { video };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
@@ -839,7 +859,7 @@ impl OwnStream {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
         let config = d.shared.engine.config();
-        let video = video_config(e, config.width, config.height, config.fps);
+        let video = for_stream(video_config(e, config.width, config.height, config.fps));
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
         let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
@@ -905,7 +925,7 @@ impl OwnStream {
             return Err(fail("While live, the frame rate can only go to a whole part of the canvas's (60 → 30)."));
         }
         let (w, h) = e.scale.map_or((config.width, config.height), |(w, h)| (w.max(2) & !1, h.max(2) & !1));
-        let video = video_config(e, w, h, fps);
+        let video = for_stream(video_config(e, w, h, fps));
         d.shared
             .engine
             .reshape_output(d.output, w, h, config.fps / fps, video)
@@ -1316,6 +1336,47 @@ mod tests {
             own_encoder: true,
             video_tracks: Vec::new(),
         }
+    }
+
+    /// The picked profile and keyframe interval reach the encoder config (the profile was
+    /// dropped and 0 was forced to 2 everywhere).
+    #[test]
+    fn the_profile_and_keyframe_choices_reach_the_encoder_config() {
+        let mut e = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        e.profile = "main".into();
+        e.keyframe_s = 0;
+        let v = video_config(&e, 1920, 1080, 60);
+        assert_eq!(v.profile, ferrocore::video::H264Profile::Main);
+        assert_eq!((v.keyframe_secs, v.gop_secs()), (0, 10), "a recording lets the encoder pick");
+        assert_eq!(for_stream(v).keyframe_secs, 2, "a stream is held to 2 s");
+        e.keyframe_s = 4;
+        assert_eq!(for_stream(video_config(&e, 1920, 1080, 60)).keyframe_secs, 4);
+    }
+
+    /// A picked x264 preset and tune (the recording's "Your own" options) reach the encoder
+    /// config; another encoder ignores them and an unknown name is dropped.
+    #[test]
+    fn a_picked_encoder_option_reaches_the_recording_encoder() {
+        let mut e = EncodeSettings::with_encoder("obs_x264");
+        e.extra.insert("preset".into(), "SLOW".into());
+        e.extra.insert("tune".into(), "film".into());
+        let v = video_config(&e, 1280, 720, 30);
+        let at = |l: &[&str], n: &str| ferrocore::video::x264_index(l, n);
+        assert_eq!(
+            (v.preset, v.tune),
+            (at(&ferrocore::video::X264_PRESETS, "slow"), at(&ferrocore::video::X264_TUNES, "film"))
+        );
+        assert!(v.preset.is_some() && v.tune.is_some());
+        e.extra.insert("preset".into(), "ludicrous".into());
+        assert_eq!(video_config(&e, 1280, 720, 30).preset, None);
+        let mut vt = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        vt.extra.insert("preset".into(), "slow".into());
+        assert_eq!(video_config(&vt, 1280, 720, 30).preset, None);
+        assert_eq!(ferrocast_studio_options_len("obs_x264"), 2);
+    }
+
+    fn ferrocast_studio_options_len(id: &str) -> usize {
+        crate::kinds::own_encoder_options(id).len()
     }
 
     #[test]
