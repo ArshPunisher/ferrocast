@@ -777,7 +777,7 @@ fn save_json(file: &std::path::Path, v: &Value) {
 }
 
 /// The folder recordings go to: the one set, or Movies/Ferrocast.
-fn record_folder(s: &StudioSettings) -> PathBuf {
+pub(crate) fn record_folder(s: &StudioSettings) -> PathBuf {
     s.record_folder.as_ref().map(PathBuf::from).unwrap_or_else(|| {
         dirs::video_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Movies")).join("Ferrocast")
     })
