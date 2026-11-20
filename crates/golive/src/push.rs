@@ -411,10 +411,25 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 refused: is_refused,
                             },
                         );
+                        // A refusal (a bad key, Kick's multistream) stays parked: asking again won't
+                        // change the answer. Anything else (an outage that outlasted the tries, a
+                        // platform node down for minutes) is tried again slowly while the stream
+                        // goes on, so one platform's bad half hour doesn't end it for the whole stream.
+                        if is_refused {
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break,
+                            }
+                        }
                         tokio::select! {
                             _ = stop.wait_for(|s| *s) => break 'streams,
                             _ = live.wait_for(|l| !still_on(l)) => break,
+                            _ = tokio::time::sleep(SLOW_RETRY) => {}
                         }
+                        attempt = 0;
+                        net_tries = 0;
+                        down_since = None;
+                        continue;
                     }
                     let shown = if net_down { net_tries } else { attempt };
                     let wait = if net_down {
@@ -461,6 +476,13 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
         }
     });
 }
+
+/// How long a destination that gave up (not for a refusal) waits before it tries again, for as long
+/// as the stream goes on.
+#[cfg(not(test))]
+const SLOW_RETRY: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const SLOW_RETRY: Duration = Duration::from_millis(400);
 
 /// A session live this long (ms) counts as the destination having worked in this stream.
 const EVER_LIVE_AFTER_MS: u64 = 1_000;

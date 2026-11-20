@@ -592,6 +592,26 @@ async fn a_destination_waiting_for_the_network_stays_reconnecting_while_a_try_is
     push::fault::set(dport, false);
 }
 
+/// One platform's bad half hour: it gives up after its tries (the stream goes on to the others), and
+/// then tries again by itself every so often: when the platform is back it is live again without
+/// anyone toggling it. (A refusal stays parked: see the key tests.)
+#[tokio::test]
+async fn a_destination_that_gave_up_tries_again_slowly_and_comes_back() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { refused: false, .. })).await;
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
 /// A destination that takes the stream and closes it at once (Kick without multistreaming, 40 ms) has
 /// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
 #[tokio::test]
