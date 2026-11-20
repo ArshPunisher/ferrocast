@@ -511,6 +511,9 @@ struct AddItemBody {
 #[derive(Deserialize)]
 struct LevelsBody {
     names: Vec<String>,
+    /// "fast": the last few blocks (about 43 ms); otherwise the 300 ms window.
+    #[serde(default)]
+    window: Option<String>,
 }
 
 /// `GET /studio/engine/scenes` → `{ scenes, current, transition }`.
@@ -1578,7 +1581,12 @@ async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) ->
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
 async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Levels { names: b.names }).await
+    let fast = match b.window.as_deref() {
+        None | Some("slow") => false,
+        Some("fast") => true,
+        Some(_) => return Err(ferrocast_engine::EngineError::Invalid("window: \"fast\" or \"slow\".".into()).into()),
+    };
+    Ok(Json(app.engine.studio_levels(b.names, fast).await?))
 }
 
 async fn show_config(State(app): State<AppState>) -> Json<Value> {

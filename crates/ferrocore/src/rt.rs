@@ -286,6 +286,10 @@ pub struct AtomicLevels {
     peak: AtomicU64,
     rms: AtomicU64,
     input_peak: AtomicU64,
+    /// The same three over a few blocks only (the dashboard's meters).
+    fast_peak: AtomicU64,
+    fast_rms: AtomicU64,
+    fast_input_peak: AtomicU64,
 }
 
 fn pair(v: [f32; 2]) -> u64 {
@@ -303,6 +307,9 @@ impl Default for AtomicLevels {
             peak: AtomicU64::new(pair(silent.peak)),
             rms: AtomicU64::new(pair(silent.rms)),
             input_peak: AtomicU64::new(pair(silent.input_peak)),
+            fast_peak: AtomicU64::new(pair(silent.peak)),
+            fast_rms: AtomicU64::new(pair(silent.rms)),
+            fast_input_peak: AtomicU64::new(pair(silent.input_peak)),
         }
     }
 }
@@ -319,6 +326,23 @@ impl AtomicLevels {
         self.peak.store(pair(l.peak), Ordering::Relaxed);
         self.rms.store(pair(l.rms), Ordering::Relaxed);
         self.input_peak.store(pair(l.input_peak), Ordering::Relaxed);
+    }
+
+    /// Publishes the fast (few-block) levels.
+    pub fn store_fast(&self, l: &Levels) {
+        self.fast_peak.store(pair(l.peak), Ordering::Relaxed);
+        self.fast_rms.store(pair(l.rms), Ordering::Relaxed);
+        self.fast_input_peak.store(pair(l.input_peak), Ordering::Relaxed);
+    }
+
+    /// The fast levels last published: three atomic loads.
+    #[must_use]
+    pub fn load_fast(&self) -> Levels {
+        Levels {
+            peak: unpair(self.fast_peak.load(Ordering::Relaxed)),
+            rms: unpair(self.fast_rms.load(Ordering::Relaxed)),
+            input_peak: unpair(self.fast_input_peak.load(Ordering::Relaxed)),
+        }
     }
 
     /// The levels last published: three atomic loads.
