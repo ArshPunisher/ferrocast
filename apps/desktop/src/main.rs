@@ -208,6 +208,8 @@ fn main() {
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
+            #[cfg(unix)]
+            tauri::async_runtime::spawn(quit_on_signal(app.handle().clone()));
             // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
             // the prompt is never hidden in the tray.
             if !minimized || !has_tray || show_for_safe_mode {
@@ -273,6 +275,54 @@ fn main() {
         }
         _ => {}
     });
+}
+
+/// The signals that mean "end now": `kill` and `pkill` (SIGTERM), Ctrl-C in a terminal (SIGINT), a
+/// terminal or login ending (SIGHUP). By default each ends the process on the spot, with no
+/// `RunEvent::Exit`: the run markers stayed and the next launch opened in Safe Mode (20 Nov, a
+/// plain `kill` of the test app). They are caught instead and asked to quit as Quit does.
+#[cfg(unix)]
+struct QuitSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl QuitSignals {
+    /// Must run inside the async runtime.
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    /// The first of them to arrive.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+            _ = self.hup.recv() => "SIGHUP",
+        }
+    }
+}
+
+/// Quits through the normal path (`RunEvent::Exit`, the clean-exit sequence) on the first signal.
+#[cfg(unix)]
+async fn quit_on_signal(app: AppHandle) {
+    let mut signals = match QuitSignals::register() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't listen for quit signals: kill ends Ferrocast without a clean quit");
+            return;
+        }
+    };
+    let which = signals.next().await;
+    tracing::info!(signal = which, "asked to quit by a signal");
+    app.exit(0);
 }
 
 /// The "Ferrocast is running" notes (the Studio's session and the engine's `running.json`) that
@@ -1276,6 +1326,18 @@ mod update_tests {
             "a launch after the update is a normal one"
         );
         engine.shutdown();
+    }
+
+    /// `kill` (SIGTERM) used to end Ferrocast with the run markers left behind; it is caught now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_signal_is_caught_so_the_quit_can_run_clean() {
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("{e}"));
+        let pid = std::process::id().to_string();
+        let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap_or_else(|e| panic!("{e}"));
+        assert!(sent.success());
+        let which = tokio::time::timeout(Duration::from_secs(5), signals.next()).await;
+        assert_eq!(which.ok(), Some("SIGTERM"));
     }
 
     #[test]
