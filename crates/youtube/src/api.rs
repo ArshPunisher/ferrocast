@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use reqwest::Method;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::oauth::{self, AppCredentials, Tokens};
 use crate::{Endpoints, YoutubeError, now_ms};
 
-type OnTokens = Arc<dyn Fn(&Tokens) -> Result<(), String> + Send + Sync>;
+pub(crate) type OnTokens = Arc<dyn Fn(&Tokens) -> Result<(), String> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct MadeBroadcast {
@@ -93,6 +93,9 @@ pub struct Api {
     app: AppCredentials,
     tokens: Mutex<Tokens>,
     on_tokens: OnTokens,
+    /// The last refreshed sign-in couldn't be saved (the Keychain): it is kept for this session and
+    /// saved again at the next use.
+    unsaved: AtomicBool,
     /// Ban ids by banned channel, so "unban" can find the ban YouTube created.
     bans: StdMutex<HashMap<String, String>>,
     /// Finding or making the normal broadcast, one at a time (CodeRabbit): two calls at once
@@ -152,6 +155,7 @@ impl Api {
             app,
             tokens: Mutex::new(tokens),
             on_tokens,
+            unsaved: AtomicBool::new(false),
             bans: StdMutex::new(HashMap::new()),
             made: Mutex::new(MadeSlot::default()),
             made_vertical: Mutex::new(MadeSlot::default()),
@@ -180,6 +184,8 @@ impl Api {
         let mut t = self.tokens.lock().await;
         if t.needs_refresh(now_ms()) {
             *t = self.refresh_locked(&t).await?;
+        } else if self.unsaved.load(Ordering::Acquire) {
+            self.save(&t);
         }
         Ok(t.access_token.clone())
     }
@@ -195,9 +201,22 @@ impl Api {
 
     async fn refresh_locked(&self, current: &Tokens) -> Result<Tokens, YoutubeError> {
         let fresh = oauth::refresh(&self.http, &self.ep, &self.app, current).await?;
-        (self.on_tokens)(&fresh)
-            .map_err(|e| YoutubeError::Refused(format!("couldn't save the new YouTube sign-in: {e}")))?;
+        // Kept even when saving it failed (a Keychain hiccup), as Twitch's and Kick's are: dropping
+        // it ended the chat, and a provider that rotates the refresh token would sign out for good.
+        self.save(&fresh);
         Ok(fresh)
+    }
+
+    fn save(&self, t: &Tokens) {
+        match (self.on_tokens)(t) {
+            Ok(()) => self.unsaved.store(false, Ordering::Release),
+            Err(e) => {
+                // Logged once, not at every use.
+                if !self.unsaved.swap(true, Ordering::AcqRel) {
+                    tracing::error!(error = %e, "couldn't save the new YouTube sign-in; it's kept for this session, saving is retried");
+                }
+            }
+        }
     }
 
     async fn call(

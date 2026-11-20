@@ -381,6 +381,29 @@ async fn a_fresh_token_that_is_refused_again_ends_the_chat_asking_for_a_sign_in(
     let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 }
 
+/// The Keychain refusing to save the refreshed sign-in (locked, a hiccup) must not throw it away:
+/// Twitch and Kick keep it for the session and save again later; YouTube refused the refresh and
+/// the chat with it. The next refresh would have used the same old refresh token, and a provider
+/// that rotates it would have signed the streamer out for good.
+#[tokio::test]
+async fn a_refreshed_sign_in_the_keychain_wouldnt_save_is_kept_for_the_session() {
+    let (ep, _script, forms) = fakes().await;
+    // Expired: the first use refreshes it.
+    let tokens = Tokens { access_token: "old".into(), refresh_token: "r".into(), expires_at: 1 };
+    let saves = Arc::new(Mutex::new(0usize));
+    let counted = saves.clone();
+    let on_tokens: crate::api::OnTokens = Arc::new(move |_| {
+        let mut n = counted.lock().unwrap();
+        *n += 1;
+        if *n == 1 { Err("the Keychain is locked".to_string()) } else { Ok(()) }
+    });
+    let api = Api::new(http_client(), ep, app(), tokens, on_tokens);
+    assert_eq!(api.access().await.expect("the refreshed token is used"), "access-0");
+    assert_eq!(api.access().await.unwrap(), "access-0", "and kept: no second refresh");
+    assert_eq!(forms.lock().unwrap().len(), 1, "refreshed once");
+    assert!(*saves.lock().unwrap() >= 2, "saving is tried again at the next use: {}", saves.lock().unwrap());
+}
+
 // ---------------------------------------------------------------- stream info (Studio)
 
 /// A fake YouTube Data API for the broadcast's video: `scheduled` decides whether there's
