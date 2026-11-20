@@ -100,7 +100,7 @@ struct Held {
     program_view: Option<Preview>,
     program_at: Option<(Rect, f64)>,
     /// Open projector windows, by id (they go when the Studio stops or the canvas changes).
-    projectors: Vec<(u64, ProjectorWin)>,
+    projectors: Vec<(u64, ProjectorWin, ProjectorReq)>,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     last_projector: u64,
     /// The vertical picture's preview, beside the main one.
@@ -269,7 +269,7 @@ fn refresh_projectors(h: &Held) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(c) = &h.collection {
         let look = multiview_look(&h.settings.clone().unwrap_or_default());
-        for (_, p) in &h.projectors {
+        for (_, p, _) in &h.projectors {
             p.update(c, look);
         }
     }
@@ -1907,6 +1907,104 @@ impl DesktopStudio {
     }
 }
 
+/// Two projectors on the same display: both full screen, on the same one.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn same_screen(a: Option<u32>, b: Option<u32>) -> bool {
+    a.is_some() && a == b
+}
+
+/// Where the open projectors are kept for "Restore projectors on start" (one file, apart from
+/// the settings, so a settings save made from an older page can't undo it).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn projectors_file(data: &std::path::Path) -> PathBuf {
+    data.join("studio").join("projectors.json")
+}
+
+/// Opens a projector: one per screen when the setting says so, above other windows when it says
+/// so. → its id. The caller saves the list.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn open_projector(h: &mut Held, p: &ProjectorReq, data: &std::path::Path) -> Result<u64, String> {
+    let settings = h.settings.clone().unwrap_or_default();
+    let c = h.collection.as_ref().ok_or(STOPPED)?;
+    let of = match p.what.as_str() {
+        "program" => ferrocast_studio::ProjectorOf::Program,
+        "multiview" => ferrocast_studio::ProjectorOf::Multiview,
+        _ => ferrocast_studio::ProjectorOf::Source(p.name.clone().unwrap_or_default()),
+    };
+    h.last_projector += 1;
+    let id = h.last_projector;
+    let data = data.to_path_buf();
+    // Closed by its own button or Esc: out of the list (and dropped) after the borrow.
+    let on_close = Box::new(move || {
+        let gone = HELD.with(|h| {
+            let mut h = h.try_borrow_mut().ok()?;
+            let i = h.projectors.iter().position(|(pid, _, _)| *pid == id)?;
+            let gone = h.projectors.remove(i);
+            save_projectors(&h, &data);
+            Some(gone)
+        });
+        drop(gone);
+    });
+    // A click on a multiview scene puts it on air, through its transition; in Studio
+    // Mode it goes to the preview instead, as in OBS.
+    let on_pick = Box::new(|scene: String| {
+        HELD.with(|h| {
+            let Ok(h) = h.try_borrow() else { return };
+            let Some(c) = &h.collection else { return };
+            let done = if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
+            if c.moving() {
+                glide();
+            }
+            if let Err(e) = done {
+                tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
+            }
+            sync_views(&h);
+        });
+    });
+    let look = multiview_look(&settings);
+    let made = c.projector(&of, p.screen.map(|s| s as usize), look, on_close, on_pick).map_err(|e| e.to_string())?;
+    if p.on_top || settings.projector_on_top {
+        made.set_on_top(true);
+    }
+    // One full-screen projector per display: the one already on it goes (after the new one is
+    // up, so the picture never leaves the screen).
+    if settings.projector_one_per_screen && p.screen.is_some() {
+        h.projectors.retain(|(_, _, r)| !same_screen(r.screen, p.screen));
+    }
+    h.projectors.push((id, made, p.clone()));
+    Ok(id)
+}
+
+/// Keeps the open projectors for the next Start, when that is asked for.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn save_projectors(h: &Held, data: &std::path::Path) {
+    if !h.settings.as_ref().is_some_and(|s| s.projector_restore) {
+        return;
+    }
+    let list: Vec<&ProjectorReq> = h.projectors.iter().map(|(_, _, r)| r).collect();
+    save_json(&projectors_file(data), &serde_json::to_value(list).unwrap_or(Value::Null));
+}
+
+/// The projectors kept from last time, opened again (a source that is gone or a display that is
+/// not there is skipped, with a note in the log).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn restore_projectors(h: &mut Held, data: &std::path::Path) {
+    if !h.settings.as_ref().is_some_and(|s| s.projector_restore) {
+        return;
+    }
+    let list: Vec<ProjectorReq> =
+        ferrocast_store::durable::load_json_with_backup::<Vec<ProjectorReq>>(&projectors_file(data), |l| {
+            l.len() <= 16 && l.iter().all(|p| p.validate().is_ok())
+        })
+        .map(|l| l.value)
+        .unwrap_or_default();
+    for p in list {
+        if let Err(e) = open_projector(h, &p, data) {
+            tracing::warn!(error = %e, what = %p.what, "a saved projector didn't open");
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl StudioHost for DesktopStudio {
     async fn status(&self) -> StudioStatus {
@@ -1950,6 +2048,8 @@ impl StudioHost for DesktopStudio {
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            restore_projectors(h, &data);
             write_session(session_now(h).as_ref());
             // The first Start after a crash says what was on, for the engine to put back.
             let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
@@ -3818,49 +3918,10 @@ impl StudioHost for DesktopStudio {
     async fn projector(&self, p: ProjectorReq) -> Result<Value, String> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
+            let data = self.data.clone();
             self.on_main(move |h| {
-                let c = h.collection.as_ref().ok_or(STOPPED)?;
-                let of = match p.what.as_str() {
-                    "program" => ferrocast_studio::ProjectorOf::Program,
-                    "multiview" => ferrocast_studio::ProjectorOf::Multiview,
-                    _ => ferrocast_studio::ProjectorOf::Source(p.name.clone().unwrap_or_default()),
-                };
-                h.last_projector += 1;
-                let id = h.last_projector;
-                // Closed by its own button or Esc: out of the list (and dropped) after the borrow.
-                let on_close = Box::new(move || {
-                    let gone = HELD.with(|h| {
-                        let mut h = h.try_borrow_mut().ok()?;
-                        let i = h.projectors.iter().position(|(pid, _)| *pid == id)?;
-                        Some(h.projectors.remove(i))
-                    });
-                    drop(gone);
-                });
-                // A click on a multiview scene puts it on air, through its transition; in Studio
-                // Mode it goes to the preview instead, as in OBS.
-                let on_pick = Box::new(|scene: String| {
-                    HELD.with(|h| {
-                        let Ok(h) = h.try_borrow() else { return };
-                        let Some(c) = &h.collection else { return };
-                        let done =
-                            if c.preview_scene().is_some() { c.set_preview(&scene) } else { c.set_current(&scene) };
-                        if c.moving() {
-                            glide();
-                        }
-                        if let Err(e) = done {
-                            tracing::warn!(error = %e, "a multiview click couldn't switch scenes");
-                        }
-                        sync_views(&h);
-                    });
-                });
-                let look = multiview_look(&h.settings.clone().unwrap_or_default());
-                let made = c
-                    .projector(&of, p.screen.map(|s| s as usize), look, on_close, on_pick)
-                    .map_err(|e| e.to_string())?;
-                if p.on_top {
-                    made.set_on_top(true);
-                }
-                h.projectors.push((id, made));
+                let id = open_projector(h, &p, &data)?;
+                save_projectors(h, &data);
                 Ok(json!({ "id": id }))
             })
             .await?
@@ -3873,8 +3934,14 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn close_projectors(&self) -> Result<(), String> {
-        // Dropped on the main thread, where their windows live.
-        self.on_main(|h| h.projectors.clear()).await
+        // Dropped on the main thread, where their windows live. Closed on purpose: the saved
+        // list is empty too (only the Studio stopping or Ferrocast quitting keeps it).
+        let data = self.data.clone();
+        self.on_main(move |h| {
+            h.projectors.clear();
+            save_projectors(h, &data);
+        })
+        .await
     }
 
     async fn screens(&self) -> Result<Value, String> {
@@ -4507,5 +4574,33 @@ mod budget_tests {
         s.video_kbps = 4_500;
         assert_eq!(effective_stream_encode(&s, Some(twitch), Some(50)).video_kbps, 2_250);
         assert_eq!(effective_stream_encode(&s, None, None).video_kbps, 4_500);
+    }
+}
+
+#[cfg(test)]
+mod projector_tests {
+    use super::*;
+
+    #[test]
+    fn only_full_screen_projectors_on_the_same_display_clash() {
+        assert!(same_screen(Some(1), Some(1)));
+        assert!(!same_screen(Some(1), Some(2)));
+        // A window (no display) never clashes with another window.
+        assert!(!same_screen(None, None));
+        assert!(!same_screen(Some(0), None));
+    }
+
+    #[test]
+    fn the_saved_list_is_the_requests_as_they_were_and_old_ones_still_read() {
+        let list = vec![
+            ProjectorReq { what: "multiview".into(), name: None, screen: Some(1), on_top: false },
+            ProjectorReq { what: "source".into(), name: Some("Camera".into()), screen: None, on_top: true },
+        ];
+        let v = serde_json::to_value(&list).unwrap();
+        let back: Vec<ProjectorReq> = serde_json::from_value(v).unwrap();
+        assert_eq!(back, list);
+        // The settings file of an older version has none of the new fields: today's behaviour.
+        let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
+        assert!(!old.projector_on_top && !old.projector_one_per_screen && !old.projector_restore);
     }
 }
