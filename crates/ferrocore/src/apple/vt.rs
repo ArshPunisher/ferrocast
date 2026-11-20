@@ -164,6 +164,9 @@ pub(crate) struct Encoder {
     rate_now: (u32, RateControl),
     /// The last failure was a lost session (see `recoverable`), not a bad frame.
     lost: bool,
+    /// After a rebuild: the lost session's codec header, until the new one's is known and
+    /// compared with it (`header_changed`).
+    prior_header: Option<Vec<u8>>,
 }
 
 // SAFETY: the session is only used through `&mut self` (one thread at a time); VideoToolbox
@@ -344,6 +347,7 @@ impl Encoder {
             cfg: *cfg,
             rate_now: (cfg.bitrate_kbps, cfg.rate),
             lost: false,
+            prior_header: None,
         })
     }
 
@@ -352,6 +356,17 @@ impl Encoder {
         set_rate(&self.session, kbps, rate)?;
         self.rate_now = (kbps, rate);
         Ok(())
+    }
+
+    /// After a rebuilt session: true once, when its codec header (SPS/PPS) is known and differs
+    /// from the lost session's, so the stream must send a new sequence header before its
+    /// keyframe. False while it isn't known yet (asked again next frame) and when it's the same.
+    pub(crate) fn header_changed(&mut self) -> bool {
+        let Some(prior) = self.prior_header.as_ref() else { return false };
+        let Some(now) = self.header() else { return false };
+        let changed = *prior != now;
+        self.prior_header = None;
+        changed
     }
 
     pub(crate) fn header(&self) -> Option<Vec<u8>> {
@@ -368,6 +383,9 @@ impl Encoder {
                 let mut fresh = Encoder::new(&self.cfg)?;
                 set_rate(&fresh.session, self.rate_now.0, self.rate_now.1)?;
                 fresh.rate_now = self.rate_now;
+                // Kept to see whether the new session's parameter sets differ from what the
+                // viewers' decoders were given (`header_changed`).
+                fresh.prior_header = self.header().or_else(|| self.prior_header.take());
                 std::mem::swap(self, &mut fresh);
                 self.lost = false;
                 self.encode_once(frame, pts_us, true)
@@ -491,6 +509,23 @@ impl Encoder {
             return Err(fail("finish", s));
         }
         self.take()
+    }
+
+    /// Tests: the lost session's header isn't what the new one will make.
+    #[cfg(test)]
+    pub(crate) fn perturb_header_for_test(&mut self) {
+        if let Ok(mut sink) = self.sink.lock()
+            && let Some(b) = sink.header.as_mut().and_then(|h| h.last_mut())
+        {
+            *b ^= 0x55;
+        }
+    }
+
+    /// Tests: the system takes the session back.
+    #[cfg(test)]
+    pub(crate) fn invalidate_for_test(&mut self) {
+        // SAFETY: the session is live; the system does the same when it takes one back.
+        unsafe { VTCompressionSessionInvalidate(self.session.0) };
     }
 
     fn take(&mut self) -> Result<Vec<VideoPacket>, AvError> {

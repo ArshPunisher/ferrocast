@@ -183,6 +183,28 @@ impl VideoEncoder {
         }
     }
 
+    /// True once when a rebuilt hardware session made a codec header unlike the lost one's:
+    /// a stream sends the new sequence header before the next keyframe.
+    pub fn header_changed(&mut self) -> bool {
+        match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.header_changed(),
+            Inner::Ffmpeg(_) => false,
+        }
+    }
+
+    /// Tests: the hardware session is taken away, and (with `differ`) its header made unlike
+    /// what a new one will have.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn lose_session_for_test(&mut self, differ: bool) {
+        if let Inner::Native(e) = &mut self.inner {
+            if differ {
+                e.perturb_header_for_test();
+            }
+            e.invalidate_for_test();
+        }
+    }
+
     /// Hands a frame in (`key` forces a keyframe where the encoder can); returns what's ready.
     pub fn encode(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
         let ok = match (frame, self.config.input) {

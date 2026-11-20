@@ -670,6 +670,17 @@ impl Pipeline {
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
         self.last_in_us = pts;
         let packets = self.video.encode(frame, pts, key)?;
+        // A hardware session the system took back and we rebuilt: if its parameter sets differ,
+        // the stream sends a new sequence header before its keyframe, as when a new picture
+        // takes over (`set_video`). A file's can't change; it keeps the first.
+        if self.video.header_changed() {
+            if self.recording.is_some() || self.replay.is_some() {
+                tracing::warn!(
+                    "the video encoder was rebuilt with other parameter sets; the recording keeps the first"
+                );
+            }
+            self.sent_video_header = false;
+        }
         self.video_out(packets)
     }
 
@@ -1381,5 +1392,70 @@ mod cut_tests {
         }
         assert_eq!(held.len(), super::MAX_HELD_AUDIO);
         assert_eq!(held.back().unwrap().1.pts_us, 9_999 * 21_333);
+    }
+}
+
+/// A hardware session lost and rebuilt (agy GAPS #4): viewers' decoders hold the first SPS/PPS,
+/// so a different pair needs a new sequence header before the keyframe; the same needs none.
+#[cfg(all(test, target_os = "macos"))]
+mod rebuild_tests {
+    use super::*;
+    use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    fn sequence_headers(tags: &[Tag]) -> usize {
+        tags.iter().filter(|t| matches!(t, Tag::Video { body, .. } if body[0] & 0x0f == 7 && body[1] == 0)).count()
+    }
+
+    fn run(differ: bool) -> Option<(usize, Vec<Tag>)> {
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        };
+        let mut pipe =
+            Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None).ok()?;
+        let (y, uv) = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let frame = || Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 };
+        let mut tags = Vec::new();
+        for i in 0..10u64 {
+            tags.extend(pipe.video(frame(), i * 33_333_333).ok()?);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = sequence_headers(&tags);
+        pipe.video.lose_session_for_test(differ);
+        for i in 10..60u64 {
+            tags.extend(pipe.video(frame(), i * 33_333_333).ok()?);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some((before, tags))
+    }
+
+    #[test]
+    fn a_rebuilt_session_with_other_parameter_sets_sends_a_new_sequence_header_first() {
+        let Some((before, tags)) = run(true) else { return };
+        assert_eq!(before, 1, "the first header went out at the start");
+        assert_eq!(sequence_headers(&tags), 2, "a new one for the rebuilt session");
+        // It comes before the keyframe that follows the rebuild.
+        let at = tags
+            .iter()
+            .rposition(|t| matches!(t, Tag::Video { body, .. } if body[0] & 0x0f == 7 && body[1] == 0))
+            .unwrap_or(0);
+        assert!(
+            matches!(tags.get(at + 1), Some(Tag::Video { body, .. }) if body[0] >> 4 == 1 && body[1] == 1),
+            "a keyframe follows the new header"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_session_with_the_same_parameter_sets_sends_no_extra_header() {
+        let Some((_, tags)) = run(false) else { return };
+        assert_eq!(sequence_headers(&tags), 1);
     }
 }
