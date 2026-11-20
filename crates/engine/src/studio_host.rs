@@ -1485,6 +1485,11 @@ pub enum StudioAct {
         talk: bool,
         down: bool,
     },
+    /// One look for the live watch's two-second tick, taken together on the Studio's thread:
+    /// `{ scenes, audio, items }`: the scenes (as `Scenes`), the sounds of the scene on air (as
+    /// `Audio`, null when none) and the items of that scene and of every scene shown inside it
+    /// (as `Items`, by scene name). Replaces a handful of separate reads every tick. Never saved.
+    WatchSnapshot,
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
     Look {
@@ -1811,7 +1816,7 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy => Ok(()),
+            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy | A::WatchSnapshot => Ok(()),
             A::SetPrivacy { privacy } => {
                 if !privacy.is_object() || privacy.to_string().len() > 8_000 {
                     return Err(EngineError::Invalid("privacy: { hide_notifications, hide_apps }.".into()));
@@ -2119,6 +2124,7 @@ impl StudioAct {
                 | A::Audio { .. }
                 | A::Levels { .. }
                 | A::PushKey { .. }
+                | A::WatchSnapshot
                 | A::Look { .. }
                 | A::AudioCare
                 | A::Privacy

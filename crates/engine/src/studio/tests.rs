@@ -1289,6 +1289,108 @@ struct FakeStudio {
     sidechain_cycles: Mutex<Vec<serde_json::Value>>,
     /// A second, unmuted mic ("Desk") speaking at -15.
     two_mics: Mutex<bool>,
+    /// How many acts the engine has made on the Studio's thread.
+    act_calls: Mutex<usize>,
+}
+
+impl FakeStudio {
+    /// What the meters say now.
+    fn levels_json(&self) -> Value {
+        let db = *self.mic_db.lock().unwrap();
+        let input = self.mic_input.lock().unwrap().unwrap_or(db);
+        let mut v = json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } });
+        if *self.two_mics.lock().unwrap() {
+            v["Desk"] = json!({ "peak": [-15.0, -15.0], "magnitude": [-15.0, -15.0], "input_peak": [-15.0, -15.0] });
+        }
+        v
+    }
+
+    /// The Studio's answer to one act (not counted: the engine's calls are, in `act`).
+    fn fake_act<'a>(
+        &'a self,
+        act: crate::studio_host::StudioAct,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::studio_host::StudioAct as A;
+            let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
+            Ok(match act {
+                A::Scenes => match self.empty_scene.lock().unwrap().clone() {
+                    None => json!({
+                        "current": lock(&self.current),
+                        "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
+                    }),
+                    Some(empty) => {
+                        let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
+                            .iter()
+                            .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
+                            .collect();
+                        json!({ "current": lock(&self.current), "scenes": scenes })
+                    }
+                },
+                A::SetCurrent { scene } => {
+                    self.acts.lock().unwrap().push(format!("scene {scene}"));
+                    *self.current.lock().unwrap() = scene;
+                    Value::Null
+                }
+                A::Audio { .. } => {
+                    let mut rows = vec![
+                        json!({ "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() }),
+                        json!({ "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false }),
+                    ];
+                    if *self.two_mics.lock().unwrap() {
+                        rows.push(
+                        json!({ "name": "Desk", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": false }),
+                    );
+                    }
+                    Value::Array(rows)
+                }
+                A::SetAudio { name, change } => {
+                    if let Some(m) = change.muted {
+                        self.acts.lock().unwrap().push(format!("mute {name} {m}"));
+                        *self.muted.lock().unwrap() = m;
+                    }
+                    Value::Null
+                }
+                A::Items { scene } => {
+                    if let Some(v) = self.scene_items.lock().unwrap().get(&scene) {
+                        v.clone()
+                    } else if self.empty_scene.lock().unwrap().as_deref() == Some(scene.as_str()) {
+                        json!([])
+                    } else if scene == "Live" {
+                        json!([{ "id": 7, "name": "Camera", "kind": "av_capture_input", "visible": *self.cam_shown.lock().unwrap() }])
+                    } else {
+                        json!([{ "id": 1, "name": "Bg", "kind": "image_source", "visible": true }])
+                    }
+                }
+                A::Levels { .. } => self.levels_json(),
+                A::Look { .. } => {
+                    let black = *self.cam_black.lock().unwrap();
+                    json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
+                }
+                A::EditItem { scene, id, edit } => {
+                    self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
+                    if id == 7 {
+                        match edit {
+                            crate::studio_host::ItemEdit::Show => *self.cam_shown.lock().unwrap() = true,
+                            crate::studio_host::ItemEdit::Hide => *self.cam_shown.lock().unwrap() = false,
+                            _ => {}
+                        }
+                    }
+                    Value::Null
+                }
+                A::WatchSnapshot => {
+                    // As the real one: the scenes, the on-air scene's sounds and its items (and the
+                    // scenes inside it), read together: one call from the engine's side.
+                    let scenes = self.fake_act(A::Scenes).await?;
+                    let current = scenes["current"].as_str().unwrap_or_default().to_string();
+                    let audio = self.fake_act(A::Audio { scene: current.clone() }).await?;
+                    let items = self.fake_act(A::Items { scene: current.clone() }).await?;
+                    json!({ "scenes": scenes, "audio": audio, "items": { current: items } })
+                }
+                other => return Err(format!("not faked: {other:?}")),
+            })
+        })
+    }
 }
 
 #[async_trait]
@@ -1330,86 +1432,17 @@ impl crate::studio_host::StudioHost for FakeStudio {
         Ok(vec![Some(0.8); pictures.len()])
     }
 
-    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
-        use crate::studio_host::StudioAct as A;
-        let lock = |m: &Mutex<String>| m.lock().unwrap().clone();
-        Ok(match act {
-            A::Scenes => match self.empty_scene.lock().unwrap().clone() {
-                None => json!({
-                    "current": lock(&self.current),
-                    "scenes": [{ "name": "Starting" }, { "name": "Live" }, { "name": "BRB" }],
-                }),
-                Some(empty) => {
-                    let scenes: Vec<Value> = ["Starting", "Live", "BRB"]
-                        .iter()
-                        .map(|n| json!({ "name": n, "items": if *n == empty { 0 } else { 2 } }))
-                        .collect();
-                    json!({ "current": lock(&self.current), "scenes": scenes })
-                }
-            },
-            A::SetCurrent { scene } => {
-                self.acts.lock().unwrap().push(format!("scene {scene}"));
-                *self.current.lock().unwrap() = scene;
-                Value::Null
-            }
-            A::Audio { .. } => {
-                let mut rows = vec![
-                    json!({ "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() }),
-                    json!({ "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false }),
-                ];
-                if *self.two_mics.lock().unwrap() {
-                    rows.push(
-                        json!({ "name": "Desk", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": false }),
-                    );
-                }
-                Value::Array(rows)
-            }
-            A::SetAudio { name, change } => {
-                if let Some(m) = change.muted {
-                    self.acts.lock().unwrap().push(format!("mute {name} {m}"));
-                    *self.muted.lock().unwrap() = m;
-                }
-                Value::Null
-            }
-            A::Items { scene } => {
-                if let Some(v) = self.scene_items.lock().unwrap().get(&scene) {
-                    v.clone()
-                } else if self.empty_scene.lock().unwrap().as_deref() == Some(scene.as_str()) {
-                    json!([])
-                } else if scene == "Live" {
-                    json!([{ "id": 7, "name": "Camera", "kind": "av_capture_input", "visible": *self.cam_shown.lock().unwrap() }])
-                } else {
-                    json!([{ "id": 1, "name": "Bg", "kind": "image_source", "visible": true }])
-                }
-            }
-            A::Levels { .. } => {
-                let db = *self.mic_db.lock().unwrap();
-                let input = self.mic_input.lock().unwrap().unwrap_or(db);
-                let mut v = json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } });
-                if *self.two_mics.lock().unwrap() {
-                    v["Desk"] =
-                        json!({ "peak": [-15.0, -15.0], "magnitude": [-15.0, -15.0], "input_peak": [-15.0, -15.0] });
-                }
-                v
-            }
-            A::Look { .. } => {
-                let black = *self.cam_black.lock().unwrap();
-                json!({ "Camera": { "luma": if black { 2 } else { 120 }, "spread": if black { 1 } else { 40 }, "sig": 1 } })
-            }
-            A::EditItem { scene, id, edit } => {
-                self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
-                if id == 7 {
-                    match edit {
-                        crate::studio_host::ItemEdit::Show => *self.cam_shown.lock().unwrap() = true,
-                        crate::studio_host::ItemEdit::Hide => *self.cam_shown.lock().unwrap() = false,
-                        _ => {}
-                    }
-                }
-                Value::Null
-            }
-            other => return Err(format!("not faked: {other:?}")),
-        })
+    /// The meters are read without the Studio's queue, as the real one's are.
+    fn levels_now(&self, _names: &[String], _fast: bool) -> Option<Value> {
+        Some(self.levels_json())
     }
+
+    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
+        // Each call the engine makes to the Studio's thread (tests count them per tick).
+        *self.act_calls.lock().unwrap() += 1;
+        self.fake_act(act).await
+    }
+
     async fn settings(&self) -> crate::studio_host::StudioSettings {
         Default::default()
     }
@@ -2181,4 +2214,50 @@ async fn preflight_does_not_warn_about_a_muted_mic_while_another_carries_the_voi
     let mut checks = Vec::new();
     e.preflight_picture_and_mics(&crate::studio::rig::Rig::Studio, &e.show_config(), Some("Live"), &mut checks).await;
     assert!(checks.iter().any(|c| c.id == "mic:Mic"), "alone it is warned about: {checks:?}");
+}
+
+/// agy REV21 R2.7: a live tick used to make a handful of separate reads on the Studio's thread
+/// (Scenes twice, Audio, Items per scene, Look); it makes two now: one snapshot (scenes, the
+/// on-air scene's sounds, the items to judge it) and the cameras' look.
+#[tokio::test]
+async fn a_live_tick_asks_the_studios_thread_at_most_twice() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        two_mics: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(json!({ "cam_sources": ["Camera"] }).as_object().unwrap()).await.unwrap();
+    // The pieces the loop runs on one snapshot.
+    let calls = || *studio.act_calls.lock().unwrap();
+    let snap = e.watch_snapshot().await;
+    e.scene_chapter_tick_with(snap.scenes.as_ref()).await;
+    let alerts = e.live_watch_tick_with(&snap).await;
+    assert_eq!(calls(), 2, "the snapshot and the cameras' look; alerts: {alerts:?}");
+    // And what the snapshot carries is what the separate reads gave: the scene is judged, the mics found.
+    let sample = e.watch_sample_with(0, &e.show_config(), &snap).await;
+    assert_eq!(sample.scene.as_ref().map(|s| (s.name.as_str(), s.empty)), Some(("Live", false)));
+    assert_eq!(sample.levels.len(), 2, "{:?}", sample.levels);
+    assert_eq!(sample.cameras.len(), 1);
+}
+
+/// The same through the loop itself: its first look at a streaming Studio makes two acts.
+#[tokio::test]
+async fn the_watch_loop_makes_two_acts_in_a_look() {
+    let (e, _d) = engine().await;
+    go_live(&e).await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        cam_shown: Mutex::new(true),
+        streaming: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(json!({ "cam_sources": ["Camera"] }).as_object().unwrap()).await.unwrap();
+    e.watch_live();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(*studio.act_calls.lock().unwrap(), 2, "one look = a snapshot and the cameras");
 }
