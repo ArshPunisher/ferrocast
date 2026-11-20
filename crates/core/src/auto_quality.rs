@@ -152,7 +152,12 @@ impl AutoQuality {
             return None;
         }
         // Every platform down: nothing is being sent, so a quiet look proves nothing.
-        if !was_down && self.pct < 100 && at - self.last_trouble >= CALM_MS && at - self.last_change >= CALM_MS {
+        if !was_down
+            && !now_down
+            && self.pct < 100
+            && at - self.last_trouble >= CALM_MS
+            && at - self.last_change >= CALM_MS
+        {
             self.pct = (self.pct + UP).min(100);
             self.last_change = at;
             return Some(self.pct);
