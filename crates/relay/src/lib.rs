@@ -743,7 +743,7 @@ async fn kick_callback(State(st): State<AppState>, Query(q): Query<Callback>) ->
     }
     let payload = json!({
         "tokens": { "access_token": tokens.access_token, "refresh_token": tokens.refresh_token,
-                    "expires_at": now_ms() + tokens.expires_in.clamp(0, 86_400 * 30) * 1000 },
+                    "expires_at": now_ms() + tokens.expires_in.clamp(600, 86_400 * 30) * 1000 },
         "user": { "id": broadcaster, "name": user["name"], "avatar_url": user["profile_picture"] },
     });
     if st.enqueue(&install, "kick_connected", &payload).is_err() {
@@ -794,7 +794,7 @@ async fn kick_refresh(
         .await
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick sent a bad answer."))?;
     Ok(axum::Json(json!({ "access_token": t.access_token, "refresh_token": t.refresh_token,
-                          "expires_at": now_ms() + t.expires_in.clamp(0, 86_400 * 30) * 1000 }))
+                          "expires_at": now_ms() + t.expires_in.clamp(600, 86_400 * 30) * 1000 }))
     .into_response())
 }
 

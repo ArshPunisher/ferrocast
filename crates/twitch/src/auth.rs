@@ -40,6 +40,13 @@ pub struct DeviceCode {
     pub interval: u64,
 }
 
+/// When a token that lives `expires_in` seconds, got at `now` (ms), counts as expiring: never sooner than
+/// the refresh margin plus ten minutes, so a short-lived token isn't "already expiring" and refreshed
+/// (spending Twitch's single-use refresh token) at every call.
+pub(crate) fn expires_at(now: i64, expires_in: i64) -> i64 {
+    now + expires_in.clamp(600, 365 * 86_400) * 1000
+}
+
 /// Saved in the secret store as JSON. `expires_at` lets us refresh before Twitch says no.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
@@ -192,7 +199,7 @@ fn tokens(t: TokenResponse) -> Tokens {
     Tokens {
         access_token: t.access_token,
         refresh_token: t.refresh_token,
-        expires_at: now_ms() + t.expires_in.clamp(0, 365 * 86_400) * 1000,
+        expires_at: expires_at(now_ms(), t.expires_in),
         scopes: t.scope,
     }
 }
@@ -233,6 +240,25 @@ mod refresh_answer_tests {
         ] {
             let e = refresh(&http, &page, "c", "r").await.unwrap_err();
             assert_ne!(e, TwitchError::SignInNeeded, "a page from a proxy is not a sign-out");
+        }
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_lived_token_is_not_refreshed_at_every_call() {
+        let now = 1_000_000_000_000;
+        for lifetime in [0, 60, 299] {
+            let t = Tokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: expires_at(now, lifetime),
+                scopes: vec![],
+            };
+            assert!(!t.needs_refresh(now), "{lifetime} s");
         }
     }
 }
