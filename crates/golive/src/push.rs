@@ -55,6 +55,12 @@ const MIN_BACKLOG_PACKETS: usize = 4;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 6;
 /// Consecutive auth/key refusals before giving up (no point hammering a bad key).
 pub const REFUSED_MAX_ATTEMPTS: u32 = 3;
+/// How long a destination waits for a network that is down (a Wi-Fi drop, a router reboot) before
+/// giving up for this stream. OBS rides out outages of about this length.
+pub const NETWORK_PATIENCE: Duration = Duration::from_secs(10 * 60);
+/// The longest wait between tries while the network is down: it comes back and the stream follows
+/// within about this long.
+const NETWORK_RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// How long a destination waits before trying again: the first wait, doubling up to the
 /// longest (Advanced mode can change both), and how many failures in a row before giving up
@@ -191,12 +197,24 @@ pub enum PushError {
     Stalled(String),
     #[error("The connection to {0} broke.")]
     Broken(String),
+    /// No way out to the internet (no route, no DNS, nothing answering): a Wi-Fi drop or a router
+    /// reboot. Not the platform's doing, so it isn't counted against the destination.
+    #[error("Your network is down: waiting for it to reach {0}.")]
+    NetworkDown(String),
 }
 
 impl PushError {
     /// The network failed (not the server saying no): another connection may do better.
     fn is_network(&self) -> bool {
-        matches!(self, Self::Unreachable(_) | Self::Slow(_) | Self::Closed(_) | Self::Stalled(_) | Self::Broken(_))
+        matches!(
+            self,
+            Self::Unreachable(_)
+                | Self::NetworkDown(_)
+                | Self::Slow(_)
+                | Self::Closed(_)
+                | Self::Stalled(_)
+                | Self::Broken(_)
+        )
     }
 
     /// The server could not be had at all (not a no to this stream or its key): another server
@@ -248,6 +266,9 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         };
         let still_on = |l: &Live| l.on && l.stream == stream;
         let mut attempt = 0u32;
+        // Tries made while the network was down (not counted in `attempt`), and since when it is.
+        let mut net_tries = 0u32;
+        let mut down_since: Option<Instant> = None;
         // The connection used: the system's default until that fails, then the next one.
         let mut via: Option<links::Network> = None;
         // The server used: the destination's own, until it can't be reached `BACKUP_AFTER` times in
@@ -304,7 +325,18 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             connect_failures = 0;
                         }
                     }
-                    attempt = attempt.saturating_add(1);
+                    // A network that is down isn't the destination failing: its tries are counted
+                    // apart and don't use up the ones an ordinary failure gets, and it is waited for
+                    // (up to NETWORK_PATIENCE) rather than given up on after a few seconds.
+                    let net_down = matches!(err, PushError::NetworkDown(_));
+                    if net_down {
+                        net_tries = net_tries.saturating_add(1);
+                        down_since.get_or_insert_with(Instant::now);
+                    } else {
+                        attempt = attempt.saturating_add(1);
+                        net_tries = 0;
+                        down_since = None;
+                    }
                     let kick_refused = rapid_close && is_kick(&dest);
                     let server_refused = matches!(err, PushError::KeyRefused(_) | PushError::Refused(..));
                     let is_refused = kick_refused || server_refused;
@@ -324,11 +356,16 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     if err.is_network() && !rapid_close && may_move(target) {
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
-                    if limit > 0 && attempt >= limit {
+                    let give_up = if net_down {
+                        limit > 0 && down_since.is_some_and(|t| t.elapsed() >= NETWORK_PATIENCE)
+                    } else {
+                        limit > 0 && attempt >= limit
+                    };
+                    if give_up {
                         let (short_reason, detail) = failure_text(&dest, &err, kick_refused);
                         tracing::warn!(
                             dest = %dest.id,
-                            attempts = attempt,
+                            attempts = attempt.max(net_tries),
                             refused = is_refused,
                             on_backup,
                             error = %err,
@@ -336,15 +373,25 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         );
                         set_state(
                             &health,
-                            PushState::Failed { attempts: attempt, reason: short_reason, detail, refused: is_refused },
+                            PushState::Failed {
+                                attempts: attempt.max(net_tries),
+                                reason: short_reason,
+                                detail,
+                                refused: is_refused,
+                            },
                         );
                         tokio::select! {
                             _ = stop.wait_for(|s| *s) => break 'streams,
                             _ = live.wait_for(|l| !still_on(l)) => break,
                         }
                     }
-                    let wait = backoff(attempt, &dest.retry);
-                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
+                    let shown = if net_down { net_tries } else { attempt };
+                    let wait = if net_down {
+                        backoff(net_tries, &dest.retry).min(NETWORK_RETRY_MAX)
+                    } else {
+                        backoff(attempt, &dest.retry)
+                    };
+                    tracing::info!(dest = %dest.id, attempt = shown, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
                     let reason = if switched {
                         format!(
                             "{err} Trying {}.",
@@ -357,7 +404,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     };
                     set_state(
                         &health,
-                        PushState::Reconnecting { attempt, retry_in_ms: wait.as_millis() as u64, reason },
+                        PushState::Reconnecting { attempt: shown, retry_in_ms: wait.as_millis() as u64, reason },
                     );
                     tokio::select! {
                         _ = stop.wait_for(|s| *s) => break 'streams,
@@ -432,16 +479,51 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// What a failed TCP connect says: no route, no network or a name that can't be looked up is the
+/// network being down; anything else (refused, reset) is that server not taking it.
+fn connect_error(e: &std::io::Error, host: &str) -> PushError {
+    use std::io::ErrorKind as K;
+    let lookup = e.raw_os_error().is_none() && e.to_string().contains("lookup address");
+    if lookup || matches!(e.kind(), K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown) {
+        PushError::NetworkDown(host.to_string())
+    } else {
+        PushError::Unreachable(host.to_string())
+    }
+}
+
+/// Tests take the network away from one destination (by its port) and give it back.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::sync::Mutex;
+    static DOWN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    pub(crate) fn set(port: u16, down: bool) {
+        let mut d = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if down {
+            d.push(port);
+        }
+    }
+    pub(crate) fn is_down(port: u16) -> bool {
+        DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+}
+
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
+    #[cfg(test)]
+    if fault::is_down(t.port) {
+        return Err(PushError::NetworkDown(host));
+    }
     let tcp = match (via, t.pin) {
         (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
         (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
         (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
     }
-    .map_err(|_| PushError::Slow(host.clone()))?
-    .map_err(|_| PushError::Unreachable(host.clone()))?;
+    // Not answering at all looks the same whether the link or the server is down: waited for as a
+    // network that is down.
+    .map_err(|_| PushError::NetworkDown(host.clone()))?
+    .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
     if !t.tls {
         return Ok(Box::pin(tcp));
@@ -927,6 +1009,35 @@ impl Publisher {
             }
             *pending = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_error_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind as K};
+
+    #[test]
+    fn no_route_or_no_dns_is_the_network_down_a_refusal_is_the_server() {
+        let down = |e: Error| matches!(connect_error(&e, "h"), PushError::NetworkDown(_));
+        assert!(down(K::NetworkUnreachable.into()), "ENETUNREACH");
+        assert!(down(K::HostUnreachable.into()), "EHOSTUNREACH");
+        assert!(down(K::NetworkDown.into()), "ENETDOWN");
+        assert!(
+            down(Error::other("failed to lookup address information: nodename nor servname provided")),
+            "DNS fails with no network"
+        );
+        assert!(!down(K::ConnectionRefused.into()), "the server said no");
+        assert!(!down(K::ConnectionReset.into()));
+        assert!(!down(Error::from_raw_os_error(61)), "an OS error that isn't the network");
+    }
+
+    #[test]
+    fn a_network_that_is_down_never_counts_as_a_refusal_or_blocks_failover() {
+        let e = PushError::NetworkDown("h".into());
+        assert!(e.is_network(), "another connection may do better");
+        assert!(e.is_connect_failure(), "the backup ingest may answer");
+        assert!(!matches!(e, PushError::KeyRefused(_) | PushError::Refused(..)));
     }
 }
 

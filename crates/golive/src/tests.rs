@@ -428,6 +428,39 @@ async fn an_unreachable_destination_retries_until_it_answers() {
     assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
 }
 
+/// A router reboot or a Wi-Fi drop of a minute: connecting fails at once (no route), over and over.
+/// That is not the platform failing, so the tries aren't counted against it: the destination waits
+/// for the network (still Reconnecting, never Failed) and goes live again by itself, and a later
+/// ordinary failure still has all its own tries.
+#[tokio::test]
+async fn a_network_that_is_down_is_waited_for_not_counted_against_the_destination() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // Well past the 3 tries an ordinary refusal would get.
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    match state {
+        PushState::Reconnecting { reason, .. } => assert!(reason.to_lowercase().contains("network"), "{reason}"),
+        s => panic!("gave up while the network was down: {s:?}"),
+    }
+    // The network comes back with the platform: live by itself.
+    push::fault::set(dport, false);
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
+}
+
 #[tokio::test]
 async fn obs_stopping_ends_the_stream_everywhere_and_waits_for_the_next() {
     let w = world().await;
