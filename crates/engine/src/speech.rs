@@ -261,7 +261,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn speaks_hostile_text_into_a_real_wav() {
-        let _turn = PEAK_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let _turn = PEAK_TEST.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("a.wav");
         // Looks like options and shell, must just be read aloud.
@@ -273,7 +273,7 @@ mod tests {
     }
 
     /// The tests that read the voice's concurrency peak take turns.
-    static PEAK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PEAK_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn input_names_never_repeat_even_across_threads() {
@@ -292,7 +292,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_alert_flood_speaks_one_at_a_time_and_lets_a_long_line_go() {
-        let _turn = PEAK_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let _turn = PEAK_TEST.lock().await;
         let dir = tempfile::tempdir().unwrap();
         // The old behaviour (no gate, every line at once): several voices at the same time.
         PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
