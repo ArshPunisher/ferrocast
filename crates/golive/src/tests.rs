@@ -561,6 +561,30 @@ async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_fo
     obs.video(10, KEY).await;
 }
 
+/// A name that never resolved (a typo in a custom server) or an address that never answered is not a
+/// network being down: it fails in the few ordinary tries with the real reason, not after ten minutes
+/// of "your network is down". Only a destination that took the stream earlier gets the long wait.
+#[tokio::test]
+async fn a_name_that_never_resolved_fails_fast_a_destination_that_was_live_waits() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, attempts, .. } => {
+            assert_eq!(attempts, 3);
+            assert!(!reason.to_lowercase().contains("network is down"), "{reason}");
+        }
+        s => panic!("{s:?}"),
+    }
+    push::fault::set_no_name(dport, false);
+}
+
 #[tokio::test]
 async fn a_network_that_is_down_is_waited_for_not_counted_against_the_destination() {
     let w = world().await;

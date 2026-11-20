@@ -349,14 +349,18 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     // (an ingest restarting, one's own server rebooting): an outage to wait for. One
                     // that never took it stays an ordinary failure (a wrong address says so fast).
                     let net_down = matches!(err, PushError::NetworkDown(_))
-                        || (ever_live && matches!(err, PushError::Unreachable(_)));
+                        || (ever_live && matches!(err, PushError::Unreachable(_) | PushError::Slow(_)));
                     if net_down {
                         net_tries = net_tries.saturating_add(1);
                         down_since.get_or_insert_with(Instant::now);
                     } else {
                         attempt = attempt.saturating_add(1);
                         net_tries = 0;
-                        down_since = None;
+                        // The patience clock restarts only once a session really took the stream
+                        // again, not on one odd error between two "network down"s.
+                        if was_live {
+                            down_since = None;
+                        }
                     }
                     let kick_refused = rapid_close && is_kick(&dest);
                     let server_refused = key_refused || matches!(err, PushError::Refused(..));
@@ -475,6 +479,13 @@ fn failure_text(dest: &Destination, err: &PushError, kick_refused: bool) -> (Str
         return ("Kick refused the stream.".into(), Some(kick_multistream_detail(err)));
     }
     match err {
+        PushError::NetworkDown(host) => (
+            "The network stayed down; stopped trying.".into(),
+            Some(format!(
+                "{host} couldn't be reached for {} minutes. Start the destination again once the internet is back.",
+                NETWORK_PATIENCE.as_secs() / 60
+            )),
+        ),
         PushError::KeyRefused(_) => ("Stream key was refused.".into(), Some(err.to_string())),
         PushError::Refused(_, _) => ("The platform refused the stream.".into(), Some(err.to_string())),
         _ => {
@@ -503,16 +514,19 @@ pub(crate) fn now_ms() -> u64 {
     t
 }
 
-/// What a failed TCP connect says: no route, no network or a name that can't be looked up is the
-/// network being down; anything else (refused, reset) is that server not taking it.
+/// What a failed TCP connect says. No route, no network or an interface that's down is the network
+/// being down (waited for, even before the stream was ever live). A name that can't be looked up, a
+/// refusal or a reset is a wrong address or that server not taking it: counted like any failure,
+/// and only waited for by a destination that was live before (it worked a moment ago).
 fn connect_error(e: &std::io::Error, host: &str) -> PushError {
     use std::io::ErrorKind as K;
-    let lookup = e.raw_os_error().is_none() && e.to_string().contains("lookup address");
-    if lookup || matches!(e.kind(), K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown) {
-        PushError::NetworkDown(host.to_string())
-    } else {
-        PushError::Unreachable(host.to_string())
+    if matches!(e.kind(), K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown) {
+        return PushError::NetworkDown(host.to_string());
     }
+    if e.kind() == K::TimedOut {
+        return PushError::Slow(host.to_string());
+    }
+    PushError::Unreachable(host.to_string())
 }
 
 /// Tests take the network away from one destination (by its port) and give it back.
@@ -534,6 +548,18 @@ pub(crate) mod fault {
     pub(crate) fn is_down(port: u16) -> bool {
         DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
     }
+    static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// The destination's name can't be looked up (a typo, or no DNS).
+    pub(crate) fn set_no_name(port: u16, on: bool) {
+        let mut d = NO_NAME.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn no_name(port: u16) -> bool {
+        NO_NAME.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
 }
 
 /// Connects to `t`, over `via` when given (else the system's default way).
@@ -543,14 +569,18 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     if fault::is_down(t.port) {
         return Err(PushError::NetworkDown(host));
     }
+    #[cfg(test)]
+    if fault::no_name(t.port) {
+        return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
+    }
     let tcp = match (via, t.pin) {
         (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
         (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
         (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
     }
-    // Not answering at all looks the same whether the link or the server is down: waited for as a
-    // network that is down.
-    .map_err(|_| PushError::NetworkDown(host.clone()))?
+    // Not answering at all looks the same whether the link or the server is down (or the address
+    // is wrong): an ordinary failure, waited for only by a destination that was live before.
+    .map_err(|_| PushError::Slow(host.clone()))?
     .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
     if !t.tls {
@@ -1049,18 +1079,25 @@ mod connect_error_tests {
     use std::io::{Error, ErrorKind as K};
 
     #[test]
-    fn no_route_or_no_dns_is_the_network_down_a_refusal_is_the_server() {
-        let down = |e: Error| matches!(connect_error(&e, "h"), PushError::NetworkDown(_));
-        assert!(down(K::NetworkUnreachable.into()), "ENETUNREACH");
-        assert!(down(K::HostUnreachable.into()), "EHOSTUNREACH");
-        assert!(down(K::NetworkDown.into()), "ENETDOWN");
-        assert!(
-            down(Error::other("failed to lookup address information: nodename nor servname provided")),
-            "DNS fails with no network"
-        );
-        assert!(!down(K::ConnectionRefused.into()), "the server said no");
-        assert!(!down(K::ConnectionReset.into()));
-        assert!(!down(Error::from_raw_os_error(61)), "an OS error that isn't the network");
+    fn only_no_route_is_the_network_down_a_name_or_a_refusal_is_the_address() {
+        let class = |e: Error| match connect_error(&e, "h") {
+            PushError::NetworkDown(_) => "down",
+            PushError::Slow(_) => "slow",
+            PushError::Unreachable(_) => "unreachable",
+            _ => "other",
+        };
+        assert_eq!(class(K::NetworkUnreachable.into()), "down", "ENETUNREACH");
+        assert_eq!(class(K::HostUnreachable.into()), "down", "EHOSTUNREACH");
+        assert_eq!(class(K::NetworkDown.into()), "down", "ENETDOWN");
+        assert_eq!(class(K::TimedOut.into()), "slow", "ETIMEDOUT / WSAETIMEDOUT");
+        // A name that can't be looked up (a typo, or no DNS; on Windows WSAHOST_NOT_FOUND 11001,
+        // WSATRY_AGAIN 11002, WSANO_DATA 11004 arrive as raw OS errors) is not proof the network is down.
+        assert_eq!(class(Error::other("failed to lookup address information")), "unreachable");
+        for code in [11001, 11002, 11004] {
+            assert_eq!(class(Error::from_raw_os_error(code)), "unreachable", "{code}");
+        }
+        assert_eq!(class(K::ConnectionRefused.into()), "unreachable");
+        assert_eq!(class(K::ConnectionReset.into()), "unreachable");
     }
 
     #[test]
@@ -1183,5 +1220,28 @@ mod via_tests {
         d.on_lagged();
         assert!(!d.should_drop_audio(200, Some(1_100), Some(900)));
         assert!(!d.should_drop(0, true, Some(1_100), Some(900), Some(400), 950, 2));
+    }
+}
+
+#[cfg(test)]
+mod give_up_text_tests {
+    use super::*;
+
+    #[test]
+    fn after_the_network_patience_runs_out_it_says_so_not_that_it_is_waiting_or_the_server_stopped() {
+        for host in ["live.twitch.tv", "a.rtmps.youtube.com", "fa723fc1b171.global-contribute.live-video.net"] {
+            let d = Destination {
+                id: "x".into(),
+                target: Target::parse(&format!("rtmp://{host}/app")).unwrap(),
+                key: "k".into(),
+                retry: Retry::default(),
+                extra_audio: false,
+                extra_video: false,
+                backup: None,
+            };
+            let (reason, detail) = failure_text(&d, &PushError::NetworkDown(host.into()), false);
+            assert!(!reason.contains("waiting") && !reason.contains("stopped taking"), "{reason}");
+            assert!(detail.is_some_and(|x| x.contains(host)));
+        }
     }
 }
