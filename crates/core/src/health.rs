@@ -7,6 +7,8 @@ use serde::Serialize;
 
 /// Looks kept (two seconds apart: the last ten seconds).
 const KEEP: usize = 6;
+/// Frames drawn with none sent for this long (ms) is a stalled stream.
+const STALL_AFTER_MS: u64 = 5_000;
 
 /// The counters at one look (running totals since the stream started, except the "now" ones).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -123,6 +125,17 @@ impl HealthMeter {
         if s.reconnecting {
             costs.push((50.0, "the stream is reconnecting".into(), "Check your internet connection."));
         }
+        // Frames are still being drawn but the stream's own sender has delivered none for several
+        // seconds: the stream (and a recording sharing its encoder) has silently stopped (a stall seen
+        // after 26 minutes of a soak, with Health still 100).
+        let span = s.at_ms.saturating_sub(first.at_ms);
+        if span >= STALL_AFTER_MS && first.sent > 0 && s.sent == first.sent && d(s.frames, first.frames) >= 60 {
+            costs.push((
+                60.0,
+                "the stream has stopped sending".into(),
+                "Frames are drawn but none are being sent. Stop and start the stream again.",
+            ));
+        }
         if s.paused {
             costs.push((
                 20.0,
@@ -192,6 +205,29 @@ mod tests {
             m.push(Sample { lagged: 1, skipped: 3, ..at(n) });
         }
         assert_eq!(m.push(Sample { lagged: 1, skipped: 3, ..at(10) }).score, 100);
+    }
+
+    #[test]
+    fn a_stream_that_stops_sending_while_frames_are_drawn_is_not_great() {
+        let mut m = HealthMeter::default();
+        let at = |n: u64, sent: u64| Sample { sent, at_ms: n * 1_000, ..at(n) };
+        let mut last = None;
+        // Sending for 3 s, then drawing on with nothing sent.
+        for n in 0..4 {
+            last = Some(m.push(at(n, n * 60)));
+        }
+        assert_eq!(last.clone().unwrap().score, 100);
+        for n in 4..12 {
+            last = Some(m.push(at(n, 180)));
+        }
+        let h = last.clone().unwrap();
+        assert!(h.score <= 40, "score {}", h.score);
+        assert!(h.reason.unwrap().contains("stopped sending"));
+        // It resumes: the window clears.
+        for n in 12..20 {
+            last = Some(m.push(at(n, 180 + (n - 11) * 60)));
+        }
+        assert_eq!(last.unwrap().score, 100);
     }
 
     #[test]
