@@ -1474,6 +1474,12 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             if let Some(t) = &change.tracks {
                 c.set_tracks(&name, t)?;
             }
+            if change.push_to_talk.is_some() || change.push_to_talk_ms.is_some() {
+                c.set_push(&name, true, change.push_to_talk, change.push_to_talk_ms)?;
+            }
+            if change.push_to_mute.is_some() || change.push_to_mute_ms.is_some() {
+                c.set_push(&name, false, change.push_to_mute, change.push_to_mute_ms)?;
+            }
             if let Some(m) = change.monitor {
                 let m = match m {
                     Hear::Off => Monitor::Off,
@@ -1488,6 +1494,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             done(c.set_channel(channel, device.as_ref().map(|d| (d.kind.as_str(), d.name.as_str(), &d.settings))))
         }
         A::Levels { names } => v(to_json!(c.levels(&names))),
+        A::PushKey { name, talk, down } => v(Ok(json!(c.push_key(&name, talk, down)?))),
         A::Look { names } => v(to_json!(c.look(&names)?)),
         A::AudioCare => v(Ok(c.audio_care())),
         A::SetAudioCare { care } => done(c.set_audio_care(&care)),

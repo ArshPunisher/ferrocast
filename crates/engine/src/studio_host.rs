@@ -1318,6 +1318,11 @@ pub struct AudioChange {
     /// Heard this much later (negative: earlier), -950 to 20000 ms.
     pub sync_ms: Option<i64>,
     pub mono: Option<bool>,
+    /// Push-to-talk / push-to-mute on or off, and their release delays (0 to 5000 ms).
+    pub push_to_talk: Option<bool>,
+    pub push_to_talk_ms: Option<u32>,
+    pub push_to_mute: Option<bool>,
+    pub push_to_mute_ms: Option<u32>,
     /// The audio tracks (1 to 6) it's mixed into.
     pub tracks: Option<Vec<u8>>,
     /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
@@ -1441,6 +1446,13 @@ pub enum StudioAct {
     /// Levels now, dBFS, for these sounds.
     Levels {
         names: Vec<String>,
+    },
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for a sound → whether the sound
+    /// has that switched on (false: the key then toggles its mute as before). Never saved.
+    PushKey {
+        name: String,
+        talk: bool,
+        down: bool,
     },
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
@@ -1823,6 +1835,9 @@ impl StudioAct {
                 {
                     return Err(EngineError::Invalid("tracks: numbers 1 to 6.".into()));
                 }
+                if c.push_to_talk_ms.is_some_and(|ms| ms > 5_000) || c.push_to_mute_ms.is_some_and(|ms| ms > 5_000) {
+                    return Err(EngineError::Invalid("push_to_talk_ms, push_to_mute_ms: 0 to 5000 ms.".into()));
+                }
                 Ok(())
             }
             A::SetChannel { channel, device } => {
@@ -1831,6 +1846,7 @@ impl StudioAct {
                 }
                 device.as_mut().map(new).transpose().map(|_| ())
             }
+            A::PushKey { name, .. } => check_source_name(name),
             A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
                     return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
@@ -2035,6 +2051,7 @@ impl StudioAct {
                 | A::Options { .. }
                 | A::Audio { .. }
                 | A::Levels { .. }
+                | A::PushKey { .. }
                 | A::Look { .. }
                 | A::AudioCare
                 | A::Privacy
@@ -3811,6 +3828,13 @@ mod tests {
                     change: AudioChange { volume_db: Some(f32::NAN), ..Default::default() },
                 },
                 "volume_db",
+            ),
+            (
+                StudioAct::SetAudio {
+                    name: "Mic".into(),
+                    change: AudioChange { push_to_talk_ms: Some(6_000), ..Default::default() },
+                },
+                "push_to_talk_ms",
             ),
             (
                 StudioAct::SetAudio {
