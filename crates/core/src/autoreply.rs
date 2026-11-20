@@ -410,11 +410,17 @@ impl RuleSet {
 
 // ------------------------------------------------------------------ cooldowns
 
+/// Hard cap on tracked auto-reply per-user cooldown entries.
+const MAX_PER_USER_COOLDOWNS: usize = 20_000;
+/// Hard cap on tracked auto-reply global cooldown entries.
+const MAX_GLOBAL_COOLDOWNS: usize = 4_096;
+
 /// When each rule last answered, per platform chat and per viewer.
 #[derive(Debug, Default)]
 pub struct Cooldowns {
     global: HashMap<(String, Platform), Millis>,
-    per_user: HashMap<(String, Platform, String), Millis>,
+    /// `(last_fired_at, expires_at)` so expired entries prune by their rule's own cooldown.
+    per_user: HashMap<(String, Platform, String), (Millis, Millis)>,
 }
 
 /// Why a matching message got no answer (logged, never said in chat).
@@ -432,6 +438,11 @@ pub struct Hit {
 }
 
 impl Cooldowns {
+    /// Current `(global, per_user)` map sizes (for monitoring and soak tests).
+    pub fn len(&self) -> (usize, usize) {
+        (self.global.len(), self.per_user.len())
+    }
+
     /// Seconds until `rule` may answer `user` on `platform` again (0 = now). Everyone waits,
     /// mods too: an auto-reply is never something a mod needs.
     pub fn wait(&self, rule: &AutoReply, platform: Platform, user: &str, now: Millis) -> i64 {
@@ -441,17 +452,48 @@ impl Cooldowns {
         let u = self
             .per_user
             .get(&(rule.id.clone(), platform, user.to_string()))
-            .map_or(0, |last| i64::from(rule.user_cooldown_s) - now.seconds_since(*last));
+            .map_or(0, |(last, _)| i64::from(rule.user_cooldown_s) - now.seconds_since(*last));
         g.max(u).max(0)
     }
 
     pub fn record(&mut self, rule: &AutoReply, platform: Platform, user: &str, now: Millis) {
-        if self.per_user.len() > 20_000 {
-            // A day is the longest cooldown, so older entries no longer matter.
-            self.per_user.retain(|_, last| now.seconds_since(*last) < i64::from(MAX_COOLDOWN_S));
+        if self.global.len() >= MAX_GLOBAL_COOLDOWNS {
+            self.global.retain(|_, last| now.seconds_since(*last) < i64::from(MAX_COOLDOWN_S));
+            if self.global.len() >= MAX_GLOBAL_COOLDOWNS {
+                let mut times: Vec<i64> = self.global.values().map(|m| m.0).collect();
+                let mid = times.len() / 2;
+                let (_, cutoff, _) = times.select_nth_unstable(mid);
+                let cutoff = *cutoff;
+                self.global.retain(|_, last| last.0 > cutoff);
+                while self.global.len() >= MAX_GLOBAL_COOLDOWNS {
+                    if let Some(k) = self.global.keys().next().cloned() {
+                        self.global.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
+        if self.per_user.len() >= MAX_PER_USER_COOLDOWNS {
+            self.per_user.retain(|_, (_, exp)| now.0 < exp.0);
+            if self.per_user.len() >= MAX_PER_USER_COOLDOWNS {
+                let mut times: Vec<i64> = self.per_user.values().map(|(last, _)| last.0).collect();
+                let mid = times.len() / 2;
+                let (_, cutoff, _) = times.select_nth_unstable(mid);
+                let cutoff = *cutoff;
+                self.per_user.retain(|_, (last, _)| last.0 > cutoff);
+                while self.per_user.len() >= MAX_PER_USER_COOLDOWNS {
+                    if let Some(k) = self.per_user.keys().next().cloned() {
+                        self.per_user.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        let exp = Millis(now.0.saturating_add(i64::from(rule.user_cooldown_s).saturating_mul(1000)));
         self.global.insert((rule.id.clone(), platform), now);
-        self.per_user.insert((rule.id.clone(), platform, user.to_string()), now);
+        self.per_user.insert((rule.id.clone(), platform, user.to_string()), (now, exp));
     }
 
     /// Forgets a rule (deleted or edited, so its new settings start fresh).
@@ -897,6 +939,17 @@ mod tests {
     fn starters_are_valid() {
         for s in starters() {
             s.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn cooldowns_enforce_hard_cap_even_within_window() {
+        let mut r = rule(MatchKind::Contains, "hi");
+        r.user_cooldown_s = 3600;
+        let mut cd = Cooldowns::default();
+        for i in 0..25_000 {
+            cd.record(&r, Platform::Twitch, &format!("u{i}"), Millis(i * 10));
+            assert!(cd.len().1 <= MAX_PER_USER_COOLDOWNS, "per_user exceeded cap: {}", cd.len().1);
         }
     }
 }

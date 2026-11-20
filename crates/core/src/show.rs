@@ -269,6 +269,11 @@ impl LiveWatch {
         self.raised.iter().cloned().collect()
     }
 
+    /// Tracked `(heard, changed, dark, sending)` map sizes (for monitoring and soak tests).
+    pub fn tracked_counts(&self) -> (usize, usize, usize, usize) {
+        (self.heard.len(), self.changed.len(), self.dark.len(), self.sending.len())
+    }
+
     /// One sample → the alerts to raise and to clear.
     pub fn tick(&mut self, cfg: &LiveWatchConfig, s: &WatchSample) -> Vec<LiveAlert> {
         let mut out = Vec::new();
@@ -358,7 +363,14 @@ impl LiveWatch {
             );
         }
         // Gone from the sample (a camera removed, a destination stopped): not watched, so
-        // whatever it raised is cleared (BRB by itself comes back too).
+        // drop its tracking state and clear whatever it raised (BRB by itself comes back too).
+        let live_mics: std::collections::HashSet<&str> = s.mics.iter().map(|(n, _)| n.as_str()).collect();
+        let live_cams: std::collections::HashSet<&str> = s.cameras.iter().map(|(n, _, _)| n.as_str()).collect();
+        let live_dests: std::collections::HashSet<&str> = s.destinations.iter().map(|(n, _)| n.as_str()).collect();
+        self.heard.retain(|n, _| live_mics.contains(n.as_str()));
+        self.changed.retain(|n, _| live_cams.contains(n.as_str()));
+        self.dark.retain(|n, _| live_cams.contains(n.as_str()));
+        self.sending.retain(|n, _| live_dests.contains(n.as_str()));
         let mut present = std::collections::BTreeSet::new();
         for (n, _) in &s.mics {
             present.insert(format!("mic:{n}"));
@@ -1097,5 +1109,23 @@ mod watch_tests {
         assert!(c.validate().unwrap_err().contains("watch.mic_silent_s"));
         c.watch.mic_silent_s = 0;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn live_watch_prunes_removed_sources_and_destinations() {
+        let cfg = LiveWatchConfig::default();
+        let mut w = LiveWatch::default();
+        for i in 0..1_000 {
+            let s = WatchSample {
+                at: i * 2_000,
+                mics: vec![(format!("Mic {i}"), -90.0)],
+                cameras: vec![(format!("Cam {i}"), true, i as u64)],
+                destinations: vec![(format!("Dest {i}"), false)],
+            };
+            let _ = w.tick(&cfg, &s);
+            assert_eq!(w.tracked_counts(), (1, 1, 1, 1));
+        }
+        let _ = w.tick(&cfg, &WatchSample { at: 3_000_000, ..Default::default() });
+        assert_eq!(w.tracked_counts(), (0, 0, 0, 0));
     }
 }
