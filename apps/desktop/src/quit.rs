@@ -12,8 +12,24 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 /// One question at a time: a second Quit while the first is open does nothing.
 static ASKING: AtomicBool = AtomicBool::new(false);
 
+/// Set when the app is to start again in Safe Mode once it has quit cleanly (`main`'s exit
+/// handler does it, after the run markers are cleared).
+#[cfg(target_os = "macos")]
+pub(crate) static RELAUNCH_SAFE: AtomicBool = AtomicBool::new(false);
+
 /// Quits, asking first when the stream, a recording or the replay buffer is on.
 pub(crate) fn request(app: &AppHandle) {
+    request_inner(app, false);
+}
+
+/// Help > Restart in Safe Mode: as Quit (asks first when something is on air), then the app
+/// starts again with `--safe-mode`.
+#[cfg(target_os = "macos")]
+pub(crate) fn request_safe_restart(app: &AppHandle) {
+    request_inner(app, true);
+}
+
+fn request_inner(app: &AppHandle, relaunch_safe: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let active = match app.try_state::<crate::Running>() {
@@ -24,13 +40,18 @@ pub(crate) fn request(app: &AppHandle) {
             None => Active::default(),
         };
         match decide(&active) {
-            Decision::Quit => app.exit(0),
+            Decision::Quit => leave(&app, relaunch_safe),
             Decision::Ask { title, text } => {
                 if ASKING.swap(true, Ordering::SeqCst) {
                     return;
                 }
                 crate::show_window(&app);
                 let quit = app.clone();
+                let (title, text) = if relaunch_safe {
+                    ("Restart in Safe Mode?", text.replace("Quit anyway?", "Restart anyway?"))
+                } else {
+                    (title, text)
+                };
                 // "Cancel" first: it is the default button and what Esc picks. The answer is
                 // true for the first button.
                 app.dialog()
@@ -41,12 +62,21 @@ pub(crate) fn request(app: &AppHandle) {
                     .show(move |cancelled| {
                         ASKING.store(false, Ordering::SeqCst);
                         if !cancelled {
-                            quit.exit(0);
+                            leave(&quit, relaunch_safe);
                         }
                     });
             }
         }
     });
+}
+
+/// Exits, and starts again in Safe Mode after when asked to.
+fn leave(app: &AppHandle, relaunch_safe: bool) {
+    #[cfg(target_os = "macos")]
+    RELAUNCH_SAFE.store(relaunch_safe, Ordering::SeqCst);
+    #[cfg(not(target_os = "macos"))]
+    let _ = relaunch_safe;
+    app.exit(0);
 }
 
 /// What is running that quitting would end.

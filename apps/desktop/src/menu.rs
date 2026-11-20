@@ -27,6 +27,8 @@ pub(crate) enum Native {
     ShowLogs,
     FullScreen,
     AlwaysOnTop,
+    /// Quits (asking first when something is on air) and starts again with `--safe-mode`.
+    RestartSafeMode,
 }
 
 pub(crate) struct Item {
@@ -94,6 +96,7 @@ pub(crate) const MENUS: &[Menu] = &[
         title: "File",
         entries: &[
             item("show-recordings", "Show Recordings", None, Act::Native(Native::ShowRecordings)),
+            item("remux", "Remux Recordings…", None, Act::Page("remux")),
             item("show-settings-folder", "Show Settings Folder", None, Act::Native(Native::ShowSettingsFolder)),
             item("show-logs", "Show Log Files", None, Act::Native(Native::ShowLogs)),
             Entry::Sep,
@@ -150,6 +153,8 @@ pub(crate) const MENUS: &[Menu] = &[
             item("docs", "Ferrocast Documentation", None, Act::Url(DOCS)),
             item("release-notes", "Release Notes", None, Act::Url(RELEASES)),
             item("help-logs", "Show Log Files", None, Act::Native(Native::ShowLogs)),
+            Entry::Sep,
+            item("restart-safe", "Restart in Safe Mode…", None, Act::Native(Native::RestartSafeMode)),
         ],
     },
 ];
@@ -269,6 +274,7 @@ mod mac {
     fn native(app: &AppHandle, n: Native) {
         match n {
             Native::Quit => crate::quit::request(app),
+            Native::RestartSafeMode => crate::quit::request_safe_restart(app),
             Native::ShowSettingsFolder => reveal(app, crate::data_dir()),
             Native::ShowLogs => reveal(app, crate::data_dir().join("logs")),
             Native::ShowRecordings => {
@@ -342,6 +348,8 @@ mod tests {
         assert_eq!(action("settings"), Some(Act::Nav("#/settings")));
         assert_eq!(action("automations"), Some(Act::Nav("#/settings/automations")));
         assert_eq!(action("plugins"), Some(Act::Nav("#/settings/plugins")));
+        assert_eq!(action("remux"), Some(Act::Page("remux")));
+        assert_eq!(action("restart-safe"), Some(Act::Native(Native::RestartSafeMode)));
     }
 
     #[test]
