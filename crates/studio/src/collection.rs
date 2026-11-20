@@ -257,6 +257,12 @@ pub struct AudioInfo {
     /// Push-to-mute: muted while its key is held (and `push_to_mute_ms` after).
     pub push_to_mute: bool,
     pub push_to_mute_ms: u32,
+    /// Judged as a microphone by the live watch ("This is a mic"): the owner's switch, else by
+    /// its kind (a capture card's, an app's or the desktop's sound is not one).
+    pub mic: bool,
+    /// Whether it is on air in this scene: its item and every scene item above it are shown. A
+    /// hidden one makes no sound (nothing is mixed), so it is never judged dead or quiet.
+    pub shown: bool,
 }
 
 /// A source and the scenes it's in.

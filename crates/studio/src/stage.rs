@@ -155,6 +155,47 @@ fn is_scene(s: &Value) -> bool {
     matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))
 }
 
+/// The device a source reads (its `device_id` setting), for telling a capture card from a mic.
+fn device_of(s: &Value) -> &str {
+    s.pointer("/settings/device_id").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Words in a device's or a source's name that say it is a capture card or a video interface:
+/// its sound is the game's or the camera's, not a voice (the owner's "USB2 Digital Audio" is a
+/// MacroSilicon card whose id reads "USB2 Video").
+const CAPTURE_CARD_WORDS: [&str; 12] = [
+    "capture",
+    "cam link",
+    "elgato",
+    "hdmi",
+    "av.io",
+    "avermedia",
+    "magewell",
+    "blackmagic",
+    "decklink",
+    "usb video",
+    "usb2 video",
+    "digital audio",
+];
+
+/// Whether a sound is judged as a microphone when the owner hasn't said: a microphone input or one
+/// of OBS's Mic/Aux channels, unless its name says capture card. The desktop's and an app's sound
+/// (and everything that isn't an input device) never is.
+pub fn mic_by_default(kind: &str, name: &str, device: &str, channel: Option<u32>) -> bool {
+    if matches!(channel, Some(1 | 2)) {
+        return false;
+    }
+    let input = matches!(
+        kind,
+        "coreaudio_input_capture" | "wasapi_input_capture" | "pulse_input_capture" | "alsa_input_capture"
+    );
+    if !input && !matches!(channel, Some(3..=6)) {
+        return false;
+    }
+    let (name, device) = (name.to_lowercase(), device.to_lowercase());
+    !CAPTURE_CARD_WORDS.iter().any(|w| name.contains(w) || device.contains(w))
+}
+
 /// Whether `kind` can produce audio (excludes picture-only sources and video-only cameras).
 fn is_audio_kind(kind: &str) -> bool {
     !matches!(
@@ -2006,7 +2047,25 @@ impl Stage {
             push_to_talk_ms: s.get("push-to-talk-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
             push_to_mute: s.get("push-to-mute").and_then(Value::as_bool).unwrap_or(false),
             push_to_mute_ms: s.get("push-to-mute-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
+            mic: s
+                .get("ferrocast_mic")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| mic_by_default(kind_of(s), name_of(s), device_of(s), channel)),
+            shown: true,
         }
+    }
+
+    /// "This is a mic" on or off for a sound (the live watch judges only mics): kept in the
+    /// source, `None` back to what its kind says.
+    pub fn set_mic(&self, name: &str, on: Option<bool>) -> Result<(), StudioError> {
+        self.with_source(name, |s| match on {
+            Some(on) => s["ferrocast_mic"] = json!(on),
+            None => {
+                if let Some(o) = s.as_object_mut() {
+                    o.remove("ferrocast_mic");
+                }
+            }
+        })
     }
 
     pub fn audio_of(&self, name: &str) -> Result<AudioInfo, StudioError> {
@@ -4189,32 +4248,45 @@ impl Stage {
             .collect())
     }
 
-    /// The sounds a scene makes (its sources with sound) and the global channels.
+    /// The sounds a scene makes: the global channels first, then its sources with sound, top first,
+    /// with those inside its groups and the scenes shown inside it (OBS hears them all; so does
+    /// the engine's mixer). `shown` says whether it is on air through every item above it.
     pub fn audio(&self, scene: &str) -> Result<Vec<AudioInfo>, StudioError> {
-        let mut out: Vec<AudioInfo> = Vec::new();
-        // Its sources top first, and those inside its groups with them (OBS's mixer lists a
-        // group's sources too; owner, 11 Nov: a video put in a group lost its sound row).
-        let mut all = Vec::new();
+        // The devices heard in every scene first (Desktop Audio, Mic/Aux), then the scene's own
+        // sources: the same order in "This scene" and "All", so a mic never jumps.
+        let mut out: Vec<AudioInfo> = self.channels();
+        let mut path = vec![scene.to_string()];
+        self.collect_audio(scene, true, &mut out, &mut path)?;
+        Ok(out)
+    }
+
+    /// `scene`'s sounds into `out`; `path` is the scenes entered so far (no scene is entered twice,
+    /// and nesting stops a few deep, as the engine's own walk does).
+    fn collect_audio(
+        &self,
+        scene: &str,
+        shown: bool,
+        out: &mut Vec<AudioInfo>,
+        path: &mut Vec<String>,
+    ) -> Result<(), StudioError> {
         for it in self.scene_items(scene)?.iter().rev() {
             let name = name_of(it);
-            if self.source(name).is_ok_and(|s| kind_of(&s) == "group") {
-                all.extend(self.scene_items(name).unwrap_or_default().into_iter().rev());
-            } else {
-                all.push(it.clone());
+            let on = shown && it.get("visible").and_then(Value::as_bool).unwrap_or(true);
+            let Ok(src) = self.source(name) else { continue };
+            if is_scene(&src) {
+                // A group's sources, or a scene inside this one.
+                if path.len() < 5 && !path.iter().any(|p| p == name) {
+                    path.push(name.to_string());
+                    let _ = self.collect_audio(name, on, out, path);
+                    path.pop();
+                }
+            } else if self.info_of(it).audio && !out.iter().any(|a| a.name == name) {
+                let mut info = self.audio_info(&src, None);
+                info.shown = on;
+                out.push(info);
             }
         }
-        for it in &all {
-            let name = name_of(it);
-            if let Ok(src) = self.source(name)
-                && !is_scene(&src)
-                && self.info_of(it).audio
-                && !out.iter().any(|a| a.name == name)
-            {
-                out.push(self.audio_info(&src, None));
-            }
-        }
-        out.extend(self.channels());
-        Ok(out)
+        Ok(())
     }
 
     /// Deinterlacing: our engine's sources are never interlaced.
@@ -6494,6 +6566,66 @@ mod tests {
         assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
         ok(s.set_channel(4, None));
         assert!(s.channels().is_empty());
+    }
+
+    /// The live watch judges only microphones: a capture card's sound (the owner's "USB2 Digital
+    /// Audio", even as a Mic/Aux channel), the desktop's and an app's are not, unless the owner
+    /// says so ("This is a mic"), and a real mic can be said not to be.
+    #[test]
+    fn only_microphones_are_judged_unless_the_owner_says_otherwise() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "KREO KAST", &json!({})))));
+        ok(s.set_channel(4, Some(("coreaudio_input_capture", "USB2 Digital Audio", &json!({})))));
+        ok(s.set_channel(1, Some(("coreaudio_output_capture", "Desktop Audio", &json!({})))));
+        ok(s.add_source(
+            "Main",
+            "coreaudio_input_capture",
+            "Line",
+            &json!({ "device_id": "AppleUSBAudioEngine:MACROSILICON:USB2 Video:15930196:4,3" }),
+            false,
+        ));
+        ok(s.add_source("Main", "sck_audio_capture", "Spotify", &json!({}), false));
+        let mic = |n: &str| ok(s.audio_of(n)).mic;
+        assert!(mic("KREO KAST"));
+        assert!(!mic("USB2 Digital Audio"), "a capture card by its name");
+        assert!(!mic("Desktop Audio"));
+        assert!(!mic("Line"), "a capture card by its device id");
+        assert!(!mic("Spotify"), "an app's sound");
+        // The owner's word wins, both ways, and can be taken back.
+        ok(s.set_mic("USB2 Digital Audio", Some(true)));
+        ok(s.set_mic("KREO KAST", Some(false)));
+        assert!(mic("USB2 Digital Audio") && !mic("KREO KAST"));
+        ok(s.set_mic("USB2 Digital Audio", None));
+        assert!(!mic("USB2 Digital Audio"));
+        // Kept in the collection.
+        ok(s.set_mic("Line", Some(true)));
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &s.save("x"), "Scene"));
+        assert!(ok(again.audio_of("Line")).mic);
+    }
+
+    /// A mic inside a scene shown inside this one is heard (the engine mixes it, OBS lists it) and
+    /// is in the list; hidden anywhere above it, it is listed but not `shown`.
+    #[test]
+    fn a_mic_in_a_nested_scene_is_listed_and_a_hidden_one_is_not_shown() {
+        let s = stage();
+        ok(s.add_scene("Audio"));
+        ok(s.add_source("Audio", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_source("Main", "ffmpeg_source", "Game", &json!({ "local_file": "/no/such.mp4" }), false));
+        let nested = ok(s.add_existing("Main", "Audio"));
+        let rows = || ok(s.audio("Main"));
+        let mic = || rows().into_iter().find(|a| a.name == "Mic").unwrap_or_else(|| panic!("no Mic row"));
+        assert!(mic().shown && mic().mic, "the nested mic is there, on air");
+        assert!(rows().iter().any(|a| a.name == "Game" && a.shown));
+        // The nested scene hidden: its mic is not heard.
+        ok(s.edit_item("Main", nested.id, ItemEdit::Hide));
+        assert!(!mic().shown);
+        // A hidden item of its own is not shown either.
+        let own = ok(s.add_source("Main", "coreaudio_input_capture", "Desk", &json!({}), false));
+        ok(s.edit_item("Main", own.id, ItemEdit::Hide));
+        assert!(!ok(s.audio("Main")).iter().find(|a| a.name == "Desk").unwrap_or_else(|| panic!("no Desk")).shown);
+        // A scene inside itself doesn't loop.
+        ok(s.add_existing("Audio", "Main"));
+        assert!(!ok(s.audio("Main")).is_empty());
     }
 
     /// Push-to-talk and push-to-mute are kept in the sound's own settings (OBS's keys), clamped to

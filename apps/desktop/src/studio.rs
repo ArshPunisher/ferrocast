@@ -1487,6 +1487,9 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             if let Some(t) = &change.tracks {
                 c.set_tracks(&name, t)?;
             }
+            if let Some(m) = change.mic {
+                c.set_mic(&name, Some(m))?;
+            }
             if change.push_to_talk.is_some() || change.push_to_talk_ms.is_some() {
                 c.set_push(&name, true, change.push_to_talk, change.push_to_talk_ms)?;
             }

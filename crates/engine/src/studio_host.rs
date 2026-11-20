@@ -1345,6 +1345,8 @@ pub struct AudioChange {
     pub push_to_talk_ms: Option<u32>,
     pub push_to_mute: Option<bool>,
     pub push_to_mute_ms: Option<u32>,
+    /// "This is a mic": whether the live watch judges it as a microphone.
+    pub mic: Option<bool>,
     /// The audio tracks (1 to 6) it's mixed into.
     pub tracks: Option<Vec<u8>>,
     /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
