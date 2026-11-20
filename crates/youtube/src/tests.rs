@@ -234,9 +234,7 @@ async fn fakes_issuing(
                     }
                     (
                         axum::http::StatusCode::OK,
-                        axum::Json(
-                            json!({ "access_token": "access-0", "refresh_token": "refresh-0", "expires_in": 3600 }),
-                        ),
+                        axum::Json(json!({ "access_token": issued, "refresh_token": "refresh-0", "expires_in": 3600 })),
                     )
                 }
             }),
