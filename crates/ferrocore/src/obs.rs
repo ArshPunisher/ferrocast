@@ -64,17 +64,18 @@ fn color(v: u64) -> [u8; 4] {
     [(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8, ((v >> 24) & 0xff) as u8]
 }
 
-/// OBS's v1 Color Correction multiplies contrast by `setting + 1` (round mid-grey); v2 and our
-/// own filter use `1 / (1 - setting)` below 0 and `setting + 1` above. So a v1 setting below 0 is
-/// carried as the v2 setting that gives the same multiplier (`-0.5` → 0.5 → `-1.0`), and one at
-/// or below -1 (OBS's multiplier of 0 or less: a flat grey, or the picture inverted) as the
-/// flattest we make, a multiplier of 0.01.
-fn color_filter_v1_contrast(setting: f32) -> f32 {
-    if !setting.is_finite() || setting >= 0.0 {
-        return if setting.is_finite() { setting } else { 0.0 };
-    }
+/// OBS's v1 Color Correction (`color_correction_filter_update_v1`) multiplies the colour by
+/// `setting + 1` round mid-grey: `c·x + (1 - c)/2`. Ours is v2's plain `1/(1 - s)` below 0, `s + 1`
+/// above, times the colour, with the brightness added after. So a v1 setting becomes the v2
+/// setting with the same multiplier, and `(1 - c)/2` goes into the brightness (the contrast and
+/// brightness matrices multiply as a scale and a shift, so the sum is exact). At or below -1
+/// (OBS's multiplier of 0 or less: a flat grey, or the picture inverted) the multiplier is the
+/// smallest we make, 0.01, never inverted. → `(contrast, brightness added)`.
+fn color_filter_v1_contrast(setting: f32) -> (f32, f32) {
+    let setting = if setting.is_finite() { setting } else { 0.0 };
     let multiplier = (setting + 1.0).max(0.01);
-    1.0 - 1.0 / multiplier
+    let ours = if multiplier >= 1.0 { multiplier - 1.0 } else { 1.0 - 1.0 / multiplier };
+    (ours, (1.0 - multiplier) / 2.0)
 }
 
 /// A source's picture filter, from OBS's id and settings; None for one the engine lacks.
@@ -152,6 +153,7 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
         }
         "color_filter" | "color_filter_v2" => {
             let v2 = kind == "color_filter_v2";
+            let v1_contrast = color_filter_v1_contrast(n("contrast", 0.0));
             let (multiply, add) = if !v2 && s.get("color_multiply").is_none() && s.get("color_add").is_none() {
                 // OBS v1 `color_correction_filter_update_v1`: single ABGR `color` where RGB
                 // multiplies and `RGB * A` adds.
@@ -169,8 +171,8 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             };
             Effect::ColorCorrection {
                 gamma: n("gamma", 0.0),
-                contrast: if v2 { n("contrast", 0.0) } else { color_filter_v1_contrast(n("contrast", 0.0)) },
-                brightness: n("brightness", 0.0),
+                contrast: if v2 { n("contrast", 0.0) } else { v1_contrast.0 },
+                brightness: n("brightness", 0.0) + if v2 { 0.0 } else { v1_contrast.1 },
                 saturation: n("saturation", 0.0),
                 hue_shift: n("hue_shift", 0.0),
                 opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
@@ -2387,24 +2389,40 @@ mod tests {
     /// `luma_key_filter`, `sharpness_filter`) import with exact OBS v1 opacity/brightness/color
     /// conversions, and v2 keyer smoothness/spill clamp >= 1.0 to avoid shader 0/0 NaNs.
     #[test]
-    fn color_correction_contrast_keeps_each_obs_versions_multiplier() {
-        // OBS v1: multiplier = setting + 1. v2: setting < 0 → 1 / (1 - setting), else setting + 1.
-        // Ours is the v2 curve, so v1's negative settings are converted at import.
-        let ours = |c: f32| if c < 0.0 { 1.0 / (1.0 - c) } else { c + 1.0 };
-        let imported = |kind: &str, c: f64| match effect_from(kind, &json!({ "contrast": c })) {
-            Some(Effect::ColorCorrection { contrast, .. }) => contrast,
+    fn color_correction_contrast_gives_each_obs_versions_picture() {
+        // The picture our filter makes: the colour times the v2 multiplier, then the brightness
+        // (`color_matrix` applied as a scale and a shift).
+        let ours = |c: f32, brightness: f32, p: f32| {
+            let m = if c < 0.0 { 1.0 / (1.0 - c) } else { c + 1.0 };
+            m * p + brightness
+        };
+        let imported = |kind: &str, c: f64, b: f64| match effect_from(kind, &json!({ "contrast": c, "brightness": b }))
+        {
+            Some(Effect::ColorCorrection { contrast, brightness, .. }) => (contrast, brightness),
             other => panic!("{other:?}"),
         };
         for c in [-0.9_f64, -0.5, -0.25, 0.0, 0.5, 2.0] {
-            let v1 = ours(imported("color_filter", c));
-            assert!((v1 - (c as f32 + 1.0)).abs() < 1e-5, "v1 {c}: multiplier {v1}");
-            let v2_setting = imported("color_filter_v2", c);
-            assert_eq!(v2_setting, c as f32, "v2 settings are ours as they are");
+            for p in [0.2_f32, 0.5, 0.8] {
+                // OBS v1 (color_correction_filter_update_v1): (p - 0.5)(c + 1) + 0.5, plus brightness.
+                let (k, b) = imported("color_filter", c, 0.1);
+                let v1 = ours(k, b, p);
+                let want = (p - 0.5) * (c as f32 + 1.0) + 0.5 + 0.1;
+                assert!((v1 - want).abs() < 1e-5, "v1 contrast {c}, pixel {p}: {v1} not {want}");
+                // OBS v2 (…_update_v2): the colour times 1/(1-c) below 0, c+1 above, no pivot.
+                let (k, b) = imported("color_filter_v2", c, 0.1);
+                assert_eq!((k, b), (c as f32, 0.1), "v2 settings are ours as they are");
+                let m = if c < 0.0 { 1.0 / (1.0 - c as f32) } else { c as f32 + 1.0 };
+                assert!((ours(k, b, p) - (p * m + 0.1)).abs() < 1e-5);
+            }
         }
+        // The documented example: v2 contrast -0.5 turns a 0.8 pixel into 0.533 and 0.2 into 0.133.
+        let (k, b) = imported("color_filter_v2", -0.5, 0.0);
+        assert!((ours(k, b, 0.8) - 0.5333).abs() < 1e-3 && (ours(k, b, 0.2) - 0.1333).abs() < 1e-3);
         // v1 at or below -1 (multiplier 0 or less in OBS) is the flattest, never inverted.
         for c in [-1.0_f64, -1.5, -2.0] {
-            let m = ours(imported("color_filter", c));
-            assert!((0.0..=0.02).contains(&m), "v1 {c}: multiplier {m}");
+            let (k, b) = imported("color_filter", c, 0.0);
+            let (lo, hi) = (ours(k, b, 0.2), ours(k, b, 0.8));
+            assert!(hi >= lo && hi - lo < 0.02, "v1 {c}: {lo} {hi}");
         }
     }
 

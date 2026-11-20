@@ -2269,12 +2269,14 @@ fn color_correction_matrix(
     multiply: u32,
     add: u32,
 ) -> [f32; 16] {
-    // Contrast turns round mid-grey (`(1 - c) / 2`), using OBS's monotonic `obs_contrast` curve
-    // so positive values boost contrast as expected while negative values down to -4 smoothly
-    // flatten toward mid-grey instead of inverting negative below -1.0.
+    // OBS's v2 Color Correction: `contrast < 0 ? 1 / (1 - contrast) : contrast + 1` and a plain
+    // multiply of the colour, no pivot (`con_matrix` in color-correction-filter.c's
+    // `color_correction_filter_update_v2`: the diagonal `contrast` and a last row of 0, 0, 0, 1,
+    // lines 263-265; its effect file applies it as `mul(color_matrix, currentPixel)`). An imported
+    // scene has to look as it does in OBS. v1's round-mid-grey contrast is the same multiply with
+    // `(1 - c) / 2` added to the brightness, which the import does.
     let c = obs_contrast(contrast);
-    let mid = (1.0 - c) / 2.0;
-    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [mid, mid, mid, 1.0]];
+    let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [0.0, 0.0, 0.0, 1.0]];
     let bright: M4 =
         [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [brightness, brightness, brightness, 1.0]];
     let s = saturation + 1.0;

@@ -393,10 +393,13 @@ fn adjust_sliders_do_what_they_say() {
     assert!(magenta[1] + 6 < magenta[0], "{magenta:?}");
 }
 
-/// OBS's Color Correction: contrast turns round mid-grey (the setting plus one, as OBS's v2).
-/// Before, it only scaled everything: more contrast just brightened the picture.
+/// OBS's v2 Color Correction contrast (`color_correction_filter_update_v2`): the colour times
+/// `1/(1 - c)` below 0 and `c + 1` above, no pivot, in the light the filter works in (linear, as
+/// the engine composes; the 8-bit values below are its sRGB encoding). An imported OBS scene looks
+/// as it does in OBS: v2 contrast -0.5 turns a linear 0.8 pixel (sRGB 231) into 0.533 (193) and a
+/// linear 0.2 pixel (124) into 0.133 (102).
 #[test]
-fn color_correction_contrast_turns_round_mid_grey() {
+fn color_correction_contrast_is_obs_v2_a_plain_multiply() {
     let Some(c) = gpu() else { return };
     let cc = |contrast: f32| ferrocore::Effect::ColorCorrection {
         gamma: 0.0,
@@ -408,19 +411,19 @@ fn color_correction_contrast_turns_round_mid_grey() {
         multiply: 0x00FF_FFFF,
         add: 0,
     };
-    let dark = through(&c, [60, 60, 60], cc(0.5));
-    let light = through(&c, [220, 220, 220], cc(0.5));
-    assert!(dark[0] < 60, "darks go darker: {dark:?}");
-    assert!(light[0] > 220, "lights go lighter: {light:?}");
     assert!(near(through(&c, [150, 150, 150], cc(0.0)), [150, 150, 150], 2), "0 changes nothing");
-    // Negative contrast below -1.0 (down to OBS's -4.0) flattens toward mid-grey instead of inverting.
+    // +0.5 multiplies the light by 1.5: sRGB 60 → 74, 100 → 121 (every grey brighter, as OBS).
+    let (a, b) = (through(&c, [60, 60, 60], cc(0.5)), through(&c, [100, 100, 100], cc(0.5)));
+    assert!(near(a, [74, 74, 74], 2), "{a:?}");
+    assert!(near(b, [121, 121, 121], 2), "{b:?}");
+    // -0.5 multiplies it by 1/1.5: linear 0.8 → 0.533 (231 → 193), 0.2 → 0.133 (124 → 102).
+    let (l, d) = (through(&c, [231, 231, 231], cc(-0.5)), through(&c, [124, 124, 124], cc(-0.5)));
+    assert!(near(l, [193, 193, 193], 2), "0.8 → 0.533: {l:?}");
+    assert!(near(d, [102, 102, 102], 2), "0.2 → 0.133: {d:?}");
+    // Down to OBS's -4.0 (multiplier 0.2) it only darkens, never inverts.
     for neg in [-2.0f32, -4.0] {
-        let d = through(&c, [40, 40, 40], cc(neg));
-        let l = through(&c, [220, 220, 220], cc(neg));
-        assert!(
-            d[0] > 40 && l[0] < 220 && d[0] < l[0],
-            "contrast={neg} must flatten without inverting: d={d:?}, l={l:?}"
-        );
+        let (d, l) = (through(&c, [40, 40, 40], cc(neg)), through(&c, [220, 220, 220], cc(neg)));
+        assert!(d[0] < 40 && l[0] < 220 && d[0] < l[0], "contrast={neg}: d={d:?}, l={l:?}");
     }
 }
 
