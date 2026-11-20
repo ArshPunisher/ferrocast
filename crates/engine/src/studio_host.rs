@@ -819,6 +819,9 @@ pub struct StudioSettings {
     pub bframes: bool,
     /// Send at this size instead of the canvas's.
     pub scale: Option<[u32; 2]>,
+    /// How a stream sent at another size is scaled: "bilinear", "bicubic" (default), "lanczos" or
+    /// "area".
+    pub scale_filter: String,
     pub audio_kbps: u32,
     /// The canvas: what's composed.
     pub width: u32,
@@ -847,6 +850,9 @@ pub struct StudioSettings {
     pub twitch_vod_track: u8,
     /// 44100 or 48000 (applies after a restart).
     pub sample_rate: u32,
+    /// The names of the recording's six audio tracks in its file (MP4 and MKV), each up to 40
+    /// characters; fewer than six leave the rest unnamed.
+    pub audio_track_names: Vec<String>,
     pub stereo: bool,
     /// The device "Hear it" plays on: (name, id); None is the system's.
     pub monitoring: Option<(String, String)>,
@@ -931,6 +937,7 @@ impl Default for StudioSettings {
             profile: "high".into(),
             bframes: true,
             scale: None,
+            scale_filter: "bicubic".into(),
             audio_kbps: 160,
             width: 1920,
             height: 1080,
@@ -949,6 +956,7 @@ impl Default for StudioSettings {
             delay_max_mb: 256,
             twitch_vod_track: 0,
             sample_rate: 48000,
+            audio_track_names: Vec::new(),
             stereo: true,
             monitoring: None,
             hotkeys: Default::default(),
@@ -1038,6 +1046,9 @@ impl StudioSettings {
         if !["high", "main", "baseline"].contains(&self.profile.as_str()) {
             return bad("profile: high, main or baseline.");
         }
+        if ferrocore::Filter::downscale_named(&self.scale_filter).is_none() {
+            return bad("scale_filter: bilinear, bicubic, lanczos or area.");
+        }
         if let Some([w, h]) = self.scale
             && !((128..=7680).contains(&w) && (72..=4320).contains(&h) && w.is_multiple_of(2) && h.is_multiple_of(2))
         {
@@ -1126,6 +1137,11 @@ impl StudioSettings {
         }
         if !(16..=4096).contains(&self.delay_max_mb) {
             return bad("delay_max_mb: 16 to 4096 megabytes.");
+        }
+        if self.audio_track_names.len() > 6
+            || self.audio_track_names.iter().any(|n| n.chars().count() > 40 || n.chars().any(char::is_control))
+        {
+            return bad("audio_track_names: up to 6 names of up to 40 characters.");
         }
         if ![44_100, 48_000].contains(&self.sample_rate) {
             return bad("sample_rate: 44100 or 48000.");
@@ -3757,6 +3773,7 @@ mod tests {
             ("keyframe_s", StudioSettings { keyframe_s: 30, ..d.clone() }),
             ("profile", StudioSettings { profile: "ultra".into(), ..d.clone() }),
             ("scale", StudioSettings { scale: Some([1281, 720]), ..d.clone() }),
+            ("scale_filter", StudioSettings { scale_filter: "sharp".into(), ..d.clone() }),
             ("audio_kbps", StudioSettings { audio_kbps: 100, ..d.clone() }),
             ("width", StudioSettings { width: 100, ..d.clone() }),
             ("fps", StudioSettings { fps: 59, ..d.clone() }),
@@ -3772,6 +3789,7 @@ mod tests {
             ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
             ("delay_max_mb", StudioSettings { delay_max_mb: 8, ..d.clone() }),
             ("sample_rate", StudioSettings { sample_rate: 96_000, ..d.clone() }),
+            ("audio_track_names", StudioSettings { audio_track_names: vec!["x".repeat(41)], ..d.clone() }),
         ] {
             let err = e.studio_set_settings(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{field}: {err:?}");

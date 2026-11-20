@@ -200,15 +200,10 @@ impl Shared {
         // The strong noise removal, when this build has it.
         #[cfg(feature = "deepfilter")]
         crate::denoiser::install();
-        let config = EngineConfig {
-            width: canvas.width,
-            height: canvas.height,
-            fps: canvas.fps.max(1),
-            ..EngineConfig::default()
-        };
+        let config = engine_config(&canvas);
         // Each output brings its own encoding; these only fill the gaps.
         let video = video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
+        let audio = AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: 160 };
         let engine = Engine::new(config, video, audio)
             .map_err(|e| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}")))?;
         let skipped = engine.load_obs(doc);
@@ -552,6 +547,34 @@ fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// The audio format, from the settings (set before the engine opens or an output starts): the rate
+/// the engine mixes at (44100 or 48000, from the next start) and the names of the six audio tracks
+/// in a recording's file.
+static AUDIO_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48_000);
+static TRACK_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub(crate) fn set_audio_format(rate: u32, names: Vec<String>) {
+    AUDIO_RATE.store(if rate == 44_100 { 44_100 } else { 48_000 }, Ordering::Relaxed);
+    *TRACK_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = names;
+}
+
+/// What the engine runs at for a canvas: its size and rate, and the sound rate set.
+fn engine_config(canvas: &crate::Canvas) -> EngineConfig {
+    EngineConfig {
+        width: canvas.width,
+        height: canvas.height,
+        fps: canvas.fps.max(1),
+        sample_rate: AUDIO_RATE.load(Ordering::Relaxed),
+        ..EngineConfig::default()
+    }
+}
+
+/// The names of the file's audio tracks, for the tracks (1 to 6) a recording carries.
+fn names_for(tracks: &[u8]) -> Vec<String> {
+    let names = TRACK_NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    tracks.iter().map(|t| names.get(usize::from(*t).saturating_sub(1)).cloned().unwrap_or_default()).collect()
 }
 
 /// The most a stream delay holds in memory (OBS has no cap: a long delay through an outage grows
@@ -900,7 +923,8 @@ impl OwnStream {
         let engine = &shared.engine;
         let config = engine.config();
         let video = video_config(e, config.width, config.height, config.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let audio =
+            AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
         let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
@@ -926,7 +950,12 @@ impl OwnStream {
                 scene: vertical_on_air(doc),
                 ..AvCanvas::main(config)
             },
-            (false, Some((w, h))) => AvCanvas::scaled(config, w.max(2) & !1, h.max(2) & !1),
+            (false, Some((w, h))) => AvCanvas::scaled_with(
+                config,
+                w.max(2) & !1,
+                h.max(2) & !1,
+                ferrocore::Filter::downscale_named(&e.scale_filter).unwrap_or(ferrocore::Filter::Bicubic),
+            ),
             (false, None) => AvCanvas::main(config),
         };
         if let Some(name) = solo {
@@ -941,6 +970,11 @@ impl OwnStream {
         if let Some(first) = picked.next() {
             out.track = first;
             out.more_tracks = picked.collect();
+        }
+        // The names the streamer gave the tracks go into a recording's file.
+        if record.is_some() {
+            let carried: Vec<u8> = tracks.iter().copied().filter(|t| (1..=6).contains(t)).collect();
+            out.track_names = names_for(&carried);
         }
         if streaming && !vertical && solo.is_none() {
             out.video_tracks = video_tracks.to_vec();
@@ -1042,7 +1076,8 @@ impl OwnStream {
         let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
         let config = d.shared.engine.config();
         let video = video_config(e, config.width, config.height, config.fps);
-        let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
+        let audio =
+            AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
         let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
@@ -1667,6 +1702,22 @@ mod tests {
         assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "nothing was sent early");
         // The count of bytes is true.
         assert_eq!(out.held_bytes, out.held.iter().map(|(_, t)| tag_len(t)).sum::<usize>());
+    }
+
+    #[test]
+    fn the_sound_rate_and_track_names_set_reach_the_engine_and_the_file() {
+        // (This test is the only one that sets them; the others run at the defaults.)
+        let canvas = crate::Canvas { width: 1920, height: 1080, fps: 60 };
+        assert_eq!(engine_config(&canvas).sample_rate, 48_000);
+        set_audio_format(44_100, vec!["Mic".into(), "".into(), "Game".into()]);
+        assert_eq!(engine_config(&canvas).sample_rate, 44_100, "from the setting, not a fixed 48 kHz");
+        assert_eq!((engine_config(&canvas).width, engine_config(&canvas).fps), (1920, 60));
+        // Tracks 3 and 1, in the file's order: Game, Mic; track 2 has no name.
+        assert_eq!(names_for(&[3, 1, 2]), vec!["Game", "Mic", ""]);
+        // Anything but 44100 is 48000.
+        set_audio_format(96_000, Vec::new());
+        assert_eq!(engine_config(&canvas).sample_rate, 48_000);
+        assert_eq!(names_for(&[1]), vec![""]);
     }
 
     #[test]

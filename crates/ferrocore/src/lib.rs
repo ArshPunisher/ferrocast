@@ -133,6 +133,20 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// The downscale filters a stream can be sent with, by name (OBS's: bilinear, bicubic, lanczos,
+    /// area); None for anything else.
+    pub fn downscale_named(name: &str) -> Option<Self> {
+        match name {
+            "bilinear" => Some(Self::Bilinear),
+            "bicubic" => Some(Self::Bicubic),
+            "lanczos" => Some(Self::Lanczos),
+            "area" => Some(Self::Area),
+            _ => None,
+        }
+    }
+}
+
+impl Filter {
     /// From the names Ferrocast's API uses (`ferrocast_studio::SCALE_FILTERS`).
     pub fn from_name(name: &str) -> Self {
         match name {

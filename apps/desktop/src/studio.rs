@@ -344,6 +344,7 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
         profile: s.profile.clone(),
         bframes: s.bframes,
         scale: s.scale.map(|[w, h]| (w, h)),
+        scale_filter: s.scale_filter.clone(),
         audio_kbps: s.audio_kbps,
         extra: if chosen.is_some() || s.video_encoder.is_none() {
             s.encoder_settings.clone()
@@ -739,9 +740,17 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
 
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
-        .map(|l| l.value)
-        .unwrap_or_default()
+    let s =
+        ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+            .map(|l| l.value)
+            .unwrap_or_default();
+    apply_audio_format(&s);
+    s
+}
+
+/// The sound's rate and the audio tracks' names, which the engine and the recording files read.
+fn apply_audio_format(s: &StudioSettings) {
+    ferrocast_studio::set_audio_format(s.sample_rate, s.audio_track_names.clone());
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {
@@ -2684,6 +2693,7 @@ impl StudioHost for DesktopStudio {
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
+                apply_audio_format(&s);
                 h.settings = Some(s);
                 // Open multiviews take a new layout at once.
                 refresh_projectors(h);

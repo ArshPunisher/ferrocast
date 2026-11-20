@@ -477,10 +477,18 @@ pub struct EncodeSettings {
     pub bframes: bool,
     /// Sent at this size instead of the canvas's.
     pub scale: Option<(u32, u32)>,
+    /// How a picture sent at another size is scaled: "bilinear", "bicubic" (OBS's default),
+    /// "lanczos" or "area".
+    #[serde(default = "default_scale_filter")]
+    pub scale_filter: String,
     pub audio_kbps: u32,
     /// The encoder's own options (OBS's keys), applied over the ones above.
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_scale_filter() -> String {
+    "bicubic".into()
 }
 
 impl EncodeSettings {
@@ -496,6 +504,7 @@ impl EncodeSettings {
             profile: "high".into(),
             bframes: true,
             scale: None,
+            scale_filter: default_scale_filter(),
             audio_kbps: 160,
             extra: Default::default(),
         }
@@ -628,6 +637,12 @@ pub fn delay_drain() -> Option<(f64, f64)> {
 /// The most memory a stream delay holds, in megabytes (from the next stream).
 pub fn set_delay_cap_mb(mb: u32) {
     own::set_delay_cap_mb(mb);
+}
+
+/// The sound's format from the settings: the rate the engine mixes at (44100 or 48000, from the next
+/// start) and the names of the six audio tracks in a recording's file.
+pub fn set_audio_format(rate: u32, track_names: Vec<String>) {
+    own::set_audio_format(rate, track_names);
 }
 
 /// Ends any delayed tail being sent (the streamer chose Stop now).

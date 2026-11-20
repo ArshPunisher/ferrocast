@@ -75,6 +75,8 @@ pub struct Pipeline {
     replay: Option<Replay>,
     /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
     stream_extra: bool,
+    /// The recording's audio tracks' names, by track ("Mic", "Game"); a missing one has none.
+    track_names: Vec<String>,
     sent_extra_headers: Vec<bool>,
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each its encoder, and whether its header went out.
@@ -431,6 +433,7 @@ impl Pipeline {
             auto_splits: 0,
             replay: None,
             stream_extra: false,
+            track_names: Vec::new(),
             sent_extra_headers: Vec::new(),
             video_tracks: Vec::new(),
             stream_from_us: 0,
@@ -590,6 +593,7 @@ impl Pipeline {
                 channels: acfg.channels,
                 config: self.audio.header(),
                 bitrate_kbps: acfg.bitrate_kbps,
+                name: String::new(),
             },
             tracks: 1 + self.extra.len(),
             packets: r.video.iter().cloned().collect(),
@@ -875,6 +879,11 @@ impl Pipeline {
         Ok(tags)
     }
 
+    /// The names the recording's audio tracks get in the file (first: track one).
+    pub fn set_track_names(&mut self, names: Vec<String>) {
+        self.track_names = names;
+    }
+
     /// Makes a stream send its extra sound tracks too (track ids 1, 2… after the main one),
     /// as OBS sends Twitch's VOD track.
     pub fn stream_extra_tracks(&mut self) {
@@ -1115,9 +1124,13 @@ impl Pipeline {
                         channels: acfg.channels,
                         config: aheader,
                         bitrate_kbps: acfg.bitrate_kbps,
+                        name: String::new(),
                     };
-                    // Every track the same shape (the extra encoders share the first's settings).
-                    let tracks = vec![a; 1 + self.extra.len()];
+                    // Every track the same shape (the extra encoders share the first's settings),
+                    // each with the name the streamer gave it.
+                    let tracks: Vec<AudioTrack> = (0..1 + self.extra.len())
+                        .map(|i| AudioTrack { name: self.track_names.get(i).cloned().unwrap_or_default(), ..a.clone() })
+                        .collect();
                     match Writer::new(file, kind, v, tracks) {
                         Ok(mut w) => {
                             let wrote = w.video(p).and_then(|()| held.iter().try_for_each(|(t, a)| w.audio(*t, a)));
@@ -1270,7 +1283,13 @@ mod full_disk_tests {
                 height: 64,
                 config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
             },
-            AudioTrack { sample_rate: 48000, channels: 2, config: vec![0x11, 0x90], bitrate_kbps: 160 },
+            AudioTrack {
+                sample_rate: 48000,
+                channels: 2,
+                config: vec![0x11, 0x90],
+                bitrate_kbps: 160,
+                name: String::new(),
+            },
         )
     }
 

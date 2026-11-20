@@ -59,6 +59,8 @@ pub struct AudioTrack {
     /// The AudioSpecificConfig.
     pub config: Vec<u8>,
     pub bitrate_kbps: u32,
+    /// The track's name in the file ("Mic", "Game"); empty: "Ferrocast sound".
+    pub name: String,
 }
 
 /// A sample's line in a fragment: duration, size, flags, composition offset.
@@ -933,7 +935,11 @@ fn audio_trak(a: &AudioTrack, id: u32, shape: &Shape<'_>, table: Option<&Table>,
     let media_ticks = table.map_or(0, Table::total);
     let mdia = boxed(
         b"mdia",
-        &cat(&[mdhd(a.sample_rate, media_ticks, shape.mov, now), hdlr(b"soun", "Ferrocast sound", shape.mov), minf]),
+        &cat(&[
+            mdhd(a.sample_rate, media_ticks, shape.mov, now),
+            hdlr(b"soun", if a.name.is_empty() { "Ferrocast sound" } else { &a.name }, shape.mov),
+            minf,
+        ]),
     );
     // A sound that started after the picture does so in the finished file too.
     let delay_ms =
@@ -1003,8 +1009,39 @@ mod finished_tests {
                 height: 64,
                 config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
             },
-            AudioTrack { sample_rate: 48000, channels: 2, config: vec![0x11, 0x90], bitrate_kbps: 160 },
+            AudioTrack {
+                sample_rate: 48000,
+                channels: 2,
+                config: vec![0x11, 0x90],
+                bitrate_kbps: 160,
+                name: String::new(),
+            },
         )
+    }
+
+    /// The streamer's names for the audio tracks show in the file (the handler's name); a track
+    /// without one keeps "Ferrocast sound".
+    #[test]
+    fn audio_tracks_carry_the_names_they_were_given() {
+        let (v, a) = tracks();
+        let named = |n: &str| AudioTrack { name: n.into(), ..a.clone() };
+        let mut w = Mp4Writer::with_tracks(Cursor::new(Vec::new()), Some(v), vec![named("Mic"), named("Game"), a])
+            .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..3i64 {
+            w.video(&VideoPacket { pts_us: i * 33_333, dts_us: i * 33_333, key: i == 0, data: vec![1; 40] })
+                .unwrap_or_else(|e| panic!("{e}"));
+            for t in 0..3 {
+                w.audio_on(t, &AudioPacket { pts_us: i * 21_333, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+        let has = |what: &[u8]| bytes.windows(what.len()).any(|w| w == what);
+        assert!(has(b"Mic") && has(b"Game"), "the names are in the file");
+        assert_eq!(
+            bytes.windows(15).filter(|w| *w == b"Ferrocast sound").count(),
+            1,
+            "the unnamed one keeps the default"
+        );
     }
 
     /// 150 frames (a keyframe each second), and three sound tracks, three chapters.

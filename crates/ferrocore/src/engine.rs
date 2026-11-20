@@ -372,6 +372,8 @@ pub struct Canvas {
     /// More of the mixer's tracks a recording carries after `track`, each its own sound track
     /// in the file (OBS's recording tracks 2-6).
     pub more_tracks: Vec<usize>,
+    /// The names of the recording's audio tracks, by track (first: track one).
+    pub track_names: Vec<String>,
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each width, height and kbps, drawn from the same picture scaled down.
     pub video_tracks: Vec<(u32, u32, u32)>,
@@ -388,6 +390,7 @@ impl Canvas {
             track: 0,
             scaled_from: None,
             more_tracks: Vec::new(),
+            track_names: Vec::new(),
             video_tracks: Vec::new(),
         }
     }
@@ -399,7 +402,7 @@ impl Canvas {
         Self {
             width,
             height,
-            scaled_from: Some((w, h, Filter::Bicubic)),
+            scaled_from: Some((w, h, self.scaled_from.map_or(Filter::Bicubic, |(.., f)| f))),
             more_tracks: Vec::new(),
             video_tracks: Vec::new(),
             ..self.clone()
@@ -408,13 +411,13 @@ impl Canvas {
 
     /// The engine's canvas scaled to `width`×`height` (bicubic, OBS's default downscale filter).
     pub fn scaled(config: EngineConfig, width: u32, height: u32) -> Self {
+        Self::scaled_with(config, width, height, Filter::Bicubic)
+    }
+
+    /// The engine's canvas scaled to `width`×`height` with `filter`.
+    pub fn scaled_with(config: EngineConfig, width: u32, height: u32, filter: Filter) -> Self {
         let from = (width, height) != (config.width, config.height);
-        Self {
-            width,
-            height,
-            scaled_from: from.then_some((config.width, config.height, Filter::Bicubic)),
-            ..Self::main(config)
-        }
+        Self { width, height, scaled_from: from.then_some((config.width, config.height, filter)), ..Self::main(config) }
     }
 }
 
@@ -2438,6 +2441,7 @@ impl Engine {
         };
         let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
+        pipe.set_track_names(canvas.track_names.clone());
         if matches!(kind, OutputKind::Stream(_)) {
             pipe.stream_extra_tracks();
             // Twitch Enhanced Broadcasting's other qualities: H.264, even sides, a few at most.
@@ -2884,7 +2888,9 @@ impl Engine {
         // Drawn at what it was drawn from (the canvas, or its own scene's size), then scaled.
         let from = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
         let from = if canvas.scene.is_none() { (config.width, config.height) } else { from };
-        canvas.scaled_from = ((width, height) != from).then_some((from.0, from.1, Filter::Bicubic));
+        // (The filter chosen for it stays.)
+        let filter = canvas.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
+        canvas.scaled_from = ((width, height) != from).then_some((from.0, from.1, filter));
         canvas.width = width;
         canvas.height = height;
         canvas.every = every;
@@ -5135,11 +5141,12 @@ fn frame(
                     continue;
                 }
                 let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
+                let f = c.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
                 let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
-                    Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, Filter::Bicubic)),
+                    Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, f)),
                     Draw::Moving(mut t) => {
-                        t.from = scaled(t.from, w, h, Filter::Bicubic);
-                        t.to = scaled(t.to, w, h, Filter::Bicubic);
+                        t.from = scaled(t.from, w, h, f);
+                        t.to = scaled(t.to, w, h, f);
                         gpu.begin_transition_nv12(&t)
                     }
                 };
@@ -6277,6 +6284,48 @@ mod tests {
         assert!(e.tap_frames(Canvas::scaled(e.config, 321, 180), sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { every: 0, ..Canvas::main(e.config) }, sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
+    }
+
+    /// The downscale filter chosen for an output is the one that draws it (it was always bicubic):
+    /// a hard edge scaled 0.6x comes out differently with bilinear, bicubic and lanczos.
+    #[test]
+    fn the_downscale_filter_chosen_is_the_one_used() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 321, height: 360, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default()), SceneItem::new(2, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let first_frame = |filter: Filter| -> Vec<u8> {
+            let got = Arc::new(Mutex::new(None::<Vec<u8>>));
+            let sink = got.clone();
+            let tap = e
+                .tap_frames(
+                    Canvas::scaled_with(e.config, 384, 216, filter),
+                    Box::new(move |f: &Nv12, _| {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(|| f.y.clone());
+                    }),
+                )
+                .unwrap_or_else(|x| panic!("{x}"));
+            let until = Instant::now() + Duration::from_secs(5);
+            while got.lock().unwrap_or_else(|p| p.into_inner()).is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            e.stop_tap(tap);
+            let y = got.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            y.unwrap_or_else(|| panic!("no frame for {filter:?}"))
+        };
+        let bilinear = first_frame(Filter::Bilinear);
+        let bicubic = first_frame(Filter::Bicubic);
+        let lanczos = first_frame(Filter::Lanczos);
+        assert_ne!(bilinear, lanczos, "lanczos isn't bilinear");
+        assert_ne!(bilinear, bicubic, "bicubic isn't bilinear");
+        assert_ne!(bicubic, lanczos, "lanczos isn't bicubic");
+        // The names a stream's setting uses.
+        assert_eq!(Filter::downscale_named("lanczos"), Some(Filter::Lanczos));
+        assert_eq!(Filter::downscale_named("area"), Some(Filter::Area));
+        assert_eq!(Filter::downscale_named("sharp"), None);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
