@@ -375,14 +375,18 @@ impl Encoder {
     /// keyframe. False while it isn't known yet (asked again next frame) and when it's the same.
     pub(crate) fn header_changed(&mut self) -> bool {
         let Some(prior) = self.prior_header.as_ref() else { return false };
-        let Some(now) = self.header() else { return false };
+        let own = self.sink.lock().ok().and_then(|s| s.header.clone());
+        let Some(now) = own else { return false };
         let changed = *prior != now;
         self.prior_header = None;
         changed
     }
 
+    /// The codec header: the session's own, or (right after a rebuild, until the new session
+    /// has made its first frame) the lost session's, so nothing that asks in that moment (a
+    /// replay save) finds none.
     pub(crate) fn header(&self) -> Option<Vec<u8>> {
-        self.sink.lock().ok().and_then(|s| s.header.clone())
+        self.sink.lock().ok().and_then(|s| s.header.clone()).or_else(|| self.prior_header.clone())
     }
 
     pub(crate) fn encode(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
@@ -725,6 +729,22 @@ mod tests {
         assert!(e.set_rate(900, RateControl::Cbr).is_ok(), "the bitrate is kept for the new session");
         assert_eq!(e.rate_now.0, 900);
         assert!(e.flush().is_ok(), "stopping after a loss isn't an error");
+    }
+
+    /// Right after a rebuild, before the new session has made a frame, the codec header is the
+    /// lost session's, not none (a replay save at that moment would find nothing; agy review R6).
+    #[test]
+    fn the_header_is_never_none_after_a_rebuild() {
+        let Ok(mut e) = Encoder::new(&config()) else { return };
+        let pix = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        for i in 0..5 {
+            e.encode(frame(&pix), i * 33_333, i == 0).unwrap_or_else(|x| panic!("{x}"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(e.header().is_some());
+        e.invalidate_for_test();
+        e.encode(frame(&pix), 6 * 33_333, false).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.header().is_some(), "the lost session's header stands in");
     }
 
     #[test]

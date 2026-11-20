@@ -2902,6 +2902,22 @@ impl Engine {
         own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
+    /// Tests: how many video frames this output's encoder has been handed.
+    #[cfg(test)]
+    fn video_calls_for_test(&self, id: u64) -> u64 {
+        let st = self.lock();
+        st.outputs.iter().find(|(i, ..)| *i == id).map_or(0, |(_, pipe, ..)| pipe.video_calls_for_test())
+    }
+
+    /// Tests: the hardware session of this output's encoder is taken away.
+    #[cfg(all(test, target_os = "macos"))]
+    fn lose_output_session_for_test(&self, id: u64) {
+        let mut st = self.lock();
+        if let Some((_, pipe, ..)) = st.outputs.iter_mut().find(|(i, ..)| *i == id) {
+            pipe.lose_video_session_for_test();
+        }
+    }
+
     /// Tests: makes this output's encoder fault on every frame.
     #[cfg(test)]
     fn fail_output_for_test(&self, id: u64) {
@@ -4154,6 +4170,7 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
         // Waiting for a signal, with the session left open: a picture that comes now (a console
         // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
+        let gone = signs.as_ref().is_some_and(|(_, _, ended)| ended.is_some());
         match signs {
             Some((count, ..)) if running && count > 0 => {
                 w.ever_sent = true;
@@ -4162,6 +4179,13 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
                 w.since = now;
                 w.tries = 0;
                 w.next_try = 0;
+            }
+            // No session to see the signal come with (the last try failed to open, or it ended
+            // with an error): a slow try (the backoff, a minute at most) puts one back. Windows
+            // has no hotplug wake, so this is what wakes it there.
+            _ if !running || gone => {
+                w.no_signal = true;
+                return Some("its session is gone while it waits for a signal".into());
             }
             _ => w.no_signal = true,
         }
@@ -4540,6 +4564,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
             .collect();
         let mut failures: Vec<(u64, String)> = Vec::new();
+        let dead: Vec<u64> = st.errors.keys().copied().collect();
         let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
@@ -4550,6 +4575,11 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             // it would only keep the encoder busy until someone presses Stop. (One that shares
             // its encode with a stream goes on, for the stream.)
             if matches!(kind, OutputKind::Record(_)) && pipe.recording_failed() {
+                continue;
+            }
+            // An output that has failed isn't fed again: its encoder would only fail 60 times a
+            // second, with the engine's lock held, until someone stops it.
+            if dead.contains(id) {
                 continue;
             }
             let mut tags = Vec::new();
@@ -5361,6 +5391,21 @@ mod tests {
         // An ordinary crash is still restarted as before.
         let mut crashed = Watch::for_kind(None, 0);
         assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
+    }
+
+    /// The wait for a signal needs a session open to see it come: without one (the last try failed
+    /// to open, or it ended with an error) the watchdog still tries, slowly (agy review R9).
+    #[test]
+    fn a_no_signal_wait_without_a_session_is_retried_slowly() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert!(look(&mut w, false, None, 40 * s).is_some(), "not running: try again");
+        let err = Some((0, true, Some("runtime error".to_string())));
+        assert!(look(&mut w, true, err, 41 * s).is_some(), "ended with an error: try again");
+        // With a healthy session it still just waits.
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 42 * s), None);
+        assert!(w.no_signal);
     }
 
     /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
@@ -6199,6 +6244,53 @@ mod tests {
         *e.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some("out of memory".into());
         assert_eq!(e.output_error(7), Some("out of memory".into()));
         assert_eq!(e.output_error(8), Some("out of memory".into()));
+    }
+
+    /// A failed output isn't fed again at 60 frames a second (agy review R2).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_failed_output_is_not_fed_again() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Wide", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
+        let id = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        e.fail_output_for_test(id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while e.output_error(id).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(e.output_error(id).is_some());
+        let after_failure = e.video_calls_for_test(id);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(e.video_calls_for_test(id), after_failure, "the encoder isn't handed more frames");
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    /// Stopping an output whose hardware session was just taken away, while the frame loop
+    /// rebuilds it under the engine's lock: it finishes, with no error and no deadlock (agy
+    /// review R5).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stopping_an_output_races_its_rebuild_without_error() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Wide", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
+        for round in 0..4 {
+            let id = e.start_output(OutputKind::Stream(Box::new(|_| {}))).unwrap_or_else(|x| panic!("{x}"));
+            std::thread::sleep(Duration::from_millis(300));
+            e.lose_output_session_for_test(id);
+            // Straight away, or a few frames later: the loop's rebuild may come before or after.
+            std::thread::sleep(Duration::from_millis(round * 25));
+            let started = Instant::now();
+            let stopped = e.stop_output(id);
+            assert!(stopped.is_ok(), "round {round}: {stopped:?}");
+            assert!(started.elapsed() < Duration::from_secs(5), "round {round}: stop took {:?}", started.elapsed());
+            assert_eq!(e.output_error(id), None);
+        }
     }
 
     /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main

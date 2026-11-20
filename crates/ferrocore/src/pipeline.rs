@@ -52,6 +52,8 @@ pub struct Pipeline {
     /// Tests: every video frame fails, as a faulting encoder's would.
     #[cfg(test)]
     fail_video: bool,
+    #[cfg(test)]
+    video_calls: u64,
     /// Time spent paused so far, taken off every later frame's time (no gap in the file).
     paused_ns: u64,
     /// The next frame is made a keyframe (after a pause, or to start a split file on).
@@ -414,6 +416,8 @@ impl Pipeline {
             paused_at: None,
             #[cfg(test)]
             fail_video: false,
+            #[cfg(test)]
+            video_calls: 0,
             paused_ns: 0,
             key_next: false,
             split_to: None,
@@ -681,6 +685,10 @@ impl Pipeline {
     pub fn video(&mut self, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         if self.paused_at.is_some() {
             return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        {
+            self.video_calls += 1;
         }
         #[cfg(test)]
         if self.fail_video {
@@ -1162,6 +1170,18 @@ fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
 }
 
 impl Pipeline {
+    /// Tests: how many frames the encoder has been handed.
+    #[cfg(test)]
+    pub(crate) fn video_calls_for_test(&self) -> u64 {
+        self.video_calls
+    }
+
+    /// Tests: the hardware session is taken away.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn lose_video_session_for_test(&mut self) {
+        self.video.lose_session_for_test(false);
+    }
+
     /// Tests: this output's encoder faults on every frame from now on.
     #[cfg(test)]
     pub(crate) fn fail_video_for_test(&mut self) {
