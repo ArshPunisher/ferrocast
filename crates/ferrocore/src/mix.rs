@@ -3429,6 +3429,66 @@ mod steady_state_tests {
         );
     }
 
+    /// A key that stops delivering (a stalled device, a paused file: the source stays, its ring
+    /// runs dry) is silence for the blocks it misses: the music comes back up as the compressor
+    /// releases, it never stays ducked on the key's last block. A key that arrives half a block
+    /// late ducks only from where its samples start.
+    #[test]
+    fn sidechain_key_that_stops_or_arrives_late_never_leaves_the_music_ducked() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { volume: 0.0, tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -30.0,
+                attack_ms: 1.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let blocks = 200usize;
+        m.push(1, &vec![0.5f32; BLOCK * blocks * 2], 2, rate, t0);
+        // The key: 10 blocks of loud tone, then nothing at all (its ring runs dry).
+        m.push(2, &vec![0.4f32; BLOCK * 10 * 2], 2, rate, t0);
+        let out = m.mix_until(t0 + blocks as u64 * step);
+        let level = |i: usize| out[i].tracks[0].iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(level(8) < 0.2, "ducked while the key plays: {}", level(8));
+        assert!(level(blocks - 5) > 0.49, "music back after the key stops: {}", level(blocks - 5));
+
+        // A key 512 frames late: the first half block is unducked, the rest ducked.
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { volume: 0.0, tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 20.0,
+                threshold_db: -40.0,
+                attack_ms: 1.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let _ = m.mix_until(t0);
+        m.push(1, &vec![0.5f32; BLOCK * 20 * 2], 2, rate, t0);
+        let late = 512u64;
+        m.push(2, &vec![0.4f32; BLOCK * 20 * 2], 2, rate, t0 + late * 1_000_000_000 / u64::from(rate));
+        let out = m.mix_until(t0 + 20 * step);
+        let first = &out[0].tracks[0];
+        let head = first[..(late as usize - 8) * 2].iter().fold(0f32, |a, v| a.max(v.abs()));
+        let tail = first[(late as usize + 400) * 2..].iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(head > 0.49, "before the key's first sample the music is untouched: {head}");
+        assert!(tail < 0.25, "from the key on it is ducked: {tail}");
+    }
+
     /// Missing, muted, or removed sidechain key sources feed silence (no ducking, no crash).
     #[test]
     fn sidechain_missing_muted_and_removed_key_feeds_silence() {
