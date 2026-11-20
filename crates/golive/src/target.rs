@@ -1,10 +1,33 @@
 //! A destination's server address (`rtmp://host[:port]/app` or `rtmps://…`), checked and split
 //! into what the RTMP connect needs. The stream key is kept apart and never part of the address.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Longest server address we accept, as typed or fetched.
 const MAX_URL: usize = 512;
+
+/// Which IP version a destination connects over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpFamily {
+    /// Whatever the system picks.
+    #[default]
+    Auto,
+    /// IPv4 only (a server whose IPv6 route is broken).
+    V4,
+    /// IPv6 only.
+    V6,
+}
+
+impl IpFamily {
+    pub fn allows(self, a: &std::net::IpAddr) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::V4 => a.is_ipv4(),
+            Self::V6 => a.is_ipv6(),
+        }
+    }
+}
 
 /// A checked server address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -21,6 +44,13 @@ pub struct Target {
     /// checks the host name.
     #[serde(skip)]
     pub pin: Option<std::net::SocketAddr>,
+    /// Connect over this IP version only.
+    #[serde(skip)]
+    pub family: IpFamily,
+    /// Send over this network connection only (its name or address), and never move to another when
+    /// it fails: the streamer chose it (the wired one, not the metered hotspot).
+    #[serde(skip)]
+    pub bind: Option<String>,
 }
 
 /// Why an address was refused, in words for the person who typed it.
@@ -78,7 +108,7 @@ impl Target {
         let host = host.to_ascii_lowercase();
         let scheme = if tls { "rtmps" } else { "rtmp" };
         let tc_url = format!("{scheme}://{authority}/{app}");
-        Ok(Self { tls, host, port, app: app.to_string(), tc_url, pin: None })
+        Ok(Self { tls, host, port, app: app.to_string(), tc_url, pin: None, family: IpFamily::Auto, bind: None })
     }
 }
 

@@ -36,7 +36,7 @@ pub use hub::{Hub, StreamStats};
 pub use ingest::Ingest;
 pub use probe::{Need, Service, Verdict};
 pub use push::{Destination, Health, Link, PushError, PushState};
-pub use target::{Target, TargetError};
+pub use target::{IpFamily, Target, TargetError};
 
 #[cfg(test)]
 mod tests;

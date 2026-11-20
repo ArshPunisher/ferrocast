@@ -174,6 +174,8 @@ pub(crate) struct OwnStream {
     /// Our engine drawing the collection (instead of libobs's frames).
     drawn: Option<Drawn>,
     hub: Option<Arc<Hub>>,
+    /// The delayed tail of the stream, sent after it ended.
+    drain: Arc<DrainGate>,
     /// SRT, RIST and WHIP destinations beside the stream, by id: their stop and health.
     directs:
         std::collections::HashMap<String, (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<Health>)>,
@@ -569,47 +571,217 @@ fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The most a stream delay holds in memory (OBS has no cap: a long delay through an outage grows
+/// until it runs out). At the cap the oldest seconds go, from a keyframe to the next.
+const DELAY_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// The stream on its way to Go live's hub, held back `delay` first (OBS's stream delay: what
-/// you do shows that much later, so viewers can't snipe). Ending sends what's still held, so
-/// the last seconds aren't lost.
+/// you do shows that much later, so viewers can't snipe). Ending does not dump what's still held
+/// in one burst (the hub drops what a listener can't take at once): it is sent on at the pace it
+/// would have gone, so the last seconds are not lost, and a new stream (or `discard_delay`) cuts
+/// the rest short.
 struct Delayed {
     hub: Arc<Hub>,
     counts: Arc<Counts>,
     delay: Duration,
     held: std::collections::VecDeque<(std::time::Instant, Tag)>,
+    held_bytes: usize,
+    cap: usize,
+    /// Said once: the cap was reached.
+    capped: bool,
+    gate: Arc<DrainGate>,
 }
 
-impl Delayed {
-    fn send(&mut self, t: Tag) {
-        if self.delay.is_zero() {
-            return self.pass(t);
-        }
-        self.held.push_back((std::time::Instant::now(), t));
-        while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
-            if let Some((_, t)) = self.held.pop_front() {
-                self.pass(t);
-            }
+/// A stream's delayed tail being sent after it ended: lets the stream's owner wait for it, and
+/// whoever starts the next stream (or discards the delay) cut it short.
+#[derive(Debug, Default)]
+struct DrainGate {
+    state: Mutex<DrainState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct DrainState {
+    running: bool,
+    cancel: bool,
+}
+
+/// Drains in progress (every stream's tail), so a new stream can end them.
+static DRAINS: Mutex<Vec<std::sync::Weak<DrainGate>>> = Mutex::new(Vec::new());
+
+/// Ends every delayed tail still being sent (a new stream starts, or the streamer chose to stop
+/// at once): what's left of the delay is dropped.
+pub(crate) fn discard_delay() {
+    let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+    drains.retain(|w| w.strong_count() > 0);
+    for g in drains.iter().filter_map(std::sync::Weak::upgrade) {
+        g.cancel();
+    }
+}
+
+impl DrainGate {
+    fn cancel(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).cancel = true;
+        self.cv.notify_all();
+    }
+
+    fn is_running(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).running
+    }
+
+    /// Blocks until the drain is over (sent, or cancelled).
+    fn wait_done(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while st.running {
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
         }
     }
 
-    fn pass(&self, t: Tag) {
-        match t {
-            Tag::Video { ms, body } => {
-                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                self.hub.video(ms, body.into());
+    /// Waits until `at`; false when the drain was cancelled meanwhile.
+    fn wait_until(&self, at: std::time::Instant) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if st.cancel {
+                return false;
             }
-            Tag::Audio { ms, body } => {
-                self.counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                self.hub.audio(ms, body.into());
+            let Some(left) = at.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()) else {
+                return true;
+            };
+            st = self.cv.wait_timeout(st, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    fn finish(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).running = false;
+        self.cv.notify_all();
+    }
+}
+
+/// A sequence header: kept whatever else is dropped, or the stream couldn't be decoded.
+fn is_header(t: &Tag) -> bool {
+    match t {
+        Tag::Video { body, .. } => {
+            // Classic AVC: codec 7, packet type 0. Enhanced RTMP: the high bit, packet type 0.
+            body.first()
+                .zip(body.get(1))
+                .is_some_and(|(b0, b1)| (b0 & 0x0f == 7 && *b1 == 0) || (b0 & 0x80 != 0 && b0 & 0x0f == 0))
+        }
+        Tag::Audio { body, .. } => body.first().zip(body.get(1)).is_some_and(|(b0, b1)| b0 >> 4 == 10 && *b1 == 0),
+    }
+}
+
+fn is_keyframe(t: &Tag) -> bool {
+    matches!(t, Tag::Video { body, .. } if body.first().is_some_and(|b| (b >> 4) & 0x7 == 1) && !is_header(t))
+}
+
+fn tag_len(t: &Tag) -> usize {
+    match t {
+        Tag::Video { body, .. } | Tag::Audio { body, .. } => body.len(),
+    }
+}
+
+impl Delayed {
+    fn new(hub: Arc<Hub>, counts: Arc<Counts>, delay: Duration, gate: Arc<DrainGate>) -> Self {
+        Self {
+            hub,
+            counts,
+            delay,
+            held: std::collections::VecDeque::new(),
+            held_bytes: 0,
+            cap: DELAY_MAX_BYTES,
+            capped: false,
+            gate,
+        }
+    }
+
+    fn send(&mut self, t: Tag) {
+        if self.delay.is_zero() {
+            return pass(&self.hub, &self.counts, t);
+        }
+        self.held_bytes += tag_len(&t);
+        self.held.push_back((std::time::Instant::now(), t));
+        while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
+            if let Some((_, t)) = self.held.pop_front() {
+                self.held_bytes -= tag_len(&t);
+                pass(&self.hub, &self.counts, t);
             }
+        }
+        self.keep_under_cap();
+    }
+
+    /// Over the cap: the oldest seconds are dropped, up to the next keyframe (never a header).
+    fn keep_under_cap(&mut self) {
+        while self.held_bytes > self.cap {
+            let mut headers = Vec::new();
+            let mut dropped = false;
+            while self.held.front().is_some_and(|(_, t)| !(dropped && is_keyframe(t))) {
+                let Some((at, t)) = self.held.pop_front() else { break };
+                if is_header(&t) {
+                    headers.push((at, t));
+                } else {
+                    self.held_bytes -= tag_len(&t);
+                    dropped = true;
+                }
+            }
+            for h in headers.into_iter().rev() {
+                self.held.push_front(h);
+            }
+            if !dropped {
+                break;
+            }
+            if !self.capped {
+                self.capped = true;
+                tracing::warn!(
+                    cap_mb = self.cap / (1024 * 1024),
+                    "the stream delay's memory is full: the oldest seconds are dropped"
+                );
+            }
+        }
+    }
+}
+
+fn pass(hub: &Hub, counts: &Counts, t: Tag) {
+    match t {
+        Tag::Video { ms, body } => {
+            counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            hub.video(ms, body.into());
+        }
+        Tag::Audio { ms, body } => {
+            counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            hub.audio(ms, body.into());
         }
     }
 }
 
 impl Drop for Delayed {
     fn drop(&mut self) {
-        while let Some((_, t)) = self.held.pop_front() {
-            self.pass(t);
+        if self.held.is_empty() {
+            return;
+        }
+        // The tail goes on at its own pace (each tag when it is `delay` old), on a thread of its
+        // own; the stream's owner waits for it (`gate`) before it ends the hub.
+        let (hub, counts, delay, gate) = (self.hub.clone(), self.counts.clone(), self.delay, self.gate.clone());
+        let held = std::mem::take(&mut self.held);
+        gate.state.lock().unwrap_or_else(|p| p.into_inner()).running = true;
+        {
+            let mut drains = DRAINS.lock().unwrap_or_else(|p| p.into_inner());
+            drains.retain(|w| w.strong_count() > 0);
+            drains.push(Arc::downgrade(&gate));
+        }
+        let spawned = std::thread::Builder::new().name("ferrocast-delay-drain".into()).spawn({
+            let gate = gate.clone();
+            move || {
+                for (at, t) in held {
+                    if !gate.wait_until(at + delay) {
+                        break;
+                    }
+                    pass(&hub, &counts, t);
+                }
+                gate.finish();
+            }
+        });
+        if spawned.is_err() {
+            gate.finish();
         }
     }
 }
@@ -721,6 +893,7 @@ impl OwnStream {
         let video = if send_to.is_some() { for_stream(video) } else { video };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
+        let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
         hub.start();
@@ -728,12 +901,10 @@ impl OwnStream {
             (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
             (Some(p), None) => OutputKind::Record(p.to_path_buf()),
             (None, None) => {
-                let mut out = Delayed {
-                    hub: hub.clone(),
-                    counts: counts.clone(),
-                    delay: Duration::from_secs(u64::from(delay_s)),
-                    held: std::collections::VecDeque::new(),
-                };
+                // A new stream ends the tail of the last one.
+                discard_delay();
+                let mut out =
+                    Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone());
                 OutputKind::Stream(Box::new(move |t: Tag| out.send(t)))
             }
         };
@@ -805,6 +976,7 @@ impl OwnStream {
                 from,
             }),
             hub: Some(hub),
+            drain,
             directs: Default::default(),
         })
     }
@@ -841,6 +1013,7 @@ impl OwnStream {
                 from: (begun.frames, begun.skipped),
             }),
             hub: None,
+            drain: Arc::new(DrainGate::default()),
             directs: Default::default(),
         })
     }
@@ -862,16 +1035,13 @@ impl OwnStream {
         let video = for_stream(video_config(e, config.width, config.height, config.fps));
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
+        let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
         hub.start();
         hub.metadata(metadata_of(&video, &audio, config.width, config.height, config.fps));
-        let mut out = Delayed {
-            hub: hub.clone(),
-            counts: counts.clone(),
-            delay: Duration::from_secs(u64::from(delay_s)),
-            held: std::collections::VecDeque::new(),
-        };
+        discard_delay();
+        let mut out = Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone());
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
             // The push started above ends with it (projects-60).
             hub.end();
@@ -901,6 +1071,7 @@ impl OwnStream {
                 from: (begun.frames, begun.skipped),
             }),
             hub: Some(hub),
+            drain,
             directs: Default::default(),
         })
     }
@@ -1307,6 +1478,29 @@ impl Drop for OwnStream {
             if let Some((shared, name)) = solo_release {
                 shared.release_alone(&name);
             }
+            // The stream's delayed tail is still being sent: the hub ends, the sender stops, after
+            // it, on a thread of its own so stopping doesn't wait out the delay.
+            if self.drain.is_running() {
+                let (gate, hub) = (self.drain.clone(), self.hub.take());
+                let (stop_push, runtime) = (self.stop_push.take(), self.runtime.take());
+                let finish = move || {
+                    gate.wait_done();
+                    if let Some(hub) = hub {
+                        hub.end();
+                    }
+                    if let Some(sp) = stop_push {
+                        std::thread::sleep(Duration::from_millis(300));
+                        let _ = sp.send(true);
+                    }
+                    if let Some(rt) = runtime {
+                        rt.shutdown_timeout(Duration::from_secs(5));
+                    }
+                };
+                if let Err(e) = std::thread::Builder::new().name("ferrocast-delay-end".into()).spawn(finish) {
+                    tracing::warn!(error = %e, "the delayed stream's end couldn't be waited for");
+                }
+                return;
+            }
             if let Some(hub) = self.hub.take() {
                 hub.end();
             }
@@ -1430,23 +1624,78 @@ mod tests {
         assert_eq!(without_on_air(&a), without_on_air(&b));
     }
 
-    #[test]
-    fn a_delayed_stream_holds_back_then_sends_the_rest_at_the_end() {
+    fn delayed(delay_ms: u64) -> (Delayed, Arc<Counts>) {
         let counts = Arc::new(Counts::default());
-        let mut out = Delayed {
-            hub: Hub::new(),
-            counts: counts.clone(),
-            delay: Duration::from_millis(200),
-            held: std::collections::VecDeque::new(),
-        };
+        let out =
+            Delayed::new(Hub::new(), counts.clone(), Duration::from_millis(delay_ms), Arc::new(DrainGate::default()));
+        (out, counts)
+    }
+
+    fn video(ms: u32, key: bool, len: usize) -> Tag {
+        let mut body = vec![0u8; len];
+        body[0] = if key { 0x17 } else { 0x27 };
+        body[1] = 1;
+        Tag::Video { ms, body }
+    }
+
+    #[test]
+    fn a_delayed_stream_holds_back_then_sends_the_rest_after_it_ends_at_its_own_pace() {
+        let (mut out, counts) = delayed(300);
+        let gate = out.gate.clone();
         let sent = || counts.bytes.load(Ordering::Relaxed);
-        out.send(Tag::Video { ms: 0, body: vec![0; 10] });
+        out.send(video(0, true, 10));
         assert_eq!(sent(), 0, "held back");
-        std::thread::sleep(Duration::from_millis(250));
-        out.send(Tag::Audio { ms: 250, body: vec![0; 5] });
-        assert_eq!(sent(), 10, "the first goes once it's 200 ms old; the second waits");
+        std::thread::sleep(Duration::from_millis(100));
+        out.send(video(100, false, 5));
+        std::thread::sleep(Duration::from_millis(100));
+        out.send(video(200, false, 7));
+        // Ending: no burst. The first goes at 300 ms, the others after it, as they would have.
         drop(out);
-        assert_eq!(sent(), 15, "ending sends what's left");
+        assert!(gate.is_running());
+        assert_eq!(sent(), 0, "ending doesn't dump what's held");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(sent(), 10, "the first when it is 300 ms old");
+        gate.wait_done();
+        assert_eq!(sent(), 22, "all of it, after the delay");
+    }
+
+    #[test]
+    fn a_new_stream_or_discarding_ends_the_delayed_tail_at_once() {
+        let (mut out, counts) = delayed(5_000);
+        let gate = out.gate.clone();
+        out.send(video(0, true, 10));
+        out.send(video(10, false, 10));
+        drop(out);
+        assert!(gate.is_running());
+        let t = std::time::Instant::now();
+        // (This gate only: `discard_delay` ends every stream's tail, and tests run side by side.)
+        gate.cancel();
+        gate.wait_done();
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "what was left is dropped");
+    }
+
+    #[test]
+    fn the_delay_never_holds_more_than_its_cap_and_resumes_at_a_keyframe() {
+        let (mut out, counts) = delayed(60_000);
+        out.cap = 1_000;
+        // Headers first (they must survive), then GOPs of a keyframe and four more, 100 bytes each.
+        out.send(Tag::Video { ms: 0, body: vec![0x17, 0, 0, 0, 0] });
+        out.send(Tag::Audio { ms: 0, body: vec![0xAF, 0, 0x12, 0x10] });
+        let mut ms = 0;
+        for gop in 0..6 {
+            for i in 0..5 {
+                ms += 33;
+                out.send(video(ms, i == 0, 100));
+            }
+            assert!(out.held_bytes <= 1_000 + 500, "over the cap after gop {gop}: {}", out.held_bytes);
+        }
+        assert!(out.held_bytes <= 1_000, "{}", out.held_bytes);
+        assert!(is_header(&out.held[0].1) && is_header(&out.held[1].1), "the headers are kept");
+        assert!(is_keyframe(&out.held[2].1), "what's kept starts at a keyframe");
+        assert_eq!(counts.bytes.load(Ordering::Relaxed), 0, "nothing was sent early");
+        // The count of bytes is true.
+        assert_eq!(out.held_bytes, out.held.iter().map(|(_, t)| tag_len(t)).sum::<usize>());
     }
 
     #[test]

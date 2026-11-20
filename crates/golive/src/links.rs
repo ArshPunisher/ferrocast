@@ -87,20 +87,27 @@ pub fn label(name: &str) -> String {
 }
 
 /// A TCP connection to `host`:`port` over `via` only (held to it where the system allows).
-pub async fn tcp_via(via: &Network, host: &str, port: u16) -> io::Result<tokio::net::TcpStream> {
+pub async fn tcp_via(
+    via: &Network,
+    host: &str,
+    port: u16,
+    family: crate::target::IpFamily,
+) -> io::Result<tokio::net::TcpStream> {
     use socket2::{Domain, Protocol, Socket, Type};
     // Its address now, not the one it had when the list was made: a DHCP renewal or a replugged
-    // cable gives the same connection a new one, and binding the old one fails on every try.
+    // cable gives the same connection a new one, and binding the old one fails on every try. The
+    // version asked for, else IPv4 (what a connection list holds).
+    let wants_v6 = family == crate::target::IpFamily::V6;
     let Some(ip) = if_addrs::get_if_addrs()?
         .into_iter()
         .filter(|i| i.name == via.name)
         .map(|i| i.ip())
-        .find(|ip| ip.is_ipv4() && !ip.is_unspecified())
+        .find(|ip| !ip.is_unspecified() && if wants_v6 { usable_v6(ip) } else { ip.is_ipv4() })
     else {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no connection named {}", via.name)));
     };
     let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{host} has no address {} can reach", via.name));
-    for to in tokio::net::lookup_host((host, port)).await?.filter(|a| a.is_ipv4()) {
+    for to in tokio::net::lookup_host((host, port)).await?.filter(|a| a.is_ipv6() == ip.is_ipv6()) {
         let sock = Socket::new(Domain::for_address(to), Type::STREAM, Some(Protocol::TCP))?;
         hold_to(&sock, &via.name)?;
         sock.bind(&SocketAddr::new(ip, 0).into())?;
@@ -116,6 +123,23 @@ pub async fn tcp_via(via: &Network, host: &str, port: u16) -> io::Result<tokio::
         }
     }
     Err(last)
+}
+
+/// A global IPv6 address (not link-local, not loopback).
+fn usable_v6(ip: &IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v) if !v.is_loopback() && (v.segments()[0] & 0xffc0) != 0xfe80)
+}
+
+/// The connection the streamer chose, by its name (`en7`, `Ethernet`) or one of its addresses:
+/// an error naming it when it isn't there (unplugged, renamed).
+pub fn find_network(spec: &str) -> io::Result<Network> {
+    let spec = spec.trim();
+    let addr = spec.parse::<IpAddr>().ok();
+    if_addrs::get_if_addrs()?
+        .into_iter()
+        .find(|i| i.name == spec || addr == Some(i.ip()))
+        .map(|i| Network { name: i.name.clone(), ip: i.ip() })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no connection named {spec}")))
 }
 
 /// How long one address of a host gets when connecting over a chosen connection.
@@ -204,10 +228,14 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
             let lo = networks_with_loopback().into_iter().find(|n| n.ip.is_loopback()).unwrap();
-            let (c, a) = tokio::join!(tcp_via(&lo, "127.0.0.1", port), l.accept());
+            let (c, a) = tokio::join!(tcp_via(&lo, "127.0.0.1", port, crate::target::IpFamily::Auto), l.accept());
             assert_eq!(c.unwrap().local_addr().unwrap().ip(), lo.ip);
             assert!(a.is_ok());
-            assert!(tcp_via(&net("no-such-network0", "127.0.0.1"), "127.0.0.1", port).await.is_err());
+            assert!(
+                tcp_via(&net("no-such-network0", "127.0.0.1"), "127.0.0.1", port, crate::target::IpFamily::Auto)
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -257,7 +285,7 @@ mod tcp_via_tests {
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move { while l.accept().await.is_ok() {} });
         let stale = Network { name: lo.name.clone(), ip: "10.254.254.254".parse().unwrap() };
-        let got = tcp_via(&stale, "127.0.0.1", port).await;
+        let got = tcp_via(&stale, "127.0.0.1", port, crate::target::IpFamily::Auto).await;
         assert!(got.is_ok(), "the connection's own current address should be bound, not the stale one: {got:?}");
     }
 }

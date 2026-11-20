@@ -24,7 +24,7 @@ use crate::conn::{self, READ_BUF};
 use crate::flv;
 use crate::hub::{Frame, Hub, Live, Subscription};
 use crate::links;
-use crate::target::Target;
+use crate::target::{IpFamily, Target};
 
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Each step after connecting (handshake, connect, publish) must answer within this.
@@ -217,6 +217,9 @@ pub enum PushError {
     /// the key worked before in this stream.
     #[error("{0} closed the connection when the stream started.")]
     PublishDropped(String),
+    /// The connection the streamer chose isn't there (unplugged, renamed).
+    #[error("The connection {0} you chose isn't available.")]
+    NoConnection(String),
     /// No way out to the internet (no route, no DNS, nothing answering): a Wi-Fi drop or a router
     /// reboot. Not the platform's doing, so it isn't counted against the destination.
     #[error("Your network is down: waiting for it to reach {0}.")]
@@ -428,7 +431,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     };
                     // Never hop network interfaces on a server refusal or rapid policy close:
                     // the connection reached the server and the platform itself closed it.
-                    if err.is_network() && !key_refused && !rapid_close && may_move(target) {
+                    if err.is_network() && !key_refused && !rapid_close && may_move(target) && target.bind.is_none() {
                         // The system's connection list is asked off the async workers (system calls).
                         let cur = via.clone();
                         via = tokio::task::spawn_blocking(move || {
@@ -690,6 +693,26 @@ pub(crate) mod fault {
     }
 }
 
+fn family_name(f: IpFamily) -> &'static str {
+    match f {
+        IpFamily::V4 => "IPv4",
+        IpFamily::V6 => "IPv6",
+        IpFamily::Auto => "IP",
+    }
+}
+
+/// A TCP connection to `host`, over one IP version only: the addresses of the other are never tried.
+pub(crate) async fn tcp_family(host: &str, port: u16, family: IpFamily) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::other(format!("{host} has no {} address", family_name(family)));
+    for a in tokio::net::lookup_host((host, port)).await?.filter(|a| family.allows(&a.ip())) {
+        match TcpStream::connect(a).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
@@ -710,10 +733,21 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     if fault::no_name(t.port) {
         return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
     }
+    // A connection the streamer chose is the only way out: it is looked up at every try (a
+    // replugged cable has a new address), and one that isn't there says so by name.
+    let chosen = match &t.bind {
+        Some(spec) => Some(links::find_network(spec).map_err(|_| PushError::NoConnection(spec.clone()))?),
+        None => None,
+    };
+    let via = chosen.as_ref().or(via);
     let tcp = match (via, t.pin) {
-        (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
-        (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
-        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
+        (None, Some(addr)) if t.family.allows(&addr.ip()) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
+        (None, Some(_)) => Ok(Err(std::io::Error::other(format!("{host} has no {} address", family_name(t.family))))),
+        (None, None) if t.family == IpFamily::Auto => {
+            timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await
+        }
+        (None, None) => timeout(CONNECT_DEADLINE, tcp_family(&t.host, t.port, t.family)).await,
+        (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port, t.family)).await,
     }
     // Not answering at all looks the same whether the link or the server is down (or the address
     // is wrong): an ordinary failure, waited for only by a destination that was live before.

@@ -884,6 +884,8 @@ type Advanced = { rules: { slow_pct: number /* 50–95, 70 */; trouble_s: number
                             first_pause_s: number /* 10–3600, 60 */; max_pause_s: number /* ≥ first, ≤ 7200; 600 */; first_to_pause: string | null };
                   keep_free_pct: number /* 0–50, 20: the upload check's reserve */; port: number /* the local server's, from the next start */;
                   ignore_service_limits?: boolean /* false: let Studio stream past Twitch/Kick limits without auto-capping (C-6) */;
+                  ip_family?: "auto" | "v4" | "v6" /* the IP version the RTMP destinations connect over; auto */;
+                  bind?: string | null /* send over this connection only (its name or address from GET /golive/networks); never moves to another when it fails; null: the system's way, with failover. A missing one fails by name */;
                   per: { [destination id]: { server: string | null /* a platform's own address instead (region, rtmp or rtmps) */;
                                              first_retry_s: number /* 1–30 */; max_retry_s: number /* ≥ first, ≤ 600 */;
                                              backup?: string /* another destination's id: it waits on standby (ticked or not) and sends
