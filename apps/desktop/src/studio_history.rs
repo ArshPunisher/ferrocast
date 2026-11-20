@@ -16,6 +16,9 @@ use serde_json::Value;
 
 /// Steps kept each way.
 const KEEP: usize = 100;
+/// What the steps may hold in all (before and after of each): a big collection's hundred steps
+/// were hundreds of MB of JSON. The oldest go first.
+const MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Edit Transform changes this close together are one step.
 const MERGE: Duration = Duration::from_secs(3);
 /// Arrow-key nudges this close together are one step.
@@ -32,6 +35,19 @@ struct Step {
     at: Instant,
     /// A drag still going: its moves join this step until the one that saves.
     open: bool,
+    /// About what `before` and `after` take in memory.
+    bytes: usize,
+}
+
+/// About how much memory a JSON value takes.
+fn approx_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 8,
+        Value::Number(_) => 16,
+        Value::String(s) => 24 + s.len(),
+        Value::Array(a) => 24 + a.iter().map(approx_bytes).sum::<usize>(),
+        Value::Object(o) => 48 + o.iter().map(|(k, v)| 24 + k.len() + approx_bytes(v)).sum::<usize>(),
+    }
 }
 
 /// What `before` noted, for `after` to finish once the act ran.
@@ -244,15 +260,24 @@ impl History {
             return;
         }
         self.redo.clear();
-        self.undo.push(Step {
+        let bytes = approx_bytes(&b.doc) + approx_bytes(&now);
+        self.push_step(Step {
             label: b.label,
             before: b.doc,
             after: now,
             key: b.key,
             at: Instant::now(),
             open: b.open,
+            bytes,
         });
-        if self.undo.len() > KEEP {
+    }
+
+    /// Keeps a step, forgetting the oldest while there are too many or they hold too much.
+    fn push_step(&mut self, step: Step) {
+        self.undo.push(step);
+        while self.undo.len() > KEEP
+            || (self.undo.len() > 1 && self.undo.iter().chain(&self.redo).map(|s| s.bytes).sum::<usize>() > MAX_BYTES)
+        {
             self.undo.remove(0);
         }
     }
@@ -303,6 +328,33 @@ mod tests {
 
     fn stage() -> Collection {
         Collection::new(Canvas { width: 1920, height: 1080, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn a_big_collections_history_stays_under_its_memory_cap() {
+        let mut h = History::default();
+        // A collection of about 2 MB of JSON, edited 100 times.
+        let big = |n: usize| {
+            serde_json::json!({ "n": n, "sources": (0..2_000).map(|i| serde_json::json!({
+            "name": format!("source number {i} with a longish name"), "settings": { "text": "x".repeat(600) } })).collect::<Vec<_>>() })
+        };
+        for n in 0..100 {
+            let (before, after) = (big(n), big(n + 1));
+            let bytes = approx_bytes(&before) + approx_bytes(&after);
+            h.push_step(Step {
+                label: format!("step {n}"),
+                before,
+                after,
+                key: None,
+                at: Instant::now(),
+                open: false,
+                bytes,
+            });
+            let held: usize = h.undo.iter().map(|s| s.bytes).sum();
+            assert!(held <= MAX_BYTES || h.undo.len() == 1, "{n}: {held} bytes in {} steps", h.undo.len());
+        }
+        assert!(h.undo.len() < KEEP, "the oldest went: {} steps kept", h.undo.len());
+        assert_eq!(h.labels().0, Some("step 99"), "the newest stays");
     }
 
     #[test]
