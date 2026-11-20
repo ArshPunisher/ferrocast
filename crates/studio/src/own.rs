@@ -25,15 +25,21 @@ use crate::collection::VERTICAL_SIZE;
 use crate::{EncodeSettings, RecordPlan, RecordStats, StreamSettings, StreamStats, StudioError};
 
 /// Our encoder's settings for `e` at a picture of this size and rate.
-fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoConfig {
+/// A frame rate as a number (29.97 for 30 with broadcast timing).
+fn fps_f32(fps: u32, ntsc: bool) -> f32 {
+    if ntsc { fps as f32 * 1000.0 / 1001.0 } else { fps as f32 }
+}
+
+fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32, ntsc: bool) -> VideoConfig {
     let codec = if e.video_encoder.to_ascii_lowercase().contains("hevc") { VideoCodec::Hevc } else { VideoCodec::H264 };
     VideoConfig {
         codec,
         input: PixelFormat::Nv12,
         width,
         height,
-        fps_num: fps.max(1),
-        fps_den: 1,
+        // Broadcast timing (29.97): the rate is told as a fraction.
+        fps_num: if ntsc { fps.max(1) * 1000 } else { fps.max(1) },
+        fps_den: if ntsc { 1001 } else { 1 },
         bitrate_kbps: e.video_kbps.max(100),
         rate: rate_of(e),
         keyframe_secs: if e.keyframe_s == 0 { 2 } else { e.keyframe_s },
@@ -202,7 +208,8 @@ impl Shared {
         crate::denoiser::install();
         let config = engine_config(&canvas);
         // Each output brings its own encoding; these only fill the gaps.
-        let video = video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps);
+        let video =
+            video_config(&EncodeSettings::with_encoder(""), canvas.width, canvas.height, canvas.fps, config.ntsc);
         let audio = AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: 160 };
         let engine = Engine::new(config, video, audio)
             .map_err(|e| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}")))?;
@@ -554,6 +561,12 @@ fn vertical_on_air(doc: &serde_json::Value) -> Option<String> {
 /// in a recording's file.
 static AUDIO_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48_000);
 static TRACK_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Broadcast timing (29.97, 59.94, 23.976), from the settings; the engine reads it when it opens.
+static NTSC: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_ntsc(on: bool) {
+    NTSC.store(on, Ordering::Relaxed);
+}
 
 pub(crate) fn set_audio_format(rate: u32, names: Vec<String>) {
     AUDIO_RATE.store(if rate == 44_100 { 44_100 } else { 48_000 }, Ordering::Relaxed);
@@ -566,6 +579,7 @@ fn engine_config(canvas: &crate::Canvas) -> EngineConfig {
         width: canvas.width,
         height: canvas.height,
         fps: canvas.fps.max(1),
+        ntsc: NTSC.load(Ordering::Relaxed) && matches!(canvas.fps, 24 | 30 | 60),
         sample_rate: AUDIO_RATE.load(Ordering::Relaxed),
         ..EngineConfig::default()
     }
@@ -922,7 +936,7 @@ impl OwnStream {
         };
         let engine = &shared.engine;
         let config = engine.config();
-        let video = video_config(e, config.width, config.height, config.fps);
+        let video = video_config(e, config.width, config.height, config.fps, config.ntsc);
         let audio =
             AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
@@ -980,7 +994,7 @@ impl OwnStream {
             out.video_tracks = video_tracks.to_vec();
         }
         if streaming {
-            hub.metadata(metadata_of(&video, &audio, out.width, out.height, config.fps));
+            hub.metadata(metadata_of(&video, &audio, out.width, out.height, fps_f32(config.fps, config.ntsc)));
         }
         let output = match engine.start_output_with(kind, out, video, audio) {
             Ok(id) => id,
@@ -1075,7 +1089,7 @@ impl OwnStream {
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
         let config = d.shared.engine.config();
-        let video = video_config(e, config.width, config.height, config.fps);
+        let video = video_config(e, config.width, config.height, config.fps, config.ntsc);
         let audio =
             AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
         let hub = Hub::new();
@@ -1083,7 +1097,7 @@ impl OwnStream {
         let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
         hub.start();
-        hub.metadata(metadata_of(&video, &audio, config.width, config.height, config.fps));
+        hub.metadata(metadata_of(&video, &audio, config.width, config.height, fps_f32(config.fps, config.ntsc)));
         discard_delay();
         let mut out = Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone());
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
@@ -1140,7 +1154,7 @@ impl OwnStream {
             return Err(fail("While live, the frame rate can only go to a whole part of the canvas's (60 → 30)."));
         }
         let (w, h) = e.scale.map_or((config.width, config.height), |(w, h)| (w.max(2) & !1, h.max(2) & !1));
-        let video = video_config(e, w, h, fps);
+        let video = video_config(e, w, h, fps, config.ntsc);
         d.shared
             .engine
             .reshape_output(d.output, w, h, config.fps / fps, video)
@@ -1150,7 +1164,7 @@ impl OwnStream {
             hub.metadata_changed(|m| {
                 m.video_width = Some(w);
                 m.video_height = Some(h);
-                m.video_frame_rate = Some(fps as f32);
+                m.video_frame_rate = Some(fps_f32(fps, config.ntsc));
                 m.video_bitrate_kbps = Some(video.bitrate_kbps);
                 m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
             });
@@ -1434,14 +1448,14 @@ fn metadata_of(
     audio: &AudioConfig,
     width: u32,
     height: u32,
-    fps: u32,
+    fps: f32,
 ) -> ferrocast_golive::hub::StreamMetadata {
     let mut m = ferrocast_golive::hub::StreamMetadata::new();
     m.video_width = Some(width);
     m.video_height = Some(height);
     // FLV's codec ids: 7 is H.264 (AVC); HEVC goes as 12, the id OBS and FFmpeg use.
     m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
-    m.video_frame_rate = Some(fps as f32);
+    m.video_frame_rate = Some(fps);
     m.video_bitrate_kbps = Some(video.bitrate_kbps);
     // 10 is AAC.
     m.audio_codec_id = Some(10);
@@ -1582,16 +1596,16 @@ mod tests {
     #[test]
     fn the_stream_says_what_it_is_like_obs() {
         let e = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
-        let video = video_config(&e, 1920, 1080, 60);
+        let video = video_config(&e, 1920, 1080, 60, false);
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
-        let m = metadata_of(&video, &audio, 1920, 1080, 60);
+        let m = metadata_of(&video, &audio, 1920, 1080, 60.0);
         assert_eq!((m.video_width, m.video_height, m.video_frame_rate), (Some(1920), Some(1080), Some(60.0)));
         assert_eq!((m.video_codec_id, m.audio_codec_id), (Some(7), Some(10)), "H.264 and AAC");
         assert_eq!((m.audio_sample_rate, m.audio_channels, m.audio_is_stereo), (Some(48_000), Some(2), Some(true)));
         assert_eq!(m.video_bitrate_kbps, Some(video.bitrate_kbps));
         assert!(m.encoder.unwrap().starts_with("Ferrocast "));
-        let hevc = video_config(&EncodeSettings::with_encoder("hevc"), 1920, 1080, 60);
-        assert_eq!(metadata_of(&hevc, &audio, 1920, 1080, 60).video_codec_id, Some(12));
+        let hevc = video_config(&EncodeSettings::with_encoder("hevc"), 1920, 1080, 60, false);
+        assert_eq!(metadata_of(&hevc, &audio, 1920, 1080, 60.0).video_codec_id, Some(12));
     }
 
     #[test]
@@ -1709,6 +1723,11 @@ mod tests {
         // (This test is the only one that sets them; the others run at the defaults.)
         let canvas = crate::Canvas { width: 1920, height: 1080, fps: 60 };
         assert_eq!(engine_config(&canvas).sample_rate, 48_000);
+        assert!(!engine_config(&canvas).ntsc);
+        set_ntsc(true);
+        assert!(engine_config(&canvas).ntsc, "59.94");
+        assert!(!engine_config(&crate::Canvas { fps: 50, ..canvas }).ntsc, "only 24, 30 and 60 have a broadcast rate");
+        set_ntsc(false);
         set_audio_format(44_100, vec!["Mic".into(), "".into(), "Game".into()]);
         assert_eq!(engine_config(&canvas).sample_rate, 44_100, "from the setting, not a fixed 48 kHz");
         assert_eq!((engine_config(&canvas).width, engine_config(&canvas).fps), (1920, 60));

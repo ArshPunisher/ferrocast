@@ -561,14 +561,29 @@ pub struct EngineConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Broadcast timing: `fps` ×1000/1001 (24 → 23.976, 30 → 29.97, 60 → 59.94).
+    pub ntsc: bool,
     pub sample_rate: u32,
     /// How far behind the clock sound is mixed, so late pieces still make it.
     pub audio_latency_ms: u32,
 }
 
+impl EngineConfig {
+    /// The frame rate as a fraction: 30/1, or 30000/1001 with broadcast timing.
+    pub fn frame_rate(&self) -> (u32, u32) {
+        if self.ntsc { (self.fps * 1000, 1001) } else { (self.fps, 1) }
+    }
+
+    /// One frame's time, in nanoseconds (33,333,333 at 30; 33,366,666 at 29.97).
+    pub fn frame_ns(&self) -> u64 {
+        let (n, d) = self.frame_rate();
+        1_000_000_000 * u64::from(d) / u64::from(n.max(1))
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, fps: 30, sample_rate: 48_000, audio_latency_ms: 40 }
+        Self { width: 1920, height: 1080, fps: 30, ntsc: false, sample_rate: 48_000, audio_latency_ms: 40 }
     }
 }
 
@@ -1196,7 +1211,13 @@ impl Engine {
             outputs: Vec::new(),
             next_output: 1,
             taps: Vec::new(),
-            video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
+            video: VideoConfig {
+                width: config.width,
+                height: config.height,
+                fps_num: config.frame_rate().0,
+                fps_den: config.frame_rate().1,
+                ..video
+            },
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
@@ -2429,8 +2450,8 @@ impl Engine {
         let video = VideoConfig {
             width: canvas.width,
             height: canvas.height,
-            fps_num: (self.config.fps / canvas.every).max(1),
-            fps_den: 1,
+            fps_num: (self.config.frame_rate().0 / canvas.every).max(1),
+            fps_den: self.config.frame_rate().1,
             ..video
         };
         // Extra tracks go in a file (a recording, or a saved replay), or with a stream as its
@@ -3917,7 +3938,7 @@ fn run(
     sleep: &crate::sleep::SleepMonitor,
 ) {
     on_time();
-    let frame_ns = 1_000_000_000 / u64::from(config.fps);
+    let frame_ns = config.frame_ns();
     let mut next = now_ns();
     let mut faults = 0u64;
     while !stop.load(Ordering::Acquire) {
@@ -5231,6 +5252,10 @@ mod tests {
     }
 
     fn engine() -> Option<Engine> {
+        engine_with(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() })
+    }
+
+    fn engine_with(config: EngineConfig) -> Option<Engine> {
         let video = VideoConfig {
             codec: VideoCodec::H264,
             input: PixelFormat::Nv12,
@@ -5244,7 +5269,7 @@ mod tests {
             software: false,
         };
         let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
-        Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio).ok()
+        Engine::new(config, video, audio).ok()
     }
 
     /// The frame loop's thread runs high and isn't throttled (Windows 11's EcoQoS).
@@ -6284,6 +6309,49 @@ mod tests {
         assert!(e.tap_frames(Canvas::scaled(e.config, 321, 180), sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { every: 0, ..Canvas::main(e.config) }, sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
+    }
+
+    /// Broadcast timing: 29.97 and 59.94 (and 23.976) as fractions, and the frame times that go with them.
+    #[test]
+    fn broadcast_timing_is_a_thousandth_slower() {
+        let c = |fps, ntsc| EngineConfig { fps, ntsc, ..Default::default() };
+        assert_eq!(c(30, false).frame_rate(), (30, 1));
+        assert_eq!(c(30, true).frame_rate(), (30_000, 1001));
+        assert_eq!(c(60, true).frame_rate(), (60_000, 1001));
+        assert_eq!(c(24, true).frame_rate(), (24_000, 1001));
+        assert_eq!(c(30, false).frame_ns(), 33_333_333);
+        assert_eq!(c(30, true).frame_ns(), 33_366_666);
+        assert_eq!(c(60, true).frame_ns(), 16_683_333);
+        // 1000 frames at 59.94 take 16,683 ms (16,667 ms at 60): the stutter a 59.94 source made.
+        assert_eq!(c(60, true).frame_ns() * 1000 / 1_000_000, 16_683);
+    }
+
+    /// An engine at 29.97 hands frames out 33.37 ms apart, and its encoders are told 30000/1001.
+    #[test]
+    fn an_ntsc_engine_paces_frames_at_29_97() {
+        let Some(e) = engine_with(EngineConfig { width: 640, height: 360, fps: 30, ntsc: true, ..Default::default() })
+        else {
+            return;
+        };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let stamps = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let sink = stamps.clone();
+        let tap = e
+            .tap_frames(
+                Canvas::main(e.config),
+                Box::new(move |_f: &Nv12, ts| sink.lock().unwrap_or_else(|p| p.into_inner()).push(ts)),
+            )
+            .unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(900));
+        e.stop_tap(tap);
+        let t = stamps.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(t.len() >= 5, "{} frames", t.len());
+        // Frames on the grid: each a whole number of 33.3667 ms frame times after the first.
+        let grid = e.config.frame_ns();
+        assert!(t.windows(2).all(|w| (w[1] - w[0]) % grid == 0 && w[1] > w[0]), "{t:?}");
     }
 
     /// The downscale filter chosen for an output is the one that draws it (it was always bicubic):

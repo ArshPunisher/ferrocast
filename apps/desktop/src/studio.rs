@@ -751,6 +751,7 @@ fn load_settings(data: &std::path::Path) -> StudioSettings {
 /// The sound's rate and the audio tracks' names, which the engine and the recording files read.
 fn apply_audio_format(s: &StudioSettings) {
     ferrocast_studio::set_audio_format(s.sample_rate, s.audio_track_names.clone());
+    ferrocast_studio::set_ntsc(s.fps_ntsc);
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {

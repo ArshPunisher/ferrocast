@@ -645,6 +645,12 @@ pub fn set_audio_format(rate: u32, track_names: Vec<String>) {
     own::set_audio_format(rate, track_names);
 }
 
+/// Broadcast timing (29.97, 59.94, 23.976 for a canvas of 30, 60, 24 fps), from the next time the
+/// engine opens.
+pub fn set_ntsc(on: bool) {
+    own::set_ntsc(on);
+}
+
 /// Ends any delayed tail being sent (the streamer chose Stop now).
 pub fn discard_delay() {
     own::discard_delay();

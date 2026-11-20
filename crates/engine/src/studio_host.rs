@@ -827,6 +827,8 @@ pub struct StudioSettings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Broadcast timing: 24 → 23.976, 30 → 29.97, 60 → 59.94 (from the next start).
+    pub fps_ntsc: bool,
     /// Where recordings go (absolute); None is the Movies folder's Ferrocast folder.
     pub record_folder: Option<String>,
     /// That Movies (Videos) folder's Ferrocast folder on this computer, so Settings can show
@@ -942,6 +944,7 @@ impl Default for StudioSettings {
             width: 1920,
             height: 1080,
             fps: 30,
+            fps_ntsc: false,
             record_folder: None,
             record_folder_default: String::new(),
             record_format: "mp4".into(),
@@ -1065,6 +1068,9 @@ impl StudioSettings {
         }
         if ![24, 25, 30, 48, 50, 60, 120].contains(&self.fps) {
             return bad("fps: 24, 25, 30, 48, 50, 60 or 120.");
+        }
+        if self.fps_ntsc && ![24, 30, 60].contains(&self.fps) {
+            return bad("fps_ntsc: only for 24 (23.976), 30 (29.97) or 60 (59.94).");
         }
         if let Some(f) = &self.record_folder
             && (f.len() > 1024 || !std::path::Path::new(f).is_absolute())
@@ -3777,6 +3783,7 @@ mod tests {
             ("audio_kbps", StudioSettings { audio_kbps: 100, ..d.clone() }),
             ("width", StudioSettings { width: 100, ..d.clone() }),
             ("fps", StudioSettings { fps: 59, ..d.clone() }),
+            ("fps_ntsc", StudioSettings { fps: 50, fps_ntsc: true, ..d.clone() }),
             ("record_folder", StudioSettings { record_folder: Some("relative/path".into()), ..d.clone() }),
             ("record_format", StudioSettings { record_format: "avi".into(), ..d.clone() }),
             ("record_name", StudioSettings { record_name: "a/b".into(), ..d.clone() }),
