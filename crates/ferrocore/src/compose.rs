@@ -29,6 +29,32 @@ const MAX: u32 = 16_384;
 /// libobs's `EPSILON` for "scaled at all".
 const EPSILON: f32 = 0.0001;
 
+/// Every transition pipeline the compositor makes: the fragment entry and whether it draws the
+/// linear view of its target.
+const TRANSITION_PIPELINES: [(&str, bool); 5] =
+    [("fs_fade", false), ("fs_fade_to_color", false), ("fs_slide", true), ("fs_swipe", true), ("fs_luma", true)];
+
+/// Every filter's fragment entry in `effects.wgsl`.
+const EFFECT_ENTRIES: [&str; 17] = [
+    "fs_rounded",
+    "fs_border",
+    "fs_shadow",
+    "fs_shape",
+    "fs_blur_area",
+    "fs_look",
+    "fs_chroma_key",
+    "fs_color_correction",
+    "fs_color_key",
+    "fs_luma_key",
+    "fs_sharpen",
+    "fs_crop",
+    "fs_mask",
+    "fs_cutout",
+    "fs_lut",
+    "fs_scroll",
+    "fs_adjust",
+];
+
 /// The fragment shaders: libobs's effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Shader {
@@ -528,7 +554,7 @@ impl Compositor {
             })
         };
         let nv12 = (conv("fs_y", wgpu::TextureFormat::R8Unorm), conv("fs_uv", wgpu::TextureFormat::Rg8Unorm));
-        Ok(Self {
+        let c = Self {
             gpu_error,
             instance,
             adapter,
@@ -561,7 +587,29 @@ impl Compositor {
             metal_alpha: cfg!(target_os = "macos"),
             bilinear,
             point,
-        })
+        };
+        c.warm_up();
+        Ok(c)
+    }
+
+    /// Builds the pipelines that were made the first time something used them, so that first use
+    /// is no slower than the next: a swipe's built mid-transition cost 85 ms (a late frame and a
+    /// hole in the stream, the first time each of a swipe and a slide was used, 20 Nov). The
+    /// transitions' and the filters' shaders, and the plain picture's.
+    fn warm_up(&self) {
+        let began = std::time::Instant::now();
+        for (entry, linear) in TRANSITION_PIPELINES {
+            let _ = self.transition_pipeline(entry, linear);
+        }
+        for entry in EFFECT_ENTRIES {
+            for linear in [false, true] {
+                let _ = self.effect_pipeline(entry, linear);
+            }
+        }
+        for linear in [false, true] {
+            let _ = self.pipeline(Shader::Default, Blend::Normal, linear);
+        }
+        tracing::debug!(ms = began.elapsed().as_millis() as u64, "the compositor's pipelines are built");
     }
 
     /// Which libobs renderer's alpha blending to match: Metal's (the Mac's default here) or
@@ -571,6 +619,8 @@ impl Compositor {
         if self.metal_alpha != metal {
             self.metal_alpha = metal;
             self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.warm_up();
         }
     }
 
