@@ -746,6 +746,10 @@ struct Src {
     sent: u64,
     /// Per-source SPSC audio ring producer attached lazily on the first forwarded audio chunk.
     audio_tx: Option<AudioProducer>,
+    /// A Video Delay filter's held pictures (set while one is on the source).
+    video_delay: Option<crate::delay::FrameDelay<Fresh>>,
+    /// Its sound held back too, when the filter says so.
+    audio_delay: Option<crate::delay::AudioDelay>,
 }
 
 /// How long a hidden capture may hold a pinned zero-copy surface without a newer frame before
@@ -796,6 +800,16 @@ impl Fresh {
         }
     }
 
+    /// What it takes of memory, for the Video Delay's cap.
+    fn bytes(&self) -> usize {
+        match self {
+            Fresh::Pic(p) => p.rgba.len(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Fresh::Screen(s) => s.size().0 as usize * s.size().1 as usize * 4,
+            Fresh::Yuv(p) => p.data.len(),
+        }
+    }
+
     fn is_pinned_surface(&self) -> bool {
         match self {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -832,6 +846,8 @@ impl Src {
             opening_since: 0,
             sent: 0,
             audio_tx: None,
+            video_delay: None,
+            audio_delay: None,
         }
     }
 }
@@ -1153,6 +1169,7 @@ fn sync_heard(st: &mut State, audio_cmd: &mpsc::Sender<AudioCmd>) {
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn forward_audio(
     id: u64,
     slot: &mut Option<AudioProducer>,
@@ -1161,11 +1178,17 @@ fn forward_audio(
     channels: usize,
     rate: u32,
     ts_ns: u64,
+    delay: Option<&mut crate::delay::AudioDelay>,
 ) {
     let Ok(ch) = u8::try_from(channels) else { return };
     if channels == 0 || rate == 0 || pcm.is_empty() || !pcm.len().is_multiple_of(channels) {
         return;
     }
+    // A Video Delay filter that holds sound back: the same length comes out, later.
+    let pcm = match delay {
+        Some(d) => d.process(pcm, channels, rate),
+        None => pcm,
+    };
     let prod = slot.get_or_insert_with(|| {
         let (p, c) = SpscAudioRing::for_seconds(FRAME_RING_SECONDS, 48_000, 2, FRAME_RING_PIECE_FRAMES);
         let _ = audio_cmd.send(AudioCmd::AttachRing { id, consumer: c });
@@ -3540,6 +3563,24 @@ fn frozen(st: &State) -> std::collections::HashSet<u64> {
         .collect()
 }
 
+/// Sources a Video Delay filter holds back: (its delay in ms, whether the sound goes with it).
+/// A source's filters are the same wherever it's shown; the longest delay wins when several say.
+fn delays(st: &State) -> HashMap<u64, (u32, bool)> {
+    let mut out: HashMap<u64, (u32, bool)> = HashMap::new();
+    for it in st.scenes.values().flatten().filter(|it| it.scene.is_none()) {
+        for e in &it.effects {
+            if let Effect::Delay { ms, audio } = e
+                && *ms > 0
+            {
+                let cur = out.entry(it.source).or_insert((0, false));
+                cur.0 = cur.0.max(*ms);
+                cur.1 |= *audio;
+            }
+        }
+    }
+    out
+}
+
 fn seen(st: &State) -> std::collections::HashSet<u64> {
     fn walk(st: &State, scene: &str, depth: u32, out: &mut std::collections::HashSet<u64>) {
         let Some(items) = st.scenes.get(scene) else { return };
@@ -4887,9 +4928,38 @@ fn frame(
             uploads.push((*id, f));
         }
     }
+    let n_pending = uploads.len();
+    // Video Delay: buffers made when a filter is set or changed (not per frame), dropped when
+    // it's gone.
+    let delayed = delays(&st);
+    let period_ns = 1_000_000_000 * u64::from(config.frame_rate().1) / u64::from(config.frame_rate().0.max(1));
+    for (id, src) in st.sources.iter_mut() {
+        match delayed.get(id) {
+            Some(&(ms, audio)) => {
+                if src.video_delay.as_ref().is_none_or(|d| d.delay_ms() != ms) {
+                    src.video_delay = Some(crate::delay::FrameDelay::new(ms, config.fps));
+                }
+                match (audio, src.audio_delay.as_ref().map(crate::delay::AudioDelay::delay_ms)) {
+                    (true, Some(cur)) if cur == ms => {}
+                    (true, _) => src.audio_delay = Some(crate::delay::AudioDelay::new(ms)),
+                    (false, _) => src.audio_delay = None,
+                }
+                // Off air, its sound isn't taken in: what's held mustn't come back later.
+                if !heard.contains(id)
+                    && let Some(a) = &mut src.audio_delay
+                {
+                    a.clear();
+                }
+            }
+            None => {
+                src.video_delay = None;
+                src.audio_delay = None;
+            }
+        }
+    }
     let mut st_recovered = 0;
     for (id, src) in st.sources.iter_mut() {
-        let Src { live, audio_tx, .. } = src;
+        let Src { live, audio_tx, audio_delay, .. } = src;
         let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match live {
             // Drawn after the frame (`visualize`).
             Live::Still | Live::Visualizer(_) => {}
@@ -4921,7 +4991,7 @@ fn frame(
                 }
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
-                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t, audio_delay.as_mut());
                     }
                 }
             }
@@ -4947,7 +5017,7 @@ fn frame(
             Live::Microphone(cap) => {
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
-                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t, audio_delay.as_mut());
                     }
                 }
             }
@@ -5004,7 +5074,7 @@ fn frame(
                     }
                     for (pcm, t) in m.take_sound() {
                         if heard.contains(id) {
-                            forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
+                            forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t, audio_delay.as_mut());
                         }
                     }
                     // Clear texture / close decoder only after the final queued frame has been shown.
@@ -5044,7 +5114,7 @@ fn frame(
                 let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                 if heard.contains(id) {
                     for (pcm, ch_rate, t) in sound {
-                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, ch_rate, t);
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, ch_rate, t, audio_delay.as_mut());
                     }
                 }
             }
@@ -5059,8 +5129,42 @@ fn frame(
         }
     }
     st.stats.recovered += st_recovered;
-    let frozen = frozen(&st);
     let now = now_ns();
+    // Pictures of a delayed source go into its queue; the one whose time has come goes on.
+    // (What came out of `pending` above was delayed already.)
+    if !delayed.is_empty() {
+        let mut i = n_pending;
+        while i < uploads.len() {
+            if delayed.contains_key(&uploads[i].0) {
+                let (id, f) = uploads.swap_remove(i);
+                if let Some(s) = st.sources.get_mut(&id)
+                    && let Some(q) = &mut s.video_delay
+                {
+                    // A pinned capture surface would starve its pool while held: copied out.
+                    if let Some(f) = f.into_pending() {
+                        let bytes = f.bytes();
+                        if q.push(now, f, bytes) {
+                            tracing::warn!(
+                                source = id,
+                                ms = q.delay_ms(),
+                                "a video delay holds too much picture: its delay is cut short to stay in memory"
+                            );
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        for (id, s) in st.sources.iter_mut() {
+            if let Some(q) = &mut s.video_delay
+                && let Some(f) = q.take_due(now, period_ns / 2)
+            {
+                uploads.push((*id, f));
+            }
+        }
+    }
+    let frozen = frozen(&st);
     for (id, f) in uploads {
         let Some(s) = st.sources.get_mut(&id) else { continue };
         // A frozen source keeps the picture it has (its first one still comes in).
@@ -7761,6 +7865,30 @@ mod tests {
         one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(px(&e, 0), [0, 255, 0, 255], "moving again");
+    }
+
+    #[test]
+    fn a_video_delay_shows_pictures_late_and_leaves_others_alone() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Fed { width: 64, height: 36 }).unwrap_or_else(|x| panic!("{x}"));
+        }
+        freeze_scene(&e, vec![Effect::Delay { ms: 600, audio: false }]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let (one, two) = (e.fed(1).unwrap_or_else(|| panic!("fed")), e.fed(2).unwrap_or_else(|| panic!("fed")));
+        let px = |e: &Engine, x: usize| e.snapshot().unwrap_or_default()[x * 4..x * 4 + 4].to_vec();
+        one.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        two.picture(Picture::solid(64, 36, [0, 0, 255, 255]));
+        std::thread::sleep(Duration::from_millis(250));
+        assert_ne!(px(&e, 0), [0, 0, 255, 255], "held back");
+        assert_eq!(px(&e, 330), [0, 0, 255, 255], "the other source isn't");
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(px(&e, 0), [0, 0, 255, 255], "shown once the delay is up");
+        // Off: pictures come straight through again.
+        freeze_scene(&e, Vec::new());
+        one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(px(&e, 0), [0, 255, 0, 255], "no delay once the filter is gone");
     }
 
     #[test]

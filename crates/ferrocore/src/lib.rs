@@ -47,6 +47,7 @@ pub mod afx;
 pub mod audio;
 pub mod audio_thread;
 mod compose;
+pub mod delay;
 pub mod engine;
 pub mod ffenc;
 pub mod ffsrc;
@@ -446,6 +447,13 @@ pub enum Effect {
     /// Holds the source's last picture: new ones aren't taken in while it's on (Exeldro's Freeze
     /// filter). It draws nothing itself; turning it off lets new pictures in again.
     Freeze,
+    /// Video Delay (OBS's Render Delay and Video Delay Async): the source's pictures shown `ms`
+    /// late (0 to 20 000), and with `audio` its sound too. Draws nothing itself: the engine
+    /// holds the pictures back.
+    Delay {
+        ms: u32,
+        audio: bool,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
