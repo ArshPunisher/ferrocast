@@ -23,10 +23,12 @@ use std::time::Duration;
 #[cfg(any(windows, test))]
 mod crash;
 mod log_limit;
-#[cfg(target_os = "macos")]
-mod mac_update;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
+mod mac_quit;
+#[cfg(target_os = "macos")]
+mod mac_update;
 mod menu;
 mod quit;
 mod store;
@@ -447,6 +449,9 @@ fn main() {
             #[cfg(target_os = "macos")]
             quit::request(app);
         }
+        // macOS: the app delegate gets the answer to a Quit from the Dock or an AppleEvent.
+        #[cfg(target_os = "macos")]
+        RunEvent::Ready => mac_quit::install(app),
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),

@@ -7,6 +7,7 @@
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// One question at a time: a second Quit while the first is open does nothing.
@@ -17,19 +18,47 @@ static ASKING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 pub(crate) static RELAUNCH_SAFE: AtomicBool = AtomicBool::new(false);
 
+/// Set once the app is on its way out (confirmed, or nothing was on): the system's own
+/// terminate request that follows must not be asked about again.
+static LEAVING: AtomicBool = AtomicBool::new(false);
+
+/// macOS: a Quit from outside the app (the Dock, an AppleEvent) reached `applicationShouldTerminate:`
+/// → says what to answer the system now. `Later` starts the question; the answer goes back with
+/// `replyToApplicationShouldTerminate:`.
+#[cfg(target_os = "macos")]
+pub(crate) fn terminate_requested(app: &AppHandle) -> crate::mac_quit::Answer {
+    let answer = crate::mac_quit::terminate_answer(LEAVING.load(Ordering::SeqCst), ASKING.load(Ordering::SeqCst));
+    if answer == crate::mac_quit::Answer::Later {
+        request_inner(app, Mode::Terminate);
+    }
+    answer
+}
+
 /// Quits, asking first when the stream, a recording or the replay buffer is on.
 pub(crate) fn request(app: &AppHandle) {
-    request_inner(app, false);
+    request_inner(app, Mode::Quit);
 }
 
 /// Help > Restart in Safe Mode: as Quit (asks first when something is on air), then the app
 /// starts again with `--safe-mode`.
 #[cfg(target_os = "macos")]
 pub(crate) fn request_safe_restart(app: &AppHandle) {
-    request_inner(app, true);
+    request_inner(app, Mode::SafeRestart);
 }
 
-fn request_inner(app: &AppHandle, relaunch_safe: bool) {
+/// Where the question came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Our own Quit (menu, tray, a closing window): the app exits itself when it is to go.
+    Quit,
+    /// Help > Restart in Safe Mode.
+    SafeRestart,
+    /// macOS: the system asked (the Dock's Quit, an AppleEvent): the answer goes back to it.
+    #[cfg(target_os = "macos")]
+    Terminate,
+}
+
+fn request_inner(app: &AppHandle, mode: Mode) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let active = match app.try_state::<crate::Running>() {
@@ -40,34 +69,83 @@ fn request_inner(app: &AppHandle, relaunch_safe: bool) {
             None => Active::default(),
         };
         match decide(&active) {
-            Decision::Quit => leave(&app, relaunch_safe),
+            Decision::Quit => go(&app, mode),
             Decision::Ask { title, text } => {
                 if ASKING.swap(true, Ordering::SeqCst) {
+                    // One question at a time. The system, if it asked, is told no.
+                    #[cfg(target_os = "macos")]
+                    if mode == Mode::Terminate {
+                        run_on_main(&app, || crate::mac_quit::reply_terminate(false));
+                    }
                     return;
                 }
                 crate::show_window(&app);
-                let quit = app.clone();
-                let (title, text) = if relaunch_safe {
+                let restart = mode == Mode::SafeRestart;
+                let (title, text) = if restart {
                     ("Restart in Safe Mode?", text.replace("Quit anyway?", "Restart anyway?"))
                 } else {
                     (title, text)
                 };
-                // "Cancel" first: it is the default button and what Esc picks. The answer is
-                // true for the first button.
-                app.dialog()
-                    .message(text)
-                    .title(title)
-                    .kind(MessageDialogKind::Warning)
-                    .buttons(MessageDialogButtons::OkCancelCustom("Cancel".into(), "Quit".into()))
-                    .show(move |cancelled| {
-                        ASKING.store(false, Ordering::SeqCst);
-                        if !cancelled {
-                            leave(&quit, relaunch_safe);
-                        }
-                    });
+                ask(&app, mode, title, text);
             }
         }
     });
+}
+
+/// Puts the question: an `NSAlert` on a Mac (Return = Cancel, Esc = Cancel), the dialog plugin's
+/// message elsewhere. Whatever the answer, `ASKING` is cleared.
+#[cfg(target_os = "macos")]
+fn ask(app: &AppHandle, mode: Mode, title: &'static str, text: String) {
+    let quit = app.clone();
+    run_on_main(app, move || {
+        let go_on = crate::mac_quit::ask_modal(title, &text, mode == Mode::SafeRestart);
+        ASKING.store(false, Ordering::SeqCst);
+        if go_on {
+            go(&quit, mode);
+        } else if mode == Mode::Terminate {
+            crate::mac_quit::reply_terminate(false);
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ask(app: &AppHandle, mode: Mode, title: &'static str, text: String) {
+    let quit = app.clone();
+    // "Cancel" first: it is the default button and what Esc picks. The answer is true for the
+    // first button.
+    app.dialog()
+        .message(text)
+        .title(title)
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom("Cancel".into(), "Quit".into()))
+        .show(move |cancelled| {
+            ASKING.store(false, Ordering::SeqCst);
+            if !cancelled {
+                go(&quit, mode);
+            }
+        });
+}
+
+/// On the main thread (an `NSAlert` and the reply to the system must be).
+#[cfg(target_os = "macos")]
+fn run_on_main(app: &AppHandle, f: impl FnOnce() + Send + 'static) {
+    if app.run_on_main_thread(f).is_err() {
+        tracing::warn!("the quit question couldn't be put on the main thread");
+        ASKING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The answer is yes (or nothing was on): leave.
+fn go(app: &AppHandle, mode: Mode) {
+    LEAVING.store(true, Ordering::SeqCst);
+    match mode {
+        Mode::Quit => leave(app, false),
+        Mode::SafeRestart => leave(app, true),
+        // The system asked: it is told yes, and quits through its own path (tao's
+        // `applicationWillTerminate:` runs the clean exit).
+        #[cfg(target_os = "macos")]
+        Mode::Terminate => run_on_main(app, || crate::mac_quit::reply_terminate(true)),
+    }
 }
 
 /// Exits, and starts again in Safe Mode after when asked to.
