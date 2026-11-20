@@ -938,6 +938,12 @@ pub struct StudioSettings {
     pub keep_recording: bool,
     pub replay_when_streaming: bool,
     pub keep_replay: bool,
+    /// OBS's General › Projectors: new projector windows stay above other apps' windows.
+    pub projector_on_top: bool,
+    /// Opening a full-screen projector on a display closes the one already there.
+    pub projector_one_per_screen: bool,
+    /// The projectors open when Ferrocast quits come back at the next Start.
+    pub projector_restore: bool,
 }
 
 /// The replay buffer's memory cap when none is set: it kept encoded video in RAM without a limit.
@@ -1022,6 +1028,9 @@ impl Default for StudioSettings {
             keep_recording: false,
             replay_when_streaming: false,
             keep_replay: false,
+            projector_on_top: false,
+            projector_one_per_screen: false,
+            projector_restore: false,
         }
     }
 }
@@ -3925,6 +3934,8 @@ mod tests {
         // A file from an older version (fields missing) still reads, with defaults.
         let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
         assert_eq!((old.video_kbps, old.fps), (4500, 30));
+        // The projector options are off until asked for: today's behaviour.
+        assert!(!old.projector_on_top && !old.projector_one_per_screen && !old.projector_restore);
         assert!(
             !StudioAct::Audio { scene: "x".into() }.changes() && StudioAct::RemoveScene { scene: "x".into() }.changes()
         );
