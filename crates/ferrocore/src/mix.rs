@@ -1322,7 +1322,11 @@ impl Mixer {
                         s.queue.push_front(*b);
                         s.queue.push_front(*a);
                     }
-                    s.filter_declick = false;
+                    // The tail is the filter's input (the dry sound), and the last sound out was
+                    // the filter's output, which is at another level (the denoiser's is about
+                    // 8 dB under): the join steps. `filter_declick` (set above) eases it over
+                    // 4 ms from the last sample out, so it is not cleared here (S57: a step of
+                    // 0.6 at every switch-off). It also needs no new buffer.
                 }
             }
         }
@@ -2466,10 +2470,15 @@ mod tests {
     /// A filter that holds sound back by `n` frames (the strong noise removal: 3968 = 82.7 ms),
     /// priming with silence as it does.
     #[derive(Debug)]
-    struct LateBy(usize, [std::collections::VecDeque<f32>; 2]);
+    struct LateBy(usize, [std::collections::VecDeque<f32>; 2], f32);
     impl LateBy {
         fn new(n: usize) -> Self {
-            Self(n, [std::iter::repeat_n(0.0, n).collect(), std::iter::repeat_n(0.0, n).collect()])
+            Self::with_gain(n, 1.0)
+        }
+        /// Its output is its (delayed) input times `gain`: like the denoiser, whose sound is not
+        /// the level of what went in.
+        fn with_gain(n: usize, gain: f32) -> Self {
+            Self(n, [std::iter::repeat_n(0.0, n).collect(), std::iter::repeat_n(0.0, n).collect()], gain)
         }
     }
     impl crate::afx::SoundPlugin for LateBy {
@@ -2477,7 +2486,7 @@ mod tests {
             for (c, q) in ch.into_iter().zip(self.1.iter_mut()) {
                 for v in c.iter_mut() {
                     q.push_back(*v);
-                    *v = q.pop_front().unwrap_or(0.0);
+                    *v = q.pop_front().unwrap_or(0.0) * self.2;
                 }
             }
             true
@@ -2493,6 +2502,11 @@ mod tests {
     /// A 440 Hz tone mixed as it comes, a 3968-frame filter attached at 2 s and taken off at
     /// 4 s (as toggling DeepFilterNet does): what came out.
     fn toggled_tone(attach: bool, detach: bool) -> Vec<f32> {
+        toggled_tone_with(attach, detach, 1.0)
+    }
+
+    /// `toggled_tone` with a filter whose sound is `gain` times what went in.
+    fn toggled_tone_with(attach: bool, detach: bool, gain: f32) -> Vec<f32> {
         let rate = 48_000u32;
         let mut m = Mixer::new(rate, 40_000_000);
         m.set(1, SourceSettings::default());
@@ -2502,7 +2516,7 @@ mod tests {
         let (mut on, mut off) = (!attach, !detach);
         if !attach {
             if let Some(src) = m.sources.get_mut(&1) {
-                src.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+                src.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::with_gain(3968, gain)), rate)];
             }
             m.raise_latency_for_filters(0, 3968);
         }
@@ -2511,7 +2525,7 @@ mod tests {
             if !on && now >= t0 + 2_000_000_000 {
                 on = true;
                 if let Some(s) = m.sources.get_mut(&1) {
-                    s.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+                    s.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::with_gain(3968, gain)), rate)];
                     s.filter_declick = true;
                 }
                 m.raise_latency_for_filters(0, 3968);
@@ -2569,6 +2583,20 @@ mod tests {
         // The filter is on from the start, off at 4 s: look from 1 s to 6 s.
         let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
         assert!(steps.is_empty() && holes.is_empty(), "steps at {steps:?}, holes at {holes:?}");
+    }
+
+    /// The same with a filter whose sound is quieter than its input (the denoiser's is, by
+    /// about 8 dB): the dry sound that takes over is at another level, so a join that just
+    /// switches steps (S57: a step of 0.6 at every switch-off in the recording). It must ease.
+    #[test]
+    fn taking_a_quieter_latency_filter_off_does_not_step() {
+        for gain in [0.4, 0.15] {
+            let out = toggled_tone_with(false, true, gain);
+            // The first second has the filter's prime and the mixer settling; judge 1-6 s but
+            // not the stretch where the level changes over its ease (4 ms around the join).
+            let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
+            assert!(steps.is_empty() && holes.is_empty(), "gain {gain}: steps at {steps:?}, holes at {holes:?}");
+        }
     }
 
     /// Putting such a filter on used to leave a hole and a step: the source is filed 82.7 ms
