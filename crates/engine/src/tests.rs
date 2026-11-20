@@ -266,6 +266,47 @@ async fn a_platform_that_needs_signing_in_shows_one_reconnect_notice() {
     assert!(notices[0]["data"]["message"].as_str().unwrap().starts_with("Kick"));
 }
 
+/// The relay answering the link with 401 has forgotten this install. It keeps which install owns a
+/// Kick channel, so the new install the next try registers owns none: Kick's events would never
+/// come, with Kick looking connected. While Kick is signed in, the install is forgotten as before
+/// and the streamer is asked to sign in to Kick again (as the refresh path does).
+#[tokio::test]
+async fn a_relay_that_forgot_this_install_while_kick_is_signed_in_asks_for_a_new_kick_sign_in() {
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route("/v1/link", axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }))
+        .route(
+            "/v1/installs",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "install_id": "n", "install_secret": "s" }))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(rl, app).await });
+    let secrets = mem();
+    secrets.set("relay-install", "old.secret").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay), ..PlatformApps::default() };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    e.register_connector(FakePlatform::new(Platform::Kick));
+    let mut live = e.subscribe_live();
+    e.ensure_relay_link();
+    let mut asked = false;
+    for _ in 0..300 {
+        while let Ok(f) = live.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["message"].as_str().is_some_and(|m| m.starts_with("Kick")) {
+                asked = true;
+            }
+        }
+        if asked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(asked, "Kick was never asked to sign in again");
+}
+
 #[tokio::test]
 async fn session_numbers_follow_tips_refunds_bits_and_viewers() {
     let (e, _d) = engine().await;

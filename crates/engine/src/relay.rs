@@ -148,6 +148,20 @@ impl Engine {
             // The relay no longer knows this install (it removes ones that never connected
             // after a week): forget it, so the next attempt registers a fresh one.
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) if res.status().as_u16() == 401 => {
+                // The relay keeps which install owns a Kick channel: the new install registered
+                // next owns none, so Kick's events would never come with Kick looking connected.
+                // While Kick is signed in, the streamer signs in to Kick again (as when the
+                // relay forgets the install at a Kick refresh).
+                if self.connector(Platform::Kick).is_some() {
+                    let _ = self
+                        .submit(ferrocast_core::event::Event::live(
+                            Platform::Kick,
+                            None,
+                            Millis(0),
+                            ferrocast_core::event::EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
                 return match self.inner.secrets.delete(INSTALL) {
                     Ok(()) => Err("the relay didn't recognise this install; registering again".into()),
                     Err(e) => {
