@@ -64,6 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyframe_secs: 2,
         software: false,
         profile: ferrocore::video::H264Profile::High,
+        preset: None,
+        tune: None,
     };
     let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 160 };
     let e = Engine::new(config, video(1920, 1080, 60), audio)?;

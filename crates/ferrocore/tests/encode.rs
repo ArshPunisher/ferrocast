@@ -31,6 +31,8 @@ fn config(codec: VideoCodec, input: PixelFormat) -> VideoConfig {
         keyframe_secs: 1,
         software: false,
         profile: ferrocore::video::H264Profile::High,
+        preset: None,
+        tune: None,
     }
 }
 
@@ -620,6 +622,8 @@ fn ffmpegs_bitrate_changes_on_the_run() {
         rate: RateControl::Cbr,
         software: true,
         profile: ferrocore::video::H264Profile::High,
+        preset: None,
+        tune: None,
         // 10 s of frames between the encoder's own keyframes: more than this test ever feeds.
         keyframe_secs: 10,
         ..config(VideoCodec::H264, PixelFormat::Nv12)
@@ -718,6 +722,8 @@ fn capped_cbr_holds_peak_bitrate_under_limit_across_scene_cuts() {
         keyframe_secs: 2,
         software: false,
         profile: ferrocore::video::H264Profile::High,
+        preset: None,
+        tune: None,
     };
     let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
     let mut packets = Vec::new();

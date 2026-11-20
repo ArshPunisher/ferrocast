@@ -13,6 +13,38 @@ use crate::{Kind, Kinds, OptionInfo};
 /// Kinds whose form lists what's on this computer now (cameras, screens, windows, mics, NDI):
 /// reading those can take seconds (on Windows FFmpeg asks DirectShow for the cameras), so
 /// they're read off the window's thread and kept a moment for the next ask.
+/// The options our own encoder offers for encoder `id` (the settings' "Your own"): x264's
+/// preset and tune; the system's encoders take their settings from the plain ones.
+pub fn own_encoder_options(id: &str) -> Vec<serde_json::Value> {
+    if !id.to_ascii_lowercase().contains("x264") {
+        return Vec::new();
+    }
+    let list = |key: &str, label: &str, help: &str, names: &[&str], default: &str| {
+        serde_json::json!({
+            "key": key, "label": label, "kind": "list", "help": help,
+            "visible": true, "enabled": true, "min": null, "max": null, "step": null,
+            "slider": false, "suffix": "", "default": default,
+            "choices": names, "values": names, "group": []
+        })
+    };
+    vec![
+        list(
+            "preset",
+            "Preset",
+            "Slower presets look better at the same size and use more of the computer.",
+            &ferrocore::video::X264_PRESETS,
+            "veryfast",
+        ),
+        list(
+            "tune",
+            "Tune",
+            "What the picture is mostly like; leave it off if unsure.",
+            &ferrocore::video::X264_TUNES,
+            "",
+        ),
+    ]
+}
+
 pub fn lists_devices(kind: &str) -> bool {
     matches!(
         kind,

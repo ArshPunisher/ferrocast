@@ -59,6 +59,20 @@ pub struct VideoConfig {
     /// The H.264 profile (HEVC is always Main). B-frames stay off in every profile: the encoders
     /// give times back by order, which B-frames would break.
     pub profile: H264Profile,
+    /// x264's speed preset and tune, when the settings pick them (`X264_PRESETS`, `X264_TUNES`);
+    /// other encoders ignore them.
+    pub preset: Option<&'static str>,
+    pub tune: Option<&'static str>,
+}
+
+/// x264's presets, fastest first, and its tunes (what the recording's "Your own" offers).
+pub const X264_PRESETS: [&str; 9] =
+    ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
+pub const X264_TUNES: [&str; 6] = ["film", "animation", "grain", "stillimage", "psnr", "zerolatency"];
+
+/// The static name of a preset or tune a settings file carries, or None if it isn't one.
+pub fn x264_name(list: &'static [&'static str], name: &str) -> Option<&'static str> {
+    list.iter().copied().find(|n| n.eq_ignore_ascii_case(name))
 }
 
 impl VideoConfig {

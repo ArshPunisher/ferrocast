@@ -3429,10 +3429,10 @@ impl StudioHost for DesktopStudio {
 
     async fn encoder_options(&self, id: String, settings: serde_json::Map<String, Value>) -> Result<Value, String> {
         self.on_main(move |h| {
-            // Our encoders take their settings from the Studio's own (bitrate, keyframes,
-            // profile): no options of their own to show.
-            let _ = (h.collection.as_ref().ok_or(STOPPED)?, &id);
-            Ok(json!({ "options": [], "values": settings }))
+            // Our encoders take most settings from the Studio's own (bitrate, keyframes, profile);
+            // x264 also has its preset and tune.
+            let _ = h.collection.as_ref().ok_or(STOPPED)?;
+            Ok(json!({ "options": ferrocast_studio::kinds::own_encoder_options(&id), "values": settings }))
         })
         .await?
     }

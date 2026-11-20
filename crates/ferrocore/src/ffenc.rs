@@ -685,7 +685,7 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
         if let Some(q) = cq {
             let q = q.to_string();
             let quality: Vec<String> = match enc.as_str() {
-                "libx264" => vec!["-crf".into(), q, "-preset".into(), "veryfast".into()],
+                "libx264" => vec!["-crf".into(), q, "-preset".into(), cfg.preset.unwrap_or("veryfast").into()],
                 "h264_nvenc" => ["-preset", "p4", "-rc", "vbr", "-cq", &q, "-b:v", "0"].map(String::from).to_vec(),
                 "h264_qsv" => {
                     ["-preset", "veryfast", "-look_ahead", "0", "-global_quality", &q].map(String::from).to_vec()
@@ -725,7 +725,21 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             "h264_videotoolbox" => &["-realtime", "1"],
             _ => &[],
         };
-        a.extend(extra.iter().chain(must_have(&enc)).map(|s| s.to_string()));
+        let mut extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        if enc == "libx264" {
+            // The settings' own preset and tune replace the defaults above.
+            for (flag, pick) in [("-preset", cfg.preset), ("-tune", cfg.tune)] {
+                if let Some(v) = pick {
+                    if let Some(at) = extra.iter().position(|x| x == flag) {
+                        extra[at + 1] = v.to_string();
+                    } else {
+                        extra.extend([flag.to_string(), v.to_string()]);
+                    }
+                }
+            }
+        }
+        a.extend(extra);
+        a.extend(must_have(&enc).iter().map(|s| s.to_string()));
         a.extend(["-f".into(), "flv".into(), "pipe:1".into()]);
         a
     }
@@ -1090,11 +1104,26 @@ mod tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            preset: None,
+            tune: None,
         }
     }
 
     fn has(a: &[String], pair: [&str; 2]) -> bool {
         a.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1])
+    }
+
+    /// The picked x264 preset and tune replace the defaults (a recording's "Your own").
+    #[test]
+    fn a_picked_x264_preset_and_tune_replace_the_defaults() {
+        let mut c = cfg(RateControl::Crf(20));
+        c.preset = Some("slow");
+        c.tune = Some("film");
+        let a = args(&c, "libx264");
+        assert!(has(&a, ["-preset", "slow"]) && has(&a, ["-tune", "film"]), "{a:?}");
+        assert!(!has(&a, ["-preset", "veryfast"]), "{a:?}");
+        let d = args(&cfg(RateControl::Crf(20)), "libx264");
+        assert!(has(&d, ["-preset", "veryfast"]) && !d.iter().any(|x| x == "-tune"), "{d:?}");
     }
 
     /// "High" recordings (libobs's 16) on each encoder's own quality option, with no bitrate.

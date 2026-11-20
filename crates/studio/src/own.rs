@@ -39,7 +39,17 @@ fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoC
         keyframe_secs: e.keyframe_s,
         software: is_x264(&e.video_encoder),
         profile: ferrocore::video::H264Profile::from_name(&e.profile),
+        preset: x264_option(e, "preset", &ferrocore::video::X264_PRESETS),
+        tune: x264_option(e, "tune", &ferrocore::video::X264_TUNES),
     }
+}
+
+/// An x264 preset or tune the settings' encoder options carry (`encode.extra`); only x264 uses it.
+fn x264_option(e: &EncodeSettings, key: &str, list: &'static [&'static str]) -> Option<&'static str> {
+    if !is_x264(&e.video_encoder) {
+        return None;
+    }
+    e.extra.get(key).and_then(|v| v.as_str()).and_then(|n| ferrocore::video::x264_name(list, n))
 }
 
 /// A stream's encoder: platforms ask for a keyframe every 2 s, so "let the encoder pick" (0) is 2.
@@ -1340,6 +1350,27 @@ mod tests {
         assert_eq!(for_stream(v).keyframe_secs, 2, "a stream is held to 2 s");
         e.keyframe_s = 4;
         assert_eq!(for_stream(video_config(&e, 1920, 1080, 60)).keyframe_secs, 4);
+    }
+
+    /// A picked x264 preset and tune (the recording's "Your own" options) reach the encoder
+    /// config; another encoder ignores them and an unknown name is dropped.
+    #[test]
+    fn a_picked_encoder_option_reaches_the_recording_encoder() {
+        let mut e = EncodeSettings::with_encoder("obs_x264");
+        e.extra.insert("preset".into(), "SLOW".into());
+        e.extra.insert("tune".into(), "film".into());
+        let v = video_config(&e, 1280, 720, 30);
+        assert_eq!((v.preset, v.tune), (Some("slow"), Some("film")));
+        e.extra.insert("preset".into(), "ludicrous".into());
+        assert_eq!(video_config(&e, 1280, 720, 30).preset, None);
+        let mut vt = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
+        vt.extra.insert("preset".into(), "slow".into());
+        assert_eq!(video_config(&vt, 1280, 720, 30).preset, None);
+        assert_eq!(ferrocast_studio_options_len("obs_x264"), 2);
+    }
+
+    fn ferrocast_studio_options_len(id: &str) -> usize {
+        crate::kinds::own_encoder_options(id).len()
     }
 
     #[test]
